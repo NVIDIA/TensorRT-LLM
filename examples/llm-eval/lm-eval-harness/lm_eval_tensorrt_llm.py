@@ -100,7 +100,6 @@ class TRTLLMEvalBase(TemplateLM):
             if hasattr(PyTorchConfig, "moe_backend"):
                 pytorch_config_params["moe_backend"] = self.moe_backend
                 print(f"Info: moe_backend is set to {self.moe_backend}")
-            pytorch_config = PyTorchConfig(**pytorch_config_params)
 
             # stop words not currently supported by torch backend
             self.use_stop_words = False
@@ -110,7 +109,7 @@ class TRTLLMEvalBase(TemplateLM):
                 tensor_parallel_size=tp,
                 trust_remote_code=trust_remote_code,
                 enable_chunked_prefill=False,
-                pytorch_backend_config=pytorch_config,
+                **pytorch_config_params,
                 tokenizer=self.tokenizer,
                 kv_cache_config=trt_kv_cache_config,
                 moe_expert_parallel_size=self.moe_expert_parallel_size,
