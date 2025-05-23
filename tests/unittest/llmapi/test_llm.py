@@ -1408,7 +1408,8 @@ def llama_7b_multi_lora_test_harness(**llm_kwargs):
         sampling_params,
         lora_request=[None, lora_req1, lora_req2, None, lora_req1, lora_req2])
     for output, ref, key_word in zip(outputs, references, key_words):
-        assert similar(output.outputs[0].text, ref) or key_word in output.outputs[0].txt
+        assert similar(output.outputs[0].text,
+                       ref) or key_word in output.outputs[0].txt
 
 
 @skip_gpu_memory_less_than_40gb
