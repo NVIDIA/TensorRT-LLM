@@ -178,15 +178,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_device_not_contain(["H100", "H200"])
     @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
     def test_auto_dtype(self, disable_overlap_scheduler):
-        ctx_server_config = {
-            "pytorch_backend_config": {
-                "disable_overlap_scheduler": True
-            }
-        }
+        ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {
-            "pytorch_backend_config": {
-                "disable_overlap_scheduler": disable_overlap_scheduler
-            }
+            "disable_overlap_scheduler": disable_overlap_scheduler
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -215,16 +209,8 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
-        ctx_server_config = {
-            "pytorch_backend_config": {
-                "disable_overlap_scheduler": True
-            }
-        }
-        gen_server_config = {
-            "pytorch_backend_config": {
-                "disable_overlap_scheduler": overlap_scheduler
-            }
-        }
+        ctx_server_config = {"disable_overlap_scheduler": True}
+        gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,

@@ -11,7 +11,6 @@ from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._utils import set_mpi_comm
 from tensorrt_llm.llmapi import KvCacheConfig, MpiCommSession
 
@@ -40,6 +39,7 @@ def model_path(model_name):
 
 
 async def run_worker(kv_cache_config, pytorch_config, model_name, rank):
+    assert isinstance(pytorch_config, dict)
     print(f"Running worker {rank}")
     port_name = MPI.Lookup_name('my_port')
     intercomm = MPI.COMM_WORLD.Connect(port_name)
@@ -53,7 +53,7 @@ async def run_worker(kv_cache_config, pytorch_config, model_name, rank):
                   auto_parallel=False,
                   model=model_name,
                   enable_chunked_prefill=False,
-                  pytorch_backend_config=pytorch_config,
+                  **pytorch_config,
                   _mpi_session=mpi_session,
                   kv_cache_config=kv_cache_config)
         print(f"LLM created")
@@ -110,15 +110,15 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
 
     # Context worker
     worker_pytorch_configs.append(
-        PyTorchConfig(disable_overlap_scheduler=True,
-                      kv_cache_dtype="auto",
-                      use_cuda_graph=enable_cuda_graph))
+        dict(disable_overlap_scheduler=True,
+             kv_cache_dtype="auto",
+             use_cuda_graph=enable_cuda_graph))
 
     # Generation worker
     worker_pytorch_configs.append(
-        PyTorchConfig(disable_overlap_scheduler=not generation_overlap,
-                      kv_cache_dtype="auto",
-                      use_cuda_graph=enable_cuda_graph))
+        dict(disable_overlap_scheduler=not generation_overlap,
+             kv_cache_dtype="auto",
+             use_cuda_graph=enable_cuda_graph))
 
     kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
     model_names = [model_path(model) for _ in range(2)]
@@ -231,15 +231,15 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
 
     # Context worker
     worker_pytorch_configs.append(
-        PyTorchConfig(disable_overlap_scheduler=True,
-                      kv_cache_dtype="auto",
-                      use_cuda_graph=enable_cuda_graph))
+        dict(disable_overlap_scheduler=True,
+             kv_cache_dtype="auto",
+             use_cuda_graph=enable_cuda_graph))
 
     # Generation worker
     worker_pytorch_configs.append(
-        PyTorchConfig(disable_overlap_scheduler=not generation_overlap,
-                      kv_cache_dtype="auto",
-                      use_cuda_graph=enable_cuda_graph))
+        dict(disable_overlap_scheduler=not generation_overlap,
+             kv_cache_dtype="auto",
+             use_cuda_graph=enable_cuda_graph))
 
     kv_cache_configs = [
         KvCacheConfig(max_tokens=128, enable_block_reuse=False)

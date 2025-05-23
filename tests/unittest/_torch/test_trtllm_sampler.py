@@ -7,7 +7,6 @@ from utils.util import similar
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
 
 
@@ -25,8 +24,7 @@ def model_path():
 
 def create_llm(model_dir):
     """Create LLM with specific overlap scheduler setting"""
-    pytorch_config = PyTorchConfig(use_cuda_graph=True,
-                                   enable_trtllm_sampler=True)
+    pytorch_config = dict(use_cuda_graph=True, enable_trtllm_sampler=True)
 
     trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
 
@@ -35,7 +33,7 @@ def create_llm(model_dir):
         tensor_parallel_size=1,
         trust_remote_code=True,
         enable_chunked_prefill=True,
-        pytorch_backend_config=pytorch_config,
+        **pytorch_config,
         kv_cache_config=trt_kv_cache_config,
         max_num_tokens=
         128  # Only one request longer than max_num_tokens is required to test chunked prefill

@@ -1555,6 +1555,12 @@ class TorchLlmArgs(BaseLlmArgs):
     enable_layerwise_nvtx_marker: bool = Field(
         default=False, description="If true, enable layerwise nvtx marker.")
 
+    auto_deploy_config: Optional[object] = Field(
+        default=None,
+        description="Auto deploy config.",
+        exclude_from_json=True,
+        json_schema_extra={"type": f"Optional[AutoDeployConfig]"})
+
     load_format: Union[str, LoadFormat] = Field(
         default='auto',
         description=
@@ -1608,6 +1614,11 @@ class TorchLlmArgs(BaseLlmArgs):
     @property
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+
+        # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
+        # Just a WAR to support the auto_deploy
+        if self.auto_deploy_config is not None:
+            return self.auto_deploy_config
 
         return PyTorchConfig(
             extra_resource_managers=self.extra_resource_managers,
