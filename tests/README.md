@@ -119,7 +119,7 @@ Due to CI hardware resource limitation, and some cases only run on specific GPUs
 
 In directory `integration/test_lists/test-db`, each yml file corresponds to a GPU type.
 
-In file `jenkins/L0_Test.groovy`, the variable `turtleConfigs` maps yml files to CI stages.
+In file `jenkins/L0_Test.groovy`, the variable `testConfigs` maps yml files to CI stages.
 
 Currently the yml files are manually maintained, which requires developer to update them when new test cases are added.
 

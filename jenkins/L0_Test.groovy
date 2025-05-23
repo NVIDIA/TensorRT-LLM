@@ -1367,7 +1367,7 @@ def runInKubernetes(pipeline, podSpec, containerName)
 def launchTestJobs(pipeline, testFilter, dockerNode=null)
 {
     def dockerArgs = "-v /mnt/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
-    turtleConfigs = [
+    testConfigs = [
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
@@ -1441,7 +1441,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H200-8_GPUs-PyTorch-[Post-Merge]": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
     ]
 
-    parallelJobs = turtleConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
+    parallelJobs = testConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -1454,12 +1454,12 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     fullSet = parallelJobs.keySet()
 
-    turtleSlurmConfigs = [
+    testSlurmConfigs = [
         "RTXPro6000-PyTorch-[Post-Merge]-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
     ]
 
     // TODO: use cpu pod to launch slurm job
-    parallelSlurmJobs = turtleSlurmConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10", "amd64", values[4] ?: 1, key.contains("Perf")), {
+    parallelSlurmJobs = testSlurmConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10", "amd64", values[4] ?: 1, key.contains("Perf")), {
     def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
