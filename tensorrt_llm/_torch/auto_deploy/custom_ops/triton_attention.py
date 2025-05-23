@@ -10,6 +10,7 @@ from torch._subclasses import FakeTensor
 from torch.fx import Node
 
 from ..utils.logger import ad_logger
+from ..utils.node_utils import extract_op_args
 from .attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -364,8 +365,9 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
         head_dim = k_fake.shape[3]
 
-        # Double check other arguments
-        attn_mask, dropout_p, is_causal = source_attn_node.args[3:6]
+        attn_mask, dropout_p, is_causal = extract_op_args(
+            source_attn_node, "attn_mask", "dropout_p", "is_causal"
+        )
         if attn_mask is not None or dropout_p != 0.0 or not is_causal:
             ad_logger.warning(
                 "Unsupported attention arguments for "

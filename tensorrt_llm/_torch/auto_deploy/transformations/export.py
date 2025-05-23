@@ -209,6 +209,12 @@ def _torch_where_patch(condition: torch.Tensor, *args, **kwargs):
 _torch_where_patch.where_original = torch.where
 
 
+def _torch_linear_patch(
+    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    return torch.ops.linear.simple(input, weight, bias)
+
+
 # TODO: remove once https://github.com/pytorch/pytorch/issues/142439 is resolved
 def _torch_modulelist_getitem_patch(self: nn.ModuleList, idx):
     if isinstance(idx, slice):
@@ -334,7 +340,8 @@ def torch_export_to_gm(
     # We overwrite the linear functional as well. This basically avoids exporting the view ops
     # that are used to flatten/unflatten multiple batch dimensions of the input tensor.
     linear_original = F.linear
-    F.linear = torch.ops.linear.simple
+    # patch linear → always supply bias
+    F.linear = _torch_linear_patch
 
     # patch torch.where(condition) to torch.nonzero(condition, as_tuple=True)
     torch.where = _torch_where_patch

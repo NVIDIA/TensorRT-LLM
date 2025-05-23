@@ -53,7 +53,13 @@ import torch
 from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
-from ...utils.node_utils import bfs, extract_output_tuple, identify_regions_between_residuals, is_op
+from ...utils.node_utils import (
+    bfs,
+    extract_op_args,
+    extract_output_tuple,
+    identify_regions_between_residuals,
+    is_op,
+)
 from .._graph import canonicalize_graph
 
 
@@ -194,13 +200,19 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         if not is_op(node, rope_ops):
             continue
 
-        rope_op = next(op for op in rope_ops if is_op(node, op))
         if is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
-            q_node, k_node, freqs_node, *rest = node.args
-            unsq = rest[0] if rest else _get_default_unsqueeze_dim(rope_op)
+            q_node, k_node, freqs_node, unsq = extract_op_args(
+                node,
+                "q",  # argument name in schema
+                "k",
+                "freqs",
+                "unsqueeze_dim",
+            )
+
         else:
-            q_node, k_node, cos_node, sin_node, *rest = node.args
-            unsq = rest[0] if rest else _get_default_unsqueeze_dim(rope_op)
+            q_node, k_node, cos_node, sin_node, unsq = extract_op_args(
+                node, "q", "k", "cos", "sin", "unsqueeze_dim"
+            )
 
         if unsq == 2:
             current_layout = "bsnd"

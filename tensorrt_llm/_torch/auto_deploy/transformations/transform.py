@@ -11,7 +11,7 @@ from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
 from ..shim.interface import AutoDeployConfig, CachedSequenceInterface
 from ..utils.logger import ad_logger
-from ._graph import canonicalize_graph, move_to_device
+from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .export import torch_export_to_gm
 from .library import (
     column_row_shard,
@@ -149,8 +149,9 @@ class InferenceOptimizer:
         egm = dp_bmm_shard(egm, local_rank, world_size)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
-        # subsequent optimization passes
-        egm = canonicalize_graph(egm, shape_prop=True)
+        # subsequent optimization passes. Lift state_dict to meta as shape propagation involves device check
+        with lift_to_meta(egm):
+            egm = canonicalize_graph(egm, shape_prop=True)
 
         ############################################################################################
         # MOVE MODEL AND LOAD WEIGHTS

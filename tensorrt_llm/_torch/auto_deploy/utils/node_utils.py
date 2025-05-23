@@ -350,3 +350,43 @@ def extract_output_tuple(node: Node, count: int = 2):
         )
         results.append(user_node)
     return results
+
+
+def extract_op_args(node: Node, *arg_names):
+    """
+    Given a call_function node for torch custom op,
+    returns a tuple of values for each name in arg_names, trying in order:
+    1. node.kwargs[name]
+    2. node.args[position_in_schema]
+    3. the schema default
+    """
+    if node.op != "call_function":
+        raise ValueError(f"extract_op_args only supports call_function nodes, got {node.op}")
+
+    op = node.target
+    if hasattr(op, "_schemas"):
+        schema = next(iter(op._schemas.values()))
+    elif hasattr(op, "_schema"):
+        schema = op._schema
+    else:
+        raise RuntimeError(f"No schema found on op {op}")
+    args_meta = schema.arguments
+
+    # name→index in signature, and name→default_value
+    pos = {a.name: i for i, a in enumerate(args_meta)}
+    defs = {a.name: a.default_value for a in args_meta if a.has_default_value}
+
+    args = list(node.args)
+    kwargs = node.kwargs or {}
+
+    def _get(name):
+        if name in kwargs:
+            return kwargs[name]
+        i = pos.get(name)
+        if i is not None and i < len(args):
+            return args[i]
+        if name in defs:
+            return defs[name]
+        raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
+
+    return [_get(n) for n in arg_names]
