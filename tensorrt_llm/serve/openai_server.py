@@ -206,10 +206,14 @@ class OpenAIServer:
                 promise: RequestOutput, postproc_params: PostprocParams) -> ChatCompletionResponse:
             await promise.aresult()
             if self.postproc_worker_enabled:
-                return promise.outputs[0]._postprocess_result
+                chat_response =promise.outputs[0]._postprocess_result
             else:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                return post_processor(promise, args)
+                chat_response = post_processor(promise, args)
+
+            # Add prompt_tokens_ids to the response
+            chat_response.prompt_token_ids = promise.prompt_token_ids
+            return chat_response
 
         try:
             conversation: List[ConversationMessage] = []
@@ -222,16 +226,19 @@ class OpenAIServer:
 
             conversation, mm_coroutines = parse_chat_messages_coroutines(request.messages, self.model_config)
 
-            prompt: str = apply_chat_template(
-                tokenizer=self.tokenizer,
-                processor=self.processor,
-                conversation=conversation,
-                add_generation_prompt=request.add_generation_prompt,
-                tools=tool_dicts,
-                documents=request.documents,
-                chat_template=request.chat_template,
-                chat_template_kwargs=request.chat_template_kwargs or {},
-            )
+            if request.prompt_token_ids is not None:
+                prompt = request.prompt_token_ids
+            else:
+                prompt: str = apply_chat_template(
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    conversation=conversation,
+                    add_generation_prompt=request.add_generation_prompt,
+                    tools=tool_dicts,
+                    documents=request.documents,
+                    chat_template=request.chat_template,
+                    chat_template_kwargs=request.chat_template_kwargs or {},
+                )
             prompt = prompt_inputs(prompt)
 
             mm_data = await mm_coroutines
