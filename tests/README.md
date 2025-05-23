@@ -217,3 +217,25 @@ cpp/test_e2e.py::test_model[eagle-86]
 cd tests/integration/defs
 pytest . --test-list="a10_list.txt" --output-dir=/tmp/llm_integration_test
 ```
+
+## 5. Set timeout for some long cases individually
+To set a timeout for specific long-running test cases, follow these steps:
+
+### For CI (test-db YAML files):
+1. Locate the test case line in the corresponding test-db YAML file (e.g., `tests/integration/test_lists/test-db/l0_a10.yml`).
+2. Append `TIMEOUT (...)` to the test case line, as shown below:
+   ```yaml
+   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
+   ```
+   - Ensure there is **at least one space** before and after the `TIMEOUT` keyword.
+   - The time value inside the parentheses `()` must be a **number** representing the timeout in **minutes**.
+
+### For Local Testing (TXT files):
+1. If you are running the tests locally using a prepared `.txt` file (e.g., `a10_list.txt`), append the `TIMEOUT` setting to the test case line in the same way:
+   ```
+   disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
+   ```
+
+### Notes:
+- The `TIMEOUT` setting ensures that the test case will be terminated if it exceeds the specified time limit.
+- This setting is useful for preventing long-running or stuck tests from blocking the pipeline or local testing.
