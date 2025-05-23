@@ -238,7 +238,6 @@ private:
     std::mutex mWorkerThreadMutex;
     std::condition_variable mWorkerThreadCondition;
     bool mWorkerThreadStopped = false;
-    int64_t mWaitIterId = 0;
     int64_t mWarmUpUntilIter = -1;
 
     // we use a separate thread to compute and update weights to avoid possible blocking for next layer due to slow
@@ -252,8 +251,16 @@ private:
     std::vector<std::shared_ptr<SingleLayerMoeLoadBalancer>> mLayers;
 
     int64_t mIterId = -1;
-    bool mStatisticEnabled = true;
-    bool mUpdateWeightsEnabled = true;
+
+    struct IterInfo
+    {
+        int64_t iterId = -1;
+        bool statisticEnabled = true;
+        bool updateWeightsEnabled = true;
+    };
+
+    std::queue<IterInfo> mIterInfoQueue;
+
     bool mModelFinalized = false;
 
     int mEpRank = 0;
