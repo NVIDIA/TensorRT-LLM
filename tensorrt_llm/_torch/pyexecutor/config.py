@@ -1,21 +1,15 @@
 import math
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Dict, List, Optional, Union
 
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
 from ...builder import BuildConfig
+from ...llmapi.llm_args import LoadFormat
 from ...logger import logger
 from ...mapping import Mapping
 from ..speculative import SpecConfig
 from .resource_manager import BaseResourceManager
-
-
-class LoadFormat(Enum):
-    AUTO = 0
-    # Initialize all weights randomly.
-    DUMMY = 1
 
 
 @dataclass
