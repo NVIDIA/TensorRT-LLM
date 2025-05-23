@@ -16,8 +16,8 @@ TensorRT-LLM
 
 ---
 <div align="left">
-## Tech Blogs
 
+## Tech Blogs
 * [05/23] DeepSeek R1 MTP Implementation and Optimization
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md)
 
