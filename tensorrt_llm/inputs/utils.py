@@ -6,7 +6,6 @@ from typing import List, Union
 from urllib.parse import urlparse
 
 import aiohttp
-import cv2
 import numpy as np
 import requests
 import torch
@@ -87,6 +86,9 @@ def load_video(
         num_frames: int = 10,
         format: str = "pt",
         device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+
+    # Keep this import local to avoid importing cv2 if not needed
+    import cv2
 
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 

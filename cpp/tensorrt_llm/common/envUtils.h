@@ -98,4 +98,6 @@ size_t getEnvMemSizeForKVCacheTransferBuffer();
 
 uint16_t getEnvNixlPort();
 
+bool getEnvDisaggBenchmarkGenOnly();
+
 } // namespace tensorrt_llm::common
