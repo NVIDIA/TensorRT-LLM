@@ -50,6 +50,7 @@ class Attention(nn.Module):
         qk_norm_type: QkNormType = QkNormType.none,
         q_scaling: float = 1.0,
         attention_chunk_size: Optional[int] = None,
+        fuse_qk_norm_rope: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -179,7 +180,7 @@ class Attention(nn.Module):
             self.head_dim,
             self.num_key_value_heads,
             pos_embd_params=self.pos_embd_params
-            if self.enable_rope_fusion else None,
+            if self.enable_rope_fusion and not fuse_qk_norm_rope else None,
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
@@ -189,14 +190,13 @@ class Attention(nn.Module):
         self.support_fused_qkv = self.attn.support_fused_qkv()
 
         self.rotary_emb = None
-        self.apply_rotary_emb = (not self.enable_rope_fusion
-                                 and pos_embd_params is not None)
-        if self.apply_rotary_emb:
-            self.rotary_emb = RotaryEmbedding(
-                pos_embd_params.rope,
-                head_dim=self.head_dim,
-                is_neox=pos_embd_params.is_neox,
-            )
+        self.apply_rotary_emb = not self.enable_rope_fusion and pos_embd_params is not None and not fuse_qk_norm_rope
+
+        self.rotary_emb = RotaryEmbedding(
+            pos_embd_params.rope,
+            head_dim=self.head_dim,
+            is_neox=pos_embd_params.is_neox,
+        )
 
         if not config.skip_create_weights_in_init:
             self.create_weights()
@@ -261,21 +261,26 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-        q, k, v = qkv, None, None
-        if self.qk_norm_type == QkNormType.pre_rope:
-            q, k, v = self.split_qkv(q, k, v)
-            q, k = self.apply_qk_norm(q, k)
-        if self.apply_rotary_emb and position_ids is not None:
-            q, k, v = self.split_qkv(q, k, v)
-            q, k = self.rotary_emb(position_ids, [q, k])
-            if self.qk_norm_type == QkNormType.post_rope:
-                q, k = self.apply_qk_norm(q, k)
-        out_scale = None
+        if self.fuse_qk_norm_rope:
+            qkv = self.apply_qk_norm_rope(qkv, position_ids)
+            q, k, v = qkv, None, None
 
+        else:
+            q, k, v = qkv, None, None
+            if self.qk_norm_type == QkNormType.pre_rope:
+                q, k, v = self.split_qkv(q, k, v)
+                q, k = self.apply_qk_norm(q, k)
+            if self.apply_rotary_emb and position_ids is not None:
+                q, k, v = self.split_qkv(q, k, v)
+                q, k = self.rotary_emb(position_ids, [q, k])
+                if self.qk_norm_type == QkNormType.post_rope:
+                    q, k = self.apply_qk_norm(q, k)
+            q, k, v = self.convert_qkv(q, k, v)
+
+        out_scale = None
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
             out_scale = self.o_proj.inv_input_scale
 
-        q, k, v = self.convert_qkv(q, k, v)
         attn_output = self.attn.forward(
             q,
             k,

@@ -28,6 +28,9 @@ class Qwen3Attention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
+
+        self.fuse_qk_norm_rope = False  # TODO: Make this configurable?
+
         if getattr(config, "rope_scaling", None) is not None:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.from_string(
@@ -52,6 +55,7 @@ class Qwen3Attention(Attention):
             dense_bias=config.attention_bias,
             config=model_config,
             qk_norm_type=QkNormType.pre_rope,
+            fuse_qk_norm_rope=self.fuse_qk_norm_rope,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
@@ -84,6 +88,17 @@ class Qwen3Attention(Attention):
         )
 
         return q, k
+
+    def apply_qk_norm_rope(self, qkv, position_ids):
+        #print("###########position_ids.shape", position_ids.shape)
+        torch.ops.trtllm.fused_qk_norm_rope(
+            qkv, self.num_heads, self.num_key_value_heads,
+            self.num_key_value_heads, self.head_dim,
+            self.q_norm.variance_epsilon, self.q_norm.weight,
+            self.k_norm.weight, self.rotary_emb.rope_params.theta,
+            self.rotary_emb.is_neox,
+            position_ids.view(-1).int())
+        return qkv
 
 
 class Qwen3DecoderLayer(DecoderLayer):
