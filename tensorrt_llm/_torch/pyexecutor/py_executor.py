@@ -1326,7 +1326,7 @@ class PyExecutor:
         """
         req_id_to_obj = {}
         for item in requests:
-            if item is None:
+            if item[0] == SHUTDOWN_REQUEST_ID:
                 continue
             req_id, req = item[:2]
             obj = getattr(req, attribute_name, None)
@@ -1340,7 +1340,7 @@ class PyExecutor:
         to each request.
         """
         for item in requests:
-            if item is None:
+            if item[0] == SHUTDOWN_REQUEST_ID:
                 continue
             req_id, req = item[:2]
             py_obj = py_request_objects.get(req_id)
