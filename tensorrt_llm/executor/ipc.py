@@ -5,7 +5,7 @@ import pickle  # nosec B403
 import time
 import traceback
 from queue import Queue
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import zmq
 import zmq.asyncio
@@ -127,6 +127,8 @@ class ZeroMqQueue:
 
     async def put_async(self, obj: Any):
         self.setup_lazily()
+        if self.socket is None:
+            raise RuntimeError("Socket is not initialized or has been closed")
         try:
             if self.use_hmac_encryption:
                 # Send pickled data with HMAC appended
@@ -135,9 +137,13 @@ class ZeroMqQueue:
                 await self.socket.send(signed_data)
             else:
                 # Send data without HMAC
-                await self.socket.send_pyobj(obj)
+                data = pickle.dumps(obj)  # nosec B301
+                await self.socket.send(data)
         except TypeError as e:
             logger.error(f"Cannot pickle {obj}")
+            raise e
+        except zmq.ZMQError as e:
+            logger.error(f"ZMQ error while sending object: {e}")
             raise e
         except Exception as e:
             logger.error(f"Error sending object: {e}")
@@ -145,6 +151,24 @@ class ZeroMqQueue:
             raise e
 
         nvtx_mark("ipc.send", color="blue", category="IPC")
+
+    def put_noblock(self, obj: Any, on_fail: Callable[[], None] = None):
+        '''
+        Parameters:
+            obj: The object to send.
+            on_fail: A callable that will be called if the send fails.
+        '''
+        self.setup_lazily()
+        data = pickle.dumps(obj)  # nosec B301
+        if self.use_hmac_encryption:
+            data = self._sign_data(data)
+        try:
+            self.socket.send(data, flags=zmq.NOBLOCK)
+        except zmq.ZMQError as e:
+            if on_fail is not None:
+                on_fail()
+            else:
+                raise e
 
     def get(self) -> Any:
         self.setup_lazily()
@@ -187,6 +211,36 @@ class ZeroMqQueue:
             # Receive data without HMAC
             obj = await self.socket.recv_pyobj()
         return obj
+
+    def get_with_poll(self,
+                      on_fail: Callable[[], None] = None,
+                      poll_timeout: float = 0.1) -> Any:
+        '''
+        Parameters:
+            on_fail: A callable that will be called each time polling times out.
+            poll_timeout: Timeout in seconds for each poll attempt.
+        '''
+        self.setup_lazily()
+        while True:
+            if self.poll(poll_timeout):
+                if self.use_hmac_encryption:
+                    # Receive signed data with HMAC
+                    signed_data = self.socket.recv()
+
+                    # Split data and HMAC
+                    data = signed_data[:-32]
+                    actual_hmac = signed_data[-32:]
+
+                    # Verify HMAC
+                    if not self._verify_hmac(data, actual_hmac):
+                        raise RuntimeError("HMAC verification failed")
+
+                    return pickle.loads(data)  # nosec B301
+                else:
+                    # Receive data without HMAC
+                    return self.socket.recv_pyobj()
+            elif on_fail is not None:
+                on_fail()
 
     def close(self):
         if self.socket:
