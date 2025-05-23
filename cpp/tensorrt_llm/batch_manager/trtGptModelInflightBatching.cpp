@@ -977,8 +977,6 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 }
             }
 
-            utils::sortByLoraId(currRequests);
-
             (*mAssignReqSeqSlots)(*mSeqSlotManager, currRequests.contextRequests, currRequests.generationRequests);
 
             if (mKvCacheManager)

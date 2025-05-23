@@ -35,7 +35,12 @@ using OptionalRef = common::OptionalRef<T>;
 
 TensorPtr collectRequestIds(RequestVector const& contextRequests, RequestVector const& generationRequests);
 
-void sortByLoraId(ScheduledRequests& scheduledRequests);
+//! @brief Sort requests for functional correctness and performance.
+//! @details Sort context requests for moveFinishedContextRequestsToGeneration.
+//!          Sort requests by lora task id for performance.
+//! @param contextRequests The context requests.
+//! @param generationRequests The generation requests.
+void sortRequests(RequestVector& contextRequests, RequestVector& generationRequests);
 
 //! @brief Move finished context requests to generation requests.
 //! @details This function assumes that the context requests are sorted so that requests with isLastContextChunk() are
