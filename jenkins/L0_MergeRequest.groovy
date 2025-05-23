@@ -1035,6 +1035,35 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             }
         },
     ]
+    def dockerBuildJob = [
+        "BuildDockerImages": {
+            script {
+                stage("BuildDockerImages") {
+                    def parameters = getCommonParameters()
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
+                    def LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "XXXXXXX"
+                    parameters += [
+                        // env.gitlabBranch is set for all gitlab jobs (all postMerge job is from gitlab)
+                        // So we use github-pre-merge as default branch tag (To avoid the custom image tag be overwritten by pre-merge job)
+                        'branch': env.gitlabBranch ? env.gitlabBranch : "github-pre-merge",
+                        'action': "push",
+                        'defaultTag': "${LLM_SHORT_COMMIT}-l0_mr-${BUILD_NUMBER}",
+                        'globalVars': globalVarsJson,
+                    ]
+
+                    echo "trigger BuildDockerImages job, params: ${parameters}"
+
+                    def status = triggerJob("/LLM/helpers/BuildDockerImages", parameters)
+                    if (status != "SUCCESS") {
+                        error "Downstream job did not succeed"
+                    }
+                }
+            }
+        }
+    ]
+    if (testFilter[(IS_POST_MERGE)]) {
+        stages += dockerBuildJob
+    }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
