@@ -2099,8 +2099,8 @@ def test_llm_dynamic_batch_config():
 def run_llm_with_postprocess_parallel(tp_size: int = 1):
     sampling_params = SamplingParams(max_tokens=6)
 
-    postproc_settings = dict(_num_postprocess_workers=2,
-                             _postprocess_tokenizer_dir=llama_model_path)
+    postproc_settings = dict(num_postprocess_workers=2,
+                             postprocess_tokenizer_dir=llama_model_path)
 
     llm_test_harness(llama_model_path,
                      prompts, ["D E F G H I J K"],
@@ -2131,8 +2131,8 @@ def run_llm_with_postprocess_parallel_and_result_handler(
               backend=backend,
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
-              _num_postprocess_workers=2,
-              _postprocess_tokenizer_dir=llama_model_path,
+              num_postprocess_workers=2,
+              postprocess_tokenizer_dir=llama_model_path,
               fast_build=True)
     golden_result = "DEFGHI"
     for i, output in enumerate(
