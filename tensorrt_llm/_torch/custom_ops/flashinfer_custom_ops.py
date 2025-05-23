@@ -38,7 +38,7 @@ if IS_FLASHINFER_AVAILABLE:
 
     @flashinfer_silu_and_mul.register_fake
     def _(x: torch.Tensor) -> torch.Tensor:
-        return torch.empty_like(x).chunk(2, dim=-1)[1]
+        return torch.empty_like(x).chunk(2, dim=-1)[1].contiguous()
 
     # Warp this into custom op since flashinfer provides default value for eps with would produce two different graphs depends on the eps value.
     @torch.library.custom_op("trtllm::flashinfer_rmsnorm", mutates_args=())
