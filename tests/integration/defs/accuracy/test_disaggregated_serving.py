@@ -219,6 +219,7 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
+        pytest.skip("https://nvbugs/5297821")
         ctx_server_config = {
             "pytorch_backend_config": {
                 "disable_overlap_scheduler": True
