@@ -19,9 +19,9 @@ In summary, Scaffolding is not a specific inference time compute method or workf
 Now Scaffolding is a module in TensorRT-LLM, so users just need to install TensorRT-LLM.
 
 ### Examples
-[The first example](example/scaffolding/run_basic_generation.py)
+[The first example](../../examples/scaffolding/run_basic_generation.py)
 ``` bash
-python example/scaffolding/run_basic_generation.py --model_dir PATH/TO/MODEL
+python examples/scaffolding/run_basic_generation.py --model_dir PATH/TO/MODEL
 ```
 This example run the generation with TensorRT-LLM backend. It shows the step of using Scaffolding. Users firstly need to create `Controller` and `Worker` instance, then map the worker tag to the worker instance, finally create the `ScaffoldingLlm` instance and run the request. It also shows how to run scaffolding on asyncio and run the batched request.
 
