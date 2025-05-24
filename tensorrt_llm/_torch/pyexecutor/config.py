@@ -1,13 +1,18 @@
+import json
 import math
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Union
+
+import yaml
 
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
 from ...builder import BuildConfig
 from ...logger import logger
 from ...mapping import Mapping
+from ..model_config import MoeLoadBalancerConfig
 from ..speculative import SpecConfig
 from .resource_manager import BaseResourceManager
 
@@ -49,6 +54,7 @@ class PyTorchConfig:
     # If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time.
     # If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used.
     moe_max_num_tokens: Optional[int] = None
+    moe_load_balancer: Optional[Union[MoeLoadBalancerConfig, dict, str]] = None
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
@@ -126,6 +132,22 @@ class PyTorchConfig:
                     -1]:
                 self.cuda_graph_batch_sizes.append(
                     self.cuda_graph_max_batch_size)
+
+        if isinstance(self.moe_load_balancer, str):
+            assert os.path.exists(self.moe_load_balancer)
+            if self.moe_load_balancer.endswith(".json"):
+                with open(self.moe_load_balancer) as f:
+                    self.moe_load_balancer = json.load(f)
+            elif self.moe_load_balancer.endswith((".yaml", ".yml")):
+                with open(self.moe_load_balancer) as f:
+                    self.moe_load_balancer = yaml.safe_load(f)
+            else:
+                raise ValueError(
+                    f"Unsupported moe load balancer config file: {self.moe_load_balancer}"
+                )
+        if isinstance(self.moe_load_balancer, dict):
+            self.moe_load_balancer = MoeLoadBalancerConfig(
+                **self.moe_load_balancer)
 
         self._convert_load_format()
 
