@@ -1194,7 +1194,7 @@ def test_llm_api_medusa_tp2():
 
 
 @pytest.mark.part0
-def test_llm_api_eagle():
+def test_llm_api_eagle(**llm_kwargs):
     prompts = [
         "Hello, my name is",
         "The president of the United States is",
@@ -1202,7 +1202,6 @@ def test_llm_api_eagle():
         "The future of AI is",
     ]
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
-    build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=True)
 
@@ -1218,11 +1217,19 @@ def test_llm_api_eagle():
                                             [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], \
                                             [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
     )
+
+    # in test_llm_multi_gpu, kv_cache_config is passed as a kwarg
+    if "kv_cache_config" in llm_kwargs:
+        kv_cache_config = llm_kwargs["kv_cache_config"]
+        del llm_kwargs["kv_cache_config"]
+
     llm = LLM(model=get_model_path("vicuna-7b-v1.3"),
-              build_config=build_config,
               kv_cache_config=kv_cache_config,
               speculative_config=speculative_config,
-              fast_build=True)
+              max_batch_size=1,
+              max_seq_len=1024,
+              fast_build=True,
+              **llm_kwargs)
 
     outputs = llm.generate(prompts, sampling_params)
 
@@ -1233,9 +1240,8 @@ def test_llm_api_eagle():
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
-@skip_single_gpu
 @pytest.mark.part0
-def test_llm_api_eagle_tp2():
+def test_llm_api_eagle2(**llm_kwargs):
     prompts = [
         "Hello, my name is",
         "The president of the United States is",
@@ -1243,29 +1249,29 @@ def test_llm_api_eagle_tp2():
         "The future of AI is",
     ]
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
-    build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=True)
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-                      speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
-
+        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
-                            eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
-                                            [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
-                                            [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
-                                            [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], \
-                                            [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], \
-                                            [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
-    )
+        use_dynamic_tree=True,
+        dynamic_tree_max_topK=10)
+
+    # in test_llm_multi_gpu, kv_cache_config is passed as a kwarg
+    if "kv_cache_config" in llm_kwargs:
+        kv_cache_config = llm_kwargs["kv_cache_config"]
+        del llm_kwargs["kv_cache_config"]
+
     llm = LLM(model=get_model_path("vicuna-7b-v1.3"),
-              build_config=build_config,
               kv_cache_config=kv_cache_config,
               speculative_config=speculative_config,
-              tensor_parallel_size=2,
-              fast_build=True)
+              max_batch_size=1,
+              max_seq_len=1024,
+              fast_build=True,
+              **llm_kwargs)
 
     outputs = llm.generate(prompts, sampling_params)
 
