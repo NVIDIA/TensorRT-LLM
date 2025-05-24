@@ -75,11 +75,9 @@ def test_valgrind_llama_v2_13b(
     llama_v2_tokenizer_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
-    if BATCHING_STRATEGY == "V1" and FEATURE_NAME == "test_embedding_bias":
-        pytest.skip("Skipping. V1 doesn't support embedding_bias tensor yet.")
+    if BATCH_SCHEDULER_POLICY == "static_batch" and FEATURE_NAME == "test_embedding_bias":
+        pytest.skip(
+            "Skipping. static batch doesn't support embedding_bias tensor yet.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -196,8 +194,9 @@ def test_valgrind_gpt_350m(
     gpt_tokenizer_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
+    if BATCH_SCHEDULER_POLICY == "static_batch" and FEATURE_NAME == "test_embedding_bias":
+        pytest.skip(
+            "Skipping. static batch doesn't support embedding_bias tensor yet.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -317,11 +316,9 @@ def test_llama_v3_8b_rss_increasement(
     llama_v3_8b_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
-    if BATCHING_STRATEGY == "V1" and FEATURE_NAME == "test_embedding_bias":
-        pytest.skip("Skipping. V1 doesn't support embedding_bias tensor yet.")
+    if BATCH_SCHEDULER_POLICY == "static_batch" and FEATURE_NAME == "test_embedding_bias":
+        pytest.skip(
+            "Skipping. static batch doesn't support embedding_bias tensor yet.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")

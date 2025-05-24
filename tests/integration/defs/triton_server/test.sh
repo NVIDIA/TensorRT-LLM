@@ -446,7 +446,7 @@ run_cpp_trtllm_backend_tests () {
         grep -E 'nv_trt_llm_kv_cache_block_metrics\{kv_cache_block_type="free",model="tensorrt_llm",version="1"\} [1-9][0-9]*$' ${TRITON_METRICS_LOG}
         grep -E 'nv_trt_llm_kv_cache_block_metrics\{kv_cache_block_type="max",model="tensorrt_llm",version="1"\} [1-9][0-9]*$' ${TRITON_METRICS_LOG}
         grep -E 'nv_trt_llm_kv_cache_block_metrics\{kv_cache_block_type="fraction",model="tensorrt_llm",version="1"\} [0-9]*\.?[0-9]+$' ${TRITON_METRICS_LOG}
-        if [[ "${BATCHING_STRATEGY}" == "v1" ]]; then
+        if [[ "${BATCH_SCHEDULER_POLICY}" == "static_batch" ]]; then
           grep -E 'nv_trt_llm_inflight_batcher_metrics\{model="tensorrt_llm",v1_specific_metric="num_ctx_tokens",version="1"\} [0-9]+$' ${TRITON_METRICS_LOG}
           grep -E 'nv_trt_llm_inflight_batcher_metrics\{model="tensorrt_llm",v1_specific_metric="num_gen_tokens",version="1"\} [0-9]+$' ${TRITON_METRICS_LOG}
           grep -E 'nv_trt_llm_inflight_batcher_metrics\{model="tensorrt_llm",v1_specific_metric="empty_gen_slots",version="1"\} [0-9]+$' ${TRITON_METRICS_LOG}
@@ -622,9 +622,9 @@ run_cpp_trtllm_queue_size_tests () {
 }
 
 BACKENDS=( "tensorrtllm" "python" )
-BATCHING_STRATEGIES=( "inflight_fused_batching"  )
+BATCHING_STRATEGIES=( "inflight_fused_batching" )
 MAX_TOKENS_IN_KV_CACHES=( "" $MAX_SEQUENCE_LEN )
-BATCH_SCHEDULER_POLICIES=( "guaranteed_no_evict" "max_utilization" )
+BATCH_SCHEDULER_POLICIES=( "guaranteed_no_evict" "max_utilization" "static_batch" )
 KV_CACHE_FREE_GPU_MEM_FRACTIONS=( "0.2" "" )
 CROSS_KV_CACHE_FRACTION=""
 ENABLE_CHUNKED_CONTEXTS=( "false" "true" )
@@ -673,11 +673,7 @@ if [ "$MODEL" = "gpt-ib" ] || [ "$MODEL" = "mistral-ib" ] || [ "$MODEL" = "mistr
         if [[ "${KV_CACHE_FREE_GPU_MEM_FRACTION}" == "" && "${MAX_TOKENS_IN_KV_CACHE}" == "" ]]; then
             continue
         fi
-        if [[ "${BATCHING_STRATEGY}" == "v1" && "${BATCH_SCHEDULER_POLICY}" == "max_utilization" ]]; then
-            continue
-        fi
-        # For V1, batchScheduler currently cannot properly estimate kvCache usage
-        if [[ "${BATCHING_STRATEGY}" == "v1" && "${MAX_TOKENS_IN_KV_CACHE}" != "" ]]; then
+        if [[ "${BATCH_SCHEDULER_POLICY}" == "static_batch" && "${MAX_TOKENS_IN_KV_CACHE}" == "" ]]; then
             continue
         fi
         # mistral is built without chunked context support
@@ -793,11 +789,7 @@ if [ "$MODEL" = "gpt-ib-streaming" ]; then
         if [[ "${KV_CACHE_FREE_GPU_MEM_FRACTION}" == "" && "${MAX_TOKENS_IN_KV_CACHE}" == "" ]]; then
             continue
         fi
-        if [[ "${BATCHING_STRATEGY}" == "v1" && "${BATCH_SCHEDULER_POLICY}" == "max_utilization" ]]; then
-            continue
-        fi
-        # For V1, batchScheduler currently cannot properly estimate kvCache usage
-        if [[ "${BATCHING_STRATEGY}" == "v1" && "${MAX_TOKENS_IN_KV_CACHE}" != "" ]]; then
+        if [[ "${BATCH_SCHEDULER_POLICY}" == "static_batch" && "${MAX_TOKENS_IN_KV_CACHE}" == "" ]]; then
             continue
         fi
 
@@ -896,8 +888,7 @@ if [ "$MODEL" = "gpt-ib-speculative-decoding-bls" ]; then
     for BATCHING_STRATEGY in "${BATCHING_STRATEGIES[@]}"; do
     for USE_DRAFT_LOGITS in "${USE_DRAFT_LOGITS_VALUES[@]}"; do
 
-
-        if [[ "${BATCHING_STRATEGY}" == "v1" ]]; then
+        if [[ "${BATCH_SCHEDULER_POLICY}" == "static_batch" ]]; then
             continue
         fi
         draft_args="--num-draft-tokens=5"
@@ -967,7 +958,7 @@ if [ "$MODEL" = "gpt-ib-ptuning" ]; then
     ENABLE_CONTEXT_FMHA_FP32_ACC="True"
 
     for BATCHING_STRATEGY in "${BATCHING_STRATEGIES[@]}"; do
-        if [[ "${BATCHING_STRATEGY}" == "v1" ]]; then
+        if [[ "${BATCH_SCHEDULER_POLICY}" == "static_batch" ]]; then
             continue
         fi
 
@@ -1018,8 +1009,8 @@ if [ "$MODEL" = "gpt-2b-ib-lora" ]; then
 
     for BATCHING_STRATEGY in "${BATCHING_STRATEGIES[@]}"; do
 
-        # LoRA is not supported in V1
-        if [[ "${BATCHING_STRATEGY}" == "v1" ]]; then
+        # LoRA is not supported in static batch
+        if [[ "${BATCH_SCHEDULER_POLICY}" == "static_batch" ]]; then
             continue
         fi
 
@@ -1083,8 +1074,8 @@ if [ "$MODEL" = "gpt-speculative-decoding" ]; then
 
     for BATCHING_STRATEGY in "${BATCHING_STRATEGIES[@]}"; do
 
-        # Speculative decoding is not supported in V1
-        if [[ "${BATCHING_STRATEGY}" == "v1" ]]; then
+        # Speculative decoding is not supported in static batch
+        if [[ "${BATCH_SCHEDULER_POLICY}" == "static_batch" ]]; then
             continue
         fi
 
@@ -1132,8 +1123,8 @@ if [ "$MODEL" = "gpt-disaggregated-serving-bls" ]; then
 
     for BATCHING_STRATEGY in "${BATCHING_STRATEGIES[@]}"; do
 
-        # Disaggregated Serving is not supported in v1 batching
-        if [[ "${BATCHING_STRATEGY}" == "v1" ]]; then
+        # Disaggregated Serving is not supported in static batch
+        if [[ "${BATCH_SCHEDULER_POLICY}" == "static_batch" ]]; then
             continue
         fi
 
@@ -1206,8 +1197,8 @@ if [ "$MODEL" = "gpt-gather-logits" ]; then
 
         for BATCHING_STRATEGY in "${BATCHING_STRATEGIES[@]}"; do
 
-            # Speculative decoding is not supported in V1
-            if [[ "${BATCHING_STRATEGY}" == "v1" ]]; then
+            # Speculative decoding is not supported in static batch
+            if [[ "${BATCH_SCHEDULER_POLICY}" == "static_batch" ]]; then
                 continue
             fi
 
