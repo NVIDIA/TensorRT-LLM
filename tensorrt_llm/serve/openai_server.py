@@ -22,6 +22,7 @@ from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import (ConversationMessage,
                                            apply_chat_template,
+                                           check_multiple_response,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
@@ -212,6 +213,7 @@ class OpenAIServer:
                 return post_processor(promise, args)
 
         try:
+            check_multiple_response(request.n, self.llm.args.backend)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -342,6 +344,7 @@ class OpenAIServer:
             return response
 
         try:
+            check_multiple_response(request.n, self.llm.args.backend)
             if isinstance(request.prompt, str) or \
                 (isinstance(request.prompt, list) and isinstance(request.prompt[0], int)):
                 prompts = [request.prompt]
