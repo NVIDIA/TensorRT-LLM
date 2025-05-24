@@ -14,6 +14,7 @@ from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
                                                    FusedMoE,
                                                    RenormalizeMoeRoutingMethod)
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.utils import get_power_of_2_num_tokens_buckets
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
@@ -68,10 +69,12 @@ def test_fused_moe(dtype, experts, RoutingMethodCls):
     ref_fused_moe.cuda()
 
     # Evaluate the outputs on a variant sequence length to cover all possible keys in Autotuner cache
-    m = SEQ_LEN
-    while m >= 2:
-        x = torch.randn((m, HIDDEN_SIZE), dtype=dtype).cuda()
-        router_logits = torch.randn((m, NUM_EXPERTS), dtype=dtype).cuda()
+    # Add 16384 to cover the case where the sequence length is larger than 8192.
+    # There should be no fallback under this setting.
+    seq_len_buckets = get_power_of_2_num_tokens_buckets(SEQ_LEN)
+    for bucket in seq_len_buckets:
+        x = torch.randn((bucket, HIDDEN_SIZE), dtype=dtype).cuda()
+        router_logits = torch.randn((bucket, NUM_EXPERTS), dtype=dtype).cuda()
 
         with torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
@@ -80,7 +83,6 @@ def test_fused_moe(dtype, experts, RoutingMethodCls):
         # Evaluate outputs
         torch.cuda.synchronize()
         torch.testing.assert_close(output, ref_output, rtol=0.2, atol=0.2)
-        m //= 2
 
 
 @skip_pre_hopper

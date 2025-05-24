@@ -1,11 +1,12 @@
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
 from ..attention_backend.interface import AttentionInputType
-from ..autotuner import AutoTuner, TunableRunner, TuningConfig
+from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
+                         TunableRunner, TuningConfig)
 from ..utils import (get_last_power_of_2_num_tokens_buckets,
                      get_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2, next_positive_power_of_2)
@@ -130,15 +131,23 @@ def fused_moe(
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
-
+    # 8192 is an sufficient upper bound for moe kernels
+    tune_upper_bound = 8192
     # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
-    tuning_config = TuningConfig(dynamic_tensors=(
-        # input, dim 0, all valid buckets, map a seq_len to power of 2 bucket index
-        (0, 0, ((8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1),
-                next_positive_power_of_2)),
-        # min_latency_tensor, dim 0, (0 for False, 1 for True), map to it self
-        (2, 0, ((0, ), lambda x: x)),
-    ))
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=0,
+                dim_idx=0,
+                gen_tuning_buckets=get_power_of_2_num_tokens_buckets(
+                    tune_upper_bound),
+                map_to_tuning_buckets=lambda x: min(next_positive_power_of_2(x),
+                                                    tune_upper_bound)),
+            # min_latency_tensor, dim 0, (0 for False, 1 for True), map to it self
+            DynamicTensorSpec(input_idx=2,
+                              dim_idx=0,
+                              gen_tuning_buckets=(0, ),
+                              map_to_tuning_buckets=lambda x: x)), )
 
     # TODO: set min_latency_mode always to False due to the error in the moe_kernels
     min_latency_tensor = torch.empty(0)
@@ -276,16 +285,13 @@ class NVFP4GemmRunner(TunableRunner):
             tactic,
         )
 
-    def find_nearest_profile(
-            self, shapes: Tuple[torch.Size],
-            dynamic_tensors: Tuple[Tuple[int, int, Tuple[Union[Tuple[int],
-                                                               Callable],
-                                                         Callable]]],
-            constraints: Tuple[Tuple[int, int, Callable]]) -> Tuple:
+    def find_nearest_profile(self, shapes: Tuple[torch.Size],
+                             dynamic_tensor_specs: Tuple[DynamicTensorSpec],
+                             constraint_specs: Tuple[ConstraintSpec]) -> Tuple:
         """Generate a unique profile to reduce host overhead during inference.
         """
-        _, _, (_, shape_round_rule) = dynamic_tensors[0]
-        m, n, k = shape_round_rule(shapes[0][0]), shapes[1][0], shapes[1][1] * 2
+        m, n, k = dynamic_tensor_specs[0].map_to_tuning_buckets(
+            shapes[0][0]), shapes[1][0], shapes[1][1] * 2
 
         return (m, n, k)
 
@@ -320,12 +326,17 @@ def nvfp4_gemm(
     tuner = AutoTuner.get()
 
     tuning_config = TuningConfig(
-        dynamic_tensors=((0, 0, (
-            lambda x: get_power_of_2_num_tokens_buckets(8192)
-            if not to_userbuffers else get_last_power_of_2_num_tokens_buckets(
-                x), lambda x: next_positive_power_of_2(x)
-            if not to_userbuffers else last_positive_power_of_2(x))), ),
-        constraints=((2, 0, fp4_scale_dims), ),
+        dynamic_tensor_specs=((DynamicTensorSpec(
+            input_idx=0,
+            dim_idx=0,
+            gen_tuning_buckets=lambda x: get_power_of_2_num_tokens_buckets(8192)
+            if not to_userbuffers else get_last_power_of_2_num_tokens_buckets(x
+                                                                              ),
+            map_to_tuning_buckets=lambda x: next_positive_power_of_2(x)
+            if not to_userbuffers else last_positive_power_of_2(x)), )),
+        constraint_specs=(ConstraintSpec(input_idx=0,
+                                         dim_idx=0,
+                                         infer_shape=fp4_scale_dims), ),
     )
 
     # allocate workspace for profiling
