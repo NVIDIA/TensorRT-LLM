@@ -133,6 +133,7 @@ def run_disaggregated_test(example_dir,
         config_file
     ]
     with open('output_workers.log', 'w') as f:
+        print(f"Running command: {' '.join(workers_cmd)}")
         workers_proc = subprocess.Popen(workers_cmd,
                                         stdout=f,
                                         stderr=subprocess.STDOUT,
