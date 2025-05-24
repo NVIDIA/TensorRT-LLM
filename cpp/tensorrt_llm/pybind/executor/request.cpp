@@ -60,6 +60,11 @@ void initRequestBindings(pybind11::module_& m)
         .value("TIMED_OUT", tle::FinishReason::kTIMED_OUT)
         .value("CANCELLED", tle::FinishReason::kCANCELLED);
 
+    py::enum_<tle::KvCacheTransferMode>(m, "KvCacheTransferMode")
+        .value("DRAM", tle::KvCacheTransferMode::DRAM)
+        .value("GDS", tle::KvCacheTransferMode::GDS)
+        .value("POSIX_DEBUG_FALLBACK", tle::KvCacheTransferMode::POSIX_DEBUG_FALLBACK);
+
     auto samplingConfigGetstate = [](tle::SamplingConfig const& self)
     {
         return py::make_tuple(self.getBeamWidth(), self.getTopK(), self.getTopP(), self.getTopPMin(),
@@ -326,18 +331,19 @@ void initRequestBindings(pybind11::module_& m)
     };
     auto kvCacheRetentionConfigGetstate = [](tle::KvCacheRetentionConfig const& self)
     {
-        return py::make_tuple(
-            self.getTokenRangeRetentionConfigs(), self.getDecodeRetentionPriority(), self.getDecodeDurationMs());
+        return py::make_tuple(self.getTokenRangeRetentionConfigs(), self.getDecodeRetentionPriority(),
+            self.getDecodeDurationMs(), self.getTransferMode(), self.getDirectory());
     };
     auto kvCacheRetentionConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 5)
         {
             throw std::runtime_error("Invalid state!");
         }
         return tle::KvCacheRetentionConfig(
             state[0].cast<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>>(),
-            state[1].cast<tle::RetentionPriority>(), state[2].cast<std::optional<std::chrono::milliseconds>>());
+            state[1].cast<tle::RetentionPriority>(), state[2].cast<std::optional<std::chrono::milliseconds>>(),
+            state[3].cast<tle::KvCacheTransferMode>(), state[4].cast<std::optional<std::string>>());
     };
 
     auto kvCacheRetentionConfig = py::class_<tle::KvCacheRetentionConfig>(m, "KvCacheRetentionConfig");
@@ -357,16 +363,45 @@ void initRequestBindings(pybind11::module_& m)
     // There's a circular dependency between the declaration of the TokenRangeRetentionPriority and
     // KvCacheRetentionConfig bindings. Defer definition of the KvCacheRetentionConfig bindings until the
     // TokenRangeRetentionPriority bindings have been defined.
+    // Provide a custom lambda that omits any direct mention of "<KvCacheTransferMode.DRAM: 0>"
+    // but allows Python users to pass an enum from the KvCacheTransferMode class.
     kvCacheRetentionConfig
-        .def(py::init<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>, tle::RetentionPriority,
-                 std::optional<std::chrono::milliseconds>>(),
+        .def(py::init(
+                 [](std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig> const& tokenRanges,
+                     tle::RetentionPriority decodePriority, std::optional<std::chrono::milliseconds> decodeDurationMs,
+                     // Renamed parameter from maybeTransferMode to transferModeOpt
+                     std::optional<tle::KvCacheTransferMode> transferModeOpt, std::optional<std::string> directory)
+                 {
+                     // If the user did not pass a value for 'transfer_mode', default to DRAM
+                     auto actualMode = tle::KvCacheTransferMode::DRAM;
+                     if (transferModeOpt.has_value())
+                     {
+                         actualMode = transferModeOpt.value();
+                     }
+                     return std::make_unique<tle::KvCacheRetentionConfig>(
+                         tokenRanges, decodePriority, decodeDurationMs, actualMode, directory);
+                 }),
+            // Provide a docstring that does NOT mention <KvCacheTransferMode.DRAM: 0>
+            R"doc(
+    Construct a KvCacheRetentionConfig.
+
+    :param token_range_retention_configs: A list of TokenRangeRetentionConfig describing how to retain KV caches.
+    :param decode_retention_priority: The retention priority for decode blocks.
+    :param decode_duration_ms: An optional duration for decode priority blocks.
+    :param transfer_mode: A KvCacheTransferMode enum (DRAM=0, GDS=1, POSIX_DEBUG_FALLBACK=2). Defaults to DRAM if None.
+    :param directory: An optional directory for offloads if using GDS or POSIX_DEBUG_FALLBACK.
+    )doc",
             py::arg("token_range_retention_configs"),
             py::arg("decode_retention_priority") = tle::KvCacheRetentionConfig::kDefaultRetentionPriority,
-            py::arg("decode_duration_ms") = py::none())
+            py::arg("decode_duration_ms") = py::none(),
+            // Pass None or an enum from KvCacheTransferMode in Python
+            py::arg("transfer_mode") = py::none(), py::arg("directory") = py::none())
         .def_property_readonly(
             "token_range_retention_configs", &tle::KvCacheRetentionConfig::getTokenRangeRetentionConfigs)
         .def_property_readonly("decode_retention_priority", &tle::KvCacheRetentionConfig::getDecodeRetentionPriority)
         .def_property_readonly("decode_duration_ms", &tle::KvCacheRetentionConfig::getDecodeDurationMs)
+        .def_property_readonly("transfer_mode", &tle::KvCacheRetentionConfig::getTransferMode)
+        .def_property_readonly("directory", &tle::KvCacheRetentionConfig::getDirectory)
         .def(py::pickle(kvCacheRetentionConfigGetstate, kvCacheRetentionConfigSetstate))
         .def("__eq__", &tle::KvCacheRetentionConfig::operator==);
 
