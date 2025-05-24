@@ -33,6 +33,7 @@ from .eagle.model import EagleForCausalLM
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.config import FalconConfig
 from .falcon.model import FalconForCausalLM, FalconModel
+from .flux.model import FluxTransformer2DModel
 from .gemma.config import (GEMMA2_ARCHITECTURE, GEMMA3_ARCHITECTURE,
                            GEMMA_ARCHITECTURE, GemmaConfig)
 from .gemma.model import GemmaForCausalLM
@@ -74,6 +75,7 @@ __all__ = [
     'BloomForCausalLM',
     'CLIPVisionTransformer',
     'DiT',
+    'FluxTransformer2DModel',
     'SD3Transformer2DModel',
     'STDiT3',
     'DeepseekForCausalLM',
@@ -200,6 +202,7 @@ MODEL_MAP = {
     'RecurrentGemmaForCausalLM': RecurrentGemmaForCausalLM,
     'CogVLMForCausalLM': CogVLMForCausalLM,
     'DiT': DiT,
+    'Flux': FluxTransformer2DModel,
     'SD3Transformer2DModel': SD3Transformer2DModel,
     'STDiT3': STDiT3Model,
     'DeepseekForCausalLM': DeepseekForCausalLM,
