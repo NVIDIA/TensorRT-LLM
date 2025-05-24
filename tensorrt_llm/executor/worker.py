@@ -12,7 +12,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
-import tensorrt_llm.executor.serialization as serialization
+import tensorrt_llm.serialization as serialization
 from tensorrt_llm.logger import logger
 
 from .._utils import (KVCacheEventSerializer, global_mpi_rank, mpi_comm,

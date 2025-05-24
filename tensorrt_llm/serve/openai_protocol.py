@@ -12,7 +12,7 @@ from openai.types.chat import \
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated, Required, TypedDict
 
-from tensorrt_llm.executor.serialization import register_approved_ipc_class
+from tensorrt_llm.serialization import register_approved_ipc_class
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 
