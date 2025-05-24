@@ -1539,8 +1539,11 @@ KvCacheRetentionConfig Serialization::deserializeKvCacheRetentionConfig(std::ist
         = su::deserialize<std::vector<executor::KvCacheRetentionConfig::TokenRangeRetentionConfig>>(is);
     auto decodePriority = su::deserialize<executor::RetentionPriority>(is);
     auto decodeDurationMs = intToDuration(su::deserialize<std::optional<size_t>>(is));
+    auto transferMode = su::deserialize<executor::KvCacheTransferMode>(is);
+    auto directory = su::deserialize<std::optional<std::string>>(is);
 
-    return KvCacheRetentionConfig{tokenRangeRetentionPriorities, decodePriority, decodeDurationMs};
+    return KvCacheRetentionConfig{
+        tokenRangeRetentionPriorities, decodePriority, decodeDurationMs, transferMode, directory};
 }
 
 void Serialization::serialize(KvCacheRetentionConfig const& kvCacheRetentionConfig, std::ostream& os)
@@ -1548,6 +1551,8 @@ void Serialization::serialize(KvCacheRetentionConfig const& kvCacheRetentionConf
     su::serialize(kvCacheRetentionConfig.getTokenRangeRetentionConfigs(), os);
     su::serialize(kvCacheRetentionConfig.getDecodeRetentionPriority(), os);
     su::serialize(durationToInt(kvCacheRetentionConfig.getDecodeDurationMs()), os);
+    su::serialize(kvCacheRetentionConfig.getTransferMode(), os);
+    su::serialize(kvCacheRetentionConfig.getDirectory(), os);
 }
 
 size_t Serialization::serializedSize(KvCacheRetentionConfig const& config)
@@ -1556,6 +1561,8 @@ size_t Serialization::serializedSize(KvCacheRetentionConfig const& config)
     totalSize += su::serializedSize(config.getTokenRangeRetentionConfigs());
     totalSize += su::serializedSize(config.getDecodeRetentionPriority());
     totalSize += su::serializedSize(durationToInt(config.getDecodeDurationMs()));
+    totalSize += su::serializedSize(config.getTransferMode());
+    totalSize += su::serializedSize(config.getDirectory());
     return totalSize;
 }
 
