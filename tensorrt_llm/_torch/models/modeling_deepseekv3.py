@@ -51,7 +51,7 @@ from ..models.modeling_utils import ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import BaseMoeRoutingMethod, FusedMoE
+from ..modules.fused_moe import DeepSeekV3MoeRoutingMethod, FusedMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -258,7 +258,7 @@ class Deepseekv3RoutingImpl():
         return topk_indices.to(torch.int32), topk_values.to(torch.float32)
 
 
-class DeepseekV3Gate(BaseMoeRoutingMethod):
+class DeepseekV3Gate(DeepSeekV3MoeRoutingMethod):
 
     def __init__(
         self,
@@ -273,7 +273,7 @@ class DeepseekV3Gate(BaseMoeRoutingMethod):
         apply_routing: bool = False,
         moe_backend: str = 'CUTLASS',
     ):
-        super().__init__()
+        super().__init__(top_k=top_k)
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
@@ -321,7 +321,7 @@ class DeepseekV3Gate(BaseMoeRoutingMethod):
         return self.routing_impl.apply(logits, self.e_score_correction_bias)
 
     @property
-    def routing_method(self) -> BaseMoeRoutingMethod:
+    def routing_method(self) -> DeepSeekV3MoeRoutingMethod:
         return self
 
     def get_experts_per_token(self):

@@ -33,6 +33,38 @@ namespace trtllmGenFp8BlockScaleMoe
 
 namespace Routing
 {
+
+// The type of method in top-K routing, for use in torch custom op
+// Please keep this in sync with the counterpart defined in tensorrt_llm/_torch/modules/fused_moe.py
+enum class RoutingMethodType : int64_t
+{
+    // Default: Softmax -> TopK
+    Default = 0,
+    // Renormalize: TopK -> Softmax
+    Renormalize = 1,
+    // DeepSeekV3: Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts from the Top4 groups
+    DeepSeekV3 = 2,
+    // Llama4: Top1 -> Sigmoid
+    Llama4 = 3,
+    // Qwen3: Softmax -> TopK -> Renormalize
+    Qwen3 = 4,
+    // Unspecified
+    Unspecified = 5,
+};
+
+inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethodType)
+{
+    switch (routingMethodType)
+    {
+    case RoutingMethodType::Default: return "Default";
+    case RoutingMethodType::Renormalize: return "Renormalize";
+    case RoutingMethodType::DeepSeekV3: return "DeepSeekV3";
+    case RoutingMethodType::Llama4: return "Llama4";
+    case RoutingMethodType::Qwen3: return "Qwen3";
+    default: TLLM_CHECK_WITH_INFO(false, "Invalid routing method"); return "";
+    };
+}
+
 inline int32_t getMaxPermutedPaddedCount(
     int32_t numTokens, int32_t expertsPerToken, int32_t numExperts, int32_t padding)
 {
@@ -74,7 +106,7 @@ public:
         int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
         int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
         int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, trtllm::gen::Dtype dtypeElt,
-        bool useRoutingScalesOnInput, bool useDeepSeekFp8, cudaStream_t stream);
+        bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream);
 };
 } // namespace Routing
 

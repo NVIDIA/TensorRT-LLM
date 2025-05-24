@@ -8,7 +8,7 @@ from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.quantization import KV_CACHE_QUANT_ALGO_LIST
+from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
@@ -150,14 +150,16 @@ def create_py_executor(executor_config: ExecutorConfig,
         if executor_config.kv_cache_config.enable_block_reuse and not (
                 get_sm_version() >= 90 and get_sm_version() <= 100):
             logger.warning(
-                f"KV cache reuse for MLA only can be enabled on SM90/SM100, "
+                f"KV cache reuse for MLA can only be enabled on SM90/SM100, "
                 f"disable enable_block_reuse for SM{get_sm_version()}")
             executor_config.kv_cache_config.enable_block_reuse = False
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
-        if executor_config.kv_cache_config.enable_block_reuse and kv_cache_quant_algo in KV_CACHE_QUANT_ALGO_LIST:
+        if executor_config.kv_cache_config.enable_block_reuse and not (
+                kv_cache_quant_algo is None or kv_cache_quant_algo
+                == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8):
             logger.warning(
-                f"KV cache reuse for MLA only can be enabled without KV cache quantization, "
+                f"KV cache reuse for MLA can only be enabled without KV cache quantization or with FP8 quantization, "
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             executor_config.kv_cache_config.enable_block_reuse = False
