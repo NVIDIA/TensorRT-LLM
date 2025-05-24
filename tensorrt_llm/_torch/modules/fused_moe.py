@@ -398,8 +398,7 @@ class BaseFusedMoE(FusedMoE):
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
         aux_stream: Optional[torch.cuda.Stream] = None,
-        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
-        VANILLA,
+        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
         apply_router_weight_on_input: bool = False,
         enable_alltoall: bool = False,
     ):
@@ -1526,13 +1525,12 @@ class FusedMoETrtllm(BaseFusedMoE):
             reduce_results: bool = False,
             model_config: ModelConfig = ModelConfig(),
             aux_stream: Optional[torch.cuda.Stream] = None,
-            weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
-        VANILLA,
+            weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
             apply_router_weight_on_input: bool = False,
             enable_alltoall: bool = False):
         super().__init__(routing_method, num_experts, hidden_size,
                          intermediate_size, dtype, reduce_results, model_config,
-                         aux_stream, weight_loading_mode, VANILLA,
+                         aux_stream, weight_loading_mode,
                          apply_router_weight_on_input, enable_alltoall)
 
     def _do_forward(
@@ -1667,13 +1665,12 @@ class FusedMoECutlass(BaseFusedMoE):
             reduce_results: bool = False,
             model_config: ModelConfig = ModelConfig(),
             aux_stream: Optional[torch.cuda.Stream] = None,
-            weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
-        VANILLA,
+            weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
             apply_router_weight_on_input: bool = False,
             enable_alltoall: bool = False):
         super().__init__(routing_method, num_experts, hidden_size,
                          intermediate_size, dtype, reduce_results, model_config,
-                         aux_stream, weight_loading_mode, VANILLA,
+                         aux_stream, weight_loading_mode,
                          apply_router_weight_on_input, enable_alltoall)
 
     def _do_forward(
