@@ -15,6 +15,7 @@ from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import split_matrix_tp
@@ -1411,6 +1412,95 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+        self.draft_model = None
+        if hasattr(
+                model_config, "spec_config"
+        ) and model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
+        ):
+            draft_config = ModelConfig.from_pretrained(
+                model_config.spec_config.draft_model_path,
+                trust_remote_code=True,
+                attn_backend=model_config.attn_backend,
+                moe_backend=model_config.moe_backend,
+                mapping=model_config.mapping)
+            draft_config.spec_config = model_config.spec_config
+            draft_config.max_num_tokens = model_config.max_num_tokens
+            draft_config.moe_max_num_tokens = model_config.moe_max_num_tokens
+            draft_config.quant_config.kv_cache_quant_algo = \
+                model_config.quant_config.kv_cache_quant_algo
+            self.draft_model = Eagle3LlamaForCausalLM(
+                draft_config, model_config.pretrained_config.num_hidden_layers)
+            self.spec_worker = get_spec_worker(model_config.spec_config,
+                                               model_config.mapping)
+
+            # Set to True to enable delayed all-gather for LM head.
+            # This means LM head will not perform all-gather on the output logits, so each rank will only have
+            # a subset of the logits. The decoding part must be aware of that and apply all gather after top1 reduction.
+            self.enable_lm_head_delayed_all_gather = True
+            if self.enable_lm_head_delayed_all_gather:
+                # Delay all-gather until after top1 reduction.
+                self.lm_head.gather_output = False
+                self.draft_model.lm_head.gather_output = False
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.LongTensor = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        hidden_states = self.model(
+            input_ids=input_ids,
+            attn_metadata=attn_metadata,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            spec_metadata=spec_metadata,
+        )
+
+        if self.draft_model is not None:
+            # get logits
+            logits = self.logits_processor.forward(
+                hidden_states[spec_metadata.gather_ids],
+                self.lm_head,
+                attn_metadata,
+                True,
+            )
+            # get accepted tokens and next draft tokens
+            return self.spec_worker(input_ids=input_ids,
+                                    position_ids=position_ids,
+                                    hidden_states=hidden_states,
+                                    logits=logits,
+                                    attn_metadata=attn_metadata,
+                                    spec_metadata=spec_metadata,
+                                    draft_model=self.draft_model)
+        else:
+            logits = self.logits_processor.forward(
+                hidden_states,
+                self.lm_head,
+                attn_metadata,
+                return_context_logits,
+            )
+
+        return logits
+
+    def infer_max_seq_len(self):
+        if self.model_config.attn_backend.upper() != 'TRTLLM':
+            logger.warning(
+                f"Attention backend {self.model_config.attn_backend} "
+                "does not support chunked attention. Sequence length "
+                "will be limited to 8192.")
+            return 8192
+        return super().infer_max_seq_len()
+
+    def load_weights(self, weights: Dict):
+        super().load_weights(weights, skip_modules=["draft_model"])
+
+    def load_draft_weights(self, weights: Dict):
+        self.draft_model.load_weights(weights)
+        self.draft_model.load_weights_from_target_model(self)
 
 
 class Llama4InputProcessor(InputProcessor):
@@ -1492,7 +1582,9 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
-        self.is_eagle3_one_model = model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
+        self.is_eagle3_one_model = hasattr(
+            model_config, "spec_config"
+        ) and model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
         )
         self.draft_model = None
         if self.is_eagle3_one_model:
