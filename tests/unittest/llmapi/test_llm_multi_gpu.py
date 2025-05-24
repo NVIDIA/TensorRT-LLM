@@ -314,6 +314,7 @@ def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
     run_command(command)
 
 
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5223608: timeout")
 @skip_single_gpu
 @pytest.mark.parametrize("nworkers", [1, 2])
 def test_llm_multi_node_pytorch(nworkers: int):
@@ -325,8 +326,10 @@ def test_llm_multi_node_pytorch(nworkers: int):
     run_command(command)
 
 
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5223608: timeout")
 @skip_single_gpu
 def test_llm_multi_node_with_postproc():
+    # TODO[chunweiy]: reactivate this later
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__),
                                   "run_llm_with_postproc.py")
