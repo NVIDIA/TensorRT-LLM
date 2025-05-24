@@ -16,7 +16,8 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (BaseMoeRoutingMethod, FusedMoE,
                                  Qwen3MoeRoutingMethod,
-                                 RenormalizeMoeRoutingMethod, RoutingMethodType)
+                                 RenormalizeMoeRoutingMethod, RoutingMethodType,
+                                 get_fusedMoe_cls)
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..utils import disable_fp4_allgather
@@ -104,7 +105,7 @@ class Qwen3MoE(nn.Module):
             moe_backend=model_config.moe_backend,
         )
 
-        self.experts = FusedMoE(
+        self.experts = get_fusedMoe_cls(model_config)(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
             hidden_size=self.hidden_dim,
@@ -408,7 +409,7 @@ class Qwen3MoeForCausalLM(DecoderModelForCausalLM[Qwen3MoEModel,
                     module.load_weights(weights=module_weights)
                 else:
                     module_weights = filter_weights(name, weights)
-                    if isinstance(module, FusedMoE):
+                    if issubclass(type(module), FusedMoE):
                         updated_module_weights = {}
                         for weight_name, weight_value in module_weights.items():
                             new_weight_name = (weight_name.replace(
