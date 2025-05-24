@@ -1224,7 +1224,7 @@ class PyExecutor:
 
         self.has_context_request = False
         new_requests_cur_rank = []
-        if new_requests != [] and new_requests[
+        if new_requests != [] and new_requests[0][
                 0] != SHUTDOWN_REQUEST_ID and self.expected_num_active_requests > all_ranks_num_active_requests[
                     self.dist.tp_rank]:
             # Balance context tokens across ranks
@@ -1279,7 +1279,7 @@ class PyExecutor:
         self.num_fetch_requests_cur_rank = self.num_fetch_requests_cur_rank + len(
             new_requests_cur_rank)
 
-        if len(new_requests) == 1 and new_requests[0] == SHUTDOWN_REQUEST_ID:
+        if len(new_requests) == 1 and new_requests[0][0] == SHUTDOWN_REQUEST_ID:
             new_requests_cur_rank = new_requests
         return new_requests_cur_rank
 
