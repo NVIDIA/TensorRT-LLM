@@ -12,7 +12,7 @@ def deepseek_v3_attention(
     self,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
+    position_ids: Optional[torch.IntTensor] = None,
     past_key_value: Optional[Cache] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
