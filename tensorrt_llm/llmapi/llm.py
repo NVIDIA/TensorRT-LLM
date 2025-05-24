@@ -336,8 +336,9 @@ class LLM:
             prompt = None
             query_token_ids = inputs.get("query_token_ids", None)
         elif "prompt" in inputs:
-            prompt_token_ids, extra_processed_inputs = self.input_processor(
-                inputs, sampling_params)
+            with nvtx_range_debug("input_processor"):
+                prompt_token_ids, extra_processed_inputs = self.input_processor(
+                    inputs, sampling_params)
             prompt = inputs['prompt']
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
