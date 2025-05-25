@@ -77,6 +77,7 @@ class ModelConfig(Generic[TConfig]):
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
+    ar_backend: str = 'TRTLLM'  # options can be MNVL, TRTLLM
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
