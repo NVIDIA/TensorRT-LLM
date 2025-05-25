@@ -22,14 +22,11 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
 
 class Qwen3Attention(Attention):
 
-    def __init__(
-        self,
-        model_config: ModelConfig[Qwen3Config],
-        layer_idx: Optional[int] = None,
-    ):
+    def __init__(self,
+                 model_config: ModelConfig[Qwen3Config],
+                 layer_idx: Optional[int] = None,
+                 fuse_qk_norm_rope: bool = True):
         config = model_config.pretrained_config
-
-        self.fuse_qk_norm_rope = True  # TODO: Make this configurable?
 
         if getattr(config, "rope_scaling", None) is not None:
             pos_embd_params = PositionalEmbeddingParams(
@@ -43,20 +40,18 @@ class Qwen3Attention(Attention):
                 rope=RopeParams.from_config(config),
             )
 
-        super().__init__(
-            hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_key_value_heads,
-            max_position_embeddings=config.max_position_embeddings,
-            bias=config.attention_bias,
-            pos_embd_params=pos_embd_params,
-            layer_idx=layer_idx,
-            dtype=config.torch_dtype,
-            dense_bias=config.attention_bias,
-            config=model_config,
-            qk_norm_type=QkNormType.pre_rope,
-            fuse_qk_norm_rope=self.fuse_qk_norm_rope,
-        )
+        super().__init__(hidden_size=config.hidden_size,
+                         num_attention_heads=config.num_attention_heads,
+                         num_key_value_heads=config.num_key_value_heads,
+                         max_position_embeddings=config.max_position_embeddings,
+                         bias=config.attention_bias,
+                         pos_embd_params=pos_embd_params,
+                         layer_idx=layer_idx,
+                         dtype=config.torch_dtype,
+                         dense_bias=config.attention_bias,
+                         config=model_config,
+                         qk_norm_type=QkNormType.pre_rope,
+                         fuse_qk_norm_rope=fuse_qk_norm_rope)
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=1e-6,
@@ -94,8 +89,8 @@ class Qwen3Attention(Attention):
             qkv, self.num_heads, self.num_key_value_heads,
             self.num_key_value_heads, self.head_dim,
             self.q_norm.variance_epsilon, self.q_norm.weight,
-            self.k_norm.weight, self.rotary_emb.rope_params.theta,
-            self.rotary_emb.is_neox, position_ids.view(-1))
+            self.k_norm.weight, self.pos_embd_params.rope.theta,
+            self.pos_embd_params.is_neox, position_ids.view(-1))
         return qkv
 
 

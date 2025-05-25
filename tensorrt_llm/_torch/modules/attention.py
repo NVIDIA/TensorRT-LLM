@@ -23,6 +23,16 @@ from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
 
+class RopeLocation(IntEnum):
+    """
+    Possible locations where RoPE can be applied.
+    """
+    none = 0  # No RoPE
+    rotary_emb = 1  # Perform RoPE in Attention.rotary_emb.forward
+    attn = 2  # Perform RoPE in Attention.attn.forward
+    qk_norm_rope = 3  # Perform RoPE in Attention.apply_qk_norm_rope
+
+
 class QkNormType(IntEnum):
     """
     The type of QK normalization.
@@ -34,24 +44,22 @@ class QkNormType(IntEnum):
 
 class Attention(nn.Module):
 
-    def __init__(
-        self,
-        *,
-        hidden_size: int,
-        num_attention_heads: int,
-        num_key_value_heads: int,
-        max_position_embeddings: int,
-        bias: bool,
-        pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-        layer_idx: Optional[int] = None,
-        dtype: torch.dtype = None,
-        dense_bias: Optional[bool] = None,
-        config: Optional[ModelConfig] = None,
-        qk_norm_type: QkNormType = QkNormType.none,
-        q_scaling: float = 1.0,
-        attention_chunk_size: Optional[int] = None,
-        fuse_qk_norm_rope: bool = False,
-    ):
+    def __init__(self,
+                 *,
+                 hidden_size: int,
+                 num_attention_heads: int,
+                 num_key_value_heads: int,
+                 max_position_embeddings: int,
+                 bias: bool,
+                 pos_embd_params: Optional[PositionalEmbeddingParams] = None,
+                 layer_idx: Optional[int] = None,
+                 dtype: torch.dtype = None,
+                 dense_bias: Optional[bool] = None,
+                 config: Optional[ModelConfig] = None,
+                 qk_norm_type: QkNormType = QkNormType.none,
+                 fuse_qk_norm_rope: bool = False,
+                 q_scaling: float = 1.0,
+                 attention_chunk_size: Optional[int] = None):
         """
         Initialize the Attention module.
 
@@ -67,6 +75,7 @@ class Attention(nn.Module):
             dense_bias (bool): Whether to use bias in the output projection layer.
             config (ModelConfig): The model configuration.
             qk_norm_type (QkNormType): The type of QK normalization.
+            fuse_qk_norm_rope (bool): Whether to fuse QK normalization and RoPE.
             q_scaling (float): The scaling factor for the qk_scale. The definition is $O = softmax(QK^T * qk_scale) * V, qk_scale = 1 / (sqrt(head_dim) * q_scaling)$. The default value is 1.0.
             attention_chunk_size (int): See [Chunked Attention] below.
         """
@@ -81,8 +90,7 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = max_position_embeddings
-        self.pos_embd_params = pos_embd_params
-        self.qk_norm_type = qk_norm_type
+
         self.dense_bias = dense_bias
         self.q_scaling = q_scaling
 
@@ -155,7 +163,7 @@ class Attention(nn.Module):
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
-        self.pos_embd_params = pos_embd_params
+        attn_cls = get_attention_backend(self.attn_backend)
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -170,9 +178,29 @@ class Attention(nn.Module):
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
-        attn_cls = get_attention_backend(self.attn_backend)
-        self.enable_rope_fusion = attn_cls.support_fused_rope(
+        self.pos_embd_params = pos_embd_params
+        self.qk_norm_type = qk_norm_type
+
+        support_qk_norm_rope = self.qk_norm_type == QkNormType.pre_rope and fuse_qk_norm_rope
+        support_rope_in_attn = attn_cls.support_fused_rope(
         ) and qk_norm_type != QkNormType.post_rope
+
+        self.rope_location = RopeLocation.none
+        if self.pos_embd_params is not None:
+            if support_qk_norm_rope:
+                self.rope_location = RopeLocation.qk_norm_rope
+            elif support_rope_in_attn:
+                self.rope_location = RopeLocation.attn
+            else:
+                self.rope_location = RopeLocation.rotary_emb
+
+        if self.rope_location == RopeLocation.rotary_emb:
+            self.rotary_emb = RotaryEmbedding(
+                pos_embd_params.rope,
+                head_dim=self.head_dim,
+                is_neox=pos_embd_params.is_neox,
+            )
+
         self.attn = create_attention(
             self.attn_backend,
             self.layer_idx,
@@ -180,7 +208,7 @@ class Attention(nn.Module):
             self.head_dim,
             self.num_key_value_heads,
             pos_embd_params=self.pos_embd_params
-            if self.enable_rope_fusion and not fuse_qk_norm_rope else None,
+            if self.rope_location == RopeLocation.attn else None,
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
@@ -188,15 +216,6 @@ class Attention(nn.Module):
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
-
-        self.rotary_emb = None
-        self.apply_rotary_emb = not self.enable_rope_fusion and pos_embd_params is not None and not fuse_qk_norm_rope
-
-        self.rotary_emb = RotaryEmbedding(
-            pos_embd_params.rope,
-            head_dim=self.head_dim,
-            is_neox=pos_embd_params.is_neox,
-        )
 
         if not config.skip_create_weights_in_init:
             self.create_weights()
@@ -261,16 +280,15 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-        if self.fuse_qk_norm_rope:
+        if self.rope_location == RopeLocation.qk_norm_rope:
             qkv = self.apply_qk_norm_rope(qkv, position_ids)
-            q, k, v = qkv, None, None
-
+            q, k, v = self.convert_qkv(qkv, None, None)
         else:
             q, k, v = qkv, None, None
             if self.qk_norm_type == QkNormType.pre_rope:
                 q, k, v = self.split_qkv(q, k, v)
                 q, k = self.apply_qk_norm(q, k)
-            if self.apply_rotary_emb and position_ids is not None:
+            if self.rope_location == RopeLocation.rotary_emb and position_ids is not None:
                 q, k, v = self.split_qkv(q, k, v)
                 q, k = self.rotary_emb(position_ids, [q, k])
                 if self.qk_norm_type == QkNormType.post_rope:
@@ -301,6 +319,11 @@ class Attention(nn.Module):
         raise NotImplementedError(
             f"QK norm is not implemented for {self.__class__.__name__}."
             "Please override the `apply_qk_norm` method in the subclass.")
+
+    def apply_qk_norm_rope(self, qkv, position_ids):
+        raise NotImplementedError(
+            f"QK norm is not implemented for {self.__class__.__name__}."
+            "Please override the `apply_qk_norm_rope` method in the subclass.")
 
 
 def extract_extra_attrs(layer_idx: str):
