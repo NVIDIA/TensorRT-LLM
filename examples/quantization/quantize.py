@@ -30,7 +30,7 @@ if __name__ == "__main__":
         "--device_map",
         help="How to map the model on the devices",
         default="auto",
-        choices=["auto", "sequential", "cpu", "gpu"],
+        type=str,
     )
     parser.add_argument(
         '--calib_dataset',
