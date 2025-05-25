@@ -93,12 +93,14 @@ class ZeroMqQueue:
     def put(self, obj: Any):
         self.setup_lazily()
         with nvtx_range_debug("send", color="blue", category="IPC"):
-            self.socket.send_pyobj(obj)
+            data = serialization.dumps(obj)
+            self.socket.send(data)
 
     async def put_async(self, obj: Any):
         self.setup_lazily()
         try:
-            await self.socket.send_pyobj(obj)
+            data = serialization.dumps(obj)
+            await self.socket.send(data)
         except TypeError as e:
             logger.error(f"Cannot pickle {obj}")
             raise e
@@ -111,13 +113,18 @@ class ZeroMqQueue:
 
     def get(self) -> Any:
         self.setup_lazily()
-
-        return self.socket.recv_pyobj()
+        data = self.socket.recv()
+        obj = serialization.loads(
+            data, approved_imports=serialization.BASE_ZMQ_CLASSES)
+        return obj
 
     async def get_async(self) -> Any:
         self.setup_lazily()
 
-        return await self.socket.recv_pyobj()
+        data = await self.socket.recv()
+        obj = serialization.loads(
+            data, approved_imports=serialization.BASE_ZMQ_CLASSES)
+        return obj
 
     def close(self):
         if self.socket:
