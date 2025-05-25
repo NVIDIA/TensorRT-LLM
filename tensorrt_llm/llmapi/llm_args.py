@@ -1,5 +1,6 @@
 import json
 import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
 from enum import Enum, EnumMeta
@@ -16,6 +17,7 @@ from transformers import PreTrainedTokenizerBase
 from tensorrt_llm.lora_manager import (LoraConfig,
                                        get_default_trtllm_modules_to_hf_modules)
 
+from .._torch.model_config import MoeLoadBalancerConfig
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 
@@ -1466,12 +1468,6 @@ class TorchLlmArgs(BaseLlmArgs):
         json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
 
     # PyTorch backend specific configurations
-    extra_resource_managers: Dict[str, object] = Field(
-        default_factory=dict,
-        description=
-        "Extra resource managers to use in addition to the KV cache manager. Each manager's prepare_resources method is called before the forward pass, and update_resources() is called after the pass finishes. free_resources() is called when a request finishes. The KV cache manager is guaranteed to be invoked after all of these extra managers in all stages.",
-        exclude=True,
-    )
 
     use_cuda_graph: bool = Field(
         default=False,
@@ -1500,6 +1496,11 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used."
     )
+
+    moe_load_balancer: Optional[
+        Union[MoeLoadBalancerConfig, dict,
+              str]] = Field(default=None,
+                            description="Configuration for MoE load balancing.")
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.")
@@ -1570,23 +1571,40 @@ class TorchLlmArgs(BaseLlmArgs):
         json_schema_extra={"type": f"Optional[AutoDeployConfig]"})
 
     load_format: Union[str, LoadFormat] = Field(
-        default='auto',
+        default=LoadFormat.AUTO,
         description=
         "How to load the model weights. By default, detect the weight type from the model checkpoint."
     )
+
+    # Extra resource managers to use in addition to the KV cache manager.
+    # Each manager's prepare_resources method is called before the forward pass,
+    # and update_resources() is called after the pass finishes. free_resources()
+    # is called when a request finishes. The KV cache manager is guaranteed to
+    # be invoked after all of these extra managers in all stages.
+    _extra_resource_managers: Dict[str,
+                                   object] = PrivateAttr(default_factory=dict, )
+
+    @property
+    def extra_resource_managers(self) -> Dict[str, object]:
+        return self._extra_resource_managers
+
+    @extra_resource_managers.setter
+    def extra_resource_managers(self, value: Dict[str, object]) -> None:
+        self._extra_resource_managers = value
+
+    @validator('load_format', pre=True)
+    def convert_load_format(cls, v):
+        if isinstance(v, LoadFormat):
+            return v
+        load_format = v.upper()
+        if load_format not in LoadFormat.__members__:
+            raise ValueError(f"Invalid LoadFormat: {v}")
+        return LoadFormat[load_format]
 
     @print_traceback_on_error
     def model_post_init(self, __context):
         super().model_post_init(__context)
         self.model_format = _ModelFormatKind.HF
-
-        # Convert load_format to enum if it's a string
-        if isinstance(self.load_format, str):
-            load_format = self.load_format.upper()
-            if load_format not in LoadFormat.__members__:
-                raise NotImplementedError(
-                    f"Invalid LoadFormat: {self.load_format}")
-            self.load_format = LoadFormat[load_format]
 
         # Validate CUDA graph settings
         if self.torch_compile_enabled and self.torch_compile_piecewise_cuda_graph:
@@ -1618,8 +1636,23 @@ class TorchLlmArgs(BaseLlmArgs):
                 self.cuda_graph_batch_sizes.append(
                     self.cuda_graph_max_batch_size)
 
+        if isinstance(self.moe_load_balancer, str):
+            assert os.path.exists(self.moe_load_balancer)
+            if self.moe_load_balancer.endswith(".json"):
+                with open(self.moe_load_balancer) as f:
+                    self.moe_load_balancer = json.load(f)
+            elif self.moe_load_balancer.endswith((".yaml", ".yml")):
+                with open(self.moe_load_balancer) as f:
+                    self.moe_load_balancer = yaml.safe_load(f)
+            else:
+                raise ValueError(
+                    f"Unsupported moe load balancer config file: {self.moe_load_balancer}"
+                )
+        if isinstance(self.moe_load_balancer, dict):
+            self.moe_load_balancer = MoeLoadBalancerConfig(
+                **self.moe_load_balancer)
+
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
-    @property
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 
@@ -1636,6 +1669,7 @@ class TorchLlmArgs(BaseLlmArgs):
             cuda_graph_padding_enabled=self.cuda_graph_padding_enabled,
             disable_overlap_scheduler=self.disable_overlap_scheduler,
             moe_max_num_tokens=self.moe_max_num_tokens,
+            moe_load_balancer=self.moe_load_balancer,
             attn_backend=self.attn_backend,
             moe_backend=self.moe_backend,
             mixed_sampler=self.mixed_sampler,
