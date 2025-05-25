@@ -62,7 +62,6 @@ def _get_mem_info_from_log(file, ranks_num):
         match = fraction_pattern.findall(line)
         if len(match) > 0:
             fraction = float(match[0])
-            print(f"Find fraction in log {fraction}")
     assert len(
         kv_mem_size) % 2 == 0, "no enough memory usage information in log"
     kv_mem_size = kv_mem_size[len(kv_mem_size) // 2:]
