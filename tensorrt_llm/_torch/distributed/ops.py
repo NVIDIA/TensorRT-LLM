@@ -307,14 +307,15 @@ class MNNVLAllReduce(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
-        self.enable_mnnvl = (os.environ.get("TRTLLM_MNNVL_AR_ENABLED",
-                                            "0") == "1"
-                             and dtype in [torch.bfloat16, torch.float32]
-                             and (not mapping.has_cp()))
+        assert (dtype in MNNVLAllReduce.get_supported_dtype()
+                and (not mapping.has_cp())), ""
 
-        if self.enable_mnnvl:
-            self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
-                self.mapping, dtype)
+        self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
+            self.mapping, dtype)
+
+    @staticmethod
+    def get_supported_dtype():
+        return [torch.bfloat16, torch.float32]
 
     def forward(
         self,
@@ -330,7 +331,7 @@ class MNNVLAllReduce(nn.Module):
         Returns:
             Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
         """
-        if not self.enable_mnnvl or input.numel() > self.max_num_elements_mnnvl:
+        if input.numel() > self.max_num_elements_mnnvl:
             return None
 
         fusion_op = all_reduce_params.fusion_op
@@ -368,12 +369,63 @@ class MNNVLAllReduce(nn.Module):
         return None
 
 
+class TLLMAllReduce(nn.Module):
+    """A specialized AllReduce implementation for Multi-Node NVLink communication.
+
+    This class handles the MNNVL-specific allreduce operations, which can be more efficient
+    for certain operations when using NVLink for multi-node communication.
+    """
+
+    def __init__(self, mapping: Mapping, strategy: AllReduceStrategy = AllReduceStrategy.AUTO):
+        super().__init__()
+        self.mapping = mapping
+        self.strategy = strategy
+        self.workspace = None
+
+        self.force_low_precision_env = os.environ.get(
+            "FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY")
+        # When Strategy is UB, it is guaranteed that the workspace is not used.
+        if self.strategy != AllReduceStrategy.UB:
+            if self.strategy == AllReduceStrategy.LOWPRECISION or self.force_low_precision_env is not None:
+                allocate_low_presicion_allreduce_workspace(self.mapping)
+            self.workspace = get_allreduce_workspace(self.mapping)
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        all_reduce_params: AllReduceParams,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """Forward pass for MNNVL AllReduce.
+
+        Args:
+            input (torch.Tensor): Input tensor to be reduced
+            all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations
+
+        Returns:
+            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
+        """
+        output = torch.ops.trtllm.allreduce(
+            input=input,
+            residual=all_reduce_params.residual,
+            norm_weight=all_reduce_params.norm_weight,
+            scale=all_reduce_params.scale,
+            bias=all_reduce_params.bias,
+            workspace=self.workspace,
+            group=self.mapping.tp_group,
+            strategy=self.strategy,
+            op=all_reduce_params.fusion_op,
+            eps=all_reduce_params.eps,
+        )
+        return output
+
+
 class AllReduce(nn.Module):
 
     def __init__(self,
                  mapping: Mapping,
                  strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
-                 dtype: Optional[torch.dtype] = None):
+                 dtype: Optional[torch.dtype] = None,
+                 ar_backend: str = "TRTLLM"):
         super().__init__()
         """
         AllReduce is a module that performs an all-reduce operation on a tensor.
@@ -415,23 +467,23 @@ class AllReduce(nn.Module):
             or by setting the environment variable FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY when using
             the AUTO strategy.
         """
+        self.skip_ar = self.mapping.tp_size == 1
+        self._mnvl_allreduce = None
+        self._tllm_allreduce = None
+        self._create_allreduce(mapping, ar_backend, strategy, dtype)
 
-        self.mapping = mapping
-        self.workspace = None
-        self.strategy = strategy
+    def _create_allreduce(self, mapping, backend, strategy, dtype):
+        if mapping.tp_size == 1:
+            return
 
-        self.force_low_precision_env = os.environ.get(
-            "FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY")
-        if self.mapping.tp_size > 1:
-            # When Strategy is UB, it is guaranteed that the workspace is not used.
-            if self.strategy != AllReduceStrategy.UB:
-                if self.strategy == AllReduceStrategy.LOWPRECISION or self.force_low_precision_env is not None:
-                    allocate_low_presicion_allreduce_workspace(self.mapping)
-                self.workspace = get_allreduce_workspace(self.mapping)
+        enable_mnnvl = (backend == "MNNVL"
+                        and (dtype
+                             and dtype in MNNVLAllReduce.get_supported_dtype())
+                        and (not mapping.has_cp()) and mapping.tp_size > 1)
+        if enable_mnnvl:
+            self._mnvl_allreduce = MNNVLAllReduce(mapping, dtype)
 
-            # Initialize MNNVL AllReduce if needed
-            self.mnnvl_allreduce = MNNVLAllReduce(mapping,
-                                                  dtype) if dtype else None
+        self._tllm_allreduce = TLLMAllReduce(mapping, strategy)
 
     def forward(
         self,
@@ -460,37 +512,26 @@ class AllReduce(nn.Module):
             RESIDUAL_RMS_NORM_QUANT_FP8: [norm_quant, residual]
             RESIDUAL_RMS_NORM_OUT_QUANT_FP8: [norm, norm_quant, residual]
             RESIDUAL_RMS_NORM_QUANT_NVFP4: [norm_quant_fp4, scale_factor, residual]
-            RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: [norm, norm_quant_fp4, scale_factor, residual]
+            RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: [norm, norm_quant_fp4, scale_factor, residual]P
         '''
-        if self.mapping.tp_size == 1 or (all_reduce_params is not None
-                                         and all_reduce_params.enable_allreduce
-                                         == False):
+        if self.skip_ar or (all_reduce_params is not None
+                            and all_reduce_params.enable_allreduce == False):
             return input
 
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
-        # Try MNNVL AllReduce first if available
         if self.mnnvl_allreduce:
             mnnvl_output = self.mnnvl_allreduce(
                 input, all_reduce_params=all_reduce_params)
             if mnnvl_output is not None:
                 return mnnvl_output
 
-        # Fall back to regular AllReduce if MNNVL is not available or not applicable
-        output = torch.ops.trtllm.allreduce(
+        # MNVL only support part of AllReduceFusionOp provided in params.
+        output = self._tllm_allreduce(
             input=input,
-            residual=all_reduce_params.residual,
-            norm_weight=all_reduce_params.norm_weight,
-            scale=all_reduce_params.scale,
-            bias=all_reduce_params.bias,
-            workspace=self.workspace,
-            group=self.mapping.tp_group,
-            strategy=self.strategy,
-            op=all_reduce_params.fusion_op,
-            eps=all_reduce_params.eps,
+            all_reduce_params=all_reduce_params,
         )
-
         return output if len(output) > 1 else output[0]
 
 
