@@ -255,6 +255,7 @@ void initBindings(pybind11::module_& m)
         .def("get_context_remaining_length", py::overload_cast<>(&GenLlmReq::getContextRemainingLength, py::const_))
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, py::arg("finish_reason"), py::arg("beam"))
         .def_property_readonly("is_finished", &GenLlmReq::isFinished)
+        .def_property_readonly("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
         .def_property(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_property_readonly("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
@@ -449,9 +450,7 @@ void initBindings(pybind11::module_& m)
         .def(py::init<runtime::SizeType32, runtime::SizeType32, tr::BufferManager>(), py::arg("max_batch_size"),
             py::arg("max_tokens_per_engine_step"), py::arg("manager"))
         .def_readwrite("setup_batch_slots", &tb::DecoderInputBuffers::setupBatchSlots)
-        .def_readwrite("forward_batch_slots_request_order", &tb::DecoderInputBuffers::forwardBatchSlotsRequestOrder)
-        .def_readwrite(
-            "forward_batch_slots_request_order_device", &tb::DecoderInputBuffers::forwardBatchSlotsRequestOrderDevice)
+        .def_readwrite("setup_batch_slots_device", &tb::DecoderInputBuffers::setupBatchSlotsDevice)
         .def_readwrite("fill_values", &tb::DecoderInputBuffers::fillValues)
         .def_readwrite("fill_values_device", &tb::DecoderInputBuffers::fillValuesDevice)
         .def_readwrite("inputs_ids", &tb::DecoderInputBuffers::inputsIds)

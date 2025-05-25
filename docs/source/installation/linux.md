@@ -56,3 +56,9 @@ There are some known limitations when you pip install pre-built TensorRT-LLM whe
    ```bash
    [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt
    ```
+
+   PyTorch NGC Container typically includes a pre-installed `tensorrt` Python package. If there is a version mismatch between this pre-installed package and the version required by the TensorRT-LLM wheel, you will need to uninstall the existing `tensorrt` package before installing TensorRT-LLM.
+
+   ```bash
+   pip uninstall -y tensorrt
+   ```

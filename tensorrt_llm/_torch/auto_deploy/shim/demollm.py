@@ -372,7 +372,7 @@ class DemoLLM(LLM):
         self.mpi_session = None
         self.runtime_context = None
         self._tokenizer = self._try_load_tokenizer()
-        self.input_processor = create_input_processor(model, self.tokenizer)
+        self.input_processor = create_input_processor(None, self.tokenizer)
 
         # construct sequence info object
         seq_info = SequenceInfo(
@@ -390,6 +390,13 @@ class DemoLLM(LLM):
             seq_info=seq_info,
             device="cuda",
         )
+
+    def __del__(self):
+        """Ensure proper cleanup of distributed resources."""
+        if hasattr(self, "_executor") and self._executor is not None:
+            self._executor.shutdown()
+        # Call cleanup to ensure process group is properly destroyed
+        dist_ad.cleanup()
 
     @staticmethod
     def _handle_response(request_output: RequestOutput, response: List[CompletionOutput]):

@@ -3879,6 +3879,7 @@ class AllReduceStrategy(IntEnum):
     AUTO = 3
     ONESHOT = 4
     TWOSHOT = 5
+    LOWPRECISION = 6
 
 
 class AllReduceFusionOp(IntEnum):

@@ -25,7 +25,6 @@
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
-#include "tensorrt_llm/batch_manager/generateRequestOptions.h"
 #include "tensorrt_llm/batch_manager/guidedDecoder.h"
 #include "tensorrt_llm/batch_manager/handleContextLogits.h"
 #include "tensorrt_llm/batch_manager/handleGenerationLogits.h"
@@ -441,7 +440,6 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     mPauseRequests = std::make_unique<PauseRequests>(getMaxInputLen());
     mAssignReqSeqSlots = std::make_unique<AssignReqSeqSlots>();
     mAllocateKvCache = std::make_unique<AllocateKvCache>();
-    mCreateNewDecoderRequests = std::make_unique<CreateNewDecoderRequests>();
 
     if (isCudaGraphMode())
     {
@@ -463,7 +461,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
     }
 
-    mGenerateRequestOptions = std::make_unique<GenerateRequestOptions>(
+    mCreateNewDecoderRequests = std::make_unique<CreateNewDecoderRequests>(
         mSpeculativeDecodingFastLogits, mIsLeaderInOrchMode, isNormalizeLogProbs());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -952,11 +950,6 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         std::tie(currRequests.contextRequests, currRequests.generationRequests)
             = (*mMicroBatchScheduler)(fittingRequests, mInflightReqIds, mMaxBatchSizeRuntime, mMaxNumTokensRuntime);
         TLLM_CHECK(currRequests.size() <= static_cast<size_t>(getMaxBatchSize()));
-
-        // Move context requests that reached the last context chunk to the end of the vector.
-        // This order is required for moveFinishedContextRequestsToGeneration.
-        std::partition(currRequests.contextRequests.begin(), currRequests.contextRequests.end(),
-            [](auto const& llmReq) { return !llmReq->isLastContextChunk(); });
 
         (*mPauseRequests)(requestsToPause, mInflightReqIds, mReqIdsToPause, false, *mSeqSlotManager, mKvCacheManager,
             mCrossKvCacheManager, mPeftCacheManager);
@@ -1489,6 +1482,16 @@ void TrtGptModelInflightBatching::prepareDisaggGenInitRequests(
     // Initiate KV cache transfer
     auto timeStart = std::chrono::steady_clock::now();
 
+    if (tc::getEnvDisaggBenchmarkGenOnly())
+    {
+        TLLM_LOG_DEBUG("Disaggregated generation only benchmark mode is enabled");
+        for (auto& req : newGenReqs)
+        {
+            req->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
+        }
+        return;
+    }
+
     auto const genInitReqNum = std::count_if(activeRequests.begin(), activeRequests.end(),
         [](auto const& req) { return req->isDisaggGenerationInitState(); });
 
@@ -1717,7 +1720,8 @@ void TrtGptModelInflightBatching::executeStep(
         // TODO: support layer-wise cross kv cache in encoder-decoder models
         if (!layerWiseRequests.empty() && !mModelConfig.useCrossAttention())
         {
-            int const numLayers = mModelConfig.getNbAttentionLayers(mWorldConfig.getPipelineParallelism());
+            int const numLayers = mModelConfig.getNbAttentionLayers(
+                mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
             progress = std::make_shared<ContextProgress>(numLayers);
         }
         bufferCast<void*>(*mBuffers[bufferId]->transformerBuffers->contextProgressHost)[0] = progress.get();
@@ -1761,7 +1765,7 @@ void TrtGptModelInflightBatching::executeStep(
 }
 
 void TrtGptModelInflightBatching::setupDecoderStep(
-    RequestVector const& contextRequests, RuntimeBuffers const& buffers, DecoderInputBuffers const& inputBuffers)
+    RequestVector const& contextRequests, RuntimeBuffers const& buffers, DecoderInputBuffers& inputBuffers)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(setupDecoderStep);
@@ -1770,16 +1774,13 @@ void TrtGptModelInflightBatching::setupDecoderStep(
     {
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
 
-        auto [batchSlots, decoderRequests, samplingConfigs] = (*mGenerateRequestOptions)(mModelConfig, mWorldConfig,
-            mDecodingConfig, contextRequests, mRuntime->getBufferManager(), logitsType, inputBuffers, buffers);
+        auto [batchSlots, decoderRequests, samplingConfigs] = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig,
+            mDecodingConfig, contextRequests, mRuntime->getBufferManager(), logitsType, inputBuffers,
+            mDecoder->getDecoderState(), mRuntime->getStream(), *mDecoder->getDecoderStream(), getMaxSequenceLen(),
+            mOperatingBeamWidth, buffers.medusaBuffers);
 
         if (!decoderRequests.empty())
         {
-            NVTX3_SCOPED_RANGE(decoderNewRequests);
-
-            (*mCreateNewDecoderRequests)(batchSlots, decoderRequests, samplingConfigs, mModelConfig, *mDecoder,
-                mRuntime->getStream(), getMaxSequenceLen());
-
             // Setup underlying decoder.
             auto const localBatchSize = batchSlots->getSize();
             auto samplingConfig = SamplingConfig(samplingConfigs);
@@ -2014,8 +2015,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     auto& decodingInput = mDecodingInputs.at(mMicroBatchId);
     std::tie(decodingInput, mDecodingOutput) = (*mMakeDecodingBatchInputOutput)(scheduledRequests.contextRequests,
         scheduledRequests.generationRequests, *mDecoderBuffers, mDecoderInputBuffers.at(fusedBufferId),
-        mDecoder->getDecoderState(), mModelConfig, getMaxNumSequences(), mOperatingBeamWidth, isTrtOverlap(),
-        mRuntime->getBufferManager(), mRuntime->getStream(), *fusedRuntimeBuffers);
+        mDecoder->getDecoderState(), mModelConfig, getMaxNumSequences(), *fusedRuntimeBuffers);
 
     auto decoderFinishEvent = mDecoder->forwardAsync(*mDecodingOutput, *decodingInput);
 

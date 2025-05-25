@@ -88,7 +88,7 @@ GetInferenceModel = Callable[[CachedSequenceInterface], nn.Module]
 @dataclass
 class AutoDeployConfig(PyTorchConfig):
     # model factory to choose from
-    model_factory: str = "hf"  # only 'hf' supported for "trtllm" runtime
+    model_factory: str = "AutoModelForCausalLM"
 
     ### MODEL EXTRA KWARGS ###
     # Extra kwargs for the model config class to customize the model config. Those arguments will
@@ -111,6 +111,9 @@ class AutoDeployConfig(PyTorchConfig):
 
     # check if we should skip loading weights
     skip_loading_weights: bool = False
+
+    # specifies the fraction of available memory to occupy for cache
+    free_mem_ratio: float = 0.8
 
     def __post_init__(self):
         super().__post_init__()

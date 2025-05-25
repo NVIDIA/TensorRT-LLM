@@ -10,6 +10,7 @@ from typing import Any, List, Literal, Optional, Sequence, Union
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 
@@ -27,8 +28,9 @@ from ..executor.utils import (create_mpi_comm_session,
 from ..inputs import PromptInputs, create_input_processor, prompt_inputs
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .llm_args import LLMARGS_EXPLICIT_DOCSTRING, PybindMirror
-from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig, LlmArgs,
+from .llm_args import (LLMARGS_EXPLICIT_DOCSTRING, PybindMirror, TorchLlmArgs,
+                       TrtLlmArgs)
+from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
@@ -112,7 +114,11 @@ class LLM:
         try:
             self.pytorch_backend_config = kwargs.pop('pytorch_backend_config',
                                                      None)
-            self.args = LlmArgs.from_kwargs(
+
+            llm_args_cls = TorchLlmArgs if kwargs.get(
+                'backend', None) == 'pytorch' else TrtLlmArgs
+
+            self.args = llm_args_cls.from_kwargs(
                 model=model,
                 tokenizer=tokenizer,
                 tokenizer_mode=tokenizer_mode,
@@ -160,8 +166,9 @@ class LLM:
             # Due to the Executor can only accept a engine path, we need to save the engine to a directory
             self._engine_dir: Optional[Path] = None
             self._executor: Optional[GenerationExecutor] = None
-            self._workspace = tempfile.TemporaryDirectory(
-                suffix="-llm-workspace", dir=self.args.workspace)
+            if self._on_trt_backend:
+                self._workspace = tempfile.TemporaryDirectory(
+                    suffix="-llm-workspace", dir=self.args.workspace)
 
             self._hf_model_dir: Optional[Path] = None
 
@@ -180,7 +187,7 @@ class LLM:
 
     @property
     def workspace(self) -> Path:
-        return Path(self._workspace.name)
+        return Path(self._workspace.name) if self._on_trt_backend else None
 
     def generate(
         self,
@@ -287,9 +294,20 @@ class LLM:
         """
         sampling_params = self._prepare_sampling_params(sampling_params)
 
-        if sampling_params.n > self.args.build_config.max_batch_size:
+        # With pytorch backend, py_executor has logic to handle max_tokens of 1,
+        # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
+        # TODO: Also support for trt backend
+        if (disaggregated_params is not None
+                and disaggregated_params.request_type == "context_only"
+                and not self._on_trt_backend):
+            sampling_params.max_tokens = 1
+
+        max_batch_size = self.args.max_batch_size
+        max_batch_size = max_batch_size or self.args.build_config.max_batch_size
+
+        if sampling_params.n > max_batch_size:
             raise ValueError(
-                f"SamplingParams.n ({sampling_params.n}) should not exceed max_batch_size ({self.args.build_config.max_batch_size})"
+                f"SamplingParams.n ({sampling_params.n}) should not exceed max_batch_size ({max_batch_size})"
             )
 
         inputs = prompt_inputs(inputs)
@@ -486,7 +504,7 @@ class LLM:
 
         if (not self.args.enable_chunked_prefill) and (
                 prompt_len / self.args.parallel_config.cp_size + query_len +
-                sampling_params.max_tokens > max_seq_len):
+            (sampling_params.max_tokens or 0) > max_seq_len):
             raise ValueError(
                 f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({build_config.max_seq_len})")
@@ -530,11 +548,19 @@ class LLM:
                                                       self.tokenizer)
         self.tokenizer = self.input_processor.tokenizer
 
-        max_batch_size = self.args.max_batch_size or self.args.build_config.max_batch_size
-        max_num_tokens = self.args.max_num_tokens or self.args.build_config.max_num_tokens
-        max_seq_len = self.args.max_seq_len or self.args.build_config.max_seq_len
+        max_batch_size = self.args.max_batch_size
+        max_num_tokens = self.args.max_num_tokens
+        max_seq_len = self.args.max_seq_len
+
+        build_config = self.args.build_config if self._on_trt_backend else BuildConfig(
+        )
+
+        max_batch_size = max_batch_size or build_config.max_batch_size
+        max_num_tokens = max_num_tokens or build_config.max_num_tokens
+        max_seq_len = max_seq_len or build_config.max_seq_len
+
         executor_config = tllm.ExecutorConfig(
-            max_beam_width=self.args.build_config.max_beam_width,
+            max_beam_width=self.args.max_beam_width,
             scheduler_config=PybindMirror.maybe_to_pybind(
                 self.args.scheduler_config),
             batching_type=PybindMirror.maybe_to_pybind(self.args.batching_type)
@@ -542,6 +568,14 @@ class LLM:
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             gather_generation_logits=self.args.gather_generation_logits)
+        if self.args.backend is None:
+            # also set executor_config.max_seq_len in TRT workflow, to deduce default max_tokens
+            if max_seq_len is not None:
+                executor_config.max_seq_len = max_seq_len
+            else:
+                engine_config = EngineConfig.from_json_file(self._engine_dir /
+                                                            "config.json")
+                executor_config.max_seq_len = engine_config.build_config.max_seq_len
         if self.args.kv_cache_config is not None:
             executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.kv_cache_config)
@@ -552,7 +586,7 @@ class LLM:
         if self.args.peft_cache_config is not None:
             executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.peft_cache_config)
-        elif self.args.build_config.plugin_config.lora_plugin:
+        elif self._on_trt_backend and self.args.build_config.plugin_config.lora_plugin:
             engine_config = EngineConfig.from_json_file(self._engine_dir /
                                                         "config.json")
             lora_config = engine_config.build_config.lora_config
@@ -580,7 +614,7 @@ class LLM:
         executor_config.normalize_log_probs = self.args.normalize_log_probs
         executor_config.enable_chunked_context = self.args.enable_chunked_prefill
         executor_config.max_beam_width = self.args.max_beam_width or self.args.build_config.max_beam_width
-        if self.args.extended_runtime_perf_knob_config is not None:
+        if self._on_trt_backend and self.args.extended_runtime_perf_knob_config is not None:
             executor_config.extended_runtime_perf_knob_config = PybindMirror.maybe_to_pybind(
                 self.args.extended_runtime_perf_knob_config)
         if self.args.cache_transceiver_config is not None:
@@ -592,7 +626,8 @@ class LLM:
             backend=self.args.backend,
             pytorch_backend_config=self.pytorch_backend_config,
             mapping=self.args.parallel_config.to_mapping(),
-            build_config=self.args.build_config,
+            build_config=self.args.build_config
+            if self._on_trt_backend else None,
             speculative_config=self.args.speculative_config,
             hf_model_dir=self._hf_model_dir,
             trt_engine_dir=self._engine_dir,
@@ -600,8 +635,9 @@ class LLM:
             max_seq_len=max_seq_len)
         executor_config.llm_parallel_config = self.args.parallel_config
         return_logits = self.args.gather_generation_logits or (
-            self.args.build_config
+            self._on_trt_backend and self.args.build_config
             and self.args.build_config.gather_context_logits)
+
         self._executor = self._executor_cls.create(
             self._engine_dir,
             executor_config=executor_config,
@@ -618,6 +654,10 @@ class LLM:
             is_llm_executor=True,
             lora_config=self.args.lora_config)
 
+    @property
+    def _on_trt_backend(self) -> bool:
+        return isinstance(self.args, TrtLlmArgs)
+
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
             return None
@@ -629,9 +669,8 @@ class LLM:
         if self.runtime_context is not None:
             return self.runtime_context.tokenizer
 
-        # TODO smor- need to look more on this
-        # what should be chose as the tokenizer? the adapter or the base model?
-        # what happens if we have multiple adapters?
+        # TODO smor- need to refine what is the desired behavior if lora is enabled
+        # in terms of the tokenizer initialization process
         if hasattr(
                 self.args, "backend"
         ) and self.args.backend == "pytorch" and self.args.lora_config is not None:
@@ -643,14 +682,12 @@ class LLM:
                         tokenizer_path,
                         trust_remote_code=self.args.trust_remote_code,
                         use_fast=self.args.tokenizer_mode != 'slow')
-                    return tokenizer
+                    if tokenizer is None:
+                        tokenizer_path = self.args.model
+                    else:
+                        return tokenizer
                 except Exception:
                     tokenizer_path = self.args.model
-            elif num_lora_dirs > 1:
-                # TODO smor- currently not supported, need to determine which tokenizer to use, if possible
-                raise ValueError(
-                    f"Expecting only a single lora dir, but got {num_lora_dirs}"
-                )
             else:
                 tokenizer_path = self.args.model
         else:

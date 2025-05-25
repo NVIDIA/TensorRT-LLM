@@ -57,13 +57,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
     void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
     int32_t* numNonExitingCtas, tg::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
-    cudaStream_t stream)
+    RoutingMethodType routingMethodType, cudaStream_t stream)
 {
-    if (nGroup > 0 && topkGroup > 0 && topkGroup <= 4 && topK <= 8)
+    if (routingMethodType == RoutingMethodType::DeepSeekV3)
     {
-        // FIXME: hardcoded for now
-        int32_t tileN = 8;
-
+        TLLM_CHECK_WITH_INFO(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
+        TLLM_CHECK_WITH_INFO(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
         moe::dev::routing::Data routingData;
         routingData.mDtypeExpW = tg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
@@ -102,11 +101,13 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mUseRoutingSoftmax = false;
         moe::dev::routing::run(routingData, stream);
     }
-    else if (nGroup <= 0 && topkGroup <= 0 && topK == 1)
+    else if (routingMethodType == RoutingMethodType::Llama4)
     {
-        // FIXME: hardcoded for now
-        int32_t tileN = 8;
-
+        TLLM_CHECK_WITH_INFO(topK == 1, "For Llama routing method, must have topK == 1");
+        if (nGroup > 0 || topkGroup > 0)
+        {
+            TLLM_LOG_WARNING("For Llama routing method, nGroup/topkGroup is ignored, got %d/%d.", nGroup, topkGroup);
+        }
         moe::dev::routingLlama4::Data routingData;
         routingData.mDtypeExpW = tg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
@@ -145,13 +146,56 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // routingData.mUseRoutingSoftmax = false;
         moe::dev::routingLlama4::run(routingData, stream);
     }
+    else if (routingMethodType == RoutingMethodType::Renormalize /* default */
+        || routingMethodType == RoutingMethodType::Qwen3 /* Softmax -> TopK */)
+    {
+        moe::dev::routingQwen3::Data routingData;
+
+        //
+        // Config
+        //
+
+        routingData.mDtypeExpW = tg::Dtype::Bfloat16;
+        // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
+        routingData.mUsePdl = true;
+        routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::Qwen3;
+        routingData.mNormTopkProb = routingMethodType == RoutingMethodType::Renormalize;
+        routingData.mPtrScores = routingLogits;
+
+        //
+        // Outputs
+        //
+        routingData.mPtrExpertIdx = routingExpertIndexes;
+        routingData.mPtrExpertCounts = expertCountHistogram;
+        routingData.mPtrPermutedIdxSize = permutedIdxSize;
+        routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+        routingData.mPtrExpertWeights = expertWeights;
+
+        //
+        // Grouped Gemm Launch Config Buffers
+        //
+        routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+        routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+        routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+
+        //
+        // Inputs
+        //
+        routingData.mNumTokens = numTokens;
+        routingData.mNumExperts = numExperts;
+        routingData.mTopK = topK;
+        routingData.mPaddingLog2 = computeLog2(tileN);
+        routingData.mLocalExpertsStartIdx = localExpertOffset;
+        routingData.mLocalExpertsStrideLog2 = 0;
+        routingData.mNumLocalExperts = localNumExperts;
+
+        moe::dev::routingQwen3::run(routingData, stream);
+    }
     else
     {
-        // check for DeepSeek-style routing with groups
-        TLLM_CHECK_WITH_INFO(
-            nGroup > 0 && topkGroup > 0, "For group-based routing, must havetopkGroup <= 4 && topK <= 8.");
-        // here we are using Llama4-style routing without groups
-        TLLM_CHECK_WITH_INFO(false, "For non-group-based routing, must have topK == 1.");
+        TLLM_CHECK_WITH_INFO(false, "Unimplemented routing method %s of enum %d",
+            serializeMoeRoutingMethodType(routingMethodType).c_str(), (int) routingMethodType);
     }
 }
 } // namespace Routing

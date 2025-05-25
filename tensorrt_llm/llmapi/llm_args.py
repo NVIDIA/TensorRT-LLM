@@ -8,31 +8,34 @@ from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 
 import torch
 import yaml
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, PrivateAttr, validator
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_manager import (LoraConfig,
+                                       get_default_trtllm_modules_to_hf_modules)
 
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
+
 # yapf: disable
-from ..bindings.executor import BatchingType as _BatchingType
-from ..bindings.executor import \
-    CacheTransceiverConfig as _CacheTransceiverConfig
-from ..bindings.executor import \
-    CapacitySchedulerPolicy as _CapacitySchedulerPolicy
-from ..bindings.executor import ContextChunkingPolicy as _ContextChunkingPolicy
-from ..bindings.executor import DecodingConfig, DecodingMode
-from ..bindings.executor import DynamicBatchConfig as _DynamicBatchConfig
-from ..bindings.executor import EagleConfig, ExecutorConfig
-from ..bindings.executor import \
-    ExtendedRuntimePerfKnobConfig as _ExtendedRuntimePerfKnobConfig
-from ..bindings.executor import KvCacheConfig as _KvCacheConfig
-from ..bindings.executor import \
-    LookaheadDecodingConfig as _LookaheadDecodingConfig
-from ..bindings.executor import PeftCacheConfig as _PeftCacheConfig
-from ..bindings.executor import SchedulerConfig as _SchedulerConfig
+# isort: off
+from ..bindings.executor import (
+                                 BatchingType as _BatchingType,
+                                 CacheTransceiverConfig as _CacheTransceiverConfig,
+                                 CapacitySchedulerPolicy as _CapacitySchedulerPolicy,
+                                 ContextChunkingPolicy as _ContextChunkingPolicy,
+                                 DecodingConfig,
+                                 DecodingMode,
+                                 DynamicBatchConfig as _DynamicBatchConfig,
+                                 EagleConfig as _EagleConfig,
+                                 ExecutorConfig as _ExecutorConfig,
+                                 ExtendedRuntimePerfKnobConfig as _ExtendedRuntimePerfKnobConfig,
+                                 KvCacheConfig as _KvCacheConfig,
+                                 LookaheadDecodingConfig as _LookaheadDecodingConfig,
+                                 PeftCacheConfig as _PeftCacheConfig,
+                                 SchedulerConfig as _SchedulerConfig) # isort: skip
+# isort: on
 # yapf: enable
 from ..builder import BuildConfig, EngineConfig
 from ..logger import logger
@@ -194,7 +197,8 @@ class DecodingBaseConfig(BaseModel):
             "MTP": MTPDecodingConfig,
             "Medusa": MedusaDecodingConfig,
             "Eagle": EagleDecodingConfig,
-            "Lookahead": LookaheadDecodingConfig
+            "Lookahead": LookaheadDecodingConfig,
+            "NGram": NGramDecodingConfig,
         }
 
         config_class = config_classes.get(decoding_type)
@@ -233,6 +237,40 @@ class EagleDecodingConfig(DecodingBaseConfig):
         return cls(**data)
 
     decoding_type: ClassVar[str] = "Eagle"
+
+
+class NGramDecodingConfig(DecodingBaseConfig):
+    """
+    Configuration for NGram drafter speculative decoding.
+
+    Arguments:
+        prompt_lookup_num_tokens: int
+                The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
+
+        max_matching_ngram_size: int
+            The length maximum of searching tokens (can be understood as length maximum of input tokens to search).
+
+        is_keep_all: bool = True
+            Whether to keep all candidate pattern-matches pairs, only one match is kept for each pattern if False.
+
+        is_use_oldest: bool = True
+            Whether to provide the oldest match when pattern is hit, the newest one is provided if False.
+
+        is_public_pool: bool = True
+            Whether to use a common pool for all requests, or the pool is private for each request if False.
+    """
+
+    prompt_lookup_num_tokens: int = 2
+    max_matching_ngram_size: int = 4
+    is_keep_all: bool = True
+    is_use_oldest: bool = True
+    is_public_pool: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "NGram"
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -698,7 +736,10 @@ class _ModelWrapper:
         return self.model if isinstance(self.model, str) else None
 
 
-class LlmArgs(BaseModel):
+class BaseLlmArgs(BaseModel):
+    """
+    Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.
+    """
     model_config = {
         "arbitrary_types_allowed": True,
         "extra": "allow",
@@ -770,30 +811,30 @@ class LlmArgs(BaseModel):
     cp_config: Optional[dict] = Field(default_factory=dict,
                                       description="Context parallel config.")
 
-    auto_parallel: bool = Field(default=False,
-                                description="Enable auto parallel mode.")
-
-    auto_parallel_world_size: Optional[int] = Field(
-        default=None, description="The world size for auto parallel mode.")
-
     load_format: Literal['auto', 'dummy'] = Field(
         default='auto',
         description="The format to load the model.",
         json_schema_extra={"type": "Literal['auto', 'dummy']"})
 
-    enable_tqdm: bool = Field(default=False,
-                              description="Enable tqdm for progress bar.")
-
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
 
-    max_lora_rank: Optional[int] = Field(default=None,
-                                         description="The maximum LoRA rank.")
+    max_lora_rank: Optional[int] = Field(
+        default=None,
+        description="The maximum LoRA rank.",
+        deprecated="Use lora_config.max_lora_rank instead.")
 
-    max_loras: int = Field(default=4, description="The maximum number of LoRA.")
+    max_loras: int = Field(default=4,
+                           description="The maximum number of LoRA.",
+                           deprecated="Use lora_config.max_loras instead.")
 
-    max_cpu_loras: int = Field(default=4,
-                               description="The maximum number of LoRA on CPU.")
+    max_cpu_loras: int = Field(
+        default=4,
+        description="The maximum number of LoRA on CPU.",
+        deprecated="Use lora_config.max_cpu_loras instead.")
+
+    lora_config: Optional[LoraConfig] = Field(
+        default=None, description="LoRA configuration for the model.")
 
     # Prompt adapter arguments
     enable_prompt_adapter: bool = Field(default=False,
@@ -805,15 +846,6 @@ class LlmArgs(BaseModel):
     # Quantization and calibration configurations
     quant_config: Optional[QuantConfig] = Field(
         default=None, description="Quantization config.")
-
-    calib_config: Optional[CalibConfig] = Field(
-        default=None, description="Calibration config.")
-
-    # BuildConfig is introduced to give users a familiar interface to configure the model building.
-    build_config: Optional[object] = Field(
-        default=None,
-        description="Build config.",
-        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
 
     # Several options from ExecutorConfig, expanded here for less hierarchy
     kv_cache_config: Optional[KvCacheConfig] = Field(
@@ -840,24 +872,7 @@ class LlmArgs(BaseModel):
         default=None,
         description="The maximum number of iterations for request stats.")
 
-    workspace: Optional[str] = Field(default=None,
-                                     description="The workspace for the model.")
-
     # A handful of options from PretrainedConfig
-    embedding_parallel_mode: str = Field(
-        default='SHARDING_ALONG_VOCAB',
-        description="The embedding parallel mode.")
-
-    fast_build: bool = Field(default=False, description="Enable fast build.")
-
-    # Once set, the model will reuse the build_cache
-    enable_build_cache: object = Field(
-        default=False,
-        description="Enable build cache.",
-        json_schema_extra={
-            "type": f"Union[{get_type_repr(BuildCacheConfig)}, bool]"
-        })
-
     peft_cache_config: Optional[PeftCacheConfig] = Field(
         default=None, description="PEFT cache config.")
 
@@ -870,21 +885,14 @@ class LlmArgs(BaseModel):
     # Speculative decoding parameters
     speculative_config: Optional[Union[
         LookaheadDecodingConfig, MedusaDecodingConfig, EagleDecodingConfig,
-        MTPDecodingConfig]] = Field(default=None,
-                                    description="Speculative decoding config.")
+        MTPDecodingConfig, NGramDecodingConfig]] = Field(
+            default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
                                                   description="Batching type.")
 
     normalize_log_probs: bool = Field(
         default=False, description="Normalize log probabilities.")
-
-    gather_generation_logits: bool = Field(
-        default=False, description="Gather generation logits.")
-
-    extended_runtime_perf_knob_config: Optional[
-        ExtendedRuntimePerfKnobConfig] = Field(
-            default=None, description="Extended runtime perf knob config.")
 
     max_batch_size: Optional[int] = Field(default=None,
                                           description="The maximum batch size.")
@@ -906,9 +914,8 @@ class LlmArgs(BaseModel):
                                    description="The backend to use.",
                                    exclude=True)
 
-    # TODO smor- this is an experimental feature and is probably subject to change before 1.0 release
-    lora_config: Optional[LoraConfig] = Field(
-        default=None, description="LoRA configuration for the model.")
+    gather_generation_logits: bool = Field(
+        default=False, description="Gather generation logits.")
 
     # private fields those are unstable and just for internal use
     num_postprocess_workers: int = Field(
@@ -982,40 +989,23 @@ class LlmArgs(BaseModel):
             moe_tp_size=self.moe_tensor_parallel_size,
             moe_ep_size=self.moe_expert_parallel_size,
             enable_attention_dp=self.enable_attention_dp,
-            cp_config=self.cp_config,
-            auto_parallel=self.auto_parallel)
-        if self.parallel_config.auto_parallel:
-            self.parallel_config.world_size = self.auto_parallel_world_size
-
-        self.auto_parallel_config = AutoParallelConfig(
-            sharded_io_allowlist=[
-                "past_key_value_\\d+",
-                "present_key_value_\\d*",
-            ],
-            same_buffer_io={
-                "past_key_value_(\\d+)": "present_key_value_\\1",
-            },
-            **infer_cluster_config(),
-        )
+            cp_config=self.cp_config)
 
         self.kv_cache_config = self.kv_cache_config or KvCacheConfig()
 
         self.scheduler_config = self.scheduler_config or SchedulerConfig()
 
-        # This is used to hold th options for convert_checkpoint
-        self._convert_checkpoint_options = {}
-
     @classmethod
-    def from_kwargs(cls, **kwargs: Any) -> "LlmArgs":
+    def from_kwargs(cls, **kwargs: Any) -> "BaseLlmArgs":
         """Create `LlmArgs` instance from kwargs.
 
         Args:
             kwargs (Any): Arguments passed to `LlmArgs` constructor.
 
         Returns:
-            tensorrt_llm.llmapi.llm_utils.LlmArgs: The `LlmArgs` instance.
+            tensorrt_llm.llmapi.llm_utils.BaseLlmArgs: The `BaseLlmArgs` instance.
         """
-        kwargs = LlmArgs._maybe_update_config_for_consistency(dict(kwargs))
+        kwargs = BaseLlmArgs._maybe_update_config_for_consistency(dict(kwargs))
         ret = cls(**kwargs)
         ret._setup()
         return ret
@@ -1035,18 +1025,18 @@ class LlmArgs(BaseModel):
         # max_beam_width is not included since vague behavior due to lacking the support for dynamic beam width during
         # generation
         black_list = set(["max_beam_width"])
-        executor_config_attrs = set(attr for attr in dir(ExecutorConfig)
-                                    if not attr.startswith('_')
-                                    and callable(getattr(ExecutorConfig, attr)))
+        executor_config_attrs = set(
+            attr for attr in dir(_ExecutorConfig) if not attr.startswith('_')
+            and callable(getattr(_ExecutorConfig, attr)))
         executor_config_attrs -= black_list
-        llm_args_attr = set(LlmArgs.model_fields.keys())
-        # NOTE: When cpp ExecutorConfig add new options, please add the new options into `_LlmArgs` with docs as well
+        llm_args_attr = set(BaseLlmArgs.model_fields.keys())
+        # NOTE: When cpp ExecutorConfig add new options, please add the new options into `LlmArgs` with docs as well
         # ASK chunweiy for help if you are not sure about the new options.
         assert executor_config_attrs.issubset(
             llm_args_attr
         ), f"New options found in underlying ExecutorConfig: {llm_args_attr - executor_config_attrs}"
 
-        # ensure build_config and LlmArgs consistency
+        # ensure build_config and LlmArgsBase consistency
         if kwargs_dict.get("backend") != "pytorch" and kwargs_dict.get(
                 "build_config"):
             # TODO: move this to _perform_config_arbitration() once it's default-on.
@@ -1056,11 +1046,11 @@ class LlmArgs(BaseModel):
                 build_val = getattr(kwargs_dict["build_config"], field_name,
                                     None)
                 llmargs_val = kwargs_dict.get(
-                    field_name) or LlmArgs.model_fields[field_name]
+                    field_name) or BaseLlmArgs.model_fields[field_name]
 
                 if build_val != llmargs_val:
                     logger.warning(
-                        f"Overriding LlmArgs.{field_name} ({llmargs_val}) with build_config.{field_name} ({build_val})."
+                        f"Overriding LlmArgsBase.{field_name} ({llmargs_val}) with build_config.{field_name} ({build_val})."
                     )
                     kwargs_dict[field_name] = build_val
 
@@ -1069,12 +1059,15 @@ class LlmArgs(BaseModel):
     def _setup(self):
         ''' This method will setup the configs right before building the model. '''
 
+        is_trt_llm_args = isinstance(self, TrtLlmArgs)
+
         assert isinstance(self.model,
                           (str, Path)), f"Invalid model: {self.model}"
 
-        self._setup_embedding_parallel_mode()
+        if is_trt_llm_args:
+            self._setup_embedding_parallel_mode()
 
-        if self.enable_build_cache:
+        if is_trt_llm_args and self.enable_build_cache:
             self.enable_build_cache = BuildCacheConfig() if isinstance(
                 self.enable_build_cache, bool) else self.enable_build_cache
             if not isinstance(self.enable_build_cache, BuildCacheConfig):
@@ -1115,7 +1108,8 @@ class LlmArgs(BaseModel):
 
         self.quant_config = self.quant_config or QuantConfig()
 
-        self.calib_config = self.calib_config or CalibConfig()
+        if is_trt_llm_args:
+            self.calib_config = self.calib_config or CalibConfig()
 
         # Note: max_batch_size and max_num_tokens in LlmArgs are for runtime,
         # which will be passed to the C++ Executor API, overwriting the values
@@ -1142,21 +1136,27 @@ class LlmArgs(BaseModel):
                 self.build_config.max_num_tokens = self.max_num_tokens
 
         # TODO: remove the checker when manage weights support all data types
-        if self.fast_build and (self.quant_config.quant_algo is QuantAlgo.FP8
-                                or self.quant_config.quant_algo is None):
+        if is_trt_llm_args and self.fast_build and (
+                self.quant_config.quant_algo is QuantAlgo.FP8
+                or self.quant_config.quant_algo is None):
             self._update_plugin_config("manage_weights", True)
 
         if self.parallel_config._world_size == 1:
             self.build_config.plugin_config.nccl_plugin = None
 
-        if self.enable_lora:
+        self._ensure_lora_config_consistency()
+
+        if self.enable_lora and self.lora_config is None and self.backend != 'pytorch':
             self.build_config.plugin_config.lora_plugin = 'auto'
             if self.max_lora_rank is not None:
                 self.build_config.lora_config.max_lora_rank = self.max_lora_rank
 
+        self._setup_speculative_config()
+
         if self.enable_prompt_adapter:
             self.build_config.max_prompt_embedding_table_size = self.max_prompt_adapter_token * self.build_config.max_batch_size
 
+    def _setup_speculative_config(self):
         if self.speculative_config:
             if isinstance(self.speculative_config, LookaheadDecodingConfig):
                 lookahead_config = self.speculative_config
@@ -1186,7 +1186,7 @@ class LlmArgs(BaseModel):
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
                 if self.backend != 'pytorch':
-                    eagle_config = EagleConfig(
+                    eagle_config = _EagleConfig(
                         self.speculative_config.eagle_choices,
                         self.speculative_config.greedy_sampling,
                         self.speculative_config.posterior_threshold,
@@ -1201,7 +1201,21 @@ class LlmArgs(BaseModel):
                         max_draft_tokens=self.speculative_config.max_draft_len,
                         eagle_weights_path=self.speculative_config.
                         pytorch_eagle_weights_path)
-
+            elif isinstance(self.speculative_config, NGramDecodingConfig):
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
+                assert self.backend == 'pytorch'
+                assert self.speculative_config.prompt_lookup_num_tokens > 0 and self.speculative_config.max_matching_ngram_size > 0
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
+                from tensorrt_llm._torch.speculative import NGramConfig
+                self.speculative_config = NGramConfig(
+                    prompt_lookup_num_tokens=self.speculative_config.
+                    prompt_lookup_num_tokens,
+                    max_matching_ngram_size=self.speculative_config.
+                    max_matching_ngram_size,
+                    is_keep_all=self.speculative_config.is_keep_all,
+                    is_use_oldest=self.speculative_config.is_use_oldest,
+                    is_public_pool=self.speculative_config.is_public_pool,
+                )
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 from tensorrt_llm._torch.speculative import MTPConfig
                 self.speculative_config = MTPConfig(
@@ -1219,10 +1233,40 @@ class LlmArgs(BaseModel):
         else:
             self.decoding_config = None
 
+    def _ensure_lora_config_consistency(self):
         if self.lora_config:
+            if self.max_lora_rank is not None:
+                logger.warning(
+                    "max_lora_rank is ignored when lora_config is provided.")
+            if self.max_loras != self.lora_config.max_loras:
+                logger.warning(
+                    "max_loras is ignored when lora_config is provided.")
+            if self.max_cpu_loras != self.lora_config.max_cpu_loras:
+                logger.warning(
+                    "max_cpu_loras is ignored when lora_config is provided.")
+
+            if len(self.lora_config.lora_dir) == 0:
+                # TODO [TRTLLM-5173]
+                logger.warning(
+                    "lora_dir is empty, so custom embedding or lm head will not be applied."
+                )
+
+        if self.enable_lora and self.lora_config is not None and self.backend == 'pytorch':
             logger.warning(
-                "Lora is an experimental feature and is probably subject to change before 1.0 release"
+                "enable_lora is ignored when lora_config is provided for pytorch backend."
             )
+
+        if self.lora_config is not None:
+            if len(self.lora_config.lora_dir) == 0 and len(
+                    self.lora_config.lora_target_modules) == 0:
+                logger.warning(
+                    "Both lora_dir and lora_target_modules are empty, so all LoRA modules will be expected. "
+                    "This will lead to serious memory consumption. Please provide either lora_dir or lora_target_modules if this behavior is not what you expect."
+                )
+                default_trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules(
+                )
+                self.lora_config.lora_target_modules = list(
+                    default_trtllm_modules_to_hf_modules.keys())
 
     @property
     def _build_config_mutable(self) -> bool:
@@ -1312,30 +1356,100 @@ class LlmArgs(BaseModel):
                 f"Invalid embedding_parallel_mode: {self.llm_args.embedding_parallel_mode}"
             )
 
-    def _validate_kv_cache_config(self):
-        if self.kv_cache_config is None:
-            raise ValueError("KvCacheConfig is required for streaming LLM.")
 
-        if self.kv_cache_config.max_attention_window is None:
-            raise ValueError(
-                "KvCacheConfig.max_attention_window should be set for streaming LLM."
-            )
-        if any(i <= 0 for i in self.kv_cache_config.max_attention_window):
-            raise ValueError(
-                "Elements in KvCacheConfig.max_attention_window should be greater than 0."
-            )
+class TrtLlmArgs(BaseLlmArgs):
 
-        if self.kv_cache_config.sink_token_length is None:
-            raise ValueError(
-                "KvCacheConfig.sink_token_length should be set for streaming LLM."
-            )
-        if self.kv_cache_config.sink_token_length <= 0:
-            raise ValueError(
-                "KvCacheConfig.sink_token_length should be greater than 0.")
+    auto_parallel: bool = Field(default=False,
+                                description="Enable auto parallel mode.")
 
+    auto_parallel_world_size: Optional[int] = Field(
+        default=None, description="The world size for auto parallel mode.")
+
+    enable_tqdm: bool = Field(default=False,
+                              description="Enable tqdm for progress bar.")
+
+    # BuildConfig is introduced to give users a familiar interface to configure the model building.
+    build_config: Optional[object] = Field(
+        default=None,
+        description="Build config.",
+        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
+
+    workspace: Optional[str] = Field(default=None,
+                                     description="The workspace for the model.")
+
+    # Once set, the model will reuse the build_cache
+    enable_build_cache: object = Field(
+        default=False,
+        description="Enable build cache.",
+        json_schema_extra={
+            "type": f"Union[{get_type_repr(BuildCacheConfig)}, bool]"
+        })
+
+    extended_runtime_perf_knob_config: Optional[
+        ExtendedRuntimePerfKnobConfig] = Field(
+            default=None, description="Extended runtime perf knob config.")
+
+    calib_config: Optional[CalibConfig] = Field(
+        default=None, description="Calibration config.")
+
+    embedding_parallel_mode: str = Field(
+        default='SHARDING_ALONG_VOCAB',
+        description="The embedding parallel mode.")
+
+    fast_build: bool = Field(default=False, description="Enable fast build.")
+
+    # Private attributes
+    _auto_parallel_config: Optional[AutoParallelConfig] = PrivateAttr(
+        default=None)
+    # This is used to hold the options for convert_checkpoint
+    _convert_checkpoint_options: Dict[str,
+                                      Any] = PrivateAttr(default_factory=dict)
+
+    @property
+    def auto_parallel_config(self) -> AutoParallelConfig:
+        return self._auto_parallel_config
+
+    @print_traceback_on_error
+    def model_post_init(self, __context):
+        super().model_post_init(__context)
+
+        self._auto_parallel_config = AutoParallelConfig(
+            sharded_io_allowlist=[
+                "past_key_value_\\d+",
+                "present_key_value_\\d*",
+            ],
+            same_buffer_io={
+                "past_key_value_(\\d+)": "present_key_value_\\1",
+            },
+            **infer_cluster_config(),
+        )
+
+        self.parallel_config.auto_parallel = self.auto_parallel
+
+        if self.parallel_config.auto_parallel:
+            self.parallel_config.world_size = self.auto_parallel_world_size
+
+
+LlmArgs = TrtLlmArgs
 
 LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(LlmArgs,
                                                             indent=' ' * 4)
+
+
+class TorchLlmArgs(BaseLlmArgs):
+
+    # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
+    build_config: Optional[object] = Field(
+        default=None,
+        description="Build config.",
+        exclude_from_json=True,
+        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
+
+    @print_traceback_on_error
+    def model_post_init(self, __context):
+        super().model_post_init(__context)
+
+        self.model_format = _ModelFormatKind.HF
 
 
 def update_llm_args_with_extra_dict(

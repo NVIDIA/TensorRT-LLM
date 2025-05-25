@@ -10,6 +10,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
@@ -151,9 +152,15 @@ def skip_forward(
     if hasattr(module, 'skip_forward'):
         module.forward = module.skip_forward
         remove_weights(module, ignore_modules)
+    else:
+        logger.warning(
+            f"Fail to skip forward since {module.__class__.__name__} "
+            f"does not have `skip_forward`.")
 
 
 def forward_after_recv(forward_fn):
+    if hasattr(forward_fn, "__wrapped_by_forward_after_recv__"):
+        return forward_fn
 
     def forward_after_recv_fn(
         position_ids,
@@ -175,10 +182,13 @@ def forward_after_recv(forward_fn):
             **kwargs,
         )
 
+    forward_after_recv_fn.__wrapped_by_forward_after_recv__ = True
     return forward_after_recv_fn
 
 
 def forward_before_send(forward_fn):
+    if hasattr(forward_fn, "__wrapped_by_forward_before_send__"):
+        return forward_fn
 
     def forward_before_send_fn(
         position_ids,
@@ -203,6 +213,7 @@ def forward_before_send(forward_fn):
             pp_send(hidden_states)
         return output
 
+    forward_before_send_fn.__wrapped_by_forward_before_send__ = True
     return forward_before_send_fn
 
 
@@ -338,6 +349,7 @@ class DecoderModelForCausalLM(nn.Module,
         self.model = model
         self.pp_rank = config.mapping.pp_rank
         self.pp_size = config.mapping.pp_size
+        self.has_custom_lm_head = False
 
         if config.mapping.enable_attention_dp:
             self.lm_head = LMHead(
@@ -355,14 +367,14 @@ class DecoderModelForCausalLM(nn.Module,
         else:
             # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
             # will considering per layer QuantConfig in the future.
-
             if (hasattr(config, 'lora_config')
                     and config.lora_config is not None
                     and len(config.lora_config.lora_dir) == 1):
-                from tensorrt_llm.lora_manager import HfLoraLoader
                 lora_loader = HfLoraLoader(config.lora_config.lora_dir)
-                weight = lora_loader.lm_head
-                vocab_size = lora_loader.vocab_size
+                if lora_loader.lm_head is not None and lora_loader.vocab_size != 0:
+                    weight = lora_loader.lm_head
+                    self.has_custom_lm_head = True
+                    vocab_size = lora_loader.vocab_size
 
             self.lm_head = LMHead(
                 vocab_size,
@@ -373,9 +385,7 @@ class DecoderModelForCausalLM(nn.Module,
                 gather_output=True,
             )
 
-            if (hasattr(config, 'lora_config')
-                    and config.lora_config is not None
-                    and len(config.lora_config.lora_dir) == 1):
+            if self.has_custom_lm_head:
                 with torch.no_grad():
                     if config.mapping.tp_size > 1:
                         weight = split_matrix_tp(
@@ -410,6 +420,8 @@ class DecoderModelForCausalLM(nn.Module,
         if not mapping.is_last_pp_rank():
             for module in self.epilogue:
                 skip_forward(module)
+
+        self.model.__pp_init__()
 
     def __post_init__(self):
         # 1. mixed precision
@@ -657,12 +669,13 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
             if model.config.tie_word_embeddings and name.startswith("lm_head"):
                 continue
 
-            # Skip loading weights for embedding and lm_head if LoRA is enabled
-            if hasattr(model.model_config, 'lora_config'
-                       ) and model.model_config.lora_config is not None and len(
-                           model.model_config.lora_config.lora_dir) == 1 and (
-                               name == "model.embed_tokens"
-                               or name == "lm_head"):
+            # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values
+            if hasattr(model, "model") and hasattr(
+                    model.model, 'has_custom_embed_tokens'
+            ) and model.model.has_custom_embed_tokens and name == "model.embed_tokens":
+                continue
+            if hasattr(model, 'has_custom_lm_head'
+                       ) and model.has_custom_lm_head and name == "lm_head":
                 continue
 
             names = name.split('.')

@@ -122,9 +122,13 @@ struct Fused_multihead_attention_params_v2
     int b, h, h_kv, h_q_per_kv, s, d;
     // The dimension of V. If unset, dv = d.
     int dv = 0;
+    // The number of grouped heads in the seqlen dimension.
+    int num_grouped_heads = 1;
     // Sliding Window Attention
     // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
     int sliding_window_size = INT_MAX;
+    // The chunked attention size in log2 (> 0 means that chunked attention is enabled).
+    int log2_chunked_attention_size = 0;
     // The scaling factors for the kernel.
     uint32_t scale_bmm1, softcapping_scale_bmm1, scale_softmax, scale_bmm2;
 

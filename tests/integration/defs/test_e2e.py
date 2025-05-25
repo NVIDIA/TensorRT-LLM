@@ -19,7 +19,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
 import pytest
 import yaml
@@ -319,6 +319,209 @@ def test_mistral_e2e(llama_example_root, llama_tokenizer_model_root, llm_venv,
     venv_check_call(llm_venv, run_cmd)
 
 
+@pytest.mark.parametrize("model_name,model_path", [
+    ("DeepSeek-R1-Distill-Qwen-1.5B", "DeepSeek-R1-Distill-Qwen-1.5B"),
+])
+def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv,
+                                             qwen_example_root, cmodel_dir,
+                                             engine_dir):
+    "RCCA: https://nvbugs/5238105"
+    model_dir = convert_weights(
+        llm_venv=llm_venv,
+        example_root=qwen_example_root,
+        cmodel_dir=cmodel_dir,
+        model=model_name,
+        model_path=f"{llm_models_root()}/{model_path}",
+    )
+
+    build_cmd = [
+        "trtllm-build", f"--checkpoint_dir={model_dir}",
+        f"--output_dir={engine_dir}", f"--gemm_plugin=float16",
+        "--max_num_tokens=32768"
+    ]
+
+    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+
+    from transformers import AutoTokenizer
+
+    from tensorrt_llm.runtime import PYTHON_BINDINGS
+
+    if PYTHON_BINDINGS:
+        from tensorrt_llm.runtime import ModelRunnerCpp
+    tokenizer = AutoTokenizer.from_pretrained(
+        f"{llm_models_root()}/{model_path}",
+        trust_remote_code=True,
+        use_fast=False)
+
+    message = r"<｜begin▁of▁sentence｜><｜User｜>The operation $\otimes$ is defined for all nonzero numbers by $a \otimes b = \frac{a^{2}}{b}$. Determine $[(1 \otimes 2) \otimes 3] - [1 \otimes (2 \otimes 3)]$. Let's think step by step and output the final answer within \boxed{}.<｜Assistant｜>"
+
+    inputs = tokenizer(message, return_tensors='pt',
+                       add_special_tokens=False)['input_ids']
+
+    runner = ModelRunnerCpp.from_dir(engine_dir=f"{engine_dir}",
+                                     max_input_len=128,
+                                     max_output_len=4096,
+                                     max_batch_size=8)
+
+    outputs = runner.generate(inputs,
+                              end_id=tokenizer.eos_token_id,
+                              pad_id=tokenizer.pad_token_id,
+                              temperature=0.6,
+                              top_p=1.0,
+                              top_k=1024,
+                              max_new_tokens=1024,
+                              return_dict=True,
+                              min_length=1,
+                              num_return_sequences=4,
+                              output_sequence_lengths=True)
+
+    seq_lengths = outputs['sequence_lengths']
+    assert not (seq_lengths == 0).any(
+    ), f"Found zero length in sequence_lengths tensor: {seq_lengths}"
+
+
+# TODO replace the trtllm_bench_prolog
+class BenchRunner:
+
+    def __init__(self,
+                 llm_root: str,
+                 llm_venv: Any,
+                 model_subdir: str,
+                 model_name: str,
+                 streaming: bool,
+                 tp_size: int,
+                 use_pytorch_backend: bool = False,
+                 skip_engine_build: bool = False,
+                 quant: Optional[str] = None,
+                 extra_llm_api_options: Optional[str] = None,
+                 use_mpirun: bool = False):
+
+        llm_models = llm_models_root()
+        assert llm_models is not None
+        self.llm_root = llm_root
+        self.llm_venv = llm_venv
+        self.model_path = Path(llm_models, model_subdir).absolute()
+        self.model_name = model_name
+        self.quant = quant
+        self.streaming = streaming
+        self.skip_engine_build = skip_engine_build
+        self.use_pytorch_backend = use_pytorch_backend
+        self.use_mpirun = use_mpirun
+        self.tp_size = tp_size
+        self.quant_name = self.quant if self.quant is not None else "FP16"
+        self.extra_llm_api_options = extra_llm_api_options
+
+        self.work_dir = Path(tempfile.TemporaryDirectory().name)
+
+        self.dataset_path = os.path.join(self.work_dir, f"data.txt")
+        if self.use_mpirun:
+            self.mpirun_cmd = f"mpirun --allow-run-as-root -n {self.tp_size} trtllm-llmapi-launch"
+        else:
+            self.mpirun_cmd = ""
+        self.engine_path = None
+
+    def __call__(self):
+        self.prepare_dataset()
+        if not (self.skip_engine_build or self.use_pytorch_backend):
+            self.build_engine()
+        self.run_bench()
+
+    def prepare_dataset(self):
+        dataset_tool = Path(self.llm_root, "benchmarks", "cpp",
+                            "prepare_dataset.py")
+
+        # Generate a small dataset to run a test.
+        self.work_dir.mkdir(parents=True)
+        command = [
+            f"{dataset_tool.resolve()}",
+            "--stdout",
+            "--tokenizer",
+            f"{self.model_path}",
+            "token-norm-dist",
+            "--input-mean",
+            "128",
+            "--output-mean",
+            "128",
+            "--input-stdev",
+            "0",
+            "--output-stdev",
+            "0",
+            "--num-requests",
+            "10",
+        ]
+        print(f"Running command: {' '.join(command)}")
+        dataset_output = self.llm_venv.run_cmd(
+            command,
+            caller=check_output,
+        )
+        # Grab the stdout and write it to a dataset file for passing to suite.
+        with open(self.dataset_path, "w") as dataset:
+            dataset.write(dataset_output)
+
+    def build_engine(self):
+        if self.skip_engine_build:
+            return
+
+        build_cmd = \
+            f"{self.mpirun_cmd} " \
+            f"trtllm-bench " \
+            f"--model {self.model_name} " \
+            f"--model_path {self.model_path} " \
+            f"--workspace {self.work_dir} " \
+            f"build --tp_size {self.tp_size}"
+
+        if self.quant is not None:
+            build_cmd = f"{build_cmd} --quantization {self.quant}"
+
+        build_cmd = f"{build_cmd} --dataset {self.dataset_path}"
+        build_output = check_output(build_cmd,
+                                    shell=True,
+                                    env=self.llm_venv._new_env)
+
+        for line in build_output.split("\n")[::-1]:
+            if line.startswith("ENGINE SAVED:"):
+                self.engine_path = Path(line.split(":")[1])
+                break
+
+    def run_bench(self):
+        streaming = "--streaming" if self.streaming else ""
+        benchmark_cmd = \
+            f"{self.mpirun_cmd} " \
+            f"trtllm-bench --model {self.model_name} --model_path {self.model_path} " \
+            f"throughput " \
+            f"--tp {self.tp_size} "
+        if self.engine_path:
+            benchmark_cmd += f"--engine_dir {self.engine_path} "
+        benchmark_cmd += f" --dataset {self.dataset_path} {streaming}"
+
+        if self.use_pytorch_backend:
+            benchmark_cmd += " --backend pytorch"
+
+        if self.extra_llm_api_options:
+            benchmark_cmd += f" --extra_llm_api_options {self.extra_llm_api_options}"
+        check_call(benchmark_cmd, shell=True, env=self.llm_venv._new_env)
+
+
+@pytest.mark.parametrize("model_name", ["meta-llama/Meta-Llama-3-8B-Instruct"],
+                         ids=["llama3-8b"])
+@pytest.mark.parametrize("model_subdir",
+                         ["llama-models-v3/llama-v3-8b-instruct-hf"],
+                         ids=["llama-v3"])
+@pytest.mark.parametrize("use_pytorch_backend", [True, False],
+                         ids=["pytorch_backend", "trt_backend"])
+def test_trtllm_bench_llmapi_launch(llm_root, llm_venv, model_name,
+                                    model_subdir, use_pytorch_backend):
+    runner = BenchRunner(llm_root=llm_root,
+                         llm_venv=llm_venv,
+                         model_name=model_name,
+                         model_subdir=model_subdir,
+                         streaming=False,
+                         use_pytorch_backend=use_pytorch_backend,
+                         use_mpirun=True,
+                         tp_size=2)
+    runner()
+
+
 def trtllm_bench_prolog(
         llm_root,
         llm_venv,
@@ -549,14 +752,14 @@ def test_trtllm_bench_mgmn(llm_root, llm_venv):
     model_name = "meta-llama/Llama-3.1-8B"
     llama_model_dir = Path(
         llm_models_root()) / "llama-3.1-model/Llama-3.1-8B-Instruct"
-    dataset_path = trtllm_bench_prolog(llm_root,
-                                       llm_venv,
-                                       engine_dir=None,
-                                       model_subdir=llama_model_dir,
-                                       model_name=model_name,
-                                       quant=None,
-                                       streaming=False,
-                                       skip_engine_build=True)
+    _, _, dataset_path = trtllm_bench_prolog(llm_root,
+                                             llm_venv,
+                                             engine_dir=None,
+                                             model_subdir=llama_model_dir,
+                                             model_name=model_name,
+                                             quant=None,
+                                             streaming=False,
+                                             skip_engine_build=True)
 
     benchmark_cmd = \
             f"mpirun -n 2 trtllm-llmapi-launch trtllm-bench --model {model_name} " \
@@ -570,7 +773,10 @@ def test_trtllm_bench_mgmn(llm_root, llm_venv):
                                      dir="./",
                                      delete=True,
                                      delete_on_close=True) as running_log:
-        check_call(benchmark_cmd, shell=True, running_log=running_log)
+        check_call(benchmark_cmd,
+                   shell=True,
+                   running_log=running_log,
+                   env=llm_venv._new_env)
         _check_mem_usage(running_log, [30, 0, 0, 0])
 
 
@@ -1257,6 +1463,7 @@ def test_ptp_quickstart(llm_root, llm_venv):
     ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
     ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
     ("Nemotron-H-8B", "Nemotron-H-8B-Base-8K"),
+    ("Qwen3-30B-A3B", "Qwen3/Qwen3-30B-A3B"),
     pytest.param('Llama3.1-8B-NVFP4',
                  'nvfp4-quantized/Meta-Llama-3.1-8B',
                  marks=skip_pre_blackwell),
@@ -1269,8 +1476,14 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Llama3.1-70B-FP8',
                  'llama-3.1-model/Llama-3.1-70B-Instruct-FP8',
                  marks=skip_pre_hopper),
+    pytest.param('Nemotron-Super-49B-v1-FP8',
+                 'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8',
+                 marks=skip_pre_hopper),
     pytest.param('Mixtral-8x7B-NVFP4',
                  'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
+                 marks=skip_pre_blackwell),
+    pytest.param('Mixtral-8x7B-FP8',
+                 'Mixtral-8x7B-Instruct-v0.1-fp8',
                  marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
@@ -1297,13 +1510,14 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
                                          dir="./",
                                          delete=True,
                                          delete_on_close=True) as running_log:
-            llm_venv.run_cmd([
+            cmds = [
                 str(example_root / "quickstart_advanced.py"),
                 "--enable_chunked_prefill",
-                "--model_dir",
-                f"{llm_models_root()}/{model_path}",
-            ],
-                             running_log=running_log)
+                f"--model_dir={llm_models_root()}/{model_path}",
+            ]
+            if "Qwen3" in model_name:
+                cmds.append(f"--kv_cache_fraction=0.6")
+            llm_venv.run_cmd(cmds, running_log=running_log)
             if model_name in mapping:
                 _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0])
 
@@ -1337,21 +1551,19 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
 
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("model_name,model_path", [
-    pytest.param('DeepSeek-V3', 'DeepSeek-V3', marks=skip_pre_hopper),
-])
+@skip_pre_hopper
+@skip_post_blackwell
+@pytest.mark.parametrize("model_path", ['DeepSeek-V3'])
 def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
-        llm_root, llm_venv, model_name, model_path):
+        llm_root, llm_venv, model_path):
     # "RCCA https://nvbugs/5163844"
-    print(f"Testing {model_name}.")
+    print(f"Testing {model_path}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
     run_cmd = [
         "trtllm-llmapi-launch",
         "python3",
         str(example_root / "quickstart_advanced.py"),
-        "--enable_overlap_scheduler",
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
+        f"--model_dir={llm_models_root()}/{model_path}",
         "--moe_ep_size=8",
         "--tp_size=16",
         "--use_cuda_graph",
@@ -1524,6 +1736,8 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B"),
+    ('Nemotron-Super-49B-v1-BF16',
+     'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1'),
     ("Mixtral-8x7B-BF16", "Mixtral-8x7B-Instruct-v0.1"),
 ])
 def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
@@ -1785,8 +1999,7 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
     tllm_logits = []
     for output in outputs:
         prompt = output.prompt
-        tllm_logit = output.context_logits.cpu(
-        )[:, 0]  # drop vocab_size dimension.
+        tllm_logit = output.context_logits.cpu()[0, :]
         print(f"Prompt: {prompt!r}, Context logits: {tllm_logit}")
         tllm_logits += [tllm_logit]
     # Stack the output
@@ -1847,6 +2060,32 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
         f"--jsonl_file={input_file}",
         "--threshold=0.5",
     ])
+
+
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("model_path", [
+    pytest.param('llama-3.3-models/Llama-3.3-70B-Instruct',
+                 marks=skip_pre_hopper),
+    pytest.param('Llama-4-Maverick-17B-128E-Instruct', marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_llama_2nodes(llm_root, llm_venv, model_path):
+    print(f"Testing {model_path}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    run_cmd = [
+        "trtllm-llmapi-launch",
+        "python3",
+        str(example_root / "quickstart_advanced.py"),
+        f"--model_dir={llm_models_root()}/{model_path}",
+        "--moe_ep_size=8",
+        "--tp_size=16",
+        "--use_cuda_graph",
+        f"--kv_cache_fraction={_MEM_FRACTION_50}",
+        "--max_batch_size=32",
+        "--max_num_tokens=2048",
+        "--disable_kv_cache_reuse",
+    ]
+    check_call(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
 
 
 # End of Pivot-To-Python examples

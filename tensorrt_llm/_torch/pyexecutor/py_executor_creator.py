@@ -1,4 +1,5 @@
 import copy
+from typing import Optional
 
 import tensorrt_llm
 from tensorrt_llm._utils import get_sm_version
@@ -7,24 +8,25 @@ from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.quantization import KV_CACHE_QUANT_ALGO_LIST
+from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
-from ..speculative import Eagle3Config, get_spec_resource_manager
+from ..speculative import Eagle3Config, NGramConfig, get_spec_resource_manager
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
-                    instantiate_decoder)
+                    instantiate_sampler, is_mla)
 from .config import PyTorchConfig
 from .config_utils import is_mla
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
+from .py_executor import PyExecutor
 
 
 def create_py_executor(executor_config: ExecutorConfig,
                        checkpoint_dir: str = None,
                        engine_dir: str = None,
-                       lora_config: LoraConfig = None):
+                       lora_config: Optional[LoraConfig] = None) -> PyExecutor:
     if executor_config.pytorch_backend_config is None:
         executor_config.pytorch_backend_config = PyTorchConfig()
 
@@ -61,11 +63,13 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     spec_config = executor_config.speculative_config
     has_draft_model_engine = isinstance(spec_config, Eagle3Config)
+    has_ngram_drafter = isinstance(spec_config, NGramConfig)
 
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=executor_config.enable_chunked_context,
         cache_reuse=executor_config.kv_cache_config.enable_block_reuse,
-        has_speculative_draft_tokens=has_draft_model_engine,
+        has_speculative_draft_tokens=has_draft_model_engine
+        or has_ngram_drafter,
     )
 
     model_engine = PyTorchModelEngine(
@@ -129,6 +133,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             executor_config.scheduler_config.context_chunking_policy
             if executor_config.scheduler_config.context_chunking_policy
             is not None else ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
+        assert chunk_unit_size is not None, "chunk_unit_size must be set"
         ctx_chunk_config = ContextChunkingConfig(chunking_policy,
                                                  chunk_unit_size)
     else:
@@ -145,21 +150,23 @@ def create_py_executor(executor_config: ExecutorConfig,
         if executor_config.kv_cache_config.enable_block_reuse and not (
                 get_sm_version() >= 90 and get_sm_version() <= 100):
             logger.warning(
-                f"KV cache reuse for MLA only can be enabled on SM90/SM100, "
+                f"KV cache reuse for MLA can only be enabled on SM90/SM100, "
                 f"disable enable_block_reuse for SM{get_sm_version()}")
             executor_config.kv_cache_config.enable_block_reuse = False
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
-        if executor_config.kv_cache_config.enable_block_reuse and kv_cache_quant_algo in KV_CACHE_QUANT_ALGO_LIST:
+        if executor_config.kv_cache_config.enable_block_reuse and not (
+                kv_cache_quant_algo is None or kv_cache_quant_algo
+                == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8):
             logger.warning(
-                f"KV cache reuse for MLA only can be enabled without KV cache quantization, "
+                f"KV cache reuse for MLA can only be enabled without KV cache quantization or with FP8 quantization, "
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             executor_config.kv_cache_config.enable_block_reuse = False
 
         executor_config.enable_chunked_context = False
 
-    decoder = instantiate_decoder(model_engine, executor_config,
+    sampler = instantiate_sampler(model_engine, executor_config,
                                   pytorch_backend_config, mapping)
 
     kv_cache_manager = None
@@ -189,7 +196,7 @@ def create_py_executor(executor_config: ExecutorConfig,
                                               pytorch_backend_config,
                                               executor_config, ctx_chunk_config,
                                               model_engine, draft_model_engine,
-                                              False, decoder, lora_config)
+                                              False, sampler, lora_config)
 
     if executor_config.pytorch_backend_config.use_kv_cache and 'cp_type' not in mapping.cp_config:
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(
@@ -197,23 +204,27 @@ def create_py_executor(executor_config: ExecutorConfig,
             origin_seq_len, ctx_chunk_config, draft_model_engine)
         # This may be None if no max number tokens set and enable cp.
         if kv_cache_max_tokens is not None:
+            del py_executor  # free before constructing new
+            del kv_cache_manager  # free before constructing new
+
             executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
 
             kv_cache_manager = create_kv_cache_manager(model_engine, mapping,
                                                        executor_config)
             resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
 
-            if model_engine.attn_metadata is not None and kv_cache_manager is not None:
+            if model_engine.attn_metadata is not None:
                 if pytorch_backend_config.use_cuda_graph:
                     model_engine._release_cuda_graphs()
                 del model_engine.attn_metadata
                 model_engine.attn_metadata = None
 
             if draft_model_engine is not None:
+                del draft_kv_cache_manager  # free before constructing new
                 draft_kv_cache_manager = create_kv_cache_manager(
                     draft_model_engine, mapping, executor_config)
                 resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
-                if draft_model_engine.attn_metadata is not None and draft_kv_cache_manager is not None:
+                if draft_model_engine.attn_metadata is not None:
                     if pytorch_backend_config.use_cuda_graph:
                         draft_model_engine._release_cuda_graphs()
                     del draft_model_engine.attn_metadata
@@ -222,7 +233,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             py_executor = create_py_executor_instance(
                 dist, resources, mapping, pytorch_backend_config,
                 executor_config, ctx_chunk_config, model_engine,
-                draft_model_engine, False, decoder, lora_config)
+                draft_model_engine, False, sampler, lora_config)
 
     py_executor.start_worker()
     return py_executor

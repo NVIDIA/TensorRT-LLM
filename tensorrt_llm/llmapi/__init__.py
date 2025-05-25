@@ -6,9 +6,10 @@ from .llm import LLM, RequestOutput
 from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        DynamicBatchConfig, EagleDecodingConfig,
-                       ExtendedRuntimePerfKnobConfig, KvCacheConfig,
+                       ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MTPDecodingConfig, SchedulerConfig)
+                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
+                       TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mpi_session import MpiCommSession
@@ -40,4 +41,8 @@ __all__ = [
     'ContextChunkingPolicy',
     'DynamicBatchConfig',
     'CacheTransceiverConfig',
+    'NGramDecodingConfig',
+    'LlmArgs',
+    'TorchLlmArgs',
+    'TrtLlmArgs',
 ]

@@ -12,6 +12,8 @@ from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.logger import logger
+from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
@@ -47,6 +49,7 @@ class Llama4Attention(Attention):
         nope_layer: bool = False,
         attn_temperature_tuning: bool = True,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        attention_chunk_size: Optional[int] = None,
     ):
         config = model_config.pretrained_config
 
@@ -56,6 +59,12 @@ class Llama4Attention(Attention):
             rope=RopeParams.from_config(config),
             is_neox=False,
         ) if self.use_rope else None
+
+        if model_config.attn_backend != "TRTLLM":
+            # TODO: support chunked attention for other backends.
+            # This is safe to do because we limit seqlen to 8k for
+            # non TRTLLM backends.
+            attention_chunk_size = None
 
         super().__init__(
             hidden_size=config.hidden_size,
@@ -69,6 +78,7 @@ class Llama4Attention(Attention):
             config=model_config,
             qk_norm_type=QkNormType.post_rope
             if use_qk_norm else QkNormType.none,
+            attention_chunk_size=attention_chunk_size,
         )
 
         if self.use_rope and use_qk_norm:
@@ -257,7 +267,10 @@ class Llama4MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
                               cutlass_min_latency_mode):
+        use_dp_padding = False
         if self.enable_attention_dp and self.mapping.tp_size > 1:
+            # Use padding here to keep the behavior unchanged
+            use_dp_padding = True
             max_num_token_across_dp_ranks = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
@@ -267,7 +280,8 @@ class Llama4MoE(nn.Module):
         routed_output = self.experts(hidden_states,
                                      router_logits,
                                      cutlass_min_latency_mode,
-                                     all_rank_num_tokens=all_rank_num_tokens)
+                                     all_rank_num_tokens=all_rank_num_tokens,
+                                     use_dp_padding=use_dp_padding)
         return routed_output
 
     def forward(
@@ -319,13 +333,18 @@ class Llama4DecoderLayer(DecoderLayer):
         self.fusion_config.PRE_MOE_FUSION = False
         self.fusion_config.POST_MLP_FUSION = False
 
+        nope_layer = config.no_rope_layers[layer_idx] == 0
+        attention_chunk_size = getattr(config, "attention_chunk_size",
+                                       None) if not nope_layer else None
+
         self.self_attn = Llama4Attention(
             model_config,
             layer_idx=layer_idx,
             use_qk_norm=getattr(config, "use_qk_norm", False),
-            nope_layer=config.no_rope_layers[layer_idx] == 0,
+            nope_layer=nope_layer,
             attn_temperature_tuning=config.attn_temperature_tuning > 0,
-            aux_stream=aux_stream)
+            aux_stream=aux_stream,
+            attention_chunk_size=attention_chunk_size)
 
         is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0
 
@@ -503,6 +522,11 @@ class LlamaDecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
 
+        self.attention_mask = PredefinedAttentionMask.CAUSAL
+        # If the model is being used as an encoder model (prefill only) we use a full attention mask
+        if not model_config.is_generation:
+            self.attention_mask = PredefinedAttentionMask.FULL
+
     def forward(
         self,
         position_ids: torch.LongTensor,
@@ -524,6 +548,7 @@ class LlamaDecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            attention_mask=self.attention_mask,
             **kwargs,
         )
 
@@ -720,14 +745,16 @@ class LlamaModel(DecoderModel):
 
         vocab_size = config.vocab_size
         # TODO smor- we load manually only if there is a single lora dir, need to come up with a better solution
+        self.has_custom_embed_tokens = False
         if hasattr(
                 model_config,
                 'lora_config') and model_config.lora_config is not None and len(
                     model_config.lora_config.lora_dir) == 1:
-            from tensorrt_llm.lora_manager import HfLoraLoader
             lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
-            weight = lora_loader.embed_tokens
-            vocab_size = lora_loader.vocab_size
+            if lora_loader.vocab_size != 0 and lora_loader.embed_tokens is not None:
+                vocab_size = lora_loader.vocab_size
+                weight = lora_loader.embed_tokens
+                self.has_custom_embed_tokens = True
 
         self.embed_tokens = Embedding(
             vocab_size,
@@ -738,10 +765,7 @@ class LlamaModel(DecoderModel):
             gather_output=True,
         )
 
-        if hasattr(
-                model_config,
-                'lora_config') and model_config.lora_config is not None and len(
-                    model_config.lora_config.lora_dir) == 1:
+        if self.has_custom_embed_tokens:
             with torch.no_grad():
                 if model_config.mapping.tp_size > 1:
                     weight = split_matrix_tp(
@@ -753,10 +777,8 @@ class LlamaModel(DecoderModel):
                 self.embed_tokens.weight.data.copy_(x)
 
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(
-                model_config,
-                layer_idx,
-            ) for layer_idx in range(config.num_hidden_layers)
+            LlamaDecoderLayer(model_config, layer_idx)
+            for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
@@ -826,8 +848,13 @@ class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
                          vocab_size=model_config.pretrained_config.vocab_size)
 
     def infer_max_seq_len(self):
-        # TODO: implement chunked attention to support 10M context length
-        return 8192
+        if self.model_config.attn_backend.upper() != 'TRTLLM':
+            logger.warning(
+                f"Attention backend {self.model_config.attn_backend} "
+                "does not support chunked attention. Sequence length "
+                "will be limited to 8192.")
+            return 8192
+        return super().infer_max_seq_len()
 
     def load_weights(self, weights: Dict):
         new_weights = {}

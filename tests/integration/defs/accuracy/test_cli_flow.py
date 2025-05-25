@@ -260,6 +260,15 @@ class TestPhi3_5MiniInstruct(CliFlowAccuracyTestHarness):
         self.run(dtype='auto')
 
 
+class TestPhi4MiniInstruct(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "microsoft/Phi-4-mini-instruct"
+    MODEL_PATH = f"{llm_models_root()}/Phi-4-mini-instruct"
+    EXAMPLE_FOLDER = "models/core/phi"
+
+    def test_auto_dtype(self):
+        self.run(tasks=[MMLU(self.MODEL_NAME)], dtype='auto')
+
+
 # Long sequence length test:
 # Model FP16 7B + 32K tokens in KV cache = 14 * 1024 MB + 32K * 0.5 MB = 30720 MB + scratch memory
 @pytest.mark.skip_less_device_memory(40000)
@@ -807,6 +816,43 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
                  ])
 
 
+# TODO: Remove the CLI tests once NIMs use PyTorch backend
+class TestLlama3_3_70BInstruct(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
+    EXAMPLE_FOLDER = "models/core/llama"
+
+    @pytest.mark.skip_less_device(8)
+    def test_auto_dtype_tp8(self):
+        self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=8, dtype='auto')
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    def test_fp8_prequantized_tp4(self, mocker):
+        mocker.patch.object(
+            self.__class__, "MODEL_PATH",
+            f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
+        )
+        self.run(tasks=[MMLU(self.MODEL_NAME)],
+                 tp_size=4,
+                 quant_algo=QuantAlgo.FP8)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_device_not_contain(["B200"])
+    def test_nvfp4_prequantized_tp4(self, mocker):
+        mocker.patch.object(
+            self.__class__,
+            "MODEL_PATH",
+            model_path=
+            f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4"
+        )
+        self.run(tasks=[MMLU(self.MODEL_NAME)],
+                 tp_size=4,
+                 quant_algo=QuantAlgo.NVFP4,
+                 kv_cache_quant_algo=QuantAlgo.FP8,
+                 extra_build_args=["--gemm_plugin=disable"])
+
+
 class TestMistral7B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/mistral-7b-v0.1"
@@ -1146,6 +1192,17 @@ class TestQwen2_0_5BInstruct(CliFlowAccuracyTestHarness):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
                         MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8)
+
+
+class TestQwen2_1_5B(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen2-1.5B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen2-1.5B"
+    EXAMPLE_FOLDER = "models/core/qwen"
+
+    @pytest.mark.skip_less_device(4)
+    def test_auto_dtype_cp4(self):
+        "RCCA: https://nvbugs/5170106"
+        self.run(dtype='auto', cp_size=4)
 
 
 class TestQwen2_7BInstruct(CliFlowAccuracyTestHarness):

@@ -202,7 +202,6 @@ trtllm-bench --model $model_name throughput --dataset $dataset_file --backend py
 ```yaml
 
  pytorch_backend_config:
-  enable_overlap_scheduler: true
   use_cuda_graph: true
   cuda_graph_padding_enabled: true
   cuda_graph_batch_sizes:
