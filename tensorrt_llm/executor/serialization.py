@@ -75,8 +75,8 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm.executor.worker": ["ExecutorBindingsWorker", "worker_main"],
     "tensorrt_llm.llmapi.llm_args": [
         "_ModelFormatKind", "_ParallelConfig", "CalibConfig",
-        "CapacitySchedulerPolicy", "KvCacheConfig", "LlmArgs",
-        "LookaheadDecodingConfig", "SchedulerConfig"
+        "CapacitySchedulerPolicy", "KvCacheConfig", "LookaheadDecodingConfig",
+        "TrtLlmArgs", "SchedulerConfig"
     ],
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.llm_utils":
