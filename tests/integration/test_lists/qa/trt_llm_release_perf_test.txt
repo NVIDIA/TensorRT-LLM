@@ -1,1 +1,0 @@
-perf/test_perf.py::test_perf[llama_v3.1_8b-bench-bfloat16-input_output_len:128,128-quant:fp8]
