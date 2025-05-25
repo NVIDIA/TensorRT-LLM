@@ -265,7 +265,7 @@ private:
     void createBuffers(executor::DecodingConfig const& decodingConfig,
         std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs);
     std::shared_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig,
-        SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, KvCacheType kvCacheType = KvCacheType::kSELF);
+        std::vector<SizeType32> const& numBlocksPerWindowSize, KvCacheType kvCacheType = KvCacheType::kSELF);
     void createRnnStateManager();
     void createCustomAllReduceWorkspace();
     void createRuntimePerfKnobsTensor(executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
