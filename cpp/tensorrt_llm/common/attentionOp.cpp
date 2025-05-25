@@ -1648,6 +1648,11 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
 
+        if (mAttentionChunkSize)
+        {
+            fmhaParams.chunkedAttentionSize = *mAttentionChunkSize;
+        }
+
         // Run the fmha kernel.
         mFmhaDispatcher->run(fmhaParams);
         sync_check_cuda_error(stream);
@@ -1666,6 +1671,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     else
     {
         TLLM_CHECK_DEBUG_WITH_INFO(params.logn_scaling_ptr == nullptr, "Unfused MHA does not support logn scaling");
+        TLLM_CHECK_WITH_INFO(mAttentionChunkSize == std::nullopt, "Unfused MHA does not support chunked attention");
         // FIXME: a temporary solution to make sure the padding part of key/value buffer is 0
         // NOTE: pointer subtraction is used below since there could be some extra gap due to alignment.
         //  Otherwise, we could do cudaMemsetAsync(k_buf_2_, 0, k_buf_2_size + v_buf_2_size, stream);

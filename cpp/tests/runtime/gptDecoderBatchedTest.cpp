@@ -56,21 +56,26 @@ struct DecoderInputs
 
 void newRequests(TensorPtr const& batchSlots, std::vector<decoder_batch::Request> const& requests,
     std::vector<SamplingConfig> const& samplingConfigs, ModelConfig const& modelConfig, GptDecoderBatched& decoder,
-    std::shared_ptr<CudaStream> runtimeStream, SizeType32 maxSequenceLength)
+    CudaStream const& runtimeStream, SizeType32 maxSequenceLength)
 {
-    auto newRequestsAlgo = tb::CreateNewDecoderRequests();
-    newRequestsAlgo(batchSlots, requests, samplingConfigs, modelConfig, decoder, *runtimeStream, maxSequenceLength);
+    auto const& decoderStream = *decoder.getDecoderStream();
+
+    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots);
+    auto const localBatchSize = batchSlots->getSize();
+    for (size_t bi = 0; bi < localBatchSize; ++bi)
+    {
+        tb::CreateNewDecoderRequests::newRequest(batchSlotsRange[bi], requests[bi], samplingConfigs[bi], modelConfig,
+            decoder.getDecoderState(), runtimeStream, decoderStream, maxSequenceLength);
+    }
 
     // Setup underlying decoder.
-    auto const localBatchSize = batchSlots->getSize();
     auto samplingConfig = SamplingConfig(samplingConfigs);
     decoder.getUnderlyingDecoder().setup(
         samplingConfig, localBatchSize, batchSlots, {decoder.getDecoderState().getJointDecodingOutput()}, {requests});
 
-    auto const& stream = decoder.getDecoderStream();
     CudaEvent event{};
-    stream->record(event);
-    runtimeStream->wait(event);
+    decoderStream.record(event);
+    runtimeStream.wait(event);
 }
 
 DecoderInputs createDecoderInputs(SizeType32 batchSize, SizeType32 maxBeamWidth, SizeType32 maxSeqLength,
@@ -323,7 +328,8 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
         *decoder.getDecoderState().getJointDecodingOutput().lengths, manager);
 
     std::vector<decoder_batch::Request> decoderRequests;
-    newRequests(inputBuffers.setupBatchSlots, requests, samplingConfigs, modelConfig, decoder, streamPtr, maxSeqLength);
+    newRequests(
+        inputBuffers.setupBatchSlots, requests, samplingConfigs, modelConfig, decoder, *streamPtr, maxSeqLength);
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;
@@ -369,7 +375,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
 
     TensorPtr batchSlotsView = ITensor::slice(inputBuffers.setupBatchSlots, 0, 1);
     std::vector<SamplingConfig> singleConfig = {samplingConfigs[0]};
-    newRequests(batchSlotsView, {requests[0]}, singleConfig, modelConfig, decoder, streamPtr, maxSeqLength);
+    newRequests(batchSlotsView, {requests[0]}, singleConfig, modelConfig, decoder, *streamPtr, maxSeqLength);
     EXPECT_FALSE(getFinished(*decoder.getDecoderState().getFinishedSum(), samplingConfigs, manager)[0]);
 }
 
@@ -464,7 +470,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     {
         TensorPtr const newBatchSlot = ITensor::slice(inputBuffers.setupBatchSlots, batchIdx, 1);
         std::vector<SamplingConfig> const singleConfig = {samplingConfigs[batchIdx]};
-        newRequests(newBatchSlot, {requests[batchIdx]}, singleConfig, modelConfig, decoder, streamPtr, maxSeqLength);
+        newRequests(newBatchSlot, {requests[batchIdx]}, singleConfig, modelConfig, decoder, *streamPtr, maxSeqLength);
 
         auto activeSlots = std::vector<SizeType32>(batchIdx + 1);
         std::iota(activeSlots.begin(), activeSlots.end(), 0);
@@ -598,7 +604,8 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     auto batchSlotsRange = BufferRange<SizeType32>(*inputBuffers.setupBatchSlots);
     std::iota(batchSlotsRange.begin(), batchSlotsRange.end(), 0);
 
-    newRequests(inputBuffers.setupBatchSlots, requests, samplingConfigs, modelConfig, decoder, streamPtr, maxSeqLength);
+    newRequests(
+        inputBuffers.setupBatchSlots, requests, samplingConfigs, modelConfig, decoder, *streamPtr, maxSeqLength);
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;
