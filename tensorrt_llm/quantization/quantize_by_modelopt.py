@@ -833,6 +833,7 @@ def quantize_and_export(
                     dtype=getattr(torch, dtype),
                     export_dir=export_path,
                 )
+                return
             case _:
                 raise ValueError(f"Unsupported export format: {export_format}")
 
