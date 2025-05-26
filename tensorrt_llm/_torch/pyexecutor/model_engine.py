@@ -1087,7 +1087,8 @@ class PyTorchModelEngine(ModelEngine):
         extend_requests = []
         generation_requests = []
         for request in scheduled_requests.generation_requests:
-            if request.py_draft_tokens is not None or next_draft_tokens_device is not None:
+            if len(request.py_draft_tokens
+                   ) > 0 or next_draft_tokens_device is not None:
                 extend_requests.append(request)
             else:
                 generation_requests.append(request)
@@ -1111,6 +1112,13 @@ class PyTorchModelEngine(ModelEngine):
         num_extend_reqs_wo_previous_batch = 0
         for request in extend_requests:
             if next_draft_tokens_device is None or request.py_batch_idx is None:
+                # the request has no previous device tensors:
+                # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
+                # (2) request.py_batch_idx is None, which means the request has no previous batch.
+                # the second condition includes dummy generation requests created for CUDA graph padding or
+                # attention DP. These dummy generation requests should be at the head of generation_requests.
+                # TODO: move the dummy generation requests to the end of generation_requests to align with
+                # the logic for those requests in generation_requests.
                 # get token ids, including input token ids and draft token ids
                 input_ids.append(request.get_last_tokens(0))
                 input_ids.extend(request.py_draft_tokens)
