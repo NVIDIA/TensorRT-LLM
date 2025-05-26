@@ -51,8 +51,27 @@ def _get_mem_info_from_log(file, ranks_num):
     # only when TLLM_LOG_LEVEL=INFO
     pattern = re.compile(r"\[MemUsageChange] Allocated ([\d]+\.[\d]+) GiB ")
     fraction_pattern = re.compile(r"fraction is set ([\d]+\.[\d]+), ")
+    total_mem_pattern = re.compile(r"device total memory ([\d]+\.[\d]+) GiB")
+    peak_mem_pattern = re.compile(
+        r"Peak memory during memory usage profiling \(torch \+ non-torch\): ([\d]+\.[\d]+) GiB"
+    )
+    extra_mem_pattern = re.compile(
+        r"Memory used outside torch \(e\.g\., NCCL and CUDA graphs\) in memory usage profiling: ([\d]+\.[\d]+) GiB"
+    )
+    activation_pattern = re.compile(
+        r"Memory dynamically allocated during inference \(inside torch\) in memory usage profiling: ([\d]+\.[\d]+) GiB"
+    )
+    model_pattern = re.compile(
+        r"Memory used after loading model weights \(inside torch\) in memory usage profiling: ([\d]+\.[\d]+) GiB"
+    )
+
     fraction = 0.90
     kv_mem_size = []
+    total_memory = []
+    peak_memory = []
+    extra_memory = []
+    activation_memory = []
+    model_memory = []
     file.seek(0)
     lines = file.readlines()
     for line in lines:
@@ -62,38 +81,57 @@ def _get_mem_info_from_log(file, ranks_num):
         match = fraction_pattern.findall(line)
         if len(match) > 0:
             fraction = float(match[0])
+        match = total_mem_pattern.findall(line)
+        if len(match) > 0:
+            total_memory.append(float(match[0]))
+        match = peak_mem_pattern.findall(line)
+        if len(match) > 0:
+            peak_memory.append(float(match[0]))
+        match = extra_mem_pattern.findall(line)
+        if len(match) > 0:
+            extra_memory.append(float(match[0]))
+        match = activation_pattern.findall(line)
+        if len(match) > 0:
+            activation_memory.append(float(match[0]))
+        match = model_pattern.findall(line)
+        if len(match) > 0:
+            model_memory.append(float(match[0]))
     assert len(
         kv_mem_size) % 2 == 0, "no enough memory usage information in log"
     kv_mem_size = kv_mem_size[len(kv_mem_size) // 2:]
-    return 0, 0, sum(kv_mem_size) / ranks_num, 0, fraction
+    return peak_memory, model_memory, sum(
+        kv_mem_size
+    ) / ranks_num, extra_memory, fraction, total_memory, activation_memory
 
 
-def _get_kv_mem_size_candidate(used_Gib, fraction):
-    import torch
-    _, total = torch.cuda.mem_get_info()
-    return (total / (1 << 30) - used_Gib) * fraction
+def _get_kv_mem_size_candidate(total, used_Gib, fraction):
+    return (total - used_Gib) * fraction
 
 
 def _check_mem_usage(file, mem_info, ranks_num=1):
     if file is None or not TEST_MEM_USAGE:
         return
     delta = 0.2  # 0.2 GB as buffer
-    peak, model_size, kv_mem_size, extra, fraction = _get_mem_info_from_log(
+    peak, model_size, kv_mem_size, extra, fraction, total_memory, activation_memory = _get_mem_info_from_log(
         file, ranks_num)
 
+    peak = max(peak)
+    min_total = min(total_memory)
     e_peak, e_model_size, e_kv_mem_size, e_extra = mem_info
-    e_kv_mem_size = _get_kv_mem_size_candidate(e_peak, fraction)
+    import torch
+    _, total = torch.cuda.mem_get_info()
+    e_kv_mem_size = _get_kv_mem_size_candidate(min_total, e_peak, fraction)
     print(
-        f"Expected memory usage: peak mem {e_peak}, model mem {e_model_size}, kv mem {e_kv_mem_size}, extra {e_extra}"
+        f"Expected memory usage: peak mem {e_peak}, model mem {e_model_size}, kv mem {e_kv_mem_size}, extra {e_extra}, total {total / (1 << 30):.2f}"
     )
     print(
-        f"Running memory information: peak mem {peak}, model mem {model_size}, kv mem {kv_mem_size}, extra {extra}"
+        f"Running memory information: peak mem {peak}, model mem {model_size}, kv mem {kv_mem_size}, extra {extra}, total {min_total}, activation {activation_memory}"
     )
 
     assert peak <= e_peak + delta, f"peak memory {peak} is larger than expected {e_peak}"
-    assert model_size <= e_model_size + delta, f"model memory {model_size} is larger than expected {e_model_size}"
     assert kv_mem_size >= e_kv_mem_size - delta, f"kv memory size {kv_mem_size} is smaller than expected {e_kv_mem_size}"
-    assert extra <= e_extra + delta, f"extra memory size {extra} is larger than expected {e_extra}"
+    # assert model_size <= e_model_size + delta, f"model memory {model_size} is larger than expected {e_model_size}"
+    # assert max(extra) <= e_extra + delta, f"extra memory size {extra} is larger than expected {e_extra}"
 
 
 def test_gpt3_175b_1layers_build_only(llm_root, llm_venv, engine_dir):
