@@ -78,7 +78,6 @@
             "epilogueTileM": 64,
             "epilogueTileN": 8,
             "numStages": 3,
-            "numMmaStages": 1,
             "numSlicesForSplitK": 1,
             "useTwoTmaLoadWarps": true,
             "clusterDimX": 1,
@@ -130,7 +129,6 @@
             "hoistMmaTaskTryWaits": true,
             "numStagesMma": 4,
             "numStagesMmaAcrossWorkTile": 2,
-            "useTwoMmasWarps": true,
             "batch": "N",
             "useMetaFp8": false,
             "numExperts": 128,
@@ -229,7 +227,7 @@
             "numTokens": 2,
             "numExperts": 2,
             "numStagesMma": 2,
-            "tileScheduler": "persistent"
+            "tileScheduler": ["persistent", "static"]
         },
         {
             "_comment": "DS_FP4_TP8_EP1_FC2",
@@ -244,7 +242,7 @@
             "numStagesMma": 2,
             "tileK": 256,
             "numStages": 6,
-            "tileScheduler": "persistent"
+            "tileScheduler": ["persistent", "static"]
         },
         {
             "_comment": "DS_FP8_FC1",
@@ -272,8 +270,7 @@
             "numExperts": 2,
             "numStages": 8,
             "numStagesMma": 4,
-            "tileScheduler": "persistent",
-            "useTwoMmaWarps": true
+            "tileScheduler": ["persistent", "static"]
         },
         {
             "_comment": "DS_FP8_FC1_16_THROUGHPUT",
@@ -300,7 +297,7 @@
             "dtypeC": "bf16",
             "numTokens": 2,
             "numExperts": 2,
-            "tileScheduler": "persistent",
+            "tileScheduler": ["persistent", "static"],
             "tileN": 16,
             "epilogueTileN": 16,
             "mmaN": 16
@@ -330,7 +327,7 @@
             "dtypeC": "bf16",
             "numTokens": 2,
             "numExperts": 2,
-            "tileScheduler": "persistent",
+            "tileScheduler": ["persistent", "static"],
             "tileN": 32,
             "epilogueTileN": 32,
             "mmaN": 32
@@ -360,7 +357,7 @@
             "dtypeC": "bf16",
             "numTokens": 2,
             "numExperts": 2,
-            "tileScheduler": "persistent",
+            "tileScheduler": ["persistent", "static"],
             "tileN": 64,
             "epilogueTileN": 64,
             "mmaN": 64
@@ -390,7 +387,7 @@
             "dtypeC": "bf16",
             "numTokens": 2,
             "numExperts": 2,
-            "tileScheduler": "persistent",
+            "tileScheduler": ["persistent", "static"],
             "tileN": 128,
             "epilogueTileN": 128,
             "mmaN": 128
@@ -421,7 +418,7 @@
             "numExperts": 2,
             "numStages": 3,
             "numStagesMma": 2,
-            "tileScheduler": "persistent"
+            "tileScheduler": ["persistent", "static"]
         },
         {
             "_comment": "MxE2m1_FC1",
@@ -446,7 +443,7 @@
             "numTokens": 2,
             "numExperts": 2,
             "numStagesMma": 2,
-            "tileScheduler": "persistent"
+            "tileScheduler": ["persistent", "static"]
         },
         {
             "_comment": "MxE2m1_TP8_EP1_FC2",
@@ -461,7 +458,7 @@
             "numStagesMma": 2,
             "tileK": 256,
             "numStages": 4,
-            "tileScheduler": "persistent"
+            "tileScheduler": ["persistent", "static"]
         }
     ]
 }

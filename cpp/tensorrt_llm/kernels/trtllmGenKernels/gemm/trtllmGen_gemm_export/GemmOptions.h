@@ -99,11 +99,11 @@ struct GemmOptions
         KernelTraits kernelTraits, int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN, bool mockAllReduce, int n,
         int numSlicesForSplitK, int numSlicesForSliceK, int numStages, int numStagesMma, int numStagesMmaWithinWorkTile,
         int numStagesMmaAcrossWorkTile, int numStagesWorkId, bool outputDebugTensors, bool useShuffledMatrixA,
-        bool sliceK, SplitK splitK, bool transposeMmaOutput, int tileM, int tileN, int tileK,
-        bool useUnrollLoop2xForMma, bool useCustomMmaSchedule, bool useHoistTryWaitForCustomMmaSchedule,
-        bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps,
-        bool useTwoMmaWarps, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
-        TileScheduler tileScheduler)
+        bool sliceK, SplitK splitK, bool transposeMatrixA, bool transposeMatrixB, bool transposeMmaOutput, int tileM,
+        int tileN, int tileK, bool useUnrollLoop2xForMma, bool useCustomMmaSchedule,
+        bool useHoistTryWaitForCustomMmaSchedule, bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB,
+        bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB,
+        tg::SfLayout sfLayoutC, TileScheduler tileScheduler)
         : mAllReduceAlgo{allReduceAlgo}
         , mClusterDimX{clusterDimX}
         , mClusterDimY{clusterDimY}
@@ -146,6 +146,8 @@ struct GemmOptions
         , mUseShuffledMatrixA{useShuffledMatrixA}
         , mSliceK{sliceK}
         , mSplitK{splitK}
+        , mTransposeMatrixA{transposeMatrixA}
+        , mTransposeMatrixB{transposeMatrixB}
         , mTransposeMmaOutput{transposeMmaOutput}
         , mTileM{tileM}
         , mTileN{tileN}
@@ -263,6 +265,10 @@ struct GemmOptions
     bool mSliceK{false};
     // The location of the exchange for split-K (it's None when split-K is disabled).
     SplitK mSplitK{SplitK::None};
+    // Is A matrix in a transposed layout? M major if true, K major otherwise
+    bool mTransposeMatrixA{false};
+    // Is B matrix in a transposed layout? K major if true, N major otherwise
+    bool mTransposeMatrixB{true};
     // Save output of MMA in M-major format.
     bool mTransposeMmaOutput{false};
     // M tile dimension of GEMM.
@@ -421,6 +427,8 @@ inline std::string dumpOptions(GemmOptions const& options)
     ss << "mSplitK="
        << "gemm::SplitK(" << static_cast<int32_t>(options.mSplitK) << ")"
        << "," << std::endl;
+    ss << "mTransposeMatrixA=" << options.mTransposeMatrixA << "," << std::endl;
+    ss << "mTransposeMatrixB=" << options.mTransposeMatrixB << "," << std::endl;
     ss << "mTransposeMmaOutput=" << options.mTransposeMmaOutput << "," << std::endl;
     ss << "mTileM=" << options.mTileM << "," << std::endl;
     ss << "mTileN=" << options.mTileN << "," << std::endl;
@@ -1058,6 +1066,26 @@ inline bool checkAndUpdateGemmOptions(
         "A: If a task triggers a secondary kernel, it must also wait for primary kernel.");
     TLLM_CHECK_ERROR((options.mGridWaitForPrimaryB || !options.mGridTriggerSecondaryB),
         "B: If a task triggers a secondary kernel, it must also wait for primary kernel.");
+
+    // The generation should support non K-major layouts for both A and B; however, it is unclear if
+    // there is a use-case
+    TLLM_CHECK_ERROR(!options.mTransposeMatrixA || options.mTransposeMatrixB,
+        "TransposeA true and TransposeB false is not supported");
+
+    // Some features are currently only support when both matrices are in K-major format
+    if (options.mTransposeMatrixA || !options.mTransposeMatrixB)
+    {
+        TLLM_CHECK_ERROR(isBlackwell, "Non K-major layouts are only supported on Blackwell");
+        TLLM_CHECK_ERROR(options.mSplitK == SplitK::None, "Non K-major layouts do not support split K");
+    }
+    if (options.mTransposeMatrixA)
+    {
+        TLLM_CHECK_ERROR(tg::dtypeGetNumBits(options.mDtypeA) >= 8, "Subbyte types only support K major layout");
+    }
+    if (!options.mTransposeMatrixB)
+    {
+        TLLM_CHECK_ERROR(tg::dtypeGetNumBits(options.mDtypeB) >= 8, "Subbyte types only support K major layout");
+    }
 
     if (updateOptions)
     {

@@ -45,14 +45,40 @@ struct KernelParams
 
     // TMA descriptor for A.
     // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
-    // makeTmaShapeStrideAb. Logical shape is [M, K]. Logical strides are [K, 1]. Tile box shape is
-    // [tileM, tileK]. Tile box strides are [tileK, 1]. Dtype is set from options.mDtypeA.
+    // makeTmaShapeStrideAb.
+    //
+    // If transposeMatrixA is false
+    //   Logical shape is [M, K].
+    //   Logical strides are [K, 1].
+    //   Tile box shape is [tileM, tileK].
+    //   Tile box strides are [tileK, 1].
+    //   Dtype is set from options.mDtypeA.
+    //
+    // If transposeMatrixA is true
+    //   Logical shape is [K, M].
+    //   Logical strides are [M, 1].
+    //   Tile box shape is [tileK, tileM].
+    //   Tile box strides are [tileM, 1].
+    //   Dtype is set from options.mDtypeA.
     CUtensorMap tmaA;
 
     // TMA descriptor for B.
     // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
-    // makeTmaShapeStrideAb. Logical shape is [N, K]. Logical strides are [K, 1]. Tile box shape is
-    // [tileN, tileK]. Tile box strides are [tileK, 1]. Dtype is set from options.mDtypeB.
+    // makeTmaShapeStrideAb.
+    //
+    // If transposeMatrixB is true
+    //   Logical shape is [N, K].
+    //   Logical strides are [K, 1].
+    //   Tile box shape is [tileN, tileK].
+    //   Tile box strides are [tileK, 1].
+    //   Dtype is set from options.mDtypeB.
+    //
+    // If transposeMatrixB is false
+    //   Logical shape is [K, N].
+    //   Logical strides are [N, 1].
+    //   Tile box shape is [tileK, tileN].
+    //   Tile box strides are [tileN, 1].
+    //   Dtype is set from options.mDtypeB.
     CUtensorMap tmaB;
 
     // TMA descriptor for C, (when useTmaStore is true)
@@ -286,6 +312,14 @@ struct KernelParams
         // Swap the first two dimension as mentioned before.
         auto stride = std::vector<uint64_t>{1, static_cast<uint64_t>(hiddenSize)};
 
+        // Apply transpose if necessary
+        if ((matrixType == MatrixType::MatrixA && options.mTransposeMatrixA)
+            || (matrixType == MatrixType::MatrixB && !options.mTransposeMatrixB))
+        {
+            std::swap(shape[0], shape[1]);
+            stride[1] = numTokens;
+        }
+
         return std::make_tuple(shape, stride);
     }
 
@@ -389,7 +423,7 @@ struct KernelParams
             return std::make_tuple(shape, stride, tileShapes);
         }
 
-        default: assert(false);
+        default: throw std::runtime_error("Unsupported SF layout");
         }
         return std::make_tuple(std::vector<uint64_t>{}, std::vector<uint64_t>{}, std::vector<uint32_t>{});
     }
@@ -416,14 +450,16 @@ struct KernelParams
         // Shape/stride for gmem tensor A.
         auto [shapeA, strideA] = makeTmaShapeStrideAb(options, MatrixType::MatrixA);
         // Build tma descriptor for A.
-        params.tmaA = gemm::buildNdTmaDescriptor(options.mDtypeA, options.mMmaKind, shapeA, strideA, options.mTileM,
-            options.mTileK, const_cast<void*>(ptrA));
+        params.tmaA = gemm::buildNdTmaDescriptor(options.mDtypeA, options.mMmaKind, shapeA, strideA,
+            options.mTransposeMatrixA ? options.mTileK : options.mTileM,
+            options.mTransposeMatrixA ? options.mTileM : options.mTileK, const_cast<void*>(ptrA));
 
         // Shape/stride for gmem tensor B.
         auto [shapeB, strideB] = makeTmaShapeStrideAb(options, MatrixType::MatrixB);
         // Build tma descriptor for B.
-        params.tmaB = gemm::buildNdTmaDescriptor(options.mDtypeB, options.mMmaKind, shapeB, strideB, options.mTileN,
-            options.mTileK, const_cast<void*>(ptrB),
+        params.tmaB = gemm::buildNdTmaDescriptor(options.mDtypeB, options.mMmaKind, shapeB, strideB,
+            !options.mTransposeMatrixB ? options.mTileK : options.mTileN,
+            !options.mTransposeMatrixB ? options.mTileN : options.mTileK, const_cast<void*>(ptrB),
             /* swizzle */ !options.mSliceK);
 
         if (options.mDtypeA == tg::Dtype::E2m1 || options.mDtypeA == tg::Dtype::MxE2m1

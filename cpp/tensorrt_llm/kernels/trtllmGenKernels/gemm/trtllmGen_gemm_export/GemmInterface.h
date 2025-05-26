@@ -61,7 +61,10 @@ struct GemmData
     struct InputBuffers
     {
         // The matrix A. The data type is controlled by options.mDtypeA.
-        // The shape is [M, K]. The rightmost dimension is contiguous in memory.
+        //
+        // When transposeMatrixA is false, the shape is [M, K].
+        // Otherwise, the shape is [K, M].
+        // The rightmost dimension is contiguous in memory.
         void const* mPtrA{nullptr};
 
         // The block scaling factors to dequantize A.
@@ -95,7 +98,10 @@ struct GemmData
         void const* mPtrPerTokenSfA{nullptr};
 
         // The matrix B. The data type is controlled by options.mDtypeB.
-        // The shape is [N, K]. The rightmost dimension is contiguous in memory.
+        //
+        // When transposeMatrixB is true, the shape is [N, K].
+        // Otherwise, the shape is [K, N].
+        // The rightmost dimension is contiguous in memory.
         void const* mPtrB{nullptr};
 
         // The scaling factors to dequantize B.
