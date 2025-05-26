@@ -19,7 +19,7 @@ namespace
 {
 // Q {B, S_Q, H, D}
 // KV {B, 2, H, S_KV, D}
-// softmax_sum {2, B, S_Q, H}
+// softmax_sum {B, S_Q, H, 2} // {max/sum}
 // output {B, S_Q, H, D}
 // S_Q <= S_KV
 template <typename T>
@@ -70,8 +70,7 @@ void selfAttentionRef(T* output, T* const Q, T* const KV, int batch_size, int nu
                 }
                 if (return_softmax)
                 {
-                    softmax_sum[batch_size * seq_len_q * num_heads + b * seq_len_q * num_heads + s_q * num_heads + h]
-                        = softmax_max;
+                    softmax_sum[b * seq_len_q * num_heads * 2 + s_q * num_heads * 2 + h * 2] = softmax_max;
                 }
             }
             // softmax
@@ -89,7 +88,7 @@ void selfAttentionRef(T* output, T* const Q, T* const KV, int batch_size, int nu
                 }
                 if (return_softmax)
                 {
-                    softmax_sum[b * seq_len_q * num_heads + s_q * num_heads + h] = sum;
+                    softmax_sum[b * seq_len_q * num_heads * 2 + s_q * num_heads * 2 + h * 2 + 1] = sum;
                 }
             }
             // BMM2
@@ -385,9 +384,9 @@ protected:
                     cudaMemcpyHostToDevice, mStream->get());
                 sync_check_cuda_error(mStream->get());
                 // merge softmax
-                invokeMergeAttnWithSoftmax<DataType>(d_output_accum_ptr, d_softmax_sum_accum_ptr, d_output_accum_ptr,
-                    d_softmax_sum_accum_ptr, d_output_ptr, d_softmax_sum_ptr, this->mBatchSize, this->mChunkSize,
-                    this->mNumHeads, this->mHeadSize, mStream->get());
+                tensorrt_llm::kernels::invokeMergeAttnWithSoftmax<DataType>(d_output_accum_ptr, d_softmax_sum_accum_ptr,
+                    d_output_accum_ptr, d_softmax_sum_accum_ptr, d_output_ptr, d_softmax_sum_ptr, this->mBatchSize,
+                    this->mChunkSize, this->mNumHeads, this->mHeadSize, mStream->get());
                 sync_check_cuda_error(mStream->get());
                 // copy merged softmax sum back to host
                 cudaMemcpyAsync(h_softmax_sum_accum_ptr, d_softmax_sum_accum_ptr,
