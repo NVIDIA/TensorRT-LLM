@@ -961,6 +961,7 @@ class MLA(nn.Module):
         assert q.is_contiguous()
 
         # determine the number of loop
+        # TODO: we should determine the real chunk size from Q s_len and kv_cache s_len
         chunk_unit_size = attn_metadata.runtime_features.chunk_unit_size
         chunked_loop_num = attn_metadata.max_ctx_cached_token_len // chunk_unit_size
         # [token_q, num_heads, 2] -> [token_q, num_heads] float2
@@ -975,27 +976,30 @@ class MLA(nn.Module):
             device=q.device,
         )
         attn_output = None
+        fake_chunked_cu_seq_len = torch.arange(0,
+                                               chunk_unit_size *
+                                               (attn_metadata.num_contexts + 1),
+                                               chunk_unit_size,
+                                               dtype=torch.int64,
+                                               device=q.device)
+        # use fake cached_cu_seq_len for chunked loop
+        attn_metadata.ctx_cached_token_indptr
+        attn_metadata.ctx_cached_token_indptr = fake_chunked_cu_seq_len
         for loop_idx in range(chunked_loop_num):
-            # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim}
+            # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim} zero padded
             # fetch `loop_idx` chunk from kv cache
             chunked_latent_cache = trtllm_attention.load_chunked_kv_cache_for_mla(
                 metadata=attn_metadata, chunked_idx=loop_idx, out_dtype=q.dtype)
-            assert chunked_latent_cache.shape[
-                1] == attn_metadata.runtime_features.chunk_unit_size
+            # assert chunked_latent_cache.shape[
+            #     1] == attn_metadata.runtime_features.chunk_unit_size
             chunked_compressed_kv, chunked_k_pe = chunked_latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
             chunked_compressed_kv = chunked_compressed_kv.contiguous()
             # up proj to uncompressed kv
+            # [tokens, 2, h, kv_dim], without rope_dim
             chunked_kv = self.kv_b_proj(chunked_compressed_kv)
-            chunked_k_nope, chunked_v = chunked_kv.split([
-                self.num_heads * self.qk_nope_head_dim,
-                self.num_heads * self.v_head_dim
-            ],
-                                                         dim=-1)
-            chunked_k_nope = chunked_k_nope.view(-1, self.num_heads,
-                                                 self.qk_nope_head_dim)
-            chunked_v = chunked_v.view(-1, self.num_heads, self.v_head_dim)
+
             # build full_kv
             # full_kv {B, 2, chunk_size / tokens_per_block, h, tokens_per_block, kv_dim + rope_dim}
             tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
@@ -1009,7 +1013,11 @@ class MLA(nn.Module):
                                   dtype=q.dtype,
                                   device=q.device)
             mla_kv_cache_block_offsets = trtllm_attention.set_chunked_kv_cache_for_mla(
-                full_kv, chunked_k_nope, chunked_v, chunked_k_pe, attn_metadata)
+                full_kv,
+                chunked_kv,
+                chunked_k_pe,
+                cached=True,
+                metadata=attn_metadata)
 
             out_scale = None
             temp_attn_output = self.mha.forward(
@@ -1035,11 +1043,6 @@ class MLA(nn.Module):
 
         # deal with the uncached kv
         kv = self.kv_b_proj(compressed_kv)
-        k_nope, v = kv.split([
-            self.num_heads * self.qk_nope_head_dim,
-            self.num_heads * self.v_head_dim
-        ],
-                             dim=-1)
 
         k_pe = k_pe.contiguous()
         # append paged kv cache for mla
@@ -1065,7 +1068,7 @@ class MLA(nn.Module):
                               dtype=q.dtype,
                               device=q.device)
         mla_kv_cache_block_offsets = trtllm_attention.set_chunked_kv_cache_for_mla(
-            full_kv, k_nope, v, k_pe, attn_metadata)
+            full_kv, kv, k_pe, cached=False, metadata=attn_metadata)
 
         temp_attn_output = self.mha.forward(
             q,
