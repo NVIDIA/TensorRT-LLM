@@ -368,8 +368,8 @@ void initRequestBindings(pybind11::module_& m)
                  std::optional<std::chrono::milliseconds>, tle::KvCacheTransferMode, std::optional<std::string>>(),
             py::arg("token_range_retention_configs"),
             py::arg("decode_retention_priority") = tle::KvCacheRetentionConfig::kDefaultRetentionPriority,
-            py::arg("decode_duration_ms") = py::none(), py::arg("transfer_mode") = tle::KvCacheTransferMode::DRAM,
-            py::arg("directory") = py::none())
+            py::arg("decode_duration_ms") = py::none(),
+            py::arg_v("transfer_mode", tle::KvCacheTransferMode::DRAM, "DRAM"), py::arg("directory") = py::none())
         .def_property_readonly(
             "token_range_retention_configs", &tle::KvCacheRetentionConfig::getTokenRangeRetentionConfigs)
         .def_property_readonly("decode_retention_priority", &tle::KvCacheRetentionConfig::getDecodeRetentionPriority)
