@@ -300,15 +300,13 @@ class KVCacheManager(BaseResourceManager):
                                            req_beam_width, req)
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
-                    if req.py_draft_tokens is not None:
-                        for _ in range(len(req.py_draft_tokens)):
-                            self.impl.add_token(req.py_request_id)
+                    for _ in range(len(req.py_draft_tokens)):
+                        self.impl.add_token(req.py_request_id)
 
         for req in generation_batch:
             self.impl.add_token(req.py_request_id)
-            if req.py_draft_tokens is not None:
-                for _ in range(len(req.py_draft_tokens)):
-                    self.impl.add_token(req.py_request_id)
+            for _ in range(len(req.py_draft_tokens)):
+                self.impl.add_token(req.py_request_id)
 
     def add_dummy_requests(
         self,
@@ -328,6 +326,9 @@ class KVCacheManager(BaseResourceManager):
         requests = []
         for i, req_id in enumerate(request_ids):
             sampling_params = SamplingParams()
+            # Here 1+max_num_draft_tokens is used to extend the prompt length to
+            # a non-zero number to skip illegal memory access issue in MLA kernel
+            # during warmup.
             token_num = token_nums[
                 i] if token_nums is not None else 1 + max_num_draft_tokens
             encoder_input_tokens = [
