@@ -197,7 +197,6 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             }
 
             if (CloudManager.isNodeOnline(nodeName)) {
-                // TODO: pass in the gpu numbers instead of hard code it to 1
                 def dockerArgs = "--gpus ${gpuCount} --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
                 slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
                 executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
@@ -1476,12 +1475,12 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     }]]}
     fullSet = parallelJobs.keySet()
 
-    turtleSlurmX86Configs = [
+    slurmX86Configs = [
         "RTXPro6000-PyTorch-[Post-Merge]-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
     ]
-    fullSet += turtleSlurmX86Configs.keySet()
+    fullSet += slurmX86Configs.keySet()
 
-    parallelSlurmJobs = turtleSlurmX86Configs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), {
+    parallelSlurmJobs = slurmX86Configs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), {
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -1503,10 +1502,10 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     ]
     fullSet += aarch64Configs.keySet()
 
-    turtleSlurmAarch64Configs = [
+    slurmSBSAConfigs = [
         "GB200-4_GPUs-PyTorch-[Post-Merge]-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
     ]
-    fullSet += turtleSlurmAarch64Configs.keySet()
+    fullSet += slurmSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = aarch64Configs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), {
@@ -1514,7 +1513,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }]]}
 
         // Add SBSA Slurm jobs
-        parallelSlurmJobs = turtleSlurmAarch64Configs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), {
+        parallelSlurmJobs = slurmSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), {
             def config = LINUX_AARCH64_CONFIG
             if (key.contains("single-device")) {
                 config = SINGLE_DEVICE_CONFIG
