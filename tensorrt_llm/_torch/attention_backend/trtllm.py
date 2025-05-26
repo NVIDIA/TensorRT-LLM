@@ -1092,9 +1092,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def set_chunked_kv_cache_for_mla(
         self,
         paged_kv: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        kv: torch.Tensor,
         k_pe: torch.Tensor,
+        cached: bool,
         metadata: TrtllmAttentionMetadata,
     ) -> torch.Tensor:
         assert self.is_mla_enable and self.mla_params is not None
@@ -1103,30 +1103,32 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert paged_kv.shape[0] == metadata.num_contexts
         assert paged_kv.is_contiguous()
 
-        k = k.contiguous()
-        v = v.contiguous()
+        kv = kv.contiguous()
         k_pe = k_pe.contiguous()
 
         num_contexts = metadata.num_contexts
-        chunk_unit_size = metadata.runtime_features.chunk_unit_size
         tokens_per_block = metadata.kv_cache_manager.tokens_per_block
-
+        if cached:
+            # this indptr is the fake.
+            cu_seq_len = metadata.ctx_cached_token_indptr
+            max_seq_len = metadata.runtime_features.chunk_unit_size
+        else:
+            cu_seq_len = metadata.ctx_kv_indptr
+            max_seq_len = metadata.max_ctx_seq_len
         paged_kv_offsets = torch.ops.trtllm.set_chunked_kv_cache_for_mla(
             paged_kv,
-            k,
-            v,
+            kv,
             k_pe,
             num_contexts,
-            metadata.ctx_cached_token_indptr,
+            cu_seq_len,
             self.num_heads,
             self.mla_params.qk_nope_head_dim,
             self.mla_params.qk_rope_head_dim,
             metadata.kv_cache_manager.tokens_per_block,
-            chunk_unit_size,
+            max_seq_len,
         )
 
-        max_block_num = (chunk_unit_size + tokens_per_block -
-                         1) // tokens_per_block
+        max_block_num = (max_seq_len + tokens_per_block - 1) // tokens_per_block
         assert paged_kv_offsets.shape == (num_contexts, 2, max_block_num)
         return paged_kv_offsets
 
