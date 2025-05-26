@@ -33,7 +33,7 @@ class MoERunner(TunableRunner):
         ep_rank: int,
         cluster_size: int,
         cluster_rank: int,
-        use_fp8_block_scaling: bool,
+        use_deepseek_fp8_block_scale: bool,
         use_w4a8_group_scaling: bool,
     ):
         self.x_dtype = x_dtype
@@ -46,17 +46,17 @@ class MoERunner(TunableRunner):
         self.ep_rank = ep_rank
         self.cluster_size = cluster_size
         self.cluster_rank = cluster_rank
-        self.use_fp8_block_scaling = use_fp8_block_scaling
+        self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
         self.use_w4a8_group_scaling = use_w4a8_group_scaling
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
-                        use_fp8_block_scaling, use_w4a8_group_scaling)
+                        use_deepseek_fp8_block_scale, use_w4a8_group_scaling)
 
         if instance_key not in MoERunner._runner_dict:
             MoERunner._runner_dict[
                 instance_key] = torch.classes.trtllm.FusedMoeRunner(
-                    x_dtype, weight_dtype, output_dtype, use_fp8_block_scaling,
-                    use_w4a8_group_scaling)
+                    x_dtype, weight_dtype, output_dtype,
+                    use_deepseek_fp8_block_scale, use_w4a8_group_scaling)
         self._fused_moe_runner = MoERunner._runner_dict[instance_key]
         self._is_nvfp4 = weight_dtype == torch.int64
 
@@ -125,7 +125,7 @@ def fused_moe(
     ep_rank: int = 0,
     cluster_size: int = 1,
     cluster_rank: int = 0,
-    use_fp8_block_scaling: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
     use_w4a8_group_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
@@ -161,7 +161,7 @@ def fused_moe(
         ep_rank=ep_rank,
         cluster_size=cluster_size,
         cluster_rank=cluster_rank,
-        use_fp8_block_scaling=use_fp8_block_scaling,
+        use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
         use_w4a8_group_scaling=use_w4a8_group_scaling,
     )
 
@@ -219,7 +219,7 @@ def _(
     ep_rank: int = 0,
     cluster_size: int = 1,
     cluster_rank: int = 0,
-    use_fp8_block_scaling: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
     use_w4a8_group_scaling: bool = False,
     min_latency_mode: bool = False,
 ):
