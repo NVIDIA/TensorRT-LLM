@@ -137,7 +137,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     , mDecodingConfig{optionalParams.decodingConfig}
     , mExtendedRuntimePerfKnobConfig{optionalParams.extendedRuntimePerfKnobConfig}
     , mDebugConfig{optionalParams.debugConfig}
-    , mAdditionalModelOutputs{optionalParams.additionalModelOutputs}
+    , mAdditionalModelOutputs{worldConfig.isLastPipelineParallelRank() ? optionalParams.additionalModelOutputs
+                                                                       : std::nullopt}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
     , mRuntime{std::make_shared<TllmRuntime>(rawEngine, mLogger.get(), optionalParams.useGpuDirectStorage,
           optionalParams.gpuWeightsPercent, modelConfig.useShapeInference())}
