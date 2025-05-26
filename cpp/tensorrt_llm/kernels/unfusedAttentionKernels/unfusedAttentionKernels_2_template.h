@@ -319,8 +319,9 @@ inline __device__ void quantizeAndWriteFP4KVCache(uint8_t* kBlockScales, uint8_t
 
     // Despite the name of cvt_warp_fp16_to_fp4, it is used by
     // the quantize op for BF16 as well.
-    kDst[inBlockIdx] = cvt_warp_fp16_to_fp4<T>(kPacked, kSecondLevelSF, kSfOut);
-    vDst[inBlockIdx] = cvt_warp_fp16_to_fp4<T>(vPacked, vSecondLevelSF, vSfOut);
+    constexpr int SF_VEC_SIZE = 16;
+    kDst[inBlockIdx] = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, false>(kPacked, kSecondLevelSF, kSfOut);
+    vDst[inBlockIdx] = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, false>(vPacked, vSecondLevelSF, vSfOut);
 }
 
 template <typename T, typename TCache, int Dh_MAX, bool ADD_BIAS, bool STORE_QKV, typename KVCacheBuffer,

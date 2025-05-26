@@ -135,7 +135,7 @@ class VanillaMoE(nn.ModuleList):
 
         self.has_any_quant = False
         self.has_fp8_qdq = False
-        self.has_fp8_block_scales = False
+        self.has_deepseek_fp8_block_scales = False
         self.has_nvfp4 = False
         gate_up_proj_shape = (
             self.expert_size_per_partition,
@@ -212,7 +212,7 @@ class VanillaMoE(nn.ModuleList):
                     requires_grad=False,
                 )
             elif qc.layer_quant_mode.has_fp8_block_scales():
-                self.has_fp8_block_scales = True
+                self.has_deepseek_fp8_block_scales = True
 
                 self.gate_up_proj_weight = nn.Parameter(
                     torch.empty(

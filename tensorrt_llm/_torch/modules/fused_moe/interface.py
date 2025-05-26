@@ -112,7 +112,7 @@ class MoE(nn.Module):
         )
 
     @property
-    def has_fp8_block_scales(self):
+    def has_deepseek_fp8_block_scales(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_block_scales(
         )
