@@ -15,7 +15,8 @@
 import pytest
 
 from tensorrt_llm._torch import LLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm._torch.pyexecutor.config import (MoeLoadBalancerConfig,
+                                                   PyTorchConfig)
 from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig, SamplingParams
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -511,9 +512,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   pytorch_backend_config=pytorch_config)
         assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
@@ -579,6 +580,38 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             if not fp8kv:
                 task = MMLU(self.MODEL_NAME)
                 task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_device_not_contain(["H100", "H200"])
+    def test_fp8_block_scales_4gpus_static_eplb(self):
+        # OOM on H100 with default free_gpu_memory_fraction=0.9
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+
+        num_experts = 72
+        num_slots = 80
+        first_k_dense_replace = 1
+        num_hidden_layers = 30
+        initial_global_assignments = {}
+        for i in range(first_k_dense_replace, num_hidden_layers):
+            initial_global_assignments[i] = [(i + j) % num_experts
+                                             for j in range(num_slots)]
+        eplb_config = MoeLoadBalancerConfig(
+            num_slots=num_slots,
+            initial_global_assignments=initial_global_assignments,
+            layer_updates_per_iter=0)
+        pytorch_config = PyTorchConfig(use_cuda_graph=True,
+                                       moe_load_balancer=eplb_config)
+        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                  tensor_parallel_size=4,
+                  moe_expert_parallel_size=4,
+                  kv_cache_config=kv_cache_config,
+                  pytorch_backend_config=pytorch_config,
+                  enable_attention_dp=True)
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
