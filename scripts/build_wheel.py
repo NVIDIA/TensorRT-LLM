@@ -217,7 +217,6 @@ def main(*,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
-         python_bindings: bool = True,
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
@@ -680,11 +679,6 @@ def add_arguments(parser: ArgumentParser):
         "--linking_install_binary",
         action="store_true",
         help="Install the built binary by symbolic linking instead of copying.")
-    parser.add_argument(
-        "--python_bindings",
-        "-p",
-        action="store_true",
-        help="(deprecated) Build the python bindings for the C++ runtime.")
     parser.add_argument("--benchmarks",
                         action="store_true",
                         help="Build the benchmarks for the C++ runtime.")
