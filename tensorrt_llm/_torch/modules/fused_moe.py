@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._mnnvl_utils import MnnvlMoe, MoEAlltoallInfo
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, logger
 from tensorrt_llm.quantization.utils.fp4_utils import (
     get_reorder_rows_for_gated_act_gemm_row_indices,
     get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices,
@@ -16,10 +16,11 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
-from ..model_config import ModelConfig
+from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                      reswizzle_sf, swizzle_sf, unswizzle_sf)
 from .linear import TensorParallelMode, load_weight_shard
+from .moe_load_balancer import MoeLoadBalancer
 
 # The declarations aligns with moe_kernels.h
 # pack inputs into int64, e.g. 4 x bf16 input values
@@ -367,6 +368,8 @@ class FusedMoE(nn.Module):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         enable_alltoall: bool = False,
+        moe_load_balancer: Optional[MoeLoadBalancer] = None,
+        layer_idx: Optional[int] = None,
     ):
         from ..distributed import AllReduce
 
@@ -404,25 +407,46 @@ class FusedMoE(nn.Module):
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
-        # self.expert_slots_per_partition will be replaced with real slots_per_partition to enable redundant expert slots
-        self.expert_slots_per_partition = num_experts // self.ep_size
-        assert self.expert_slots_per_partition * self.ep_size >= num_experts, "total slots should be at lease num_experts"
-        if self.smart_router:
-            assert self.expert_slots_per_partition == num_experts // self.ep_size,\
-                "Smart router should not have redundant slots"
-        self.num_slots = self.expert_slots_per_partition * self.ep_size
-        # Here the meaning of expert_size_per_partition is the number of expert slots that each rank has.
-        self.expert_size_per_partition = self.expert_slots_per_partition
-        self.slot_start = self.ep_rank * self.expert_size_per_partition
-        self.slot_end = self.slot_start + self.expert_size_per_partition
+        moe_load_balancer_config = model_config.moe_load_balancer
+        if moe_load_balancer_config is None:
+            assert moe_load_balancer is None
+            # A dummy MoeLoadBalancerConfig to generate default initial_global_assignments and initial_local_expert_ids
+            moe_load_balancer_config = MoeLoadBalancerConfig()
+            moe_load_balancer_config.setup(num_experts=num_experts,
+                                           ep_rank=self.ep_rank,
+                                           ep_size=self.ep_size)
+        else:
+            assert moe_load_balancer is not None
 
-        self.initial_global_assignments = [
-            (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
-            self.num_experts for ep_rank in range(self.ep_size)
-            for local_slot_id in range(self.expert_slots_per_partition)
-        ]
+        self.num_slots = moe_load_balancer_config.num_slots
+        if self.smart_router:
+            assert self.num_slots == self.num_experts, "Smart router should not have redundant slots"
+
+        self.initial_global_assignments = moe_load_balancer_config.get_layer_initial_global_assignments(
+            layer_idx)
+        self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
+        self.slot_start = moe_load_balancer_config.slot_start
+        self.slot_end = moe_load_balancer_config.slot_end
         self.initial_local_expert_ids = self.initial_global_assignments[
             self.slot_start:self.slot_end]
+        assert len(
+            self.initial_local_expert_ids) == self.expert_size_per_partition
+
+        self.balancer_layer = None
+        if moe_load_balancer is not None:
+            self.balancer_layer = moe_load_balancer.add_layer(
+                expert_count=num_experts,
+                top_k=routing_method.experts_per_token,
+                slot_count_per_rank=self.expert_size_per_partition,
+            )
+            self.balancer_layer.set_initial_weight_assignments(
+                self.initial_global_assignments)
+            logger.info(
+                f"MoE load balancer enabled. num_experts = {num_experts}, num_slots = {self.num_slots}, ep_size = {self.ep_size}"
+            )
+            logger.info(
+                f"initial_global_assignments (layer {layer_idx}) = {self.initial_global_assignments}"
+            )
 
         max_num_tokens = model_config.max_num_tokens
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
@@ -854,13 +878,18 @@ class FusedMoE(nn.Module):
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
             router_logits)
+        if self.balancer_layer is None:
+            token_selected_slots = token_selected_experts
+        else:
+            token_selected_slots = self.balancer_layer.route(
+                token_selected_experts)
 
-        assert token_selected_experts.shape[
+        assert token_selected_slots.shape[
             1] == self.routing_method.experts_per_token
-        assert token_selected_experts.shape == token_final_scales.shape
-        assert token_selected_experts.shape[0] == router_logits.shape[0]
+        assert token_selected_slots.shape == token_final_scales.shape
+        assert token_selected_slots.shape[0] == router_logits.shape[0]
         assert token_final_scales.dtype == torch.float32
-        assert token_selected_experts.dtype == torch.int32
+        assert token_selected_slots.dtype == torch.int32
 
         if self.apply_router_weight_on_input:
             x = x * token_final_scales.to(x.dtype)
@@ -872,10 +901,10 @@ class FusedMoE(nn.Module):
         alltoall_info = None
 
         if self.enable_alltoall:
-            x, token_selected_experts, token_final_scales, alltoall_info = \
+            x, token_selected_slots, token_final_scales, alltoall_info = \
                 self.alltoall_prepare_maybe_dispatch(all_rank_num_tokens,
                                                      x,
-                                                     token_selected_experts,
+                                                     token_selected_slots,
                                                      token_final_scales)
 
         x_sf = None
@@ -910,15 +939,15 @@ class FusedMoE(nn.Module):
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
             if x_sf is None:
-                x, token_selected_experts, token_final_scales = allgather(
-                    [x, token_selected_experts, token_final_scales],
+                x, token_selected_slots, token_final_scales = allgather(
+                    [x, token_selected_slots, token_final_scales],
                     self.mapping,
                     dim=0,
                     sizes=None if use_dp_padding else all_rank_num_tokens)
             else:
                 # Fp4 gemm has extra scaling factor
-                x, x_sf, token_selected_experts, token_final_scales = allgather(
-                    [x, x_sf, token_selected_experts, token_final_scales],
+                x, x_sf, token_selected_slots, token_final_scales = allgather(
+                    [x, x_sf, token_selected_slots, token_final_scales],
                     self.mapping,
                     dim=0,
                     sizes=None if use_dp_padding else all_rank_num_tokens)
@@ -953,7 +982,7 @@ class FusedMoE(nn.Module):
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
-            token_selected_experts,
+            token_selected_slots,
             token_final_scales,
             w3_w1_weight.view(weight_dtype),
             w2_weight.view(weight_dtype),
@@ -1234,31 +1263,29 @@ class FusedMoE(nn.Module):
 
     def alltoall_prepare_maybe_dispatch(self, all_rank_num_tokens: list,
                                         x: torch.Tensor,
-                                        token_selected_experts: torch.Tensor,
+                                        token_selected_slots: torch.Tensor,
                                         token_final_scales: torch.Tensor):
         top_k = self.routing_method.experts_per_token
         expert_count = self.num_experts
         # gather router info
         max_num_token = max(all_rank_num_tokens)
-        token_selected_experts = torch.nn.functional.pad(
-            token_selected_experts,
-            (0, 0, 0, max_num_token - token_selected_experts.shape[0]),
+        token_selected_slots = torch.nn.functional.pad(
+            token_selected_slots,
+            (0, 0, 0, max_num_token - token_selected_slots.shape[0]),
             'constant', self.num_experts)
         token_final_scales = torch.nn.functional.pad(
             token_final_scales,
             (0, 0, 0, max_num_token - token_final_scales.shape[0]))
-        gathered_token_selected_experts, gathered_token_final_scales = allgather(
-            [token_selected_experts, token_final_scales], self.mapping, dim=0)
-        gathered_token_selected_experts = torch.flatten(
-            gathered_token_selected_experts.contiguous(),
-            start_dim=0,
-            end_dim=-2)
+        gathered_token_selected_slots, gathered_token_final_scales = allgather(
+            [token_selected_slots, token_final_scales], self.mapping, dim=0)
+        gathered_token_selected_slots = torch.flatten(
+            gathered_token_selected_slots.contiguous(), start_dim=0, end_dim=-2)
         gathered_token_final_scales = torch.flatten(
             gathered_token_final_scales.contiguous(), start_dim=0, end_dim=-2)
         gathered_target_rank_ids = MnnvlMoe.compute_target_rank_id(
-            gathered_token_selected_experts, self.num_experts, self.ep_size)
-        alltoall_info, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
-            gathered_target_rank_ids, None, gathered_token_selected_experts,
+            gathered_token_selected_slots, self.num_experts, self.ep_size)
+        alltoall_info, token_selected_slots, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
+            gathered_target_rank_ids, None, gathered_token_selected_slots,
             gathered_token_final_scales, max_num_token, expert_count, top_k,
             self.ep_rank, self.ep_size)
 
@@ -1270,7 +1297,7 @@ class FusedMoE(nn.Module):
                                              self.alltoall_workspace,
                                              self.ep_rank, self.ep_size)
 
-        return x, token_selected_experts, token_final_scales, alltoall_info
+        return x, token_selected_slots, token_final_scales, alltoall_info
 
     def alltoall_postquant_dispatch(self, x: torch.Tensor, x_sf: torch.Tensor,
                                     x_row: int, x_col: int,
