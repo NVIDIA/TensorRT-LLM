@@ -25,7 +25,6 @@
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
-#include "tensorrt_llm/batch_manager/generateRequestOptions.h"
 #include "tensorrt_llm/batch_manager/guidedDecoder.h"
 #include "tensorrt_llm/batch_manager/handleContextLogits.h"
 #include "tensorrt_llm/batch_manager/handleGenerationLogits.h"
@@ -138,7 +137,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     , mDecodingConfig{optionalParams.decodingConfig}
     , mExtendedRuntimePerfKnobConfig{optionalParams.extendedRuntimePerfKnobConfig}
     , mDebugConfig{optionalParams.debugConfig}
-    , mAdditionalModelOutputs{optionalParams.additionalModelOutputs}
+    , mAdditionalModelOutputs{worldConfig.isLastPipelineParallelRank() ? optionalParams.additionalModelOutputs
+                                                                       : std::nullopt}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
     , mRuntime{std::make_shared<TllmRuntime>(rawEngine, mLogger.get(), optionalParams.useGpuDirectStorage,
           optionalParams.gpuWeightsPercent, modelConfig.useShapeInference())}
@@ -441,7 +441,6 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     mPauseRequests = std::make_unique<PauseRequests>(getMaxInputLen());
     mAssignReqSeqSlots = std::make_unique<AssignReqSeqSlots>();
     mAllocateKvCache = std::make_unique<AllocateKvCache>();
-    mCreateNewDecoderRequests = std::make_unique<CreateNewDecoderRequests>();
 
     if (isCudaGraphMode())
     {
@@ -463,7 +462,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
     }
 
-    mGenerateRequestOptions = std::make_unique<GenerateRequestOptions>(
+    mCreateNewDecoderRequests = std::make_unique<CreateNewDecoderRequests>(
         mSpeculativeDecodingFastLogits, mIsLeaderInOrchMode, isNormalizeLogProbs());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -1776,17 +1775,13 @@ void TrtGptModelInflightBatching::setupDecoderStep(
     {
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
 
-        auto [batchSlots, decoderRequests, samplingConfigs] = (*mGenerateRequestOptions)(mModelConfig, mWorldConfig,
+        auto [batchSlots, decoderRequests, samplingConfigs] = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig,
             mDecodingConfig, contextRequests, mRuntime->getBufferManager(), logitsType, inputBuffers,
-            mDecoder->getDecoderState(), mOperatingBeamWidth, mRuntime->getStream(), buffers);
+            mDecoder->getDecoderState(), mRuntime->getStream(), *mDecoder->getDecoderStream(), getMaxSequenceLen(),
+            mOperatingBeamWidth, buffers.medusaBuffers);
 
         if (!decoderRequests.empty())
         {
-            NVTX3_SCOPED_RANGE(decoderNewRequests);
-
-            (*mCreateNewDecoderRequests)(batchSlots, decoderRequests, samplingConfigs, mModelConfig, *mDecoder,
-                mRuntime->getStream(), getMaxSequenceLen());
-
             // Setup underlying decoder.
             auto const localBatchSize = batchSlots->getSize();
             auto samplingConfig = SamplingConfig(samplingConfigs);
