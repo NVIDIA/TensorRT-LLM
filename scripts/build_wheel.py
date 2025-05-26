@@ -67,15 +67,14 @@ def clear_folder(folder_path):
             os.remove(item_path)
 
 
-def setup_venv(*, project_dir: Path, requirements_file: Path, clean: bool):
+def setup_venv(*, project_dir: Path, clean: bool):
     """Creates/updates a venv and installs requirements.
 
     Args:
         project_dir: The root directory of the project.
-        requirements_file: Path to the requirements file.
 
     Returns:
-        Tuple[Path, Path]: Paths to the python and conan executables in the venv.
+        Path: Path to the venv.
     """
     py_major = sys.version_info.major
     py_minor = sys.version_info.minor
@@ -101,38 +100,26 @@ def setup_venv(*, project_dir: Path, requirements_file: Path, clean: bool):
     else:
         print("-- Virtual environment already exists.")
 
-    # Determine venv executable paths
-    scripts_dir = venv_dir / "bin"
-    venv_python = scripts_dir / "python"
-
-    # Install/update requirements
-    print(
-        f"-- Installing requirements from {requirements_file} into {venv_dir}..."
-    )
-    build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
-
-    venv_conan = setup_conan(scripts_dir=scripts_dir, venv_python=venv_python)
-
-    return venv_python, venv_conan
+    return venv_dir
 
 
-def setup_conan(*, scripts_dir, venv_python):
-    build_run(f'"{venv_python}" -m pip install conan==2.14.0')
+def setup_conan(*, scripts_dir, python_executable):
+    build_run(f'"{python_executable}" -m pip install conan==2.14.0')
     # Determine the path to the conan executable within the venv
-    venv_conan = scripts_dir / "conan"
-    if not venv_conan.exists():
+    conan_executable = scripts_dir / "conan"
+    if not conan_executable.exists():
         # Attempt to find it using shutil.which as a fallback, in case it's already installed in the system
         try:
             result = build_run(
-                f'''{venv_python} -c "import shutil; print(shutil.which('conan'))" ''',
+                f'''{python_executable} -c "import shutil; print(shutil.which('conan'))" ''',
                 capture_output=True,
                 text=True)
             conan_path_str = result.stdout.strip()
 
             if conan_path_str:
-                venv_conan = Path(conan_path_str)
+                conan_executable = Path(conan_path_str)
                 print(
-                    f"-- Found conan executable via PATH search at: {venv_conan}"
+                    f"-- Found conan executable via PATH search at: {conan_executable}"
                 )
             else:
                 raise RuntimeError(
@@ -147,21 +134,21 @@ def setup_conan(*, scripts_dir, venv_python):
                 f"Failed to locate conan executable in virtual environment {scripts_dir} or system PATH."
             )
     else:
-        print(f"-- Found conan executable at: {venv_conan}")
+        print(f"-- Found conan executable at: {conan_executable}")
 
     # Create default profile
-    build_run(f'"{venv_conan}" profile detect -f')
+    build_run(f'"{conan_executable}" profile detect -f')
 
     # Add the tensorrt-llm remote if it doesn't exist
     build_run(
-        f'"{venv_conan}" remote add --force tensorrt-llm https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan',
+        f'"{conan_executable}" remote add --force tensorrt-llm https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan',
         stdout=DEVNULL,
         stderr=DEVNULL)
 
-    return venv_conan
+    return conan_executable
 
 
-def generate_fmha_cu(project_dir, venv_python):
+def generate_fmha_cu(project_dir):
     fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
     fmha_v2_cu_dir.mkdir(parents=True, exist_ok=True)
 
@@ -221,8 +208,8 @@ def main(*,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
          skip_stubs: bool = False,
-         generate_fmha: bool = False):
-
+         generate_fmha: bool = False,
+         no_venv: bool = False):
     if clean:
         clean_wheel = True
 
@@ -241,15 +228,30 @@ def main(*,
         build_run('git submodule update --init --recursive')
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
+    requirements_file = project_dir / requirements_filename
 
-    # Setup venv and install requirements
-    venv_python, venv_conan = setup_venv(project_dir=project_dir,
-                                         requirements_file=project_dir /
-                                         requirements_filename,
-                                         clean=clean)
+    if not no_venv:
+        # Setup venv and install requirements
+        venv_dir = setup_venv(project_dir=project_dir, clean=clean)
 
-    # Ensure base TRT is installed (check inside the venv)
-    reqs = check_output([str(venv_python), "-m", "pip", "freeze"])
+        # Determine venv executable paths
+        scripts_dir = venv_dir / "bin"
+        python_executable = str(scripts_dir / "python")
+    else:
+        python_executable = sys.executable
+
+    # Install/update requirements
+    print(
+        f"-- Installing requirements from {requirements_file} into {venv_dir if not no_venv else 'system'}..."
+    )
+    build_run(f'"{python_executable}" -m pip install -r "{requirements_file}"')
+
+    conan_executable = setup_conan(scripts_dir=scripts_dir,
+                                   python_executable=python_executable)
+
+    # Ensure TRT is installed on windows to prevent surprises.
+    reqs = check_output([python_executable, "-m", "pip", "freeze"])
+
     installed_packages = [r.decode().split("==")[0] for r in reqs.split()]
     if "tensorrt" not in installed_packages:
         error_msg = "TensorRT was not installed properly."
@@ -260,7 +262,7 @@ def main(*,
                 " See https://docs.nvidia.com/deeplearning/tensorrt/install-guide/index.html#installing-zip for more details."
             )
         else:
-            error_msg += f" Please install tensorrt into the venv using \"`{venv_python}` -m pip install tensorrt\" and relaunch build_wheel.py"
+            error_msg += f" Please install tensorrt using \"`{python_executable}` -m pip install tensorrt\" and relaunch build_wheel.py"
         raise RuntimeError(error_msg)
 
     if cuda_architectures is not None:
@@ -351,14 +353,14 @@ def main(*,
     fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
     if clean or generate_fmha:
         build_run(f"rm -rf {fmha_v2_cu_dir}")
-        generate_fmha_cu(project_dir, venv_python)
+        generate_fmha_cu(project_dir)
     elif not fmha_v2_cu_dir.exists():
-        generate_fmha_cu(project_dir, venv_python)
+        generate_fmha_cu(project_dir)
 
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
             build_run(
-                f"\"{venv_conan}\" install --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f'"{conan_executable}" install --remote=tensorrt-llm --output-folder={build_dir}/conan -s "build_type={build_type}" {source_dir}'
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
@@ -372,7 +374,7 @@ def main(*,
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
                 f' -DBUILD_WHEEL_TARGETS="{";".join(targets)}"'
-                f' -DPython_EXECUTABLE={venv_python} -DPython3_EXECUTABLE={venv_python}'
+                f' -DPython_EXECUTABLE={python_executable} -DPython3_EXECUTABLE={python_executable}'
                 f' {cmake_cuda_architectures} {cmake_def_args} {cmake_generator} -S "{source_dir}"'
             )
             print("CMake Configure command: ")
@@ -535,7 +537,8 @@ def main(*,
         install_file(get_pybind_lib(), pkg_dir)
         if not skip_stubs:
             with working_directory(project_dir):
-                build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
+                build_run(
+                    f'"{python_executable}" -m pip install pybind11-stubgen')
             with working_directory(pkg_dir):
                 if on_windows:
                     stubgen = "stubgen.py"
@@ -557,7 +560,7 @@ def main(*,
                         main()
                     """.format(lib_dir=lib_dir)
                     (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
-                    build_run(f"\"{venv_python}\" {stubgen} -o . bindings")
+                    build_run(f'"{python_executable}" {stubgen} -o . bindings')
                     (pkg_dir / stubgen).unlink()
                 else:
                     env_ld = os.environ.copy()
@@ -568,7 +571,7 @@ def main(*,
                     env_ld["LD_LIBRARY_PATH"] = new_library_path
                     try:
                         build_run(
-                            f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
+                            f'"{python_executable}" -m pybind11_stubgen -o . bindings --exit-code',
                             env=env_ld)
                     except CalledProcessError as ex:
                         print(f"Failed to build pybind11 stubgen: {ex}",
@@ -593,7 +596,7 @@ def main(*,
             clear_folder(dist_dir)
 
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
+            f'"{python_executable}" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"'
         )
 
     if install:
@@ -694,6 +697,9 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--generate_fmha",
                         action="store_true",
                         help="Generate the FMHA cu files.")
+    parser.add_argument("--no_venv",
+                        action="store_true",
+                        help="Do not create a virtual environment.")
 
 
 if __name__ == "__main__":
