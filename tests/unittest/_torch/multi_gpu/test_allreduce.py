@@ -27,6 +27,7 @@ from utils.util import skip_pre_blackwell
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.mapping import Mapping
@@ -123,7 +124,7 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
     ).cuda()
     norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
 
-    allreduce = AllReduce(mapping=mapping).cuda()
+    allreduce = AllReduce(model_config=ModelConfig(mapping=mapping)).cuda()
 
     scale = torch.tensor(1.0, dtype=torch.float32).cuda()
     linear.load_weights([dict(weight=weights[0])])
