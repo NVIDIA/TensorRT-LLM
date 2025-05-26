@@ -49,12 +49,16 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
                   kubernetes.io/arch: ${arch}"""
 
     if (build_wheel && arch == "arm64") {
-        // For aarch64, we need to use lws to fix the ucxx issue when building wheels
+        // For aarch64, we need to use hostname to fix the ucxx issue when building wheels
         selectors = """
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux
-                  nvidia.com/lws: true
-                  kubernetes.io/arch: ${arch}"""
+                  kubernetes.io/arch: ${arch}
+                  matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: Regexp
+                    values:
+                    - ".*\\.ipp2u1\\.colossus$"""
     }
 
     switch(type)
