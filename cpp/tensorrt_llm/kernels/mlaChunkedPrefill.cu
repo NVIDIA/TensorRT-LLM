@@ -80,8 +80,9 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float* merged_softmax
 
     int const global_attn_offset = batch_idx * chunked_token_size * num_heads * head_size
         + token_idx * num_heads * head_size + head_idx * head_size;
-    int const global_softmax_sum_offset = batch_idx * chunked_token_size * num_heads + token_idx * num_heads + head_idx;
-    int const global_softmax_max_offset = global_softmax_sum_offset + batch_size * chunked_token_size * num_heads;
+    int const global_softmax_sum_offset
+        = (((batch_idx * chunked_token_size * num_heads) + (token_idx * num_heads) + head_idx) * 2) + 1;
+    int const global_softmax_max_offset = global_softmax_sum_offset - 1;
     auto* merged_attn_ptr = merged_attn + global_attn_offset;
     auto* merged_softmax_sum_ptr = merged_softmax_sum + global_softmax_sum_offset;
     auto* merged_softmax_max_ptr = merged_softmax_sum + global_softmax_max_offset;
@@ -234,7 +235,7 @@ namespace kernels
 {
 
 // merged_attn [B, S, H=128, D=128] (T)
-// merged_softmax_sum [2, B, S, H] (float), the first part is the softmax sum, the second part is the max value for each
+// merged_softmax_sum [B, S, H, 2] (float), the first part is the softmax sum, the second part is the max value for each
 // row of P = QK^T we just ignore the second part.
 template <typename T>
 void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_sum, T* const pre_attn,
