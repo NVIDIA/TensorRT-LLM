@@ -29,6 +29,9 @@
 namespace batchedGemm
 {
 
+namespace batchedGemm
+{
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // BatchedGemmData
@@ -84,7 +87,7 @@ struct BatchedGemmData
 
     struct InputBuffers
     {
-        // The matrix A. The data type is controlled by options.mDtypeElt.
+        // The matrix A. The data type is controlled by options.mDtypeA.
         //
         // If (routeAct == true && batchM), the shape is [M, K]
         // Else
@@ -137,7 +140,7 @@ struct BatchedGemmData
         //
         void const* mPtrPerTokenSfA{nullptr};
 
-        // The matrix B. The data type is controlled by options.mDtypeElt.
+        // The matrix B. The data type is controlled by options.mDtypeB.
         //
         // If (routeAct == true && batchN), the shape is [N, K]
         //
@@ -547,7 +550,8 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     auto options = getOptionsFromConfigAndData(config, batchedGemmData);
 
     bool const batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
-    bool const useDeepSeekFp8 = options.mUseDeepSeekFp8 && options.mDtypeElt == tg::Dtype::E4m3;
+    bool const useDeepSeekFp8
+        = options.mUseDeepSeekFp8 && options.mDtypeA == tg::Dtype::E4m3 && options.mDtypeB == tg::Dtype::E4m3;
 
     auto workspaceSizes = getWorkspaceSizesInBytes(config, batchedGemmData);
     float* dPtrRowMax{nullptr};
@@ -642,3 +646,5 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
 } // namespace batchedGemm
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+} // namespace batchedGemm

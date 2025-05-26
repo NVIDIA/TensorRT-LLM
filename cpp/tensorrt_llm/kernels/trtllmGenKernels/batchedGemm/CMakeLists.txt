@@ -20,7 +20,7 @@ file(GLOB_RECURSE SRC_CU *.cu)
 
 filter_cuda_archs("100" SRC_CPP)
 
-add_library(trtllm_gen_batched_gemm OBJECT ${SRC_CPP} ${SRC_CU})
+add_library(trtllm_gen_batched_gemm OBJECT ${SRC_CPP} ${SRC_CPP})
 target_compile_definitions(trtllm_gen_batched_gemm
                            PUBLIC TLLM_GEN_EXPORT_INTERFACE TLLM_ENABLE_CUDA)
 

@@ -19,100 +19,138 @@
 
 #include "BatchedGemmOptions.h"
 
+namespace batchedGemm
+{
+
 namespace tensorrt_llm
 {
 namespace kernels
 {
 // clang-format off
 
-#define TLLM_GEN_COMMIT "2a3144fd"
-#define TLLM_GEN_EXPORT_VERSION "5.0.2.0.1.0"
+#define TLLM_GEN_COMMIT "1afbaceb"
+#define TLLM_GEN_EXPORT_VERSION "6.0.3.0.2.0"
 
-static constexpr size_t tllmGenBatchedGemmListLen = 32;
+static constexpr size_t tllmGenBatchedGemmListLen = 48;
 
 #ifndef EXCLUDE_SM_100
-extern unsigned char BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x256_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x256u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E2m1Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E2m1Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
-extern unsigned char BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x256_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x256u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x128x128u2_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x16x128_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x16x128u2_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x32x128_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x32x128u2_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x64x128_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x64x128u2_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x128x128u2_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x16x128_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x16x128u2_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x32x128_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x32x128u2_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x64x128_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x64x128u2_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
+extern unsigned char BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin[];
 #endif // EXCLUDE_SM_100
 
 #ifndef EXCLUDE_SM_100
-extern unsigned int BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x256_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x256u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E2m1Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E2m1Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
-extern unsigned int BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x256_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x256u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x128x128u2_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x16x128_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x16x128u2_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x32x128_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x32x128u2_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x64x128_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x64x128u2_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x128x128u2_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x16x128_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x16x128u2_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x32x128_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x32x128u2_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x64x128_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x64x128u2_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
+extern unsigned int BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len;
 #endif // EXCLUDE_SM_100
 
 
 static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 #ifndef EXCLUDE_SM_100
-{BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x256_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x256_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len, 126976, "BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x256_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a", 480, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x256_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x256_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len, 126976, "BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x256_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a", 480, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(17826819)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -120,12 +158,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -171,16 +210,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x256u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x256u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len, 126976, "BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x256u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a", 480, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x256u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x256u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len, 126976, "BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x256u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a", 480, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(17826819)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -188,12 +230,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -239,16 +282,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len, 166912, "BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a", 480, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len, 166912, "BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a", 480, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(17826819)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -256,12 +302,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -307,16 +354,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 166912, "BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 166912, "BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(17826819)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -324,12 +374,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -375,16 +426,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len, 166912, "BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a", 480, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len, 166912, "BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_persistent_sm100a", 480, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(17826819)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -392,12 +446,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -443,16 +498,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 166912, "BatchedGemmKernel_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 166912, "BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(17826819)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -460,12 +518,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -511,16 +570,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin_len, 165888, "BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a", 480, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin_len, 165888, "BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a", 480, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(17826819)
-, /* mDtypeC */ trtllm::gen::Dtype(17826819)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
+, /* mDtypeC */ trtllm::gen::Dtype(17826818)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -528,12 +590,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -579,16 +642,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 165888, "BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 165888, "BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(17826819)
-, /* mDtypeC */ trtllm::gen::Dtype(17826819)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
+, /* mDtypeC */ trtllm::gen::Dtype(17826818)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -596,12 +662,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -647,16 +714,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin_len, 165888, "BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a", 480, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin_len, 165888, "BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a", 480, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(17826819)
-, /* mDtypeC */ trtllm::gen::Dtype(17826819)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
+, /* mDtypeC */ trtllm::gen::Dtype(17826818)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -664,12 +734,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -715,16 +786,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 165888, "BatchedGemmKernel_BatchN_E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 165888, "BatchedGemmKernel_BatchN_E2m1E2m1Fp32_E2m1_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(17826819)
-, /* mDtypeC */ trtllm::gen::Dtype(17826819)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
+, /* mDtypeC */ trtllm::gen::Dtype(17826818)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -732,12 +806,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -783,16 +858,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E2m1Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 166912, "BatchedGemmKernel_BatchN_E2m1Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 166912, "BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(17826819)
-, /* mDtypeC */ trtllm::gen::Dtype(1052680)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
+, /* mDtypeC */ trtllm::gen::Dtype(1052679)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -800,12 +878,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -851,16 +930,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E2m1Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 166912, "BatchedGemmKernel_BatchN_E2m1Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 166912, "BatchedGemmKernel_BatchN_E2m1E2m1Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(17826819)
-, /* mDtypeC */ trtllm::gen::Dtype(1052680)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
+, /* mDtypeC */ trtllm::gen::Dtype(1052679)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -868,12 +950,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -919,16 +1002,595 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len, 148480, "BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len, 175104, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 128
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 128
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 128
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 0
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(1)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 0
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x128x128u2_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x128x128u2_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len, 175104, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x128x128u2_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 128
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 128
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 128
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 1
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(1)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 0
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x16x128_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x16x128_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len, 84992, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x16x128_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 16
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 16
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 16
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 0
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(1)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 0
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x16x128u2_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x16x128u2_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len, 84992, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x16x128u2_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 16
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 16
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 16
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 1
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(1)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 0
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x32x128_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x32x128_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len, 97280, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x32x128_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 32
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 32
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 32
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 0
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(1)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 0
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x32x128u2_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x32x128u2_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len, 97280, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x32x128u2_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 32
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 32
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 32
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 1
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(1)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 0
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x64x128_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x64x128_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len, 123904, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x64x128_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 64
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 64
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 64
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 0
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(1)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 0
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x64x128u2_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x64x128u2_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len, 123904, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x64x128u2_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 64
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 64
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 64
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 1
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(1)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 0
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len, 149504, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 64
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -936,12 +1598,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 64
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -987,16 +1650,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len, 61440, "BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a", 384, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len, 61440, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a", 384, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 64
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1004,12 +1670,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 64
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1022,7 +1689,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
-, /* mUseShuffledMatrixA */ 1
+, /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
 , /* mTransposeMmaOutput */ 1
@@ -1055,16 +1722,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len, 148480, "BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a_cubin_len, 149504, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_persistent_sm100a", 448, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 64
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1072,12 +1742,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 64
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1123,16 +1794,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len, 61440, "BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a", 384, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len, 61440, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a", 384, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 64
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1140,12 +1814,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 64
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1158,7 +1833,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
-, /* mUseShuffledMatrixA */ 1
+, /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
 , /* mTransposeMmaOutput */ 1
@@ -1191,16 +1866,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len, 217088, "BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a", 256, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len, 217088, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a", 256, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1208,12 +1886,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1259,16 +1938,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 217088, "BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 217088, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1276,12 +1958,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1327,16 +2010,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len, 217088, "BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a", 256, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a_cubin_len, 217088, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_persistent_sm100a", 256, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1344,12 +2030,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1395,16 +2082,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 217088, "BatchedGemmKernel_BatchN_E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 217088, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Bfloat16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
 , /* mDtypeC */ trtllm::gen::Dtype(1052672)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1412,12 +2102,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1463,16 +2154,595 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len, 148480, "BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len, 158720, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
-, /* mDtypeC */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 128
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 128
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 128
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 0
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(0)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 1
+, /* mGridWaitForPrimaryRouting */ 1
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x128x128u2_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x128x128u2_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len, 158720, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x128x128u2_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 128
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 128
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 128
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 1
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(0)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 1
+, /* mGridWaitForPrimaryRouting */ 1
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x16x128_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x16x128_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len, 82944, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x16x128_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 16
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 16
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 16
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 0
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(0)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 1
+, /* mGridWaitForPrimaryRouting */ 1
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x16x128u2_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x16x128u2_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len, 82944, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x16x128u2_EpiTile64x16_Mma64x16x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 16
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 16
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 16
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 1
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(0)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 1
+, /* mGridWaitForPrimaryRouting */ 1
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x32x128_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x32x128_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len, 93184, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x32x128_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 32
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 32
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 32
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 0
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(0)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 1
+, /* mGridWaitForPrimaryRouting */ 1
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x32x128u2_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x32x128u2_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len, 93184, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x32x128u2_EpiTile64x32_Mma64x32x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 32
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 32
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 32
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 1
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(0)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 1
+, /* mGridWaitForPrimaryRouting */ 1
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x64x128_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x64x128_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len, 115712, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x64x128_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 64
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 64
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 64
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 0
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(0)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 1
+, /* mGridWaitForPrimaryRouting */ 1
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x64x128u2_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x64x128u2_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len, 115712, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x64x128u2_EpiTile64x64_Mma64x64x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 64
+, /* mEpilogueTileN */ 64
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 1
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 64
+, /* mMmaN */ 64
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 4
+, /* mNumStagesMmaWithinWorkTile */ 2
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mUseShuffledMatrixA */ 0
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 64
+, /* mTileK */ 128
+, /* mUseUnrollLoop2xForMma */ 1
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 1
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mTileScheduler */ gemm::TileScheduler(0)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteAct */ 1
+, /* mGridWaitForPrimaryRouting */ 1
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+ }, gemm::SmVersion::Sm100a },
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len, 149504, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 64
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1480,12 +2750,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 64
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1531,16 +2802,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len, 61440, "BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a", 384, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len, 61440, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a", 384, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
-, /* mDtypeC */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 64
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1548,12 +2822,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 64
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1566,7 +2841,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
-, /* mUseShuffledMatrixA */ 1
+, /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
 , /* mTransposeMmaOutput */ 1
@@ -1599,16 +2874,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len, 148480, "BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len, 149504, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a", 416, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
-, /* mDtypeC */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 64
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1616,12 +2894,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 64
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1667,16 +2946,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len, 61440, "BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a", 384, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len, 61440, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a", 384, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
-, /* mDtypeC */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 64
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1684,12 +2966,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 64
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1702,7 +2985,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
-, /* mUseShuffledMatrixA */ 1
+, /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
 , /* mTransposeMmaOutput */ 1
@@ -1735,16 +3018,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin_len, 216064, "BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a", 256, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin_len, 216064, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a", 256, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
-, /* mDtypeC */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1752,12 +3038,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1803,16 +3090,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 216064, "BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 216064, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
-, /* mDtypeC */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1820,12 +3110,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1871,16 +3162,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin_len, 216064, "BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a", 256, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a_cubin_len, 216064, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_perTokenSfB_sm100a", 256, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
-, /* mDtypeC */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 1
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1888,12 +3182,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -1939,16 +3234,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 216064, "BatchedGemmKernel_BatchN_E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 216064, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_E4m3_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
-, /* mDtypeC */ trtllm::gen::Dtype(1050630)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1050629)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -1956,12 +3254,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -2007,16 +3306,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len, 61440, "BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a", 384, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len, 61440, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a", 384, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
-, /* mDtypeC */ trtllm::gen::Dtype(1052680)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052679)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 64
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -2024,12 +3326,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 64
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -2042,7 +3345,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
-, /* mUseShuffledMatrixA */ 1
+, /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
 , /* mTransposeMmaOutput */ 1
@@ -2075,16 +3378,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len, 61440, "BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a", 384, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len, 61440, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x128u2_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a", 384, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
-, /* mDtypeC */ trtllm::gen::Dtype(1052680)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052679)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 64
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -2092,12 +3398,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 64
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -2110,7 +3417,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumStagesMmaAcrossWorkTile */ 1
 , /* mNumStagesWorkId */ 3
 , /* mOutputDebugTensors */ 0
-, /* mUseShuffledMatrixA */ 1
+, /* mUseShuffledMatrixA */ 0
 , /* mSliceK */ 0
 , /* mSplitK */ gemm::SplitK(0)
 , /* mTransposeMmaOutput */ 1
@@ -2143,16 +3450,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 217088, "BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 217088, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x512_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
-, /* mDtypeC */ trtllm::gen::Dtype(1052680)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052679)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -2160,12 +3470,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -2211,16 +3522,19 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadNonEpilogueWarp */ 0
 , /* mNumRegsPerThreadEpilogueWarp */ 0
  }, gemm::SmVersion::Sm100a },
-{BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 217088, "BatchedGemmKernel_BatchN_E4m3Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin, BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len, 217088, "BatchedGemmKernel_BatchN_E4m3E4m3Fp32_Fp16_Tile128x8x512u2_EpiTile128x8_Mma128x8x32_Cluster1x1x1_transposeMmaOutput_sm100a", 224, { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mClusterDimX */ 1
 , /* mClusterDimY */ 1
 , /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056777)
-, /* mDtypeElt */ trtllm::gen::Dtype(1050630)
-, /* mDtypeC */ trtllm::gen::Dtype(1052680)
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052679)
 , /* mEnablesEarlyExit */ 0
 , /* mEnablesDelayedEarlyExit */ 0
 , /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
 , /* mEpilogueTileM */ 128
 , /* mEpilogueTileN */ 8
 , /* mGridTriggerSecondaryA */ 0
@@ -2228,12 +3542,13 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mGridWaitForPrimaryEarlyExit */ 1
 , /* mGridWaitForPrimaryA */ 0
 , /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 0
+, /* mHoistLoadTaskInit */ 1
 , /* mHoistMmaTaskTryWaits */ 0
 , /* mK */ 2048
 , /* mKernelTraits */ {}
 , /* mM */ 256
 , /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
 , /* mMmaM */ 128
 , /* mMmaN */ 8
 , /* mMockAllReduce */ 0
@@ -2284,3 +3599,4 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 // clang-format on
 } // namespace kernels
 } // namespace tensorrt_llm
+} // namespace batchedGemm
