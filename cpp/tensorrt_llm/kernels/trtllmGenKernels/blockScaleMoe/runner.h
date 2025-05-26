@@ -100,13 +100,18 @@ class Runner
 public:
     explicit Runner();
 
+    explicit Runner(int32_t tileTokensDim);
+
     void run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
         int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset, int32_t localNumExperts,
         float routedScalingFactor, int32_t* routingExpertIndexes, int32_t* expertCountHistogram,
         int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
         int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
-        int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, trtllm::gen::Dtype dtypeElt,
+        int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, batchedGemm::trtllm::gen::Dtype dtypeElt,
         bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream);
+
+private:
+    int32_t mTileTokensDim{8};
 };
 } // namespace Routing
 
@@ -115,7 +120,7 @@ namespace PermuteGemm1
 class Runner
 {
 public:
-    explicit Runner(trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8);
+    explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim);
 
     size_t getWorkspaceSizeInBytes(
         int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens);
@@ -128,8 +133,8 @@ public:
         bool useRoutingScalesOnInput, int device, cudaStream_t stream);
 
 private:
-    int32_t mTileTokensDim{8};
-    trtllm::gen::Dtype mDtypeElt;
+    batchedGemm::trtllm::gen::Dtype mDtypeElt;
+    int32_t mTileTokensDim;
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
 };
 } // namespace PermuteGemm1
@@ -139,7 +144,8 @@ namespace Gemm2
 class Runner
 {
 public:
-    explicit Runner(trtllm::gen::Dtype dtypeElt, trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8);
+    explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, batchedGemm::trtllm::gen::Dtype outputDtype,
+        bool useDeepSeekFp8, int tileTokensDim);
 
     size_t getWorkspaceSizeInBytes(
         int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens);
@@ -151,16 +157,16 @@ public:
         void* bmm2Workspace, int device, cudaStream_t stream);
 
 private:
-    int32_t mTileTokensDim{8};
-    trtllm::gen::Dtype mDtypeElt;
-    trtllm::gen::Dtype mOutputDtype;
+    batchedGemm::trtllm::gen::Dtype mDtypeElt;
+    batchedGemm::trtllm::gen::Dtype mOutputDtype;
+    int32_t mTileTokensDim;
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
 };
 } // namespace Gemm2
 
 namespace MoE
 {
-namespace tg = trtllm::gen;
+namespace btg = batchedGemm::trtllm::gen;
 
 struct MoERunnerArgs
 {
@@ -191,14 +197,13 @@ struct MoERunnerArgs
     int32_t local_expert_offset{0};
     int32_t local_num_experts{0};
     // TODO: support other types
-    tg::Dtype mDtypeElt{tg::Dtype::Void};
-    tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
-    tg::Dtype mDtypeOut{tg::Dtype::Bfloat16};
+    btg::Dtype mDtypeElt{btg::Dtype::Void};
+    btg::Dtype mDtypeExpW{btg::Dtype::Bfloat16};
+    btg::Dtype mDtypeOut{btg::Dtype::Bfloat16};
 
     // Apply routing scale factors to input activations
     bool mUseRoutingScalesOnInput{false};
     bool mUseDeepSeekFp8{false};
-
     float* output1_scales_scalar = nullptr;
     float* output1_scales_gate_scalar = nullptr;
     float* output2_scales_scalar = nullptr;
@@ -258,7 +263,8 @@ struct MoEWorkspace
 class Runner
 {
 public:
-    Runner(trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8);
+    // FIXME: tileTokensDim is hardcoded for now
+    Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8);
 
     void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream);
 

@@ -38,7 +38,7 @@ namespace routing
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace tg = trtllm::gen;
+namespace tg = batchedGemm::trtllm::gen;
 namespace cg = cooperative_groups;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -49,6 +49,7 @@ static constexpr int NumThreadsGemm = 128;
 static constexpr int WarpSize = 32;
 static constexpr int NumWarps = NumThreads / WarpSize;
 static constexpr int NumTopGroups = 4;
+static constexpr int NumExpertsPerGroup = 32;
 static constexpr int NumTopGroupScores = 2;
 static constexpr int NumTopExperts = 8;
 
@@ -342,7 +343,7 @@ __global__ void routingMainKernel(KernelParams params)
     // declare shared memory structure
     // number of experts is bounded by number of threads
     __shared__ float __attribute((aligned(128))) smemScoreSigmoid[NumThreads];
-    __shared__ float __attribute((aligned(128))) smemScoreBias[NumThreads];
+    __shared__ float __attribute((aligned(128))) smemScoreBias[NumExpertsPerGroup * NumThreads];
     // number of expert groups is bounded by number of warps
     __shared__ float __attribute((aligned(128))) smemGroupScores[NumWarps];
 
@@ -1252,6 +1253,9 @@ void run(Data const& data, void* stream)
     TLLM_CHECK_WITH_INFO(
         data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
     TLLM_CHECK_WITH_INFO(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got %d", data.mPaddingLog2);
+    TLLM_CHECK_WITH_INFO(data.mNumExperts / data.mNumExpertGroups <= NumExpertsPerGroup,
+        "Routing kernel expects number of experts per group <= %d, got %d", NumExpertsPerGroup,
+        data.mNumExperts / data.mNumExpertGroups);
     int const numBlocks = data.mNumTokens;
 
     if (data.mPtrExpertWeightsFull != nullptr)
@@ -1358,7 +1362,7 @@ namespace routingLlama4
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace tg = trtllm::gen;
+namespace tg = batchedGemm::trtllm::gen;
 namespace cg = cooperative_groups;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
