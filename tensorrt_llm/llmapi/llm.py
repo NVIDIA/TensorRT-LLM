@@ -116,8 +116,11 @@ class LLM:
                 'backend', None) == 'pytorch' else TrtLlmArgs
 
             # check the kwargs and raise ValueError directly
+            valid_keys = set(
+                list(llm_args_cls.model_fields.keys()) +
+                ['_mpi_session', 'backend'])
             for key in kwargs:
-                if key not in llm_args_cls.model_fields:
+                if key not in valid_keys:
                     raise ValueError(
                         f"{self.__class__.__name__} got invalid argument: {key}"
                     )
