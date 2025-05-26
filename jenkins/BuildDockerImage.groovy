@@ -54,11 +54,16 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux
                   kubernetes.io/arch: ${arch}
-                  matchExpressions:
-                  - key: kubernetes.io/hostname
-                    operator: Regexp
-                    values:
-                    - ".*\\.ipp2u1\\.colossus$"""
+                affinity:
+                    nodeAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                            nodeSelectorTerms:
+                                - matchExpressions:
+                                    - key: "kubernetes.io/hostname"
+                                      operator: Regexp
+                                      values:
+                                        - ".*\\.ipp2u1\\.colossus$"
+        """
     }
 
     switch(type)
