@@ -47,7 +47,7 @@ def get_llm_args(model: str,
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=free_gpu_memory_fraction)
 
-    pytorch_backend_config = {}
+    pytorch_backend_options = {}
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
         enable_max_num_tokens_tuning=False,
@@ -73,7 +73,7 @@ def get_llm_args(model: str,
         "max_seq_len": max_seq_len,
         "kv_cache_config": kv_cache_config,
         "backend": backend if backend == "pytorch" else None,
-        **pytorch_backend_config,
+        **pytorch_backend_options,
         "_num_postprocess_workers": num_postprocess_workers,
         "_postprocess_tokenizer_dir": tokenizer or model,
         "_reasoning_parser": reasoning_parser,

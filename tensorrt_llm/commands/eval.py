@@ -112,7 +112,7 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
 
     if backend == "tensorrt":
         backend = None
-    pytorch_backend_config = {}
+    pytorch_backend_options = {}
 
     llm_args = {
         "model": model,
@@ -125,7 +125,7 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         "build_config": build_config,
         "kv_cache_config": kv_cache_config,
         "backend": backend,
-        **pytorch_backend_config,
+        **pytorch_backend_options,
     }
 
     if extra_llm_api_options is not None:

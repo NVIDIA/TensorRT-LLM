@@ -1695,9 +1695,6 @@ class TorchLlmArgs(BaseLlmArgs):
         2. If cuda_graph_batch_sizes is not provided, it is generated based on cuda_graph_max_batch_size
         3. If both are provided, cuda_graph_batch_sizes must match the generated values
         """
-        if not self.use_cuda_graph:
-            return self
-
         if self.cuda_graph_batch_sizes is not None:
             self.cuda_graph_batch_sizes = sorted(self.cuda_graph_batch_sizes)
             if self.cuda_graph_max_batch_size != 0:
@@ -1710,6 +1707,9 @@ class TorchLlmArgs(BaseLlmArgs):
                         f"cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}, "
                         f"cuda_graph_max_batch_size: {self.cuda_graph_max_batch_size}"
                     )
+            else:
+                self.cuda_graph_max_batch_size = max(
+                    self.cuda_graph_batch_sizes)
         else:
             max_batch_size = self.cuda_graph_max_batch_size or 128
             generated_sizes = self._generate_cuda_graph_batch_sizes(
