@@ -10,6 +10,7 @@ from utils.util import unittest_name_func
 
 import tensorrt_llm
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+from tensorrt_llm._utils import str_dtype_to_torch
 
 
 class TestFunctional(unittest.TestCase):
@@ -40,7 +41,7 @@ class TestFunctional(unittest.TestCase):
         seq_len = max_seq_len if req_type == "context" else 1
         mean = 0.0
         std_dev = 1.0 if dtype == "float32" else 0.5
-        torch_dtype = getattr(torch, dtype)
+        torch_dtype = str_dtype_to_torch(dtype)
 
         # test data
         torch.random.manual_seed(0)

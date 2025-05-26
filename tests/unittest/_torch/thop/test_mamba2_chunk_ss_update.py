@@ -28,6 +28,7 @@ from tensorrt_llm._torch.modules.mamba.selective_state_update import \
     selective_state_update
 from tensorrt_llm._torch.modules.mamba.ssd_combined import \
     mamba_chunk_scan_combined
+from tensorrt_llm._utils import str_dtype_to_torch
 
 
 class TestFunctional(unittest.TestCase):
@@ -87,7 +88,7 @@ class TestFunctional(unittest.TestCase):
         else:
             std_dev = 0.1
 
-        torch_dtype = getattr(torch, dtype)
+        torch_dtype = str_dtype_to_torch(dtype)
 
         # test data
         torch.random.manual_seed(0)
