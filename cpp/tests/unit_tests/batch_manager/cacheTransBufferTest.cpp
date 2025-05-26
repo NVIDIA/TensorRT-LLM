@@ -106,12 +106,12 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize)
         size_t sendBufferCount = tensorrt_llm::common::getEnvParallelCacheSend()
             ? tensorrt_llm::common::getEnvKVCacheSendMaxConcurrenceNum()
             : 1;
-        size_t bufferSize = CacheTransBufferManager::preAllocBufferSize(
-            maxNumTokens, kvCacheSizePerToken(4, 2, 64, CacheType::kSELFKONLY));
+        size_t bufferSizeBytes = CacheTransBufferManager::preAllocBufferSize(maxNumTokens)
+            * kvCacheSizePerToken(4, 2, 64, CacheType::kSELFKONLY);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
         EXPECT_EQ(bufferId.value(), 0);
-        EXPECT_GT(bufferSize,
+        EXPECT_GT(bufferSizeBytes,
             mTransBufferManager->getSendBuffer(bufferId)->getSizeInBytes() * (recvbufferCount + sendBufferCount));
         mTransBufferManager->freeBufferIndexForSend(bufferId);
         exit(testing::Test::HasFailure() ? 1 : 0);
@@ -143,12 +143,12 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize2)
         size_t sendBufferCount = tensorrt_llm::common::getEnvParallelCacheSend()
             ? tensorrt_llm::common::getEnvKVCacheSendMaxConcurrenceNum()
             : 1;
-        size_t bufferSize = CacheTransBufferManager::preAllocBufferSize(
-            maxNumTokens, kvCacheSizePerToken(4, 2, 64, CacheType::kSELFKONLY));
+        size_t bufferSizeBytes = CacheTransBufferManager::preAllocBufferSize(maxNumTokens)
+            * kvCacheSizePerToken(4, 2, 64, CacheType::kSELFKONLY);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
         EXPECT_EQ(bufferId.value(), 0);
-        EXPECT_GT(bufferSize,
+        EXPECT_GT(bufferSizeBytes,
             mTransBufferManager->getSendBuffer(bufferId)->getSizeInBytes() * (recvbufferCount + sendBufferCount));
         mTransBufferManager->freeBufferIndexForSend(bufferId);
         exit(testing::Test::HasFailure() ? 1 : 0);
