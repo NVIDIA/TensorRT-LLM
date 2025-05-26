@@ -97,10 +97,13 @@ def GetDataTypeBits(type):
     return DataTypeSize[type]
 
 
-def GetDataTypeNames(type):
+def GetDataTypeNames(type, is_mx_fp4=None):
+    mxprefix = ""
+    if is_mx_fp4 is not None:
+        mxprefix = "mx_" if is_mx_fp4 else "nv_"
     if isinstance(type, e2m1_type):
-        return "e2m1"
-    return DataTypeNames[type]
+        return mxprefix + "e2m1"
+    return mxprefix + DataTypeNames[type]
 
 
 CudaTypeName = {
@@ -132,7 +135,8 @@ class TrtLlm_GemmLauncher:
                  cga_shape,
                  mainloop_schedule,
                  epi_schedule,
-                 epi_fusion=None):
+                 epi_fusion=None,
+                 is_mx_fp4=False):
         self.gemm_kind = gemm_kind
         self.arch = arch
         self.act_type = act_type
@@ -149,11 +153,13 @@ class TrtLlm_GemmLauncher:
         self.mainloop_schedule = mainloop_schedule
         self.epi_schedule = epi_schedule
         self.epi_fusion = epi_fusion
+        self.is_mx_fp4 = is_mx_fp4
 
     def __repr__(self):
         kernel_prefix = "{}_sm{}_{}_{}_{}_{}_{}_{}_{}_{}x{}x{}_{}x{}x{}_{}".format(
             GemmKindNames[self.gemm_kind], self.arch,
-            GetDataTypeNames(self.act_type), GetDataTypeNames(self.weight_type),
+            GetDataTypeNames(self.act_type, self.is_mx_fp4),
+            GetDataTypeNames(self.weight_type, self.is_mx_fp4),
             GetDataTypeNames(self.scalezero_type),
             GetDataTypeNames(self.bias_type),
             GetDataTypeNames(self.output_type), QuantOpNames[self.quant_op],
@@ -206,7 +212,9 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
 );
 """
     elif operation.gemm_kind == GemmKind.Grouped:
-        if operation.act_type != operation.weight_type:
+        if operation.act_type != operation.weight_type and (
+                operation.act_type != DataType.e4m3
+                or operation.weight_type != e2m1):
             # Mixed MoE GEMM
             weight_tag = DataTypeTag[operation.weight_type]
             instantiation = f"""
@@ -238,8 +246,11 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
                 DataType.e4m3: "defined(ENABLE_FP8)",
                 DataType.bf16: "defined(ENABLE_BF16)"
             }
-            guard = guard_map[
+            guard_act = guard_map[
                 operation.act_type] if operation.act_type in guard_map else "1"
+            guard_weight = guard_map[
+                operation.
+                weight_type] if operation.weight_type in guard_map else "1"
             # TODO Revert this once compiler bug is fixed so we can use template instead of macro again
             #         instantiation = f"""
             #         template void tma_warp_specialized_generic_moe_gemm_kernelLauncher<{arch_tag}, {act_tag}, {weight_tag}, {out_tag},
@@ -247,9 +258,9 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
             #                 (TmaWarpSpecializedGroupedGemmInput, int, int, cudaStream_t, int*, size_t*);
             # """
             instantiation = f"""
-#if {guard}\n
+#if {guard_act} && {guard_weight}\n
         INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag},
-                {epi_tag}, {epi_fusion}, {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]}, false);\n
+                {epi_tag}, {epi_fusion}, {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]}, {"true" if operation.is_mx_fp4 else "false"}, false);\n
 #endif
 """
     return instantiation
@@ -334,10 +345,17 @@ def is_gemm_op_valid_sm100(op):
     if tile_m not in [64, 128]:
         return False
 
+    # FP4 Has some much more limited sizes
+    if op.act_type == e2m1 or op.weight_type == e2m1:
+        # TODO 128x256x256 FP4 compiles but crashes
+        # if tile_n % 64 != 0 or tile_n < 128:
+        #     return False
+        if tile_n not in [64, 128] or tile_m != 128:
+            return False
+
     # Shapes for fp8 small N shapes
-    if (op.act_type == DataType.e4m3) and (tile_n == 16
-                                           or tile_n == 8) and (cga_m == 1
-                                                                and cga_n == 1):
+    if (op.act_type == DataType.e4m3 and (tile_n == 16 or tile_n == 8)
+            and (cga_m == 1 and cga_n == 1)):
         # todo: double check why this is disable in CUTLASS backend. @yuhan
         if tile_m == 128 and tile_n == 8:
             return False
@@ -351,14 +369,6 @@ def is_gemm_op_valid_sm100(op):
     # Two CTA mode needs bigger tile n alignment
     if cga_m % 2 == 0 and tile_n % 64 != 0:
         return False
-
-    # FP4 Has some much more limited sizes
-    if op.act_type == e2m1:
-        # TODO 128x256x256 FP4 compiles but crashes
-        # if tile_n % 64 != 0 or tile_n < 128:
-        #     return False
-        if tile_n not in [64, 128] or tile_m != 128:
-            return False
 
     return True
 
@@ -639,7 +649,8 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
         return []
     arch = 100
     supported_dtypes = [
-        DataType.f16, DataType.bf16, DataType.f32, DataType.e4m3, e2m1
+        DataType.f16, DataType.bf16, DataType.f32, DataType.e4m3, e2m1,
+        (DataType.e4m3, e2m1)
     ]
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
@@ -662,6 +673,11 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
 
     operations = list()
     for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape in partial_args:
+        if isinstance(dtype, tuple):
+            dtype, weight_type = dtype
+        else:
+            weight_type = dtype
+
         cta_shape_mnk = calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype)
         cga_tile_shape_mnk = elementwise(cta_shape_mnk, cga_shape, mul)
 
@@ -675,9 +691,23 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
 
         for otype in otypes:
             moe_gemm_operation = TrtLlm_GemmLauncher(
-                GemmKind.Grouped, arch, dtype, dtype, dtype, dtype, otype,
-                quant_op, epi_tag, cga_tile_shape_mnk, warp_shape, stages,
-                cga_shape, mainloop_schedule, epi_schedule, epi_fusion)
+                GemmKind.Grouped,
+                arch,
+                dtype,
+                weight_type,
+                otype,
+                otype,
+                otype,
+                quant_op,
+                epi_tag,
+                cga_tile_shape_mnk,
+                warp_shape,
+                stages,
+                cga_shape,
+                mainloop_schedule,
+                epi_schedule,
+                epi_fusion,
+                is_mx_fp4=(dtype == DataType.e4m3 and weight_type == e2m1))
 
             if is_op_valid(moe_gemm_operation):
                 operations.append(moe_gemm_operation)
@@ -783,29 +813,38 @@ if __name__ == "__main__":
         is_internal = op.gemm_kind == GemmKind.Grouped
         return is_internal != args.internal
 
+    # The mixed dtype grouped gemm for w4afp8 has a different launcher
     def is_mixed_dtype_grouped(op):
         if isinstance(op, GemmSm80LauncherConfig):
             return False
-        return (op.act_type != op.weight_type) and (op.gemm_kind
-                                                    == GemmKind.Grouped)
+        return (op.act_type != op.weight_type) and (
+            op.gemm_kind == GemmKind.Grouped) and (op.act_type != DataType.e4m3
+                                                   or op.weight_type != e2m1)
 
     op_groups = dict()
     for op in operations:
         if should_skip(op):
             continue
-        dict_key = (op.gemm_kind, op.arch, op.cta_shape[0],
-                    is_mixed_dtype_grouped(op))
+        # This dict key is used to group kernels with common instantiations together
+        # Similar implementations should live in the same file so the compiler can share the cutlass state
+        # Without this we see significant memory consumption, and separating them also does not reduce the compilation time
+        # because most time is spent parsing the same cutlass files
+        # We separate by: Architecture, Leading dimension of the CTA shape, FP4 (i.e. block scaled MMA), mixed input
+        # TODO Do a more scientific analysis of this
+        dict_key = (op.gemm_kind, op.arch, op.cta_shape[0], op.arch >= 100
+                    and op.weight_type == e2m1, is_mixed_dtype_grouped(op))
         op_group = op_groups.get(dict_key, list())
         op_group.append(op)
         op_groups[dict_key] = op_group
 
-    file_counter = 1
+    file_list = []
     for key, value in op_groups.items():
-        gemm_kind, _, _, is_mixed_dtype_grouped = key
+        gemm_kind, _, _, _, is_mixed = key
         out_file = os.path.join(
             output_dir, GemmKindNames[gemm_kind],
-            f"cutlass_kernel_file_{file_counter}.generated.cu")
-        inl_file = [moe_mixed_gemm_inl
-                    ] if is_mixed_dtype_grouped else inl_map[key[:2]]
+            f"cutlass_kernel_file_{key[0]}_sm{key[1]}_M{key[2]}_BS{key[3]}_Mixed{key[4]}.generated.cu"
+        )
+        inl_file = [moe_mixed_gemm_inl] if is_mixed else inl_map[key[:2]]
         write_file(inl_file, value, out_file)
-        file_counter += 1
+        file_list.append(out_file)
+    print(";".join(file_list))

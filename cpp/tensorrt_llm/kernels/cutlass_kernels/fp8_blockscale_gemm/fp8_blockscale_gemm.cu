@@ -22,18 +22,6 @@ namespace tensorrt_llm::kernels::fp8_blockscale_gemm
 {
 
 template <typename ElementA, typename ElementB, typename ElementD>
-CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::CutlassFp8BlockScaleGemmRunner()
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-}
-
-template <typename ElementA, typename ElementB, typename ElementD>
-CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::~CutlassFp8BlockScaleGemmRunner()
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-}
-
-template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(void* mat_d, void const* mat_a,
     void const* mat_b, int shape_m, int shape_n, int shape_k, cudaStream_t stream, float const* scales_a,
     float const* scales_b)
