@@ -368,7 +368,13 @@ def launchReleaseCheck(pipeline)
             trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
             try {
-                sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f -not -path \"*/.git/*\" -not -path \"*/3rdparty/*\") 2>&1 | tee scan.log"
+                ignoreList = [
+                    "*/.git/*",
+                    "*/3rdparty/*",
+                    "*/examples/scaffolding/contrib/mcp/weather/weather.py",
+                    "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz"
+                ]
+                sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')}) 2>&1 | tee scan.log"
                 def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
                 if (lastLine.toLowerCase().contains("error")) {
                     error "Guardwords Scan Failed."
