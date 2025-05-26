@@ -1,8 +1,3 @@
-import argparse
-import os
-import subprocess
-
-kVALID_TEST_LIST_MARKERS = ["SKIP"]
 """
 This script is used to verify test lists for L0, QA, and waives file.
 
@@ -18,6 +13,9 @@ Options:
 Note:
 All the perf tests will be excluded since they are generated dynamically.
 """
+import argparse
+import os
+import subprocess
 
 
 def install_python_dependencies(llm_src):
@@ -98,11 +96,8 @@ def verify_waive_list(llm_src):
         if "perf/test_perf.py" in line:
             continue
 
-        # Check for kVALID_TEST_LIST_MARKERS and split by the first occurrence
-        for marker in kVALID_TEST_LIST_MARKERS:
-            if marker in line:
-                line = line.split(marker, 1)[0].strip()
-                break
+        # Check for SKIP marker in waives.txt and split by the first occurrence
+        line = line.split(" SKIP ", 1)[0].strip()
 
         # If the line starts with 'full:', process it
         if line.startswith("full:"):
