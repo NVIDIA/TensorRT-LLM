@@ -8,8 +8,12 @@ import pickle  # nosec B403
 # it is only needed in a single instance the class can be added at runtime
 # using register_approved_ipc_class.
 BASE_ZMQ_CLASSES = {
-    "builtins": ["Exception", "ValueError"
-                 ],  # each Exception Error class needs to be added explicitly
+    "builtins": [
+        "Exception",
+        "ValueError",
+        "NotImplementedError",
+        "AttributeError",
+    ],  # each Exception Error class needs to be added explicitly
     "collections": ["OrderedDict"],
     "datetime": ["timedelta"],
     "pathlib": ["PosixPath"],

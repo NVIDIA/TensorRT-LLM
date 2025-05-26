@@ -264,9 +264,8 @@ class ReportUtility:
             model = self.rt_cfg.model_path or self.rt_cfg.model
             model_config = ModelConfig.from_pretrained(model,
                                                        trust_remote_code=True)
-            validate_and_set_kv_cache_quant(
-                model_config,
-                self.kwargs["pytorch_backend_config"].kv_cache_dtype)
+            validate_and_set_kv_cache_quant(model_config,
+                                            self.kwargs["kv_cache_dtype"])
 
             stats_dict["engine"] |= {
                 "backend":

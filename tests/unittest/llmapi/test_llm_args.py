@@ -1,5 +1,6 @@
 import tempfile
 
+import pytest
 import yaml
 
 import tensorrt_llm.bindings.executor as tle
@@ -173,3 +174,46 @@ def test_PeftCacheConfig_declaration():
     assert pybind_config.device_cache_percent == 0.5
     assert pybind_config.host_cache_size == 1024
     assert pybind_config.lora_prefetch_dir == "."
+
+
+class TestTorchLlmArgsCudaGraphSettings:
+
+    def test_cuda_graph_batch_sizes_case_0(self):
+        # set both cuda_graph_batch_sizes and cuda_graph_max_batch_size, and
+        # cuda_graph_batch_sizes is not equal to generated
+        with pytest.raises(ValueError):
+            TorchLlmArgs(model=llama_model_path,
+                         use_cuda_graph=True,
+                         cuda_graph_batch_sizes=[1, 2, 3],
+                         cuda_graph_max_batch_size=128)
+
+    def test_cuda_graph_batch_sizes_case_0_1(self):
+        # set both cuda_graph_batch_sizes and cuda_graph_max_batch_size, and
+        # cuda_graph_batch_sizes is equal to generated
+        args = TorchLlmArgs(model=llama_model_path,
+                            use_cuda_graph=True,
+                            cuda_graph_padding_enabled=True,
+                            cuda_graph_batch_sizes=TorchLlmArgs.
+                            _generate_cuda_graph_batch_sizes(128, True),
+                            cuda_graph_max_batch_size=128)
+        assert args.cuda_graph_batch_sizes == TorchLlmArgs._generate_cuda_graph_batch_sizes(
+            128, True)
+        assert args.cuda_graph_max_batch_size == 128
+
+    def test_cuda_graph_batch_sizes_case_1(self):
+        # set cuda_graph_batch_sizes only
+        args = TorchLlmArgs(model=llama_model_path,
+                            use_cuda_graph=True,
+                            cuda_graph_padding_enabled=True,
+                            cuda_graph_batch_sizes=[1, 2, 4])
+        assert args.cuda_graph_batch_sizes == [1, 2, 4]
+
+    def test_cuda_graph_batch_sizes_case_2(self):
+        # set cuda_graph_max_batch_size only
+        args = TorchLlmArgs(model=llama_model_path,
+                            use_cuda_graph=True,
+                            cuda_graph_padding_enabled=True,
+                            cuda_graph_max_batch_size=128)
+        assert args.cuda_graph_batch_sizes == TorchLlmArgs._generate_cuda_graph_batch_sizes(
+            128, True)
+        assert args.cuda_graph_max_batch_size == 128

@@ -1,8 +1,7 @@
 import json
 import math
-import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
@@ -10,7 +9,8 @@ from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
 
 import torch
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr, validator
+from pydantic import (BaseModel, Field, PrivateAttr, field_validator,
+                      model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -557,7 +557,9 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
         get_default_lookahead_decoding_verification_set(),
         description="Number of NGrams in verification branch per step.")
 
-    @validator('max_window_size', 'max_ngram_size', 'max_verification_set_size')
+    @field_validator('max_window_size', 'max_ngram_size',
+                     'max_verification_set_size')
+    @classmethod
     def validate_positive_values(cls, v):
         if v <= 0:
             raise ValueError(f"Value must be positive, got {v}")
@@ -1024,8 +1026,7 @@ class BaseLlmArgs(BaseModel):
         Returns:
             dict: The dict that contains all fields of the `LlmArgs` instance.
         """
-        return dict(
-            (field.name, getattr(self, field.name)) for field in fields(self))
+        return self.model_dump()
 
     @staticmethod
     def _maybe_update_config_for_consistency(
@@ -1576,6 +1577,16 @@ class TorchLlmArgs(BaseLlmArgs):
         "How to load the model weights. By default, detect the weight type from the model checkpoint."
     )
 
+    @field_validator('load_format', mode='before')
+    @classmethod
+    def convert_load_format(cls, v):
+        if isinstance(v, LoadFormat):
+            return v
+        load_format = v.upper()
+        if load_format not in LoadFormat.__members__:
+            raise ValueError(f"Invalid LoadFormat: {v}")
+        return LoadFormat[load_format]
+
     # Extra resource managers to use in addition to the KV cache manager.
     # Each manager's prepare_resources method is called before the forward pass,
     # and update_resources() is called after the pass finishes. free_resources()
@@ -1592,65 +1603,10 @@ class TorchLlmArgs(BaseLlmArgs):
     def extra_resource_managers(self, value: Dict[str, object]) -> None:
         self._extra_resource_managers = value
 
-    @validator('load_format', pre=True)
-    def convert_load_format(cls, v):
-        if isinstance(v, LoadFormat):
-            return v
-        load_format = v.upper()
-        if load_format not in LoadFormat.__members__:
-            raise ValueError(f"Invalid LoadFormat: {v}")
-        return LoadFormat[load_format]
-
     @print_traceback_on_error
     def model_post_init(self, __context):
         super().model_post_init(__context)
         self.model_format = _ModelFormatKind.HF
-
-        # Validate CUDA graph settings
-        if self.torch_compile_enabled and self.torch_compile_piecewise_cuda_graph:
-            assert self.torch_compile_fullgraph, "Fullgraph must be enabled for piecewise CUDA graph."
-
-        if self.cuda_graph_batch_sizes is not None:
-            assert self.cuda_graph_max_batch_size == 0, (
-                "Please don't set both cuda_graph_batch_sizes "
-                "and cuda_graph_max_batch_size.")
-            self.cuda_graph_batch_sizes = sorted(self.cuda_graph_batch_sizes)
-        else:
-            self.cuda_graph_max_batch_size = self.cuda_graph_max_batch_size or 128
-            if self.cuda_graph_padding_enabled:
-                self.cuda_graph_batch_sizes = [1, 2, 4] + [
-                    i * 8 for i in range(1, 17)
-                ]
-            else:
-                self.cuda_graph_batch_sizes = list(range(1, 32)) + [32, 64, 128]
-            self.cuda_graph_batch_sizes += [
-                2**i for i in range(
-                    8, math.floor(math.log(self.cuda_graph_max_batch_size, 2)))
-            ]
-            self.cuda_graph_batch_sizes = [
-                size for size in self.cuda_graph_batch_sizes
-                if size <= self.cuda_graph_max_batch_size
-            ]
-            if self.cuda_graph_max_batch_size != self.cuda_graph_batch_sizes[
-                    -1]:
-                self.cuda_graph_batch_sizes.append(
-                    self.cuda_graph_max_batch_size)
-
-        if isinstance(self.moe_load_balancer, str):
-            assert os.path.exists(self.moe_load_balancer)
-            if self.moe_load_balancer.endswith(".json"):
-                with open(self.moe_load_balancer) as f:
-                    self.moe_load_balancer = json.load(f)
-            elif self.moe_load_balancer.endswith((".yaml", ".yml")):
-                with open(self.moe_load_balancer) as f:
-                    self.moe_load_balancer = yaml.safe_load(f)
-            else:
-                raise ValueError(
-                    f"Unsupported moe load balancer config file: {self.moe_load_balancer}"
-                )
-        if isinstance(self.moe_load_balancer, dict):
-            self.moe_load_balancer = MoeLoadBalancerConfig(
-                **self.moe_load_balancer)
 
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
@@ -1689,6 +1645,79 @@ class TorchLlmArgs(BaseLlmArgs):
             autotuner_enabled=self.autotuner_enabled,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format)
+
+    @field_validator('cuda_graph_max_batch_size')
+    @classmethod
+    def validate_cuda_graph_max_batch_size(cls, v):
+        """Validate cuda_graph_max_batch_size is non-negative."""
+        if v < 0:
+            raise ValueError("cuda_graph_max_batch_size must be non-negative")
+        return v
+
+    @staticmethod
+    def _generate_cuda_graph_batch_sizes(max_batch_size: int,
+                                         padding_enabled: bool) -> List[int]:
+        """Generate a list of batch sizes for CUDA graphs.
+
+        Args:
+            max_batch_size: Maximum batch size to generate up to
+            padding_enabled: Whether padding is enabled, which affects the batch size distribution
+
+        Returns:
+            List of batch sizes to create CUDA graphs for
+        """
+        if padding_enabled:
+            batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
+        else:
+            batch_sizes = list(range(1, 32)) + [32, 64, 128]
+
+        # Add powers of 2 up to max_batch_size
+        batch_sizes += [
+            2**i for i in range(8, math.floor(math.log(max_batch_size, 2)))
+        ]
+
+        # Filter and sort batch sizes
+        batch_sizes = sorted(
+            [size for size in batch_sizes if size <= max_batch_size])
+
+        # Add max_batch_size if not already included
+        if max_batch_size != batch_sizes[-1]:
+            batch_sizes.append(max_batch_size)
+
+        return batch_sizes
+
+    @model_validator(mode='after')
+    def validate_cuda_graph_config(self) -> 'TorchLlmArgs':
+        """Validate CUDA graph configuration.
+
+        Ensures that:
+        1. If cuda_graph_batch_sizes is provided, cuda_graph_max_batch_size must be 0
+        2. If cuda_graph_batch_sizes is not provided, it is generated based on cuda_graph_max_batch_size
+        3. If both are provided, cuda_graph_batch_sizes must match the generated values
+        """
+        if not self.use_cuda_graph:
+            return self
+
+        if self.cuda_graph_batch_sizes is not None:
+            self.cuda_graph_batch_sizes = sorted(self.cuda_graph_batch_sizes)
+            if self.cuda_graph_max_batch_size != 0:
+                if self.cuda_graph_batch_sizes != self._generate_cuda_graph_batch_sizes(
+                        self.cuda_graph_max_batch_size,
+                        self.cuda_graph_padding_enabled):
+                    raise ValueError(
+                        "Please don't set both cuda_graph_batch_sizes "
+                        "and cuda_graph_max_batch_size.\n"
+                        f"cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}, "
+                        f"cuda_graph_max_batch_size: {self.cuda_graph_max_batch_size}"
+                    )
+        else:
+            max_batch_size = self.cuda_graph_max_batch_size or 128
+            generated_sizes = self._generate_cuda_graph_batch_sizes(
+                max_batch_size, self.cuda_graph_padding_enabled)
+            self.cuda_graph_batch_sizes = generated_sizes
+            self.cuda_graph_max_batch_size = max_batch_size
+
+        return self
 
 
 def update_llm_args_with_extra_dict(
