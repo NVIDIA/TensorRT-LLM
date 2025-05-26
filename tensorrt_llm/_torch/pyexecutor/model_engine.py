@@ -889,6 +889,7 @@ class PyTorchModelEngine(ModelEngine):
         config = ModelConfig.from_pretrained(checkpoint_dir,
                                              trust_remote_code=True,
                                              **kwargs)
+        config.pytorch_backend_config = self.pytorch_backend_config
         config.spec_config = self.spec_config
         config.max_num_tokens = max_num_tokens
         config.moe_max_num_tokens = moe_max_num_tokens

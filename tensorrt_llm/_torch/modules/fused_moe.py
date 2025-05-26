@@ -954,10 +954,7 @@ class FusedMoE(nn.Module):
             assert use_dp_padding is not None
             num_rows = sum(all_rank_num_tokens)
         else:
-            if isinstance(x, Fp4QuantizedTensor):
-                num_rows = x.fp4_tensor.shape[0]
-            else:
-                num_rows = x.shape[0]
+            num_rows = x.shape[0]
 
         # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = (num_rows + self.moe_max_num_tokens -

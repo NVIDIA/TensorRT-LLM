@@ -114,7 +114,7 @@ torch::Tensor llama4_fp8_fp8_gemm_swiglu(torch::Tensor const& inputA, torch::Ten
     TORCH_CHECK(inputA.dim() == 2, "inputA must be 2D.");
     TORCH_CHECK(inputB.dim() == 2, "inputB must be 2D.");
     TORCH_CHECK(inputA.sizes()[1] == 5120, "inputA.size(1) must be 5120");
-    TORCH_CHECK(inputB.sizes()[0] == 5120, "inputB.size(0) must be 5120");
+    TORCH_CHECK(inputB.sizes()[1] == 5120, "inputB.size(1) must be 5120");
     TORCH_CHECK(in_scale.dim() == 0, "in_scale must be a scalar tensor");
     TORCH_CHECK(out_scale_inv.dim() == 0, "out_scale_inv must be a scalar tensor");
 

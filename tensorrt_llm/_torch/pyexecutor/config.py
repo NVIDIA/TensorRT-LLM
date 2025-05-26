@@ -89,6 +89,9 @@ class PyTorchConfig:
     # from the model checkpoint.
     load_format: Union[str, LoadFormat] = 'auto'
 
+    # If true, enable min-latency mode. Currently only used for Llama4.
+    enable_min_latency: bool = False
+
     def _convert_load_format(self) -> None:
         if isinstance(self.load_format, LoadFormat):
             return

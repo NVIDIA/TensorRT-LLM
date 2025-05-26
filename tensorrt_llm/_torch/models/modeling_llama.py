@@ -1,12 +1,9 @@
 import copy
-from collections.abc import Callable
-from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from PIL.Image import Image
 from torch import nn
-from torch.nn import functional as F
 from transformers import (AutoProcessor, Llama4Config, Llama4VisionModel,
                           LlamaConfig)
 from transformers.modeling_utils import load_sharded_checkpoint
@@ -17,14 +14,10 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import HfLoraLoader
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import split_matrix_tp
-from tensorrt_llm.quantization.utils.fp4_utils import (
-    reorder_rows_for_gated_act_gemm, shuffle_matrix_a)
 
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
-from ...models.modeling_utils import QuantConfig
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
@@ -33,11 +26,9 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention, QkNormType
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod, FusedMoE,
-                                 FusedMoEQuantScalesFP8,
-                                 Llama4RenormalizeMoeRoutingMethod,
+from ..modules.fused_moe import (FusedMoE, Llama4RenormalizeMoeRoutingMethod,
                                  MoEWeightLoadingMode)
-from ..modules.gated_mlp import GatedMLP, swiglu
+from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -47,329 +38,6 @@ from ..utils import Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, register_auto_model)
-
-# Perf heuristics thresholds.
-# Use routing gemv kernels when num_tokens <= 8.
-MIN_LATENCY_ROUTING_GEMM_NUM_TOKENS = 8
-# Use QKV gemv kernel with fused attn scaling when num_tokens <= 8.
-MIN_LATENCY_QKV_GEMM_ATTN_SCALING_NUM_TOKENS = 8
-# Use QKV gemv kernel when num_tokens <= 4.
-MIN_LATENCY_QKV_GEMM_NUM_TOKENS = 4
-# Use FC2 trtllm-gen kernel when num_tokens <= 16.
-MIN_LATENCY_FC2_NUM_TOKENS = 16
-# Use FC13 gemv kernel with fused swiglu when num_tokens < 4.
-MIN_LATENCY_FC13_FUSED_GEMM_SWIGLU_NUM_TOKENS_GEMV = 4
-# Use FC13 trtllm-gen kernel with fused swiglu when 4 <= num_tokens <= 16.
-MIN_LATENCY_FC13_FUSED_GEMM_SWIGLU_NUM_TOKENS_TRTLLM_GEN = 16
-# Use min-latency MoE kernels when num_tokens <= 8.
-MIN_LATENCY_FUSED_MOE_NUM_TOKENS = 8
-
-
-# A helper function to get the num_tokens from the input tensor.
-def get_num_tokens(x: torch.Tensor) -> int:
-    return x.fp4_tensor.shape[0] if isinstance(
-        x, Fp4QuantizedTensor) else x.shape[0]
-
-
-class Llama4Linear(Linear):
-    """
-    A wrapper around Linear because we may optionally use min-latency kernels depending on input shapes.
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        dtype: torch.dtype = None,
-        mapping: Optional[Mapping] = None,
-        tensor_parallel_mode: Optional[TensorParallelMode] = None,
-        gather_output: bool = False,
-        quant_config: Optional[QuantConfig] = None,
-        weights_loading_config: Optional[WeightsLoadingConfig] = None,
-        reduce_output: bool = True,
-        skip_create_weights_in_init: bool = False,
-        use_custom_cublas_mm: bool = False,
-        enable_fused_gemm_swiglu: bool = False,
-        enable_fused_gemm_attn_scaling: bool = False,
-        enable_trtllm_gen: bool = False,
-        post_load_weights_hook: Optional[Callable] = None,
-    ):
-        super().__init__(
-            in_features,
-            out_features,
-            bias,
-            dtype,
-            mapping,
-            tensor_parallel_mode,
-            gather_output,
-            quant_config,
-            weights_loading_config,
-            reduce_output,
-            skip_create_weights_in_init,
-            use_custom_cublas_mm,
-        )
-        self.enable_fused_gemm_swiglu = enable_fused_gemm_swiglu
-        self.enable_fused_gemm_attn_scaling = enable_fused_gemm_attn_scaling
-        self.enable_trtllm_gen = enable_trtllm_gen
-        self.post_load_weights_hook = post_load_weights_hook
-        self.position_ids = None
-
-    def load_weights(self, weights: List[Dict]):
-
-        super().load_weights(weights)
-
-        # After loading weights, calculate the combined scale (input_scale * weight_scale) for special kernels and
-        # trtllm-gen kernels.
-        if self.has_fp8_qdq:
-            self.combined_scale = self.input_scale * self.weight_scale
-
-            # If this is gate_up_proj + swiglu and trtllm-gen kernels will be used, we need to reorder the weights
-            # for trtllm-gen gemm+swiglu kernels.
-            if self.enable_trtllm_gen and self.enable_fused_gemm_swiglu:
-                reordered_weight = self.weight.reshape(2,
-                                                       self.out_features // 2,
-                                                       self.in_features)
-                reordered_weight = torch.cat(
-                    [reordered_weight[1], reordered_weight[0]], dim=0)
-                reordered_weight = reorder_rows_for_gated_act_gemm(
-                    reordered_weight)
-                self.trtllm_gen_weight = shuffle_matrix_a(
-                    reordered_weight.view(torch.uint8),
-                    128).view(torch.float8_e4m3fn)
-
-            # Otherwise, if trtllm-gen kernels will be used, shuffle the weights.
-            elif self.enable_trtllm_gen:
-                self.trtllm_gen_weight = shuffle_matrix_a(
-                    self.weight.view(torch.uint8),
-                    128).view(torch.float8_e4m3fn)
-
-        if self.post_load_weights_hook is not None:
-            self.post_load_weights_hook(self)
-
-    # Override apply_linear instead of forward so that we can reuse the AllReduce/AllGather logic in the parent class.
-    def apply_linear(
-        self,
-        input,
-        weight,
-        bias,
-        lora_params: Optional[dict] | None = None,
-        layer_idx: Optional[int] | None = None,
-    ) -> torch.Tensor:
-
-        # Quantize the input if it is not already in float8_e4m3fn.
-        # We cannot do this when enable_fused_gemm_swiglu is True and num_tokens > 16 because the default path
-        # does not support FP8 input.
-        if self.has_fp8_qdq \
-            and input.dtype != torch.float8_e4m3fn:
-            input, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                input, self.input_scale)
-
-        # Use special BF16-input BF16-output gemm kernel for routing gemm when num_tokens <= 8.
-        if get_num_tokens(input) <= MIN_LATENCY_ROUTING_GEMM_NUM_TOKENS \
-            and self.in_features == 5120 \
-            and self.out_features == 128 \
-            and input.dtype == torch.bfloat16 \
-            and self.weight.dtype == torch.bfloat16 \
-            and not self.has_any_quant:
-            return torch.ops.trtllm.llama4_bf16_bf16_gemm(input, self.weight)
-
-        # Use special FP8-input BF16-output gemm kernel for QKV-gemm.
-        if get_num_tokens(input) <= MIN_LATENCY_QKV_GEMM_ATTN_SCALING_NUM_TOKENS \
-            and self.in_features == 5120 \
-            and self.out_features == 896 \
-            and input.dtype == torch.float8_e4m3fn:
-
-            # Check if we should fuse attn_scaling into QKV-gemm.
-            should_fuse_attn_scaling = self.enable_fused_gemm_attn_scaling \
-                and self.position_ids is not None
-
-            # When num_tokens < 4, we use the special QKV-gemm kernel.
-            # Or if attn_scaling is needed, we also use the special QKV-gemm kernel.
-            if get_num_tokens(
-                    input
-            ) <= MIN_LATENCY_QKV_GEMM_NUM_TOKENS or should_fuse_attn_scaling:
-                return torch.ops.trtllm.llama4_fp8_bf16_gemm(
-                    input,
-                    self.weight,
-                    self.combined_scale,
-                    self.position_ids,
-                )
-            # Otherwise, we use the trtllm-gen QKV-gemm kernel.
-            else:
-                if not hasattr(self, "trtllm_gen_weight"):
-                    raise ValueError('Expect trtllm_gen_weight to be set')
-                return torch.ops.trtllm.fp8_per_tensor_scaling_tllmg_gemm(
-                    input,
-                    self.trtllm_gen_weight,
-                    global_scale=self.combined_scale,
-                    out_dtype=torch.bfloat16,
-                    low_latency_kernel=True,
-                    gated_silu=False,
-                )
-
-        # Use trtllm-gen FP8-input BF16-output gemm kernel for FC2.
-        if get_num_tokens(input) <= MIN_LATENCY_FC2_NUM_TOKENS \
-            and self.in_features % 512 == 0 \
-            and self.out_features == 5120 \
-            and input.dtype == torch.float8_e4m3fn:
-            if not hasattr(self, "trtllm_gen_weight"):
-                raise ValueError('Expect trtllm_gen_weight to be set')
-            return torch.ops.trtllm.fp8_per_tensor_scaling_tllmg_gemm(
-                input,
-                self.trtllm_gen_weight,
-                global_scale=self.combined_scale,
-                out_dtype=torch.bfloat16,
-                low_latency_kernel=True,
-                gated_silu=False,
-            )
-
-        # Use special FP8-input FP8-output gemm+swiglu kernel for FC13+swiglu.
-        if self.enable_fused_gemm_swiglu and self.has_fp8_qdq:
-            # When num_tokens < 4, we use the special gemm+swiglu kernel.
-            if get_num_tokens(
-                    input) < MIN_LATENCY_FC13_FUSED_GEMM_SWIGLU_NUM_TOKENS_GEMV:
-                if not hasattr(self, "inv_output_scale"):
-                    raise ValueError('Expect inv_output_scale to be set')
-                return torch.ops.trtllm.llama4_fp8_fp8_gemm_swiglu(
-                    input,
-                    self.weight,
-                    self.combined_scale,
-                    self.inv_output_scale,
-                )
-            # When 4 <= num_tokens <= 16, we use the trtllm-gen gemm+swiglu kernel.
-            elif MIN_LATENCY_FC13_FUSED_GEMM_SWIGLU_NUM_TOKENS_GEMV <= get_num_tokens(input) \
-                and get_num_tokens(input) <= MIN_LATENCY_FC13_FUSED_GEMM_SWIGLU_NUM_TOKENS_TRTLLM_GEN:
-                if not hasattr(self, "trtllm_gen_global_scale"):
-                    raise ValueError('Expect trtllm_gen_global_scale to be set')
-                if not hasattr(self, "trtllm_gen_weight"):
-                    raise ValueError('Expect trtllm_gen_weight to be set')
-                return torch.ops.trtllm.fp8_per_tensor_scaling_tllmg_gemm(
-                    input,
-                    self.trtllm_gen_weight,
-                    global_scale=self.trtllm_gen_global_scale,
-                    global_scale_gate=self.combined_scale,
-                    out_dtype=torch.float8_e4m3fn,
-                    low_latency_kernel=True,
-                    gated_silu=True,
-                )
-
-        # If special gemm+swiglu kernel is not used and enable_fused_gemm_swiglu is True, we need to apply swiglu
-        # manually.
-        if self.enable_fused_gemm_swiglu:
-            intermediate = super().apply_linear(input, weight, bias,
-                                                lora_params, layer_idx)
-            return swiglu(intermediate)
-
-        # Otherwise, call the default apply_linear method.
-        return super().apply_linear(input, weight, bias, lora_params, layer_idx)
-
-    # Set the position_ids for the next call to apply_linear.
-    def set_position_ids(self, position_ids: Optional[torch.LongTensor] = None):
-        self.position_ids = position_ids
-
-
-class Llama4GatedMLP(GatedMLP):
-    """
-    A wrapper around GatedMLP so that we can pre-compute some scales needed by the special kernels.
-    """
-
-    def __init__(self,
-                 *,
-                 hidden_size: int,
-                 intermediate_size: int,
-                 bias: bool,
-                 activation: Callable[[torch.Tensor], torch.Tensor] = F.silu,
-                 dtype: Optional[torch.dtype] = None,
-                 config: Optional[ModelConfig] = None,
-                 overridden_tp_size: Optional[int] = None,
-                 reduce_output: bool = True,
-                 layer_idx: Optional[int] = None):
-        super().__init__(hidden_size=hidden_size,
-                         intermediate_size=intermediate_size,
-                         bias=bias,
-                         activation=activation,
-                         dtype=dtype,
-                         config=config,
-                         overridden_tp_size=overridden_tp_size,
-                         reduce_output=reduce_output,
-                         layer_idx=layer_idx)
-
-        # Override gate_up_proj and down_proj with Llama4Linear if we want to use special kernels.
-        self.enable_fused_gemm_swiglu = False
-        if self.hidden_size == 5120 \
-            and (self.intermediate_size == 16384 or self.intermediate_size == 8192) \
-            and self.mapping.tp_size == 8 \
-            and config.quant_config.quant_mode.has_fp8_qdq():
-
-            self.enable_fused_gemm_swiglu = True
-            self.gate_up_proj = Llama4Linear(
-                self.hidden_size,
-                self.intermediate_size * 2,
-                bias=bias,
-                dtype=dtype,
-                mapping=self.mapping,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                weights_loading_config=WeightsLoadingConfig(
-                    weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
-                quant_config=config.get_quant_config(),
-                reduce_output=reduce_output,
-                skip_create_weights_in_init=config.skip_create_weights_in_init,
-                enable_fused_gemm_swiglu=True,
-                enable_trtllm_gen=True,
-            )
-
-            # After loading both gate_up_proj and down_proj, we need to set the scales needed by the special kernels and by
-            # the trtllm-gen gemm+swiglu kernel.
-            def post_load_weights_hook(gate_up_proj, down_proj):
-                if gate_up_proj.has_fp8_qdq:
-                    # For the special gemm+swiglu kernel, we need to set the inverse of the output scale, which is the inverse
-                    # of down_proj's combined input scale.
-                    gate_up_proj.inv_output_scale = 1.0 / down_proj.input_scale
-                    # For the trtllm-gen gemm+swiglu kernel, we need to set the global scale, which is gate_up_proj's
-                    # combined input scale times inv_output_scale.
-                    gate_up_proj.trtllm_gen_global_scale = gate_up_proj.combined_scale * gate_up_proj.inv_output_scale
-
-            self.down_proj = Llama4Linear(
-                self.intermediate_size,
-                self.hidden_size,
-                bias=bias,
-                dtype=dtype,
-                mapping=self.mapping,
-                tensor_parallel_mode=TensorParallelMode.ROW,
-                quant_config=config.get_quant_config(),
-                reduce_output=reduce_output,
-                skip_create_weights_in_init=config.skip_create_weights_in_init,
-                enable_trtllm_gen=True,
-                post_load_weights_hook=partial(post_load_weights_hook,
-                                               self.gate_up_proj),
-            )
-
-    def forward(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        all_rank_num_tokens=None,
-        final_all_reduce_params: Optional[AllReduceParams] = None,
-        lora_params: Optional[dict] = None,
-    ) -> torch.Tensor:
-        # When gemm+swiglu is fused, we need to temporarily disable the activation function to avoid reapplying swiglu.
-        if self.enable_fused_gemm_swiglu:
-            orig_activation = self.activation
-            self.activation = None
-
-        # Call the parent's forward method.
-        output = super().forward(
-            x,
-            all_rank_num_tokens,
-            final_all_reduce_params,
-            lora_params,
-        )
-
-        # Restore the original activation function.
-        if self.enable_fused_gemm_swiglu:
-            self.activation = orig_activation
-
-        return output
 
 
 class Llama4Attention(Attention):
@@ -427,40 +95,6 @@ class Llama4Attention(Attention):
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
         self.attn_scale = getattr(config, "attn_scale", 0.1)
 
-        # Enable min-latency QKV gemm when the sizes are as expected.
-        tp_size = model_config.mapping.tp_size
-        self.enable_min_latency_qkv = False
-        self.enable_fused_gemm_attn_scaling = False
-
-        if config.hidden_size == 5120 \
-            and config.num_attention_heads == 40 \
-            and config.num_key_value_heads == 8 \
-            and tp_size == 8:
-            self.enable_min_latency_qkv = True
-
-            # Decide whether to fuse attn_scaling into QKV gemm.
-            self.enable_fused_gemm_attn_scaling = self.attn_temperature_tuning \
-                and self.floor_scale == 8192.0 \
-                and self.attn_scale == 0.1
-
-            # When min-latency QKV gemm is enabled, override qkv_proj.
-            self.qkv_proj = Llama4Linear(
-                self.hidden_size,
-                tp_size * self.q_size + 2 * tp_size * self.kv_size,
-                bias=config.attention_bias,
-                dtype=config.torch_dtype,
-                mapping=model_config.mapping,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                weights_loading_config=WeightsLoadingConfig(
-                    weight_mode=WeightMode.FUSED_QKV_LINEAR),
-                quant_config=model_config.get_quant_config(),
-                skip_create_weights_in_init=model_config.
-                skip_create_weights_in_init,
-                enable_fused_gemm_attn_scaling=self.
-                enable_fused_gemm_attn_scaling,
-                enable_trtllm_gen=True,
-            )
-
     def apply_qk_norm(self, q, k):
 
         def q_l2norm():
@@ -502,15 +136,8 @@ class Llama4Attention(Attention):
         CAUSAL,
         mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
+        skip_attn_scaling: bool = False,
     ):
-        # If we are going to use min-latency gemm+attn_scaling kernel, pass position_ids to QKV gemm.
-        skip_attn_scaling = False
-        if self.enable_min_latency_qkv \
-            and self.enable_fused_gemm_attn_scaling \
-            and position_ids is not None \
-            and get_num_tokens(hidden_states) <= MIN_LATENCY_QKV_GEMM_ATTN_SCALING_NUM_TOKENS:
-            self.qkv_proj.set_position_ids(position_ids)
-            skip_attn_scaling = True
 
         qkv = self.qkv_proj(hidden_states)
 
@@ -550,9 +177,8 @@ class Llama4Attention(Attention):
         **kwargs,
     ) -> torch.Tensor:
         assert lora_params is None, "LORA is not supported for Llama4Attention"
-
         if self.use_rope:
-            outputs = super().forward(
+            return super().forward(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
@@ -563,11 +189,9 @@ class Llama4Attention(Attention):
                 **kwargs,
             )
         else:
-            outputs = self._forward_nope(position_ids, hidden_states,
-                                         attn_metadata, attention_mask,
-                                         mrope_config, all_reduce_params)
-
-        return outputs
+            return self._forward_nope(position_ids, hidden_states,
+                                      attn_metadata, attention_mask,
+                                      mrope_config, all_reduce_params)
 
 
 class LlamaAttention(Attention):
@@ -594,91 +218,6 @@ class LlamaAttention(Attention):
         )
 
 
-class Llama4FusedMoE(FusedMoE):
-
-    def __init__(
-        self,
-        *,
-        routing_method: BaseMoeRoutingMethod,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size: int,
-        dtype: Optional[torch.dtype] = None,
-        reduce_results: bool = False,
-        model_config: ModelConfig = ModelConfig(),
-        aux_stream: torch.cuda.Stream = torch.cuda.Stream(),
-        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
-        VANILLA,
-        apply_router_weight_on_input: bool = False,
-        post_load_weights_hook: Optional[Callable] = None,
-    ):
-
-        super().__init__(
-            routing_method=routing_method,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            dtype=dtype,
-            reduce_results=reduce_results,
-            model_config=model_config,
-            aux_stream=aux_stream,
-            weight_loading_mode=weight_loading_mode,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-        )
-
-        self.post_load_weights_hook = post_load_weights_hook
-
-        # Enable min-latency mode for Llama4 Maverick TP8 EP1.
-        self.enable_min_latency_fused_moe = False
-        if num_experts == 128 \
-            and hidden_size == 5120 \
-            and intermediate_size == 8192 \
-            and model_config.quant_config.quant_mode.has_fp8_qdq() \
-            and model_config.mapping.moe_tp_size == 8 \
-            and model_config.mapping.moe_ep_size == 1 \
-            and routing_method.top_k == 1 \
-            and apply_router_weight_on_input:
-            self.enable_min_latency_fused_moe = True
-
-    def load_weights(self, weights: List[Dict]):
-        super().load_weights(weights)
-
-        if self.post_load_weights_hook:
-            self.post_load_weights_hook(self)
-
-    def forward(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        cutlass_min_latency_mode: bool = False,
-        output_dtype: Optional[torch.dtype] = None,
-        x_high: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-
-        # Use special min-latency MoE kernels when num_tokens <= 8.
-        if self.enable_min_latency_fused_moe \
-            and x.dtype == torch.float8_e4m3fn \
-            and get_num_tokens(x) <= MIN_LATENCY_FUSED_MOE_NUM_TOKENS:
-            assert hasattr(self, "min_latency_quant_scales"
-                           ), "Expect min_latency_quant_scales to be set"
-
-            return torch.ops.trtllm.llama4_moe_tp8ep1_min_latency(
-                x, router_logits, self.w3_w1_weight, self.w2_weight,
-                self.min_latency_quant_scales)
-
-        # Default MoE implementation does not support FP8 input, so use high-precision one instead.
-        if x.dtype == torch.float8_e4m3fn:
-            if x_high is not None:
-                x = x_high
-            else:
-                raise ValueError(
-                    "x_high is required when x.dtype is float8_e4m3fn in Llama4FusedMoE fallback path!"
-                )
-
-        return super().forward(x, router_logits, cutlass_min_latency_mode,
-                               output_dtype)
-
-
 class Llama4MoE(nn.Module):
 
     def __init__(
@@ -701,7 +240,9 @@ class Llama4MoE(nn.Module):
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.top_k = top_k
 
-        self.shared_expert = Llama4GatedMLP(
+        # Create shared_expert before experts because in min-latency mode the experts depend on the scaling factors of
+        # shared_expert.
+        self.shared_expert = GatedMLP(
             hidden_size=hidden_size,
             intermediate_size=shared_expert_intermediate_size,
             bias=False,
@@ -710,23 +251,7 @@ class Llama4MoE(nn.Module):
             overridden_tp_size=1 if self.enable_attention_dp else None,
             reduce_output=False)
 
-        def post_load_weights_hook(shared_expert, experts):
-            # Set min-latency quant scales for routed experts if we plan to use min-latency MoE kernels.
-            # This is because the routed experts' input scale is after the score multiplication, so we must use the
-            # pre-score scaling input scale, which happens to be shared expert's input scale.
-            if experts.enable_min_latency_fused_moe and hasattr(
-                    shared_expert.gate_up_proj, "input_scale"):
-                pre_score_scaling_input_scale = shared_expert.gate_up_proj.input_scale
-                experts.min_latency_quant_scales = FusedMoEQuantScalesFP8(
-                    fc1_dequant=experts.fc31_dequant.data /
-                    experts.fc31_input_dequant.data *
-                    pre_score_scaling_input_scale,
-                    fc2_quant=experts.fc2_quant,
-                    fc2_dequant=experts.fc2_dequant,
-                    fc1_input_dequant=pre_score_scaling_input_scale,
-                )
-
-        self.experts = Llama4FusedMoE(
+        self.experts = FusedMoE(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -736,37 +261,36 @@ class Llama4MoE(nn.Module):
             False,  # In both low latency and max-throughput scenarios, FusedMoE needs not to do allreduce inside op.
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             model_config=model_config,
-            apply_router_weight_on_input=True,
-            post_load_weights_hook=partial(post_load_weights_hook,
-                                           self.shared_expert))
+            apply_router_weight_on_input=True)
 
-        self.router = Llama4Linear(hidden_size,
-                                   num_experts,
-                                   bias=False,
-                                   dtype=config.torch_dtype,
-                                   quant_config=None)
+        self.router = Linear(hidden_size,
+                             num_experts,
+                             bias=False,
+                             dtype=config.torch_dtype,
+                             quant_config=None)
 
         self.mapping = model_config.mapping
         self.all_reduce = AllReduce(self.mapping)
         self.moe_event = [torch.cuda.Event(), torch.cuda.Event()]
         self.aux_stream = aux_stream
 
-    def compute_routed_output(
-            self,
-            hidden_states,
-            all_rank_num_tokens,
-            cutlass_min_latency_mode,
-            hidden_states_high: Optional[torch.Tensor] = None):
-        # Use high precision hidden states for routing gemm if it is provided.
-        hidden_states_routing = hidden_states_high if hidden_states_high is not None else hidden_states
-        router_logits = self.router.forward(hidden_states_routing)
-        routed_output = self.experts.forward(
-            hidden_states,
-            router_logits,
-            cutlass_min_latency_mode=cutlass_min_latency_mode,
-            x_high=hidden_states_high,
-        )
-
+    def compute_routed_output(self, hidden_states, all_rank_num_tokens,
+                              cutlass_min_latency_mode):
+        use_dp_padding = False
+        if self.enable_attention_dp and self.mapping.tp_size > 1:
+            # Use padding here to keep the behavior unchanged
+            use_dp_padding = True
+            max_num_token_across_dp_ranks = max(all_rank_num_tokens)
+            hidden_states = torch.nn.functional.pad(
+                hidden_states,
+                (0, 0, 0,
+                 max_num_token_across_dp_ranks - hidden_states.shape[0]))
+        router_logits = self.router(hidden_states)
+        routed_output = self.experts(hidden_states,
+                                     router_logits,
+                                     cutlass_min_latency_mode,
+                                     all_rank_num_tokens=all_rank_num_tokens,
+                                     use_dp_padding=use_dp_padding)
         return routed_output
 
     def forward(
@@ -775,15 +299,12 @@ class Llama4MoE(nn.Module):
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         cutlass_min_latency_mode: Optional[bool] = False,
-        # Optional input for routing gemm if experts and routing gemm require
-        # different precisions for input hidden states.
-        hidden_states_high: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
+        # Only enable multi-stream for cuda graph since switch stream has extra host overhead
+        # This design is mainly for low latency use case. Need to improve for max throughput use case.
         fn0 = lambda: self.shared_expert(hidden_states)
         fn1 = lambda: self.compute_routed_output(
-            hidden_states, all_rank_num_tokens, cutlass_min_latency_mode,
-            hidden_states_high)
+            hidden_states, all_rank_num_tokens, cutlass_min_latency_mode)
         shared_output, routed_output = maybe_execute_in_parallel(
             fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
         if cutlass_min_latency_mode:
@@ -826,6 +347,11 @@ class Llama4DecoderLayer(DecoderLayer):
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
 
         self.fusion_config = EagerFusionConfig()
+        # self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
+        # )
+        # TODO: re-enable these fusions
+        self.fusion_config.PRE_MOE_FUSION = False
+        self.fusion_config.POST_MLP_FUSION = False
 
         nope_layer = config.no_rope_layers[layer_idx] == 0
         attention_chunk_size = getattr(config, "attention_chunk_size",
@@ -844,7 +370,7 @@ class Llama4DecoderLayer(DecoderLayer):
                              1) % config.interleave_moe_layer_step != 0
 
         if self.is_mlp_layer:
-            self.feed_forward = Llama4GatedMLP(
+            self.feed_forward = GatedMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size_mlp,
                 # Llama4 has no mlp_bias field.
@@ -852,10 +378,11 @@ class Llama4DecoderLayer(DecoderLayer):
                 dtype=config.torch_dtype,
                 config=model_config,
                 overridden_tp_size=1 if self.enable_attention_dp else None,
-                layer_idx=layer_idx)
+                layer_idx=layer_idx,
+            )
 
-            self.fusion_config.PRE_MLP_FUSION = model_config.mapping.has_tp()
-            self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp()
+            # self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
+            # )
         else:
             self.feed_forward = Llama4MoE(
                 num_experts=config.num_local_experts,
@@ -867,8 +394,8 @@ class Llama4DecoderLayer(DecoderLayer):
                 aux_stream=aux_stream,
                 dtype=config.torch_dtype)
 
-            self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp()
-            self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp()
+            # self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp(
+            # )
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -884,8 +411,6 @@ class Llama4DecoderLayer(DecoderLayer):
         self.next_attn: LlamaAttention = None
 
         self.moe_allreduce = MoEAllReduce(self.mapping)
-        self.pre_mlp_quant_allreduce = AllReduce(self.mapping)
-        self.post_quant_allreduce = AllReduce(self.mapping)
 
     def forward(
         self,
@@ -896,13 +421,16 @@ class Llama4DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-
-        num_tokens = get_num_tokens(hidden_states)
+        # Only enable min-latency mode on Blackwell
+        # TODO: Remove it after we fix crash on Hopper
+        # major, minor = torch.cuda.get_device_capability()
+        # is_blackwell = (major * 10 + minor) >= 100
+        # cutlass_min_latency_mode = hidden_states.size(
+        #     0
+        # ) <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
 
         # Temporarily disable min-latency mode for Llama4
         cutlass_min_latency_mode = False
-        use_fp8_allreduce = num_tokens <= 128 and self.is_fp8_quant
-        use_fp4_allreduce = num_tokens <= 128 and self.is_nvfp4
 
         if residual is None:
             residual = hidden_states
@@ -914,51 +442,12 @@ class Llama4DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.PRE_MOE_FUSION
-                or self.fusion_config.PRE_MLP_FUSION
-                or self.mapping.tp_size == 1 or self.enable_attention_dp)),
+                self.fusion_config.PRE_MOE_FUSION or self.mapping.tp_size == 1
+                or self.enable_attention_dp)),
             **kwargs,
         )
 
-        # Reserved if we need both high-precision and low-precision hidden states.
-        hidden_states_high = None
-        if self.fusion_config.PRE_MLP_FUSION and use_fp8_allreduce:
-            hidden_states, residual = self.pre_mlp_quant_allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
-                    residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
-                    scale=self.feed_forward.gate_up_proj.input_scale,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                ))
-        elif self.fusion_config.PRE_MLP_FUSION and use_fp4_allreduce:
-            act_fp4, act_sf, residual = self.pre_mlp_quant_allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
-                    residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
-                    scale=self.feed_forward.gate_up_proj.input_scale,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                ))
-            hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
-        elif self.fusion_config.PRE_MOE_FUSION and use_fp8_allreduce:
-            # For pre-MoE all reduce in FP8 mode, we must output two variants of
-            # the tensor: one in high-precision (BF16) and one in FP8.
-            # This is because routing gemm requires BF16 input while shared
-            # expert and routed expert require FP8 input.
-            hidden_states_high, hidden_states, residual = self.pre_mlp_quant_allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
-                    residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
-                    scale=self.feed_forward.shared_expert.gate_up_proj.
-                    input_scale,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                ))
-        elif self.fusion_config.PRE_MOE_FUSION or self.fusion_config.PRE_MLP_FUSION:
+        if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.all_reduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -972,36 +461,15 @@ class Llama4DecoderLayer(DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
-        # In eagle3 mode, we capture the value in the boundary of decoder layer.
-        # If fusing rms in the next layer, the value is not correct. Thus, if
-        # this layer will be captured, we should not fuse the rms in the next
-        # layer.
-        if spec_metadata is not None:
-            if spec_metadata.is_layer_capture(self.layer_idx):
-                self.fusion_config.POST_MOE_FUSION = False
-                self.fusion_config.POST_MLP_FUSION = False
-                cutlass_min_latency_mode = False
-
-        if self.is_mlp_layer:
-            hidden_states = self.feed_forward(
-                hidden_states,
-                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-                final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                    self.fusion_config.POST_MOE_FUSION
-                    or self.fusion_config.POST_MLP_FUSION
-                    or self.mapping.tp_size == 1 or self.enable_attention_dp)),
-            )
-        else:
-            hidden_states = self.feed_forward(
-                hidden_states,
-                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-                final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                    self.fusion_config.POST_MOE_FUSION
-                    or self.fusion_config.POST_MLP_FUSION
-                    or self.mapping.tp_size == 1 or self.enable_attention_dp)),
-                cutlass_min_latency_mode=cutlass_min_latency_mode,
-                hidden_states_high=hidden_states_high,
-            )
+        hidden_states = self.feed_forward(
+            hidden_states,
+            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            final_all_reduce_params=AllReduceParams(enable_allreduce=not (
+                self.fusion_config.POST_MOE_FUSION
+                or self.fusion_config.POST_MLP_FUSION
+                or self.mapping.tp_size == 1 or self.enable_attention_dp)),
+            cutlass_min_latency_mode=cutlass_min_latency_mode,
+        )
 
         if spec_metadata is not None:
             # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
@@ -1011,46 +479,24 @@ class Llama4DecoderLayer(DecoderLayer):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
 
-        if cutlass_min_latency_mode:
-            shared_output = hidden_states[0]
-            hidden_states_activated_experts = hidden_states[1]
-            num_activated_experts_per_node = hidden_states[2]
-            experts_to_token_score = hidden_states[3]
-            hidden_states, residual = self.moe_allreduce(
-                residual,
-                self.next_layer_layernorm.weight,
-                device_num_experts=num_activated_experts_per_node,
-                scale_input=experts_to_token_score,
-                active_experts_token_input=hidden_states_activated_experts,
-                token_input=shared_output,
-                eps=self.next_layer_layernorm.variance_epsilon,
-            )
-        elif (self.fusion_config.POST_MOE_FUSION
-              or self.fusion_config.POST_MLP_FUSION
-              ) and self.next_layer_layernorm is not None:
-            # fp8 POST_MOE_FUSION case might have illegal memory access issue. Disable it temporarily.
-            if (self.fusion_config.POST_MLP_FUSION
-                    or self.fusion_config.POST_MOE_FUSION
-                ) and use_fp8_allreduce and self.next_attn is not None:
-                hidden_states, residual = self.post_quant_allreduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
-                        residual=residual,
-                        norm_weight=self.next_layer_layernorm.weight,
-                        scale=self.next_attn.qkv_proj.input_scale,
-                        eps=self.next_layer_layernorm.variance_epsilon,
-                    ))
-            elif use_fp4_allreduce and self.next_attn is not None:
-                act_fp4, act_sf, residual = self.post_quant_allreduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
-                        residual=residual,
-                        norm_weight=self.next_layer_layernorm.weight,
-                        scale=self.next_attn.qkv_proj.input_scale,
-                        eps=self.next_layer_layernorm.variance_epsilon,
-                    ))
+        if (self.fusion_config.POST_MOE_FUSION
+                or self.fusion_config.POST_MLP_FUSION
+            ) and self.next_layer_layernorm is not None:
+            if cutlass_min_latency_mode:
+                shared_output = hidden_states[0]
+                hidden_states_activated_experts = hidden_states[1]
+                num_activated_experts_per_node = hidden_states[2]
+                experts_to_token_score = hidden_states[3]
+
+                hidden_states, residual = self.moe_allreduce(
+                    residual,
+                    self.next_layer_layernorm.weight,
+                    device_num_experts=num_activated_experts_per_node,
+                    scale_input=experts_to_token_score,
+                    active_experts_token_input=hidden_states_activated_experts,
+                    token_input=shared_output,
+                    eps=self.next_layer_layernorm.variance_epsilon,
+                )
             else:
                 hidden_states, residual = self.all_reduce(
                     hidden_states,
@@ -1239,7 +685,6 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
-        # assert isinstance(spec_metadata, Eagle3SpecMetadata)
         # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
         # PyExecutor will extract these from the draft model engine's spec metadata.
         # They will be passed to the draft model engine on the next iteration.
@@ -1258,6 +703,7 @@ class Llama4Model(DecoderModel):
         self.padding_idx = config.pad_token_id
         self.num_hidden_layers = config.num_hidden_layers
         self.aux_stream = torch.cuda.Stream()
+        self.mapping = model_config.mapping
 
         if self.model_config.mapping.enable_attention_dp:
             self.embed_tokens = Embedding(config.vocab_size,
@@ -1273,8 +719,14 @@ class Llama4Model(DecoderModel):
                 gather_output=True,
             )
 
+        # If enable_min_latency is True, we will use min-latency mode.
+        DecoderLayerClass = Llama4DecoderLayer
+        if model_config.pytorch_backend_config.enable_min_latency:
+            from .modeling_llama_min_latency import Llama4MinLatencyDecoderLayer
+            DecoderLayerClass = Llama4MinLatencyDecoderLayer
+
         self.layers = nn.ModuleList([
-            Llama4DecoderLayer(
+            DecoderLayerClass(
                 model_config,
                 layer_idx,
                 self.aux_stream,
@@ -1304,7 +756,7 @@ class Llama4Model(DecoderModel):
         hidden_states = inputs_embeds
         residual = None
 
-        for decoder_layer in self.layers[:self.num_hidden_layers]:
+        for idx, decoder_layer in enumerate(self.layers[:self.num_hidden_layers]):
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -1431,15 +883,6 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 draft_config, model_config.pretrained_config.num_hidden_layers)
             self.spec_worker = get_spec_worker(model_config.spec_config,
                                                model_config.mapping)
-
-            # Set to True to enable delayed all-gather for LM head.
-            # This means LM head will not perform all-gather on the output logits, so each rank will only have
-            # a subset of the logits. The decoding part must be aware of that and apply all gather after top1 reduction.
-            self.enable_lm_head_delayed_all_gather = True
-            if self.enable_lm_head_delayed_all_gather:
-                # Delay all-gather until after top1 reduction.
-                self.lm_head.gather_output = False
-                self.draft_model.lm_head.gather_output = False
 
     def forward(
         self,

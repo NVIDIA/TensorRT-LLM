@@ -246,6 +246,7 @@ class Eagle3OneModelWorker(nn.Module):
         super().__init__()
         self.spec_config = spec_config
         self.max_draft_tokens = self.spec_config.max_draft_tokens
+        self.mapping = mapping
 
     @torch.compile(mode="max-autotune-no-cudagraphs")
     def forward(self, input_ids, position_ids, hidden_states, logits,
@@ -345,7 +346,6 @@ class Eagle3OneModelWorker(nn.Module):
         next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
                                        dim=1)
 
-        # return accepted_tokens, num_accepted_tokens, next_draft_tokens, next_new_tokens
         return {
             'logits': raw_logits,
             'new_tokens': accepted_tokens,
