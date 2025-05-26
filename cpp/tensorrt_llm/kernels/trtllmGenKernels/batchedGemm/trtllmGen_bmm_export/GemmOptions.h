@@ -754,7 +754,10 @@ inline bool checkAndUpdateGemmOptions(
             shuffleBlockSize, ") when useShuffledMatrixA");
     }
 
-    TLLM_CHECK_ERROR(options.mMmaM <= options.mEpilogueTileM, "EpilogueTileM must be larger or equal than mmaM.");
+    if (!options.mSliceK)
+    {
+        TLLM_CHECK_ERROR(options.mMmaM <= options.mEpilogueTileM, "EpilogueTileM must be larger or equal than mmaM.");
+    }
     TLLM_CHECK_ERROR(options.mTileM % options.mEpilogueTileM == 0 && options.mTileN % options.mEpilogueTileN == 0,
         "TileM and TileN must be divisible by EpilogueTileM and EpilogueTileN respectively.");
     TLLM_CHECK_ERROR(
@@ -952,26 +955,32 @@ inline bool checkAndUpdateGemmOptions(
         TLLM_CHECK_ERROR(options.mTileN == options.mEpilogueTileN, "TileN must be equal to EpilogueTileN for slice-K");
 
         TLLM_LOG_WARNING("Overwriting TileM and EpilogueTileM to 32 for slice-K");
-        if (updateOptions)
+        if (options.mTileM != 32 || options.mEpilogueTileM != 32)
         {
-            // FIXME: it is possible to remove this restriction.
-            options.mTileM = 32;
-            options.mEpilogueTileM = 32;
-        }
-        else
-        {
-            return false;
+            if (updateOptions)
+            {
+                // FIXME: it is possible to remove this restriction.
+                options.mTileM = 32;
+                options.mEpilogueTileM = 32;
+            }
+            else
+            {
+                return false;
+            }
         }
         TLLM_CHECK_ERROR(options.mDtypeA == tg::Dtype::E4m3 && options.mDtypeB == tg::Dtype::E4m3,
             "Slice-K requires e4m3 input dtype");
 
-        if (updateOptions)
+        if (options.mNumSlicesForSliceK != 4)
         {
-            options.mNumSlicesForSliceK = 4;
-        }
-        else
-        {
-            return false;
+            if (updateOptions)
+            {
+                options.mNumSlicesForSliceK = 4;
+            }
+            else
+            {
+                return false;
+            }
         }
         TLLM_CHECK_ERROR((options.mTileK / options.mMmaK) % options.mNumSlicesForSliceK == 0, "TileK (", options.mTileK,
             ") / MmaK (", options.mMmaK, ") must be a multiple of mNumSlicesForSliceK (", options.mNumSlicesForSliceK,
