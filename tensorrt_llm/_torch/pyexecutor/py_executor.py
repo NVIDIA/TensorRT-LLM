@@ -1524,7 +1524,8 @@ class PyExecutor:
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
-                req.py_draft_tokens = req.context_phase_params.draft_tokens
+                ctx_draft_tokens = req.context_phase_params.draft_tokens
+                req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.sampling_config.beam_width
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
