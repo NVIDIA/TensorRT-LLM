@@ -609,12 +609,12 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     auto const managedLayersPerWindowSize
         = KVCacheManager::calculateManagedLayersPerWindowSize(maxAttentionWindowVec, numLayers);
 
-    auto const blocksPerWindowSize
+    auto const blocksPerWindow
         = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, isCrossAttention, kvDtype, mModelConfig, mWorldConfig,
             mRuntime->getBufferManager(), managedLayersPerWindowSize, extraCostMemory, kvCacheManagerFraction);
 
     auto kvCacheManager = std::make_shared<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
-        blocksPerWindowSize, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
+        blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
         kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse,
         kvCacheConfig.onboardBlocks, kvCacheType, kvCacheConfig.secondaryOffloadMinPriority,
         kvCacheConfig.eventBufferMaxSize > 0
