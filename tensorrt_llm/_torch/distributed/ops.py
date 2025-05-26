@@ -307,8 +307,10 @@ class MNNVLAllReduce(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
-        assert (dtype in MNNVLAllReduce.get_supported_dtype()
-                and (not mapping.has_cp())), ""
+        assert (
+            dtype in MNNVLAllReduce.get_supported_dtype()
+            and (not mapping.has_cp())
+        ), "MNNVL all reduce only support dtype {MNNVLAllReduce.get_supported_dtype()} and without cp."
 
         self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
             self.mapping, dtype)
@@ -331,6 +333,9 @@ class MNNVLAllReduce(nn.Module):
         Returns:
             Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
         """
+        if self.mapping == 1:
+            return input
+
         if input.numel() > self.max_num_elements_mnnvl:
             return None
 
@@ -376,7 +381,9 @@ class TLLMAllReduce(nn.Module):
     for certain operations when using NVLink for multi-node communication.
     """
 
-    def __init__(self, mapping: Mapping, strategy: AllReduceStrategy = AllReduceStrategy.AUTO):
+    def __init__(self,
+                 mapping: Mapping,
+                 strategy: AllReduceStrategy = AllReduceStrategy.AUTO):
         super().__init__()
         self.mapping = mapping
         self.strategy = strategy
@@ -404,6 +411,9 @@ class TLLMAllReduce(nn.Module):
         Returns:
             Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
         """
+        if self.mapping == 1:
+            return input
+
         output = torch.ops.trtllm.allreduce(
             input=input,
             residual=all_reduce_params.residual,
@@ -467,7 +477,7 @@ class AllReduce(nn.Module):
             or by setting the environment variable FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY when using
             the AUTO strategy.
         """
-        self.skip_ar = self.mapping.tp_size == 1
+        self.skip_ar = mapping.tp_size == 1
         self._mnvl_allreduce = None
         self._tllm_allreduce = None
         self._create_allreduce(mapping, ar_backend, strategy, dtype)
@@ -521,13 +531,13 @@ class AllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
-        if self.mnnvl_allreduce:
-            mnnvl_output = self.mnnvl_allreduce(
+        if self._mnvl_allreduce:
+            mnnvl_output = self._mnvl_allreduce(
                 input, all_reduce_params=all_reduce_params)
             if mnnvl_output is not None:
                 return mnnvl_output
 
-        # MNVL only support part of AllReduceFusionOp provided in params.
+        # MNNVL only support part of AllReduceFusionOp provided in params.
         output = self._tllm_allreduce(
             input=input,
             all_reduce_params=all_reduce_params,
