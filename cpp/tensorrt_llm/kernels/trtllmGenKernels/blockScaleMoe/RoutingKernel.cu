@@ -1178,39 +1178,42 @@ void run(Data const& data, void* stream)
         TLLM_CHECK_WITH_INFO(data.mPtrExpertIdx != nullptr && data.mPtrPermutedIdxSize,
             "If permuted index is required, `mPtrExpertIdx` is also required");
     TLLM_CHECK_WITH_INFO(!data.mUseRoutingSoftmax, "Routing with softmax not implemented yet");
-    TLLM_CHECK_WITH_INFO(data.mNumLimitedGroups <= MaxNumTopGroups, "Routing kernel expects <= ", MaxNumTopGroups,
-        " top groups, got ", data.mNumLimitedGroups);
-    TLLM_CHECK_WITH_INFO(data.mTopK <= MaxNumTopExperts, "Routing kernel expects topK experts <= ", MaxNumTopExperts,
-        ", got ", data.mTopK);
-    TLLM_CHECK_WITH_INFO(data.mTopK <= WarpSize, "Routing kernel expects top K <= warp size, got ", data.mTopK);
+    TLLM_CHECK_WITH_INFO(data.mNumLimitedGroups <= MaxNumTopGroups, "Routing kernel expects <= %d top groups, got %d",
+        MaxNumTopGroups, data.mNumLimitedGroups);
+    TLLM_CHECK_WITH_INFO(data.mTopK <= MaxNumTopExperts, "Routing kernel expects topK experts <= %d, got %d",
+        MaxNumTopExperts, data.mTopK);
+    TLLM_CHECK_WITH_INFO(data.mTopK <= WarpSize, "Routing kernel expects top K <= warp size, got %d", data.mTopK);
     TLLM_CHECK_WITH_INFO(data.mTopK * data.mNumLimitedGroups <= WarpSize,
-        "Routing kernel expects top K * top groups <= warp size (for now), got ", data.mTopK, " * ",
+        "Routing kernel expects top K * top groups <= warp size (for now), got %d * %d", data.mTopK,
         data.mNumLimitedGroups);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts >= MaxNumTopExperts, "Routing kernel expects ", MaxNumTopExperts,
-        " to be at most #experts ", data.mNumExperts);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts <= NumThreads, "Routing kernel expects #experts ", data.mNumExperts,
-        " <= #threads ", NumThreads);
-    TLLM_CHECK_WITH_INFO(data.mNumExpertGroups >= data.mNumLimitedGroups, "Routing kernel expects top groups ",
-        data.mNumLimitedGroups, " to be limited by #expert groups ", data.mNumExpertGroups);
+    TLLM_CHECK_WITH_INFO(data.mNumExperts >= MaxNumTopExperts, "Routing kernel expects %d to be at most #experts %d",
+        MaxNumTopExperts, data.mNumExperts);
+    TLLM_CHECK_WITH_INFO(data.mNumExperts <= NumThreads, "Routing kernel expects #experts %d  <= #threads %d",
+        data.mNumExperts, NumThreads);
+    TLLM_CHECK_WITH_INFO(data.mNumExpertGroups >= data.mNumLimitedGroups,
+        "Routing kernel expects top groups %d to be limited by #expert groups %d", data.mNumLimitedGroups,
+        data.mNumExpertGroups);
     if (data.mNumExpertGroups > 1)
     {
-        TLLM_CHECK_WITH_INFO(data.mNumExpertGroups <= NumWarps, "Routing kernel expects #experts groups ",
-            data.mNumExpertGroups, " to be <= #warps", NumWarps);
-        TLLM_CHECK_WITH_INFO(data.mNumExperts % data.mNumExpertGroups == 0, "Routing kernel expects #experts ",
-            data.mNumExperts, " to be a multiple of #expert groups ", data.mNumExpertGroups);
+        TLLM_CHECK_WITH_INFO(data.mNumExpertGroups <= NumWarps,
+            "Routing kernel expects #experts groups %d to be <= #warps %d", data.mNumExpertGroups, NumWarps);
+        TLLM_CHECK_WITH_INFO(data.mNumExperts % data.mNumExpertGroups == 0,
+            "Routing kernel expects #experts %d to be a multiple of #expert groups %d", data.mNumExperts,
+            data.mNumExpertGroups);
         TLLM_CHECK_WITH_INFO(data.mNumExperts / data.mNumExpertGroups <= WarpSize,
-            "Routing kernel expects #experts per group <= warp size, got ", data.mNumExperts / data.mNumExpertGroups);
+            "Routing kernel expects #experts per group <= warp size, got %d", data.mNumExperts / data.mNumExpertGroups);
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(data.mNumExperts <= WarpSize * MaxNumTopGroups, "Routing kernel expects #experts ",
-            data.mNumExperts, " <= WarpSize * MaxNumTopGroups ", WarpSize * MaxNumTopGroups);
+        TLLM_CHECK_WITH_INFO(data.mNumExperts <= WarpSize * MaxNumTopGroups,
+            "Routing kernel expects #experts %d <= WarpSize * MaxNumTopGroups %d", data.mNumExperts,
+            WarpSize * MaxNumTopGroups);
         TLLM_CHECK_WITH_INFO(
-            data.mTopK <= NumWarps, "Routing kernel expects top K ", data.mTopK, " to be <= #warps", NumWarps);
+            data.mTopK <= NumWarps, "Routing kernel expects top K %d to be <= #warps %d", data.mTopK, NumWarps);
     }
     TLLM_CHECK_WITH_INFO(
-        data.mNumExperts % 4 == 0, "Routing kernel expects #experts ", data.mNumExperts, " to be a multiple of 4.");
-    TLLM_CHECK_WITH_INFO(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got ", data.mPaddingLog2);
+        data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
+    TLLM_CHECK_WITH_INFO(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got %d", data.mPaddingLog2);
     int const numBlocks = data.mNumTokens;
 
     if (data.mPtrExpertWeightsFull != nullptr)
@@ -3704,10 +3707,10 @@ void run(Data const& data, void* stream)
                 /*smemSize=*/0, // No dynamic smem
                 stream);
         }
-        LAUNCH_EXPW_ONLY(data, false, routingIndicesHistogramKernel, numBlocksHistogram, NumThreadsHist,
+        LAUNCH_EXPW_ONLY_QWEN3(data, false, routingIndicesHistogramKernel, numBlocksHistogram, NumThreadsHist,
             /*smemSize=*/0, // No dynamic smem
             stream);
-        LAUNCH_EXPW_ONLY(data, false, routingIndicesOffsetsKernel, numBlocksOffsets, NumThreadsHist,
+        LAUNCH_EXPW_ONLY_QWEN3(data, false, routingIndicesOffsetsKernel, numBlocksOffsets, NumThreadsHist,
             /*smemSize=*/0, // No dynamic smem
             stream);
     }

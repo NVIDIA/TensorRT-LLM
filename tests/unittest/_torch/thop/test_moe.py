@@ -582,6 +582,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
     num_experts, n_groups, top_k_groups, top_k = expert_info
     padding = 8
     routed_scaling = 2.5
+    routing_method_type = RoutingMethodType.DeepSeekV3
 
     assert top_k <= num_experts
     assert top_k <= 8
@@ -628,7 +629,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
         expert_logits, routing_bias, hidden_states, hidden_states_scale,
         gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales, num_experts,
         top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
-        routed_scaling)
+        routed_scaling, routing_method_type)
 
     output_dequant_actual = output.to(torch.float)
     #
@@ -965,6 +966,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     # FIXME: set to TileN size
     padding = 8
     routed_scaling = 2.5
+    routing_method_type = RoutingMethodType.Llama4
 
     assert top_k <= num_experts
     assert top_k <= 8
@@ -1066,7 +1068,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
         hidden_states_quant, gemm1_weights_fp8_shuffled, scale_c_fc1,
         scale_gate_fc1, gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts,
         top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
-        routed_scaling, use_routing_scales_on_input)
+        routed_scaling, use_routing_scales_on_input, routing_method_type)
 
     output_dequant_actual = output.to(torch.float)
 

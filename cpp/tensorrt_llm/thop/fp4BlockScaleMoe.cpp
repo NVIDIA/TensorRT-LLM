@@ -62,9 +62,13 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
         TORCH_CHECK(top_k < (topk_group.value() * num_experts / n_group.value()),
             "top_k must be less than total number of experts in selected groups");
     }
-    else
+    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Qwen3)
     {
-        TORCH_CHECK(top_k == 1, "Current routing kernel (no groups) only supports top_k=1.");
+        TORCH_CHECK(top_k == 8, "Current routing kernel (no groups, Qwen3) only supports top_k=8.");
+    }
+    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4)
+    {
+        TORCH_CHECK(top_k == 1, "Current routing kernel (no groups, Llama4) only supports top_k=1.");
     }
 
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
@@ -75,10 +79,12 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
 
     // setup args
     // note: the assumption is that output data type is always Bfloat16 (the default)
+    auto const routing_bias_dtype
+        = routing_bias.has_value() ? routing_bias.value().scalar_type() : at::ScalarType::BFloat16;
     args.mDtypeElt = tg::Dtype::E2m1;
-    args.mDtypeExpW = routing_bias.scalar_type() == at::ScalarType::BFloat16 ? tg::Dtype::Bfloat16 : tg::Dtype::Fp32;
-    args.routing_logits = routing_logits.data_ptr<float>();
-    args.routing_bias = routing_bias.data_ptr();
+    args.mDtypeExpW = routing_bias_dtype == at::ScalarType::Float ? tg::Dtype::Fp32 : tg::Dtype::Bfloat16;
+    args.routing_logits = routing_logits.data_ptr();
+    args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
     args.hidden_states = hidden_states.data_ptr();
     args.hidden_states_scale = hidden_states_scale.data_ptr();
     args.gemm1_weights = gemm1_weights.data_ptr();
@@ -112,7 +118,7 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
     at::Tensor permuted_idx_to_token_idx
         = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     at::Tensor expert_weights = at::detail::empty_cuda(
-        {args.num_tokens, args.top_k}, routing_bias.scalar_type(), routing_logits.device(), std::nullopt);
+        {args.num_tokens, args.top_k}, routing_bias_dtype, routing_logits.device(), std::nullopt);
     at::Tensor expert_indexes = at::detail::empty_cuda(
         {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     at::Tensor expert_count_histogram = at::detail::empty_cuda({2 * 256},

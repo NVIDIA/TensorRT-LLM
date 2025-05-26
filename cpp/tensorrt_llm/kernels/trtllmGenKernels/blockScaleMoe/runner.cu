@@ -59,6 +59,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     int32_t* numNonExitingCtas, tg::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
     RoutingMethodType routingMethodType, cudaStream_t stream)
 {
+    // FIXME: hardcoded for now
+    int32_t tileN = 8;
+
     if (routingMethodType == RoutingMethodType::DeepSeekV3)
     {
         TLLM_CHECK_WITH_INFO(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
