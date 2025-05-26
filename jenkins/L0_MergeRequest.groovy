@@ -359,18 +359,19 @@ def launchReleaseCheck(pipeline)
                 sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
             }
         }
-        // Step 3: do some check in container
+        // Step 3: Run license check
         sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
-        // Step 4: do guardwords scan
+
+        // Step 4: Run guardwords scan
         def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
         if (env.alternativeTRT || isOfficialPostMergeJob) {
             trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
-            sh "cd ${SCAN_ROOT} && pip3 install -e ."
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
             try {
                 sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f -not -path \"*/.git/*\" -not -path \"*/3rdparty/*\") 2>&1 | tee scan.log"
                 def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
                 if (lastLine.toLowerCase().contains("error")) {
-                    error "Guardwords scan failed."
+                    error "Guardwords Scan Failed."
                 }
             } catch (Exception e) {
                 throw e
