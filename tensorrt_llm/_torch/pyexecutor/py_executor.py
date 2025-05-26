@@ -889,12 +889,11 @@ class PyExecutor:
                                                       batch_outputs)
 
                     self._update_request_states(scheduled_batch)
+                    self._update_requests(sample_state)
 
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
-
-                    self._update_requests(sample_state)
 
                     if num_dummy_request > 0:
                         self._finish_dummy_request(scheduled_batch)
@@ -1598,7 +1597,8 @@ class PyExecutor:
         if (scheduled_ctx_requests is None or len(scheduled_ctx_requests) == 0):
             return []
         for req in scheduled_ctx_requests:
-            if req.is_context_only_request and req.is_context_finished:
+            if req.is_context_only_request and (req.is_context_finished or
+                                                req.is_finished_due_to_length):
                 self.kv_cache_transceiver.respond_and_send_async(req)
                 self.resource_manager.resource_managers[
                     "seq_slot_manager"].free_resources(req)

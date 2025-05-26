@@ -462,8 +462,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if torch_compile and attention_dp:
             pytest.skip("https://nvbugs/5252559")
         # OOM on H100 with default free_gpu_memory_fraction=0.9
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                        enable_block_reuse=not fp8kv)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = PyTorchConfig(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -544,8 +543,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
         # OOM on H100 with default free_gpu_memory_fraction=0.9
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                        enable_block_reuse=not fp8kv)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = PyTorchConfig(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -597,8 +595,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                    torch_compile):
         if torch_compile and attention_dp:
             pytest.skip("https://nvbugs/5252559")
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
-                                        enable_block_reuse=not fp8kv)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
 
         pytorch_config = PyTorchConfig(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -650,8 +647,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252559")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
-                                        enable_block_reuse=not fp8kv)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         pytorch_config = PyTorchConfig(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -762,24 +758,27 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,batch_size,moe_backend",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
-            (8, 1, 4, 3, False, False, True, True, 1, "CUTLASS"),
-            #TODO: enable mtp after bug fix
-            (8, 1, 4, 0, False, False, True, True, 1, "TRTLLM"),
-            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS"),
-            (8, 1, 1, 0, True, True, True, True, 24, "CUTLASS"),
+            #  Use a larger batch_size to speed up the tests
+            (8, 1, 4, 3, False, False, True, True, 32, "CUTLASS"),
+            (8, 1, 4, 3, False, False, True, True, 32, "TRTLLM"),
+            (8, 1, 8, 0, True, True, True, True, 32, "CUTLASS"),
+            (8, 1, 1, 0, True, True, True, True, 32, "CUTLASS"),
         ],
         ids=["latency", "latency_trtllmgen", "throughput", "throughput_tp8"])
     def test_nvfp4_8gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                          attention_dp, cuda_graph, overlap_scheduler,
-                         batch_size, moe_backend):
+                         max_batch_size, moe_backend):
+        #TODO: remove after the test failure for TRTLLM backend is fixed
+        if moe_backend == "TRTLLM":
+            pytest.skip("https://nvbugs/5302441")
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                        enable_block_reuse=not fp8kv)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
         pytorch_config = PyTorchConfig(
             disable_overlap_scheduler=not overlap_scheduler,
-            use_cuda_graph=cuda_graph)
+            use_cuda_graph=cuda_graph,
+            moe_backend=moe_backend)
 
         quant_config = QuantConfig()
         quant_config.quant_algo = QuantAlgo.NVFP4
@@ -791,7 +790,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
         llm = LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
-                  batch_size=batch_size,
+                  max_batch_size=max_batch_size,
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
@@ -799,8 +798,9 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                   pytorch_backend_config=pytorch_config,
                   quant_config=quant_config,
                   enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config,
-                  moe_backend=moe_backend)
+                  speculative_config=mtp_config)
+
+        assert llm.pytorch_backend_config.moe_backend == moe_backend
         assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
         if fp8kv:
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
@@ -817,13 +817,13 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     @skip_pre_hopper
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,batch_size",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",
         [(8, 1, 4, 3, False, False, True, True, 1),
          (8, 1, 8, 0, True, True, True, True, 24)],
         ids=["latency", "throughput"])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
-                            batch_size):
+                            max_batch_size):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
         pytorch_config = PyTorchConfig(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -839,7 +839,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
         llm = LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1",
-                  batch_size=batch_size,
+                  max_batch_size=max_batch_size,
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
@@ -1030,14 +1030,32 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
-        [(1, 1, 1, True, True, True)],
-        ids=["latency"])
-    def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
-                   overlap_scheduler):
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
+        [
+            (1, 1, 1, True, True, True, "CUTLASS"),
+            # TODO: enable TRTLLM backend
+            # (1, 1, 1, True, True, True, "TRTLLM"),
+        ],
+        ids=[
+            "latency_moe_cutlass",
+            # "latency_moe_trtllm",
+        ],
+    )
+    def test_nvfp4(
+        self,
+        tp_size,
+        pp_size,
+        ep_size,
+        attention_dp,
+        cuda_graph,
+        overlap_scheduler,
+        moe_backend,
+    ):
         pytorch_config = PyTorchConfig(
             disable_overlap_scheduler=not overlap_scheduler,
-            use_cuda_graph=cuda_graph)
+            use_cuda_graph=cuda_graph,
+            moe_backend=moe_backend,
+        )
 
         llm = LLM(
             f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf",

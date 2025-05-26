@@ -323,7 +323,8 @@ protected:
         return ptr;
     }
 
-    bool checkSufficientTestMemory(int64_t num_tokens, int64_t hidden_size, int64_t num_experts, int64_t k)
+    bool checkSufficientTestMemory(
+        int64_t num_tokens, int64_t hidden_size, int64_t num_experts, int64_t k, bool parallel = false)
     {
         this->managed_buffers.clear();             // Make sure all the previous buffers are freed
         check_cuda_error(cudaDeviceSynchronize()); // Sync to make sure all previous operations are resolved
@@ -343,7 +344,13 @@ protected:
         size_t const in_out_size = 2 * num_tokens * hidden_size * sizeof(DataType);
 
         // This should be correct to within 100MiB (on tests with 30GiB total)
-        size_t const total_size = workspace_size + weight_size + in_out_size;
+        size_t total_size = workspace_size + weight_size + in_out_size;
+
+        // We allocate an extra shard of the weights for the parallel case, divide by 2 for when TP2
+        if (parallel)
+        {
+            total_size += weight_size / 2;
+        }
 
         size_t const memory_pool_free_mem_size = mBufferManager->memoryPoolFree();
         auto const [freeMem, totalMem] = tensorrt_llm::common::getDeviceMemoryInfo(false);
@@ -1686,12 +1693,12 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
         size_t inter_size = 2048;                                                                                      \
         this->mInterSizeFraction = float(inter_size) / hidden_size;                                                    \
                                                                                                                        \
-        if (!this->checkSufficientTestMemory(100, hidden_size, 256, 8))                                                \
+        if (!this->checkSufficientTestMemory(75, hidden_size, 256, 8, true))                                           \
         {                                                                                                              \
             GTEST_SKIP() << "Insufficient free memory for test";                                                       \
         }                                                                                                              \
                                                                                                                        \
-        this->ParallelismType##Test(8, hidden_size, 256, 100, this->mInterSizeFraction);                               \
+        this->ParallelismType##Test(8, hidden_size, 256, 75, this->mInterSizeFraction);                                \
     }                                                                                                                  \
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwo)                                                   \
