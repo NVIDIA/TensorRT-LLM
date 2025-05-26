@@ -17,11 +17,9 @@ LLM_ROOT = "llm"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-scan-repo', variable: 'DEFAULT_SCAN_REPO')]) {
-    SCAN_REPO = env.scanGitlabSourceRepoHttpUrl ? env.scanGitlabSourceRepoHttpUrl : "${DEFAULT_SCAN_REPO}"
+    SCAN_REPO = "${DEFAULT_SCAN_REPO}"
 }
-withCredentials([string(credentialsId: 'default-scan-commit', variable: 'DEFAULT_SCAN_COMMIT')]) {
-    SCAN_COMMIT = env.scanGitlabSourceRepoCommit ? env.scanGitlabSourceRepoCommit : "${DEFAULT_SCAN_COMMIT}"
-}
+SCAN_COMMIT = "main"
 SCAN_ROOT = "scan"
 
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
@@ -361,8 +359,27 @@ def launchReleaseCheck(pipeline)
                 sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
             }
         }
-        // Step 3: do some check in container
+        // Step 3: Run license check
         sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
+
+        // Step 4: Run guardwords scan
+        def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+        if (env.alternativeTRT || isOfficialPostMergeJob) {
+            trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
+            try {
+                sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f -not -path \"*/.git/*\" -not -path \"*/3rdparty/*\") 2>&1 | tee scan.log"
+                def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
+                if (lastLine.toLowerCase().contains("error")) {
+                    error "Guardwords Scan Failed."
+                }
+            } catch (Exception e) {
+                throw e
+            } finally {
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/guardwords-scan-results/")
+                echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
+            }
+        }
     }
 
     def image = "urm.nvidia.com/docker/golang:1.22"
@@ -388,26 +405,6 @@ def launchReleaseCheck(pipeline)
                 } else {
                     throw e
                 }
-            }
-        }
-        def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-        if (env.alternativeTRT || isOfficialPostMergeJob) {
-            stage("Scan") {
-                sh "whoami"
-                trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
-                sh "cd ${SCAN_ROOT} && pip3 install -e ."
-                try {
-                    sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f) 2>&1 | tee scan.log"
-                } catch (Exception e) {
-                    catchError(
-                        buildResult: 'SUCCESS',
-                        stageResult: 'FAILURE') {
-                        error "Scan failed. Error: ${e.message}"
-                    }
-                }
-                sh "cd ${LLM_ROOT} && cat scan.log"
-                trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/scan-results/")
-                echo "Scan results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/scan-results/scan.log"
             }
         }
     })
