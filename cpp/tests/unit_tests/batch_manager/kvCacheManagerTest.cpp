@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <memory>
 #include <set>
@@ -404,25 +405,52 @@ TEST_F(KVCacheManagerTest, BlockManagerTestBlocksPerWindowSize)
     // Single window size
     {
         std::map<SizeType32, std::vector<SizeType32>> windowSizeToLayers{{1024, {0, 1, 2}}};
-        auto result = BlockManager::blocksPerWindow(numPrimaryBlocks, windowSizeToLayers);
+        std::map<SizeType32, SizeType32> cacheSizePerTokenPerWindow{{1024, 1}}; // Uniform cache size per token.
+
+        auto result = BlockManager::calculateWindowSizeToShare(windowSizeToLayers, cacheSizePerTokenPerWindow);
         EXPECT_EQ(result.size(), 1);
-        EXPECT_EQ(result.at(1024), numPrimaryBlocks);
+        EXPECT_NEAR(result.at(1024), 1.0f, 1e-6f);
+        // With a single window size, the entire share should be allocated to it.
     }
     // Variable window size
     {
         std::map<SizeType32, std::vector<SizeType32>> windowSizeToLayers{
-            {1024, {1}},       // contribution = 1024*1 = 1024  / 29696
-            {4096, {0, 4, 5}}, // contribution = 4096*3 = 12288 / 29696
-            {8192, {2, 3}},    // contribution = 8192*2 = 16384 / 29696
+            {1024, {1}},       // contribution = 1024*1 = 1024
+            {4096, {0, 4, 5}}, // contribution = 4096*3 = 12288
+            {8192, {2, 3}},    // contribution = 8192*2 = 16384
         };
-        auto result = BlockManager::blocksPerWindow(numPrimaryBlocks, windowSizeToLayers);
+        // Use identical cache size per token across window sizes for simplicity.
+        std::map<SizeType32, SizeType32> cacheSizePerTokenPerWindow{{1024, 1}, {4096, 1}, {8192, 1}};
+
+        auto result = BlockManager::calculateWindowSizeToShare(windowSizeToLayers, cacheSizePerTokenPerWindow);
         EXPECT_EQ(result.size(), 3);
-        EXPECT_EQ(std::accumulate(result.begin(), result.end(), 0, [](auto sum, auto cur) { return sum + cur.second; }),
-            numPrimaryBlocks);
-        // Two blocks that were lost due to rounding down were awarded in order to the smallest window sizes:
-        EXPECT_EQ(result.at(1024), 565);  // 564 + 1
-        EXPECT_EQ(result.at(4096), 6780); // 6779 + 1
-        EXPECT_EQ(result.at(8192), 9039); // 9039 + 0
+
+        // Ensure the shares sum to 1.
+        auto const sumShares = std::accumulate(
+            result.begin(), result.end(), 0.0f, [](float sum, auto const& kv) { return sum + kv.second; });
+        EXPECT_NEAR(sumShares, 1.0f, 1e-6f);
+
+        // Calculate expected shares based on contributions.
+        std::map<SizeType32, float> expectedShares;
+        std::map<SizeType32, SizeType32> contributions;
+        for (auto const& [windowSize, layers] : windowSizeToLayers)
+        {
+            contributions[windowSize] = windowSize * static_cast<SizeType32>(layers.size());
+        }
+        auto const totalContribution = std::accumulate(contributions.begin(), contributions.end(), 0.0f,
+            [](float sum, auto const& kv) { return sum + kv.second; });
+
+        for (auto const& [windowSize, contribution] : contributions)
+        {
+            expectedShares[windowSize] = static_cast<float>(contribution) / totalContribution;
+            EXPECT_NEAR(result.at(windowSize), expectedShares[windowSize], 1e-6f);
+        }
+        // Additional check: integer allocations replicate previous behaviour (rounded to nearest int).
+        auto getRoundedBlocks
+            = [&](float share) { return static_cast<SizeType32>(std::round(share * numPrimaryBlocks)); };
+        EXPECT_EQ(getRoundedBlocks(result.at(1024)), 565);
+        EXPECT_EQ(getRoundedBlocks(result.at(4096)), 6780);
+        EXPECT_EQ(getRoundedBlocks(result.at(8192)), 9039);
     }
 }
 
