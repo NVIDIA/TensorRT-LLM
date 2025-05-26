@@ -44,25 +44,35 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     def targetCould = "kubernetes-cpu"
     def containerConfig = ""
     def selectors = """
+                nodeSelector:
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux
                   kubernetes.io/arch: ${arch}"""
 
     if (build_wheel && arch == "arm64") {
         // For aarch64, we need to use hostname to fix the ucxx issue when building wheels
-        selectors = """
-                  nvidia.com/node_type: builder
-                  kubernetes.io/os: linux
-                  kubernetes.io/arch: ${arch}
+        selectors += """
                 affinity:
                     nodeAffinity:
                         requiredDuringSchedulingIgnoredDuringExecution:
                             nodeSelectorTerms:
                                 - matchExpressions:
                                     - key: "kubernetes.io/hostname"
-                                      operator: Regexp
+                                      operator: In
                                       values:
-                                        - ".*\\.ipp2u1\\.colossus$"
+                                        - "rl300-0008.ipp2u1.colossus"
+                                        - "rl300-0014.ipp2u1.colossus"
+                                        - "rl300-0023.ipp2u1.colossus"
+                                        - "rl300-0024.ipp2u1.colossus"
+                                        - "rl300-0030.ipp2u1.colossus"
+                                        - "rl300-0040.ipp2u1.colossus"
+                                        - "rl300-0041.ipp2u1.colossus"
+                                        - "rl300-0042.ipp2u1.colossus"
+                                        - "rl300-0043.ipp2u1.colossus"
+                                        - "rl300-0044.ipp2u1.colossus"
+                                        - "rl300-0045.ipp2u1.colossus"
+                                        - "rl300-0046.ipp2u1.colossus"
+                                        - "rl300-0047.ipp2u1.colossus"
         """
     }
 
@@ -135,7 +145,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
             kind: Pod
             spec:
                 qosClass: Guaranteed
-                nodeSelector: ${selectors}
+                ${selectors}
                 containers:
                   ${containerConfig}
                   - name: jnlp
