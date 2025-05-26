@@ -1,3 +1,4 @@
+import weakref
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -7,6 +8,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         AttentionMetadata, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
@@ -59,23 +61,23 @@ class TrtllmAttentionWrapper:
     qk_rope_head_dim: Optional[int]
     qk_nope_head_dim: Optional[int]
     v_head_dim: Optional[int]
+    attention_chunk_size: Optional[int]
     kwargs: dict
 
     def __init__(
         self,
-        layer_idx: int,
         num_heads: int,
         head_size: int,
         num_kv_heads: Optional[int] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         q_scaling: Optional[float] = None,
         mla_params: Optional[MLAParams] = None,
+        attention_chunk_size: Optional[int] = None,
         **kwargs,
     ):
         """
         Initialize the attention wrapper.
         Args:
-            layer_idx (int): The index of the attention layer in the model.
             num_heads (int): The number of query heads.
             head_dim (int): The size of each attention head (hidden_size // num_heads).
             num_kv_heads (int): The number of kv heads. Defaults to num_heads if None.
@@ -90,6 +92,7 @@ class TrtllmAttentionWrapper:
         self.is_mla_enable = mla_params is not None
         self.q_scaling = q_scaling or 1.0
         self.predicted_tokens_per_seq = 1
+        self.attention_chunk_size = attention_chunk_size
 
         if self.is_mla_enable:
             self.q_lora_rank = mla_params.q_lora_rank
@@ -108,7 +111,6 @@ class TrtllmAttentionWrapper:
         self.rotary_inv_freq, self.rotary_cos_sin = rope_params.create_rope_const_params(
         )
 
-        self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads or num_heads
         self.head_size = head_size
@@ -132,18 +134,19 @@ class TrtllmAttentionWrapper:
     def plan(
         self,
         *,
+        layer_idx: int = 0,
         tokens_per_block: Optional[int] = None,
-        max_num_requests: int,
-        max_sequence_length: int,
-        max_context_length: int,
+        max_num_requests: int = 0,
+        max_sequence_length: int = 0,
+        max_context_length: int = 0,
         attention_window_size: Optional[int] = None,
         sink_token_length: int = 0,
         beam_width: int = 1,
-        sequence_length: torch.Tensor,
-        host_past_key_value_lengths: torch.Tensor,
-        context_lengths: torch.Tensor,
-        host_context_lengths: torch.Tensor,
-        host_request_types: torch.Tensor,
+        sequence_length: torch.Tensor = ...,
+        host_past_key_value_lengths: torch.Tensor = ...,
+        context_lengths: torch.Tensor = ...,
+        host_context_lengths: torch.Tensor = ...,
+        host_request_types: torch.Tensor = ...,
         kv_cache_block_offsets: Optional[torch.Tensor] = None,
         host_kv_cache_block_offsets: Optional[torch.Tensor] = None,
         host_kv_cache_pool_pointers: Optional[torch.Tensor] = None,
@@ -159,11 +162,16 @@ class TrtllmAttentionWrapper:
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
+        mla_context_paged_kv: Optional[torch.Tensor] = None,
+        mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
         Plan the attention operation.
+        Call this method without arguments can reset the planned states.
+        For required arguments, can use ellipsis (...) as default value to represent invalid states.
         Args:
+            layer_idx (int): The index of the attention layer in the model.
             tokens_per_block (int): Token number per KV cache block.
             max_num_requests (int): Max request number per batch.
             max_sequence_length (int): Max sequence length.
@@ -187,7 +195,10 @@ class TrtllmAttentionWrapper:
             out_scale (torch.Tensor): The tensor to store the scaling factor to quantize output, with shape (1) on GPU.
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
+            mla_context_paged_kv (torch.Tensor): The paged KV cache for MLA context, for kv cache reuse/chunked context.
+            mla_context_kv_cache_block_offsets (torch.Tensor): The block offsets for the paged KV cache for MLA context, for kv cache reuse/chunked context.
         """
+        self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
         self.max_num_requests = max_num_requests
         self.max_context_length = max_context_length
@@ -216,13 +227,16 @@ class TrtllmAttentionWrapper:
             'mrope_rotary_cos_sin') if mrope_config is not None else None
         self.mrope_position_deltas = mrope_config.get(
             'mrope_position_deltas') if mrope_config is not None else None
-        self.kwargs.update(kwargs)
         self.block_ids_per_seq = block_ids_per_seq
+        self.mla_context_paged_kv = mla_context_paged_kv
+        self.mla_context_kv_cache_block_offsets = mla_context_kv_cache_block_offsets
 
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
             )
+
+        self.kwargs.update(kwargs)
 
     def run(
         self,
@@ -286,9 +300,15 @@ class TrtllmAttentionWrapper:
         else:
             assert is_fused_qkv
             if self.attention_input_type == AttentionInputType.context_only:
-                qkv_hidden_size = self.num_heads * (
-                    2 * (self.qk_nope_head_dim + self.qk_rope_head_dim)
-                ) + self.num_kv_heads * self.v_head_dim
+                if self.use_paged_context_fmha:
+                    assert self.mla_context_paged_kv is not None
+                    assert self.mla_context_kv_cache_block_offsets is not None
+                    qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
+                                                        self.qk_rope_head_dim)
+                else:
+                    qkv_hidden_size = self.num_heads * (
+                        2 * (self.qk_nope_head_dim + self.qk_rope_head_dim)
+                    ) + self.num_kv_heads * self.v_head_dim
             elif self.attention_input_type == AttentionInputType.generation_only:
                 qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
                                                     self.qk_rope_head_dim)
@@ -371,7 +391,12 @@ class TrtllmAttentionWrapper:
             self.v_head_dim,
             self.mrope_rotary_cos_sin,
             self.mrope_position_deltas,
+            self.mla_context_paged_kv,
+            self.mla_context_kv_cache_block_offsets,
+            self.attention_chunk_size,
         )
+        # reset the planned states (especially tensors) to avoid memory leak
+        self.plan()
         return output
 
 
@@ -446,6 +471,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                         device='cpu',
                                         pin_memory=True)
         self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
+
         # For debugging, can use it to call the wrapper's plan function
         if self.workspace is None:
             self.workspace = torch.empty(
@@ -486,9 +512,35 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     device='cuda',
                 )
+            if self.enable_paged_context_mla:
+                # for kv cache reuse/chunked context in MLA
+                self.ctx_cached_token_indptr = torch.zeros(
+                    (self.max_num_requests + 1, ),
+                    device='cuda',
+                    dtype=torch.int64,
+                )
+                self.host_ctx_cached_token_indptr = torch.zeros_like(
+                    self.ctx_cached_token_indptr,
+                    device='cpu',
+                    pin_memory=True,
+                )
+                # context full seqlens include cached tokens and uncached tokens
+                self.ctx_kv_indptr = torch.zeros(
+                    (self.max_num_requests + 1, ),
+                    device='cuda',
+                    dtype=torch.int64,
+                )
+                self.host_ctx_kv_indptr = torch.zeros_like(
+                    self.ctx_kv_indptr,
+                    device='cpu',
+                    pin_memory=True,
+                )
 
     def prepare(self) -> None:
-
+        extra_attrs = get_model_extra_attrs()
+        # If model extra attrs is set, attention_metadata is setup in executor.
+        if extra_attrs is None:
+            get_global_attrs().attention_metadata = weakref.ref(self)
         if self.kv_cache_manager is None:
             # Convert the attention metadata to a TRT-LLM no cache attention metadata.
             assert self.kv_cache_manager is None, "no cache attention should not have KV cache manager"
@@ -534,6 +586,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_request_types[:self.num_contexts].fill_(0)
         self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
 
+        # prepare for kv cache reuse/chunked context in MLA
+        if self.enable_paged_context_mla:
+            self.prepare_paged_context_mla(cached_token_lens, kv_lens)
+
         # kv block offsets
         assert self.request_ids is not None
         if self.kv_cache_manager is not None:
@@ -568,6 +624,35 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_request_types_runtime = self.host_request_types[:self.
                                                                   num_seqs]
 
+    def prepare_paged_context_mla(self, cached_token_lens: torch.Tensor,
+                                  kv_lens: torch.Tensor) -> None:
+        if self.num_contexts > 0:
+            self.num_ctx_cached_tokens = cached_token_lens[:self.
+                                                           num_contexts].sum(
+                                                           ).item()
+            self.max_ctx_kv_len = kv_lens[:self.num_contexts].max().item()
+            self.max_ctx_seq_len = self.seq_lens[:self.num_contexts].max().item(
+            )
+        else:
+            self.num_ctx_cached_tokens = 0
+            self.max_ctx_kv_len = 0
+            self.max_ctx_seq_len = 0
+        torch.cumsum(cached_token_lens[:self.num_contexts],
+                     dim=0,
+                     dtype=torch.int64,
+                     out=self.host_ctx_cached_token_indptr[1:self.num_contexts +
+                                                           1])
+        self.ctx_cached_token_indptr[:self.num_contexts + 1].copy_(
+            self.host_ctx_cached_token_indptr[:self.num_contexts + 1],
+            non_blocking=True)
+
+        torch.cumsum(kv_lens[:self.num_contexts],
+                     dim=0,
+                     dtype=torch.int64,
+                     out=self.host_ctx_kv_indptr[1:self.num_contexts + 1])
+        self.ctx_kv_indptr[:self.num_contexts + 1].copy_(
+            self.host_ctx_kv_indptr[:self.num_contexts + 1], non_blocking=True)
+
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
@@ -584,6 +669,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         mla_params: Optional[MLAParams] = None,
         skip_create_weights_in_init: bool = False,
+        attention_chunk_size: Optional[int] = None,
         **kwargs,
     ):
         """
@@ -611,13 +697,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          **kwargs)
 
         self.wrapper = TrtllmAttentionWrapper(
-            layer_idx,
             num_heads,
             head_dim,
             num_kv_heads,
             pos_embd_params=pos_embd_params,
             q_scaling=q_scaling,
             mla_params=mla_params,
+            attention_chunk_size=attention_chunk_size,
         )
 
         self.is_mla_enable = mla_params is not None
@@ -647,7 +733,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_fp8_block_wise = self.quant_config.layer_quant_mode.has_fp8_block_scales(
             )
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
-            self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
+
+    def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
+        if metadata.kv_cache_manager is None:
+            return self.layer_idx
+        else:
+            return metadata.kv_cache_manager.layer_offsets[self.layer_idx]
 
     def forward(
         self,
@@ -662,6 +753,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
+        attention_window_size: Optional[int] = None,
+        mla_context_paged_kv: Optional[torch.Tensor] = None,
+        mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert isinstance(
@@ -676,13 +770,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             or metadata.runtime_features.has_speculative_draft_tokens
         ) if metadata.runtime_features else False
 
+        if self.is_mla_enable:
+            # for MLA, we only use paged_context_fmha when there is cached kv
+            use_paged_context_fmha = use_paged_context_fmha and self.has_cached_kv_for_mla_context(
+                metadata)
+
         self.wrapper.plan(
+            layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
             max_sequence_length=metadata.max_seq_len,
             max_context_length=min(metadata.max_seq_len - 1,
                                    metadata.max_num_tokens),
-            attention_window_size=None,
+            attention_window_size=attention_window_size,
             sink_token_length=0,
             beam_width=1,
             sequence_length=metadata.kv_lens_cuda_runtime,
@@ -705,6 +805,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             latent_cache=latent_cache,
             q_pe=q_pe,
             mrope_config=mrope_config,
+            mla_context_paged_kv=mla_context_paged_kv,
+            mla_context_kv_cache_block_offsets=
+            mla_context_kv_cache_block_offsets,
         )
         out_dtype = None
         if out_scale is not None:
@@ -735,3 +838,167 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     @classmethod
     def support_mla(cls) -> bool:
         return True
+
+    def has_cached_kv_for_mla_context(
+        self,
+        metadata: TrtllmAttentionMetadata,
+    ) -> bool:
+        return (self.is_mla_enable and metadata.kv_cache_manager is not None
+                and metadata.enable_paged_context_mla
+                and metadata.num_ctx_cached_tokens > 0)
+
+    def load_paged_kv_cache_for_mla(
+        self,
+        metadata: TrtllmAttentionMetadata,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
+        assert self.is_mla_enable and self.mla_params is not None
+        assert metadata.kv_cache_manager is not None
+        assert metadata.max_ctx_kv_len > 0
+
+        sink_token_length = 0
+        beam_width = 1
+
+        compressed_kv, k_pe = torch.ops.trtllm.load_paged_kv_cache_for_mla(
+            out_dtype,
+            metadata.num_contexts,
+            metadata.max_ctx_kv_len,
+            metadata.ctx_kv_indptr,
+            metadata.kv_cache_block_offsets,
+            metadata.host_kv_cache_block_offsets,
+            metadata.kv_cache_manager.kv_cache_pool_pointers,
+            metadata.kv_cache_manager.kv_cache_pool_mapping,
+            self.kv_scale_orig_quant,
+            self.kv_scale_quant_orig,
+            self.get_local_layer_idx(metadata),
+            self.mla_params.kv_lora_rank,
+            self.mla_params.qk_rope_head_dim,
+            metadata.kv_cache_manager.tokens_per_block,
+            metadata.kv_cache_manager.max_seq_len,
+            sink_token_length,
+            beam_width,
+            self.wrapper.quant_mode,
+        )
+
+        return compressed_kv, k_pe
+
+    def set_paged_kv_cache_for_mla(
+        self,
+        paged_kv: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_pe: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+    ) -> torch.Tensor:
+        assert self.is_mla_enable and self.mla_params is not None
+        assert self.mla_params.qk_nope_head_dim == self.mla_params.v_head_dim
+        assert metadata.kv_cache_manager is not None
+        assert paged_kv.shape[0] == metadata.num_contexts
+        assert paged_kv.is_contiguous()
+
+        num_contexts = metadata.num_contexts
+        max_seq_len = metadata.max_ctx_kv_len
+        tokens_per_block = metadata.kv_cache_manager.tokens_per_block
+
+        paged_kv_offsets = torch.ops.trtllm.set_paged_kv_cache_for_mla(
+            paged_kv,
+            k,
+            v,
+            k_pe,
+            num_contexts,
+            metadata.ctx_kv_indptr,
+            max_seq_len,
+            self.num_heads,
+            self.mla_params.qk_nope_head_dim,
+            self.mla_params.qk_rope_head_dim,
+            tokens_per_block,
+        )
+
+        max_block_num = (max_seq_len + tokens_per_block - 1) // tokens_per_block
+        assert paged_kv_offsets.shape == (num_contexts, 2, max_block_num)
+        return paged_kv_offsets
+
+    def set_paged_kv_cache_v2_for_mla(
+        self,
+        paged_kv: torch.Tensor,
+        cached_k: torch.Tensor,
+        cached_v: torch.Tensor,
+        cached_k_pe: torch.Tensor,
+        new_k: torch.Tensor,
+        new_v: torch.Tensor,
+        new_k_pe: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+    ) -> torch.Tensor:
+        assert self.is_mla_enable and self.mla_params is not None
+        assert self.mla_params.qk_nope_head_dim == self.mla_params.v_head_dim
+        assert metadata.kv_cache_manager is not None
+        assert paged_kv.shape[0] == metadata.num_contexts
+        assert paged_kv.is_contiguous()
+
+        cached_k = cached_k.contiguous()
+        cached_v = cached_v.contiguous()
+        cached_k_pe = cached_k_pe.contiguous()
+        new_k = new_k.contiguous()
+        new_v = new_v.contiguous()
+        new_k_pe = new_k_pe.contiguous()
+
+        num_contexts = metadata.num_contexts
+        max_seq_len = metadata.max_ctx_kv_len
+        tokens_per_block = metadata.kv_cache_manager.tokens_per_block
+
+        paged_kv_offsets = torch.ops.trtllm.set_paged_kv_cache_v2_for_mla(
+            paged_kv,
+            cached_k,
+            cached_v,
+            cached_k_pe,
+            new_k,
+            new_v,
+            new_k_pe,
+            num_contexts,
+            metadata.ctx_cached_token_indptr,
+            metadata.ctx_kv_indptr,
+            max_seq_len,
+            self.num_heads,
+            self.mla_params.qk_nope_head_dim,
+            self.mla_params.qk_rope_head_dim,
+            tokens_per_block,
+        )
+
+        max_block_num = (max_seq_len + tokens_per_block - 1) // tokens_per_block
+        assert paged_kv_offsets.shape == (num_contexts, 2, max_block_num)
+        return paged_kv_offsets
+
+    def append_paged_kv_cache_for_mla(
+        self,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+    ) -> None:
+        assert self.is_mla_enable and self.mla_params is not None
+        assert metadata.kv_cache_manager is not None
+
+        sink_token_length = 0
+        beam_width = 1
+
+        torch.ops.trtllm.append_paged_kv_cache_for_mla(
+            compressed_kv,
+            k_pe,
+            metadata.num_contexts,
+            metadata.ctx_cached_token_indptr,
+            metadata.ctx_kv_indptr,
+            metadata.max_ctx_seq_len,
+            metadata.kv_cache_block_offsets,
+            metadata.host_kv_cache_block_offsets,
+            metadata.kv_cache_manager.kv_cache_pool_pointers,
+            metadata.kv_cache_manager.kv_cache_pool_mapping,
+            self.kv_scale_orig_quant,
+            self.kv_scale_quant_orig,
+            self.get_local_layer_idx(metadata),
+            self.mla_params.kv_lora_rank + self.mla_params.qk_rope_head_dim,
+            metadata.kv_cache_manager.tokens_per_block,
+            metadata.kv_cache_manager.max_seq_len,
+            sink_token_length,
+            beam_width,
+            self.wrapper.quant_mode,
+        )

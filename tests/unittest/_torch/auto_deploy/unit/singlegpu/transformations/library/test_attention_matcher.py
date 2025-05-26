@@ -194,6 +194,95 @@ class EagerAttentionModel(torch.nn.Module):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
 
 
+class ComplexEagerAttentionModel(torch.nn.Module):
+    """
+    A model that implements a complex eager attention pattern similar to the one in the user's graph.
+    This includes additional to_dtype operations and different transpose patterns.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        has_mask: bool = True,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.has_mask = has_mask
+        self.dropout = dropout
+
+        # Use a division for scaling instead of multiplication
+        self.scale_divisor = self.head_dim**0.5  # sqrt(head_dim)
+
+        # Define linear layers
+        self.q_proj = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
+        self.k_proj = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
+        self.v_proj = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
+        self.out_proj = torch.nn.Linear(num_heads * self.head_dim, hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        # Generate q, k, v
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+
+        # Transpose to [batch, heads, seq, dim]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # Use a standard transpose that will work correctly for matmul
+        # We need the dimensions to align for the matrix multiplication
+        k_transposed = k.transpose(2, 3)
+
+        # Compute attention scores using division for scaling instead of multiplication
+        attn_weights = torch.matmul(q, k_transposed) / self.scale_divisor
+
+        # Add attention mask if enabled
+        if self.has_mask:
+            mask = torch.triu(
+                torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
+                diagonal=1,
+            )
+            mask = mask.unsqueeze(0).unsqueeze(0)
+            attn_mask = torch.zeros_like(attn_weights, device=device)
+            attn_mask = attn_mask.masked_fill(mask, float("-inf"))
+            attn_weights = attn_weights + attn_mask
+
+        # Add a to_dtype node before softmax to match pattern in the graph
+        attn_weights = attn_weights.to(torch.float32)
+
+        # Apply softmax
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+
+        # Add a to_dtype node after softmax to match pattern in the graph
+        attn_weights = attn_weights.to(dtype)
+
+        # Apply dropout
+        attn_weights = torch.nn.functional.dropout(
+            attn_weights, p=self.dropout, training=self.training
+        )
+
+        # Apply attention weights to values
+        attn_output = torch.matmul(attn_weights, v)
+
+        # Reshape for output projection
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        output = self.out_proj(attn_output)
+
+        return output
+
+    def get_dynamic_shapes(self):
+        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
+
+
 class CounterExampleModel(torch.nn.Module):
     """
     A model with similar operations (unsqueeze -> expand -> reshape) but with different
@@ -417,27 +506,43 @@ def test_match_repeat_kv(num_heads, num_kv_heads, model_cls):
         (0.1, float("inf"), float("inf")),  # (dropout, rtol, atol) for dropout=0.1
     ],
 )
+@pytest.mark.parametrize("model_type", ["standard", "complex"])
 @torch.inference_mode()
-def test_match_eager_attention(has_mask, use_division, dropout, rtol, atol):
+def test_match_eager_attention(has_mask, use_division, dropout, rtol, atol, model_type):
+    # Set a fixed seed for consistent dropout behavior in tests
+    torch.manual_seed(0)
+
     batch_size, seq_len = 4, 12
     hidden_size = 512
     num_heads = 8
 
-    model = EagerAttentionModel(hidden_size, num_heads, has_mask, dropout, use_division).to(
-        "cuda", dtype=torch.float16
-    )
-    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
-    dynamic_shapes = model.get_dynamic_shapes()
-
-    # Print the original scaling approach and value
-    if use_division:
-        print(f"\nOriginal model using DIVISION with inv_scaling={model.inv_scaling}")
-        expected_scale = 1.0 / model.inv_scaling
-    else:
-        print(f"\nOriginal model using MULTIPLICATION with scaling={model.scaling}")
-        expected_scale = model.scaling
+    # Create different model types based on the parameter
+    if model_type == "standard":
+        model = EagerAttentionModel(hidden_size, num_heads, has_mask, dropout, use_division).to(
+            "cuda", dtype=torch.float16
+        )
+        # Print the original scaling approach and value
+        if use_division:
+            print(f"\nOriginal model using DIVISION with inv_scaling={model.inv_scaling}")
+            expected_scale = 1.0 / model.inv_scaling
+        else:
+            print(f"\nOriginal model using MULTIPLICATION with scaling={model.scaling}")
+            expected_scale = model.scaling
+    else:  # complex
+        # Complex model only uses division for scaling
+        model = ComplexEagerAttentionModel(hidden_size, num_heads, has_mask, dropout).to(
+            "cuda", dtype=torch.float16
+        )
+        expected_scale = 1.0 / model.scale_divisor
+        # Override use_division and only run test once (ignore the parameterization)
+        if not use_division:
+            pytest.skip("Complex model only uses division scaling")
 
     print(f"Expected normalized scale: {expected_scale}")
+    # Use fixed seed for input to ensure consistent results
+    torch.manual_seed(42)
+    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
+    dynamic_shapes = model.get_dynamic_shapes()
 
     # We should find 1 instance of the pattern
     expected_matches = 1
@@ -512,16 +617,11 @@ def test_match_eager_attention(has_mask, use_division, dropout, rtol, atol):
 
             # Check mask handling for masked attention
             if has_mask:
-                # Check for either attn_mask in kwargs or is_causal in args/kwargs
                 has_mask_arg = "attn_mask" in kwargs
                 if not has_mask_arg and len(node.args) >= 4:
                     has_mask_arg = node.args[3] is not None
 
-                is_causal_value = kwargs.get("is_causal", None)
-                if is_causal_value is None and len(node.args) >= 6:
-                    is_causal_value = node.args[5]
-
-                if not has_mask_arg and is_causal_value is None:
+                if not has_mask_arg:
                     print("❌ Missing mask information in SDPA node")
                     valid = False
 

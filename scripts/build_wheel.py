@@ -157,6 +157,40 @@ def setup_conan(scripts_dir, venv_python):
     return venv_conan
 
 
+def generate_fmha_cu(project_dir, venv_python):
+    fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
+    fmha_v2_cu_dir.mkdir(parents=True, exist_ok=True)
+
+    fmha_v2_dir = project_dir / "cpp/kernels/fmha_v2"
+    os.chdir(fmha_v2_dir)
+
+    env = os.environ.copy()
+    env.update({
+        "TORCH_CUDA_ARCH_LIST": "9.0",
+        "ENABLE_SM89_QMMA": "1",
+        "ENABLE_HMMA_FP32": "1",
+        "GENERATE_CUBIN": "1",
+        "SCHEDULING_MODE": "1",
+        "ENABLE_SM100": "1",
+        "ENABLE_SM120": "1",
+        "GENERATE_CU_TRTLLM": "true"
+    })
+
+    build_run("rm -rf generated")
+    build_run("rm -rf temp")
+    build_run("rm -rf obj")
+    build_run("python3 setup.py", env=env)
+
+    # Copy generated header file when cu path is active and cubins are deleted.
+    # cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
+    # build_run(f"mv generated/fmha_cubin.h {cubin_dir}")
+
+    for cu_file in (fmha_v2_dir / "generated").glob("*sm*.cu"):
+        build_run(f"mv {cu_file} {fmha_v2_cu_dir}")
+
+    os.chdir(project_dir)
+
+
 def main(*,
          build_type: str = "Release",
          generator: str = "",
@@ -168,6 +202,7 @@ def main(*,
          extra_make_targets: str = "",
          trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
+         nixl_root: str = None,
          internal_cutlass_kernels_root: str = None,
          clean: bool = False,
          clean_wheel: bool = False,
@@ -182,7 +217,8 @@ def main(*,
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
-         skip_stubs: bool = False):
+         skip_stubs: bool = False,
+         generate_fmha: bool = False):
 
     if clean:
         clean_wheel = True
@@ -263,6 +299,9 @@ def main(*,
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
 
+    if nixl_root is not None:
+        cmake_def_args.append(f"-DNIXL_ROOT={nixl_root}")
+
     build_dir = get_build_dir(build_dir, build_type)
     first_build = not Path(build_dir, "CMakeFiles").exists()
 
@@ -304,6 +343,13 @@ def main(*,
 
     source_dir = get_source_dir()
 
+    fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
+    if clean or generate_fmha:
+        build_run(f"rm -rf {fmha_v2_cu_dir}")
+        generate_fmha_cu(project_dir, venv_python)
+    elif not fmha_v2_cu_dir.exists():
+        generate_fmha_cu(project_dir, venv_python)
+
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
             build_run(
@@ -321,6 +367,7 @@ def main(*,
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
                 f' -DBUILD_WHEEL_TARGETS="{";".join(targets)}"'
+                f' -DPython_EXECUTABLE={venv_python} -DPython3_EXECUTABLE={venv_python}'
                 f' {cmake_cuda_architectures} {cmake_def_args} {cmake_generator} -S "{source_dir}"'
             )
             print("CMake Configure command: ")
@@ -440,6 +487,14 @@ def main(*,
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so",
                 lib_dir / "libtensorrt_llm_ucx_wrapper.so")
+        if os.path.exists(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so"
+        ):
+            install_file(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so",
+                lib_dir / "libtensorrt_llm_nixl_wrapper.so")
         install_file(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",
@@ -502,7 +557,7 @@ def main(*,
                 else:
                     env_ld = os.environ.copy()
 
-                    new_library_path = "/usr/local/cuda/compat/lib.real"
+                    new_library_path = "/usr/local/cuda/compat:/usr/local/cuda/compat/lib:/usr/local/cuda/compat/lib.real"
                     if 'LD_LIBRARY_PATH' in env_ld:
                         new_library_path += f":{env_ld['LD_LIBRARY_PATH']}"
                     env_ld["LD_LIBRARY_PATH"] = new_library_path
@@ -595,6 +650,8 @@ def add_arguments(parser: ArgumentParser):
                         help="Directory to find TensorRT headers/libs")
     parser.add_argument("--nccl_root",
                         help="Directory to find NCCL headers/libs")
+    parser.add_argument("--nixl_root",
+                        help="Directory to find NIXL headers/libs")
     parser.add_argument(
         "--internal-cutlass-kernels-root",
         default="",
@@ -634,6 +691,9 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--skip-stubs",
                         action="store_true",
                         help="Skip building python stubs")
+    parser.add_argument("--generate_fmha",
+                        action="store_true",
+                        help="Generate the FMHA cu files.")
 
 
 if __name__ == "__main__":

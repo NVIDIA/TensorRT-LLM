@@ -17,7 +17,7 @@ include(FetchContent)
 set(SRCS
     utils/mpiUtils.cpp
     utils/numpyUtils.cpp
-    utils/sessionUtils.cpp
+    utils/runtimeUtils.cpp
     utils/debugUtils.cu
     utils/speculativeChoicesUtils.cpp
     bufferManager.cpp
@@ -33,29 +33,24 @@ set(SRCS
     loraCache.cpp
     decodingOutput.cpp
     decoderState.cpp
-    generationConfig.cpp
     gptDecoder.cpp
     gptDecoderBatched.cpp
     gptJsonConfig.cpp
-    gptSession.cpp
     iBuffer.cpp
     iTensor.cpp
     ipcUtils.cpp
     ipcSocket.cpp
     ipcNvlsMemory.cpp
+    mcastDeviceMemory.cpp
     memoryCounters.cpp
+    moeLoadBalancer.cpp
     ncclCommunicator.cpp
     promptTuningParams.cpp
-    runtimeBuffers.cpp
     runtimeKernels.cu
-    rnnStateBuffers.cpp
-    statefulGptDecoder.cpp
-    statefulGptDecoderBatched.cpp
     tllmBuffers.cpp
     tllmRuntime.cpp
     tllmStreamReaders.cpp
     tllmLogger.cpp
-    transformerBuffers.cpp
     workerPool.cpp
     worldConfig.cpp)
 

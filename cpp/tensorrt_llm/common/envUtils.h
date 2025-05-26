@@ -54,6 +54,7 @@ bool getEnvEnablePDL();
 bool getEnvUseUCXKvCache();
 
 bool getEnvUseMPIKvCache();
+bool getEnvUseNixlKvCache();
 
 std::string getEnvUCXInterface();
 
@@ -94,5 +95,9 @@ bool getEnvKVCacheTransferUseAsyncBuffer();
 size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
+
+uint16_t getEnvNixlPort();
+
+bool getEnvDisaggBenchmarkGenOnly();
 
 } // namespace tensorrt_llm::common

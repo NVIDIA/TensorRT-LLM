@@ -77,6 +77,7 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
 @pytest.mark.part0
 def test_llm_loading_from_ckpt_for_tp2(
         engine_from_checkpoint: tempfile.TemporaryDirectory):
+    pytest.skip(reason="https://nvbugspro.nvidia.com/bug/5273941")
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     llm_test_harness(engine_from_checkpoint.name,
                      prompts, ["D E F G H I J K"],
@@ -314,8 +315,8 @@ def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
 
 
 @skip_single_gpu
-def test_llm_multi_node_pytorch():
-    nworkers = 2
+@pytest.mark.parametrize("nworkers", [1, 2])
+def test_llm_multi_node_pytorch(nworkers: int):
     test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
     os.path.join(os.path.dirname(__file__), "launch.py")
     command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-llmapi-launch python3 {test_case_file} --model_dir {llama_model_path} --tp_size {nworkers} --use_pytorch"
@@ -326,6 +327,7 @@ def test_llm_multi_node_pytorch():
 
 @skip_single_gpu
 def test_llm_multi_node_with_postproc():
+    pytest.skip(reason="https://nvbugs/5302891")
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__),
                                   "run_llm_with_postproc.py")

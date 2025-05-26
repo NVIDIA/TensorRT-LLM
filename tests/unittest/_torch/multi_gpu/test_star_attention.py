@@ -62,7 +62,8 @@ def test_model(backend, model_name, quant, sp_size, sa_block_size,
     max_output_tokens = 128
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
     pytorch_backend_config = PyTorchConfig(
-        attn_backend='FLASHINFER_STAR_ATTENTION')
+        attn_backend='FLASHINFER_STAR_ATTENTION',
+        disable_overlap_scheduler=True)
 
     llm = LLM(model=model_dir,
               backend=backend,

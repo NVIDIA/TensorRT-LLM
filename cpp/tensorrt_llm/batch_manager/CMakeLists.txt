@@ -27,7 +27,6 @@ set(SRCS
     dataTransceiverImpl.cpp
     decoderBuffers.cpp
     encoderBuffers.cpp
-    generateRequestOptions.cpp
     guidedDecoder.cpp
     handleContextLogits.cpp
     handleGenerationLogits.cpp
@@ -50,7 +49,6 @@ set(SRCS
     transformerBuffers.cpp
     trtEncoderModel.cpp
     trtGptModelInflightBatching.cpp
-    trtGptModelV1.cpp
     updateDecoderBuffers.cpp
     utils/debugUtils.cpp
     utils/inflightBatchingUtils.cpp

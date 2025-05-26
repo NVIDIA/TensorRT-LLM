@@ -10,8 +10,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        DecoderModelForCausalLM,
-                                                       register_auto_model,
-                                                       support_pp)
+                                                       register_auto_model)
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 from tensorrt_llm._torch.modules.embedding import Embedding
@@ -115,7 +114,6 @@ class MistralDecoderLayer(DecoderLayer):
         return hidden_states, residual
 
 
-@support_pp
 class MistralModel(DecoderModel):
 
     def __init__(self, model_config: ModelConfig[MistralConfig]):

@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
+import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
 from .._utils import (KVCacheEventSerializer, global_mpi_rank, mpi_comm,
@@ -92,6 +93,16 @@ class ExecutorBindingsWorker(GenerationExecutor):
             processor_batched=batched_logits_processor, replicate=False)
 
         def _create_engine():
+            device_id = self.global_rank % torch.cuda.device_count()
+            torch.cuda.set_device(device_id)
+
+            # Make sure C++ executor would use same devices/ranks as py_executor
+            global_rank = global_mpi_rank()
+            comm_ranks = mpi_comm().allgather(global_rank)
+            device_ids = mpi_comm().allgather(device_id)
+            executor_config.parallel_config = tllm.ParallelConfig(
+                participant_ids=comm_ranks, device_ids=device_ids)
+
             if isinstance(engine, Engine):
                 return tllm.Executor(engine.engine,
                                      json.dumps(engine.config.to_dict(),
@@ -121,8 +132,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
 
-            device_id = self.global_rank % torch.cuda.device_count()
-            torch.cuda.set_device(device_id)
             return create_executor(**args)
 
         self.engine = _create_engine()
@@ -272,9 +281,34 @@ class ExecutorBindingsWorker(GenerationExecutor):
         return True  # success
 
     def dispatch_stats_task(self) -> bool:
-        return self._iteration_result_task(
-            self.stats_queues, self.engine.get_latest_iteration_stats,
-            self._iter_stats_result, lambda x: x.to_json_str())
+
+        # Define a Callable to join iteration and request stats
+        def stats_serializer(
+                stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
+            iteration_stats, req_stats = stats
+            stats_dict = json.loads(iteration_stats.to_json_str())
+
+            if req_stats is not None and len(req_stats) > 0:
+                stats_dict["requestStats"] = []
+                for req_stat in req_stats:
+                    stats_dict["requestStats"].append(
+                        json.loads(req_stat.to_json_str()))
+
+            # Convert back to JSON string
+            return json.dumps(stats_dict)
+
+        def get_stats():
+            if isinstance(self.engine, tllm.Executor):
+                iter_stats = self.engine.get_latest_iteration_stats()
+                #TODO: Support req stats with TRT engine
+                #      This would require ensuring iter and req stats have same size
+                return [(iter_stat, None) for iter_stat in iter_stats]
+            else:
+                return self.engine.get_latest_iteration_stats()
+
+        return self._iteration_result_task(self.stats_queues, get_stats,
+                                           self._iter_stats_result,
+                                           stats_serializer)
 
     def dispatch_kv_cache_events_task(self) -> bool:
         if isinstance(self.engine, tllm.Executor):
@@ -359,7 +393,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
 
-        is_overlap_enabled = self._is_pytorch_backend and self._executor_config.pytorch_backend_config.enable_overlap_scheduler
+        is_overlap_enabled = self._is_pytorch_backend and not self._executor_config.pytorch_backend_config.disable_overlap_scheduler
         if is_overlap_enabled:
             is_disaggregated = self.engine.kv_cache_transceiver is not None
             if is_disaggregated and (
@@ -369,11 +403,34 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 )
 
         assert request.id is not None
+
+        def _deduce_max_tokens(request: GenerationRequest,
+                               executor_config: tllm.ExecutorConfig) -> int:
+            if request.sampling_params.max_tokens:
+                return request.sampling_params.max_tokens
+            # deduce max_tokens when it's not set by user
+            query_token_len = len(
+                request.query_token_ids) if request.query_token_ids else 0
+            cp_size = 1 if (not hasattr(executor_config, "mapping")
+                            or executor_config.mapping.cp_size
+                            is None) else executor_config.mapping.cp_size
+            if not hasattr(executor_config, "max_seq_len"):
+                raise RuntimeError(
+                    "max_tokens for sampling is not set and cannot be deduced")
+            splited_prompt_len = int(len(prompt_token_ids) / cp_size)
+            default_max_tokens = executor_config.max_seq_len - splited_prompt_len - query_token_len
+            if default_max_tokens < 0:
+                raise ValueError(
+                    f"Deduced max_tokens {default_max_tokens} is less than 0, because"
+                    f"prompt length {splited_prompt_len} plus query length {query_token_len} "
+                    f"is larger than max_seq_len {executor_config.max_seq_len}")
+            return default_max_tokens
+
         try:
             executor_request = tllm.Request(
                 client_id=request.id,
                 input_token_ids=prompt_token_ids,
-                max_tokens=request.sampling_params.max_tokens,
+                max_tokens=_deduce_max_tokens(request, self._executor_config),
                 streaming=request.streaming,
                 sampling_config=request.sampling_params._get_sampling_config(),
                 end_id=-1 if request.sampling_params.ignore_eos else
@@ -528,7 +585,11 @@ def worker_main(
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
+    BASE_ZMQ_CLASSES: Dict = serialization.BASE_ZMQ_CLASSES,
 ) -> None:
+    # The base classes for ZMQ serialization. Passed through from the parent process to ensure
+    # that children processes include any classes added at runtime (such as those from `register_approved_ipc_class`).
+    serialization.BASE_ZMQ_CLASSES = BASE_ZMQ_CLASSES
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
                         "green")
@@ -623,12 +684,11 @@ def worker_main(
         assert isinstance(proxy_result_queue, tuple)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
-                postproc_worker_main,
-                result_queues[i].address,
+                postproc_worker_main, result_queues[i].address,
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
-            )
+                serialization.BASE_ZMQ_CLASSES)
             postprocess_worker_futures.append(fut)
 
     # Error handling in the Worker/MPI process
@@ -657,6 +717,7 @@ def worker_main(
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
+        print_colored_debug(f"error: {traceback.format_exc()}", "red")
         if is_leader:
             request_error_queue.put(e)
         return

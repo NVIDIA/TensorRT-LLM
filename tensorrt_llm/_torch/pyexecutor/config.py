@@ -1,13 +1,18 @@
+import json
 import math
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Union
+
+import yaml
 
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
 from ...builder import BuildConfig
 from ...logger import logger
 from ...mapping import Mapping
+from ..model_config import MoeLoadBalancerConfig
 from ..speculative import SpecConfig
 from .resource_manager import BaseResourceManager
 
@@ -45,22 +50,32 @@ class PyTorchConfig:
     # If true, batches are rounded up to the nearest cuda_graph_batch_size.
     # This is usually a net win for performance.
     cuda_graph_padding_enabled: bool = False
-    enable_overlap_scheduler: bool = False
+    disable_overlap_scheduler: bool = False
     # If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time.
     # If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used.
     moe_max_num_tokens: Optional[int] = None
+    moe_load_balancer: Optional[Union[MoeLoadBalancerConfig, dict, str]] = None
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
-    # If true, will iterate over sampling_params of each request and use the
-    # corresponding decoding way, like top-k, top-p, etc.
-    mixed_decoder: bool = False
-    # If true, will use the TRTLLM decoder instead of the PyTorch decoder.
-    # The TRTLLM decoder has a wide coverage of decoding strategies.
-    enable_trtllm_decoder: bool = False
+
+    mixed_sampler: bool = False
+    """
+    If true, will iterate over sampling_params of each request and use the
+    corresponding sampling strategy, e.g. top-k, top-p, etc.
+    """
+    enable_trtllm_sampler: bool = False
+    """
+    If true, will use the TRTLLM sampler instead of the PyTorch sampler.
+    The TRTLLM sampler has a wide coverage of sampling strategies.
+    """
+
     kv_cache_dtype: str = "auto"
     use_kv_cache: bool = True
     enable_iter_perf_stats: bool = False
+    # If true, enables per request stats per iteration
+    # Must also set enable_iter_perf_stats to true to get request stats
+    enable_iter_req_stats: bool = False
     print_iter_log: bool = False
 
     torch_compile_enabled: bool = False
@@ -118,6 +133,22 @@ class PyTorchConfig:
                 self.cuda_graph_batch_sizes.append(
                     self.cuda_graph_max_batch_size)
 
+        if isinstance(self.moe_load_balancer, str):
+            assert os.path.exists(self.moe_load_balancer)
+            if self.moe_load_balancer.endswith(".json"):
+                with open(self.moe_load_balancer) as f:
+                    self.moe_load_balancer = json.load(f)
+            elif self.moe_load_balancer.endswith((".yaml", ".yml")):
+                with open(self.moe_load_balancer) as f:
+                    self.moe_load_balancer = yaml.safe_load(f)
+            else:
+                raise ValueError(
+                    f"Unsupported moe load balancer config file: {self.moe_load_balancer}"
+                )
+        if isinstance(self.moe_load_balancer, dict):
+            self.moe_load_balancer = MoeLoadBalancerConfig(
+                **self.moe_load_balancer)
+
         self._convert_load_format()
 
 
@@ -159,9 +190,9 @@ def update_executor_config(
 
     logger.info(f"{executor_config.pytorch_backend_config}")
 
-    if build_config is not None:
-        # TODO: move to pure-Python KvCacheConfig, and remove dependency on build_config.
-        executor_config.tokens_per_block = executor_config.tokens_per_block or build_config.plugin_config.tokens_per_block
+    build_config = build_config or BuildConfig()
+    # TODO: move to pure-Python KvCacheConfig, and remove dependency on build_config.
+    executor_config.tokens_per_block = executor_config.tokens_per_block or build_config.plugin_config.tokens_per_block
 
     executor_config.hf_model_dir = hf_model_dir
     executor_config.trt_engine_dir = trt_engine_dir

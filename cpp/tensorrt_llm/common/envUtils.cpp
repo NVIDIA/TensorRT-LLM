@@ -18,6 +18,7 @@
 #include "envUtils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/stringUtils.h"
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
@@ -98,11 +99,7 @@ size_t parseMemorySize(std::string const& input)
         throw std::invalid_argument("Invalid number format in memory size: " + input);
     }
 
-    for (char& c : unitPart)
-    {
-        c = std::tolower(c);
-    }
-
+    toLower(unitPart);
     size_t multiplier = 1;
     if (unitPart == "b")
     {
@@ -264,6 +261,12 @@ bool getEnvUseMPIKvCache()
     return useMPIKVCache;
 }
 
+bool getEnvUseNixlKvCache()
+{
+    static bool const useNixlKvCache = getBoolEnv("TRTLLM_USE_NIXL_KVCACHE");
+    return useNixlKvCache;
+}
+
 std::string getEnvUCXInterface()
 {
     static std::once_flag flag;
@@ -395,6 +398,17 @@ size_t getEnvMemSizeForKVCacheTransferBuffer()
         });
 
     return memSizeForKVCacheTransferBuffer;
+}
+
+uint16_t getEnvNixlPort()
+{
+    static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
+    return nixlPort;
+}
+
+bool getEnvDisaggBenchmarkGenOnly()
+{
+    return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY");
 }
 
 } // namespace tensorrt_llm::common

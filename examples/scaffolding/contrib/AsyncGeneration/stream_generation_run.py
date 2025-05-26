@@ -21,7 +21,8 @@ def parse_arguments():
 
 
 def test(prompts, proposer_worker):
-    prototype_controller = NativeStreamGenerationController()
+    prototype_controller = NativeStreamGenerationController(
+        sampling_params={"temperature": 0.9})
 
     llm = ScaffoldingLlm(
         prototype_controller,
@@ -81,11 +82,12 @@ def main():
         "There exist real numbers $x$ and $y$, both greater than 1, such that $\\log_x\\left(y^x\\right)=\\log_y\\left(x^{4y}\\right)=10$. Find $xy$.",
         "Find the largest possible real part of \\[(75+117i)z+\\frac{96+144i}{z}\\]where $z$ is a complex number with $|z|=4$.",
     ]
-    llm_worker = TRTLLMWorker.init_with_new_llm(args.model_dir,
-                                                backend="pytorch",
-                                                max_batch_size=32,
-                                                max_num_tokens=4096,
-                                                temperature=0.9)
+    llm_worker = TRTLLMWorker.init_with_new_llm(
+        args.model_dir,
+        backend="pytorch",
+        max_batch_size=32,
+        max_num_tokens=4096,
+    )
 
     print(f'main llm worker init done')
     llm_worker.register_task_handler(StreamGenerationTask,

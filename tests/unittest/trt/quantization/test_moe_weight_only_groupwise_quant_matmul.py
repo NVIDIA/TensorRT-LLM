@@ -154,14 +154,14 @@ class TestMoEWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
             2**31, (num_experts, n, k // num_weights_in_32_bits),
             dtype=torch.int32,
             device="cuda")
-        pre_quant_scale_1 = torch.randn(1,
-                                        k,
-                                        dtype=activation_dtype,
-                                        device="cuda")
-        pre_quant_scale_2 = torch.randn(1,
-                                        n,
-                                        dtype=activation_dtype,
-                                        device="cuda")
+        pre_quant_scale_1 = torch.ones(num_experts,
+                                       1,
+                                       dtype=activation_dtype,
+                                       device="cuda")
+        pre_quant_scale_2 = torch.ones(num_experts,
+                                       1,
+                                       dtype=activation_dtype,
+                                       device="cuda")
         scale_1 = torch.randn(num_experts,
                               k // group_size,
                               n * 2,
@@ -182,14 +182,8 @@ class TestMoEWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                              k,
                              dtype=activation_dtype,
                              device="cuda") * 0.01
-        alpha_1 = torch.randn(num_experts,
-                              1,
-                              dtype=torch.float32,
-                              device="cuda")
-        alpha_2 = torch.randn(num_experts,
-                              1,
-                              dtype=torch.float32,
-                              device="cuda")
+        alpha_1 = 1 / pre_quant_scale_1.float()
+        alpha_2 = 1 / pre_quant_scale_2.float()
 
         preprocessor = tensorrt_llm.quantization.functional.preprocess_weights_for_mixed_gemm
         unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
@@ -242,8 +236,9 @@ class TestMoEWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                 input = inputs_merged[i, :]
                 fc1_qd = ref_weight_1[expert].cuda().float()
                 if has_pre_quant:
-                    input = input * pre_quant_scale_1.squeeze()
+                    input = input * pre_quant_scale_1[expert]
                 if has_alpha:
+                    input[input > 448.0] = 448.0
                     input = input.to(torch.float8_e4m3fn).float()
                     fc1_qd = fc1_qd.to(torch.float8_e4m3fn).float()
                     fc1 = torch.matmul(input, fc1_qd) * alpha_1[expert]
@@ -253,8 +248,9 @@ class TestMoEWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                 fc1 = fc1 * torch.nn.functional.silu(gate)
                 fc2_qd = ref_weight_2[expert].cuda().float()
                 if has_pre_quant:
-                    fc1 = fc1 * pre_quant_scale_2.squeeze()
+                    fc1 = fc1 * pre_quant_scale_2[expert]
                 if has_alpha:
+                    fc1[fc1 > 448.0] = 448.0
                     fc1 = fc1.to(torch.float8_e4m3fn).float()
                     fc2_qd = fc2_qd.to(torch.float8_e4m3fn).float()
                     final = torch.matmul(fc1, fc2_qd) * alpha_2[expert]
@@ -282,11 +278,6 @@ class TestMoEWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                           name_func=unittest_name_func)
     @skip_non_ada_unittest
     def test_moe_w4a8(self, m, n, k, experts, dtype, has_pre_quant, has_zero):
-        # Skip specific problematic case
-        if m == 1 and n == 14336 and k == 4096 and experts == 8 and dtype == "bfloat16" and has_pre_quant and not has_zero:
-            self.skipTest(
-                "Skipping problematic case test_moe_w4a8_1_14336_4096_8_bfloat16_True_False"
-            )
 
         self._woq_moe_groupwise_matmul(m, n, k, experts, dtype, torch.quint4x2,
                                        has_pre_quant, has_zero, True)

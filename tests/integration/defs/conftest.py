@@ -179,6 +179,13 @@ def llm_root():
 
 
 @pytest.fixture(scope="session")
+def llm_backend_root():
+    llm_root_directory = get_llm_root()
+    llm_backend_repo_root = os.path.join(llm_root_directory, "triton_backend")
+    return llm_backend_repo_root
+
+
+@pytest.fixture(scope="session")
 def llm_datasets_root() -> str:
     return os.path.join(llm_models_root(), "datasets")
 
@@ -702,8 +709,16 @@ def llm_venv(llm_root, custom_user_workspace):
         workspace_dir = "llm-test-workspace"
     workspace_dir = os.path.join(workspace_dir, subdir)
     from defs.local_venv import PythonVenvRunnerImpl
-    return PythonVenvRunnerImpl("", "", "python3",
+    venv = PythonVenvRunnerImpl("", "", "python3",
                                 os.path.join(os.getcwd(), workspace_dir))
+    yield venv
+    # Remove the workspace directory
+    if os.path.exists(workspace_dir):
+        print(f"Cleaning up workspace: {workspace_dir}")
+        try:
+            shutil.rmtree(workspace_dir)
+        except Exception as e:
+            print(f"Failed to clean up workspace: {e}")
 
 
 @pytest.fixture(scope="session")
@@ -794,6 +809,8 @@ def multimodal_model_root(request, llm_venv):
         tllm_model_name = tllm_model_name + ".nemo"
     elif 'Llama-3.2' in tllm_model_name:
         models_root = os.path.join(llm_models_root(), 'llama-3.2-models')
+    elif 'Mistral-Small' in tllm_model_name:
+        models_root = llm_models_root()
 
     multimodal_model_root = os.path.join(models_root, tllm_model_name)
 
@@ -1758,6 +1775,8 @@ def star_attention_input_root(llm_root):
 def parametrize_with_ids(argnames: str | Sequence[str],
                          argvalues: Iterable[ParameterSet | Sequence[object]
                                              | object], **kwargs):
+    """An alternative to pytest.mark.parametrize with automatically generated test ids.
+    """
     if isinstance(argnames, str):
         argname_list = [n.strip() for n in argnames.split(",")]
     else:
@@ -1772,15 +1791,10 @@ def parametrize_with_ids(argnames: str | Sequence[str],
             case_argvalues = (case_argvalues, )
         assert len(case_argvalues) == len(argname_list)
 
-        case_id = []
-        for name, value in zip(argname_list, case_argvalues):
-            if value is None:
-                pass
-            elif isinstance(value, bool):
-                if value:
-                    case_id.append(name)
-            else:
-                case_id.append(f"{name}={value}")
+        case_id = [
+            f"{name}={value}"
+            for name, value in zip(argname_list, case_argvalues)
+        ]
         case_ids.append("-".join(case_id))
 
     return pytest.mark.parametrize(argnames, argvalues, ids=case_ids, **kwargs)
@@ -1825,11 +1839,11 @@ skip_pre_hopper = pytest.mark.skipif(
     reason="This test is not supported in pre-Hopper architecture")
 
 skip_pre_blackwell = pytest.mark.skipif(
-    get_sm_version() < 100 or get_sm_version() >= 120,
+    get_sm_version() < 100,
     reason="This test is not supported in pre-Blackwell architecture")
 
 skip_post_blackwell = pytest.mark.skipif(
-    get_sm_version() >= 100 and get_sm_version() < 120,
+    get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
 
 skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
@@ -1837,6 +1851,9 @@ skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
 skip_no_hopper = pytest.mark.skipif(
     get_sm_version() != 90,
     reason="This test is only  supported in Hopper architecture")
+
+skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
+                                   reason="This test is for Blackwell SM120")
 
 
 def skip_fp8_pre_ada(use_fp8):
@@ -1969,9 +1986,28 @@ def pytest_generate_tests(metafunc: pytest.Metafunc):
         lines = preprocess_test_list_lines(testlist_path, lines)
 
     uts = []
+    ids = []
     for line in lines:
         if line.startswith("unittest/"):
-            uts.append(line.strip())
+            if " TIMEOUT " in line:
+                # Process for marker TIMEOUT
+                case_part, timeout_part = line.split(" TIMEOUT ", 1)
+                case = case_part.strip()
+                timeout_str = timeout_part.strip()
+                timeout_num_match = re.search(r'\(?(\d+)\)?', timeout_str)
+                if timeout_num_match:
+                    timeout_min = int(timeout_num_match.group(1))
+                    timeout_sec = timeout_min * 60
+                else:
+                    raise ValueError(
+                        f"Invalid TIMEOUT format: {timeout_str} in line: {line}"
+                    )
+                mark = pytest.mark.timeout(int(timeout_sec))
+                uts.append(pytest.param(case, marks=mark))
+                # Change back id to include timeout information
+                ids.append(f"{case} TIMEOUT {timeout_str}")
+            else:
+                uts.append(line.strip())
     metafunc.parametrize("case", uts, ids=lambda x: x)
 
 
@@ -2223,3 +2259,12 @@ def disaggregated_test_root(llm_root, llm_venv):
                                       "tests/integration/defs/disaggregated")
 
     return disaggregated_root
+
+
+@pytest.fixture(scope="function")
+def tritonserver_test_root(llm_root):
+    "Get tritonserver test root"
+    tritonserver_root = os.path.join(llm_root,
+                                     "tests/integration/defs/triton_server")
+
+    return tritonserver_root
