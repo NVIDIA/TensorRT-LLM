@@ -48,13 +48,14 @@ BASE_ZMQ_CLASSES = {
     ### ending import of torch models classes
     "tensorrt_llm._torch.pyexecutor.llm_request":
     ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
+    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm.auto_parallel.config": ["AutoParallelConfig", "CostModel"],
     "tensorrt_llm.bindings.executor": [
         "BatchingType", "CapacitySchedulerPolicy", "ContextPhaseParams",
         "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
         "FinishReason", "KvCacheConfig", "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
-        "SchedulerConfig"
+        "SchedulerConfig", "DynamicBatchConfig", "ContextChunkingPolicy"
     ],
     "tensorrt_llm.builder": ["BuildConfig"],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
@@ -81,6 +82,7 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.llm_utils":
     ["CachedModelLoader._node_build_task", "LlmBuildStats"],
+    "tensorrt_llm.llmapi.tokenizer": ["TransformersTokenizer"],
     "tensorrt_llm.lora_manager": ["LoraConfig"],
     "tensorrt_llm.mapping": ["Mapping"],
     "tensorrt_llm.models.modeling_utils":
@@ -96,6 +98,9 @@ BASE_ZMQ_CLASSES = {
     ],
     "torch._utils": ["_rebuild_tensor_v2"],
     "torch.storage": ["_load_from_bytes"],
+    "transformers.tokenization_utils_fast": ["PreTrainedTokenizerFast"],
+    "tokenizers": ["Tokenizer", "AddedToken"],
+    "tokenizers.models": ["Model"],
 }
 
 
