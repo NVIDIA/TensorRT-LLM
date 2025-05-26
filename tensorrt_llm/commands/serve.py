@@ -419,6 +419,8 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
         llm_args = update_llm_args_with_extra_dict(llm_args,
                                                    llm_args_extra_dict)
 
+        # Ignore the non-LLM args
+        llm_args.pop("router", None)
         _launch_disaggregated_server(config_file, llm_args)
         return
 
