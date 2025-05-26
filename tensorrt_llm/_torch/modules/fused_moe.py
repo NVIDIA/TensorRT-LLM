@@ -424,9 +424,11 @@ class FusedMoE(nn.Module):
 
         self.initial_global_assignments = moe_load_balancer_config.get_layer_initial_global_assignments(
             layer_idx)
-        self.initial_local_expert_ids = moe_load_balancer_config.get_layer_initial_local_expert_ids(
-            layer_idx)
-        self.expert_size_per_partition = self.num_slots // self.ep_size
+        self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
+        self.slot_start = moe_load_balancer_config.slot_start
+        self.slot_end = moe_load_balancer_config.slot_end
+        self.initial_local_expert_ids = self.initial_global_assignments[
+            self.slot_start:self.slot_end]
         assert len(
             self.initial_local_expert_ids) == self.expert_size_per_partition
 

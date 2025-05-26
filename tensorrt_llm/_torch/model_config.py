@@ -59,11 +59,6 @@ class MoeLoadBalancerConfig:
                 range(self.num_experts))
             return self.initial_global_assignments[layer_idx]
 
-    def get_layer_initial_local_expert_ids(self, layer_idx: int) -> List[int]:
-        layer_initial_global_assignments = self.get_layer_initial_global_assignments(
-            layer_idx)
-        return layer_initial_global_assignments[self.slot_start:self.slot_end]
-
 
 @dataclass(kw_only=True)
 class ModelConfig(Generic[TConfig]):
