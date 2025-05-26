@@ -67,7 +67,7 @@ def clear_folder(folder_path):
             os.remove(item_path)
 
 
-def setup_venv(project_dir: Path, requirements_file: Path):
+def setup_venv(*, project_dir: Path, requirements_file: Path, clean: bool):
     """Creates/updates a venv and installs requirements.
 
     Args:
@@ -88,6 +88,10 @@ def setup_venv(project_dir: Path, requirements_file: Path):
     print("-- Ensuring virtualenv version >=20.29.1,<22.0 is installed...")
     build_run(f'"{sys.executable}" -m pip install "virtualenv>=20.29.1,<22.0"')
 
+    if clean:
+        print(f"-- Cleaning virtual environment in {venv_dir}...")
+        rmtree(venv_dir)
+
     # Create venv if it doesn't exist
     if not venv_dir.exists():
         print(f"-- Creating virtual environment in {venv_dir}...")
@@ -107,12 +111,12 @@ def setup_venv(project_dir: Path, requirements_file: Path):
     )
     build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
 
-    venv_conan = setup_conan(scripts_dir, venv_python)
+    venv_conan = setup_conan(scripts_dir=scripts_dir, venv_python=venv_python)
 
     return venv_python, venv_conan
 
 
-def setup_conan(scripts_dir, venv_python):
+def setup_conan(*, scripts_dir, venv_python):
     build_run(f'"{venv_python}" -m pip install conan==2.14.0')
     # Determine the path to the conan executable within the venv
     venv_conan = scripts_dir / "conan"
@@ -240,8 +244,10 @@ def main(*,
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
 
     # Setup venv and install requirements
-    venv_python, venv_conan = setup_venv(project_dir,
-                                         project_dir / requirements_filename)
+    venv_python, venv_conan = setup_venv(project_dir=project_dir,
+                                         requirements_file=project_dir /
+                                         requirements_filename,
+                                         clean=clean)
 
     # Ensure base TRT is installed (check inside the venv)
     reqs = check_output([str(venv_python), "-m", "pip", "freeze"])
