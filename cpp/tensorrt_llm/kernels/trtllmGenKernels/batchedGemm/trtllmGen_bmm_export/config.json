@@ -148,7 +148,7 @@
             "tileK": 512,
             "epilogueTileM": 128,
             "epilogueTileN": 8,
-            "numStages": 4,
+            "numStages": 3,
             "numMmaStages": 1,
             "numSlicesForSplitK": 1,
             "useTwoTmaLoadWarps": true,
@@ -460,7 +460,7 @@
             "numExperts": 2,
             "numStagesMma": 2,
             "tileK": 256,
-            "numStages": 6,
+            "numStages": 4,
             "tileScheduler": "persistent"
         }
     ]
