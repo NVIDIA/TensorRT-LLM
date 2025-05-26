@@ -18,6 +18,9 @@
 
 #include <cstdint>
 
+namespace batchedGemm
+{
+
 namespace gemm
 {
 
@@ -78,3 +81,5 @@ SPLIT_K_FUNCTION(Dsmem)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace gemm
+
+} // namespace batchedGemm
