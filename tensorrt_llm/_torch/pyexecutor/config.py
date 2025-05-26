@@ -19,7 +19,7 @@ class PyTorchConfig:
     """
 
     # Extra resource managers to use in addition to the KV cache manager.
-    # Each manager's prepare_resources method is called before the forward pass,
+    # Each manager's prepare_resources() is called before the forward pass,
     # and update_resources() is called after the pass finishes. free_resources()
     # is called when a request finishes.
     # The KV cache manager is guaranteed to be invoked after all of these extra

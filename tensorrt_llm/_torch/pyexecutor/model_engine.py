@@ -1025,6 +1025,7 @@ class PyTorchModelEngine(ModelEngine):
         input_ids = []
         sequence_lengths = []
         prompt_lengths = []
+        orig_prompt_lengths = []
         request_ids = []
         gather_ids = []
         position_ids = []
@@ -1050,6 +1051,7 @@ class PyTorchModelEngine(ModelEngine):
             gather_ids.append(len(input_ids) - 1)
             sequence_lengths.append(len(prompt_tokens))
             prompt_lengths.append(len(prompt_tokens))
+            orig_prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = request.context_current_position
             num_cached_tokens_per_seq.append(past_seen_token_num)
             multimodal_embedding = request.multimodal_embedding()
@@ -1108,6 +1110,7 @@ class PyTorchModelEngine(ModelEngine):
                 position_ids.append(past_seen_token_num)
                 draft_lens.append(num_draft_tokens)
                 prompt_lengths.append(num_draft_tokens + 1)
+                orig_prompt_lengths.append(num_draft_tokens + 1)
                 # draft tokens
                 input_ids.extend(request.py_draft_tokens)
                 gather_ids.extend(
@@ -1148,7 +1151,7 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(past_seen_token_num +
                                                  self.max_draft_len + 1)
                 prompt_lengths.append(request.py_prompt_len)
-
+                orig_prompt_lengths.append(request.py_orig_prompt_len)
             request_ids.append(request.py_request_id)
 
         sequence_lengths.extend([1] * len(generation_requests))
@@ -1176,6 +1179,7 @@ class PyTorchModelEngine(ModelEngine):
             position_ids.append(past_seen_token_num)
             num_cached_tokens_per_seq.append(past_seen_token_num)
             prompt_lengths.append(request.py_prompt_len)
+            orig_prompt_lengths.append(request.py_orig_prompt_len)
             draft_lens.append(0)
 
             request.py_batch_idx = batch_idx
@@ -1264,6 +1268,7 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
+        attn_metadata.orig_prompt_lens = orig_prompt_lengths
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
         if self.is_spec_decode and self.spec_config.spec_dec_mode.extend_ctx(
                 self.attn_backend):
@@ -1476,6 +1481,7 @@ class PyTorchModelEngine(ModelEngine):
         sequence_lengths = []
         input_ids = []
         prompt_lengths = []
+        orig_prompt_lengths = []
         request_ids = []
         gather_ids = []
         position_ids = []
@@ -1486,7 +1492,7 @@ class PyTorchModelEngine(ModelEngine):
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             prompt_lengths.append(request.py_prompt_len)
-
+            orig_prompt_lengths.append(request.py_orig_prompt_len)
             ctx_iter = request.ctx_iters
             ctx_blocks = request.ctx_blocks
             ctx_position_blocks = request.ctx_position_blocks
@@ -1599,7 +1605,7 @@ class PyTorchModelEngine(ModelEngine):
         for request in generation_requests:
             request_ids.append(request.py_request_id)
             prompt_lengths.append(request.py_prompt_len)
-
+            orig_prompt_lengths.append(request.py_orig_prompt_len)
             input_token_id = request.get_token(0, request.get_num_tokens(0) - 1)
             input_ids.append(input_token_id)
             gather_ids.append(len(input_ids) - 1)
@@ -1667,6 +1673,7 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
+        attn_metadata.orig_prompt_lens = orig_prompt_lengths
         attn_metadata.num_contexts = num_contexts
         attn_metadata.num_queries = num_queries
 

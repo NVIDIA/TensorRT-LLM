@@ -20,14 +20,52 @@ from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_clip import CLIPVisionModel
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import fuse_input_embeds, prepare_multimodal_ifb
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
+
+DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
 class LlavaNextInputProcessor(InputProcessor):
 
     def __init__(self, model_path, model_config, tokenizer):
         self.tokenizer = tokenizer
+
+        if DISAGG:
+            self.mm_encoder = LlavaNextVisionModel(model_path, model_config)
+
+    @torch.inference_mode()
+    def __call__(
+        self, inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        # text input - tokenization
+        text_prompt = inputs.get("prompt")
+        input_ids = self.tokenizer(text_prompt,
+                                   return_tensors="pt").input_ids[0]
+
+        # multimodal input - either mm encoder or plain concatenation the raw media tensors
+        mm_data = inputs.get("multi_modal_data", None)
+        assert mm_data is not None and 'image' in mm_data, "Multimodal inputs must be a dictionary with 'image' field"
+        if DISAGG:
+            # disaggregated batching mode: multimodal encoder runs as a per-request input processor, always BS=1
+            # returning expanded input_ids & multimodal embedding
+            mm_embeds, mm_embed_lengths = self.mm_encoder.forward(
+                mm_data['image'])
+            fused_input_ids, mm_embeds = self.mm_encoder._postprocess(
+                input_ids.to(mm_embeds.device), mm_embeds, mm_embed_lengths)
+            return fused_input_ids.tolist(), {"mm_embedding": mm_embeds}
+        else:
+            # inflight batching mode: multimodal encoder runs as part of the model forward
+            # returning raw input_ids & raw media
+            # within each request, input images/frames are usually of the same size; across requests, the sizes may vary
+            # InputProcessor is per-request call, so we can stack all images/frames as [num_images, C, H, W]. still on CPU.
+            mm_data = torch.stack(mm_data['image'])
+            return input_ids.tolist(), {"mm_embedding": mm_data}
+
+
+class LlavaNextVisionModel:
+
+    def __init__(self, model_path, model_config):
         self.processor = AutoProcessor.from_pretrained(model_path,
                                                        use_fast=True)
         self.model_config = model_config
@@ -67,6 +105,8 @@ class LlavaNextInputProcessor(InputProcessor):
         # Use HF multi-modal projector
         self.mm_projector = hf_mm_projector
 
+        self.max_batch_size = 8
+
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self, images):
         return [
@@ -91,7 +131,7 @@ class LlavaNextInputProcessor(InputProcessor):
         return image_features.reshape(-1, image_features.shape[-1])
 
     @nvtx_range("[Vision] postprocess")
-    def _postprocess(self, input_ids, mm_features):
+    def _postprocess(self, input_ids, mm_features, mm_feature_lengths):
         # Define model specific variables here before shared logic
         mm_tokens = torch.tensor([self.model_config.image_token_index
                                   ]).to(input_ids.device)
@@ -99,6 +139,9 @@ class LlavaNextInputProcessor(InputProcessor):
         vocab_size = self.model_config.text_config.vocab_size
         start_len = end_len = 0  # for llava, need not append start/end token around each image token
         # End model specific variables
+
+        mm_features = mm_features.reshape(len(mm_feature_lengths), -1,
+                                          mm_features.shape[-1])
 
         ## find mm token positions in input_ids
         mm_token_positions = torch.where(torch.isin(input_ids, mm_tokens))[0]
@@ -158,7 +201,7 @@ class LlavaNextInputProcessor(InputProcessor):
         assert mm_split_idx == len(
             mm_ids_splits), "All mm_ids_splits should be consumed"
 
-        ## concat text & mm input_ids, wrap mm feature in prompt tuning config
+        ## concat text & mm input_ids
         fused_input_ids = torch.cat(input_ids_splits).to(
             device=input_ids.device)
         fused_length = len(input_ids) + mm_total_length + num_frames * (
@@ -169,26 +212,24 @@ class LlavaNextInputProcessor(InputProcessor):
 
         # [num_frames, feature_length, hidden_dim] -> [num_frames * feature_length, hidden_dim]
         mm_features = mm_features.view(-1, mm_features.shape[-1])
-        return fused_input_ids, mm_features
+        return fused_input_ids.to(torch.int32), mm_features
 
     @torch.inference_mode()
-    def __call__(
-        self, inputs: TextPrompt, sampling_params: SamplingParams
-    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        text_prompt, mm_data = inputs.get("prompt"), inputs.get(
-            "multi_modal_data", {})
-        assert 'image' in mm_data
+    def forward(self,
+                images: List[torch.Tensor]) -> Tuple[torch.Tensor, List[int]]:
 
-        input_ids = self.tokenizer(
-            text_prompt, return_tensors="pt").input_ids[0].to(self.device)
+        # List[raw image tensors (CPU)] for N requests, could have different sizes --> CPU compute-vision ops e.g. resize, crop, etc. --> List[preprocessed tensors (GPU)] for N requests
+        mm_preprocessed = self._preprocess(images)
+        mm_preprocessed_lengths = [t.size(0) for t in mm_preprocessed]
 
-        mm_tensor = self._preprocess(mm_data['image'])
-        mm_features = torch.stack(
-            [self._process(tensor) for tensor in mm_tensor])
-        fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
-        return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_features
-        }
+        # concatenated preprocessed tensors (GPU) --> GPU model forward --> mm embedding tensors (GPU), [total_num_media_tokens, hidden_dim]
+        mm_embeds = self._process(torch.cat(mm_preprocessed))
+        mm_embed_lengths = [
+            mm_embeds.shape[0] // sum(mm_preprocessed_lengths) * l
+            for l in mm_preprocessed_lengths
+        ]  # calculate num_media_tokens for each request, which is proportional to the preprocessed length
+
+        return mm_embeds, mm_embed_lengths
 
 
 @register_auto_model("LlavaNextForConditionalGeneration")
@@ -219,8 +260,13 @@ class LlavaNextModel(PreTrainedModel):
                                    torch.float16)
         logger.info(f"{self.dtype=} {self.model_dtype=}")
 
+        if not DISAGG:
+            self.mm_encoder = LlavaNextVisionModel(config.checkpoint_dir,
+                                                   config)
+            self.mm_tokens = torch.tensor([config.image_token_index],
+                                          device='cuda')
+
         self.post_config()
-        self.is_loaded = True
 
     def load_weights(self, weights):
 
@@ -247,13 +293,39 @@ class LlavaNextModel(PreTrainedModel):
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
         logger.debug(f"{num_context_requests=}, {num_generation_requests=}")
 
-        mm_embed = kwargs.get("multi_modal_data", [])
-        assert mm_embed == [] or len(
-            mm_embed
-        ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
+        mm_data = kwargs.get("multi_modal_data", [])
+        if DISAGG:
+            # disaggregated batching mode: multimodal context phase is decoupled from LLM forward. mm_data is processed multimodal embedding
+            logger.warning(
+                "No multimodal encoder found in model definition. You might be in disaggregated inference mode. Skipping multimodal processing. It's expected that a expanded input_ids and mm_embed are provided as inputs."
+            )
+            mm_embed = mm_data
+            assert mm_embed == [] or len(
+                mm_embed
+            ) == num_context_requests, f"Number of multimodal tensors ({len(mm_data)}) should be equal to number of context requests ({num_context_requests}) in the batch."
+            input_ids, inputs_embeds = fuse_input_embeds(
+                self.llm.model.embed_tokens, input_ids, mm_embed)
+        else:
+            # inflight batching mode: multimodal context phase is fused in LLM forward. mm_data is raw media tensors
+            mm_embeds, mm_embed_lengths = None, None
+            if len(mm_data) > 0:
+                assert len(
+                    mm_data
+                ) == num_context_requests, f"Number of multimodal tensors ({len(mm_data)}) should be equal to number of context requests ({num_context_requests}) in the batch."
+                mm_embeds, mm_embed_lengths = self.mm_encoder.forward(mm_data)
 
-        input_ids, inputs_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens, input_ids, mm_embed)
+            attn_metadata, input_ids, position_ids, inputs_embeds = prepare_multimodal_ifb(
+                self.llm.model.embed_tokens,
+                attn_metadata,
+                input_ids,
+                position_ids,
+                self.mm_tokens,
+                mm_embeds,
+                mm_embed_lengths,
+                prepare_position_ids=self.llm.model.layers[0].self_attn.
+                apply_rotary_emb
+            )  # position_ids is only relevant when RoPE needs to be explicitly applied outside the fused attention op.
+
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
         return logits

@@ -368,10 +368,7 @@ class GenerationExecutorWorker(GenerationExecutor):
 
         prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
         prompt_tuning_config = None
-        multimodal_embedding = None
         mrope_config = None
-        if request.multimodal_embedding is not None:
-            multimodal_embedding = request.multimodal_embedding
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)
             uid = str(request.prompt_adapter_request.adapter_id)
@@ -450,7 +447,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
-                multimodal_embedding=multimodal_embedding,
+                multimodal_embedding=request.multimodal_embedding
+                if request.multimodal_embedding is not None else None,
                 mrope_config=mrope_config,
                 logits_post_processor_name=(
                     tllm.Request.BATCHED_POST_PROCESSOR_NAME

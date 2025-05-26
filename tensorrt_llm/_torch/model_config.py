@@ -135,6 +135,8 @@ class ModelConfig(Generic[TConfig]):
         model_dir = Path(
             transformers.utils.hub.cached_file(checkpoint_dir,
                                                'config.json')).parent
+        pretrained_config.checkpoint_dir = model_dir
+
         quant_config = QuantConfig()
         layer_quant_config = None
         # quantized ckpt in modelopt format

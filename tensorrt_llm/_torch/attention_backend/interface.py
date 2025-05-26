@@ -53,12 +53,6 @@ class AttentionMetadata:
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
 
-    # The length of each sequence in the batch for query.
-    # The shape is (batch_size), and located on CPU memory.
-    # For sub metadata of cross attention, it's automatically
-    # initialized to seq_lens of parent metadata.
-    seq_lens: Optional[torch.Tensor]  # Implemented using property
-
     # The number of context-phase sequences in the batch.
     num_contexts: int  # Implemented using property
 
@@ -70,6 +64,12 @@ class AttentionMetadata:
     _num_contexts: int = field(init=False, default=0, repr=False)
     # The parameters for the KV cache.
     kv_cache_params: Optional[KVCacheParams] = None
+
+    # The length of each sequence in the batch for query.
+    # The shape is (batch_size), and located on CPU memory.
+    # For sub metadata of cross attention, it's automatically
+    # initialized to seq_lens of parent metadata.
+    seq_lens: Optional[torch.Tensor]  # Implemented using property
 
     # The length of each sequence in the batch for key and value.
     # The shape is (batch_size), and located on CPU memory.
@@ -110,6 +110,8 @@ class AttentionMetadata:
     # For generation-phase sequence, the value is the token number of its context phase.
     # The shape is (batch_size) if provided.
     prompt_lens: Optional[List[int]] = None
+    # The "original" prompt length of each sequence in the batch. Useful in cases where the prompt tokens can be updated thus become different from the original user input prompt, e.g. multimodal.
+    orig_prompt_lens: Optional[List[int]] = None
 
     # These fields indicate whether the runtime can use various features.
     # The kernels may or may not have different behaviors when these
@@ -148,6 +150,35 @@ class AttentionMetadata:
         elif self._seq_lens is not None:
             self._num_tokens = self._seq_lens.sum().item()
 
+    def on_update_gpu(self, key="all"):
+        '''
+        Update underlying GPU buffers when seq_lens or seq_lens_kv is updated.
+        '''
+        if key in ["seq_lens", "all"]:
+            # The model executor sets seq_lens to None initially.
+            if self._seq_lens is not None:
+                self._seq_lens = self._seq_lens.pin_memory()
+
+                if self.is_cuda_graph and self._seq_lens_cuda is not None:
+                    # Very important: do not reallocate if we are using CUDA graphs.
+                    # This copy is safe because the batch size is guaranteed to not
+                    # change in the CUDA graph case. The seqlens can change if we
+                    # are doing spec decode.
+                    self._seq_lens_cuda.copy_(self._seq_lens, non_blocking=True)
+                else:
+                    self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
+
+            if self.has_cross_sub_metadata:
+                self.cross._seq_lens = self._seq_lens
+                self.cross._seq_lens_cuda = self._seq_lens_cuda
+
+        if key in ["seq_lens_kv", "all"]:
+            # The model executor sets seqlens to None initially.
+            if self._seq_lens_kv is not None:
+                self._seq_lens_kv = self._seq_lens_kv.pin_memory()
+                self._seq_lens_kv_cuda = self._seq_lens_kv.cuda(
+                    non_blocking=True)
+
     @property
     def seq_lens(self) -> Optional[torch.Tensor]:
         return self._seq_lens
@@ -158,23 +189,26 @@ class AttentionMetadata:
         value = value if value is not AttentionMetadata.seq_lens else None
         self._seq_lens = value
         self.on_update()
+        self.on_update_gpu("seq_lens")
 
-        # The model executor sets seq_lens to None initially.
-        if self._seq_lens is not None:
-            self._seq_lens = self._seq_lens.pin_memory()
+    @property
+    def seq_lens_cuda(self):
+        return self._seq_lens_cuda
 
-            if self.is_cuda_graph and self._seq_lens_cuda is not None:
-                # Very important: do not reallocate if we are using CUDA graphs.
-                # This copy is safe because the batch size is guaranteed to not
-                # change in the CUDA graph case. The seqlens can change if we
-                # are doing spec decode.
-                self._seq_lens_cuda.copy_(self._seq_lens, non_blocking=True)
-            else:
-                self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
+    @property
+    def seq_lens_kv(self) -> Optional[torch.Tensor]:
+        return self._seq_lens_kv if self._seq_lens_kv is not None else self._seq_lens
 
-        if self.has_cross_sub_metadata:
-            self.cross._seq_lens = self._seq_lens
-            self.cross._seq_lens_cuda = self._seq_lens_cuda
+    @seq_lens_kv.setter
+    def seq_lens_kv(self, value: Optional[torch.Tensor]):
+        value = value if value is not AttentionMetadata.seq_lens_kv else None
+        self._seq_lens_kv = value
+        self.on_update()
+        self.on_update_gpu("seq_lens_kv")
+
+    @property
+    def seq_lens_kv_cuda(self):
+        return self._seq_lens_kv_cuda if self._seq_lens_kv_cuda is not None else self._seq_lens_cuda
 
     @property
     def num_contexts(self) -> int:
@@ -195,28 +229,6 @@ class AttentionMetadata:
         value = value if value is not AttentionMetadata.num_generations else 0
         self._num_generations = value
         self.on_update()
-
-    @property
-    def seq_lens_cuda(self):
-        return self._seq_lens_cuda
-
-    @property
-    def seq_lens_kv(self) -> Optional[torch.Tensor]:
-        return self._seq_lens_kv if self._seq_lens_kv is not None else self._seq_lens
-
-    @seq_lens_kv.setter
-    def seq_lens_kv(self, value: Optional[torch.Tensor]):
-        value = value if value is not AttentionMetadata.seq_lens_kv else None
-        self._seq_lens_kv = value
-        self.on_update()
-        # The model executor sets seqlens to None initially.
-        if self._seq_lens_kv is not None:
-            self._seq_lens_kv = self._seq_lens_kv.pin_memory()
-            self._seq_lens_kv_cuda = self._seq_lens_kv.cuda(non_blocking=True)
-
-    @property
-    def seq_lens_kv_cuda(self):
-        return self._seq_lens_kv_cuda if self._seq_lens_kv_cuda is not None else self._seq_lens_cuda
 
     @property
     def context_lens(self) -> torch.Tensor:

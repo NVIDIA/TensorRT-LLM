@@ -277,7 +277,7 @@ def format_qwen2_vl_input(model_dir, inputs):
 def default_image_loader(prompts: List[str],
                          images: Union[List[List[str]], List[str]],
                          image_data_format: str = "pt",
-                         device: str ="cuda"):
+                         device: str = "cuda"):
     if len(images) > len(prompts) and len(prompts) == 1:
         # 1 prompt + N media
         images = [images]
@@ -298,7 +298,7 @@ def default_image_loader(prompts: List[str],
 def default_video_loader(prompts: List[str],
                          videos: Union[List[List[str]], List[str]],
                          image_data_format: str = "pt",
-                         device: str ="cuda",
+                         device: str = "cuda",
                          num_frames: int = 8):
     if len(videos) > len(prompts) and len(prompts) == 1:
         # 1 prompt + N media

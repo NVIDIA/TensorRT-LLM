@@ -27,7 +27,158 @@ from torchvision.transforms import Normalize, Resize, ToTensor
 
 from tensorrt_llm._torch.modules.embedding import Embedding
 
+from ..._utils import nvtx_range
 
+
+@nvtx_range("prepare_multimodal_ifb")
+def prepare_multimodal_ifb(embedding_layer,
+                           attn_metadata,
+                           input_ids,
+                           position_ids,
+                           mm_tokens=None,
+                           mm_embeds=None,
+                           mm_embed_lengths=None,
+                           prepare_position_ids=False):
+    """
+    Prepare for inflight batching LLM forward in multimodal mode. When Encoder + LLM is in the same forward, this function should be called between the encoder forward and the LLM forward.
+
+    Challenges:
+    in multimodal, the actual seq_lens (text + media) is only known AFTER the encoder forward (there are VLM models that vision seq_len is deterministic and independent of the media size; but a generic solution shouldn't base on such assumption). We need a way to update from the text-only seq_lens to the actual (text + media) seq_lens, which is not easy.
+    - approach 1: update the input_ids field in llm request, such as using a dummy input_ids that matches the real seq_lens.
+        Pros: worry-free about setting the correct lengths during scheduling and metadata init.
+        Cons: (i) inside forward, we have no handle to the request object (ii) input_ids field in LlmRequest class is immutable (iii) wasted space to store the dummy input_ids
+    - approach 2: update the actual lengths in model forward.
+        Pros: (i) model-specific handling, doesn't affect other models (ii) no wasted space.
+        Cons: (i) a bit hacky, modifying the metadata is error-prone (ii) in theory, the IFB scheduling may over-shoot because it's based on the text-only seq_lens
+    The current implementation is approach 2.
+    The ideal approach is to add a new seq_len field in LlmRequest. Let this field be mutable & all seq_len getter routes to this field rather than calculating len(input_ids).
+    TODO: handle the hybrid case of both text-only & multimodal requests
+    """
+
+    num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
+
+    input_embeds = None
+
+    # multimodal context requests
+    if num_context_requests > 0 and mm_embeds is not None:  # skip dummy requests
+        ## Fuse input embeddings
+        # 1. remove mm tokens from input_ids
+        raw_ctx_tokens, raw_gen_tokens = input_ids[:attn_metadata.
+                                                   num_ctx_tokens], input_ids[
+                                                       attn_metadata.
+                                                       num_ctx_tokens:]
+        raw_text_mask = ~torch.isin(raw_ctx_tokens, mm_tokens)
+        input_ids = torch.cat([raw_ctx_tokens[raw_text_mask], raw_gen_tokens])
+        input_embeds = torch.empty(input_ids.shape[0] + mm_embeds.shape[0],
+                                   mm_embeds.shape[-1],
+                                   device=mm_embeds.device,
+                                   dtype=mm_embeds.dtype)
+        fused_text_mask = torch.full((input_embeds.shape[0], ), False)
+        if raw_gen_tokens.shape[0] > 0:
+            fused_text_mask[-raw_gen_tokens.shape[0]:] = True
+
+        # 2. calculate the text token indices in the fused input_embeds
+        raw_text_masks = list(
+            raw_text_mask.split(attn_metadata.context_lens.tolist()))
+        mm_embed_splits = list(mm_embeds.split(mm_embed_lengths))
+        start_idx, last_start_idx = 0, 0
+        fused_lengths = []
+        for text_mask, mm_embed in zip(raw_text_masks,
+                                       mm_embed_splits):  # per request
+            mm_positions = torch.where(text_mask == False)[0].tolist()
+            num_medias = len(mm_positions)
+            media_length = len(mm_embed) // num_medias
+
+            # Diagram for 2 media, length 3 & length 4 each. After processing the 1st media:
+            # index:           0  1  2  3  4  5  6  7  8  9  10 11 12 13
+            # raw tokens:      T  T  T  M  T  T  M  T  T (T - text, M - media)
+            # mm_positions:             ^        ^
+            #                                    ^pos
+            #                              ^last_pos
+            # fused_text mask: T  T  T  F  F  F  T  T  F  F  F  F  T  T (T-True, F-False)
+            #                                    ^start_idx
+            last_pos = 0
+            for pos in mm_positions:  # per media in each request
+                text_length = pos - last_pos
+                fused_text_mask[start_idx:start_idx + text_length] = True
+                start_idx += text_length + media_length
+                last_pos = pos + 1
+
+            if last_pos < len(text_mask):
+                # text between last media token & the end
+                text_length = len(text_mask) - last_pos
+                fused_text_mask[start_idx:start_idx + text_length] = True
+                start_idx += text_length
+
+            fused_lengths.append(start_idx - last_start_idx)
+            last_start_idx = start_idx
+
+        # 3. fuse embeddings
+        input_embeds[fused_text_mask] = embedding_layer(input_ids)
+        input_embeds[~fused_text_mask] = mm_embeds
+        input_ids = None  # use input_embeds mode for multimodal
+
+        ## Update metadata
+        # 1. Update attn_metadata for the following LLM forward. This can be done in-place in this forward(). NOTE: we cannot simply do attn_metadata.seq_lens[:num_context_requests] = xx, because this won't trigger the setter calls (see interface.py) thus the underlying seq_lens_cuda buffer won't get updated. We MUST do an explicit setter.
+        attn_metadata.prompt_lens[:num_context_requests] = fused_lengths
+        attn_metadata.seq_lens[:num_context_requests] = torch.tensor(
+            fused_lengths, dtype=torch.int32)
+        attn_metadata.seq_lens_kv[:num_context_requests] = torch.tensor(
+            fused_lengths, dtype=torch.int32)
+        attn_metadata.on_update_gpu()
+        # 2. Update request data for the generation phase. It's not straightforward to propagate the updated info back to request fields. A viable solution is to temporarily store the info in KVCacheManager, and leverage its update_resources() -- which is invoked after the forward() step -- to update the request data. see resource_manager.py.
+        attn_metadata.kv_cache_manager.extra_info_for_update_resources[
+            'updated_seq_lens_ctx'] = attn_metadata.seq_lens[:
+                                                             num_context_requests].tolist(
+                                                             )
+        # 3. Update KV cache size allocation
+        # TODO: is there a better way to add multiple tokens or extend the sequence in one go?
+        for i, req in enumerate(
+                attn_metadata.request_ids[:num_context_requests]):
+            for _ in range(fused_lengths[i] -
+                           attn_metadata.orig_prompt_lens[i]):
+                attn_metadata.kv_cache_manager.impl.add_token(req)
+
+    # multimodal generation requests
+    if num_generation_requests > 0:
+        # 4. Update KV cache length for generation requests
+        # num_cached_tokens_per_seq is counting based on the original prompt length (because llmRequest class only stores the original text input ids). Number of generated tokens is the delta between the two.
+        attn_metadata.kv_cache_params.num_cached_tokens_per_seq[
+            num_context_requests:] = list(
+                map(
+                    lambda x, y, z: x + y - z,
+                    attn_metadata.prompt_lens[num_context_requests:],
+                    attn_metadata.kv_cache_params.
+                    num_cached_tokens_per_seq[num_context_requests:],
+                    attn_metadata.orig_prompt_lens[num_context_requests:]))
+        # TODO: (1) could just save the delta between original & current prompt lens to save a subtract op exposed in step latency (2) more performant impl than list map
+
+    attn_metadata.prepare()  # must update internal buffers
+
+    if prepare_position_ids:
+        position_ids_list = []
+        for i in range(num_context_requests + num_generation_requests):
+            if i < num_context_requests:
+                position_ids_list.append(
+                    torch.arange(start=0,
+                                 end=attn_metadata.seq_lens[i],
+                                 dtype=torch.int,
+                                 device='cuda'))
+            else:
+                position_ids_list.append(
+                    torch.tensor([
+                        attn_metadata.kv_cache_params.
+                        num_cached_tokens_per_seq[i]
+                    ],
+                                 dtype=torch.int,
+                                 device='cuda'))
+        if len(position_ids_list) > 0:
+            position_ids = torch.cat(position_ids_list).unsqueeze(0)
+
+    return attn_metadata, input_ids, position_ids, input_embeds
+
+
+@nvtx_range("fuse_input_embeds")
 def fuse_input_embeds(
     embedding_layer: Embedding,
     input_ids: torch.LongTensor,

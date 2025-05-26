@@ -235,6 +235,10 @@ class KVCacheManager(BaseResourceManager):
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
 
+        # store extra info saved during model forward() that may be needed by update_resources()
+        # e.g. updated seq_lens in multimodal cases
+        self.extra_info_for_update_resources = {}
+
     def shutdown(self):
         self.impl.release_pools()
 
@@ -353,6 +357,18 @@ class KVCacheManager(BaseResourceManager):
         return requests
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
+        # update seq_lens after multimodal context phase
+        updated_seq_lens_ctx = self.extra_info_for_update_resources.get(
+            'updated_seq_lens_ctx', None)
+        if len(scheduled_batch.context_requests
+               ) > 0 and updated_seq_lens_ctx is not None:
+            assert len(updated_seq_lens_ctx) == len(
+                scheduled_batch.context_requests
+            ), f"updated_seq_lens_ctx length {len(updated_seq_lens_ctx)} != context_requests length {len(scheduled_batch.context_requests)}"
+            for i, request in enumerate(scheduled_batch.context_requests):
+                request.py_prompt_len = updated_seq_lens_ctx[i]
+            self.extra_info_for_update_resources = {}  # reset
+
         # rewind kv cache
         for request in scheduled_batch.generation_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:

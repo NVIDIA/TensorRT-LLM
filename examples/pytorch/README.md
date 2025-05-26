@@ -35,14 +35,15 @@ python3 quickstart_advanced.py --model_dir nvidia/Nemotron-H-8B-Base-8K --disabl
 
 ```bash
 # default inputs
-python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --modality image [--use_cuda_graph]
+TLLM_MULTIMODAL_DISAGGREGATED=1 python3 quickstart_multimodal.py --model_dir llava-hf/llava-v1.6-mistral-7b-hf --modality image [--use_cuda_graph]
 
 # user inputs
 # supported modes:
 # (1) N prompt, N media (N requests are in-flight batched)
 # (2) 1 prompt, N media
 # Note: media should be either image or video. Mixing image and video is not supported.
-python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --modality video --prompt "Tell me what you see in the video briefly." "Describe the scene in the video briefly." --media "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4" "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/world.mp4" --max_tokens 128 [--use_cuda_graph]
+TLLM_MULTIMODAL_DISAGGREGATED=0 python3 quickstart_multimodal.py --model_dir llava-hf/llava-v1.6-mistral-7b-hf --modality video --prompt "Tell me what you see in the video briefly." "Describe the scene in the video briefly." --media "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4" "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/world.mp4" --max_tokens 64 [--use_cuda_graph] [--enable_overlap_scheduler]
+# use TLLM_MULTIMODAL_DISAGGREGATED to control vision+LLM in a single forward pass (0) or in separate forward pass (1)
 ```
 
 ### Supported Models

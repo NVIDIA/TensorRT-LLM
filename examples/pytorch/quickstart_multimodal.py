@@ -1,8 +1,8 @@
 import argparse
 import json
 import os
-from typing import Any, Dict, List, Callable
 from functools import partial
+from typing import Any, Callable, Dict, List
 
 from quickstart_advanced import add_llm_args, setup_llm
 
@@ -29,14 +29,15 @@ example_video_prompts = [
 ]
 
 
-def prepare_multimodal_inputs(model_dir: str,
-                              modality: str,
-                              prompts: List[str],
-                              media: List[str],
-                              input_formatter: Callable,
-                              mm_loader: Callable,
-                              data_format: str = "pt",  # Options: "pt" or "pil"
-                              device: str = "cuda") -> List[Dict[str, Any]]:
+def prepare_multimodal_inputs(
+        model_dir: str,
+        modality: str,
+        prompts: List[str],
+        media: List[str],
+        input_formatter: Callable,
+        mm_loader: Callable,
+        data_format: str = "pt",  # Options: "pt" or "pil"
+        device: str = "cuda") -> List[Dict[str, Any]]:
 
     inputs = []
     if modality in ["image", "video"]:
@@ -106,12 +107,12 @@ def main():
     elif args.modality == "video":
         mm_loader = partial(default_video_loader, num_frames=args.num_frames)
     data_format = "pt"  # ["pt", "pil"]
-    device = "cuda"
+    media_input_device = "cpu"
 
     inputs = prepare_multimodal_inputs(args.model_dir, args.modality,
-                                       args.prompt, args.media,
-                                       input_formatter, mm_loader,
-                                       data_format, device)
+                                       args.prompt, args.media, input_formatter,
+                                       mm_loader, data_format,
+                                       media_input_device)
 
     outputs = llm.generate(inputs, sampling_params)
 
