@@ -150,8 +150,9 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             max_tokens = 25
 
             requests = []
-            requests.append((prompt, SamplingParams(max_tokens=1),
-                             DisaggregatedParams(request_type="context_only")))
+            requests.append(
+                (prompt, SamplingParams(max_tokens=max_tokens, ignore_eos=True),
+                 DisaggregatedParams(request_type="context_only")))
 
             responses = send_requests_to_worker(requests, 0, intercomm)
             output = responses[0]
@@ -166,8 +167,9 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             generation_request_disagg_params = output[0].disaggregated_params
             generation_request_disagg_params.request_type = "generation_only"
             requests = []
-            requests.append((prompt, SamplingParams(max_tokens=max_tokens),
-                             generation_request_disagg_params))
+            requests.append(
+                (prompt, SamplingParams(max_tokens=max_tokens, ignore_eos=True),
+                 generation_request_disagg_params))
 
             responses = send_requests_to_worker(requests, 1, intercomm)
             output = responses[0]
@@ -194,9 +196,10 @@ def test_disaggregated_simple_llama(model, generation_overlap,
     verify_disaggregated(
         model, generation_overlap, enable_cuda_graph,
         "What is the capital of Germany?",
-        "\n<|assistant|>\nThe capital of Germany is Berlin.", [
+        "\n<|assistant|>\nThe capital of Germany is Berlin. \n<|user|>", [
             2, 29871, 13, 29966, 29989, 465, 22137, 29989, 29958, 13, 1576,
-            7483, 310, 9556, 338, 5115, 29889, 2
+            7483, 310, 9556, 338, 5115, 29889, 2, 29871, 13, 29966, 29989, 1792,
+            29989, 29958
         ])
 
 
@@ -238,7 +241,10 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
                       kv_cache_dtype="auto",
                       use_cuda_graph=enable_cuda_graph))
 
-    kv_cache_configs = [KvCacheConfig(max_tokens=128) for _ in range(2)]
+    kv_cache_configs = [
+        KvCacheConfig(max_tokens=128, enable_block_reuse=False)
+        for _ in range(2)
+    ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
     worker_args = list(
@@ -273,7 +279,7 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
             # Send 256 requests to make sure the context worker is saturated
             for _ in range(256):
                 requests.append(
-                    (prompt, SamplingParams(max_tokens=1),
+                    (prompt, SamplingParams(max_tokens=1, ignore_eos=True),
                      DisaggregatedParams(request_type="context_only")))
 
             intercomm.send(requests, dest=0, tag=MPI_REQUEST)
@@ -289,7 +295,9 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
                     0].disaggregated_params
                 generation_request_disagg_params.request_type = "generation_only"
                 requests = []
-                requests.append((prompt, SamplingParams(max_tokens=max_tokens),
+                requests.append((prompt,
+                                 SamplingParams(max_tokens=max_tokens,
+                                                ignore_eos=True),
                                  generation_request_disagg_params))
 
                 intercomm.send(requests, dest=1, tag=MPI_REQUEST)

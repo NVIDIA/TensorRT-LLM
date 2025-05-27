@@ -38,9 +38,9 @@
 #define USE_SMALL_IO 1
 #endif
 
-bool const isPerfsim = []()
+bool const isTracing = []()
 {
-    auto const v = std::getenv("XQA_IS_PERFSIM");
+    auto const v = std::getenv("XQA_IS_TRACING");
     if (!v)
     {
         return false;
@@ -75,7 +75,7 @@ public:
 
     void prefetch(int dstDevice, cudaStream_t stream = nullptr) const
     {
-        if (!isPerfsim)
+        if (!isTracing)
         {
             checkCuda(cudaMemPrefetchAsync(get(), sizeof(T) * size(), dstDevice, stream));
         }
@@ -601,7 +601,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             semaphores.get(), scratch, stream);
         checkCuda(cudaGetLastError());
     };
-    if (testPerf && !isPerfsim)
+    if (testPerf && !isTracing)
     {
         if (verbose)
         {
@@ -618,7 +618,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         }
     }
     checkCuda(cudaEventRecord(tic, stream));
-    int32_t const nbIters = (USE_SMALL_IO || isPerfsim || !testPerf ? 1 : 100);
+    int32_t const nbIters = (USE_SMALL_IO || isTracing || !testPerf ? 1 : 100);
     for (int32_t i = 0; i < nbIters; i++)
     {
         runKernel();
@@ -1018,8 +1018,8 @@ TEST(NVRTC, compile)
     };
     std::vector<char const*> headers_name = {"cuda_hint.cuh", "defines.h", "ldgsts.cuh", "mha.h", "mhaUtils.cuh",
         "mma.cuh", "platform.h", "utils.cuh", "utils.h", "mha_stdheaders.cuh", "gmma.cuh", "gmma_impl.cuh",
-        "barriers.cuh", "tma.h", "pairedF32Op.cuh", "cuda_bf16.h", "cuda_bf16.hpp", "cuda_fp16.h", "cuda_fp16.hpp",
-        "cuda_fp8.h", "cuda_fp8.hpp", "vector_types.h", "vector_functions.h", "device_types.h"};
+        "barriers.cuh", "tma.h", "cuda_bf16.h", "cuda_bf16.hpp", "cuda_fp16.h", "cuda_fp16.hpp", "cuda_fp8.h",
+        "cuda_fp8.hpp", "vector_types.h", "vector_functions.h", "device_types.h"};
     assert(headers_content.size() == headers_name.size());
     std::pair<char const* const, std::function<bool(int, int)>> const sourceFileAndArchCond[] = {
         {tensorrt_llm::kernels::mha_cu_content, [](int major, int minor) { return major >= 8; }},
@@ -1115,7 +1115,7 @@ TEST(NVRTC, compile)
 }
 #endif
 
-TEST(Perf, perfsim_long)
+TEST(Perf, tracing_long)
 {
 #ifndef NDEBUG
     GTEST_SKIP() << "Skipping perf tests for debug build";
@@ -1123,7 +1123,7 @@ TEST(Perf, perfsim_long)
     runTest<1>(0, 4096, true, false);
 }
 
-TEST(Perf, perfsim_short)
+TEST(Perf, tracing_short)
 {
 #ifndef NDEBUG
     GTEST_SKIP() << "Skipping perf tests for debug build";

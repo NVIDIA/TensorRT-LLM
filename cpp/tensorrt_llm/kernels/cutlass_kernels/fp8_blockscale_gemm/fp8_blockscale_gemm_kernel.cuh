@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "ada_blockwise_gemm/ada_blockwise_gemm.cuh"
 #include "fp8_blockscale_mma_utils.cuh"
 #include "fp8_blockscale_tma_utils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -975,7 +976,7 @@ template <typename InputType, typename OutputType, typename ScaleType = float>
 __global__ void scale_1x128_kernel(
     OutputType* output, ScaleType* scales, InputType const* const input, int dim_x, int dim_y)
 {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890))
     size_t scales_along_dim_x = div_up(dim_x, 128);
     size_t scales_along_dim_y = div_up(dim_y, 1);
     size_t stride_scale_dim_y = div_up(dim_y, 4) * 4;
@@ -1655,6 +1656,43 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
     }
 }
 
+void gemm_dispatch_sm89(void* mat_a, void* mat_b, void* mat_d, float* scales_a, float* scales_b, uint32_t shape_m,
+    uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+{
+    if (num_device_sms < 0)
+    {
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    }
+    using ElementInput = cute::float_e4m3_t;
+    using ElementOutput = cute::bfloat16_t;
+    using ElementAccum = float;
+    using ElementBlockScale = float;
+    static constexpr int Stages = 4;
+    using TileShape = cutlass::gemm::GemmShape<32, 128, 128>; // only support 32x128x128 for now
+    using KT = ada_blockwise_gemm::AdaBlockwiseGemmTraits<ElementInput, ElementOutput, ElementAccum, ElementBlockScale,
+        Stages, TileShape::kM, TileShape::kN, TileShape::kK>;
+    using Gemm = ada_blockwise_gemm::AdaBlockwiseGemm<KT>;
+
+    int gemm_m = shape_m;
+    int gemm_n = shape_n;
+    int gemm_k = shape_k;
+    typename KT::Arguments args({gemm_m, gemm_n, gemm_k}, mat_a, mat_b, mat_d, scales_a, scales_b);
+
+    Gemm gemm{};
+
+    auto status = gemm.can_implement(args);
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "This kernel is not supported. Last CUDA error is: %s",
+        cutlassGetStatusString(status));
+
+    status = gemm.initialize(args);
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
+        "Failed to initialize the CUTLASS kernel. Last CUDA error is: %s", cutlassGetStatusString(status));
+
+    status = gemm.run(stream);
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess,
+        "Failed to run the CUTLASS kernel. Last CUDA error is: %s", cutlassGetStatusString(status));
+}
+
 void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b, __nv_bfloat16* mat_d, int ld_d,
     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, float* scales_a, float* scales_b, cudaStream_t stream)
 {
@@ -1663,6 +1701,12 @@ void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b
         return;
     }
 
+    int arch = tensorrt_llm::common::getSMVersion();
+    if (arch == 89)
+    {
+        gemm_dispatch_sm89(mat_a, mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream);
+        return;
+    }
     if (kDeepGemmEnabled)
     {
         gemm_dispatch(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream);

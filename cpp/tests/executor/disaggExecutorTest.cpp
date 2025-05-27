@@ -718,7 +718,7 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
         {
             GTEST_SKIP() << "DisaggExecutorTest requires at least 4 GPUs";
         }
-        ASSERT_TRUE(tensorrt_llm::common::getEnvUseUCXKvCache());
+        ASSERT_TRUE(tensorrt_llm::common::getEnvUseUCXKvCache() || tensorrt_llm::common::getEnvUseNixlKvCache());
     }
 
     ASSERT_EQ(participantIdsEachInstance.size(), participantDeviceIdsEachInstance.size());

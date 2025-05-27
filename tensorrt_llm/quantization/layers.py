@@ -32,6 +32,7 @@ from ..layers.embedding import Embedding
 from ..layers.linear import Linear, RowLinear
 from ..module import Module
 from ..parameter import Parameter
+from .utils import fp4_utils
 
 # isort: off
 from .functional import (
@@ -2113,10 +2114,12 @@ class FP4Linear(Linear):
             shape=(self.out_features,
                    self.in_features // self.scaling_vector_size),
             dtype=trt.fp8)
-        self.weights_block_scaling_factor_interleaved = Parameter(
-            shape=(self.out_features,
-                   self.in_features // self.scaling_vector_size),
-            dtype=trt.fp8)
+        nrows = fp4_utils.pad_up(self.out_features, 128)
+        ncols = fp4_utils.pad_up(self.in_features // self.scaling_vector_size,
+                                 4)
+        self.weights_block_scaling_factor_interleaved = Parameter(shape=(nrows,
+                                                                         ncols),
+                                                                  dtype=trt.fp8)
         self.weights_global_scaling_factor = Parameter(shape=(1, ),
                                                        dtype=trt.float32)
         self.activation_global_scaling_factor = Parameter(shape=(1, ),
@@ -2274,10 +2277,12 @@ class FP4RowLinear(RowLinear):
             shape=(self.out_features,
                    self.in_features // self.scaling_vector_size),
             dtype=trt.fp8)
-        self.weights_block_scaling_factor_interleaved = Parameter(
-            shape=(self.out_features,
-                   self.in_features // self.scaling_vector_size),
-            dtype=trt.fp8)
+        nrows = fp4_utils.pad_up(self.out_features, 128)
+        ncols = fp4_utils.pad_up(self.in_features // self.scaling_vector_size,
+                                 4)
+        self.weights_block_scaling_factor_interleaved = Parameter(shape=(nrows,
+                                                                         ncols),
+                                                                  dtype=trt.fp8)
         self.weights_global_scaling_factor = Parameter(shape=(1, ),
                                                        dtype=trt.float32)
         self.activation_global_scaling_factor = Parameter(shape=(1, ),

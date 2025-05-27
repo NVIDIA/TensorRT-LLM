@@ -41,12 +41,10 @@ def get_llm_args(model: str,
         gpus_per_node = device_count()
         if gpus_per_node == 0:
             raise ValueError("No GPU devices found on the node")
-
     build_config = BuildConfig(max_batch_size=max_batch_size,
                                max_num_tokens=max_num_tokens,
                                max_beam_width=max_beam_width,
                                max_seq_len=max_seq_len)
-
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=free_gpu_memory_fraction)
 
@@ -70,6 +68,10 @@ def get_llm_args(model: str,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
         "build_config": build_config,
+        "max_batch_size": max_batch_size,
+        "max_num_tokens": max_num_tokens,
+        "max_beam_width": max_beam_width,
+        "max_seq_len": max_seq_len,
         "kv_cache_config": kv_cache_config,
         "backend": backend if backend == "pytorch" else None,
         "pytorch_backend_config": pytorch_backend_config,

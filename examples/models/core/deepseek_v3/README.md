@@ -678,7 +678,7 @@ echo "All processes completed!"
 The converted checkpoint could be used as `<YOUR_MODEL_DIR>` and consumed by other commands.
 
 ### KV Cache Reuse
-KV cache reuse is supported for MLA on SM90 and SM100. It is enabled by default and does not support FP8 KV cache right now. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
+KV cache reuse is supported for MLA on SM90 and SM100. It is enabled by default. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
 
 ## Notes and Troubleshooting
 

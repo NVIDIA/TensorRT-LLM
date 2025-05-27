@@ -8,6 +8,8 @@
 
 # TensorRT-LLM Pytorch backend
 /tensorrt_llm/_torch @NVIDIA/trt-llm-torch-devs
+## TensorRT-LLM Pytorch backend - runtime
+/tensorrt_llm/_torch/pyexecutor @NVIDIA/trt-llm-torch-runtime-devs
 
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.

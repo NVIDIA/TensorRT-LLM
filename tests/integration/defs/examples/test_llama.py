@@ -1065,6 +1065,7 @@ def test_llm_llama_v3_1_autoq_2gpu_mmlu(llama_example_root, llama_model_root,
     check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("use_auto_parallel", [True, False],

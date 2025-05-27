@@ -101,11 +101,11 @@ using MaskType = uint32_t;
 #define SLIDING_WINDOW 0
 #endif
 
-// 0 - no FDL
-// 1 - naive FDL
-// 2 - aggressive FDL (implemented only in mha_sm90.cu for now)
-#ifndef ENABLE_FDL
-#define ENABLE_FDL 2
+// 0 - no PDL
+// 1 - naive PDL
+// 2 - aggressive PDL (implemented only in mha_sm90.cu for now)
+#ifndef ENABLE_PDL
+#define ENABLE_PDL 2
 #endif
 
 #ifndef USE_INPUT_KV

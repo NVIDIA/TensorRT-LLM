@@ -1237,10 +1237,10 @@ CUBIN_EXPORT __global__
     {
         // IO warps
         static_assert(beamWidth == 1);
-#if ENABLE_FDL
+#if ENABLE_PDL
         preExit();
 #endif
-#if ENABLE_FDL == 1
+#if ENABLE_PDL == 1
         acqBulk();
 #endif
         assert(warpIdx.z == 2);
@@ -1267,7 +1267,7 @@ CUBIN_EXPORT __global__
                 = reinterpret_cast<Vec<float, validElemsPerHead> const&>(ropeCosSin[cacheSeqLen - 1]);
             auto const cosSinPairs = loadHead<float, false, thrdsPerHead>(ropeCosSinHead, tid);
 #endif
-#if ENABLE_FDL == 2
+#if ENABLE_PDL == 2
             acqBulk();
 #endif
 #pragma unroll
@@ -1288,7 +1288,7 @@ CUBIN_EXPORT __global__
             }
 #else
             TinyPtr<IOHead const> const qData{q, headGrpSize * (nbKHeads * (beamWidth * ctaInputTokBeg) + idxHeadGrp)};
-#if ENABLE_FDL == 2
+#if ENABLE_PDL == 2
             acqBulk();
 #endif
             auto const f16QData = QCvt::load(threadIdx.x, qData, nbKHeads, ctaNbValidTokens);
@@ -1315,7 +1315,7 @@ CUBIN_EXPORT __global__
             {
                 uint32_t const idxKTile = idxKTileInit + idxIter * nbSubSeq;
                 kTilePartLoader.loadPages(idxKTile);
-#if USE_INPUT_KV || ENABLE_FDL == 2
+#if USE_INPUT_KV || ENABLE_PDL == 2
 #if SPEC_DEC
                 static_assert(SLIDING_WINDOW == 0);
                 bool const anyNewTokens = (gemm0CtaTileNbTokens * (idxKTile + 1) > cacheSeqLen - inputSeqLen);
@@ -1324,7 +1324,7 @@ CUBIN_EXPORT __global__
 #endif
                 if (anyNewTokens)
                 {
-#if ENABLE_FDL == 2
+#if ENABLE_PDL == 2
                     acqBulk();
 #endif
 #if USE_INPUT_KV
@@ -1384,7 +1384,7 @@ CUBIN_EXPORT __global__
             {
                 uint32_t const idxVTile = idxVTileInit + idxIter * nbSubSeq;
                 vTileLoader.loadPages(idxVTile);
-#if USE_INPUT_KV || ENABLE_FDL == 2
+#if USE_INPUT_KV || ENABLE_PDL == 2
 #if SPEC_DEC
                 static_assert(SLIDING_WINDOW == 0);
                 bool const anyNewTokens = (gemm0CtaTileNbTokens * (idxVTile + 1) > cacheSeqLen - inputSeqLen);
@@ -1393,7 +1393,7 @@ CUBIN_EXPORT __global__
 #endif
                 if (anyNewTokens)
                 {
-#if ENABLE_FDL == 2
+#if ENABLE_PDL == 2
                     acqBulk();
 #endif
 #if USE_INPUT_KV
@@ -3143,7 +3143,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     // gridDim.z == nbKHeads * batchSize && gridDim.y == nbSubSeqPerSeq && gridDim.x == nbInputSeqSplit
     dim3 const dimGrid{divUp(qSeqLen, inputTokensPerCta), nbSubSeqPerSeq, nbKHeads * batchSize};
     dim3 const dimCta{warp_size * gmmaWarpsPerGrp, 1, 3};
-    auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_FDL != 0);
+    auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
 #if USE_PAGED_KV_CACHE
     uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
     KVCacheList<true> const cacheList{pool, kvCachePageList, seqLen, maxNbPagesPerSeq};

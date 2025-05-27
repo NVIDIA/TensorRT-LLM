@@ -27,7 +27,6 @@ set(SRCS
     dataTransceiverImpl.cpp
     decoderBuffers.cpp
     encoderBuffers.cpp
-    generateRequestOptions.cpp
     guidedDecoder.cpp
     handleContextLogits.cpp
     handleGenerationLogits.cpp

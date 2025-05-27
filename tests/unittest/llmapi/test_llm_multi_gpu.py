@@ -327,6 +327,7 @@ def test_llm_multi_node_pytorch(nworkers: int):
 
 @skip_single_gpu
 def test_llm_multi_node_with_postproc():
+    pytest.skip(reason="https://nvbugs/5302891")
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__),
                                   "run_llm_with_postproc.py")

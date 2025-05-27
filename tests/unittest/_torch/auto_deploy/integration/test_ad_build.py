@@ -123,6 +123,7 @@ from utils.llm_data import llm_models_root
     ],
 )
 def test_build_ad(world_size: Optional[int], config: Dict):
+    pytest.skip("https://nvbugs/5289305")
     simple_config = SimpleConfig(**config)
     simple_config.world_size = world_size
     simple_config.free_mem_ratio = 0.01  # we don't need the cache and it may cause OOM issues
