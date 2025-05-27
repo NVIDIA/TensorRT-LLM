@@ -1042,7 +1042,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     def parameters = getCommonParameters()
                     String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
-                        'branch': branch,
+                        'branch': env.gitlabBranch ? env.gitlabBranch : "main",
                         'action': "push",
                         'globalVars': globalVarsJson,
                     ]
