@@ -295,9 +295,15 @@ class Linear(nn.Module):
             elif qc.layer_quant_mode.is_int4_weight_only_per_group():
                 self.has_w4a16_awq = True
 
+                # self.weight = Parameter(torch.empty(
+                #     (self.out_features // 2, self.in_features),
+                #     dtype=torch.uint8,
+                # ),
+                #                         requires_grad=False)
+
                 self.weight = Parameter(torch.empty(
-                    (self.out_features // 2, self.in_features),
-                    dtype=torch.uint8,
+                    (self.in_features, self.out_features // 2),
+                    dtype=torch.int8,
                 ),
                                         requires_grad=False)
 
@@ -397,15 +403,10 @@ class Linear(nn.Module):
 
                 # NOTE: without the preprocess during the runtime, the gemm output nan's. in order to use the preprocess_weights_for_mixed_gemm
                 # we need to cast the weight to int8 first.
-                # TODO not sure if its only relevant to sm 89, in addition we might want to do this in the load_weights, but we need to input dtype as well
-                w = self.weight.to(torch.int8)
-                preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
-                w = preprocessor(w.T.contiguous().cpu(), torch.quint4x2,
-                                 input.dtype).cuda().contiguous()
 
                 output = torch.ops.trtllm.w4a16_gemm(
                     input.contiguous(),
-                    w,
+                    self.weight,
                     self.weight_scale.T.to(dtype=input.dtype).contiguous(
                     ),  # TODO: needs to cast to fp16/bf16 in order to make the kernel run
                     qc.group_size,
@@ -504,6 +505,13 @@ class Linear(nn.Module):
 
             weight = load_weight_shard(weights[0]['weight'], self.tp_size,
                                        self.tp_rank, self.tp_mode, device)
+
+            if quant_mode and quant_mode.is_int4_weight_only_per_group():
+                weight = weight.T.to(torch.int8)
+                preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
+                weight = preprocessor(weight.contiguous().cpu(), torch.quint4x2,
+                                      torch.float16).cuda().contiguous()
+
             _copy(self.weight, weight)
 
             if self.bias is not None:
@@ -630,6 +638,13 @@ class Linear(nn.Module):
                 fused_weight = (fused_weight / self.weight_scale).to(
                     torch.float8_e4m3fn)
 
+            if quant_mode and quant_mode.is_int4_weight_only_per_group():
+                fused_weight = (fused_weight).to(torch.int8)
+                preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
+                fused_weight = preprocessor(fused_weight.T.contiguous().cpu(),
+                                            torch.quint4x2,
+                                            torch.float16).cuda().contiguous()
+
             _copy(self.weight, fused_weight)
 
             if self.bias is not None:
@@ -702,6 +717,13 @@ class Linear(nn.Module):
             if quant_mode and quant_mode.has_fp8_qdq():
                 fused_weight = (fused_weight / self.weight_scale).to(
                     torch.float8_e4m3fn)
+
+            if quant_mode and quant_mode.is_int4_weight_only_per_group():
+                fused_weight = (fused_weight).to(torch.int8)
+                preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
+                fused_weight = preprocessor(fused_weight.T.contiguous().cpu(),
+                                            torch.quint4x2,
+                                            torch.float16).cuda().contiguous()
 
             _copy(self.weight, fused_weight)
 
