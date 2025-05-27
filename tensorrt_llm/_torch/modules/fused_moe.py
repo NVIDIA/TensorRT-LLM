@@ -404,14 +404,7 @@ class VanillaMoE(nn.ModuleList):
         self._weights_created = True
 
     def load_weights(self, weights: List[Dict]):
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
+        from ..models.modeling_utils import filter_weights
 
         assert self._weights_created
         assert len(weights) == 1
