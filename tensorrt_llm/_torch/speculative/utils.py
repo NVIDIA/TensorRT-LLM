@@ -1,4 +1,4 @@
-from .draft_target import DraftTargetSampler, DraftTargetSpecMetadata
+from .draft_target import DraftTargetSpecMetadata
 from .eagle3 import Eagle3Sampler, Eagle3SpecMetadata
 from .mtp import MTPHiddenStatesManager, MTPSampler, MTPSpecMetadata
 from .ngram import NGramPoolManager

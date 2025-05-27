@@ -62,7 +62,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     dist = MPIDist(mapping=mapping)
 
     spec_config = executor_config.speculative_config
-    has_draft_model_engine = spec_config.spec_dec_mode.has_pytorch_model()
+    has_draft_model_engine = spec_config.spec_dec_mode.has_pytorch_model() if spec_config is not None else False
     has_ngram_drafter = isinstance(spec_config, NGramConfig)
 
     attn_runtime_features = AttentionRuntimeFeatures(
