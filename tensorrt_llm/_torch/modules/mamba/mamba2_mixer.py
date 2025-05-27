@@ -161,20 +161,20 @@ class Mamba2Mixer(nn.Module):
 
         # calculate split size
         num_prefills = attn_metadata.num_contexts
-        num_generations = attn_metadata.seq_lens.shape[0] - num_prefills
+        num_decodes = attn_metadata.seq_lens.shape[0] - num_prefills
         num_prefill_tokens = attn_metadata.num_ctx_tokens
         num_decode_tokens = attn_metadata.num_tokens - num_prefill_tokens
-        split_size = [num_prefill_tokens, num_decode_tokens]
+        seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
+        batch_split_size = [num_prefills, num_decodes]
 
         # handle warm up request
         if not is_warmup:
             state_indices = attn_metadata.kv_cache_manager.get_state_indices()
-            split_indices = torch.split(state_indices,
-                                        [num_prefills, num_generations])
+            split_indices = torch.split(state_indices, batch_split_size)
 
         # in_proj
         zxbcdt = self.in_proj(hidden_states)
-        split_zxbcdt = torch.split(zxbcdt, split_size, dim=0)
+        split_zxbcdt = torch.split(zxbcdt, seqlen_split_size, dim=0)
 
         # a batch can have either:
         # * only context requests
@@ -184,13 +184,13 @@ class Mamba2Mixer(nn.Module):
         # req_type = 1 -> generation
         batch = None
         # both context and generation requests
-        if num_prefills > 0 and num_generations > 0:
+        if num_prefills > 0 and num_decodes > 0:
             batch = [0, 1]
         # only context requests
         elif num_prefills > 0:
             batch = [0]
         # only generation requests
-        elif num_generations > 0:
+        elif num_decodes > 0:
             batch = [1]
 
         out = []
