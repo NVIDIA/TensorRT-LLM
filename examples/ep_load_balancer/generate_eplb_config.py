@@ -13,6 +13,8 @@ from tensorrt_llm.bindings.internal.runtime import (MoeLoadBalanceMetaInfo,
                                                     do_replication)
 from tensorrt_llm.logger import logger
 
+logger.set_level("info")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--expert_statistic_path",
@@ -58,7 +60,7 @@ if __name__ == "__main__":
     if args.iter_start is None:
         args.iter_start = iters[0]
     if args.iter_stop is None:
-        args.iter_stop = iters[-1]
+        args.iter_stop = iters[-1] + 1
     logger.info(f"Statistic iterations: {iters}")
     logger.info(f"Used iteration range: {args.iter_start} - {args.iter_stop}")
     logger.info(f"Statistic layers: {layers}")
@@ -67,9 +69,12 @@ if __name__ == "__main__":
     initial_global_assignments = {}
 
     for layer_idx in layers:
-        expert_token_count = sum(data for key, data in statistic.items()
-                                 if args.iter_start <= key[0] < args.iter_stop
-                                 and key[1] == layer_idx)
+        expert_token_count = [
+            data for key, data in statistic.items() if
+            args.iter_start <= key[0] < args.iter_stop and key[1] == layer_idx
+        ]
+        assert len(expert_token_count) == args.iter_stop - args.iter_start
+        expert_token_count = sum(expert_token_count)
         expert_load_factor = expert_token_count.float().tolist()
 
         meta_info = MoeLoadBalanceMetaInfo(expert_count=num_experts,
