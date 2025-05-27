@@ -4,7 +4,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
+from typing import (Any, ClassVar, Dict, List, Literal, Optional, TypeAlias,
+                    Union)
 
 import torch
 import yaml
@@ -576,6 +577,15 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
     decoding_type: ClassVar[str] = "Lookahead"
 
 
+SpeculativeConfig: TypeAlias = Optional[Union[
+    LookaheadDecodingConfig,
+    MedusaDecodingConfig,
+    EagleDecodingConfig,
+    MTPDecodingConfig,
+    NGramDecodingConfig,
+]]
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(BaseModel, PybindMirror):
     """
@@ -883,10 +893,8 @@ class BaseLlmArgs(BaseModel):
         default=None, description="Cache transceiver config.")
 
     # Speculative decoding parameters
-    speculative_config: Optional[Union[
-        LookaheadDecodingConfig, MedusaDecodingConfig, EagleDecodingConfig,
-        MTPDecodingConfig, NGramDecodingConfig]] = Field(
-            default=None, description="Speculative decoding config.")
+    speculative_config: SpeculativeConfig = Field(
+        default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
                                                   description="Batching type.")

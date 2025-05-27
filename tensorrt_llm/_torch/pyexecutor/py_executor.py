@@ -873,7 +873,7 @@ class PyExecutor:
                 if not got_finish_signal:
                     num_dummy_request = self._pad_attention_dp_dummy_request()
 
-                if self.draft_model_engine is not None or is_ngram:
+                if self.draft_model_engine is not None:
                     self._prepare_draft_requests()
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -906,8 +906,7 @@ class PyExecutor:
                 finished_requests = []
 
                 if scheduled_batch.batch_size > 0:
-                    has_ngram_iter_stats = is_ngram and self.model_engine.spec_config.spec_dec_mode.is_ngram(
-                    ) and iter_stats is not None
+                    has_ngram_iter_stats = (is_ngram and iter_stats is not None)
                     if has_ngram_iter_stats:
                         before = time.time()
 
@@ -972,7 +971,6 @@ class PyExecutor:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
             for req in self.active_requests:
-                # TODO: enable draft tokens in context phase
                 if req.state != LlmRequestState.GENERATION_IN_PROGRESS:
                     continue
                 req.py_last_draft_tokens = req.py_draft_tokens
@@ -995,6 +993,10 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         got_finish_signal = False
         num_dummy_request = 0
+        is_ngram = hasattr(
+            self.model_engine, "spec_config"
+        ) and self.model_engine.spec_config is not None and self.model_engine.spec_config.spec_dec_mode.is_ngram(
+        )
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
