@@ -1,7 +1,7 @@
 """Graph-related utilities for transformations."""
 
 from contextlib import contextmanager
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -17,6 +17,7 @@ from torch.fx.passes.tools_common import legalize_graph
 from torch.utils._pytree import _LEAF_SPEC
 
 from ..utils.logger import ad_logger
+from ..utils.node_utils import is_op
 
 
 def get_buffers_and_params(model: nn.Module) -> Dict[str, torch.Tensor]:
@@ -89,14 +90,19 @@ def lift_to_meta(model: nn.Module, strict_missing: bool = True, strict_unexpecte
         )
 
 
-def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule:
-    """Move the entire graph module to the specified device.
+def named_graphmodules(gm: fx.GraphModule) -> Iterator[Tuple[str, fx.GraphModule]]:
+    """Yield (name, submodule) for every fx.GraphModule inside gm (including gm itself)."""
+    for name, m in gm.named_modules():
+        if isinstance(m, fx.GraphModule):
+            yield name, m
 
+
+def _move_single_gm_to_device(
+    gm: GraphModule, device: torch.device, recompile_graph: bool = False
+) -> None:
+    """Move one GraphModule and its nodes to the specified device in-place.
     Partially inspired by https://github.com/pytorch/pytorch/blob/05cb98f91d49df9eadfcb3fc29bbd1b621d88860/torch/export/passes/__init__.py#L11
     """
-    # get device
-    device = torch.device(device)
-
     # move state dict
     gm.to(device)
 
@@ -106,11 +112,31 @@ def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule
             kwargs = node.kwargs.copy()
             kwargs["device"] = device
             node.kwargs = kwargs
+
+        if is_op(node, torch.ops.aten.to.device):
+            args = list(node.args)
+            args[1] = device
+            node.args = tuple(args)
+
         # move all the tensor metadata
         node.meta["val"] = pytree.tree_map(
             lambda v: v.to(device) if isinstance(v, torch.Tensor) else v,
             node.meta.get("val"),
         )
+    if recompile_graph:
+        # recompile graph to update self generated codes in subgraph
+        gm.graph.lint()
+        gm.recompile()
+
+
+def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule:
+    """Move the entire graph module and all sub-GraphModules to the specified device."""
+    # get device
+    device = torch.device(device)
+
+    for _, subgm in reversed(list(named_graphmodules(gm))):
+        # recompile graph to update self generated codes in subgraph
+        _move_single_gm_to_device(subgm, device, subgm is not gm)
 
 
 def _is_impure_node(node: Node) -> bool:
@@ -128,26 +154,9 @@ def _is_impure_node(node: Node) -> bool:
             node.target._nondeterministic_seeded = True
 
 
-def canonicalize_graph(
+def _canonicalize_single_gm(
     gm: GraphModule, shape_prop: bool = False, args_static: Optional[Tuple[Any, ...]] = None
 ) -> GraphModule:
-    """Canonicalize the graph of the given GraphModule.
-
-    Args:
-        gm: The GraphModule to canonicalize.
-        shape_prop: Whether to run shape propagation. Shape propagation tends to be finicky and
-            slow, so we only run it optionally.
-        args_static: A tuple of static arguments to use for shape propagation. Shape propagation
-            requires all inputs to the graph ("placeholder" nodes) to have metadata with an
-            appropriate FakeTensor argument (``node.meta["val"]``). ``args_static`` can be used to
-            infer static FakeTensor information if some placeholder nodes do not have metadata.
-            When ``meta["val"]`` is available, it will take precedence over ``args_static``.
-
-    Returns:
-        The canonicalized (cleaned-up) GraphModule.
-    """
-    ad_logger.debug(f"Before canonicalizing: {gm}")
-
     # clean up graph (needs to be done repeatedly until no more dead code)
     gm.graph.eliminate_dead_code(is_impure_node=_is_impure_node)
 
@@ -181,6 +190,32 @@ def canonicalize_graph(
 
     # lint the graph
     gm.graph.lint()
+
+
+def canonicalize_graph(
+    gm: GraphModule, shape_prop: bool = False, args_static: Optional[Tuple[Any, ...]] = None
+) -> GraphModule:
+    """Canonicalize the graph of the given GraphModule.
+
+    Args:
+        gm: The GraphModule to canonicalize.
+        shape_prop: Whether to run shape propagation. Shape propagation tends to be finicky and
+            slow, so we only run it optionally.
+        args_static: A tuple of static arguments to use for shape propagation. Shape propagation
+            requires all inputs to the graph ("placeholder" nodes) to have metadata with an
+            appropriate FakeTensor argument (``node.meta["val"]``). ``args_static`` can be used to
+            infer static FakeTensor information if some placeholder nodes do not have metadata.
+            When ``meta["val"]`` is available, it will take precedence over ``args_static``.
+
+    Returns:
+        The canonicalized (cleaned-up) GraphModule.
+    """
+    ad_logger.debug(f"Before canonicalizing: {gm}")
+
+    for _, subgm in reversed(list(named_graphmodules(gm))):
+        _canonicalize_single_gm(
+            subgm, shape_prop=shape_prop, args_static=args_static if subgm is gm else None
+        )
 
     ad_logger.debug(f"After canonicalizing: {gm}")
 

@@ -684,7 +684,6 @@ class PyExecutor:
     def _executor_loop_pp(self):
         torch.cuda.set_device(self.device_id)
         got_finish_signal = False
-        num_dummy_request = 0
         microbatch_id = 0
         with self._profiler() as profile_step:
             iter_start_time = time.time()
@@ -705,7 +704,7 @@ class PyExecutor:
                         self.new_active_requests_queue_latency_ms)
 
                 if not got_finish_signal:
-                    num_dummy_request = self._pad_attention_dp_dummy_request()
+                    self._pad_attention_dp_dummy_request()
 
                 scheduled_batch, _, _ = self._schedule()
 
@@ -759,9 +758,6 @@ class PyExecutor:
                         microbatch_id=microbatch_id,
                     )
 
-                    if num_dummy_request > 0:
-                        self._finish_dummy_request(
-                            sample_state.scheduled_requests)
                     self.micro_batches[microbatch_id] = batch_state
 
                 # Stage 2: Communicate new tokens for previous batch between ranks
@@ -844,7 +840,6 @@ class PyExecutor:
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         got_finish_signal = False
-        num_dummy_request = 0
         is_ngram = hasattr(
             self.model_engine, "spec_config"
         ) and self.model_engine.spec_config is not None and self.model_engine.spec_config.spec_dec_mode.is_ngram(
@@ -871,7 +866,7 @@ class PyExecutor:
                         self.new_active_requests_queue_latency_ms)
 
                 if not got_finish_signal:
-                    num_dummy_request = self._pad_attention_dp_dummy_request()
+                    self._pad_attention_dp_dummy_request()
 
                 if self.draft_model_engine is not None or is_ngram:
                     self._prepare_draft_requests()
@@ -938,9 +933,6 @@ class PyExecutor:
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                    if num_dummy_request > 0:
-                        self._finish_dummy_request(scheduled_batch)
-
                     if self.kv_cache_transceiver:
                         # For context only req in transmission, we reset the state since sampler might have changed it
                         for req in ctx_transmission_reqs:
@@ -994,7 +986,6 @@ class PyExecutor:
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         got_finish_signal = False
-        num_dummy_request = 0
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
@@ -1017,7 +1008,7 @@ class PyExecutor:
                         self.new_active_requests_queue_latency_ms)
 
                 if not got_finish_signal:
-                    num_dummy_request = self._pad_attention_dp_dummy_request()
+                    self._pad_attention_dp_dummy_request()
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
                 )
@@ -1086,9 +1077,6 @@ class PyExecutor:
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
-
-                    if num_dummy_request > 0:
-                        self._finish_dummy_request(scheduled_batch)
 
                     has_previous_batch = self.previous_batch is not None
                     if has_previous_batch:
@@ -1272,14 +1260,14 @@ class PyExecutor:
             new_requests = sorted(new_requests,
                                   key=lambda x: len(x.request.input_token_ids),
                                   reverse=True)
-            for request_item in new_requests:
+            for req_item in new_requests:
                 val = heapq.heappop(all_ranks_new_requests_heap)
                 val = val._replace(
                     num_tokens=val.num_tokens +
-                    len(request_item.request.input_token_ids),
+                    len(req_item.request.input_token_ids),
                     num_requests=val.num_requests - 1,
                 )
-                val.request_list.append(request_item)
+                val.request_list.append(req_item)
                 if val.num_requests > 0:
                     heapq.heappush(all_ranks_new_requests_heap, val)
                 elif val.rank == self.dist.tp_rank:
@@ -1323,19 +1311,6 @@ class PyExecutor:
             self.active_requests.append(req)
 
         return False
-
-    def _finish_dummy_request(self, scheduled_requests: ScheduledRequests):
-        for req in scheduled_requests.context_requests:
-            if req.is_attention_dp_dummy:
-                req.state = LlmRequestState.GENERATION_COMPLETE
-        for req in scheduled_requests.generation_requests:
-            if req.is_attention_dp_dummy:
-                req.state = LlmRequestState.GENERATION_COMPLETE
-        for req in self.active_requests[:]:
-            if req.is_attention_dp_dummy:
-                self.inflight_req_ids.erase(req.request_id)
-                self._terminate_request(req)
-                self.active_requests.remove(req)
 
     def _collect_py_objects_from_requests(
             self, requests: list[RequestQueueItem],
@@ -1510,10 +1485,10 @@ class PyExecutor:
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
-        Pad dummy requests to ensure each attention_dp rank has the same number of active requests
+        Pad with a dummy request, if required, to ensure every attention_dp rank has at least one active request.
         """
         if not self.enable_attention_dp:
-            return 0
+            return
 
         assert self.expected_num_active_requests >= len(self.active_requests)
         if self.kv_cache_transceiver is None:
@@ -1525,19 +1500,16 @@ class PyExecutor:
                 for req in self.active_requests
             ])
 
-        num_dummy_request = self.expected_num_active_requests - num_active_request
-        if num_dummy_request > 0:
-            llm_request_list = self.kv_cache_manager.add_dummy_requests(
-                request_ids=list(range(num_dummy_request)),
+        if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
+            llm_request = self.kv_cache_manager.add_dummy_requests(
+                request_ids=[0],
                 is_gen=not self.has_context_request,
                 prepare_resource=not self.has_context_request,
                 max_num_draft_tokens=0
                 if self.has_context_request else self.max_draft_tokens,
-            )
-            for llm_request in llm_request_list:
-                llm_request.is_attention_dp_dummy = True
-            self.active_requests += llm_request_list
-        return num_dummy_request
+            )[0]
+            llm_request.is_attention_dp_dummy = True
+            self.active_requests.append(llm_request)
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
@@ -1646,12 +1618,18 @@ class PyExecutor:
             return None
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
+        # handle potential attention dp dummy request
+        req = self.active_requests[-1]
+        if req.is_attention_dp_dummy:
+            req.state = LlmRequestState.GENERATION_COMPLETE
+            self.inflight_req_ids.erase(req.py_request_id)
+            self._terminate_request(req)
+            self.active_requests.remove(req)
+
         for request in scheduled_requests.context_requests:
             request.move_to_next_context_chunk()
             if request.get_context_remaining_length() == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
-            if request.is_attention_dp_dummy:
-                request.state = LlmRequestState.GENERATION_COMPLETE
 
     def _update_request_states_star_attention(
             self, scheduled_requests: ScheduledRequests):

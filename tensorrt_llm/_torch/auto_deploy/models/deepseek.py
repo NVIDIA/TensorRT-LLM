@@ -146,13 +146,28 @@ def deepseek_v3_moe(self, hidden_states):
     return final_hidden_states.to(hidden_states.dtype)
 
 
+def deepseek_v3_rope(self, x, seq_len=None):
+    """DeepSeekV3 Rotary Embedding forward function rewritten to enable torch export.
+    We return the full cached cos and sin values, instead of slicing them based on seq_len as this
+    would cause an issue during the generate phase (when seq_len=1 from input_ids). We also move the cos
+    sin buffers to appropriate device to enable export.
+    """
+
+    return (
+        self.cos_cached.to(dtype=x.dtype).to(device=x.device),
+        self.sin_cached.to(dtype=x.dtype).to(device=x.device),
+    )
+
+
 _from_config_original = AutoModelForCausalLM.from_config
 
 CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
     "DeepseekV3MoE": deepseek_v3_moe,
     "DeepseekV2MoE": deepseek_v3_moe,
-    "DeepseekV3Attention": deepseek_v3_attention,
-    "DeepseekV2Attention": deepseek_v3_attention,
+    "DeepseekV3RotaryEmbedding": deepseek_v3_rope,
+    "DeepseekV3YarnRotaryEmbedding": deepseek_v3_rope,
+    "DeepseekV2RotaryEmbedding": deepseek_v3_rope,
+    "DeepseekV2YarnRotaryEmbedding": deepseek_v3_rope,
 }
 
 
