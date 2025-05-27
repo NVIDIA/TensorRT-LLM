@@ -15,7 +15,6 @@ from tensorrt_llm.llmapi.llm_args import *
 def test_ModelLoader():
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
     args = TrtLlmArgs(model=llama_model_path, kv_cache_config=kv_cache_config)
-    args._setup()
 
     # Test with HF model
     temp_dir = tempfile.TemporaryDirectory()
@@ -28,7 +27,7 @@ def test_ModelLoader():
 
     # Test with engine
     args.model = build_engine()
-    args._setup()
+    args.model_post_init({})
     assert args.model_format is _ModelFormatKind.TLLM_ENGINE
     print(f'engine_dir: {args.model}')
     model_loader = ModelLoader(args)
@@ -41,7 +40,7 @@ def test_CachedModelLoader():
     args = LlmArgs(model=llama_model_path,
                    kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
     args.enable_build_cache = True
-    args._setup()
+    args.model_post_init({})
     stats = LlmBuildStats()
     model_loader = CachedModelLoader(args, llm_build_stats=stats)
     engine_dir, _ = model_loader()
