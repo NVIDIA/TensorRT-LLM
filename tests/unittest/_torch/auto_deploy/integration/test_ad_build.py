@@ -120,6 +120,31 @@ from utils.llm_data import llm_models_root
                 "compile_backend": "torch-simple",
             },
         ),
+        # Phi3-mini-4k with torch-opt backend + simple runtime
+        param_with_device_count(
+            2,
+            {
+                "model": _hf_model_dir_or_hub_id(
+                    f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct",
+                    "microsoft/Phi-3-mini-4k-instruct",
+                ),
+                "compile_backend": "torch-opt",
+                "attn_backend": "TritonWithFlattenedInputs",
+            },
+        ),
+        # Llama4 Scout Instruct
+        param_with_device_count(
+            4,
+            {
+                "model": _hf_model_dir_or_hub_id(
+                    f"{llm_models_root()}/Llama-4-Scout-17B-16E-Instruct",
+                    "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+                ),
+                "model_factory": "AutoModelForImageTextToText",
+                "compile_backend": "torch-simple",
+                "attn_backend": "FlashInfer",
+            },
+        ),
     ],
 )
 def test_build_ad(world_size: Optional[int], config: Dict):

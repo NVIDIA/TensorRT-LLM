@@ -1571,7 +1571,7 @@ CUBIN_EXPORT __global__
 #endif
     __syncthreads();
 
-#if ENABLE_FDL
+#if ENABLE_PDL
     preExit();
     acqBulk();
 #endif
@@ -2756,7 +2756,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
 #endif
     dim3 const dimCta{warp_size * ctaShapeInWarps.x, ctaShapeInWarps.y, ctaShapeInWarps.z};
-    auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_FDL != 0);
+    auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
 #if USE_PAGED_KV_CACHE
     uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
     KVCacheList<true> const cacheList{pool, kvCachePageList, seqLen, maxNbPagesPerSeq};

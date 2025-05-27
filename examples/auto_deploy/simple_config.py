@@ -21,7 +21,9 @@ class SimpleConfig:
     # If no `model` argument is provided, the checkpoint directory is used to infer the model
     # architecture.
     model: Optional[str] = None
-    model_factory: Literal["AutoModelForCausalLM"] = "AutoModelForCausalLM"
+    model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = (
+        "AutoModelForCausalLM"
+    )
     skip_loading_weights: bool = False  # only load the architecture, not the weights
     customize_tokenizer: bool = False  # True: tokenizer from the model factory, False: from LLM api
 
@@ -35,6 +37,9 @@ class SimpleConfig:
     # Note that that if the kwarg does not exist in the model config class, it will be ignored.
     # An example model config class can be found [here](https://github.com/huggingface/transformers/blob/c409cd81777fb27aadc043ed3d8339dbc020fb3b/src/transformers/models/llama/configuration_llama.py#L26).
     model_kwargs: Dict = field(default_factory=dict)
+
+    # TODO: temp fix for dashboard to modify the number of hidden layers
+    num_hidden_layers: int = -1
 
     ### TOKENIZER EXTRA KWARGS #####################################################################
     # Extra kwargs for the tokenizer class to customize the tokenizer. Same as model_kwargs.
@@ -76,7 +81,7 @@ class SimpleConfig:
     visualize: bool = False
 
     ### BENCHMARKING CONFIG ########################################################################
-    free_mem_ratio: float = 0.8  # specifies the fraction of available memory to occupy for cache
+    free_mem_ratio: float = 0.0  # specifies the fraction of available memory to occupy for cache
     benchmark: bool = False  # If true, set ISO to 2048 random int and OSL to 128
     benchmark_num: int = 10  # By default run 10 times and get average
     benchmark_isl: int = 2048  # input seq length for benchmarking
@@ -129,3 +134,6 @@ class SimpleConfig:
         # replicate prompts to get to batch_size
         prompts = self.prompt * (self.batch_size // len(self.prompt) + 1)
         self.prompt = prompts[: self.batch_size]
+
+        if self.num_hidden_layers != -1:
+            self.model_kwargs["num_hidden_layers"] = self.num_hidden_layers

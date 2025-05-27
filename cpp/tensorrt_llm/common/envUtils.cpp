@@ -406,4 +406,9 @@ uint16_t getEnvNixlPort()
     return nixlPort;
 }
 
+bool getEnvDisaggBenchmarkGenOnly()
+{
+    return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY");
+}
+
 } // namespace tensorrt_llm::common

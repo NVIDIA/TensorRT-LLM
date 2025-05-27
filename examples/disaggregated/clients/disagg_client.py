@@ -27,14 +27,15 @@ async def wait_for_server(session, server_host, server_port, timeout):
 
 
 async def send_request(session, server_host, server_port, model, prompt,
-                       max_tokens, temperature, streaming):
+                       max_tokens, temperature, streaming, ignore_eos):
     url = f"http://{server_host}:{server_port}/v1/completions"
     headers = {"Content-Type": "application/json"}
     data = {
         "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
-        "temperature": temperature
+        "temperature": temperature,
+        "ignore_eos": ignore_eos
     }
     if streaming:
         data["stream"] = True
@@ -153,6 +154,7 @@ async def main():
     parser.add_argument("--streaming",
                         action="store_true",
                         help="Enable streaming responses")
+    parser.add_argument("--ignore-eos", action="store_true", help="Ignore eos")
     args = parser.parse_args()
 
     with open(args.disagg_config_file, "r") as file:
@@ -174,8 +176,8 @@ async def main():
         if args.endpoint == "completions":
             tasks = [
                 send_request(session, server_host, server_port, model, prompt,
-                             args.max_tokens, args.temperature, args.streaming)
-                for prompt in prompts
+                             args.max_tokens, args.temperature, args.streaming,
+                             args.ignore_eos) for prompt in prompts
             ]
         elif args.endpoint == "chat":
             tasks = [

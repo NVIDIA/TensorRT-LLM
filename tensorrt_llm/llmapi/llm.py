@@ -294,6 +294,14 @@ class LLM:
         """
         sampling_params = self._prepare_sampling_params(sampling_params)
 
+        # With pytorch backend, py_executor has logic to handle max_tokens of 1,
+        # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
+        # TODO: Also support for trt backend
+        if (disaggregated_params is not None
+                and disaggregated_params.request_type == "context_only"
+                and not self._on_trt_backend):
+            sampling_params.max_tokens = 1
+
         max_batch_size = self.args.max_batch_size
         max_batch_size = max_batch_size or self.args.build_config.max_batch_size
 
@@ -328,8 +336,9 @@ class LLM:
             prompt = None
             query_token_ids = inputs.get("query_token_ids", None)
         elif "prompt" in inputs:
-            prompt_token_ids, extra_processed_inputs = self.input_processor(
-                inputs, sampling_params)
+            with nvtx_range_debug("input_processor"):
+                prompt_token_ids, extra_processed_inputs = self.input_processor(
+                    inputs, sampling_params)
             prompt = inputs['prompt']
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
