@@ -31,7 +31,6 @@ full:L40S/examples/test_commandr.py::test_llm_commandr_plus_4gpus_summary[disabl
 examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3-small-128k-instruct-fp8-bfloat16] SKIP (https://nvbugs/4955671)
 examples/test_whisper.py::test_llm_whisper_general[large-v3-enable_gemm_plugin-enable_attention_plugin-enable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/4967883)
 full:GH200/cpp/test_e2e.py::test_model[fp8-gptj-90] SKIP (https://nvbugspro.nvidia.com/bug/4979920)
-full:GH200/examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugspro.nvidia.com/bug/4979845)
 full:GH200/unittest/trt/model_api/test_model_quantization.py SKIP (https://nvbugspro.nvidia.com/bug/4979955)
 examples/test_gemma.py::test_llm_hf_gemma_quantization_1gpu[gemma-7b-int8_sq-bfloat16-8] SKIP (https://nvbugs/4988782)
 examples/test_llama.py::test_llm_llama_v3_8b_1048k_long_context_ppl[SlimPajama-6B-Llama-3-8B-Instruct-Gradient-1048k] SKIP (https://nvbugs/4993898)
@@ -370,7 +369,6 @@ full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[quant:in
 full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[quant:int8_sq_per_token_channel] SKIP (https://nvbugspro.nvidia.com/bug/5161074)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5174573)
 examples/test_qwen.py::test_llm_qwen_moe_single_gpu_summary[qwen1.5_moe_a2.7b_chat-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha] SKIP (https://nvbugs/5180961)
-examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5214245)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-disable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
@@ -386,12 +384,9 @@ examples/test_eagle.py::test_mistral_eagle_1gpu[mistral-7b-v0.1-eagle2] SKIP (ht
 examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:8-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5214239)
 examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1] SKIP (https://nvbugs/5214239)
 examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:8-cpp_e2e:True-nb:1] SKIP (https://nvbugs/5214239)
-examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:8-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5220761)
-examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:8-cpp_e2e:True-nb:1] SKIP (https://nvbugs/5220761)
 examples/test_cli_flow.py::TestSantacoder::test_auto_dtype SKIP (https://nvbugs/5219531)
 examples/test_medusa.py::test_llama_medusa_1gpu[llama-3.1-8b] SKIP (https://nvbugs/5219535)
 examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-4-mini-instruct-fp8-bfloat16] SKIP (https://nvbugspro.nvidia.com/bug/5226339)
-examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:True-nb:1] SKIP (https://nvbugs/5227342)
 perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20] SKIP # https://nvbugspro.nvidia.com/bug/5207477
 perf/test_perf.py::test_perf[flan_t5_base-bench-float16-input_output_len:128,20] SKIP
 perf/test_perf.py::test_perf[flan_t5_large-bench-float16-input_output_len:128,20] SKIP
