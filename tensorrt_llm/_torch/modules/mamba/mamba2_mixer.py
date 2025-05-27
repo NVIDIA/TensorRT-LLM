@@ -160,21 +160,17 @@ class Mamba2Mixer(nn.Module):
         ]
 
         # calculate split size
-        num_contexts = attn_metadata.num_contexts
-        num_generations = attn_metadata.seq_lens.shape[0] - num_contexts
-        sum_seq = torch.cumsum(attn_metadata.seq_lens, dim=0)
-        split_ctx = sum_seq[num_contexts - 1] if num_contexts > 0 else 0
-        split_gen = sum_seq[-1] - split_ctx
-        split_size = [split_ctx, split_gen]
+        num_prefills = attn_metadata.num_contexts
+        num_generations = attn_metadata.seq_lens.shape[0] - num_prefills
+        num_prefill_tokens = attn_metadata.num_ctx_tokens
+        num_decode_tokens = attn_metadata.num_tokens - num_prefill_tokens
+        split_size = [num_prefill_tokens, num_decode_tokens]
 
         # handle warm up request
         if not is_warmup:
             state_indices = attn_metadata.kv_cache_manager.get_state_indices()
             split_indices = torch.split(state_indices,
-                                        [num_contexts, num_generations])
-
-        split_seq_lens = torch.split(attn_metadata.seq_lens,
-                                     [num_contexts, num_generations])
+                                        [num_prefills, num_generations])
 
         # in_proj
         zxbcdt = self.in_proj(hidden_states)
@@ -188,10 +184,10 @@ class Mamba2Mixer(nn.Module):
         # req_type = 1 -> generation
         batch = None
         # both context and generation requests
-        if num_contexts > 0 and num_generations > 0:
+        if num_prefills > 0 and num_generations > 0:
             batch = [0, 1]
         # only context requests
-        elif num_contexts > 0:
+        elif num_prefills > 0:
             batch = [0]
         # only generation requests
         elif num_generations > 0:
@@ -222,18 +218,20 @@ class Mamba2Mixer(nn.Module):
 
                 cu_seqlens = (torch.cat(
                     [
-                        torch.zeros(1),
-                        torch.cumsum(split_seq_lens[req_type], dim=0)
+                        torch.zeros(1,
+                                    device=attn_metadata.seq_lens_cuda.device),
+                        torch.cumsum(attn_metadata.seq_lens_cuda[:num_prefills],
+                                     dim=0)
                     ],
                     dim=0,
                 ).to(torch.int32).to(torch.device("cuda")))
 
                 seq_idx = torch.repeat_interleave(
-                    torch.arange(len(split_seq_lens[req_type]),
+                    torch.arange(num_prefills,
                                  dtype=torch.int32,
                                  device=cu_seqlens.device),
-                    cu_seqlens.diff(),
-                    output_size=cu_seqlens[-1]).unsqueeze(0)
+                    attn_metadata.seq_lens_cuda[:num_prefills],
+                    output_size=num_prefill_tokens).unsqueeze(0)
 
                 xbc = causal_conv1d_fn(xbc.transpose(0, 1),
                                        self.conv1d.weight,
