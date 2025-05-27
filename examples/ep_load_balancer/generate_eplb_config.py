@@ -1,8 +1,9 @@
 import argparse
 import glob
+import json
 import os
-import pickle  # nosec B403
 
+import safetensors
 import torch
 import yaml
 
@@ -10,6 +11,7 @@ from tensorrt_llm.bindings.internal.runtime import (MoeLoadBalanceMetaInfo,
                                                     MoePlacementCpuInfo,
                                                     do_placement,
                                                     do_replication)
+from tensorrt_llm.logger import logger
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -17,8 +19,8 @@ if __name__ == "__main__":
                         type=str,
                         default=os.environ.get("EXPERT_STATISTIC_PATH",
                                                "expert_statistic"))
-    parser.add_argument("--iter_start", type=int, default=50)
-    parser.add_argument("--iter_stop", type=int, default=100)
+    parser.add_argument("--iter_start", type=int, default=None)
+    parser.add_argument("--iter_stop", type=int, default=None)
     parser.add_argument("--output_path",
                         type=str,
                         default="moe_load_balancer.yaml")
@@ -27,27 +29,39 @@ if __name__ == "__main__":
     parser.add_argument("--layer_updates_per_iter", type=int, default=0)
     args = parser.parse_args()
 
-    num_experts = None
-    num_experts_per_token = None
+    with open(f"{args.expert_statistic_path}/meta_info.json", "r") as f:
+        meta_info = json.load(f)
+    num_experts = meta_info["num_experts"]
+    num_experts_per_token = meta_info["num_experts_per_token"]
+
     statistic = {}
-    for statistic_file in glob.glob(f"{args.expert_statistic_path}/rank_*.pkl"):
-        with open(statistic_file, 'rb') as f:
-            meta_info = pickle.load(f)
-            rank_statistic = pickle.load(f)
-        if num_experts is None:
-            num_experts = meta_info["num_experts"]
-        if num_experts_per_token is None:
-            num_experts_per_token = meta_info["num_experts_per_token"]
+    for statistic_file in glob.glob(
+            f"{args.expert_statistic_path}/rank*.safetensors"):
+        rank_statistic = safetensors.torch.load_file(statistic_file)
         for key, data in rank_statistic.items():
             if key not in statistic:
-                statistic[key] = torch.zeros_like(rank_statistic[key])
-            statistic[key] += rank_statistic[key]
+                statistic[key] = torch.zeros_like(data)
+            statistic[key] += data
 
-    iters = sorted(list(set(iter_idx for iter_idx, _ in statistic.keys())))
-    layers = sorted(list(set(layer_idx for _, layer_idx in statistic.keys())))
+    def parse_key(key: str) -> tuple[int, int]:
+        iter_idx, layer_idx = key.split("_")
+        return int(iter_idx), int(layer_idx)
+
+    statistic = {parse_key(key): data for key, data in statistic.items()}
+
+    iters = sorted(list(set(iter_idx for iter_idx, _ in statistic)))
+    layers = sorted(list(set(layer_idx for _, layer_idx in statistic)))
     num_iters = len(iters)
     num_layers = len(layers)
     assert len(statistic) == num_iters * num_layers
+
+    if args.iter_start is None:
+        args.iter_start = iters[0]
+    if args.iter_stop is None:
+        args.iter_stop = iters[-1]
+    logger.info(f"Statistic iterations: {iters}")
+    logger.info(f"Used iteration range: {args.iter_start} - {args.iter_stop}")
+    logger.info(f"Statistic layers: {layers}")
 
     num_local_slots = args.num_slots // args.ep_size
     initial_global_assignments = {}
