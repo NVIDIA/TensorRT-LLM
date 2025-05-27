@@ -1756,7 +1756,7 @@ class FusedMoE(nn.Module):
                 x, self.fc31_input_scale, 16, scale_factor_use_ue8m0,
                 is_scale_factor_swizzled)
 
-            final_hidden_states = torch.ops.trtllm.fp4_block_scale_moe_runner(
+            outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
                 hidden_states_fp4,
@@ -1778,7 +1778,15 @@ class FusedMoE(nn.Module):
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
+                do_finalize=True,
             )
+            if len(outputs) == 1:
+                final_hidden_states = outputs[0]
+            else:
+                final_hidden_states = outputs[0]
+                # shape [token_num, top_k]
+                outputs[1]
+                outputs[2]
         else:
             raise NotImplementedError(
                 "The TRTLLM backend of FusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
