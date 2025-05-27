@@ -151,6 +151,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::arg("onboard_blocks") = true, py::arg("cross_kv_cache_fraction") = py::none(),
             py::arg("secondary_offload_min_priority") = py::none(), py::arg("event_buffer_max_size") = 0,
             py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true)
+        .def(py::init<tle::KvCacheConfig const&>(), py::arg("executor_kv_cache_config"))
         .def_readwrite("max_tokens", &tbk::KvCacheConfig::maxTokens)
         .def_readwrite("max_attention_window", &tbk::KvCacheConfig::maxAttentionWindowVec)
         .def_readwrite("sink_token_length", &tbk::KvCacheConfig::sinkTokenLength)
