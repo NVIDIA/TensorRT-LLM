@@ -1,5 +1,5 @@
 import os
-import pickle
+import pickle  # nosec B403
 
 import torch
 

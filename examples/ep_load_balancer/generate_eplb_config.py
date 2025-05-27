@@ -1,7 +1,7 @@
 import argparse
 import glob
 import os
-import pickle
+import pickle  # nosec B403
 
 import torch
 import yaml
