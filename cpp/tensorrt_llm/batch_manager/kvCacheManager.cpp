@@ -2026,20 +2026,37 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
     std::map<SizeType32, std::vector<SizeType32>> const& managedLayersPerWindowSize, SizeType32 extraCostMemory,
     float kvCacheManagerFraction, SizeType32 kvFactor)
 {
+    TLLM_CUDA_CHECK(::cudaDeviceSynchronize());
+    auto const [freeMem, totalMem] = tc::getDeviceMemoryInfo(config.useUvm);
+    std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow;
+    for (auto const& [windowSize, managedLayers] : managedLayersPerWindowSize)
+    {
+        auto const cacheSizePerToken = BaseKVCacheManager::calculateCacheSizePerToken(
+            modelConfig, worldConfig, managedLayers, isCrossAttention, kvFactor);
+        auto const cacheSizeBytesPerToken = cacheSizePerToken * BufferDataType(dtype).getSize();
+        cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
+    }
+    auto const extraCostMemoryBytes = extraCostMemory
+        * std::accumulate(cacheSizeBytesPerTokenPerWindow.cbegin(), cacheSizeBytesPerTokenPerWindow.cend(),
+            SizeType32{0}, [](SizeType32 acc, auto const cost) { return cost.second; });
+
+    auto const finalFreeMem = static_cast<double>(freeMem + bufferManager.memoryPoolFree() - extraCostMemoryBytes);
+
+    TLLM_LOG_INFO(
+        "Memory usage when calculating max tokens in paged kv cache: total: %0.2f GiB, available (excluding "
+        "extraCostMemory): %0.2f GiB",
+        totalMem / static_cast<double>(1 << 30), finalFreeMem / static_cast<double>(1 << 30));
+    TLLM_LOG_DEBUG(
+        "extraCostMemoryBytes [all windows] [Gib]: %0.2f", extraCostMemoryBytes / static_cast<double>(1 << 30));
+
     auto const freeMemFraction = config.freeGpuMemoryFraction.value_or(KvCacheConfig::kDefaultGpuMemFraction);
     TLLM_CHECK_WITH_INFO(freeMemFraction < 1.0F,
         "Invalid freeMemFraction, freeMemFraction (%f) must be smaller than 1.0f", freeMemFraction);
-    TLLM_CUDA_CHECK(::cudaDeviceSynchronize());
-    auto const [freeMem, totalMem] = tc::getDeviceMemoryInfo(config.useUvm);
     auto const tokensPerBlock = modelConfig.getTokensPerBlock();
     auto const calculatePrimaryBlocks
         = [&](SizeType32 windowSize, float windowSizeFraction, SizeType32 cacheSizeBytesPerToken)
     {
-        auto extraCostMemoryBytes = extraCostMemory * (cacheSizeBytesPerToken);
-        TLLM_LOG_INFO("extraCostMemory for windowSize %d: %0.2f GiB", windowSize,
-            extraCostMemoryBytes / static_cast<double>(1 << 30));
         const float fraction = freeMemFraction * kvCacheManagerFraction * windowSizeFraction;
-        const float finalFreeMem = static_cast<double>(freeMem - extraCostMemoryBytes + bufferManager.memoryPoolFree());
         auto maxTokens = static_cast<SizeType32>(finalFreeMem * fraction / static_cast<double>(cacheSizeBytesPerToken));
         if (config.maxTokens.has_value())
         {
@@ -2066,10 +2083,6 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
             windowSize, blocksInSecondaryPool, config.onboardBlocks ? "true" : "false");
         return blocksInSecondaryPool;
     };
-
-    TLLM_LOG_INFO("Memory usage when calculating max tokens in paged kv cache: total: %0.2f GiB, available: %0.2f GiB",
-        (totalMem / static_cast<double>(1 << 30)),
-        ((freeMem + bufferManager.memoryPoolFree()) / static_cast<double>(1 << 30)));
 
     auto const isHomogeneous
         = managedLayersPerWindowSize.size() == 1 && managedLayersPerWindowSize.cbegin()->second.size() == 1;
@@ -2108,14 +2121,6 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         return BlocksPerWindow{{windowSize, std::make_tuple(blocksInPrimaryPool, blocksInSecondaryPool)}};
     }
 
-    std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow;
-    for (auto const& [windowSize, managedLayers] : managedLayersPerWindowSize)
-    {
-        auto const cacheSizePerToken = BaseKVCacheManager::calculateCacheSizePerToken(
-            modelConfig, worldConfig, managedLayers, isCrossAttention, kvFactor);
-        auto const cacheSizeBytesPerToken = cacheSizePerToken * BufferDataType(dtype).getSize();
-        cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
-    }
     auto const windowSizeToShare
         = BlockManager::calculateWindowSizeToShare(managedLayersPerWindowSize, cacheSizeBytesPerTokenPerWindow);
 
