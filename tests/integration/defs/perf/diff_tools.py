@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from io import StringIO
 
 import numpy as np
@@ -53,10 +51,12 @@ def get_full_diff(base: pd.DataFrame, target: pd.DataFrame,
     thershold_diff = pd.merge(base,
                               target,
                               on=PERF_CASE_NAME,
-                              suffixes=['_base',
-                                        '_target'])[diff_over_threshold][[
-                                            PERF_METRIC_BASE, PERF_METRIC_TARGET
-                                        ]]
+                              how='outer',
+                              suffixes=['_base', '_target'])
+    if not thershold_diff.empty:
+        thershold_diff = thershold_diff[diff_over_threshold][[
+            PERF_METRIC_BASE, PERF_METRIC_TARGET
+        ]]
     missing_from_base = missing_from_base.rename(
         columns={PERF_METRIC: PERF_METRIC_TARGET})[[PERF_METRIC_TARGET]]
     missing_from_target = missing_from_target.rename(

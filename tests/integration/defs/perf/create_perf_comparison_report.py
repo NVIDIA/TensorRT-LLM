@@ -128,12 +128,13 @@ def parse_perf_data(
     return name_mapping, merged, suffixes
 
 
-def generate_perf_compare_report(perf_files: list[str], output_path: str):
+def generate_perf_compare_report(perf_files: list[str],
+                                 output_path: str) -> None:
     name_mapping, merged, suffixes = parse_perf_data(perf_files)
     generate_plots(Path(output_path), name_mapping, merged, suffixes)
 
 
-def parse_arguments():
+def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create a report comparing multiple performance csvs")
     parser.add_argument('--files',

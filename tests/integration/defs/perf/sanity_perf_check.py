@@ -30,9 +30,14 @@ class SanityPerfCheck():
     def report_diff(self, full_diff: pd.DataFrame) -> None:
         print("=" * 40)
         for diff in full_diff.itertuples():
-            print(
-                f"perf_case_name: {diff.Index}, base->target: {diff.perf_metric_base}->{diff.perf_metric_target}"
-            )
+            if pd.isna(diff.perf_metric_base):
+                print(f"perf_case_name: {diff.Index} is missing from base")
+            elif pd.isna(diff.perf_metric_target):
+                print(f"perf_case_name: {diff.Index} is missing from target")
+            else:
+                print(
+                    f"perf_case_name: {diff.Index}, base->target: {diff.perf_metric_base}->{diff.perf_metric_target}"
+                )
         print("=" * 40)
 
     def write_patch(self, old_lines: list[str], new_lines: list[str],
