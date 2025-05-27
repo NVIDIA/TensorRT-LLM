@@ -28,22 +28,25 @@ class ExpertStatistic:
             rank_id, start, stop)
 
     @staticmethod
-    def set_iter(iter_id: int):
+    def set_iter(iter_id: int) -> bool:
         if ExpertStatistic.expert_statistic_obj is not None:
             return ExpertStatistic.expert_statistic_obj._set_iter(iter_id)
+        else:
+            return False
 
     @staticmethod
-    def set_layer(layer_id: int):
+    def set_layer(layer_id: int) -> None:
         if ExpertStatistic.expert_statistic_obj is not None:
             ExpertStatistic.expert_statistic_obj._set_layer(layer_id)
 
     @staticmethod
-    def maybe_add_info(expert_count: int, token_selected_experts: torch.Tensor):
+    def maybe_add_info(expert_count: int,
+                       token_selected_experts: torch.Tensor) -> None:
         if ExpertStatistic.expert_statistic_obj is not None:
             ExpertStatistic.expert_statistic_obj._maybe_add_info(
                 expert_count, token_selected_experts)
 
-    def __init__(self, rank_id: int, start: int, stop: int):
+    def __init__(self, rank_id: int, start: int, stop: int) -> None:
         self.current_iter_id = None
         self.current_layer = None
         self.rank_id = rank_id
@@ -72,11 +75,11 @@ class ExpertStatistic:
                 pickle.dump(self._records, f)
         return self.should_record
 
-    def _set_layer(self, layer: int):
+    def _set_layer(self, layer: int) -> None:
         self.current_layer = layer
 
     def _maybe_add_info(self, expert_count: int,
-                        token_selected_experts: torch.Tensor):
+                        token_selected_experts: torch.Tensor) -> None:
         if not self.should_record:
             return
 
