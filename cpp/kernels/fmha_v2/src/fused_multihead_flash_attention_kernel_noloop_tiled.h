@@ -129,14 +129,19 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
 
     // The block info.
     Single_cta<Kernel_traits::VERSION> const binfo(params, bidb, bidh, 0, tidx);
-    int const q_sequence_start = q_loop * Gmem_tile_q::ROWS + binfo.actual_kv_seqlen - binfo.actual_q_seqlen;
+    // The local sequence offset of Q.
+    int q_sequence_start = Kernel_traits::IS_MTP ? (q_loop * Gmem_tile_q::ROWS) / params.num_grouped_heads
+                                                 : (q_loop * Gmem_tile_q::ROWS);
+    // Consider the past sequence length.
+    q_sequence_start += binfo.actual_kv_seqlen - binfo.actual_q_seqlen;
     if (binfo.stop_early(q_loop * Gmem_tile_q::ROWS))
     {
         return;
     }
 
     // Create the object to control the masks.
-    fmha::Mask<Traits_p, Cta_tile_p, Kernel_traits::MASK_VERSION> mask(params, binfo, tidx);
+    fmha::Mask_dispatcher<Traits_p, Cta_tile_p, Kernel_traits::MASK_VERSION, Kernel_traits::IS_MTP> mask(
+        params, binfo, tidx);
 
     // Allocate the global memory tile loader for Q.
     Gmem_tile_q gmem_q(params, 0, binfo, tidx, q_loop * Gmem_tile_q::ROWS);
@@ -252,7 +257,7 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     };
 
     // Load the mask for that iteration.
-    mask.load(Kernel_traits::CUSTOM_MASK ? q_loop * Gmem_tile_q::ROWS : q_sequence_start);
+    mask.load(Kernel_traits::CUSTOM_MASK || Kernel_traits::IS_MTP ? q_loop * Gmem_tile_q::ROWS : q_sequence_start);
 
     // Declare the accumulators for the 2nd gemm.
     fmha::Fragment_accumulator<Traits_o> acc_o[Mma_tile_o::MMAS_M][Mma_tile_o::VALID_MMAS_N];

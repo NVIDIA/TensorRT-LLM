@@ -152,9 +152,15 @@ def skip_forward(
     if hasattr(module, 'skip_forward'):
         module.forward = module.skip_forward
         remove_weights(module, ignore_modules)
+    else:
+        logger.warning(
+            f"Fail to skip forward since {module.__class__.__name__} "
+            f"does not have `skip_forward`.")
 
 
 def forward_after_recv(forward_fn):
+    if hasattr(forward_fn, "__wrapped_by_forward_after_recv__"):
+        return forward_fn
 
     def forward_after_recv_fn(
         position_ids,
@@ -176,10 +182,13 @@ def forward_after_recv(forward_fn):
             **kwargs,
         )
 
+    forward_after_recv_fn.__wrapped_by_forward_after_recv__ = True
     return forward_after_recv_fn
 
 
 def forward_before_send(forward_fn):
+    if hasattr(forward_fn, "__wrapped_by_forward_before_send__"):
+        return forward_fn
 
     def forward_before_send_fn(
         position_ids,
@@ -204,6 +213,7 @@ def forward_before_send(forward_fn):
             pp_send(hidden_states)
         return output
 
+    forward_before_send_fn.__wrapped_by_forward_before_send__ = True
     return forward_before_send_fn
 
 
@@ -410,6 +420,8 @@ class DecoderModelForCausalLM(nn.Module,
         if not mapping.is_last_pp_rank():
             for module in self.epilogue:
                 skip_forward(module)
+
+        self.model.__pp_init__()
 
     def __post_init__(self):
         # 1. mixed precision

@@ -421,7 +421,7 @@ class AutoTuner:
                 self.stats.cache_miss_config_collection[custom_op].add(
                     input_shapes)
 
-                logger.info(
+                logger.debug(
                     f"[AutoTunner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
                 )
                 assert runner == runners[0] \

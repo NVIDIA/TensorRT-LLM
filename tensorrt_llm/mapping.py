@@ -14,6 +14,8 @@
 # limitations under the License.
 from typing import List
 
+import torch
+
 
 class Mapping(object):
     '''
@@ -241,8 +243,10 @@ class Mapping(object):
         for i in range(pp_size):
             for j in range(moe_tp_size):
                 ranks = range(
-                    i * moe_tp_cluster_ep_size + j * moe_cluster_size,
-                    i * moe_tp_cluster_ep_size + (j + 1) * moe_cluster_size)
+                    i * moe_tp_cluster_ep_size +
+                    j * moe_cluster_size * moe_ep_size,
+                    i * moe_tp_cluster_ep_size +
+                    (j + 1) * moe_cluster_size * moe_ep_size)
                 self.moe_cluster_groups.append(list(ranks))
 
         # init moe ep group
@@ -351,16 +355,14 @@ class Mapping(object):
 
     @property
     def moe_cluster_group(self):
-        return self.moe_cluster_groups[self.pp_rank * self.moe_tp_size *
-                                       self.moe_ep_size +
-                                       self.moe_tp_rank * self.moe_ep_size +
-                                       self.moe_ep_rank]
+        return self.moe_cluster_groups[self.pp_rank * self.moe_tp_size +
+                                       self.moe_tp_rank]
 
     @property
     def moe_ep_group(self):
-        return self.moe_ep_groups[self.pp_rank * self.moe_cluster_size *
-                                  self.moe_tp_size +
-                                  self.tp_rank * self.moe_cluster_size +
+        return self.moe_ep_groups[self.pp_rank * self.moe_tp_size *
+                                  self.moe_cluster_size +
+                                  self.moe_tp_rank * self.moe_cluster_size +
                                   self.moe_cluster_rank]
 
     @property
@@ -420,12 +422,9 @@ class Mapping(object):
         return self.moe_ep_size > 1
 
     def pp_layers(self, num_layers: int) -> List[int]:
-        base_layers = num_layers // self.pp_size
-        extra_layers = num_layers % self.pp_size
-        start_idx = self.pp_rank * base_layers + min(self.pp_rank, extra_layers)
-        layers_in_stage = base_layers + (1
-                                         if self.pp_rank < extra_layers else 0)
-        return list(range(start_idx, start_idx + layers_in_stage))
+        # If num_layers % pp_size = n != 0, first n ranks get one extra layer
+        return torch.tensor_split(torch.arange(num_layers),
+                                  self.pp_size)[self.pp_rank].tolist()
 
     def ep_experts(self, num_experts: int) -> List[int]:
         assert self.cp_size == 1

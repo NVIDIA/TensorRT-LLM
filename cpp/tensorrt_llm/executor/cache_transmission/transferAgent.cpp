@@ -29,19 +29,18 @@ namespace tensorrt_llm::executor::kv_cache
     return instance;
 }
 
-[[nodiscard]] void* DynLibLoader::getHandle(char const* name)
+[[nodiscard]] void* DynLibLoader::getHandle(std::string const& name)
 {
-    const std::string nameStr{name};
     std::lock_guard<std::mutex> lock(mDllMutex);
-    auto it = mHandlers.find(nameStr);
+    auto it = mHandlers.find(name);
     if (it != mHandlers.end())
     {
         return it->second;
     }
-    TLLM_LOG_INFO("dlopen: " + nameStr);
-    void* handler = dlopen(name, RTLD_LAZY);
-    TLLM_CHECK_WITH_INFO(handler, "%s can not be loaded correctly: %s", name, dlerror());
-    mHandlers[nameStr] = handler;
+    TLLM_LOG_INFO("dlopen: " + name);
+    void* handler = dlopen(name.c_str(), RTLD_LAZY);
+    TLLM_CHECK_WITH_INFO(handler, "%s can not be loaded correctly: %s", name.c_str(), dlerror());
+    mHandlers[name] = handler;
     return handler;
 }
 

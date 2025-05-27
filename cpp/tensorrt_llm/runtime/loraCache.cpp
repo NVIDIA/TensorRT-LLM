@@ -454,7 +454,8 @@ SizeType32 LoraCache::determineNumPages(TaskIdType taskId) const
 SizeType32 LoraCache::determineNumPages(TensorPtr loraConfig) const
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
-    auto const localNumLayers = mModelConfig.getNbAttentionLayers(mWorldConfig.getPipelineParallelism());
+    auto const localNumLayers = mModelConfig.getNbAttentionLayers(
+        mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
     auto const firstLayerId = mWorldConfig.getPipelineParallelRank() * localNumLayers;
     auto const lastLayerId = firstLayerId + localNumLayers;
 
@@ -579,7 +580,7 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
     auto const ppSize = worldConfig.getPipelineParallelism();
     auto const ppRank = worldConfig.getPipelineParallelRank();
     // TODO(oargov): why *attention* layers?
-    auto const localNumLayers = modelConfig.getNbAttentionLayers(ppSize);
+    auto const localNumLayers = modelConfig.getNbAttentionLayers(ppSize, ppRank);
     auto const firstLayerId = ppRank * localNumLayers;
     auto const lastLayerId = firstLayerId + localNumLayers;
 

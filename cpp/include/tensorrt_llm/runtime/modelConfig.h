@@ -167,23 +167,36 @@ public:
         LayerType layerType, SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
         TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
-        auto const numLocalLayers = mNbLayers / pipelineParallelism; // WARNING: assume no remainder
-        auto const firstLocalLayerIt = mLayerTypes.cbegin() + (numLocalLayers * pipelineParallelismRank);
+        auto const firstLocalLayer = getFirstLocalLayer(pipelineParallelism, pipelineParallelismRank);
+        auto const numLocalLayers = getNbLayers(pipelineParallelism, pipelineParallelismRank);
+        auto const firstLocalLayerIt = mLayerTypes.cbegin() + firstLocalLayer;
         return std::count(firstLocalLayerIt, firstLocalLayerIt + numLocalLayers, layerType);
+    }
+
+    [[nodiscard]] SizeType32 getFirstLocalLayer(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
+    {
+        auto const numBaseLayers = mNbLayers / pipelineParallelism;
+        auto const numExtraLayers = mNbLayers % pipelineParallelism;
+        // If num_layers % pp_size = n != 0, first n ranks get one extra layer
+        return pipelineParallelismRank * numBaseLayers + std::min(pipelineParallelismRank, numExtraLayers);
     }
 
     [[nodiscard]] SizeType32 countLowerRankLayers(
         LayerType layerType, SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
-        auto const numLocalLayers = mNbLayers / pipelineParallelism; // WARNING: assume no remainder
-        auto const firstLocalLayer = numLocalLayers * pipelineParallelismRank;
+        auto const firstLocalLayer = getFirstLocalLayer(pipelineParallelism, pipelineParallelismRank);
         // count number of previous non-local attention layers
         return std::count(mLayerTypes.cbegin(), mLayerTypes.cbegin() + firstLocalLayer, layerType);
     }
 
-    [[nodiscard]] SizeType32 getNbLayers(SizeType32 pipelineParallelism = 1) const
+    [[nodiscard]] SizeType32 getNbLayers(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
-        return mNbLayers / pipelineParallelism; // WARNING: assume no remainder
+        auto const numBaseLayers = mNbLayers / pipelineParallelism;
+        auto const numExtraLayers = mNbLayers % pipelineParallelism;
+        // If num_layers % pp_size = n != 0, first n ranks get one extra layer
+        return numBaseLayers + (pipelineParallelismRank < numExtraLayers ? 1 : 0);
     }
 
     [[nodiscard]] SizeType32 getNbAttentionLayers(

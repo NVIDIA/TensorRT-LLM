@@ -50,7 +50,7 @@ Output Sequence Length (OSL): 2k tokens
 ### Model Architecture
 The base DeepSeek-R1 main model contains: 3x dense layers (initial) and 58x MoE layers, there is also 1x Multi-Tokens Prediction (MTP) layer (MoE-architecture equivalent) for speculative decoding.  Our optimized configuration extends the MTP layer to 3x layers using autoregressive styling for peak performance exploration.
 
-<img src="../media/tech_blog1_model_overview.png?raw=true" alt="tech_blog1_model_overview" width="500" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog1_model_overview.png?raw=true" alt="tech_blog1_model_overview" width="500" height="auto">
 
 ### Precision Strategy
 We have explored a mixed precision recipe, which provides a better tradeoff between accuracy and performance.
@@ -84,7 +84,7 @@ We have also explored and introduced mixed parallel strategy on 8xB200 GPUs. Spe
 ### Everything in One Diagram
 Now let's put everything into one diagram, which represents a MoE layer from a decoding iteration.
 
-<img src="../media/tech_blog1_model_details.png?raw=true" alt="tech_blog1_model_details" width="1600" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog1_model_details.png?raw=true" alt="tech_blog1_model_details" width="1600" height="auto">
 
 
 The modules in the diagram are:
@@ -195,7 +195,7 @@ We have introduced multi-streams based optimizations to hide some kernels' overh
 
 #### Sparse Experts as GEMMs (only works when moe_backend=CUTLASS)
 
-<img src="../media/tech_blog1_sparse_exp_as_a_gemm.png?raw=true" alt="tech_blog1_sparse_exp_as_a_gemm" width="800" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog1_sparse_exp_as_a_gemm.png?raw=true" alt="tech_blog1_sparse_exp_as_a_gemm" width="800" height="auto">
 
 The existing CUTLASS-based Sparse Experts flow (illustrated in the figure) dispatches input tokens to their designated experts, then applies indexed local reduction on each expert's outputs before a global allreduce. Both dispatching and indexed local reduction incur high overhead in low-latency scenarios. To address this, we propose treating "Sparse Experts as GEMMs" by sending all tokens to each activated expert and masking out unneeded outputs before local reduction. Because grouped GEMMs are memory-bound, the extra computations from redundant tokens have minimal impact, effectively eliminating the costly dispatch and reduction overhead.
 
@@ -229,12 +229,12 @@ We focus on optimizing two kinds of dense GEMMs: Fuse_A_GEMM and RouterGEMM, bec
 ##### Fuse_A_GEMM
 We developed a custom Fuse_A_GEMM that prefetches the majority of its weights into shared memory (enabled by PDL and overlapped with oneshot-AllReduce), significantly enhancing performance. The kernel shows substantial improvements over default GEMM implementation when num_tokens < 16.
 
-<img src="../media/tech_blog1_fuse_a_gemm.png?raw=true" alt="tech_blog1_fuse_a_gemm" width="500" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog1_fuse_a_gemm.png?raw=true" alt="tech_blog1_fuse_a_gemm" width="500" height="auto">
 
 ##### RouterGEMM
 By leveraging our internal AI code generator, we automatically generate an optimized RouterGEMM kernel, which delivers substantial improvements over the default GEMM implementation when num_tokens <=30.
 
-<img src="../media/tech_blog1_router_gemm.png?raw=true" alt="tech_blog1_router_gemm" width="500" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog1_router_gemm.png?raw=true" alt="tech_blog1_router_gemm" width="500" height="auto">
 
 #### Kernel fusion
 Kernel fusion is necessary for min-latency scenario to reduce extra global memory write/read cost, and we support following fusion patterns now

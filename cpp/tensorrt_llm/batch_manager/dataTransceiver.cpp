@@ -432,44 +432,42 @@ private:
 
         tensorrt_llm::common::setThreadName("dataTransRequest");
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-        try
-        {
-            while (!resource.mTerminate)
-            {
-                RequestAndPromise requestAndPromise;
-                {
-                    std::unique_lock lck(resource.mMtxForQueue);
 
-                    resource.mCVforQueue.wait(
-                        lck, [&resource] { return !resource.mRequestsQueue.empty() || resource.mTerminate; });
-                    if (resource.mTerminate)
+        while (!resource.mTerminate)
+        {
+            RequestAndPromise requestAndPromise;
+            {
+                std::unique_lock lck(resource.mMtxForQueue);
+
+                resource.mCVforQueue.wait(
+                    lck, [&resource] { return !resource.mRequestsQueue.empty() || resource.mTerminate; });
+                if (resource.mTerminate)
+                {
+                    if (!resource.mRequestsQueue.empty())
                     {
-                        if (!resource.mRequestsQueue.empty())
-                        {
-                            TLLM_LOG_WARNING(
-                                "There are still %zu requests in the mRequestsQueue, but encountered terminate.",
-                                resource.mRequestsQueue.size());
-                        }
-                        break;
+                        TLLM_LOG_WARNING(
+                            "There are still %zu requests in the mRequestsQueue, but encountered terminate.",
+                            resource.mRequestsQueue.size());
                     }
-                    requestAndPromise = std::move(resource.mRequestsQueue.front());
-                    resource.mRequestsQueue.pop_front();
+                    break;
                 }
+                requestAndPromise = std::move(resource.mRequestsQueue.front());
+                resource.mRequestsQueue.pop_front();
+            }
+            {
+                try
                 {
                     TLLM_CHECK_WITH_INFO(requestAndPromise.mRequest != nullptr, "requestAndPromise.mRequest is null");
                     requestSync(*requestAndPromise.mRequest);
                     requestAndPromise.mPromise->set_value();
                 }
-            }
-        }
-        catch (std::exception const& err)
-
-        {
-            TLLM_LOG_ERROR("Exception in DataRequester request(): %s", err.what());
-
-            for (auto& requsetAndPromise : resource.mRequestsQueue)
-            {
-                requsetAndPromise.mPromise->set_exception(std::current_exception());
+                catch (std::exception const& err)
+                {
+                    TLLM_LOG_ERROR("Exception in DataRequester request(): request id:%ld , request context id:%ld : %s",
+                        requestAndPromise.mRequest->mRequestId,
+                        requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
+                    requestAndPromise.mPromise->set_exception(std::current_exception());
+                }
             }
         }
     }

@@ -3685,3 +3685,17 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
 
             print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
             venv_check_call(llm_backend_venv, run_cmd)
+
+            run_cmd = [
+                f"{llm_backend_inflight_batcher_llm_root}/benchmark_core_model.py",
+                f"--max-input-len=300",
+                f"--tensorrt-llm-model-name={E2E_MODEL_NAME}",
+                f"--protocol={protocol}",
+                f"--test-llmapi",
+                'dataset',
+                f"--dataset={os.path.join(llm_backend_dataset_root, 'mini_cnn_eval.json')}",
+                f"--tokenizer-dir=TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            ]
+
+            print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
+            venv_check_call(llm_backend_venv, run_cmd)

@@ -29,8 +29,7 @@ namespace tensorrt_llm::executor::kv_cache
 
 extern "C"
 {
-    [[nodiscard]] std::unique_ptr<BaseTransferAgent> createNixlTransferAgent(
-        BaseAgentConfig const* config, AgentRegistrar* registrar);
+    [[nodiscard]] std::unique_ptr<BaseTransferAgent> createNixlTransferAgent(BaseAgentConfig const* config);
 }
 
 #if defined(__clang__)

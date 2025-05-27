@@ -97,16 +97,16 @@ struct DMA
         USE_CUSTOM_MASK = Kernel_traits::USE_CUSTOM_MASK
     };
 
-    // Whether do we skip those masked tiles when causal mask is enabled ?
+    // Whether we skip those masked tiles when causal mask is enabled ?
     enum
     {
         SKIP_CAUSAL_MASK_TILES = CAUSAL_MASK && !USE_CUSTOM_MASK
     };
 
-    // Whether we will ignore the long distance tokens in the beginning.
+    // Whether we attend to the specific sliding window or chunk ?
     enum
     {
-        SLIDING_WINDOW_ATTENTION = Kernel_traits::SLIDING_WINDOW_ATTENTION
+        SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION
     };
 
     // Is heads interleaved ?
@@ -161,7 +161,7 @@ struct DMA
 
     static_assert(STEP_KV % K_ == 0);
     using Transposer = Transposer<typename Kernel_traits::Traits_o, typename Kernel_traits::Cta_tile_o, K_,
-        (STEP_KV > 128 || SLIDING_WINDOW_ATTENTION) ? 1 : 2 /* UNROLL */>;
+        (STEP_KV > 128 || SLIDING_OR_CHUNKED_ATTENTION) ? 1 : 2 /* UNROLL */>;
 
     struct Device
     {
@@ -179,6 +179,39 @@ struct DMA
         inline __device__ Device(uint32_t elect_one)
             : elect_one_(elect_one)
         {
+        }
+
+        ////////////////////////////////////////////////////////////////////////////////////////////
+
+        // Compute the kv tile idx start (inclusive) and end (exclusive).
+        static inline __device__ std::pair<int, int> compute_kv_tile_idx(
+            bert::Fused_multihead_attention_params_v2 const& params, int q_step_offset, int q_step_end, int kv_steps)
+        {
+
+            // The default kv_idx_start and kv_idx_end (exclusive).
+            int kv_idx_start = 0;
+            int kv_idx_end = kv_steps;
+
+            // Is the chunked_attention used ?
+            bool is_chunked_attention = params.log2_chunked_attention_size > 0;
+
+            // Skip initial kv tiles due to sliding_window_size
+            if (SLIDING_OR_CHUNKED_ATTENTION)
+            {
+                // The kv_offset_start.
+                int kv_offset_start = is_chunked_attention
+                    ? ((q_step_offset >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size)
+                    : max(0, q_step_offset - params.sliding_window_size);
+                kv_idx_start = kv_offset_start / STEP_KV;
+            }
+
+            // Early stop when causal mask is enabled.
+            if (SKIP_CAUSAL_MASK_TILES)
+            {
+                kv_idx_end = (q_step_end + STEP_KV - 1) / STEP_KV;
+            }
+
+            return std::make_pair(kv_idx_start, kv_idx_end);
         }
 
         ////////////////////////////////////////////////////////////////////////////////////////////
@@ -226,7 +259,7 @@ struct DMA
                 else
                 {
                     // Balanced dynamic scheduling
-                    if (CAUSAL_MASK && !SLIDING_WINDOW_ATTENTION && params.use_balanced_scheduling)
+                    if (CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling)
                     {
                         q_step_offset
                             = (params.num_tiles_per_head - 1 - tile_id_ / (params.b * params.h)) * NUM_COMPUTE_GROUPS;
@@ -299,17 +332,14 @@ struct DMA
                     load_q(bidh, q_step_idx + 0 + q_step_offset, desc_q, shared->smem_q[0], cbw0);
                     load_q(bidh, q_step_idx + 1 + q_step_offset, desc_q, shared->smem_q[1], cbw1);
 
-                    // Skip initial kv tiles due to sliding_window_size
-                    int const kv_idx_start = SLIDING_WINDOW_ATTENTION
-                        ? (max(0, (q_step_idx + q_step_offset) * STEP_Q - params.sliding_window_size) / STEP_KV)
-                        : 0;
-
                     // Q step bound is 2 tiles away at this moment because of 2x1 math warpgroup
-                    int const q_step_bound = (q_step_idx + q_step_offset + 2) * STEP_Q - 1;
+                    int const q_step_end = (q_step_idx + q_step_offset + 2) * STEP_Q - 1;
 
-                    // Early stop when causal mask is enabled.
-                    int const kv_idx_end = SKIP_CAUSAL_MASK_TILES ? ((q_step_bound + STEP_KV - 1) / STEP_KV) : kv_steps;
+                    // The kv tile idx range for this q step.
+                    auto const [kv_idx_start, kv_idx_end]
+                        = compute_kv_tile_idx(params, (q_step_idx + q_step_offset) * STEP_Q, q_step_end, kv_steps);
 
+                    // Iterate over the kv tiles for this q step.
                     for (int kv_step_idx = kv_idx_start; kv_step_idx < kv_idx_end; kv_step_idx++)
                     {
                         int bar_id = load_kv(bidh, params.h, params.h_kv, kv_step_idx, desc_kv, shared, cbw_k, cbw_v,
@@ -372,7 +402,7 @@ struct DMA
             // This will be removed later as the remapping will be handled by the kvCacheManger in TRTLLM.
 #ifdef GENERATE_CUBIN
             // Sliding window attention + chunked context needs special handling.
-            if constexpr (SLIDING_WINDOW_ATTENTION)
+            if constexpr (SLIDING_OR_CHUNKED_ATTENTION)
             {
                 // For chunked context (i.e. separate q and kv layout), the kv cache might be
                 // overwritten after last chunk is processed.
@@ -523,17 +553,14 @@ struct DMA
                     load_separate_q(
                         bidh, (q_step_idx + 1) * STEP_Q + local_q_tile_offset, desc_q, shared->smem_q[1], cbw1);
 
-                    // Skip initial kv tiles due to sliding_window_size
-                    int const kv_idx_start = SLIDING_WINDOW_ATTENTION
-                        ? (max(0, q_step_idx * STEP_Q + q_tile_offset - params.sliding_window_size) / STEP_KV)
-                        : 0;
+                    // Q step end is 2 tiles away at this moment because of 2x1 math warpgroup
+                    int const q_step_end = (q_step_idx + 2) * STEP_Q - 1 + q_tile_offset;
 
-                    // Q step bound is 2 tiles away at this moment because of 2x1 math warpgroup
-                    int const q_step_bound = (q_step_idx + 2) * STEP_Q - 1 + q_tile_offset;
+                    // The kv tile idx range for this q step.
+                    auto const [kv_idx_start, kv_idx_end]
+                        = compute_kv_tile_idx(params, q_step_idx * STEP_Q + q_tile_offset, q_step_end, kv_steps);
 
-                    // Early stop when causal mask is enabled.
-                    int const kv_idx_end = SKIP_CAUSAL_MASK_TILES ? ((q_step_bound + STEP_KV - 1) / STEP_KV) : kv_steps;
-
+                    // Iterate over the kv tiles for this q step.
                     for (int kv_step_idx = kv_idx_start; kv_step_idx < kv_idx_end; kv_step_idx++)
                     {
                         // Remap the kv tile idx if sliding window attention is enabled.

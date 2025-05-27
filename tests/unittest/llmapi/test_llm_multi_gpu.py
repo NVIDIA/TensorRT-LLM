@@ -315,8 +315,8 @@ def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
 
 
 @skip_single_gpu
-def test_llm_multi_node_pytorch():
-    nworkers = 2
+@pytest.mark.parametrize("nworkers", [1, 2])
+def test_llm_multi_node_pytorch(nworkers: int):
     test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
     os.path.join(os.path.dirname(__file__), "launch.py")
     command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-llmapi-launch python3 {test_case_file} --model_dir {llama_model_path} --tp_size {nworkers} --use_pytorch"
@@ -327,6 +327,7 @@ def test_llm_multi_node_pytorch():
 
 @skip_single_gpu
 def test_llm_multi_node_with_postproc():
+    pytest.skip(reason="https://nvbugs/5302891")
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__),
                                   "run_llm_with_postproc.py")

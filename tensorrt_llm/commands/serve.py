@@ -41,12 +41,10 @@ def get_llm_args(model: str,
         gpus_per_node = device_count()
         if gpus_per_node == 0:
             raise ValueError("No GPU devices found on the node")
-
     build_config = BuildConfig(max_batch_size=max_batch_size,
                                max_num_tokens=max_num_tokens,
                                max_beam_width=max_beam_width,
                                max_seq_len=max_seq_len)
-
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=free_gpu_memory_fraction)
 
@@ -70,6 +68,10 @@ def get_llm_args(model: str,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
         "build_config": build_config,
+        "max_batch_size": max_batch_size,
+        "max_num_tokens": max_num_tokens,
+        "max_beam_width": max_beam_width,
+        "max_seq_len": max_seq_len,
         "kv_cache_config": kv_cache_config,
         "backend": backend if backend == "pytorch" else None,
         "pytorch_backend_config": pytorch_backend_config,
@@ -263,12 +265,14 @@ def disaggregated(config_file: Optional[str], server_start_timeout: int,
     ctx_server_urls, gen_server_urls = get_ctx_gen_server_urls(
         disagg_cfg.server_configs)
 
-    server = OpenAIDisaggServer(ctx_servers=ctx_server_urls,
-                                gen_servers=gen_server_urls,
-                                req_timeout_secs=request_timeout,
-                                server_start_timeout_secs=server_start_timeout,
-                                ctx_router_config=disagg_cfg.ctx_router_config,
-                                gen_router_config=disagg_cfg.gen_router_config)
+    server = OpenAIDisaggServer(
+        ctx_servers=ctx_server_urls,
+        gen_servers=gen_server_urls,
+        req_timeout_secs=request_timeout,
+        server_start_timeout_secs=server_start_timeout,
+        ctx_router_config=disagg_cfg.ctx_router_config,
+        gen_router_config=disagg_cfg.gen_router_config,
+        conditional_disagg_config=disagg_cfg.conditional_disagg_config)
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 

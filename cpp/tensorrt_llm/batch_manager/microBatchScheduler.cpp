@@ -16,9 +16,8 @@
  */
 
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
+#include "tensorrt_llm/batch_manager/utils/inflightBatchingUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
-
-namespace tle = tensorrt_llm::executor;
 
 namespace tensorrt_llm::batch_manager
 {
@@ -309,6 +308,8 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
                 "context request scheduled: ID %lu, chunk size %d", llmReq->mRequestId, llmReq->getContextChunkSize());
         }
     }
+
+    utils::sortRequests(contextRequests, generationRequests, !allContextRequestsFit);
 
     TLLM_LOG_DEBUG(
         "batchSize (num ctx/enc requests + num gen requests): %u", contextRequests.size() + generationRequests.size());

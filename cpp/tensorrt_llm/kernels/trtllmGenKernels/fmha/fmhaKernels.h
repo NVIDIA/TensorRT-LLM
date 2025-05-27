@@ -311,8 +311,25 @@ private:
         // Consider the multiCtasKvMode for better GPU utilization.
         if (isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode))
         {
+            // The maximum attention window (the maximum number of tokensKv that will be attended to).
+            int maxAttentionWindow{params.mMaxSeqLenKv};
+            // Some of the tilesKv will be skipped if the sliding window attention or chunked attention is used.
+            if (isSlidingOrChunkedCausalMask(params.mMaskType))
+            {
+                if (params.mMaxSeqLenKv > params.mAttentionWindowSize)
+                {
+                    // Consider that the first tileKv might contain tokensKv that is out of the attention window.
+                    maxAttentionWindow
+                        = std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mStepKv - 1);
+                }
+                else
+                {
+                    maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mChunkedAttentionSize);
+                }
+            }
+
             // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
-            int const maxNumCtasPerSeqKv = (params.mMaxSeqLenKv + kernelMeta.mStepKv - 1) / kernelMeta.mStepKv;
+            int const maxNumCtasPerSeqKv = (maxAttentionWindow + kernelMeta.mStepKv - 1) / kernelMeta.mStepKv;
             // Compute numCtasPerSeqKv.
             numCtasPerSeqKv = std::min(maxNumCtasPerSeqKv,
                 std::max(1, int32_t(params.mMultiProcessorCount / (numCtasPerSeqQ * numCtasY * numCtasZ))));
@@ -465,10 +482,17 @@ private:
 
         // The mask type.
         TrtllmGenAttentionMaskType maskType = params.mMaskType;
-        // Enable sliding window causal if the max kv sequence length exceeds attention window size.
-        if (params.mAttentionWindowSize < params.mMaxSeqLenKv && maskType == TrtllmGenAttentionMaskType::Causal)
+        // Enable sliding window or chunked causal if the max kv sequence length exceeds attention window size or
+        // chunked attention size.
+        // This is supported by causal-mask context kernels and generation-phase kernels.
+        if ((maskType == TrtllmGenAttentionMaskType::Causal || !isContextKernel(params.mKernelType))
+            && (params.mMaxSeqLenKv > params.mAttentionWindowSize
+                || params.mMaxSeqLenKv > params.mChunkedAttentionSize))
         {
-            maskType = TrtllmGenAttentionMaskType::SlidingWindowCausal;
+            TLLM_CHECK_WITH_INFO(params.mMaxSeqLenKv <= params.mAttentionWindowSize
+                    || params.mMaxSeqLenKv <= params.mChunkedAttentionSize,
+                "Sliding window attention and chunked attention should not be used together");
+            maskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
         }
         // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
         int numTokensPerPage = (!isPagedKv(params.mQkvLayout)) ? 0 : params.mNumTokensPerPage;

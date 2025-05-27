@@ -216,7 +216,7 @@ struct TmaWarpSpecializedGroupedGemmInput
         constexpr static int group_size = 128; // Unused, hard-coded to 128
         bool enabled = false;
         using SFA = __nv_bfloat16;
-        using SFB = __nv_bfloat16;
+        using SFB = __nv_bfloat16; // Unused
         using ProblemShapeInt = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
         using LayoutSFA = typename cutlass::layout::ColumnMajor;
         using LayoutSFB = typename cutlass::layout::ColumnMajor;        // Unused

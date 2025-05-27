@@ -709,8 +709,16 @@ def llm_venv(llm_root, custom_user_workspace):
         workspace_dir = "llm-test-workspace"
     workspace_dir = os.path.join(workspace_dir, subdir)
     from defs.local_venv import PythonVenvRunnerImpl
-    return PythonVenvRunnerImpl("", "", "python3",
+    venv = PythonVenvRunnerImpl("", "", "python3",
                                 os.path.join(os.getcwd(), workspace_dir))
+    yield venv
+    # Remove the workspace directory
+    if os.path.exists(workspace_dir):
+        print(f"Cleaning up workspace: {workspace_dir}")
+        try:
+            shutil.rmtree(workspace_dir)
+        except Exception as e:
+            print(f"Failed to clean up workspace: {e}")
 
 
 @pytest.fixture(scope="session")
@@ -1978,9 +1986,28 @@ def pytest_generate_tests(metafunc: pytest.Metafunc):
         lines = preprocess_test_list_lines(testlist_path, lines)
 
     uts = []
+    ids = []
     for line in lines:
         if line.startswith("unittest/"):
-            uts.append(line.strip())
+            if " TIMEOUT " in line:
+                # Process for marker TIMEOUT
+                case_part, timeout_part = line.split(" TIMEOUT ", 1)
+                case = case_part.strip()
+                timeout_str = timeout_part.strip()
+                timeout_num_match = re.search(r'\(?(\d+)\)?', timeout_str)
+                if timeout_num_match:
+                    timeout_min = int(timeout_num_match.group(1))
+                    timeout_sec = timeout_min * 60
+                else:
+                    raise ValueError(
+                        f"Invalid TIMEOUT format: {timeout_str} in line: {line}"
+                    )
+                mark = pytest.mark.timeout(int(timeout_sec))
+                uts.append(pytest.param(case, marks=mark))
+                # Change back id to include timeout information
+                ids.append(f"{case} TIMEOUT {timeout_str}")
+            else:
+                uts.append(line.strip())
     metafunc.parametrize("case", uts, ids=lambda x: x)
 
 

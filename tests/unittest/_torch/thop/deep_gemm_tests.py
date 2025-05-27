@@ -31,7 +31,7 @@ from utils.util import getSMVersion
 )
 @pytest.mark.parametrize(
     "m",
-    [7, 64, 128, 4096],
+    [7, 16, 64, 128, 4096],
 )
 def test_fp8_block_scale_gemm(m, k, n):
     torch.random.manual_seed(0)
@@ -162,7 +162,8 @@ def construct_batched(
     getSMVersion() != 90,
     reason="Op only supported on Hopper, current SM is %d." % getSMVersion(),
 )
-@pytest.mark.parametrize("ms", [[256, 256], [128, 64, 64], [16, 24, 48]])
+@pytest.mark.parametrize(
+    "ms", [[256, 256], [128, 64, 64], [16, 24, 48], [4, 8, 16, 32]])
 @pytest.mark.parametrize("k, n", [(7168, 4096), (2048, 7168)])
 def test_fp8_block_scaling_moe_gemm(ms, k, n):
     offset_cpu = [0] + list(itertools.accumulate(ms))

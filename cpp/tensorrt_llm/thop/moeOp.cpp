@@ -18,8 +18,6 @@
 #include "moe_kernels.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -413,9 +411,10 @@ public:
 
             bool const USE_BIAS = false;
             bool const USE_LORA = false;
+            auto activation_dtype = mUseW4A8GroupScaling ? at::ScalarType::Float8_e4m3fn : mActivationDtype;
+            activation_dtype = isNvfp4Quant() ? at::ScalarType::Long : activation_dtype;
             mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
-                tensorrt_llm::runtime::TorchUtils::dataType(
-                    mUseW4A8GroupScaling ? at::ScalarType::Float8_e4m3fn : mActivationDtype),
+                tensorrt_llm::runtime::TorchUtils::dataType(activation_dtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                 hidden_size, inter_size, group_size, tensorrt_llm::ActivationType::Swiglu, USE_BIAS, USE_LORA,

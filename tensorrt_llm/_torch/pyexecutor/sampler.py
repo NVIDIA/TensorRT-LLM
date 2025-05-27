@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
@@ -9,8 +10,8 @@ from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import (
-    CreateNewDecoderRequests, GenerateRequestOptions, HandleContextLogits,
-    HandleGenerationLogits, MakeDecodingBatchInputOutput)
+    CreateNewDecoderRequests, HandleContextLogits, HandleGenerationLogits,
+    MakeDecodingBatchInputOutput)
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers)
 from tensorrt_llm.bindings.internal.runtime import (BufferManager,
@@ -31,7 +32,7 @@ class SampleStateTensors:
         return vars(self).values()
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class SampleState:
     scheduled_requests: ScheduledRequests
 
@@ -42,6 +43,8 @@ class SampleState:
 
 
 class Sampler(ABC):
+
+    SampleState = SampleState
 
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
         pass
@@ -74,11 +77,14 @@ class EarlyStopSampler(Sampler):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            logits = state.logits[idx]
-            if logits.ndim == 1:
-                # For BERT: Add vocab_size axis to be compatible with LogitsStorage.
-                logits = logits.unsqueeze(-1)
-            request.py_result.append_context_logits(logits)
+            if request.py_return_context_logits:
+                logits = state.logits[idx]
+                if logits.ndim == 1:
+                    # For BERT: Add axis to be compatible with LogitsStorage
+                    # (LogitsStorage will interpret this dim as the prompt_len which
+                    # is not relevant for outputting logits of encoder only model).
+                    logits = logits.unsqueeze(0)
+                request.py_result.append_context_logits(logits)
 
 
 def top_k_sampling_batch(logits, top_k=50):
@@ -362,7 +368,8 @@ class TorchStarAttentionSampler(TorchSampler):
         num_tokens = request.add_new_token(new_token, beam_idx)
 
         current_logits = logits[output_token_idx].unsqueeze(0)
-        request.py_result.append_generation_logits(current_logits)
+        if request.py_return_generation_logits:
+            request.py_result.append_generation_logits(current_logits)
         if request.py_return_log_probs:
             _, log_probs = greedy_search_sampling_batch(current_logits)
             request.py_result.append_log_probs([[{
@@ -405,7 +412,7 @@ class SampleStateTensorsHostTRTLLM(SampleStateTensors):
     sequence_lengths: torch.Tensor
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class SampleStateTRTLLM(SampleState):
     host: SampleStateTensorsHostTRTLLM
     device: SampleStateTensors
@@ -413,6 +420,7 @@ class SampleStateTRTLLM(SampleState):
 
 class TRTLLMSampler(Sampler):
     MAX_DECODING_TOKENS = 1  # It must be 1 when not in speculative decoding
+    SampleState = SampleStateTRTLLM
 
     def __init__(
         self,
@@ -496,30 +504,25 @@ class TRTLLMSampler(Sampler):
             dtype=self.logits_datatype,
             model_config=self.model_config,
             world_config=self.world_config)
-        self.algs.generate_request_options = GenerateRequestOptions(
+        self.algs.create_new_decoder_requests = CreateNewDecoderRequests(
             speculative_decoding_fast_logits=False,
             is_leader_in_orch_mode=False,
             is_normalize_log_probs=False)
-        self.algs.create_new_decoder_requests = CreateNewDecoderRequests()
         self.algs.handle_context_logits = HandleContextLogits()
         self.algs.handle_generation_logits = HandleGenerationLogits()
         self.algs.make_decoding_batch_input_output = MakeDecodingBatchInputOutput(
         )
 
     def setup_sampler_step(self, requests):
-        batch_slots, decoder_requests, sampling_configs = self.algs.generate_request_options(
+        batch_slots, decoder_requests, sampling_configs = self.algs.create_new_decoder_requests(
             self.model_config, self.world_config, self.decoding_config,
             requests, self.store["buffer_manager"], self.logits_datatype,
             self.store["decoder_input_buffers"],
-            self.algs.decoder.decoder_state, self.beam_width,
-            self.store["cuda_stream"])
+            self.algs.decoder.decoder_state, self.store["cuda_stream"],
+            self.algs.decoder.decoder_stream, self.executor_config.max_seq_len,
+            self.beam_width(requests))
 
         if len(decoder_requests):
-            self.algs.create_new_decoder_requests(
-                batch_slots, decoder_requests, sampling_configs,
-                self.model_config, self.algs.decoder, self.store["cuda_stream"],
-                self.executor_config.max_seq_len)
-
             local_batch_size = len(batch_slots)
             sampling_config = make_sampling_config(sampling_configs)
             self.algs.decoder.underlying_decoder().setup(
@@ -528,15 +531,15 @@ class TRTLLMSampler(Sampler):
                 decoder_requests)
 
     @staticmethod
-    def beam_width(scheduled_requests: ScheduledRequests) -> int:
-        for req in scheduled_requests.all_requests:
+    def beam_width(scheduled_requests: Iterable[LlmRequest]) -> int:
+        for req in scheduled_requests:
             return req.sampling_config.beam_width
-        raise ValueError("No beam width found")
+        return 0
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateTRTLLM:
         batch_size = scheduled_requests.batch_size
-        beam_width = self.beam_width(scheduled_requests)
+        beam_width = self.beam_width(scheduled_requests.all_requests)
 
         logits = model_outputs["logits"].reshape((batch_size, beam_width, -1))
 
@@ -604,7 +607,7 @@ class TRTLLMSampler(Sampler):
 
         scheduled_requests = state.scheduled_requests
         assert scheduled_requests.batch_size > 0
-        beam_width = self.beam_width(scheduled_requests)
+        beam_width = self.beam_width(scheduled_requests.all_requests)
         sampler_event = state.sampler_event
 
         if sampler_event:

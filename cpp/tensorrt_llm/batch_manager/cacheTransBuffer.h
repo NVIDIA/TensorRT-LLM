@@ -54,6 +54,8 @@ public:
 
     runtime::ITensor::SharedPtr getSendBuffer(std::optional<int> bufferId);
     runtime::ITensor::SharedPtr getRecvBuffer(std::optional<int> bufferId);
+    size_t getRecvBufferCount();
+    size_t getSendBufferCount();
 
 private:
     struct ConcurrenceResource

@@ -108,6 +108,8 @@ struct KernelParams
     int32_t mAttentionWindowSize;
     // The batch size
     int32_t mBatchSize;
+    // The chunked attention size in log2.
+    int32_t mChunkedAttentionSizeLog2;
     // The log of the Sage Attention block size for K.
     int32_t mLogNumEltsPerSageAttnBlkK;
     // The log of the Sage Attention block size for P.
@@ -741,6 +743,17 @@ struct KernelParams
         params.ptrSoftmaxStats = options.softmaxStatsPtr;
 
         params.mAttentionWindowSize = options.mAttentionWindowSize;
+        if (isSlidingOrChunkedCausalMask(options.mMaskType) && options.mMaxSeqLenKv > options.mChunkedAttentionSize)
+        {
+            TLLM_CHECK_WITH_INFO((options.mChunkedAttentionSize & (options.mChunkedAttentionSize - 1)) == 0,
+                "Chunked attention size must be a power of 2");
+            params.mChunkedAttentionSizeLog2 = std::log2(options.mChunkedAttentionSize);
+        }
+        else
+        {
+            // Default 0 means that chunked attention is disabled.
+            params.mChunkedAttentionSizeLog2 = 0;
+        }
         params.mMaxSeqLenQ = options.mMaxSeqLenQ;
         params.mMaxSeqLenKv = options.mMaxSeqLenKv;
         params.mMaxNumCtasQ = maxNumCtasQ;

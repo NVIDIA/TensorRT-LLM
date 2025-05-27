@@ -55,7 +55,7 @@ enum class Dtype : uint32_t
     // clang-format off
   Bfloat16 = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 1u, /*int*/ 0u, /*bits*/  16u, /*uid*/  0u),
   Bool     = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/   1u, /*uid*/  1u),
-  E0m3     = TLLM_ENCODE_DTYPE(/*block*/ 1u, /*signed*/ 1u, /*int*/ 0u, /*bits*/   4u, /*uid*/  2u),
+  PadType  = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 1u, /*int*/ 1u, /*bits*/   8u, /*uid*/  2u),
   E2m1     = TLLM_ENCODE_DTYPE(/*block*/ 1u, /*signed*/ 1u, /*int*/ 0u, /*bits*/   4u, /*uid*/  3u),
   E2m3     = TLLM_ENCODE_DTYPE(/*block*/ 1u, /*signed*/ 1u, /*int*/ 0u, /*bits*/   6u, /*uid*/  4u),
   E3m2     = TLLM_ENCODE_DTYPE(/*block*/ 1u, /*signed*/ 1u, /*int*/ 0u, /*bits*/   6u, /*uid*/  5u),
@@ -141,7 +141,6 @@ inline std::string dtypeToString(Dtype dtype)
     {
     case Dtype::Bfloat16: return "Bfloat16";
     case Dtype::Bool: return "Bool";
-    case Dtype::E0m3: return "E0m3";
     case Dtype::E2m1: return "E2m1";
     case Dtype::E2m3: return "E2m3";
     case Dtype::E3m2: return "E3m2";

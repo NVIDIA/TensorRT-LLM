@@ -996,19 +996,22 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mMaxSeqLenCacheKv = generation_params.max_attention_window_size;
         // This should be set to numDraftTokens + 1.
         tllmRunnerParams.mMaxSeqLenQ = params.acc_q_len / batch_beam;
-        tllmRunnerParams.mMaxSeqLenKv
-            = std::min(generation_params.cyclic_attention_window_size, generation_params.max_past_kv_length);
+        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_past_kv_length;
         tllmRunnerParams.mSumOfSeqLensQ = int(batch_beam * tllmRunnerParams.mMaxSeqLenQ);
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
+
+        // The attention window size.
+        tllmRunnerParams.mAttentionWindowSize = generation_params.cyclic_attention_window_size;
+        // The chunked attention size.
+        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+
+        // The scaleQ that will be applied to the BMM1 output.
         tllmRunnerParams.mScaleQ = mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))
             / sqrtf((float) (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim));
 
-        // The kv cache should be based on the maximum headDim of K and V due to paddings.
-        int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
-        tllmRunnerParams.mNumPagesInMemPool = mTllmGenFMHARunner->getTotalDeviceMemory()
-            / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv * elemSize);
-
+        // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
+        tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = stream;
         tllmRunnerParams.mSfStartTokenIdx = generation_params.start_token_idx_sf;
@@ -1152,11 +1155,12 @@ int AttentionOp::mlaGeneration(
     {
         MHARunnerParams fmhaParams{};
         fmhaParams.b = batch_beam;
-        fmhaParams.qSeqLen = params.head_num;
+        fmhaParams.numGroupedHeads = params.head_num;
+        fmhaParams.qSeqLen = params.head_num * (params.acc_q_len / batch_beam);
         fmhaParams.kvSeqLen = generation_params.max_past_kv_length;
         // Disable sliding window attention when it is not needed.
         fmhaParams.slidingWindowSize = generation_params.cyclic_attention_window_size;
-        fmhaParams.totalQSeqLen = batch_beam * params.head_num;
+        fmhaParams.totalQSeqLen = batch_beam * fmhaParams.qSeqLen;
         // TODO: set it correctly for contiguous kv buffer (cross-attention).
         // fmhaParams.totalKvSeqLen = params.num_tokens;
         // Device buffer pointers.
@@ -1650,6 +1654,11 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
 
+        if (mAttentionChunkSize)
+        {
+            fmhaParams.chunkedAttentionSize = *mAttentionChunkSize;
+        }
+
         // Run the fmha kernel.
         mFmhaDispatcher->run(fmhaParams);
         sync_check_cuda_error(stream);
@@ -1668,6 +1677,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     else
     {
         TLLM_CHECK_DEBUG_WITH_INFO(params.logn_scaling_ptr == nullptr, "Unfused MHA does not support logn scaling");
+        TLLM_CHECK_WITH_INFO(mAttentionChunkSize == std::nullopt, "Unfused MHA does not support chunked attention");
         // FIXME: a temporary solution to make sure the padding part of key/value buffer is 0
         // NOTE: pointer subtraction is used below since there could be some extra gap due to alignment.
         //  Otherwise, we could do cudaMemsetAsync(k_buf_2_, 0, k_buf_2_size + v_buf_2_size, stream);

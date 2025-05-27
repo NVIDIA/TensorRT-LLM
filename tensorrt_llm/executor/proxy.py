@@ -9,9 +9,10 @@ import torch
 import zmq
 import zmq.asyncio
 
+import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
-from .._utils import mpi_rank
+from .._utils import mpi_rank, nvtx_range_debug
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
@@ -297,7 +298,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
             ready_signal=ExecutorBindingsProxy.READY_SIGNAL,
-        )
+            BASE_ZMQ_CLASSES=serialization.BASE_ZMQ_CLASSES)
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)
 
@@ -404,9 +405,11 @@ class ExecutorBindingsProxy(GenerationExecutor):
             logprob_params=logprob_params)
         self._results[request.id] = result
 
-        self.request_queue.put(request)
+        with nvtx_range_debug("request_queue.put"):
+            self.request_queue.put(request)
 
-        error = self.request_error_queue.get()
+        with nvtx_range_debug("request_error_queue.get"):
+            error = self.request_error_queue.get()
         if isinstance(error, Exception):
             raise error
 

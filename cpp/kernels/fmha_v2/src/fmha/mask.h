@@ -249,7 +249,7 @@ struct Mask<Traits, Cta_tile, 2>
     }
 
     // The length of the sequence.
-    int const seqlen_;
+    int seqlen_;
     // The left-most position of the thread in the sequence.
     int col_, col_init_;
     // The current col iteration
@@ -334,6 +334,102 @@ struct Mask<Traits, Cta_tile, 3> : public Mask<Traits, Cta_tile, 2>
     // The upper-most position of the thread in the sequence.
     int row_;
     // Current row step offset.
+    int row_loop_step_;
+};
+
+// Specialized mask for MTP (multi-token prediction used in MLA).
+template <typename Traits, typename Cta_tile>
+struct MtpMask : public Mask<Traits, Cta_tile, 2>
+{
+    // MTP mask (causal mask) extends from V2 (dense) masks (self-attention).
+    using Base = Mask<Traits, Cta_tile, 2>;
+
+    // The shape of the MMA tile.
+    using Mma_tile = typename Base::Mma_tile;
+
+    // Ctor.
+    template <typename Params, typename Block_info>
+    inline __device__ MtpMask(Params const& params, Block_info const& block_info, int tidx)
+        : Base(params, block_info, tidx)
+        , num_grouped_heads_(params.num_grouped_heads)
+        , row_loop_step_(0)
+    {
+
+        // Update the seqlen (excluding all MTP draft tokens).
+        this->seqlen_ = this->seqlen_ - (block_info.actual_q_seqlen / params.num_grouped_heads) + 1;
+
+        int warp = tidx / Cta_tile::THREADS_PER_WARP;
+        int lane = tidx % Cta_tile::THREADS_PER_WARP;
+
+        // The position of the warp.
+        int warp_m = warp % Cta_tile::WARPS_M;
+        row_ = warp_m * 16 + lane / 4;
+    }
+
+    inline __device__ int get_row(int mi, int ii) const
+    {
+        // The position of the thread in the sequence.
+        int row = this->row_ + this->row_loop_step_ + mi * Mma_tile::M_PER_MMA_PER_CTA;
+        // The position inside the MMA.
+        row += ii * 8;
+        return row;
+    }
+
+    inline __device__ int get_col(int ni, int jj) const
+    {
+        // The position of the thread in the sequence.
+        int col = this->col_ + this->col_loop_step_ * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA;
+        // The position inside the MMA.
+        col += (jj & 0x02) * 4 + (jj & 0x1);
+        return col;
+    }
+
+    inline __device__ void get_row_col(int& row, int& col, int mi, int ni, int ii, int jj) const
+    {
+        row = get_row(mi, ii);
+        col = get_col(ni, jj);
+    }
+
+    // Is a given position valid?
+    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const
+    {
+        int col = get_col(ni, jj);
+
+        // Is it a valid position in the sequence?
+        return col < (this->seqlen_ + mtp_token_idx_[mi][ii]);
+    }
+
+    // Is a given position valid?
+    inline __device__ bool is_valid(int row, int col) const
+    {
+        // Is it a valid position in the sequence, i.e. are we in the lower triangle?
+        return (row >= col);
+    }
+
+    // Load the mask... we use it to keep track of to row.
+    inline __device__ void load(int row_loop_step)
+    {
+        row_loop_step_ = row_loop_step;
+// Update the MTP token index.
+#pragma unroll
+        for (int mi = 0; mi < Mma_tile::MMAS_M; ++mi)
+        {
+#pragma unroll
+            for (int ii = 0; ii < 2; ++ii)
+            {
+                mtp_token_idx_[mi][ii] = get_row(mi, ii) / num_grouped_heads_;
+            }
+        }
+    }
+
+    // The number of grouped heads in the row dimension.
+    int num_grouped_heads_;
+    // The corresponding MTP token index for each row.
+    // FIXME: currently we assume 2 rows per thread (volta/hopper-gmma traits are not supported yet).
+    int mtp_token_idx_[Mma_tile::MMAS_M][2];
+    // The upper-most position of the thread in the sequence.
+    int row_;
+    // The current row step offset.
     int row_loop_step_;
 };
 
@@ -677,6 +773,41 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 3> : public Mask<Volta_hmma_fp16_t
     int row_;
     // Current iteration.
     int loop_step_;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Traits, typename Cta_tile, int FMHA_VERSION, bool IS_MTP>
+struct Mask_dispatcher
+{
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Traits, typename Cta_tile, int FMHA_VERSION>
+struct Mask_dispatcher<Traits, Cta_tile, FMHA_VERSION, false> : public Mask<Traits, Cta_tile, FMHA_VERSION>
+{
+    using Base = Mask<Traits, Cta_tile, FMHA_VERSION>;
+
+    template <typename Params, typename Block_info>
+    inline __device__ Mask_dispatcher(Params const& params, Block_info const& block_info, int tidx)
+        : Base(params, block_info, tidx)
+    {
+    }
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Traits, typename Cta_tile, int FMHA_VERSION>
+struct Mask_dispatcher<Traits, Cta_tile, FMHA_VERSION, true> : public MtpMask<Traits, Cta_tile>
+{
+    using Base = MtpMask<Traits, Cta_tile>;
+
+    template <typename Params, typename Block_info>
+    inline __device__ Mask_dispatcher(Params const& params, Block_info const& block_info, int tidx)
+        : Base(params, block_info, tidx)
+    {
+    }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

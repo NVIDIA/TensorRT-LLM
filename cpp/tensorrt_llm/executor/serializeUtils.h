@@ -353,6 +353,10 @@ T deserialize(std::istream& is)
     {
         return Serialization::deserializeSocketState(is);
     }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::kv_cache::AgentState>)
+    {
+        return Serialization::deserializeAgentState(is);
+    }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::kv_cache::CacheState>)
     {
         return Serialization::deserializeCacheState(is);
@@ -464,6 +468,10 @@ T deserialize(std::istream& is)
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::InflightBatchingStats>)
     {
         return Serialization::deserializeInflightBatchingStats(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::SpecDecodingStats>)
+    {
+        return Serialization::deserializeSpecDecodingStats(is);
     }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::IterationStats>)
     {
