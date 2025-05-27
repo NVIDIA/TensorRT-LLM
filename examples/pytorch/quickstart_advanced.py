@@ -157,6 +157,7 @@ def setup_llm(args):
               backend='pytorch',
               disable_overlap_scheduler=args.disable_overlap_scheduler,
               kv_cache_dtype=args.kv_cache_dtype,
+              kv_cache_config=kv_cache_config,
               attn_backend=args.attention_backend,
               use_cuda_graph=args.use_cuda_graph,
               load_format=args.load_format,

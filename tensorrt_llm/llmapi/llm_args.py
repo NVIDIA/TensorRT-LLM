@@ -1,5 +1,6 @@
 import json
 import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
@@ -17,7 +18,6 @@ from transformers import PreTrainedTokenizerBase
 from tensorrt_llm.lora_manager import (LoraConfig,
                                        get_default_trtllm_modules_to_hf_modules)
 
-from .._torch.model_config import MoeLoadBalancerConfig
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 
@@ -858,8 +858,8 @@ class BaseLlmArgs(BaseModel):
         default=None, description="Quantization config.")
 
     # Several options from ExecutorConfig, expanded here for less hierarchy
-    kv_cache_config: Optional[KvCacheConfig] = Field(
-        default=None, description="KV cache config.")
+    kv_cache_config: KvCacheConfig = Field(default_factory=KvCacheConfig,
+                                           description="KV cache config.")
 
     enable_chunked_prefill: bool = Field(default=False,
                                          description="Enable chunked prefill.")
@@ -886,8 +886,8 @@ class BaseLlmArgs(BaseModel):
     peft_cache_config: Optional[PeftCacheConfig] = Field(
         default=None, description="PEFT cache config.")
 
-    scheduler_config: Optional[SchedulerConfig] = Field(
-        default=None, description="Scheduler config.")
+    scheduler_config: SchedulerConfig = Field(default_factory=SchedulerConfig,
+                                              description="Scheduler config.")
 
     cache_transceiver_config: Optional[CacheTransceiverConfig] = Field(
         default=None, description="Cache transceiver config.")
@@ -1000,10 +1000,6 @@ class BaseLlmArgs(BaseModel):
             moe_ep_size=self.moe_expert_parallel_size,
             enable_attention_dp=self.enable_attention_dp,
             cp_config=self.cp_config)
-
-        self.kv_cache_config = self.kv_cache_config or KvCacheConfig()
-
-        self.scheduler_config = self.scheduler_config or SchedulerConfig()
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "BaseLlmArgs":
@@ -1498,10 +1494,10 @@ class TorchLlmArgs(BaseLlmArgs):
         "If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used."
     )
 
-    moe_load_balancer: Optional[
-        Union[MoeLoadBalancerConfig, dict,
-              str]] = Field(default=None,
-                            description="Configuration for MoE load balancing.")
+    moe_load_balancer: Optional[Union[object, dict, str]] = Field(
+        default=None,
+        description="Configuration for MoE load balancing.",
+        json_schema_extra={"type": f"Union[MoeLoadBalancerConfig, dict, str]"})
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.")
@@ -1605,8 +1601,26 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @print_traceback_on_error
     def model_post_init(self, __context):
+        from .._torch.model_config import MoeLoadBalancerConfig
+
         super().model_post_init(__context)
         self.model_format = _ModelFormatKind.HF
+
+        if isinstance(self.moe_load_balancer, str):
+            assert os.path.exists(self.moe_load_balancer)
+            if self.moe_load_balancer.endswith(".json"):
+                with open(self.moe_load_balancer) as f:
+                    self.moe_load_balancer = json.load(f)
+            elif self.moe_load_balancer.endswith((".yaml", ".yml")):
+                with open(self.moe_load_balancer) as f:
+                    self.moe_load_balancer = yaml.safe_load(f)
+            else:
+                raise ValueError(
+                    f"Unsupported moe load balancer config file: {self.moe_load_balancer}"
+                )
+        if isinstance(self.moe_load_balancer, dict):
+            self.moe_load_balancer = MoeLoadBalancerConfig(
+                **self.moe_load_balancer)
 
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":

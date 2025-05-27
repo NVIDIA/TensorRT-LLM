@@ -5,7 +5,6 @@ import yaml
 
 import tensorrt_llm.bindings.executor as tle
 from tensorrt_llm.llmapi.llm_args import *
-from tensorrt_llm.llmapi.llm_utils import *
 
 from .test_llm import llama_model_path
 
@@ -51,7 +50,7 @@ speculative_config:
         f.seek(0)
         dict_content = yaml.safe_load(f)
 
-    llm_args = LlmArgs(llama_model_path)
+    llm_args = LlmArgs(model=llama_model_path)
     llm_args_dict = update_llm_args_with_extra_dict(llm_args.to_dict(),
                                                     dict_content)
     llm_args = LlmArgs(**llm_args_dict)
