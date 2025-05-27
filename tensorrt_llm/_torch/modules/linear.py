@@ -14,6 +14,7 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ...models.modeling_utils import QuantConfig
 from ..utils import Fp4QuantizedTensor
@@ -294,14 +295,9 @@ class Linear(nn.Module):
                 # (amax_input*amax_weight) / (448*6*448*6)
                 self.alpha = Parameter(torch.empty([1], dtype=torch.float32),
                                        requires_grad=False)
-            elif qc.layer_quant_mode.is_int4_weight_only_per_group():
+            elif qc.layer_quant_mode.is_int4_weight_only_per_group(
+            ) and qc.quant_algo == QuantAlgo.W4A16_AWQ:
                 self.has_w4a16_awq = True
-
-                # self.weight = Parameter(torch.empty(
-                #     (self.out_features // 2, self.in_features),
-                #     dtype=torch.uint8,
-                # ),
-                #                         requires_grad=False)
 
                 self.weight = Parameter(torch.empty(
                     (self.in_features, self.out_features // 2),
@@ -508,7 +504,8 @@ class Linear(nn.Module):
             weight = load_weight_shard(weights[0]['weight'], self.tp_size,
                                        self.tp_rank, self.tp_mode, device)
 
-            if quant_mode and quant_mode.is_int4_weight_only_per_group():
+            if quant_mode and quant_mode.is_int4_weight_only_per_group(
+            ) and self.quant_config.quant_algo == QuantAlgo.W4A16_AWQ:
                 weight = weight.T.to(torch.int8)
                 weight = preprocess_weights_for_mixed_gemm(
                     weight.contiguous().cpu(), torch.quint4x2,
@@ -564,7 +561,8 @@ class Linear(nn.Module):
                         _copy(self.input_scale, weights[0]["input_scale"])
                         self.inv_input_scale.data = 1.0 / self.input_scale
 
-                elif quant_mode.is_int4_weight_only_per_group():
+                elif quant_mode.is_int4_weight_only_per_group(
+                ) and self.quant_config.quant_algo == QuantAlgo.W4A16_AWQ:
                     pre_quant_scale = load_weight_shard(
                         weights[0]['pre_quant_scale'], self.tp_size,
                         self.tp_rank, self.tp_mode, device)
@@ -628,7 +626,8 @@ class Linear(nn.Module):
                     fused_fp8_block_scale = torch.cat(
                         (q_scale, k_scale, v_scale))
                     _copy(self.weight_scale, fused_fp8_block_scale)
-                elif quant_mode.is_int4_weight_only_per_group():
+                elif quant_mode.is_int4_weight_only_per_group(
+                ) and self.quant_config.quant_algo == QuantAlgo.W4A16_AWQ:
                     weight_scales = load_weight_scales_w4a16(weights)
 
                     # Create concatenated weight scale tensor
@@ -703,7 +702,8 @@ class Linear(nn.Module):
                                                     self.tp_mode, device)
                     fused_scale = torch.cat([left_scale, right_scale], dim=0)
                     _copy(self.weight_scale, fused_scale)
-                elif quant_mode.is_int4_weight_only_per_group():
+                elif quant_mode.is_int4_weight_only_per_group(
+                ) and self.quant_config.quant_algo == QuantAlgo.W4A16_AWQ:
                     left_scale = load_weight_shard(weights[0]['weight_scale'],
                                                    self.tp_size, self.tp_rank,
                                                    self.tp_mode,
@@ -722,7 +722,8 @@ class Linear(nn.Module):
                 fused_weight = (fused_weight / self.weight_scale).to(
                     torch.float8_e4m3fn)
 
-            if quant_mode and quant_mode.is_int4_weight_only_per_group():
+            if quant_mode and quant_mode.is_int4_weight_only_per_group(
+            ) and self.quant_config.quant_algo == QuantAlgo.W4A16_AWQ:
                 fused_weight = (fused_weight).to(torch.int8)
                 fused_weight = preprocess_weights_for_mixed_gemm(
                     fused_weight.T.contiguous().cpu(), torch.quint4x2,
