@@ -4,9 +4,9 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.nn import functional as F
-from transformers import (LlamaConfig)
+from transformers import LlamaConfig
 
-from tensorrt_llm._torch.distributed import (AllReduceFusionOp, AllReduceParams)
+from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a)
@@ -25,8 +25,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..speculative import SpecMetadata
 from ..utils import Fp4QuantizedTensor
-from .modeling_llama import (Llama4Attention, Llama4DecoderLayer, Llama4MoE)
-
+from .modeling_llama import Llama4Attention, Llama4DecoderLayer, Llama4MoE
 
 # Perf heuristics thresholds.
 # Use routing gemv kernels when num_tokens <= 8.
@@ -163,7 +162,8 @@ class Llama4MinLatencyLinear(Linear):
 
             # When num_tokens < 4, we use the special QKV-gemm kernel.
             # Or if attn_scaling is needed, we also use the special QKV-gemm kernel.
-            if input.shape[0] <= MIN_LATENCY_QKV_GEMM_NUM_TOKENS or should_fuse_attn_scaling:
+            if input.shape[
+                    0] <= MIN_LATENCY_QKV_GEMM_NUM_TOKENS or should_fuse_attn_scaling:
                 return torch.ops.trtllm.llama4_fp8_bf16_gemm(
                     input,
                     self.weight,
@@ -202,7 +202,8 @@ class Llama4MinLatencyLinear(Linear):
         # Use special FP8-input FP8-output gemm+swiglu kernel for FC13+swiglu.
         if self.enable_fused_gemm_swiglu and self.has_fp8_qdq:
             # When num_tokens < 4, we use the special gemm+swiglu kernel.
-            if input.shape[0] < MIN_LATENCY_FC13_FUSED_GEMM_SWIGLU_NUM_TOKENS_GEMV:
+            if input.shape[
+                    0] < MIN_LATENCY_FC13_FUSED_GEMM_SWIGLU_NUM_TOKENS_GEMV:
                 if not hasattr(self, "inv_output_scale"):
                     raise ValueError('Expect inv_output_scale to be set')
                 return torch.ops.trtllm.llama4_fp8_fp8_gemm_swiglu(
@@ -427,13 +428,9 @@ class Llama4MinLatencyAttention(Llama4Attention):
             self.qkv_proj.set_position_ids(position_ids)
             skip_attn_scaling = True
 
-        return super()._forward_nope(position_ids,
-                                     hidden_states,
-                                     attn_metadata,
-                                     attention_mask,
-                                     mrope_config,
-                                     all_reduce_params,
-                                     skip_attn_scaling)
+        return super()._forward_nope(position_ids, hidden_states, attn_metadata,
+                                     attention_mask, mrope_config,
+                                     all_reduce_params, skip_attn_scaling)
 
 
 class Llama4MinLatencyFusedMoE(FusedMoE):
@@ -516,7 +513,9 @@ class Llama4MinLatencyFusedMoE(FusedMoE):
                     "x_high is required when x.dtype is float8_e4m3fn in Llama4FusedMoE fallback path!"
                 )
 
-        return super().forward(x, router_logits, cutlass_min_latency_mode=False,
+        return super().forward(x,
+                               router_logits,
+                               cutlass_min_latency_mode=False,
                                output_dtype=output_dtype)
 
 
@@ -589,11 +588,12 @@ class Llama4MinLatencyMoE(Llama4MoE):
             post_load_weights_hook=partial(post_load_weights_hook,
                                            self.shared_expert))
 
-        self.router = Llama4MinLatencyLinear(hidden_size,
-                                             num_experts,
-                                             bias=False,
-                                             dtype=model_config.pretrained_config.torch_dtype,
-                                             quant_config=None)
+        self.router = Llama4MinLatencyLinear(
+            hidden_size,
+            num_experts,
+            bias=False,
+            dtype=model_config.pretrained_config.torch_dtype,
+            quant_config=None)
 
     def compute_routed_output(
             self,
@@ -830,7 +830,8 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
                 act_fp4, act_sf, residual = self.all_reduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                        fusion_op=AllReduceFusionOp.
+                        RESIDUAL_RMS_NORM_QUANT_NVFP4,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
                         scale=self.next_attn.qkv_proj.input_scale,
@@ -857,4 +858,3 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
                 ))
 
         return hidden_states, residual
-
