@@ -59,6 +59,8 @@ class Qwen3Attention(Attention):
             config=model_config,
         )
 
+        # If fuse_qk_norm_rope is true, we pass pos_embd_params=None to super().__init__,
+        # so we need to do assignment to record the actual pos_embd_params.
         self.pos_embd_params = pos_embd_params
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,

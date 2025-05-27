@@ -174,11 +174,13 @@ class Attention(nn.Module):
         # If false, RoPE will be applied in self.apply_rope.
         self.enable_rope_fusion = attn_cls.support_fused_rope(
         ) and self.qk_norm_type != QkNormType.post_rope
-        if not self.enable_rope_fusion and pos_embd_params is not None:
+
+        self.rotary_emb = None
+        if not self.enable_rope_fusion and self.pos_embd_params is not None:
             self.rotary_emb = RotaryEmbedding(
-                pos_embd_params.rope,
+                self.pos_embd_params.rope,
                 head_dim=self.head_dim,
-                is_neox=pos_embd_params.is_neox,
+                is_neox=self.pos_embd_params.is_neox,
             )
 
         self.attn = create_attention(
