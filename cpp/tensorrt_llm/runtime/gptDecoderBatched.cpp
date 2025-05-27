@@ -33,6 +33,7 @@
 #include <vector>
 
 using namespace tensorrt_llm::runtime;
+using TensorPtr = ITensor::SharedPtr;
 
 GptDecoderBatched::GptDecoderBatched(GptDecoderBatched::CudaStreamPtr stream,
     SpeculativeDecodingMode const& speculativeDecodingMode, nvinfer1::DataType dtype)
@@ -120,62 +121,65 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::setExplicitDraftTokensInputs(decoder_batch::Input const& input)
+namespace
+{
+//! @brief Sets inputs for explicit draft tokens.
+void setExplicitDraftTokensInputs(DecodingInput& dInput, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto explicitDraftTokensInputs = DecodingInput::ExplicitDraftTokensInputs();
+    dInput.explicitDraftTokensInputs = DecodingInput::ExplicitDraftTokensInputs();
     TLLM_CHECK(input.explicitDraftTokensInputs.has_value());
     TLLM_CHECK(input.explicitDraftTokensLastInputs.has_value());
 
-    explicitDraftTokensInputs.nextDraftTokens = input.explicitDraftTokensInputs->nextDraftTokens;
-    explicitDraftTokensInputs.nextFlatTokens = input.explicitDraftTokensInputs->nextFlatTokens;
-    explicitDraftTokensInputs.nextDraftIndices = input.explicitDraftTokensInputs->nextDraftIndices;
-    explicitDraftTokensInputs.nextDraftProbs = input.explicitDraftTokensInputs->nextDraftProbs;
-    explicitDraftTokensInputs.lastDraftTokens = input.explicitDraftTokensLastInputs->draftTokens;
-    explicitDraftTokensInputs.lastDraftIndices = input.explicitDraftTokensLastInputs->draftIndices;
-    explicitDraftTokensInputs.lastPositionIdsBase = input.explicitDraftTokensLastInputs->positionIdsBase;
-    explicitDraftTokensInputs.masks = input.explicitDraftTokensInputs->masks;
-    explicitDraftTokensInputs.packedPositionIds = input.explicitDraftTokensInputs->packedPositionIds;
-    explicitDraftTokensInputs.bestPathLengths = input.explicitDraftTokensInputs->bestPathLengths;
-    explicitDraftTokensInputs.bestPathIndices = input.explicitDraftTokensInputs->bestPathIndices;
-    explicitDraftTokensInputs.nextGenerationLengths = input.explicitDraftTokensInputs->nextGenerationLengths;
-    explicitDraftTokensInputs.lastGenerationLengths = input.explicitDraftTokensLastInputs->generationLengths;
-    explicitDraftTokensInputs.maxGenLengthDevice = input.explicitDraftTokensInputs->maxGenToken;
-    explicitDraftTokensInputs.seqSlots = input.batchSlotsRequestOrder;
-    mDecoderState->getJointDecodingInput().explicitDraftTokensInputs = explicitDraftTokensInputs;
+    dInput.explicitDraftTokensInputs->nextDraftTokens = input.explicitDraftTokensInputs->nextDraftTokens;
+    dInput.explicitDraftTokensInputs->nextFlatTokens = input.explicitDraftTokensInputs->nextFlatTokens;
+    dInput.explicitDraftTokensInputs->nextDraftIndices = input.explicitDraftTokensInputs->nextDraftIndices;
+    dInput.explicitDraftTokensInputs->nextDraftProbs = input.explicitDraftTokensInputs->nextDraftProbs;
+    dInput.explicitDraftTokensInputs->lastDraftTokens = input.explicitDraftTokensLastInputs->draftTokens;
+    dInput.explicitDraftTokensInputs->lastDraftIndices = input.explicitDraftTokensLastInputs->draftIndices;
+    dInput.explicitDraftTokensInputs->lastPositionIdsBase = input.explicitDraftTokensLastInputs->positionIdsBase;
+    dInput.explicitDraftTokensInputs->masks = input.explicitDraftTokensInputs->masks;
+    dInput.explicitDraftTokensInputs->packedPositionIds = input.explicitDraftTokensInputs->packedPositionIds;
+    dInput.explicitDraftTokensInputs->bestPathLengths = input.explicitDraftTokensInputs->bestPathLengths;
+    dInput.explicitDraftTokensInputs->bestPathIndices = input.explicitDraftTokensInputs->bestPathIndices;
+    dInput.explicitDraftTokensInputs->nextGenerationLengths = input.explicitDraftTokensInputs->nextGenerationLengths;
+    dInput.explicitDraftTokensInputs->lastGenerationLengths = input.explicitDraftTokensLastInputs->generationLengths;
+    dInput.explicitDraftTokensInputs->maxGenLengthDevice = input.explicitDraftTokensInputs->maxGenToken;
+    dInput.explicitDraftTokensInputs->seqSlots = input.batchSlotsRequestOrder;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::setEagleInputs(decoder_batch::Input const& input)
+//! @brief Sets inputs for eagle decoding.
+void setEagleInputs(DecodingInput& dInput, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     TLLM_CHECK(input.eagleInputs.has_value());
     TLLM_CHECK(input.eagleLastInputs.has_value());
 
-    auto eagleInputs = DecodingInput::EagleInputs(input.eagleInputs->nextDraftTokens, input.eagleInputs->nextDraftLens,
-        input.eagleInputs->nextDraftPaths, input.eagleLastInputs->draftTokens, input.eagleLastInputs->draftLens,
-        input.eagleLastInputs->draftPaths, input.eagleInputs->acceptedTokens, input.eagleInputs->acceptedLens,
-        input.eagleInputs->acceptedPaths, input.eagleInputs->chunkedContextNextTokens, input.batchSlotsRequestOrder);
-
-    mDecoderState->getJointDecodingInput().eagleInputs = eagleInputs;
+    dInput.eagleInputs = DecodingInput::EagleInputs(input.eagleInputs->nextDraftTokens,
+        input.eagleInputs->nextDraftLens, input.eagleInputs->nextDraftPaths, input.eagleLastInputs->draftTokens,
+        input.eagleLastInputs->draftLens, input.eagleLastInputs->draftPaths, input.eagleInputs->acceptedTokens,
+        input.eagleInputs->acceptedLens, input.eagleInputs->acceptedPaths, input.eagleInputs->chunkedContextNextTokens,
+        input.batchSlotsRequestOrder);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-// TODO: produce new input and output
-void GptDecoderBatched::prepareForward(
-    SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input)
+//! @brief Prepare Input and Output for decoder step.
+// TODO: produce new input and output objects
+void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, decoder_batch::Output& output,
+    decoder_batch::Input const& input, BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const maxBeamWidth = mDecoderState->getMaxBeamWidth();
-    auto const speculativeDecodingMode = mDecoderState->getSpeculativeDecodingMode();
+    auto const maxBeamWidth = decoderState.getMaxBeamWidth();
+    auto const speculativeDecodingMode = decoderState.getSpeculativeDecodingMode();
 
-    auto& dInput = mDecoderState->getJointDecodingInput();
-    auto& dOutput = mDecoderState->getJointDecodingOutput();
+    auto& dInput = decoderState.getJointDecodingInput();
+    auto& dOutput = decoderState.getJointDecodingOutput();
 
     if (maxBeamWidth > 1)
     {
@@ -186,24 +190,24 @@ void GptDecoderBatched::prepareForward(
 
     if (speculativeDecodingMode.isExplicitDraftTokens())
     {
-        setExplicitDraftTokensInputs(input);
+        setExplicitDraftTokensInputs(dInput, input);
     }
     else if (speculativeDecodingMode.isEagle())
     {
-        setEagleInputs(input);
+        setEagleInputs(dInput, input);
     }
 
     dInput.batchSlots = input.batchSlots.at(step);
     dInput.batchSize = static_cast<SizeType32>(dInput.batchSlots->getSize());
     dInput.logitsVec = input.logits.at(step);
 
-    TensorPtr finishedStepsInput = ITensor::slice(mDecoderState->getFinishedSteps(), step, 1);
+    TensorPtr finishedStepsInput = ITensor::slice(decoderState.getFinishedSteps(), step, 1);
     TensorPtr finishedStepsOutput
-        = ITensor::slice(mDecoderState->getFinishedSteps(), std::min(input.maxDecoderSteps - 1, step + 1), 1);
+        = ITensor::slice(decoderState.getFinishedSteps(), std::min(input.maxDecoderSteps - 1, step + 1), 1);
     finishedStepsInput->squeeze(0);
     finishedStepsOutput->squeeze(0);
     TensorPtr newTokensStepView
-        = ITensor::slice(dOutput.newTokensSteps, step, mDecoderState->getMaxDecodingDecoderTokens());
+        = ITensor::slice(dOutput.newTokensSteps, step, decoderState.getMaxDecodingDecoderTokens());
 
     dInput.finishReasons = finishedStepsInput;
 
@@ -219,13 +223,11 @@ void GptDecoderBatched::prepareForward(
         // WAR: reset finished state for generation requests
         if (step == 0)
         {
-            BufferManager manager{mDecoderStream};
-
             auto batchSlotsRange = BufferRange<SizeType32 const>(*dInput.batchSlots);
             for (auto batchSlot : batchSlotsRange)
             {
                 TensorPtr finishedSteps = ITensor::slice(finishedStepsInput, batchSlot, 1);
-                manager.setZero(*finishedSteps);
+                bufferManager.setZero(*finishedSteps);
             }
         }
     }
@@ -236,17 +238,21 @@ void GptDecoderBatched::prepareForward(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input)
+} // namespace
+
+void GptDecoderBatched::forwardDispatch(
+    decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     for (SizeType32 step = 0; step < input.maxDecoderSteps; ++step)
     {
-        prepareForward(step, output, input);
+        BufferManager manager{mDecoderStream};
+        prepareForward(decoderState, step, output, input, manager);
 
-        if (mDecoderState->getJointDecodingInput().batchSize > 0)
+        if (decoderState.getJointDecodingInput().batchSize > 0)
         {
-            mDecoder->forwardAsync(mDecoderState->getJointDecodingOutput(), mDecoderState->getJointDecodingInput());
+            mDecoder->forwardAsync(decoderState.getJointDecodingOutput(), decoderState.getJointDecodingInput());
         }
     }
 
@@ -261,7 +267,7 @@ CudaEvent GptDecoderBatched::forwardAsync(decoder_batch::Output& output, decoder
     mRuntimeStream->record(eventStart);
     mDecoderStream->wait(eventStart.get());
 
-    forwardDispatch(output, input);
+    forwardDispatch(*mDecoderState, output, input);
 
     CudaEvent event{};
     mDecoderStream->record(event);

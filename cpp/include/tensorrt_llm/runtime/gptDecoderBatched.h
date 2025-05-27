@@ -44,7 +44,6 @@ public:
     using LlmRequestPtr = std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>;
     using RequestVector = std::vector<LlmRequestPtr>;
     using TensorPtr = ITensor::SharedPtr;
-    using SharedConstPtr = ITensor::SharedConstPtr;
 
     GptDecoderBatched(
         CudaStreamPtr stream, SpeculativeDecodingMode const& speculativeDecodingMode, nvinfer1::DataType dtype);
@@ -90,17 +89,9 @@ public:
     }
 
 private:
-    //! @brief Sets inputs for explicit draft tokens.
-    void setExplicitDraftTokensInputs(decoder_batch::Input const& input);
-
-    //! @brief Sets inputs for eagle decoding.
-    void setEagleInputs(decoder_batch::Input const& input);
-
     //! @brief Calls decoders for tokens per engine step
-    void forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input);
-
-    //! @brief Prepare Input and Output for decoder step
-    void prepareForward(SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input);
+    void forwardDispatch(
+        decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input);
 
 private:
     CudaStreamPtr mRuntimeStream;
