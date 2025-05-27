@@ -175,7 +175,7 @@ class Attention(nn.Module):
             enable_fused_rope = attn_cls.support_fused_rope(
             ) and qk_norm_type != QkNormType.post_rope
         self.enable_fused_rope = enable_fused_rope
-        if not self.enable_fused_rope:
+        if not self.enable_fused_rope and pos_embd_params is not None:
             self.rotary_emb = RotaryEmbedding(
                 pos_embd_params.rope,
                 head_dim=self.head_dim,
