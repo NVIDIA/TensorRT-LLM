@@ -46,7 +46,8 @@ inline size_t smem_size_in_bytes(Multihead_attention_params<T, DO_CROSS_ATTENTIO
     using Tk = typename kernel_type_t<T>::Type;
     // The amount of shared memory needed to store the Q*K^T values in float.
     auto const attention_window_size_bound
-        = divUp(params.cyclic_attention_window_size, std::max(params.seq_len_tile, 1));
+        = divUp(std::min(params.cyclic_attention_window_size, (2 << params.chunked_attention_size_log2)),
+            std::max(params.seq_len_tile, 1));
     auto const max_timesteps = DO_CROSS_ATTENTION
         ? attention_window_size_bound
         : min((DO_MULTI_BLOCK ? params.timesteps_per_block : params.timestep), attention_window_size_bound);
@@ -131,8 +132,9 @@ inline void multi_block_grid_setup(dim3& grid, Multihead_attention_params<T, DO_
         params.seq_len_tile <= block_size, "The number of blocks per sequence may not exceed the thread block size.");
 
     // We should consider the new timestep.
-    params.timesteps_per_block
-        = mmha::divUp(std::min(tlength, params.cyclic_attention_window_size) + 1, params.seq_len_tile);
+    params.timesteps_per_block = mmha::divUp(
+        std::min({tlength, params.cyclic_attention_window_size, (2 << params.chunked_attention_size_log2)}) + 1,
+        params.seq_len_tile);
 
     params.multi_block_mode = (params.seq_len_tile > 1);
 

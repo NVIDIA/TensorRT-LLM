@@ -80,6 +80,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     PositionEmbeddingType position_embedding_type;
     bool position_shift_enabled;
 
+    int chunked_attention_size;
     int attention_mask_stride;
     int max_attention_window_size;
     int cyclic_attention_window_size;
@@ -237,10 +238,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.beam_width = generationsParams.beam_width;
     // Speculative decoding mode has generation input_length > 1.
     xqaParams.generation_input_length = generationsParams.input_seq_length;
-    if(mAttentionChunkSize)
-    {
-        xqaParams.chunked_attention_size = *mAttentionChunkSize;
-    }
+    xqaParams.chunked_attention_size = mAttentionChunkSize ? *mAttentionChunkSize : INT_MAX;
     xqaParams.max_attention_window_size = generationsParams.max_attention_window_size;
     xqaParams.cyclic_attention_window_size = generationsParams.cyclic_attention_window_size;
     xqaParams.max_blocks_per_sequence = generationsParams.max_blocks_per_sequence;
@@ -566,6 +564,16 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.cache_indir = input_params.cache_indir;
     params.batch_size = input_params.inference_batch_size;
     params.beam_width = input_params.beam_width;
+    if (input_params.chunked_attention_size > 0)
+    {
+        TLLM_CHECK_WITH_INFO((input_params.chunked_attention_size & (input_params.chunked_attention_size - 1)) == 0,
+            "Attention chunk size should be a power of 2.");
+        params.chunked_attention_size_log2 = std::log2(input_params.chunked_attention_size);
+    }
+    else
+    {
+        params.chunked_attention_size_log2 = 0;
+    }
     params.max_attention_window_size = input_params.max_attention_window_size;
     params.cyclic_attention_window_size = input_params.cyclic_attention_window_size;
     params.sink_token_length = input_params.sink_token_length;
@@ -2179,6 +2187,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.size_per_head = getHeadSize();
     dispatch_params.rotary_embedding_dim = mRotaryEmbeddingDim;
     dispatch_params.position_embedding_type = mPositionEmbeddingType;
+    dispatch_params.chunked_attention_size = mAttentionChunkSize ? *mAttentionChunkSize : 0;
     dispatch_params.max_attention_window_size = params.max_attention_window_size;
     dispatch_params.cyclic_attention_window_size = params.cyclic_attention_window_size;
     dispatch_params.sink_token_length = isCrossAttention() ? 0 : params.sink_token_length;
