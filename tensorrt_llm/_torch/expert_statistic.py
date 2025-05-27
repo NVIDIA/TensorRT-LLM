@@ -63,6 +63,8 @@ class ExpertStatistic:
                 f'[ExpertStatistic] Rank={self.rank_id}, saving iter={iter_id}, start={self.start}, stop={self.stop}'
             )
             path = os.environ.get('EXPERT_STATISTIC_PATH', 'expert_statistic')
+            if not os.path.exists(path):
+                os.makedirs(path, exist_ok=True)
             filename = f'rank_{self.rank_id}.pkl'
             full_filename = os.path.join(path, filename)
             with open(full_filename, 'wb') as f:

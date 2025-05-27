@@ -1,19 +1,28 @@
-# Expert Parallelism Load Balancer
+# Expert Parallelism Load Balancer (EPLB)
 
-## Offline (Static) EP Load Balancer
+Effective load balancing is crucial when leveraging large-scale expert parallelism. As described in the [DeepSeek-V3 paper](https://arxiv.org/abs/2412.19437), redundant experts can be introduced to rebalance the workload across GPUs. This mechanism is known as the Expert Parallelism Load Balancer ([EPLB](https://github.com/deepseek-ai/EPLB)).
 
-Run the model on a target dataset, e.g., GSM8K. At the same time, enable counting the routed expert ids during the model inference. The statistic data will be dumped when the counting finishes.
+> **Note:** Currently, only the offline EP load balancer is supported.
+
+## Offline EP Load Balancer
+
+### Step 1: Run Inference and Collect Statistics
+
+To generate the necessary statistics for load balancing, run your model on a target dataset (e.g., GSM8K) while counting the routed expert IDs during inference. Once counting is complete, the statistics will be saved for further processing.
+
+Set up some environment variables:
 
 ```bash
 export MODEL_PATH=<YOUR_MODEL_PATH>
 # Set the expert statistic data path
 export EXPERT_STATISTIC_PATH=./expert_statistic
-# Enable counting routed expert ids from iteration 50 to iteration 100
+# Enable counting of routed expert IDs from iteration 50 to iteration 100
 export EXPERT_STATISTIC_ITER_RANGE=50-100
+```
 
-mkdir -p $EXPERT_STATISTIC_PATH
+Prepare a configuration file and run inference on GSM8K:
 
-# Prepare a config file and run inference on GSM8K
+```bash
 cat > ./extra_llm_api_options.yaml <<EOF
 enable_attention_dp: true
 pytorch_backend_config:
@@ -27,7 +36,11 @@ trtllm-eval --model $MODEL_PATH \
     --backend pytorch gsm8k
 ```
 
-You may check the dumped statstic files in `$EXPERT_STATISTIC_PATH`. Then, use [`generate_eplb_config.py`](./generate_eplb_config.py) to read the dumped statistics and convert to an EPLB config file. Please also specify the expert parallelism size (`--ep_size`) and the number of total slots (`--num_slots`) that will be used in EPLB deployment.
+After inference, review the dumped statistic files in `$EXPERT_STATISTIC_PATH`.
+
+### Step 2: Generate the EPLB Configuration
+
+Use the provided [`generate_eplb_config.py`](./generate_eplb_config.py) script to convert the collected statistics into an EPLB configuration file. Specify the expert parallelism size (`--ep_size`) and the total number of slots (`--num_slots`) that will be used for deployment:
 
 ```bash
 python generate_eplb_config.py \
@@ -37,13 +50,17 @@ python generate_eplb_config.py \
     --output_path ./moe_load_balancer.yaml
 ```
 
-Disable counting the routed expert ids, and run inference with EPLB configuration.
+### Step 3: Run Inference with the EPLB Configuration
+
+Disable the expert ID counting by unsetting the environment variable:
 
 ```bash
-# Disable counting routed expert ids
 unset EXPERT_STATISTIC_ITER_RANGE
+```
 
-# Prepare a config file with EPLB config and run inference on GSM8K
+Prepare a new configuration file that incorporates the generated EPLB configuration, then run inference on GSM8K:
+
+```bash
 cat > ./extra_llm_api_options_eplb.yaml <<EOF
 enable_attention_dp: true
 pytorch_backend_config:
@@ -52,8 +69,8 @@ pytorch_backend_config:
 EOF
 
 trtllm-eval --model $MODEL_PATH \
-    --tp_size 2 \
-    --ep_size 2 \
+    --tp_size 8 \
+    --ep_size 8 \
     --extra_llm_api_options ./extra_llm_api_options_eplb.yaml \
     --backend pytorch gsm8k
 ```
