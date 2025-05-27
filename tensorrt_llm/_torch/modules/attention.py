@@ -52,12 +52,12 @@ class Attention(nn.Module):
                  max_position_embeddings: int,
                  bias: bool,
                  pos_embd_params: Optional[PositionalEmbeddingParams] = None,
+                 enable_fused_rope: Optional[bool] = None,
+                 qk_norm_type: QkNormType = QkNormType.none,
                  layer_idx: Optional[int] = None,
                  dtype: torch.dtype = None,
                  dense_bias: Optional[bool] = None,
                  config: Optional[ModelConfig] = None,
-                 qk_norm_type: QkNormType = QkNormType.none,
-                 fuse_qk_norm_rope: bool = False,
                  q_scaling: float = 1.0,
                  attention_chunk_size: Optional[int] = None):
         """
@@ -70,12 +70,12 @@ class Attention(nn.Module):
             max_position_embeddings (int): The maximum position embeddings.
             bias (bool): Whether to use bias in the linear layers.
             pos_embd_params (PositionalEmbeddingParams): The positional embedding parameters.
+            enable_fused_rope (bool): If true, fuse RoPE into the self.attn.forward rather than in self.apply_rope. By default (None), Attention will try to enable fused RoPE if supported by the attention backend.
+            qk_norm_type (QkNormType): The type of QK normalization.
             layer_idx (int): The layer index.
             dtype (torch.dtype): The data type.
             dense_bias (bool): Whether to use bias in the output projection layer.
             config (ModelConfig): The model configuration.
-            qk_norm_type (QkNormType): The type of QK normalization.
-            fuse_qk_norm_rope (bool): Whether to fuse QK normalization and RoPE.
             q_scaling (float): The scaling factor for the qk_scale. The definition is $O = softmax(QK^T * qk_scale) * V, qk_scale = 1 / (sqrt(head_dim) * q_scaling)$. The default value is 1.0.
             attention_chunk_size (int): See [Chunked Attention] below.
         """
@@ -181,20 +181,11 @@ class Attention(nn.Module):
         self.pos_embd_params = pos_embd_params
         self.qk_norm_type = qk_norm_type
 
-        support_qk_norm_rope = self.qk_norm_type == QkNormType.pre_rope and fuse_qk_norm_rope
-        support_rope_in_attn = attn_cls.support_fused_rope(
-        ) and qk_norm_type != QkNormType.post_rope
-
-        self.rope_location = RopeLocation.none
-        if self.pos_embd_params is not None:
-            if support_qk_norm_rope:
-                self.rope_location = RopeLocation.qk_norm_rope
-            elif support_rope_in_attn:
-                self.rope_location = RopeLocation.attn
-            else:
-                self.rope_location = RopeLocation.rotary_emb
-
-        if self.rope_location == RopeLocation.rotary_emb:
+        if enable_fused_rope is None:
+            enable_fused_rope = attn_cls.support_fused_rope(
+            ) and qk_norm_type != QkNormType.post_rope
+        self.enable_fused_rope = enable_fused_rope
+        if not self.enable_fused_rope:
             self.rotary_emb = RotaryEmbedding(
                 pos_embd_params.rope,
                 head_dim=self.head_dim,
@@ -208,7 +199,7 @@ class Attention(nn.Module):
             self.head_dim,
             self.num_key_value_heads,
             pos_embd_params=self.pos_embd_params
-            if self.rope_location == RopeLocation.attn else None,
+            if self.enable_fused_rope else None,
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
@@ -280,20 +271,9 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-        if self.rope_location == RopeLocation.qk_norm_rope:
-            qkv = self.apply_qk_norm_rope(qkv, position_ids)
-            q, k, v = self.convert_qkv(qkv, None, None)
-        else:
-            q, k, v = qkv, None, None
-            if self.qk_norm_type == QkNormType.pre_rope:
-                q, k, v = self.split_qkv(q, k, v)
-                q, k = self.apply_qk_norm(q, k)
-            if self.rope_location == RopeLocation.rotary_emb and position_ids is not None:
-                q, k, v = self.split_qkv(q, k, v)
-                q, k = self.rotary_emb(position_ids, [q, k])
-                if self.qk_norm_type == QkNormType.post_rope:
-                    q, k = self.apply_qk_norm(q, k)
-            q, k, v = self.convert_qkv(q, k, v)
+        q, k, v = self.apply_rope(qkv, position_ids)
+
+        q, k, v = self.convert_qkv(q, k, v)
 
         out_scale = None
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
@@ -320,10 +300,28 @@ class Attention(nn.Module):
             f"QK norm is not implemented for {self.__class__.__name__}."
             "Please override the `apply_qk_norm` method in the subclass.")
 
-    def apply_qk_norm_rope(self, qkv, position_ids):
-        raise NotImplementedError(
-            f"QK norm is not implemented for {self.__class__.__name__}."
-            "Please override the `apply_qk_norm_rope` method in the subclass.")
+    def apply_rope(self, qkv: torch.Tensor, position_ids: torch.Tensor):
+        """
+        Apply RoPE to the query and key, possibly including QK norm.
+        Args:
+            qkv (torch.Tensor): The query, key, and value tensor.
+            position_ids (torch.Tensor): The position IDs of each token for RoPE.
+        Returns:
+            tuple: A tuple of (q, k, v).
+            This method could be overridden in the subclass, it is possible that k/v is None and q is the concatenated qkv tensor, up to the implementation.
+            Before self.attn.forward, convert_qkv will be called to make sure that the format of (q, k, v) satisfies the requirement of self.attn.
+        """
+        q, k, v = qkv, None, None
+        if self.qk_norm_type == QkNormType.pre_rope:
+            q, k, v = self.split_qkv(q, k, v)
+            q, k = self.apply_qk_norm(q, k)
+        if not self.enable_fused_rope and position_ids is not None:
+            q, k, v = self.split_qkv(q, k, v)
+            q, k = self.rotary_emb(position_ids, [q, k])
+            if self.qk_norm_type == QkNormType.post_rope:
+                q, k = self.apply_qk_norm(q, k)
+
+        return q, k, v
 
 
 def extract_extra_attrs(layer_idx: str):
