@@ -876,6 +876,114 @@ def getSSHConnectionPorts(portConfigFile, stageName)
     return [userPort, monitorPort]
 }
 
+def rerunFailedTests(stageName, llmSrc, testCmdLine) {
+    if (!fileExists("${WORKSPACE}/${stageName}/results.xml")) {
+        error "There is not results.xml file, skip the rerun step"
+    }
+
+    // Generate rerun test lists
+    def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
+    sh """
+        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        generate_rerun_tests_list \
+        --output-dir=${WORKSPACE}/${stageName}/ \
+        --input-file=${WORKSPACE}/${stageName}/results.xml \
+        --fail-signatures='${failSignaturesList}'
+    """
+
+    // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
+    // fail the stage immediately without attempting any reruns
+    rerunTestList = "${WORKSPACE}/${stageName}/rerun_0.txt"
+    if (fileExists(rerunTestList)) {
+        sh "cat ${rerunTestList}"
+        error "There are some failed tests that cannot be rerun, skip the rerun step."
+    }
+
+    // If the stage has more than 5 failed tests, skip the rerun step
+    def validLineCount = 0
+    for (times in [1, 2]) {
+        rerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
+        if (fileExists(rerunTestList)) {
+            count = sh(
+                script: "grep -v '^[[:space:]]*\$' ${rerunTestList} | wc -l",
+                returnStdout: true
+            ).trim().toInteger()
+            echo "Found ${count} tests to rerun ${times} time(s)"
+            validLineCount += count
+        }
+    }
+    if (validLineCount > 5) {
+        error "There are more than 5 failed tests, skip the rerun step."
+    }
+
+    // Rerun tests
+    isRerunFailed = false
+    for (times in [1, 2]) {
+        rerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
+        if (!fileExists(rerunTestList)) {
+            echo "No failed tests need to be rerun ${times} time(s)"
+            continue
+        }
+        sh "cat ${rerunTestList}"
+        xmlFile = "${WORKSPACE}/${stageName}/rerun_results_${times}.xml"
+        // change the testCmdLine for rerun
+        noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--waives-file", "--cov"]
+        needToChangeLine = ["--test-list", "--csv", "--junit-xml"]
+        testCmdLine = testCmdLine.findAll { cmd ->
+            !noNeedLine.any { line -> cmd.contains(line) } && !needToChangeLine.any { line -> cmd.contains(line) }
+        }
+        testCmdLine += [
+            "--test-list=${rerunTestList}",
+            "--csv=${WORKSPACE}/${stageName}/rerun_report_${times}.csv",
+            "--junit-xml ${xmlFile}",
+            "--reruns ${times - 1}"
+        ]
+        try {
+            sh """
+                cd ${llmSrc}/tests/integration/defs && \
+                ${testCmdLine.join(" ")}
+            """
+        } catch(InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            if (!fileExists(xmlFile)) {
+                echo "The tests crashed when rerun attempt."
+                throw e
+            }
+            echo "The tests still failed after rerun attempt."
+            isRerunFailed = true
+        }
+    }
+
+    // generate rerun report
+    inputFiles = ["${WORKSPACE}/${stageName}/results.xml",
+                  "${WORKSPACE}/${stageName}/rerun_results_1.xml",
+                  "${WORKSPACE}/${stageName}/rerun_results_2.xml"]
+    sh """
+        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        generate_rerun_report \
+        --output-file=${WORKSPACE}/${stageName}/rerun_results.xml \
+        --input-files=${inputFiles.join(",")}
+    """
+
+    // Update original results xml file with rerun results xml files for junit
+    sh """
+        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        merge_junit_xmls \
+        --output-file=${WORKSPACE}/${stageName}/results.xml \
+        --input-files=${inputFiles.join(",")} \
+        --deduplicate
+    """
+
+    trtllm_utils.uploadArtifacts(
+        "${WORKSPACE}/${stageName}/rerun_results.html",
+        "${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
+    )
+
+    echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
+    return isRerunFailed
+}
+
 def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
 {
     // Step 1: create LLM_ROOT dir
@@ -1101,16 +1209,21 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
                 sh "env | sort"
-                trtllm_utils.llmExecStepWithRetry(
-                    pipeline,
-                    numRetries: 1,
-                    script: """
+                try {
+                    sh """
                         rm -rf ${stageName}/ && \
                         cd ${llmSrc}/tests/integration/defs && \
                         ${testCmdLine.join(" ")}
-                    """,
-                    retryLog: "stageName = ${stageName}, HOST_NODE_NAME = ${env.HOST_NODE_NAME}"
-                )
+                    """
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
+                    if (isRerunFailed) {
+                        echo "The tests still failed after rerun attempt."
+                        throw e
+                    }
+                }
             }
         }
 
