@@ -23,16 +23,6 @@ from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
 
-class RopeLocation(IntEnum):
-    """
-    Possible locations where RoPE can be applied.
-    """
-    none = 0  # No RoPE
-    rotary_emb = 1  # Perform RoPE in Attention.rotary_emb.forward
-    attn = 2  # Perform RoPE in Attention.attn.forward
-    qk_norm_rope = 3  # Perform RoPE in Attention.apply_qk_norm_rope
-
-
 class QkNormType(IntEnum):
     """
     The type of QK normalization.
