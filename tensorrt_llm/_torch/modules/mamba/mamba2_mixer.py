@@ -193,148 +193,122 @@ class Mamba2Mixer(nn.Module):
         xbc_p, xbc_d = torch.split(xbc, seqlen_split_size, dim=0)
         dt_p, dt_d = torch.split(dt, seqlen_split_size, dim=0)
 
-        # a batch can have either:
-        # * only context requests
-        # * only generation requests
-        # * both context and generation requests
-        # req_type = 0 -> context
-        # req_type = 1 -> generation
-        batch = None
-        # both context and generation requests
-        if num_prefills > 0 and num_decodes > 0:
-            batch = [0, 1]
-        # only context requests
-        elif num_prefills > 0:
-            batch = [0]
-        # only generation requests
-        elif num_decodes > 0:
-            batch = [1]
-
         out = []
-        for req_type in batch:
 
-            # prefill
-            if req_type == 0:
+        if num_prefills > 0:
 
-                cu_seqlens = (torch.cat(
-                    [
-                        torch.zeros(1,
-                                    device=attn_metadata.seq_lens_cuda.device),
-                        torch.cumsum(attn_metadata.seq_lens_cuda[:num_prefills],
-                                     dim=0)
-                    ],
-                    dim=0,
-                ).to(torch.int32).to(torch.device("cuda")))
+            cu_seqlens = (torch.cat(
+                [
+                    torch.zeros(1, device=attn_metadata.seq_lens_cuda.device),
+                    torch.cumsum(attn_metadata.seq_lens_cuda[:num_prefills],
+                                 dim=0)
+                ],
+                dim=0,
+            ).to(torch.int32).to(torch.device("cuda")))
 
-                seq_idx = torch.repeat_interleave(
-                    torch.arange(num_prefills,
-                                 dtype=torch.int32,
-                                 device=cu_seqlens.device),
-                    attn_metadata.seq_lens_cuda[:num_prefills],
-                    output_size=num_prefill_tokens).unsqueeze(0)
+            seq_idx = torch.repeat_interleave(
+                torch.arange(num_prefills,
+                             dtype=torch.int32,
+                             device=cu_seqlens.device),
+                attn_metadata.seq_lens_cuda[:num_prefills],
+                output_size=num_prefill_tokens).unsqueeze(0)
 
-                xbc_p = causal_conv1d_fn(
-                    xbc_p.transpose(0, 1),
-                    self.conv1d.weight,
-                    self.conv1d.bias,
-                    activation="silu",
-                    conv_states=conv_states,
-                    query_start_loc=cu_seqlens,
-                    cache_indices=state_indices_p).transpose(0, 1)
+            xbc_p = causal_conv1d_fn(xbc_p.transpose(0, 1),
+                                     self.conv1d.weight,
+                                     self.conv1d.bias,
+                                     activation="silu",
+                                     conv_states=conv_states,
+                                     query_start_loc=cu_seqlens,
+                                     cache_indices=state_indices_p).transpose(
+                                         0, 1)
 
-                x_p, B_p, C_p = torch.split(xbc_p.unsqueeze(0), [
+            x_p, B_p, C_p = torch.split(xbc_p.unsqueeze(0), [
+                self.tp_d_inner,
+                self.tp_ngroups * self.d_state,
+                self.tp_ngroups * self.d_state,
+            ],
+                                        dim=-1)
+
+            x_p = rearrange(x_p, "b l (h p) -> b l h p", h=self.tp_nheads)
+            dt_p = dt_p.unsqueeze(0)
+            B_p = rearrange(B_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
+            C_p = rearrange(C_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
+            z_p = rearrange(z_p.unsqueeze(0),
+                            "b l (h p) -> b l h p",
+                            h=self.tp_nheads)
+
+            y, current_ssm_states = mamba_chunk_scan_combined(
+                x_p,
+                dt_p,
+                self.A,
+                B_p,
+                C_p,
+                chunk_size=self.chunk_size,
+                D=self.D,
+                z=z_p,
+                dt_bias=self.dt_bias,
+                initial_states=None,
+                dt_softplus=self.delta_softplus,
+                cu_seqlens=cu_seqlens,
+                seq_idx=seq_idx,
+                return_varlen_states=True,
+                return_final_states=False,
+            )
+            out.append(rearrange(y, "b l h p -> (b l) (h p)"))
+
+            # copy new ssm state
+            if not is_warmup:
+                ssm_states[state_indices_p] = current_ssm_states
+
+        if num_decodes > 0:
+            xbc_d = causal_conv1d_update(xbc_d,
+                                         conv_states,
+                                         self.conv1d.weight,
+                                         self.conv1d.bias,
+                                         activation="silu",
+                                         conv_state_indices=state_indices_d)
+
+            x_d, B_d, C_d = torch.split(
+                xbc_d,
+                [
                     self.tp_d_inner,
                     self.tp_ngroups * self.d_state,
                     self.tp_ngroups * self.d_state,
                 ],
-                                            dim=-1)
+                dim=-1,
+            )
 
-                x_p = rearrange(x_p, "b l (h p) -> b l h p", h=self.tp_nheads)
-                dt_p = dt_p.unsqueeze(0)
-                B_p = rearrange(B_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
-                C_p = rearrange(C_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
-                z_p = rearrange(z_p.unsqueeze(0),
-                                "b l (h p) -> b l h p",
-                                h=self.tp_nheads)
+            x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
+            dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
+            B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
+            C_d = rearrange(C_d, "b (g n) -> b g n", g=self.tp_ngroups)
+            z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
 
-                y, current_ssm_states = mamba_chunk_scan_combined(
-                    x_p,
-                    dt_p,
-                    self.A,
-                    B_p,
-                    C_p,
-                    chunk_size=self.chunk_size,
-                    D=self.D,
-                    z=z_p,
-                    dt_bias=self.dt_bias,
-                    initial_states=None,
-                    dt_softplus=self.delta_softplus,
-                    cu_seqlens=cu_seqlens,
-                    seq_idx=seq_idx,
-                    return_varlen_states=True,
-                    return_final_states=False,
-                )
-                y = rearrange(y, "b l h p -> (b l) (h p)")
+            A = repeat(self.A, "h -> h p n", p=self.head_dim,
+                       n=self.d_state).to(dtype=torch.float32)
+            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
+            D = repeat(self.D, "h -> h p", p=self.head_dim)
 
-                # copy new ssm state
-                if not is_warmup:
-                    ssm_states[state_indices_p] = current_ssm_states
+            y = selective_state_update(
+                ssm_states,
+                x_d,
+                dt_d,
+                A,
+                B_d,
+                C_d,
+                D,
+                z=z_d,
+                dt_bias=dt_bias,
+                dt_softplus=self.delta_softplus,
+                state_batch_indices=state_indices_d,
+            )
 
-            # decode
-            else:
-                xbc_d = causal_conv1d_update(xbc_d,
-                                             conv_states,
-                                             self.conv1d.weight,
-                                             self.conv1d.bias,
-                                             activation="silu",
-                                             conv_state_indices=state_indices_d)
-
-                x_d, B_d, C_d = torch.split(
-                    xbc_d,
-                    [
-                        self.tp_d_inner,
-                        self.tp_ngroups * self.d_state,
-                        self.tp_ngroups * self.d_state,
-                    ],
-                    dim=-1,
-                )
-
-                x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
-                dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
-                B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
-                C_d = rearrange(C_d, "b (g n) -> b g n", g=self.tp_ngroups)
-                z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
-
-                A = repeat(self.A,
-                           "h -> h p n",
-                           p=self.head_dim,
-                           n=self.d_state).to(dtype=torch.float32)
-                dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
-                D = repeat(self.D, "h -> h p", p=self.head_dim)
-
-                y = selective_state_update(
-                    ssm_states,
-                    x_d,
-                    dt_d,
-                    A,
-                    B_d,
-                    C_d,
-                    D,
-                    z=z_d,
-                    dt_bias=dt_bias,
-                    dt_softplus=self.delta_softplus,
-                    state_batch_indices=state_indices_d,
-                )
-
-                y = rearrange(y, "b h p -> b (h p)")
-
-            # gated norm
-            y = self.norm(y)
-
-            # append output
-            out.append(y)
+            out.append(rearrange(y, "b h p -> b (h p)"))
 
         out = torch.cat(out, dim=0)
+
+        # norm
+        out = self.norm(out)
 
         # out_proj
         out = self.out_proj(out)
