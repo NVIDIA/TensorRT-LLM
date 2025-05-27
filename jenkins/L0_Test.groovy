@@ -72,11 +72,6 @@ def BUILD_CONFIGS = [
 
 BUILD_JOBS = "8"
 
-SLURM_CORES_REQUEST = "1"
-SLURM_CORES_LIMIT = "1"
-SLURM_MEMORY_REQUEST = "8Gi"
-SLURM_MEMORY_LIMIT = "12Gi"
-
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 
