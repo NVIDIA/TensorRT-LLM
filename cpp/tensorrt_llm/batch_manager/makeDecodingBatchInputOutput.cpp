@@ -120,9 +120,8 @@ std::pair<std::vector<SizeType32>, std::vector<SizeType32>> getActiveSlots(
 
 } // namespace
 
-std::tuple<std::unique_ptr<tr::decoder_batch::Input>, std::unique_ptr<tr::decoder_batch::Output>>
-MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
-    DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
+std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests,
+    RequestVector const& generationRequests, DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
     runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
     OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
 {
@@ -156,10 +155,8 @@ MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, R
         decodingInput->eagleLastInputs = fusedRuntimeBuffers->mEagleBuffers->engineInputs;
     }
 
-    auto decodingOutput = std::make_unique<tr::decoder_batch::Output>();
-
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return {std::move(decodingInput), std::move(decodingOutput)};
+    return decodingInput;
 }
 
 } // namespace tensorrt_llm::batch_manager

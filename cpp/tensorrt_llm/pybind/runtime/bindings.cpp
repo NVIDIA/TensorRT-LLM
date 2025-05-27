@@ -278,8 +278,6 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("generation_steps", &tr::decoder_batch::Input::generationSteps)
         .def_readwrite("predicted_draft_logits", &tr::decoder_batch::Input::predictedDraftLogits);
 
-    py::class_<tr::decoder_batch::Output>(m, "DecoderBatchOutput").def(py::init());
-
     py::class_<tr::LookaheadDecodingBuffers>(m, "LookaheadDecodingBuffers")
         .def(py::init<tr::SizeType32, tr::SizeType32, tr::BufferManager const&>(), py::arg("max_num_sequences"),
             py::arg("max_tokens_per_step"), py::arg("buffer_manager"))
@@ -388,8 +386,7 @@ void initBindings(pybind11::module_& m)
         .def(py::init<tr::GptDecoderBatched::CudaStreamPtr>(), py::arg("stream"))
         .def("setup", &tr::GptDecoderBatched::setup, py::arg("mode"), py::arg("max_batch_size"),
             py::arg("max_beam_width"), py::arg("dtype"), py::arg("model_config"), py::arg("world_config"))
-        .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("decoder_state"), py::arg("output"),
-            py::arg("input"))
+        .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("decoder_state"), py::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
         .def_property_readonly(
             "decoder_stream",

@@ -47,11 +47,11 @@ public:
 
     MakeDecodingBatchInputOutput() = default;
 
-    std::tuple<std::unique_ptr<runtime::decoder_batch::Input>, std::unique_ptr<runtime::decoder_batch::Output>>
-    operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
-        DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
-        runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig,
-        SizeType32 maxNumSequences, OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
+    std::unique_ptr<runtime::decoder_batch::Input> operator()(RequestVector const& contextRequests,
+        RequestVector const& generationRequests, DecoderBuffers& decoderBuffers,
+        DecoderInputBuffers const& inputBuffers, runtime::decoder::DecoderState& decoderState,
+        runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
+        OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
 
     [[nodiscard]] static std::unique_ptr<runtime::decoder_batch::Input> createDecoderBatchInputs(
         std::vector<SizeType32> const& activeSlots, runtime::decoder::DecoderState const& decoderState,

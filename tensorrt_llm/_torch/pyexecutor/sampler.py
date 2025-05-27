@@ -624,7 +624,7 @@ class TRTLLMSampler(Sampler):
 
         self.store["decoder_input_buffers"].logits = decoder_buffer_logits
 
-        decoding_input, self.decoding_output = self.algs.make_decoding_batch_input_output(
+        decoding_input = self.algs.make_decoding_batch_input_output(
             scheduled_requests.context_requests,
             scheduled_requests.generation_requests,
             self.store["decoder_buffers"], self.store["decoder_input_buffers"],
@@ -632,7 +632,7 @@ class TRTLLMSampler(Sampler):
             self.max_num_sequences)
 
         self.algs.decoder.forward_async(self.store["decoder_state"],
-                                        self.decoding_output, decoding_input)
+                                        decoding_input)
 
         # NOTE: The following code prepares a new_tokens_device_tensor in accordance with the
         #       current implementation of model_engine.

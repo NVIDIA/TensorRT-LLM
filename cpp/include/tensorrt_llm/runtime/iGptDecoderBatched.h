@@ -93,14 +93,6 @@ public:
     std::optional<EagleBuffers::Inputs> eagleLastInputs;
 };
 
-class Output
-{
-public:
-    using TensorPtr = std::shared_ptr<ITensor>;
-
-    Output() = default;
-};
-
 } // namespace decoder_batch
 
 //! GPT decoder class with support for in-flight batching
@@ -121,14 +113,10 @@ public:
     virtual void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots) = 0;
 
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
-    virtual CudaEvent forwardAsync(
-        decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input)
-        = 0;
+    virtual CudaEvent forwardAsync(decoder::DecoderState const& decoderState, decoder_batch::Input const& input) = 0;
 
     //! @brief Run one step for all requests and wait for completion on the host.
-    virtual void forward(
-        decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input)
-        = 0;
+    virtual void forward(decoder::DecoderState const& decoderState, decoder_batch::Input const& input) = 0;
 
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned

@@ -1,11 +1,10 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List
 
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm.bindings.internal.runtime import (DecoderBatchInput,
-                                                    DecoderBatchOutput)
+from tensorrt_llm.bindings.internal.runtime import DecoderBatchInput
 
 
 @dataclass
@@ -86,11 +85,15 @@ class MakeDecodingBatchInputOutput:
         return decoding_input
 
     def __call__(
-            self, context_requests: List[LlmRequest],
-            generation_requests: List[LlmRequest], decoder_buffers,
-            decoder_input_buffers, decoder_state, model_config,
-            max_num_sequences: int
-    ) -> Tuple[DecoderBatchInput, DecoderBatchOutput]:
+        self,
+        context_requests: List[LlmRequest],
+        generation_requests: List[LlmRequest],
+        decoder_buffers,
+        decoder_input_buffers,
+        decoder_state,
+        model_config,
+        max_num_sequences: int,
+    ) -> DecoderBatchInput:
         """Create decoder batch inputs and outputs for the given requests.
 
         Args:
@@ -104,7 +107,7 @@ class MakeDecodingBatchInputOutput:
             fused_runtime_buffers: Optional fused runtime buffers
 
         Returns:
-            Tuple of (DecoderBatchInput, DecoderBatchOutput)
+            DecoderBatchInput
         """
         # Get active slots and generation steps
         active_slots = []
@@ -150,7 +153,4 @@ class MakeDecodingBatchInputOutput:
         #     decoding_input.eagle_inputs = fused_runtime_buffers.eagle_buffers.engine_outputs
         #     decoding_input.eagle_last_inputs = fused_runtime_buffers.eagle_buffers.engine_inputs
 
-        # Create decoder batch output
-        decoding_output = DecoderBatchOutput()
-
-        return decoding_input, decoding_output
+        return decoding_input
