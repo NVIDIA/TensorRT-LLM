@@ -39,6 +39,7 @@ from ..compilation.backend import Backend
 from ..compilation.utils import set_enable_piecewise_cuda_graph_capture_flag
 from ..distributed import MPIDist
 from ..distributed.communicator import init_pp_comm
+from ..expert_statistic import ExpertStatistic
 from ..metadata import KVCacheParams
 from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..models import AutoModelForCausalLM
@@ -300,6 +301,7 @@ class PyTorchModelEngine(ModelEngine):
         if mapping.has_pp():
             init_pp_comm(mapping)
         self.dist = dist
+        ExpertStatistic.create(self.dist.rank)
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
@@ -828,6 +830,10 @@ class PyTorchModelEngine(ModelEngine):
         Get a CUDA graph runner or return None (e.g. if CUDA graphs are disabled
         or if the batch size is too big).
         """
+        # disable when doing statistic
+        if ExpertStatistic.set_iter(self.iter_counter):
+            return None
+
         spec_max_draft_tokens = spec_config.max_draft_tokens if self.is_spec_decode else 0
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = len(batch.generation_requests)

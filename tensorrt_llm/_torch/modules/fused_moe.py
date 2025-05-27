@@ -19,6 +19,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
+from ..expert_statistic import ExpertStatistic
 from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                      reswizzle_sf, swizzle_sf, unswizzle_sf)
@@ -936,10 +937,11 @@ class FusedMoE(nn.Module):
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
+        self.layer_idx = layer_idx
         moe_load_balancer_config = model_config.moe_load_balancer
         if moe_load_balancer_config is None:
             assert moe_load_balancer is None
-            # A dummy MoeLoadBalancerConfig to generate default initial_global_assignments and initial_local_expert_ids
+            # A dummy MoeLoadBalancerConfig to generate default initial_global_assignments
             moe_load_balancer_config = MoeLoadBalancerConfig()
             moe_load_balancer_config.setup(num_experts=num_experts,
                                            ep_rank=self.ep_rank,
@@ -1408,6 +1410,8 @@ class FusedMoE(nn.Module):
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
             router_logits)
+        ExpertStatistic.set_layer(self.layer_idx)
+        ExpertStatistic.maybe_add_info(self.num_experts, token_selected_experts)
         if self.balancer_layer is None:
             token_selected_slots = token_selected_experts
         else:
