@@ -785,8 +785,8 @@ def collectTestResults(pipeline, testFilter)
 
                 sh "cd cov && coverage combine"
                 sh "cd cov && find . -type f"
-                sh "cd cov && coverage report"
-                sh "cd cov && coverage html -d test_coverage_html"
+                sh "cd cov && coverage report -i"   // -i: ignore errors. Ignore the error that the source code file cannot be found.
+                sh "cd cov && coverage html -d test_coverage_html -i"
                 trtllm_utils.uploadArtifacts("cov/test_coverage_html/*", "${UPLOAD_PATH}/test-results/coverage-report/")
                 echo "Test coverage report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/coverage-report/index.html"
             } // Test coverage
