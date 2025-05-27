@@ -449,7 +449,7 @@ pipeline {
                 }
             }
         }
-        stage("Sanity check") {
+        stage("Upload Artifacts") {
             steps {
                 script {
                     String imageKeyToTagJson = writeJSON returnText: true, json: imageKeyToTag
