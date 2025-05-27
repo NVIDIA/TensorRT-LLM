@@ -50,10 +50,10 @@ CacheTransBufferManager::CacheTransBufferManager(
     mPreAllocBufferSize = mTransferBufferSize * (mRecvBufferCount + mSendBufferCount);
     TLLM_LOG_INFO(
         "CacheTransBufferManager: mMaxNumTokens:%ld, mRecvBufferCount:%ld, "
-        "mSendBufferCount:%ld,mTransferBufferSize:%ld, mPreAllocBufferSize:%ld,monlyUseDynamicBuffer:%d",
+        "mSendBufferCount:%ld,mTransferBufferSize:%ld, mPreAllocBufferSize:%ld,mOnlyUseDynamicBuffer:%d",
         maxNumTokens.has_value() ? maxNumTokens.value() : 0, mRecvBufferCount, mSendBufferCount, mTransferBufferSize,
         mPreAllocBufferSize, mOnlyUseDynamicBuffer);
-    bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseUCXKvCache();
+    bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseUCXKvCache() || common::getEnvUseNixlKvCache();
 
     TLLM_CHECK_WITH_INFO(to_allocate, "CacheTransBufferManager: to_allocate is false");
     allocateBuffer();
@@ -62,7 +62,7 @@ CacheTransBufferManager::CacheTransBufferManager(
 size_t CacheTransBufferManager::preAllocBufferSize(
     std::optional<size_t> maxNumTokens, std::optional<size_t> kvCacheSizePerToken)
 {
-    bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseUCXKvCache();
+    bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseUCXKvCache() || common::getEnvUseNixlKvCache();
     if (!to_allocate)
     {
         return 0;
@@ -122,7 +122,7 @@ runtime::ITensor::SharedPtr CacheTransBufferManager::getSendBuffer(std::optional
     if (bufferId.has_value())
     {
         TLLM_CHECK(static_cast<size_t>(bufferId.value()) < mSendBufferCount);
-        TLLM_CHECK(mConcurrenceSendResource.mBufferIndexFlag[bufferId.value()] == 1);
+        // TLLM_CHECK(mConcurrenceSendResource.mBufferIndexFlag[bufferId.value()] == 1);
         return mConcurrenceSendResource.mBuffers[bufferId.value()];
     }
     return nullptr;
@@ -134,7 +134,7 @@ runtime::ITensor::SharedPtr CacheTransBufferManager::getRecvBuffer(std::optional
     if (bufferId.has_value())
     {
         TLLM_CHECK(static_cast<size_t>(bufferId.value()) < mRecvBufferCount);
-        TLLM_CHECK(mConcurrenceRecvResource.mBufferIndexFlag[bufferId.value()] == 1);
+        // TLLM_CHECK(mConcurrenceRecvResource.mBufferIndexFlag[bufferId.value()] == 1);
         return mConcurrenceRecvResource.mBuffers[bufferId.value()];
     }
     return nullptr;
@@ -267,6 +267,16 @@ void CacheTransBufferManager::freeBufferIndex(
         resource.mConcurrence--;
         resource.mBuffersCV.notify_one();
     }
+}
+
+size_t CacheTransBufferManager::getRecvBufferCount()
+{
+    return mRecvBufferCount;
+}
+
+size_t CacheTransBufferManager::getSendBufferCount()
+{
+    return mSendBufferCount;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

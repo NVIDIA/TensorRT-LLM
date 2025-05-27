@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
+import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
 from .._utils import (KVCacheEventSerializer, global_mpi_rank, mpi_comm,
@@ -92,6 +93,16 @@ class ExecutorBindingsWorker(GenerationExecutor):
             processor_batched=batched_logits_processor, replicate=False)
 
         def _create_engine():
+            device_id = self.global_rank % torch.cuda.device_count()
+            torch.cuda.set_device(device_id)
+
+            # Make sure C++ executor would use same devices/ranks as py_executor
+            global_rank = global_mpi_rank()
+            comm_ranks = mpi_comm().allgather(global_rank)
+            device_ids = mpi_comm().allgather(device_id)
+            executor_config.parallel_config = tllm.ParallelConfig(
+                participant_ids=comm_ranks, device_ids=device_ids)
+
             if isinstance(engine, Engine):
                 return tllm.Executor(engine.engine,
                                      json.dumps(engine.config.to_dict(),
@@ -121,8 +132,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
 
-            device_id = self.global_rank % torch.cuda.device_count()
-            torch.cuda.set_device(device_id)
             return create_executor(**args)
 
         self.engine = _create_engine()
@@ -576,7 +585,11 @@ def worker_main(
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
+    BASE_ZMQ_CLASSES: Dict = serialization.BASE_ZMQ_CLASSES,
 ) -> None:
+    # The base classes for ZMQ serialization. Passed through from the parent process to ensure
+    # that children processes include any classes added at runtime (such as those from `register_approved_ipc_class`).
+    serialization.BASE_ZMQ_CLASSES = BASE_ZMQ_CLASSES
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
                         "green")
@@ -671,12 +684,11 @@ def worker_main(
         assert isinstance(proxy_result_queue, tuple)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
-                postproc_worker_main,
-                result_queues[i].address,
+                postproc_worker_main, result_queues[i].address,
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
-            )
+                serialization.BASE_ZMQ_CLASSES)
             postprocess_worker_futures.append(fut)
 
     # Error handling in the Worker/MPI process
@@ -705,6 +717,7 @@ def worker_main(
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
+        print_colored_debug(f"error: {traceback.format_exc()}", "red")
         if is_leader:
             request_error_queue.put(e)
         return

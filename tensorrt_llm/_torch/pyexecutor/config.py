@@ -1,13 +1,18 @@
+import json
 import math
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Union
+
+import yaml
 
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
 from ...builder import BuildConfig
 from ...logger import logger
 from ...mapping import Mapping
+from ..model_config import MoeLoadBalancerConfig
 from ..speculative import SpecConfig
 from .resource_manager import BaseResourceManager
 
@@ -49,6 +54,7 @@ class PyTorchConfig:
     # If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time.
     # If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used.
     moe_max_num_tokens: Optional[int] = None
+    moe_load_balancer: Optional[Union[MoeLoadBalancerConfig, dict, str]] = None
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
@@ -127,6 +133,22 @@ class PyTorchConfig:
                 self.cuda_graph_batch_sizes.append(
                     self.cuda_graph_max_batch_size)
 
+        if isinstance(self.moe_load_balancer, str):
+            assert os.path.exists(self.moe_load_balancer)
+            if self.moe_load_balancer.endswith(".json"):
+                with open(self.moe_load_balancer) as f:
+                    self.moe_load_balancer = json.load(f)
+            elif self.moe_load_balancer.endswith((".yaml", ".yml")):
+                with open(self.moe_load_balancer) as f:
+                    self.moe_load_balancer = yaml.safe_load(f)
+            else:
+                raise ValueError(
+                    f"Unsupported moe load balancer config file: {self.moe_load_balancer}"
+                )
+        if isinstance(self.moe_load_balancer, dict):
+            self.moe_load_balancer = MoeLoadBalancerConfig(
+                **self.moe_load_balancer)
+
         self._convert_load_format()
 
 
@@ -168,9 +190,9 @@ def update_executor_config(
 
     logger.info(f"{executor_config.pytorch_backend_config}")
 
-    if build_config is not None:
-        # TODO: move to pure-Python KvCacheConfig, and remove dependency on build_config.
-        executor_config.tokens_per_block = executor_config.tokens_per_block or build_config.plugin_config.tokens_per_block
+    build_config = build_config or BuildConfig()
+    # TODO: move to pure-Python KvCacheConfig, and remove dependency on build_config.
+    executor_config.tokens_per_block = executor_config.tokens_per_block or build_config.plugin_config.tokens_per_block
 
     executor_config.hf_model_dir = hf_model_dir
     executor_config.trt_engine_dir = trt_engine_dir

@@ -23,6 +23,7 @@ class KVCacheType(Enum):
     NONE = auto()
     MPI = auto()
     UCX = auto()
+    NIXL = auto()
 
 
 def get_multi_gpu_env(kv_cache_type=KVCacheType.NONE, llama_multi_gpu=False):
@@ -33,6 +34,8 @@ def get_multi_gpu_env(kv_cache_type=KVCacheType.NONE, llama_multi_gpu=False):
             env["TRTLLM_USE_MPI_KVCACHE"] = "1"
         case KVCacheType.UCX:
             env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        case KVCacheType.NIXL:
+            env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
         case KVCacheType.NONE:
             pass
         case _:
@@ -44,10 +47,11 @@ def get_multi_gpu_env(kv_cache_type=KVCacheType.NONE, llama_multi_gpu=False):
     return env
 
 
-def run_simple_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
+def run_mpi_utils_tests(build_dir, timeout=300):
+
     tests_dir = build_dir / "tests"
-    cpp_env = {**_os.environ}
-    # Utils tests
+    mgpu_env = get_multi_gpu_env()
+
     mpi_utils_test = [
         "mpirun",
         "-n",
@@ -55,43 +59,34 @@ def run_simple_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
         "--allow-run-as-root",
         "mpiUtilsTest",
     ]
-    _cpp.run_command(mpi_utils_test, cwd=tests_dir, env=cpp_env, timeout=300)
-
-    # Cache transceiver MPI tests
-    new_env = get_multi_gpu_env(kv_cache_type=KVCacheType.MPI)
-
-    cache_trans_test = [
-        "mpirun",
-        "-n",
-        "2",
-        "--allow-run-as-root",
-        "batch_manager/cacheTransceiverTest",
-    ]
-    _cpp.run_command(cache_trans_test, cwd=tests_dir, env=new_env, timeout=300)
-
-    cache_trans_test_8_proc = [
-        "mpirun",
-        "-n",
-        "8",
-        "--allow-run-as-root",
-        "batch_manager/cacheTransceiverTest",
-    ]
-    _cpp.run_command(cache_trans_test_8_proc,
+    _cpp.run_command(mpi_utils_test,
                      cwd=tests_dir,
-                     env=new_env,
-                     timeout=600)
+                     env=mgpu_env,
+                     timeout=timeout)
 
-    # Cache transceiver tests with UCX
-    new_env = get_multi_gpu_env(kv_cache_type=KVCacheType.UCX)
+
+def run_cache_transceiver_tests(build_dir: _pl.Path,
+                                nprocs=2,
+                                kv_cache_type=KVCacheType.MPI,
+                                timeout=600):
+
+    tests_dir = build_dir / "tests"
+    mgpu_env = get_multi_gpu_env(kv_cache_type=kv_cache_type)
 
     cache_trans_test = [
         "mpirun",
         "-n",
-        "2",
+        f"{nprocs}",
         "--allow-run-as-root",
         "batch_manager/cacheTransceiverTest",
     ]
-    _cpp.run_command(cache_trans_test, cwd=tests_dir, env=new_env, timeout=300)
+    _cpp.run_command(cache_trans_test,
+                     cwd=tests_dir,
+                     env=mgpu_env,
+                     timeout=timeout)
+
+    # Nixl transfer agent tests
+    new_env = get_multi_gpu_env(kv_cache_type=KVCacheType.NIXL)
 
     # Cache transceiver tests
     cache_trans_test_8_proc = [
@@ -447,12 +442,25 @@ def multi_gpu_model(request, prepare_model_multi_gpu):
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
-def test_simple(build_google_tests, build_dir):
+def test_mpi_utils(build_google_tests, build_dir):
+
+    if platform.system() != "Windows":
+        run_mpi_utils_tests(build_dir, timeout=300)
+
+
+@pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
+                         indirect=True)
+@pytest.mark.parametrize("kvcache_type", [KVCacheType.MPI, KVCacheType.UCX],
+                         ids=["mpi_kvcache", "ucx_kvcache"])
+@pytest.mark.parametrize("nprocs", [2, 8], ids=["2proc", "8proc"])
+def test_cache_transceiver(build_google_tests, nprocs, kvcache_type, build_dir):
 
     if platform.system() != "Windows":
 
-        run_simple_multi_gpu_tests(build_dir=build_dir,
-                                   timeout=_cpp.default_test_timeout)
+        run_cache_transceiver_tests(build_dir=build_dir,
+                                    nprocs=nprocs,
+                                    kv_cache_type=kvcache_type,
+                                    timeout=600)
 
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
@@ -527,8 +535,9 @@ def test_trt_gpt_real_decoder(build_google_tests, multi_gpu_model, lora_setup,
                          indirect=True)
 class TestDisagg:
 
-    @pytest.mark.parametrize("kvcache_type", [KVCacheType.MPI, KVCacheType.UCX],
-                             ids=["mpi_kvcache", "ucx_kvcache"])
+    @pytest.mark.parametrize(
+        "kvcache_type", [KVCacheType.MPI, KVCacheType.UCX, KVCacheType.NIXL],
+        ids=["mpi_kvcache", "ucx_kvcache", "nixl_kvcache"])
     @pytest.mark.parametrize("nprocs", [2, 4, 8],
                              ids=["2proc", "4proc", "8proc"])
     @pytest.mark.parametrize("model", ["gpt", "llama"])
@@ -547,8 +556,9 @@ class TestDisagg:
                                                 nprocs=nprocs,
                                                 kvcache_type=kvcache_type)
 
-    @pytest.mark.parametrize("kvcache_type", [KVCacheType.MPI, KVCacheType.UCX],
-                             ids=["mpi_kvcache", "ucx_kvcache"])
+    @pytest.mark.parametrize(
+        "kvcache_type", [KVCacheType.MPI, KVCacheType.UCX, KVCacheType.NIXL],
+        ids=["mpi_kvcache", "ucx_kvcache", "nixl_kvcache"])
     @pytest.mark.parametrize("nprocs", [4, 6, 8],
                              ids=["4proc", "6proc", "8proc"])
     @pytest.mark.parametrize("model", ["llama"])
@@ -564,8 +574,9 @@ class TestDisagg:
                                                  nprocs=nprocs,
                                                  kvcache_type=kvcache_type)
 
-    @pytest.mark.parametrize("kvcache_type", [KVCacheType.MPI, KVCacheType.UCX],
-                             ids=["mpi_kvcache", "ucx_kvcache"])
+    @pytest.mark.parametrize(
+        "kvcache_type", [KVCacheType.MPI, KVCacheType.UCX, KVCacheType.NIXL],
+        ids=["mpi_kvcache", "ucx_kvcache", "nixl_kvcache"])
     @pytest.mark.parametrize("model", ["llama"])
     def test_orchestrator_params(self, build_google_tests, model, kvcache_type,
                                  prepare_models_disagg, build_dir):
@@ -577,8 +588,9 @@ class TestDisagg:
                                                  model=model,
                                                  kvcache_type=kvcache_type)
 
-    @pytest.mark.parametrize("kvcache_type", [KVCacheType.UCX],
-                             ids=["ucx_kvcache"])
+    @pytest.mark.parametrize("kvcache_type",
+                             [KVCacheType.UCX, KVCacheType.NIXL],
+                             ids=["ucx_kvcache", "nixl_kvcache"])
     @pytest.mark.parametrize("model", ["llama"])
     def test_spawn_orchestrator(self, build_google_tests, model, kvcache_type,
                                 prepare_models_disagg, build_dir):

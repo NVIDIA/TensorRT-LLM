@@ -20,7 +20,7 @@ class SampleStateTensorsMTP(SampleStateTensors):
     next_draft_tokens: torch.Tensor
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class SampleStateMTP(SampleState):
     device: SampleStateTensorsMTP
     host: SampleStateTensorsMTP
@@ -220,6 +220,8 @@ class MTPSampler(TorchSampler):
     """
     MTP sampler.
     """
+
+    SampleState = SampleStateMTP
 
     def __init__(self, max_seq_len: int, config: MTPConfig):
         super().__init__(max_seq_len, False)
