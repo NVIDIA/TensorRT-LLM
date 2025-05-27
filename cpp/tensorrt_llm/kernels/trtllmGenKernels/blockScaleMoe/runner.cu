@@ -162,7 +162,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
         routingData.mUsePdl = true;
         routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::Qwen3;
-        routingData.mNormTopkProb = routingMethodType == RoutingMethodType::Renormalize;
+        // routingData.mNormTopkProb = routingMethodType == RoutingMethodType::Renormalize;
+        routingData.mNormTopkProb = routingMethodType == RoutingMethodType::Qwen3;
         routingData.mPtrScores = routingLogits;
 
         //

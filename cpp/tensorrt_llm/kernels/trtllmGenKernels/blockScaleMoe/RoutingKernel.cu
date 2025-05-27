@@ -267,9 +267,9 @@ __global__ void routingMainKernel(KernelParams params)
     // declare shared memory structure
     // number of experts is bounded by number of threads
     __shared__ float __attribute((aligned(128))) smemScoreSigmoid[NumThreads];
-    __shared__ TypeExpW __attribute((aligned(128))) smemScoreBias[NumThreads];
+    __shared__ float __attribute((aligned(128))) smemScoreBias[NumThreads];
     // number of expert groups is bounded by number of warps
-    __shared__ TypeExpW __attribute((aligned(128))) smemGroupScores[NumWarps];
+    __shared__ float __attribute((aligned(128))) smemGroupScores[NumWarps];
 
     // needed for warp reduce
     auto block = cg::this_thread_block();
@@ -326,26 +326,26 @@ __global__ void routingMainKernel(KernelParams params)
     // get the score with bias
     // note that with invalid values, because sigmoid is < 1 and bias is -1,
     // we must get a negative value, which is smaller than any valid value
-    auto scoreBias = TypeExpW{scoreSigmoid + float{biasVal}};
+    auto scoreBias = float{scoreSigmoid + float{biasVal}};
     if (expertSelected)
     {
         smemScoreBias[threadExpert] = scoreBias;
     }
 
     // registers for top group score reduction
-    TypeExpW topExpGroupScores[NumTopGroupScores];
+    float topExpGroupScores[NumTopGroupScores];
     [[maybe_unused]] int32_t topExpGroupIdx[NumTopGroupScores];
-    TypeExpW topGroups[MaxNumTopGroups]; // bound of params.mNumLimitedGroups
+    float topGroups[MaxNumTopGroups]; // bound of params.mNumLimitedGroups
     int32_t topGroupIdx[MaxNumTopGroups];
-    TypeExpW expertScoreGroup[MaxNumTopGroups];
+    float expertScoreGroup[MaxNumTopGroups];
     int32_t expertIdxGroup[MaxNumTopGroups];
-    TypeExpW topScores[MaxNumTopExperts]; // bound of params.mTopK
+    float topScores[MaxNumTopExperts]; // bound of params.mTopK
     int32_t topExperts[MaxNumTopExperts];
 
     if constexpr (KernelParams::UseGroups)
     {
         reduceTopK(warp, topExpGroupScores, topExpGroupIdx, scoreBias, threadExpert,
-            /* minValue */ invalidScore);
+            /* minValue */ invalidScoreFloat);
 
         // get the final group score and write it to shared
         if (cute::elect_one_sync())
@@ -364,10 +364,10 @@ __global__ void routingMainKernel(KernelParams params)
         // a single warp performs the selection of top groups, and goes on to select the final experts
         if constexpr (KernelParams::UseGroups)
         {
-            TypeExpW groupScore = laneIdx < params.mNumExpertGroups ? smemGroupScores[laneIdx] : invalidScore;
+            float groupScore = laneIdx < params.mNumExpertGroups ? smemGroupScores[laneIdx] : invalidScoreFloat;
 
             reduceTopK(warp, topGroups, topGroupIdx, groupScore, laneIdx,
-                /* minValue */ invalidScore);
+                /* minValue */ invalidScoreFloat);
 
             // final expert selection: get relevant indexes and scores from shared
 
@@ -376,7 +376,7 @@ __global__ void routingMainKernel(KernelParams params)
             { // bound of params.mNumLimitedGroups
                 auto groupIdx = topGroupIdx[ii];
                 expertIdxGroup[ii] = groupIdx * params.mNumExpertsPerGroup + laneIdx;
-                expertScoreGroup[ii] = expertSelected ? smemScoreBias[expertIdxGroup[ii]] : invalidScore;
+                expertScoreGroup[ii] = expertSelected ? smemScoreBias[expertIdxGroup[ii]] : invalidScoreFloat;
             }
         }
         else
@@ -388,12 +388,12 @@ __global__ void routingMainKernel(KernelParams params)
             {
                 auto expertIdx = ii * WarpSize + laneIdx;
                 expertIdxGroup[ii] = expertIdx;
-                expertScoreGroup[ii] = expertIdx < params.mNumExperts ? smemScoreBias[expertIdx] : invalidScore;
+                expertScoreGroup[ii] = expertIdx < params.mNumExperts ? smemScoreBias[expertIdx] : invalidScoreFloat;
             }
         }
 
         reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
-            /* minValue */ invalidScore);
+            /* minValue */ invalidScoreFloat);
 
         // determine our lane's expert index and write to output
         int32_t expertIdx = 0;
