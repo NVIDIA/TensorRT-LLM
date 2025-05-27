@@ -226,7 +226,6 @@ def buildImage(config, imageKeyToTag)
             sh "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}"
         }
     }
-    return
     try {
         def build_jobs = BUILD_JOBS
         // Fix the triton image pull timeout issue
