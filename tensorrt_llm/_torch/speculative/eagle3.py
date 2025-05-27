@@ -114,7 +114,7 @@ class Eagle3SpecMetadata(SpecMetadata):
 
 class Eagle3Sampler(TorchSampler):
 
-    def _batch_sample(self, scheduled_requests, model_outputs) -> SampleState:
+    def _sample(self, scheduled_requests, model_outputs) -> SampleState:
         logits = model_outputs["logits"]
         new_tokens_device = torch.argmax(logits, dim=-1)
         if "d2t" in model_outputs:
