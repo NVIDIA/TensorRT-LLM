@@ -237,6 +237,10 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.beam_width = generationsParams.beam_width;
     // Speculative decoding mode has generation input_length > 1.
     xqaParams.generation_input_length = generationsParams.input_seq_length;
+    if(mAttentionChunkSize)
+    {
+        xqaParams.chunked_attention_size = *mAttentionChunkSize;
+    }
     xqaParams.max_attention_window_size = generationsParams.max_attention_window_size;
     xqaParams.cyclic_attention_window_size = generationsParams.cyclic_attention_window_size;
     xqaParams.max_blocks_per_sequence = generationsParams.max_blocks_per_sequence;

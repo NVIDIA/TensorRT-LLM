@@ -407,7 +407,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;
         // The chunked attention size.
         // The generation-phase chunked attention is disabled for now.
-        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+        tllmRunnerParams.mChunkedAttentionSize = params.chunked_attention_size;
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenKv);
         tllmRunnerParams.mScaleQ = params.q_scaling;
