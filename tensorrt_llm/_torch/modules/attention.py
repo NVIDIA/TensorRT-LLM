@@ -34,22 +34,23 @@ class QkNormType(IntEnum):
 
 class Attention(nn.Module):
 
-    def __init__(self,
-                 *,
-                 hidden_size: int,
-                 num_attention_heads: int,
-                 num_key_value_heads: int,
-                 max_position_embeddings: int,
-                 bias: bool,
-                 pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-                 enable_fused_rope: Optional[bool] = None,
-                 qk_norm_type: QkNormType = QkNormType.none,
-                 layer_idx: Optional[int] = None,
-                 dtype: torch.dtype = None,
-                 dense_bias: Optional[bool] = None,
-                 config: Optional[ModelConfig] = None,
-                 q_scaling: float = 1.0,
-                 attention_chunk_size: Optional[int] = None):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        max_position_embeddings: int,
+        bias: bool,
+        pos_embd_params: Optional[PositionalEmbeddingParams] = None,
+        qk_norm_type: QkNormType = QkNormType.none,
+        layer_idx: Optional[int] = None,
+        dtype: torch.dtype = None,
+        dense_bias: Optional[bool] = None,
+        config: Optional[ModelConfig] = None,
+        q_scaling: float = 1.0,
+        attention_chunk_size: Optional[int] = None,
+    ):
         """
         Initialize the Attention module.
 
@@ -60,7 +61,6 @@ class Attention(nn.Module):
             max_position_embeddings (int): The maximum position embeddings.
             bias (bool): Whether to use bias in the linear layers.
             pos_embd_params (PositionalEmbeddingParams): The positional embedding parameters.
-            enable_fused_rope (bool): If true, fuse RoPE into the self.attn.forward rather than in self.apply_rope. By default (None), Attention will try to enable fused RoPE if supported by the attention backend.
             qk_norm_type (QkNormType): The type of QK normalization.
             layer_idx (int): The layer index.
             dtype (torch.dtype): The data type.
@@ -80,7 +80,8 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = max_position_embeddings
-
+        self.pos_embd_params = pos_embd_params
+        self.qk_norm_type = qk_norm_type
         self.dense_bias = dense_bias
         self.q_scaling = q_scaling
 
@@ -168,14 +169,12 @@ class Attention(nn.Module):
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
-        self.pos_embd_params = pos_embd_params
-        self.qk_norm_type = qk_norm_type
-
-        if enable_fused_rope is None:
-            enable_fused_rope = attn_cls.support_fused_rope(
-            ) and qk_norm_type != QkNormType.post_rope
-        self.enable_fused_rope = enable_fused_rope
-        if not self.enable_fused_rope and pos_embd_params is not None:
+        # enable_rope_fusion: Whether to fuse RoPE into the attention OP.
+        # If true, RoPE will be applied in self.attn.forward.
+        # If false, RoPE will be applied in self.apply_rope.
+        self.enable_rope_fusion = attn_cls.support_fused_rope(
+        ) and self.qk_norm_type != QkNormType.post_rope
+        if not self.enable_rope_fusion and pos_embd_params is not None:
             self.rotary_emb = RotaryEmbedding(
                 pos_embd_params.rope,
                 head_dim=self.head_dim,
@@ -189,7 +188,7 @@ class Attention(nn.Module):
             self.head_dim,
             self.num_key_value_heads,
             pos_embd_params=self.pos_embd_params
-            if self.enable_fused_rope else None,
+            if self.enable_rope_fusion else None,
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
@@ -263,12 +262,11 @@ class Attention(nn.Module):
 
         q, k, v = self.apply_rope(qkv, position_ids)
 
-        q, k, v = self.convert_qkv(q, k, v)
-
         out_scale = None
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
             out_scale = self.o_proj.inv_input_scale
 
+        q, k, v = self.convert_qkv(q, k, v)
         attn_output = self.attn.forward(
             q,
             k,
@@ -305,7 +303,7 @@ class Attention(nn.Module):
         if self.qk_norm_type == QkNormType.pre_rope:
             q, k, v = self.split_qkv(q, k, v)
             q, k = self.apply_qk_norm(q, k)
-        if not self.enable_fused_rope and position_ids is not None:
+        if not self.enable_rope_fusion and position_ids is not None:
             q, k, v = self.split_qkv(q, k, v)
             q, k = self.rotary_emb(position_ids, [q, k])
             if self.qk_norm_type == QkNormType.post_rope:

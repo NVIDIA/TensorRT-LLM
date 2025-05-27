@@ -22,10 +22,12 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
 
 class Qwen3Attention(Attention):
 
-    def __init__(self,
-                 model_config: ModelConfig[Qwen3Config],
-                 layer_idx: Optional[int] = None,
-                 fuse_qk_norm_rope: bool = True):
+    def __init__(
+        self,
+        model_config: ModelConfig[Qwen3Config],
+        layer_idx: Optional[int] = None,
+        fuse_qk_norm_rope: bool = True,
+    ):
         config = model_config.pretrained_config
 
         if getattr(config, "rope_scaling", None) is not None:
@@ -48,14 +50,16 @@ class Qwen3Attention(Attention):
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
-            pos_embd_params=pos_embd_params,
-            enable_fused_rope=not self.
-            fuse_qk_norm_rope,  # If fused_qk_norm_rope, force disable RoPE in attention OP.
+            pos_embd_params=pos_embd_params
+            if not self.fuse_qk_norm_rope else None,
             qk_norm_type=QkNormType.pre_rope,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=config.attention_bias,
-            config=model_config)
+            config=model_config,
+        )
+
+        self.pos_embd_params = pos_embd_params
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=1e-6,
