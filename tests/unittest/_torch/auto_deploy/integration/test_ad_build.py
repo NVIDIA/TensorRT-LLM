@@ -129,6 +129,7 @@ from utils.llm_data import llm_models_root
                     "microsoft/Phi-3-mini-4k-instruct",
                 ),
                 "compile_backend": "torch-opt",
+                "attn_backend": "TritonWithFlattenedInputs",
             },
         ),
         # Llama4 Scout Instruct
@@ -140,7 +141,7 @@ from utils.llm_data import llm_models_root
                     "meta-llama/Llama-4-Scout-17B-16E-Instruct",
                 ),
                 "model_factory": "AutoModelForImageTextToText",
-                "compile_backend": "torch-opt",
+                "compile_backend": "torch-simple",
                 "attn_backend": "FlashInfer",
             },
         ),
