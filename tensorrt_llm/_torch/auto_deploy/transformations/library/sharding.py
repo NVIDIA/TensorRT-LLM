@@ -88,7 +88,7 @@ def _insert_sharded_matmul(
         return torch.tensor_split(t, ws, dim=d)[r]
 
     num_users = num_users_of_weight_node(node)
-    if num_users > 1:
+    if num_users > 1 or num_users == 0:
         ad_logger.warning(
             f"Weight node {node} has {num_users} users. This is not supported for sharding. Skipping."
         )

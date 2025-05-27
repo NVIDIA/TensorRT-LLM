@@ -20,7 +20,6 @@ from .library import (
     ep_shard,
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
-    fuse_gemms,
     fuse_moe,
     insert_cached_attention,
     match_attention_layout,
@@ -172,7 +171,8 @@ class InferenceOptimizer:
         egm = fuse_moe(egm)
 
         # run GEMM fusion
-        egm = fuse_gemms(egm)
+        # TODO: this is causing OOMs, so we're disabling it for now
+        # egm = fuse_gemms(egm)
 
         # check if we can fuse allreduce, residual and rmsnorm
         egm = fuse_allreduce_residual_rmsnorm(egm)

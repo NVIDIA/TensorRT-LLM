@@ -152,7 +152,7 @@ def extract_weight_node(mm_node: Node) -> int:
 def num_users_of_weight_node(mm_node: Node) -> int:
     """Returns the number of users of the weight node of the given matmul node."""
     weight_node = extract_weight_node(mm_node)
-    return len(weight_node.users)
+    return len(weight_node.users) if weight_node is not None else 0
 
 
 def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]]:

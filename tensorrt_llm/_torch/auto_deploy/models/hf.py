@@ -72,6 +72,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         self.model_kwargs = model_kwargs or {}
         self.tokenizer_kwargs = tokenizer_kwargs or {}
+        self.tokenizer_kwargs.setdefault("trust_remote_code", True)
         self._quant_config = None
 
         # heuristic to disable use_cache
