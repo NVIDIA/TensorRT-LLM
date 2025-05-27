@@ -96,7 +96,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
                     imagePullPolicy: Always"""
         break
     case "build":
-        // Replace image, support bash commands, and pre-install cmake dependencies to avoid random ucxx issues
+        // Use a customized docker:dind image with essential dependencies
         containerConfig = """
                   - name: docker
                     image: urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:202505221445_docker_dind_withbash
@@ -133,7 +133,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
         """
     }
     def nodeLabelPrefix = "cpu"
-    def jobName = "buildImages"
+    def jobName = "llm-build-images"
     def buildID = env.BUILD_ID
     def nodeLabel = trtllm_utils.appendRandomPostfix("${nodeLabelPrefix}---tensorrt-${jobName}-${buildID}")
     def podConfig = [
@@ -191,12 +191,12 @@ def buildImage(config)
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
 
     stage (config.stageName) {
-        // Step 1: cloning tekit source code
-        // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
+        // Step 1: Clone TRT-LLM source codes
+        // If using a forked repo, svc_tensorrt needs to have the access to the forked repo.
         trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
     }
 
-    // Step 2: building wheels
+    // Step 2: Build the images
     stage ("Install packages") {
         sh "pwd && ls -alh"
         sh "env"
@@ -226,12 +226,12 @@ def buildImage(config)
         containerGenFailure = null
 
         if (dependOtherTarget) {
-            stage ("make ${dependOtherTarget}_push (${arch})") {
+            stage ("make ${dependOtherTarget}_${action} (${arch})") {
                 retry(3) {
                     sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
                 }
                 sh """
-                cd ${LLM_ROOT} && make -C docker ${dependOtherTarget}_push \
+                cd ${LLM_ROOT} && make -C docker ${dependOtherTarget}_${action} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${preTargetTag} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
@@ -240,7 +240,8 @@ def buildImage(config)
                 args += " DEVEL_IMAGE=${IMAGE_NAME}/${dependOtherTarget}:${preTargetTag}"
             }
         }
-        // Fix the build OOM issue of release builds
+
+        // Avoid the frequency of OOM issue when building the wheel
         if (target == "trtllm") {
             if (arch == "x86_64") {
                 build_jobs = BUILD_JOBS_RELEASE_X86_64
@@ -249,8 +250,7 @@ def buildImage(config)
             }
         }
         stage ("make ${target}_${action} (${arch})") {
-            retry(3)
-            {
+            retry(3) {
                 retry(3) {
                     sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
                 }
@@ -304,34 +304,34 @@ def launchBuildJobs(pipeline) {
     ]
     def release_action = env.JOB_NAME ==~ /.*PostMerge.*/ ? "push" : params.action
     def buildConfigs = [
-        "Build trtllm release(x86_64)": [
+        "Build trtllm release (x86_64)": [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG,
             build_wheel: true,
         ],
-        "Build trtllm release(SBSA)": [
+        "Build trtllm release (SBSA)": [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-sbsa",
             build_wheel: true,
             arch: "arm64"
         ],
-        "Build CI image(x86_64)": [:],
-        "Build CI image(SBSA)": [
+        "Build CI image (x86_64 tritondevel)": [:],
+        "Build CI image (SBSA tritondevel)": [
             arch: "arm64",
         ],
-        "Build CI image(rockylinux8-py310)": [
+        "Build CI image (RockyLinux8 Python310)": [
             target: "rockylinux8",
-            args: "PYTHON_VERSION=3.10.12 STAGE=tritondevel",
+            args: "PYTHON_VERSION=3.10.12",
             postTag: "-py310",
         ],
-        "Build CI image(rockylinux8-py312)": [
+        "Build CI image(RockyLinux8 Python312)": [
             target: "rockylinux8",
             args: "PYTHON_VERSION=3.12.3 STAGE=tritondevel",
             postTag: "-py312",
         ],
-        "Build NGC devel and release(x86_64)": [
+        "Build NGC devel and release (x86_64)": [
             target: "ngc_release",
             action: release_action,
             customTag: "ngc-" + LLM_BRANCH_TAG + "-x86_64",
