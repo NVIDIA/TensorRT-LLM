@@ -19,8 +19,6 @@ LLM_COMMIT_OR_BRANCH = env.gitlabCommit ?: LLM_BRANCH
 
 LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefined"
 
-LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
-
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
@@ -38,6 +36,9 @@ def globalVars = [
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
 ]
+
+@Field
+def imageKeyToTag = [:]
 
 def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 {
@@ -173,7 +174,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 }
 
 
-def buildImage(config)
+def buildImage(config, imageKeyToTag)
 {
     def target = config.target
     def action = config.action
@@ -183,10 +184,17 @@ def buildImage(config)
     def postTag = config.postTag
     def dependentTarget = config.dependentTarget
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
+    def branchTag = config.branchTag
+    def llmDefaultTag = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${branchTag}-${BUILD_NUMBER}"
 
-    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
+    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${llmDefaultTag}"
 
     def dependentTargetTag = tag.replace("${arch}-${target}-", "${arch}-${dependentTarget}-")
+
+    if (target == "ngc-release") {
+        imageKeyToTag["NGC Devel Image ${config.arch}"] = "${IMAGE_NAME}/${dependentTarget}:${dependentTargetTag}"
+        imageKeyToTag["NGC Release Image ${config.arch}"] = "${IMAGE_NAME}/${target}:${tag}"
+    }
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
 
@@ -218,6 +226,7 @@ def buildImage(config)
             sh "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}"
         }
     }
+    return
     try {
         def build_jobs = BUILD_JOBS
         // Fix the triton image pull timeout issue
@@ -291,7 +300,13 @@ def buildImage(config)
 }
 
 
-def launchBuildJobs(pipeline) {
+def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
+    def branchTag = LLM_BRANCH_TAG
+    if (globalVars[GITHUB_PR_API_URL]) {
+        branchTag = globalVars[GITHUB_PR_API_URL].split('/').last()
+        echo "branchTag is: ${branchTag}"
+    }
+
     def defaultBuildConfig = [
         target: "tritondevel",
         action: params.action,
@@ -302,7 +317,9 @@ def launchBuildJobs(pipeline) {
         arch: "amd64",
         build_wheel: false,
         dependentTarget: "",
+        branchTag: branchTag,
     ]
+
     def release_action = env.JOB_NAME ==~ /.*PostMerge.*/ ? "push" : params.action
     def buildConfigs = [
         "Build trtllm release (x86_64)": [
@@ -336,6 +353,7 @@ def launchBuildJobs(pipeline) {
             target: "ngc-release",
             action: release_action,
             customTag: "ngc-" + LLM_BRANCH_TAG + "-x86_64",
+            args: "DOCKER_BUILD_OPTS = --load --platform linux/amd64",
             build_wheel: true,
             dependentTarget: "devel",
         ],
@@ -343,6 +361,7 @@ def launchBuildJobs(pipeline) {
             target: "ngc-release",
             action: release_action,
             customTag: "ngc-" + LLM_BRANCH_TAG + "-sbsa",
+            args: "DOCKER_BUILD_OPTS = --load --platform linux/arm64",
             arch: "arm64",
             build_wheel: true,
             dependentTarget: "devel",
@@ -366,7 +385,7 @@ def launchBuildJobs(pipeline) {
                 stage(key) {
                     config.stageName = key
                     trtllm_utils.launchKubernetesPod(pipeline, config.podConfig, "docker") {
-                        buildImage(config)
+                        buildImage(config, imageKeyToTag)
                     }
                 }
             }
@@ -427,7 +446,17 @@ pipeline {
         stage("Build") {
             steps{
                 script{
-                    launchBuildJobs(this)
+                    launchBuildJobs(this, globalVars, imageKeyToTag)
+                }
+            }
+        }
+        stage("Sanity check") {
+            steps {
+                script {
+                    String imageKeyToTagJson = writeJSON returnText: true, json: imageKeyToTag
+                    echo "imageKeyToTag is: ${imageKeyToTagJson}"
+                    writeFile file: "imageKeyToTag.json", text: imageKeyToTagJson
+                    archiveArtifacts artifacts: 'imageKeyToTag.json', fingerprint: true
                 }
             }
         }
