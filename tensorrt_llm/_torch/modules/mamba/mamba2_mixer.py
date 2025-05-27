@@ -197,14 +197,14 @@ class Mamba2Mixer(nn.Module):
 
         if num_prefills > 0:
 
-            cu_seqlens = (torch.cat(
+            cu_seqlens = torch.cat(
                 [
                     torch.zeros(1, device=attn_metadata.seq_lens_cuda.device),
                     torch.cumsum(attn_metadata.seq_lens_cuda[:num_prefills],
                                  dim=0)
                 ],
                 dim=0,
-            ).to(torch.int32).to(torch.device("cuda")))
+            ).to(torch.int32)
 
             seq_idx = torch.repeat_interleave(
                 torch.arange(num_prefills,
