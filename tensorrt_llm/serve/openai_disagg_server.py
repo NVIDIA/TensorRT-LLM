@@ -234,6 +234,14 @@ class OpenAIDisaggServer:
                 # Append disaggregates parameters to generation request
                 req.disaggregated_params = ctx_response.choices[0].disaggregated_params
                 req.disaggregated_params.request_type = "generation_only"
+
+                # Replace the string prompt with prompt_tokens_ids
+                if isinstance(req, CompletionRequest):
+                    req.prompt = ctx_response.prompt_token_ids
+                elif isinstance(req, ChatCompletionRequest):
+                    req.prompt_token_ids = ctx_response.prompt_token_ids
+                else:
+                    raise ValueError("Invalid request type: {type(req).__name__}")
             else:
                 ctx_response = None
 

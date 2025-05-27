@@ -401,8 +401,13 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = params.max_attention_window_size;
         tllmRunnerParams.mMaxSeqLenQ = params.generation_input_length;
-        tllmRunnerParams.mMaxSeqLenKv = std::min(params.cyclic_attention_window_size, params.max_past_kv_length);
+        tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
+        // The sliding window attention size.
+        tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;
+        // The chunked attention size.
+        // The generation-phase chunked attention is disabled for now.
+        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenKv);
         tllmRunnerParams.mScaleQ = params.q_scaling;

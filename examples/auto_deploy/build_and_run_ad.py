@@ -96,6 +96,7 @@ def main(config: Optional[SimpleConfig] = None):
     llm = build_llm_from_config(config)
 
     # prompt the model and print its output
+    ad_logger.info("Running example prompts...")
     outs = llm.generate(
         config.prompt,
         sampling_params=SamplingParams(
@@ -107,7 +108,8 @@ def main(config: Optional[SimpleConfig] = None):
     print_outputs(outs)
 
     # run a benchmark for the model with batch_size == config.benchmark_bs
-    if config.benchmark:
+    if config.benchmark and config.runtime != "trtllm":
+        ad_logger.info("Running benchmark...")
         keys = [
             "compile_backend",
             "attn_backend",
@@ -120,13 +122,19 @@ def main(config: Optional[SimpleConfig] = None):
         benchmark(
             func=lambda: llm.generate(
                 torch.randint(0, 100, (config.benchmark_bs, config.benchmark_isl)).tolist(),
-                sampling_params=SamplingParams(max_tokens=config.benchmark_osl, top_k=None),
+                sampling_params=SamplingParams(
+                    max_tokens=config.benchmark_osl,
+                    top_k=None,
+                    ignore_eos=True,
+                ),
                 use_tqdm=False,
             ),
             num_runs=config.benchmark_num,
             log_prefix="Benchmark with " + ", ".join(f"{k}={getattr(config, k)}" for k in keys),
             results_path=config.benchmark_results_path,
         )
+    elif config.benchmark:
+        ad_logger.info("Skipping simple benchmarking for trtllm...")
     llm.shutdown()
 
 

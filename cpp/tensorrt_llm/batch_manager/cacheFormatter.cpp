@@ -599,6 +599,11 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
 
 [[nodiscard]] bool CacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const
 {
+    if (selfConfig.getDataType() != destConfig.getDataType())
+    {
+        return false;
+    }
+
     std::unordered_set<SizeType32> setVecSelf{
         selfConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), selfConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
 
@@ -618,6 +623,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
     {
         return false;
     }
+
     std::unordered_set<int> setVecDest{
         destConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), destConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
 
