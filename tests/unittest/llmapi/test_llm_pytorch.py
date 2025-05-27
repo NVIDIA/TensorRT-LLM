@@ -317,3 +317,17 @@ def test_codellama_fp8_with_bf16_lora() -> None:
                                lora_request=lora_requests)
 
         assert len(outputs) == 2
+
+
+def test_debug():
+    from tensorrt_llm._torch.llm import LLM
+    from tensorrt_llm._torch.models.loader.hf_weights_loader import \
+        HfWeightsLoader
+
+    non_quantized_model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+    # quantized_model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
+    llm = LLM(model=non_quantized_model_path, weights_loader=HfWeightsLoader)
+    # llm = LLM(model=quantized_model_path)
+
+    prompts = ["Hello, how are you?"]
+    llm.generate(prompts)

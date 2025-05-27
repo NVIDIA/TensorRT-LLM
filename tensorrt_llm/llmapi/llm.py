@@ -642,6 +642,29 @@ class LLM:
             trt_engine_dir=self._engine_dir,
             max_input_len=self.args.max_input_len,
             max_seq_len=max_seq_len)
+
+        # TODO smor- is there a better place?
+        if self.args.weights_loader is not None:
+            # Assuming self.args.weights_loader is an already configured instance
+            executor_config.weights_loader = self.args.weights_loader
+        else:
+            logger.warning(
+                "LlmArgs.weights_loader is None. Attempting to use default HfWeightsLoader for executor_config."
+            )
+            from tensorrt_llm._torch.models.loader.hf_weights_loader import \
+                HfWeightsLoader  # Local import
+            current_mapping = getattr(executor_config, 'mapping', None)
+            if current_mapping is None:
+                from tensorrt_llm.mapping import \
+                    Mapping  # Local import for default mapping
+                current_mapping = Mapping()
+                logger.warning(
+                    "executor_config.mapping not found, using default Mapping() for HfWeightsLoader fallback."
+                )
+            executor_config.weights_loader = HfWeightsLoader(
+                mapping=current_mapping)
+
+        # TODO smor- set mapper here
         executor_config.llm_parallel_config = self.args.parallel_config
         return_logits = self.args.gather_generation_logits or (
             self._on_trt_backend and self.args.build_config

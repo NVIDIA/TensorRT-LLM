@@ -139,8 +139,8 @@ class _ExecutorMemoryMonitor():
 
 
 def create_py_executor(executor_config: ExecutorConfig,
-                       checkpoint_dir: str = None,
-                       engine_dir: str = None,
+                       checkpoint_dir: Optional[str] = None,
+                       engine_dir: Optional[str] = None,
                        lora_config: Optional[LoraConfig] = None) -> PyExecutor:
     if executor_config.pytorch_backend_config is None:
         executor_config.pytorch_backend_config = PyTorchConfig()
@@ -188,6 +188,14 @@ def create_py_executor(executor_config: ExecutorConfig,
         has_speculative_draft_tokens=has_draft_model_engine
         or has_ngram_drafter,
     )
+    print("SMOR BEFORE MODEL ENGINE ")
+    from IPython import embed
+    embed()
+    # TODO smor- is there a better place?
+    if self.args.weights_loader is None:
+        self.args.weights_loader = HfWeightsLoader
+    executor_config.weights_loader = self.args.weights_loader(
+        executor_config.mapping)
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
     mem_monitor = _ExecutorMemoryMonitor()
@@ -205,6 +213,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             spec_config=spec_config,
             guided_decoding_config=executor_config.guided_decoding_config,
             lora_config=lora_config,
+            weights_loader=executor_config.weights_loader,
         )
 
     if has_draft_model_engine:
@@ -225,6 +234,7 @@ def create_py_executor(executor_config: ExecutorConfig,
                 attn_runtime_features=attn_runtime_features,
                 dist=dist,
                 spec_config=draft_spec_config,
+                weights_loader=executor_config.weights_loader,
             )
             draft_model_engine.kv_cache_manager_key = DRAFT_KV_CACHE_MANAGER_KEY
             draft_model_engine.load_weights_from_target_model(

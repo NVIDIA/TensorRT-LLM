@@ -19,6 +19,8 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.models.loader.file_system_weights_loader_interface import \
+    FileSystemWeightsLoaderInterface
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, local_mpi_rank,
@@ -294,6 +296,7 @@ class PyTorchModelEngine(ModelEngine):
         self,
         model_path: str,
         pytorch_backend_config: PyTorchConfig,
+        weights_loader: FileSystemWeightsLoaderInterface,
         batch_size: int = 8,
         max_num_tokens: int = 8192,
         max_seq_len: Optional[int] = None,
@@ -328,6 +331,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_backend = pytorch_backend_config.attn_backend
         self.model = self._load_model(
             model_path,
+            weights_loader=weights_loader,
             mapping=self.mapping,
             attn_backend=attn_backend,
             moe_backend=pytorch_backend_config.moe_backend,
@@ -894,12 +898,15 @@ class PyTorchModelEngine(ModelEngine):
 
     def _load_model(self,
                     checkpoint_dir: str,
+                    weights_loader: FileSystemWeightsLoaderInterface,
                     load_format: LoadFormat,
                     max_num_tokens: int,
                     moe_max_num_tokens: Optional[int] = None,
                     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None,
                     lora_config: Optional[LoraConfig] = None,
                     **kwargs):
+        # TODO smor- need to be able to get model config from CUSTOM checkpoints
+        # possibly need to adjust kwargs or add a new argument
         config = ModelConfig.from_pretrained(checkpoint_dir,
                                              trust_remote_code=True,
                                              **kwargs)
@@ -947,7 +954,11 @@ class PyTorchModelEngine(ModelEngine):
             logger.info(
                 f"Rank {self.mapping.rank} uses {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
-
+            print(
+                "*********** SMOR *********** after from_config, ensure load_weights is correct"
+            )
+            from IPython import embed
+            embed()
             if load_format == LoadFormat.AUTO:
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = load_weights(

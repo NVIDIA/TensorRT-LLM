@@ -21,6 +21,7 @@ from tensorrt_llm.lora_manager import (LoraConfig,
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 
@@ -56,6 +57,9 @@ from .build_cache import BuildCacheConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import (generate_api_docs_as_docstring, get_type_repr,
                     print_traceback_on_error)
+
+# if TYPE_CHECKING:
+#     from tensorrt_llm._torch.models.loader.file_system_weights_loader_interface import FileSystemWeightsLoaderInterface
 
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 
@@ -958,6 +962,13 @@ class BaseLlmArgs(BaseModel):
         json_schema_extra={"type": "Optional[MpiSession]"},
         exclude=True,  # exclude from serialization
         alias="_mpi_session")
+
+    weights_loader: Optional[object] = Field(
+        default=None,
+        description="The weights loader to use for this LLM instance.",
+        json_schema_extra={
+            "type": "Optional[FileSystemWeightsLoaderInterface]"
+        })
 
     @print_traceback_on_error
     def model_post_init(self, __context: Any):
