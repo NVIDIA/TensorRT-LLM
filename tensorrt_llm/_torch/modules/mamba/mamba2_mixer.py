@@ -184,7 +184,14 @@ class Mamba2Mixer(nn.Module):
 
         # in_proj
         zxbcdt = self.in_proj(hidden_states)
-        split_zxbcdt = torch.split(zxbcdt, seqlen_split_size, dim=0)
+        z, xbc, dt = torch.split(
+            zxbcdt,
+            [self.tp_d_inner, self.tp_conv_dim, self.tp_nheads],
+            dim=-1,
+        )
+        z_p, z_d = torch.split(z, seqlen_split_size, dim=0)
+        xbc_p, xbc_d = torch.split(xbc, seqlen_split_size, dim=0)
+        dt_p, dt_d = torch.split(dt, seqlen_split_size, dim=0)
 
         # a batch can have either:
         # * only context requests
@@ -206,12 +213,6 @@ class Mamba2Mixer(nn.Module):
         out = []
         for req_type in batch:
 
-            z, xbc, dt = torch.split(
-                split_zxbcdt[req_type],
-                [self.tp_d_inner, self.tp_conv_dim, self.tp_nheads],
-                dim=-1,
-            )
-
             # prefill
             if req_type == 0:
 
@@ -232,39 +233,39 @@ class Mamba2Mixer(nn.Module):
                     attn_metadata.seq_lens_cuda[:num_prefills],
                     output_size=num_prefill_tokens).unsqueeze(0)
 
-                xbc = causal_conv1d_fn(xbc.transpose(0, 1),
-                                       self.conv1d.weight,
-                                       self.conv1d.bias,
-                                       activation="silu",
-                                       conv_states=conv_states,
-                                       query_start_loc=cu_seqlens,
-                                       cache_indices=state_indices_p).transpose(
-                                           0, 1)
+                xbc_p = causal_conv1d_fn(
+                    xbc_p.transpose(0, 1),
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    activation="silu",
+                    conv_states=conv_states,
+                    query_start_loc=cu_seqlens,
+                    cache_indices=state_indices_p).transpose(0, 1)
 
-                x, B, C = torch.split(xbc.unsqueeze(0), [
+                x_p, B_p, C_p = torch.split(xbc_p.unsqueeze(0), [
                     self.tp_d_inner,
                     self.tp_ngroups * self.d_state,
                     self.tp_ngroups * self.d_state,
                 ],
-                                      dim=-1)
+                                            dim=-1)
 
-                x = rearrange(x, "b l (h p) -> b l h p", h=self.tp_nheads)
-                dt = dt.unsqueeze(0)
-                B = rearrange(B, "b l (g n) -> b l g n", g=self.tp_ngroups)
-                C = rearrange(C, "b l (g n) -> b l g n", g=self.tp_ngroups)
-                z = rearrange(z.unsqueeze(0),
-                              "b l (h p) -> b l h p",
-                              h=self.tp_nheads)
+                x_p = rearrange(x_p, "b l (h p) -> b l h p", h=self.tp_nheads)
+                dt_p = dt_p.unsqueeze(0)
+                B_p = rearrange(B_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
+                C_p = rearrange(C_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
+                z_p = rearrange(z_p.unsqueeze(0),
+                                "b l (h p) -> b l h p",
+                                h=self.tp_nheads)
 
                 y, current_ssm_states = mamba_chunk_scan_combined(
-                    x,
-                    dt,
+                    x_p,
+                    dt_p,
                     self.A,
-                    B,
-                    C,
+                    B_p,
+                    C_p,
                     chunk_size=self.chunk_size,
                     D=self.D,
-                    z=z,
+                    z=z_p,
                     dt_bias=self.dt_bias,
                     initial_states=None,
                     dt_softplus=self.delta_softplus,
@@ -281,15 +282,15 @@ class Mamba2Mixer(nn.Module):
 
             # decode
             else:
-                xbc = causal_conv1d_update(xbc,
-                                           conv_states,
-                                           self.conv1d.weight,
-                                           self.conv1d.bias,
-                                           activation="silu",
-                                           conv_state_indices=state_indices_d)
+                xbc_d = causal_conv1d_update(xbc_d,
+                                             conv_states,
+                                             self.conv1d.weight,
+                                             self.conv1d.bias,
+                                             activation="silu",
+                                             conv_state_indices=state_indices_d)
 
-                x, B, C = torch.split(
-                    xbc,
+                x_d, B_d, C_d = torch.split(
+                    xbc_d,
                     [
                         self.tp_d_inner,
                         self.tp_ngroups * self.d_state,
@@ -298,27 +299,28 @@ class Mamba2Mixer(nn.Module):
                     dim=-1,
                 )
 
+                x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
+                dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
+                B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
+                C_d = rearrange(C_d, "b (g n) -> b g n", g=self.tp_ngroups)
+                z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
+
                 A = repeat(self.A,
                            "h -> h p n",
                            p=self.head_dim,
                            n=self.d_state).to(dtype=torch.float32)
-                dt = repeat(dt, "b h -> b h p", p=self.head_dim)
                 dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
                 D = repeat(self.D, "h -> h p", p=self.head_dim)
-                B = rearrange(B, "b (g n) -> b g n", g=self.tp_ngroups)
-                C = rearrange(C, "b (g n) -> b g n", g=self.tp_ngroups)
-                x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.head_dim)
-                z = rearrange(z, "b (h p) -> b h p", p=self.head_dim)
 
                 y = selective_state_update(
                     ssm_states,
-                    x_reshaped,
-                    dt,
+                    x_d,
+                    dt_d,
                     A,
-                    B,
-                    C,
+                    B_d,
+                    C_d,
                     D,
-                    z=z,
+                    z=z_d,
                     dt_bias=dt_bias,
                     dt_softplus=self.delta_softplus,
                     state_batch_indices=state_indices_d,
