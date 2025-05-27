@@ -50,6 +50,9 @@ BASE_ZMQ_CLASSES = {
     ### ending import of torch models classes
     "tensorrt_llm._torch.pyexecutor.llm_request":
     ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
+    "tensorrt_llm._torch.speculative.mtp": ["MTPConfig"],
+    "tensorrt_llm._torch.speculative.interface": ["SpeculativeDecodingMode"],
+    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm.auto_parallel.config": ["AutoParallelConfig", "CostModel"],
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm.bindings.executor": [
@@ -86,6 +89,7 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.llm_utils":
     ["CachedModelLoader._node_build_task", "LlmBuildStats"],
+    "tensorrt_llm.llmapi.tokenizer": ["TransformersTokenizer "],
     "tensorrt_llm.lora_manager": ["LoraConfig"],
     "tensorrt_llm.mapping": ["Mapping"],
     "tensorrt_llm.models.modeling_utils":
