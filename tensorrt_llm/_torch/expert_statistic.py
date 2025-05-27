@@ -49,7 +49,8 @@ class ExpertStatistic:
         self.rank_id = rank_id
         self.start = start
         self.stop = stop
-        self.records = {}
+        self._meta_info = None
+        self._records = {}
 
     @property
     def should_record(self) -> bool:
@@ -65,7 +66,8 @@ class ExpertStatistic:
             filename = f'rank_{self.rank_id}.pkl'
             full_filename = os.path.join(path, filename)
             with open(full_filename, 'wb') as f:
-                pickle.dump(self.records, f)
+                pickle.dump(self._meta_info, f)
+                pickle.dump(self._records, f)
         return self.should_record
 
     def _set_layer(self, layer: int):
@@ -76,7 +78,12 @@ class ExpertStatistic:
         if not self.should_record:
             return
 
+        if self._meta_info is None:
+            self._meta_info = {
+                "num_experts": expert_count,
+                "num_experts_per_token": token_selected_experts.size(-1)
+            }
         key = (self.current_iter_id, self.current_layer)
         counts = torch.bincount(token_selected_experts.flatten(),
                                 minlength=expert_count)
-        self.records[key] = counts.cpu()
+        self._records[key] = counts.cpu()

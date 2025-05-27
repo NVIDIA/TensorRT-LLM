@@ -22,16 +22,22 @@ if __name__ == "__main__":
     parser.add_argument("--output_path",
                         type=str,
                         default="moe_load_balancer.yaml")
-    parser.add_argument("--num_experts_per_token", type=int, default=8)
     parser.add_argument("--ep_size", type=int, default=8)
     parser.add_argument("--num_slots", type=int, default=320)
     parser.add_argument("--layer_updates_per_iter", type=int, default=0)
     args = parser.parse_args()
 
+    num_experts = None
+    num_experts_per_token = None
     statistic = {}
     for statistic_file in glob.glob(f"{args.expert_statistic_path}/rank_*.pkl"):
         with open(statistic_file, 'rb') as f:
+            meta_info = pickle.load(f)
             rank_statistic = pickle.load(f)
+        if num_experts is None:
+            num_experts = meta_info["num_experts"]
+        if num_experts_per_token is None:
+            num_experts_per_token = meta_info["num_experts_per_token"]
         for key, data in rank_statistic.items():
             if key not in statistic:
                 statistic[key] = torch.zeros_like(rank_statistic[key])
@@ -43,31 +49,24 @@ if __name__ == "__main__":
     num_layers = len(layers)
     assert len(statistic) == num_iters * num_layers
 
-    num_experts = next(iter(statistic.values())).size(-1)
-    num_slots = args.num_slots
-    num_experts_per_token = args.num_experts_per_token
-    ep_size = args.ep_size
-    num_local_slots = num_slots // ep_size
-    iter_start = args.iter_start
-    iter_stop = args.iter_stop
-
+    num_local_slots = args.num_slots // args.ep_size
     initial_global_assignments = {}
 
     for layer_idx in layers:
-        expert_token_count = sum(
-            data for key, data in statistic.items()
-            if iter_start <= key[0] < iter_stop and key[1] == layer_idx)
+        expert_token_count = sum(data for key, data in statistic.items()
+                                 if args.iter_start <= key[0] < args.iter_stop
+                                 and key[1] == layer_idx)
         expert_load_factor = expert_token_count.float().tolist()
 
         meta_info = MoeLoadBalanceMetaInfo(expert_count=num_experts,
                                            top_k=num_experts_per_token,
                                            ep_rank=0,
-                                           ep_size=ep_size,
+                                           ep_size=args.ep_size,
                                            slot_count_per_rank=num_local_slots)
         placement_info = MoePlacementCpuInfo()
         placement_info.expert_replica_count = [0] * num_experts
         placement_info.rank_expert_ids = [[0] * num_local_slots
-                                          for _ in range(ep_size)]
+                                          for _ in range(args.ep_size)]
 
         do_replication(meta_info, expert_load_factor, placement_info)
         do_placement(meta_info, expert_load_factor, placement_info)
@@ -77,7 +76,7 @@ if __name__ == "__main__":
             initial_global_assignments[layer_idx].extend(local_expert_ids)
 
     eplb_config = {
-        "num_slots": num_slots,
+        "num_slots": args.num_slots,
         "initial_global_assignments": initial_global_assignments,
         "layer_updates_per_iter": args.layer_updates_per_iter,
     }
