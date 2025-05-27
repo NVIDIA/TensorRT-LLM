@@ -238,6 +238,7 @@ def create_py_executor(
             spec_config=spec_config,
             guided_decoding_config=executor_config.guided_decoding_config,
             lora_config=lora_config,
+            checkpoint_loader=executor_config.checkpoint_loader,
         )
 
     if has_draft_model_engine:
@@ -260,6 +261,7 @@ def create_py_executor(
                 attn_runtime_features=attn_runtime_features,
                 dist=dist,
                 spec_config=draft_spec_config,
+                checkpoint_loader=executor_config.checkpoint_loader,
                 is_draft_model=True,
             )
             draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER

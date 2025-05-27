@@ -981,6 +981,16 @@ class BaseLlmArgs(BaseModel):
         exclude=True,
         alias="_mpi_session")
 
+    checkpoint_loader: Optional[object] = Field(
+        default=None,
+        description="The checkpoint loader to use for this LLM instance.",
+        json_schema_extra={"type": "Optional[CheckpointLoader]"})
+
+    checkpoint_format: Optional[str] = Field(
+        default=None,
+        description="The checkpoint format to use for this LLM instance.",
+    )
+
     backend: Optional[str] = Field(
         default=None,
         description="The backend to use for this LLM instance.",
@@ -1374,6 +1384,25 @@ class BaseLlmArgs(BaseModel):
         ) if self._speculative_model is not None else None
         if self._speculative_model and speculative_model_obj.is_local_model:
             self._speculative_model_format = _ModelFormatKind.HF
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_checkpoint_format(self):
+        if self.checkpoint_format is not None and self.checkpoint_loader is not None:
+            logger.warning(
+                "checkpoint_format and checkpoint_loader are both provided, "
+                "checkpoint_loader will be ignored.")
+            self.checkpoint_loader = None
+
+        if self.checkpoint_format is None and self.checkpoint_loader is None:
+            logger.warning(
+                "checkpoint_format and checkpoint_loader are both not provided, "
+                "checkpoint_format will be set to HF.")
+            self.checkpoint_format = "HF"
+
+        if self.checkpoint_format is None and self.checkpoint_loader is not None:
+            self.checkpoint_format = self.checkpoint_loader.checkpoint_format
 
         return self
 
