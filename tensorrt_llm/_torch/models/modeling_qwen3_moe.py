@@ -17,7 +17,7 @@ from ..modules.rms_norm import RMSNorm
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, duplicate_kv_weight,
-                             register_auto_model)
+                             filter_weights, register_auto_model)
 
 
 class Qwen3MoE(nn.Module):
@@ -269,14 +269,6 @@ class Qwen3MoeForCausalLM(DecoderModelForCausalLM[Qwen3MoEModel,
         head_dim = getattr(
             self.config, "head_dim",
             self.config.hidden_size // self.config.num_attention_heads)
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
 
         params_map = {
             "qkv_proj": ["q_proj", "k_proj", "v_proj"],
