@@ -750,7 +750,8 @@ class Llama4Model(DecoderModel):
         hidden_states = inputs_embeds
         residual = None
 
-        for idx, decoder_layer in enumerate(self.layers[:self.num_hidden_layers]):
+        for idx, decoder_layer in enumerate(
+                self.layers[:self.num_hidden_layers]):
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
