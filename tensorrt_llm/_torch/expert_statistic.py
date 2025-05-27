@@ -1,6 +1,7 @@
+import json
 import os
-import pickle  # nosec B403
 
+import safetensors
 import torch
 
 from tensorrt_llm.logger import logger
@@ -68,11 +69,11 @@ class ExpertStatistic:
             path = os.environ.get('EXPERT_STATISTIC_PATH', 'expert_statistic')
             if not os.path.exists(path):
                 os.makedirs(path, exist_ok=True)
-            filename = f'rank_{self.rank_id}.pkl'
-            full_filename = os.path.join(path, filename)
-            with open(full_filename, 'wb') as f:
-                pickle.dump(self._meta_info, f)
-                pickle.dump(self._records, f)
+            if self.rank_id == 0:
+                with open(f"{path}/meta_info.json", "w") as f:
+                    json.dump(self._meta_info, f)
+            safetensors.torch.save_file(
+                self._records, f"{path}/rank{self.rank_id}.safetensors")
         return self.should_record
 
     def _set_layer(self, layer: int) -> None:
@@ -88,7 +89,7 @@ class ExpertStatistic:
                 "num_experts": expert_count,
                 "num_experts_per_token": token_selected_experts.size(-1)
             }
-        key = (self.current_iter_id, self.current_layer)
         counts = torch.bincount(token_selected_experts.flatten(),
                                 minlength=expert_count)
+        key = f"{self.current_iter_id}_{self.current_layer}"
         self._records[key] = counts.cpu()
