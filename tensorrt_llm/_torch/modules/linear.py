@@ -315,10 +315,9 @@ class Linear(nn.Module):
                     (self.out_features, self.in_features // group_size),
                     dtype=torch.float16),
                                               requires_grad=False)
-
-                self.pre_quant_scale = Parameter(torch.ones(
-                    (self.in_features, ), dtype=torch.float16),
-                                                 requires_grad=False)
+                # NOTE: Not in all linear we have this tensor - pre_quant_scale is computed as an average and merged with the
+                # LayerNorm for QKV and Gate/Up projection layers when possible. we can see the tensor only for o_proj and down_proj
+                self.pre_quant_scale = None
             else:
                 # TODO(zhenhuanc): support other quant mode
                 raise ValueError(f'unsupported quant mode: {qc.quant_mode}')
@@ -394,8 +393,10 @@ class Linear(nn.Module):
                 if bias is not None:
                     output = output + bias
             elif self.has_w4a16_awq:
-                pre_quant_scale = self.pre_quant_scale.repeat(input.shape[0], 1)
-                input = torch.mul(input, pre_quant_scale)
+                if self.pre_quant_scale is not None:
+                    pre_quant_scale = self.pre_quant_scale.repeat(
+                        input.shape[0], 1)
+                    input = torch.mul(input, pre_quant_scale)
 
                 bias = bias.contiguous() if bias is not None else None
 
@@ -566,6 +567,10 @@ class Linear(nn.Module):
                     pre_quant_scale = load_weight_shard(
                         weights[0]['pre_quant_scale'], self.tp_size,
                         self.tp_rank, self.tp_mode, device)
+                    self.pre_quant_scale = Parameter(
+                        torch.ones((self.in_features, ), dtype=torch.float16),
+                        requires_grad=False).to(device=device)
+
                     weight_scale = load_weight_shard(weights[0]['weight_scale'],
                                                      self.tp_size, self.tp_rank,
                                                      self.tp_mode,
