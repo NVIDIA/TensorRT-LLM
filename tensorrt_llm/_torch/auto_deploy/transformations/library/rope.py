@@ -53,7 +53,13 @@ import torch
 from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
-from ...utils.node_utils import bfs, extract_output_tuple, identify_regions_between_residuals, is_op
+from ...utils.node_utils import (
+    bfs,
+    extract_op_args,
+    extract_output_tuple,
+    identify_regions_between_residuals,
+    is_op,
+)
 from .._graph import canonicalize_graph
 
 
@@ -159,14 +165,6 @@ def match_complex_rope(gm: GraphModule) -> GraphModule:
     return gm
 
 
-def _get_default_unsqueeze_dim(op):
-    schema = next(iter(op._schemas.values()))
-    for a in schema.arguments:
-        if a.name == "unsqueeze_dim" and a.has_default_value:
-            return a.default_value
-    raise RuntimeError(f"No default unsqueeze_dim on {op}")
-
-
 def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphModule:
     """
     Match and transform input and output of rope ops to the layout specified to meet requirements of optimized ops.
@@ -194,13 +192,18 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         if not is_op(node, rope_ops):
             continue
 
-        rope_op = next(op for op in rope_ops if is_op(node, op))
         if is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
-            q_node, k_node, freqs_node, *rest = node.args
-            unsq = rest[0] if rest else _get_default_unsqueeze_dim(rope_op)
+            q_node, k_node, freqs_node, unsq = extract_op_args(
+                node,
+                "xq",  # argument name in schema
+                "xk",
+                "freqs_cis",
+                "unsqueeze_dim",
+            )
         else:
-            q_node, k_node, cos_node, sin_node, *rest = node.args
-            unsq = rest[0] if rest else _get_default_unsqueeze_dim(rope_op)
+            q_node, k_node, cos_node, sin_node, unsq = extract_op_args(
+                node, "q", "k", "cos", "sin", "unsqueeze_dim"
+            )
 
         if unsq == 2:
             current_layout = "bsnd"
@@ -397,7 +400,13 @@ def _optimize_explicit(
 def _optimize_complex(
     graph: GraphModule, node: Node, cache: Dict[Any, Node], pos_cache: Dict[str, Node]
 ) -> None:
-    q_node, k_node, inv_freq_node = node.args
+    # q_node, k_node, inv_freq_node = node.args
+    q_node, k_node, inv_freq_node = extract_op_args(
+        node,
+        "xq",  # argument name in schema
+        "xk",
+        "freqs_cis",
+    )
 
     # Sanity check on head_dim
     if not _validate_rope_inputs(q_node, k_node):

@@ -93,37 +93,53 @@ class ModelFactory(ABC):
                 the same model that is built above but it needs to have a state dict compatible with
                 the model built above.
             device: The device to load the model on.
+
+        NOTE: we always call ``self._to_maybe_random(model, device)`` as a preprocessing step
+        to ensure the model parameters already exist on the right device and have the desired dtype
+        as set in the model architecture. Moreover, initializing weights will ensure that no
+        ``assign=True`` logic is triggered during state dict loading. We want to avoid this since
+        this can interfere with things like weight sharding loading hooks. Particularly,
+        ``assign=True`` can cause OOM issues because although we shard the weight it may still
+        reference the full weight tensor in memory and hence with ``assign=True`` memory equivalent
+        to the full weight tensor and hence the full model may be reserved on each rank.
+
+        NOTE: this function will roughly allocate the following amount of memory:
+
+            * ``skip_loading_weights=True``:
+
+                .. code-block:: python
+
+                    sum(t.element_size() * t.numel() for t in model.state_dict().values())
+
+            * ``skip_loading_weights=False``:
+
+                .. code-block:: python
+
+                    sum(t.element_size() * t.numel() for t in model.state_dict().values()) +
+                    <SIZE_OF_LARGEST_CHECKPOINT_FILE>
+
         """
         ad_logger.info("Loading and initializing weights.")
-        if self.skip_loading_weights:
-            self._load_random_init(model, device)
-        else:
+        self._to_maybe_random(model, device)
+        if not self.skip_loading_weights:
             self._load_checkpoint(model, device)
 
     @staticmethod
-    def _to_maybe_empty(model: nn.Module, device: DeviceLikeType):
-        """A mix of ``model.to(device)`` and ``model.to_empty(device)``.
+    def _to_maybe_random(model: nn.Module, device: DeviceLikeType):
+        """A mix of ``model.to(device)`` and random initialization of parameters.
 
         If a parameter is already initialized, then we will call `to()` on it. Otherwise, we will
-        initialize it with an empty tensor on the given device.
+        initialize it with a random tensor on the given device.
 
+        NOTE: this utility is written in such a fashion that not more memory than what the model
+        shard needs is reserved and/or allocated.
         """
         model._apply(
-            lambda t: torch.empty_like(t, device=device)
+            # NOTE (lucaslie): torch.normal is not supported for all dtypes
+            lambda t: torch.normal(0.0, 1.0, size=t.shape, device=device).to(t.dtype)
             if t.device == torch.device("meta")
             else t.to(device)
         )
-
-    @classmethod
-    def _load_random_init(cls, model: nn.Module, device: DeviceLikeType):
-        """Randomly initialize model."""
-        cls._to_maybe_empty(model, device)
-        state_dict = model.state_dict()
-        for k in state_dict:
-            state_dict[k] = torch.normal(0.0, 1.0, size=state_dict[k].shape, device=device).to(
-                state_dict[k].dtype
-            )
-        model.load_state_dict(state_dict, strict=True, assign=True)
 
     @abstractmethod
     def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
