@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "w4a16_gemm_thop.h"
+#include "finegrained_mixed_dtype_gemm_thop.h"
 
 #include "cutlass_extensions/gemm_configs.h"
 #include "cutlass_extensions/weight_only_quant_op.h"
@@ -52,8 +52,7 @@ W4A16GemmRunner::W4A16GemmRunner(at::ScalarType activationDtype, int64_t quant_m
         if (activationDtype == at::ScalarType::Half)
         {
             mGemmRunner = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<half,
-                cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, half,
-                half>>(); // todo check if weights are int4b_t or uint4b_t
+                cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, half, half>>();
         }
         else if (activationDtype == at::ScalarType::BFloat16)
         {
