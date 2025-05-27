@@ -144,20 +144,21 @@ def match_causal_attn_mask(gm: GraphModule) -> GraphModule:
 
         ad_logger.debug(f"Found causal attention mask at {node}")
 
-        # Create new arguments with None mask and is_causal=True
-        new_args = list(node.args)
-        new_args[3] = None  # Set mask to None
+        # construct the new args list with args provided to the node and the default values otherwise
+        new_args = []
+        for idx, arg in enumerate(node.target._schema.arguments):
+            # In case arg is provided to the node, use it
+            if idx < len(node.args):
+                new_args.append(node.args[idx])
+            # In case arg is not provided to the node, use the default value
+            elif arg.has_default_value:
+                new_args.append(arg.default_value)
+            else:
+                raise ValueError(f"Missing required argument: {arg.name}")
 
-        # Check if we have enough arguments to set is_causal
-        if len(new_args) > 5:
-            new_args[5] = True  # Set is_causal to True
-        else:
-            # If is_causal wasn't specified (using default value), extend args
-            while len(new_args) < 5:
-                new_args.append(
-                    node.args[len(new_args)] if len(node.args) > len(new_args) else None
-                )
-            new_args.append(True)  # Append is_causal=True
+        # Create new arguments with None mask and is_causal=True
+        new_args[3] = None  # Set mask to None
+        new_args[5] = True  # Set is_causal to True
 
         # Create new node with updated arguments
         with graph.inserting_before(node):
