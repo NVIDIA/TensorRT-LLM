@@ -10,6 +10,8 @@ import aiohttp
 import pytest
 import yaml
 from defs.conftest import skip_no_hopper
+from defs.disaggregated.test_disaggregated_single_gpu import \
+    model_path as get_model_path
 from defs.trt_test_alternative import popen
 from transformers import AutoTokenizer
 
@@ -242,7 +244,7 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
         if model_path is None:
-            model_path = model_path(model_name)
+            model_path = get_model_path(model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.model_name = model_name
         self.kv_cache_block_maps: dict[str, KvCacheAwareServerState] = {}
