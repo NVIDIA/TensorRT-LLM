@@ -75,7 +75,9 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
         build_config=build_config,
         pytorch_backend_config=ad_config,
         tensor_parallel_size=config.world_size,
-        tokenizer=factory.init_tokenizer() if config.customize_tokenizer else None,
+        tokenizer=factory.init_tokenizer(config.tokenizer_name)
+        if config.customize_tokenizer
+        else None,
     )
 
     return llm

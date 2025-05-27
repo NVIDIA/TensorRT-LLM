@@ -175,11 +175,14 @@ class AutoModelForCausalLMFactory(ModelFactory):
             kv_cache_dtype = None
         return CacheConfig(dtype=kv_cache_dtype)
 
-    def init_tokenizer(self) -> Optional[Any]:
-        """Initialize the tokenizer for the model."""
-        if not self.model:
+    def init_tokenizer(self, tokenizer_name: str = None) -> Optional[Any]:
+        """Initialize the tokenizer—either a custom name or the model's default."""
+        if self.model is None and tokenizer_name is None:
             return None
-        return self.autotokenizer_from_pretrained(self.model, **self.tokenizer_kwargs)
+
+        # prefer a user-specified tokenizer_name, otherwise use the model ID
+        target = tokenizer_name or self.model
+        return self.autotokenizer_from_pretrained(target, **self.tokenizer_kwargs)
 
     def _get_ignore_patterns(self, repo_id: str):
         """Get the ignore patterns for the HF repo."""
