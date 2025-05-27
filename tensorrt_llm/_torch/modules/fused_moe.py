@@ -1279,7 +1279,7 @@ class FusedMoE(nn.Module):
         # it's still faster to load weights in parallel because it can utilize
         # CPU memory bandwidth better.
         max_workers = min(
-            len(self.initial_local_expert_ids) * 2,
+            (self.expert_end - self.expert_start) * 2,
             os.cpu_count() * 2,
             16,
         )
