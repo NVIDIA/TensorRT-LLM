@@ -35,28 +35,15 @@
 using namespace tensorrt_llm::runtime;
 using TensorPtr = ITensor::SharedPtr;
 
-GptDecoderBatched::GptDecoderBatched(GptDecoderBatched::CudaStreamPtr stream,
-    SpeculativeDecodingMode const& speculativeDecodingMode, nvinfer1::DataType dtype)
+GptDecoderBatched::GptDecoderBatched(GptDecoderBatched::CudaStreamPtr stream)
     : mRuntimeStream{std::move(stream)}
     , mBufferManager{mRuntimeStream}
 {
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    mDecoderState = std::make_shared<decoder::DecoderState>(dtype, mBufferManager);
-
-    if (!speculativeDecodingMode.isNone())
-    {
-        mDecoderState->allocateSpeculativeDecodingBuffers(speculativeDecodingMode, dtype, mBufferManager);
-    }
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void GptDecoderBatched::disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    mDecoderState->disableLookahead(genRequests);
 
     std::vector<SamplingConfig> samplingConfigs;
     samplingConfigs.reserve(genRequests.size());
@@ -86,24 +73,16 @@ void GptDecoderBatched::disableLookahead(RequestVector const& genRequests, Tenso
 }
 
 void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
-    SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-    SizeType32 maxTokensPerEngineStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+    SizeType32 maxSequenceLength, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxBatchSize > 0);
     TLLM_CHECK(maxBeamWidth > 0);
-    TLLM_CHECK(maxTokensPerEngineStep > 0);
     TLLM_CHECK(maxSequenceLength > 0);
 
-    mDecoderState->setup(maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength,
-        modelConfig, worldConfig, mBufferManager);
-
-    mDecoderState->setupSpeculativeDecoding(
-        mDecoderState->getSpeculativeDecodingMode(), maxTokensPerEngineStep, modelConfig, worldConfig, mBufferManager);
-
     std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModulePtr = nullptr;
-    if (mDecoderState->getSpeculativeDecodingMode().predictsDraftTokens())
+    if (modelConfig.getSpeculativeDecodingMode().predictsDraftTokens())
     {
         speculativeDecodingModulePtr = modelConfig.getSpeculativeDecodingModulePtr();
     }
@@ -259,7 +238,8 @@ void GptDecoderBatched::forwardDispatch(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-CudaEvent GptDecoderBatched::forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input)
+CudaEvent GptDecoderBatched::forwardAsync(
+    decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -267,7 +247,7 @@ CudaEvent GptDecoderBatched::forwardAsync(decoder_batch::Output& output, decoder
     mRuntimeStream->record(eventStart);
     mDecoderStream->wait(eventStart.get());
 
-    forwardDispatch(*mDecoderState, output, input);
+    forwardDispatch(decoderState, output, input);
 
     CudaEvent event{};
     mDecoderStream->record(event);
@@ -279,10 +259,11 @@ CudaEvent GptDecoderBatched::forwardAsync(decoder_batch::Output& output, decoder
     return eventStop;
 }
 
-void GptDecoderBatched::forward(decoder_batch::Output& output, decoder_batch::Input const& input)
+void GptDecoderBatched::forward(
+    decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto decoderFinishEvent = forwardAsync(output, input);
+    auto decoderFinishEvent = forwardAsync(decoderState, output, input);
     decoderFinishEvent.synchronize();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
