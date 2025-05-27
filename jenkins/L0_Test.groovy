@@ -1454,7 +1454,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     fullSet = parallelJobs.keySet()
 
-    slurmX86Configs = [:]
+    turtleSlurmConfigs = [:]
     // "RTXPro6000-PyTorch-[Post-Merge]-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
 
     // TODO: use cpu pod to launch slurm job
