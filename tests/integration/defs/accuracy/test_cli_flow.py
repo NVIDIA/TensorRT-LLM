@@ -1002,7 +1002,8 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
     @pytest.mark.parametrize(
         "moe_tp_size", [1, 4, 8],
         ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
-    def test_ootb_except_mha_tp8(self, moe_tp_size):
+    def test_ootb_except_mha_tp8(self, moe_tp_size, mocker):
+        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 1)
         self.run(tp_size=8,
                  extra_convert_args=[
                      f"--moe_tp_size={moe_tp_size}",
