@@ -42,7 +42,7 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
     )
     max_batch_size = 1
 
-    target_model_dir = f"{models_path}/llama-3.2-models/Llama-3.2-3B"
+    target_model_dir = f"{models_path}/llama-3.2-models/Llama-3.2-1B"
     draft_model_dir = f"{models_path}/llama-3.2-models/Llama-3.2-1B"
 
     draft_len = 4
