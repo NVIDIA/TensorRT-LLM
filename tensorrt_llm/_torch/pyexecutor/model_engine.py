@@ -588,6 +588,12 @@ class PyTorchModelEngine(ModelEngine):
         def get_torch_compile_warmup_request(batch_size,
                                              num_tokens_per_request):
             available_blocks = kv_cache_manager.get_num_free_blocks()
+            print(
+                f"====================get_torch_compile_warmup_request============================"
+            )
+            print(f"batch_size: {batch_size}")
+            print(f"num_tokens_per_request: {num_tokens_per_request}")
+            print(f"available_blocks: {available_blocks}")
             if available_blocks >= batch_size * math.ceil(
                     num_tokens_per_request / kv_cache_manager.tokens_per_block):
                 # Should only need (at most) one more page per request.
@@ -612,6 +618,9 @@ class PyTorchModelEngine(ModelEngine):
                     result.context_requests = requests
             else:
                 result = None
+            print(
+                f"====================get_torch_compile_warmup_request result============================"
+            )
             return result
 
         def get_autotune_warmup_request():
