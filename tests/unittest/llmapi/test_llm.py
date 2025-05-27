@@ -1963,11 +1963,11 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
         LLM_CLASS = LLM_torch
     else:
         LLM_CLASS = LLM
+        llm_args_extra["fast_build"] = True
 
     llm = LLM_CLASS(model=llama_model_path,
                     kv_cache_config=global_kvcache_config,
                     tensor_parallel_size=tp_size,
-                    fast_build=True,
                     **llm_args_extra)
 
     max_tokens = 6

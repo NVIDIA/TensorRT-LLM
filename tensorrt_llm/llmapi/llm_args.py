@@ -928,7 +928,7 @@ class BaseLlmArgs(BaseModel):
     num_postprocess_workers: int = Field(
         default=0,
         description=
-        "The number of processes for generated token postprocessing, such as detokenization and so on."
+        "The number of processes used for postprocessing the generated tokens, including detokenization."
     )
 
     postprocess_tokenizer_dir: Optional[str] = Field(
@@ -1057,8 +1057,6 @@ class BaseLlmArgs(BaseModel):
 
         self._setup_speculative_config()
 
-
-
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "BaseLlmArgs":
         """Create `LlmArgs` instance from kwargs.
@@ -1170,8 +1168,7 @@ class BaseLlmArgs(BaseModel):
                     max_draft_tokens=self.speculative_config.max_draft_len,
                     draft_model_path=self.speculative_config.
                     pytorch_eagle_weights_path,
-                    eagle3_one_model=self.speculative_config.
-                    eagle3_one_model)
+                    eagle3_one_model=self.speculative_config.eagle3_one_model)
 
         elif isinstance(self.speculative_config, NGramDecodingConfig):
             self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
@@ -1202,8 +1199,6 @@ class BaseLlmArgs(BaseModel):
             raise ValueError(
                 f"Speculative config type not recognized: {self.speculative_config}"
             )
-
-
 
     @field_validator("lora_config", "enable_lora", "max_lora_rank", "max_loras",
                      "max_cpu_loras")
@@ -1454,27 +1449,10 @@ class TrtLlmArgs(BaseLlmArgs):
         if self.parallel_config.auto_parallel:
             self.parallel_config.world_size = self.auto_parallel_world_size
 
-    @field_validator("max_batch_size")
-    @classmethod
-    def validate_max_batch_size(cls, v, info):
-        values = info.data
-        if values.get("build_config") is not None and values[
-                "_build_config_init_method"] == "from_kwargs":
-            logger.warning(
-                f"max_batch_size [{v}] is ignored because it's specified in build_config"
-            )
-        return v
+        # Setup build config after model initialization
+        self.setup_build_config()
 
-    @field_validator("max_beam_width")
-    @classmethod
-    def validate_max_beam_width(cls, v, info):
-        values = info.data
-        if values.get("build_config") is not None and values[
-                "_build_config_init_method"] == "from_kwargs":
-            logger.warning(
-                f"max_beam_width [{v}] is ignored because it's specified in build_config"
-            )
-        return v
+        self.calib_config = self.calib_config or CalibConfig()
 
     @field_validator("max_input_len")
     @classmethod
@@ -1496,57 +1474,60 @@ class TrtLlmArgs(BaseLlmArgs):
                 raise ValueError(f"Invalid build_cache_config: {v}")
         return v
 
-    @field_validator("build_config", mode='after')  # after model created
-    @classmethod
-    def validate_build_config(cls, v, info):
-        values = info.data
-        if v is None:
-            cls._build_config_init_method = "default"
+    def setup_build_config(self):
+        """Setup the build configuration based on the provided parameters.
+
+        This method handles:
+        1. Creating a default BuildConfig if none is provided
+        2. Validating that runtime parameters don't exceed build-time parameters
+        3. Setting the _build_config_init_method attribute
+        """
+        if self.build_config is None:
+            self._build_config_init_method = "default"
             kwargs = {}
-            if values.get("max_batch_size"):
-                kwargs["max_batch_size"] = values["max_batch_size"]
-            if values.get("max_num_tokens"):
-                kwargs["max_num_tokens"] = values["max_num_tokens"]
-            if values.get("max_seq_len"):
-                kwargs["max_seq_len"] = values["max_seq_len"]
-            if values.get("max_beam_width"):
-                kwargs["max_beam_width"] = values["max_beam_width"]
-            if values.get("max_input_len"):
-                kwargs["max_input_len"] = values["max_input_len"]
-            return BuildConfig(**kwargs)
+            if self.max_batch_size:
+                kwargs["max_batch_size"] = self.max_batch_size
+            if self.max_num_tokens:
+                kwargs["max_num_tokens"] = self.max_num_tokens
+            if self.max_seq_len:
+                kwargs["max_seq_len"] = self.max_seq_len
+            if self.max_beam_width:
+                kwargs["max_beam_width"] = self.max_beam_width
+            if self.max_input_len:
+                kwargs["max_input_len"] = self.max_input_len
+            self.build_config = BuildConfig(**kwargs)
         else:
-            cls._build_config_init_method = cls._build_config_init_method or "from_kwargs"
+            self._build_config_init_method = self._build_config_init_method or "from_kwargs"
 
         # Note: max_batch_size and max_num_tokens in LlmArgs are for runtime,
         # which will be passed to the C++ Executor API, overwriting the values
         # from an built engine. In order to set build configuration, it is
         # recommended to use build_config instead.
-        if values.get("max_batch_size") is not None:
-            if values["max_batch_size"] > v.max_batch_size:
+        if self.max_batch_size is not None:
+            if self.max_batch_size > self.build_config.max_batch_size:
                 raise ValueError(
-                    f"max_batch_size [{values['max_batch_size']}] is greater than max_batch_size [{v.max_batch_size}] in build_config"
+                    f"max_batch_size [{self.max_batch_size}] is greater than build_config.max_batch_size [{self.build_config.max_batch_size}] in build_config"
                 )
-        if values.get("max_num_tokens") is not None:
-            if values["max_num_tokens"] > v.max_num_tokens:
+        if self.max_num_tokens is not None:
+            if self.max_num_tokens > self.build_config.max_num_tokens:
                 raise ValueError(
-                    f"max_num_tokens [{values['max_num_tokens']}] is greater than max_num_tokens [{v.max_num_tokens}] in build_config"
+                    f"max_num_tokens [{self.max_num_tokens}] is greater than build_config.max_num_tokens [{self.build_config.max_num_tokens}] in build_config"
                 )
-        if values.get("max_seq_len") is not None:
-            if values["max_seq_len"] != v.max_seq_len:
+        if self.max_seq_len is not None:
+            if self.max_seq_len != self.build_config.max_seq_len:
                 raise ValueError(
-                    f"max_seq_len [{values['max_seq_len']}] is overridden by max_seq_len [{v.max_seq_len}] in build_config"
+                    f"max_seq_len [{self.max_seq_len}] is overridden by build_config.max_seq_len [{self.build_config.max_seq_len}] in build_config"
                 )
-        if values.get("max_beam_width") is not None:
-            if values["max_beam_width"] != v.max_beam_width:
+        if self.max_beam_width is not None:
+            if self.max_beam_width != self.build_config.max_beam_width:
                 raise ValueError(
-                    f"max_beam_width [{values['max_beam_width']}] is overridden by max_beam_width [{v.max_beam_width}] in build_config"
+                    f"max_beam_width [{self.max_beam_width}] is overridden by build_config.max_beam_width [{self.build_config.max_beam_width}] in build_config"
                 )
-        if values.get("max_input_len") is not None:
-            if values["max_input_len"] != v.max_input_len:
+        if self.max_input_len is not None:
+            if self.max_input_len != self.build_config.max_input_len:
                 raise ValueError(
-                    f"max_input_len [{values['max_input_len']}] is overridden by max_input_len [{v.max_input_len}] in build_config"
+                    f"max_input_len [{self.max_input_len}] is overridden by build_config.max_input_len [{self.build_config.max_input_len}] in build_config"
                 )
-        return v
 
 
 LlmArgs = TrtLlmArgs
