@@ -631,6 +631,15 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
     return renamed_weights
 
 
+def filter_weights(prefix, weights: Dict):
+    result = {}
+    for k, v in weights.items():
+        if k.startswith(prefix):
+            new_k = k[len(prefix) + 1:]
+            result[new_k] = v
+    return result
+
+
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
                        params_map: Optional[Dict[str, str]] = None):
@@ -648,14 +657,6 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     head_dim = getattr(
         model.config, "head_dim",
         model.config.hidden_size // model.config.num_attention_heads)
-
-    def filter_weights(prefix, weights: Dict):
-        result = {}
-        for k, v in weights.items():
-            if k.startswith(prefix):
-                new_k = k[len(prefix) + 1:]
-                result[new_k] = v
-        return result
 
     params_map = {
         'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],

@@ -469,6 +469,10 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
 
 [[nodiscard]] bool MLACacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const
 {
+    if (selfConfig.getDataType() != destConfig.getDataType())
+    {
+        return false;
+    }
     if (selfConfig.getAttentionConfig().mAttentionType != CacheState::AttentionType::kMLA
         || destConfig.getAttentionConfig().mAttentionType != CacheState::AttentionType::kMLA)
     {

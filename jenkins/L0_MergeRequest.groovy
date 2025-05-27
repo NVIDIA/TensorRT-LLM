@@ -15,6 +15,13 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 }
 LLM_ROOT = "llm"
 
+// LLM repository configuration
+withCredentials([string(credentialsId: 'default-scan-repo', variable: 'DEFAULT_SCAN_REPO')]) {
+    SCAN_REPO = "${DEFAULT_SCAN_REPO}"
+}
+SCAN_COMMIT = "main"
+SCAN_ROOT = "scan"
+
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
@@ -352,8 +359,33 @@ def launchReleaseCheck(pipeline)
                 sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
             }
         }
-        // Step 3: do some check in container
+        // Step 3: Run license check
         sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
+
+        // Step 4: Run guardwords scan
+        def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+        if (env.alternativeTRT || isOfficialPostMergeJob) {
+            trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
+            try {
+                ignoreList = [
+                    "*/.git/*",
+                    "*/3rdparty/*",
+                    "*/examples/scaffolding/contrib/mcp/weather/weather.py",
+                    "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz"
+                ]
+                sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')}) 2>&1 | tee scan.log"
+                def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
+                if (lastLine.toLowerCase().contains("error")) {
+                    error "Guardwords Scan Failed."
+                }
+            } catch (Exception e) {
+                throw e
+            } finally {
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/guardwords-scan-results/")
+                echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
+            }
+        }
     }
 
     def image = "urm.nvidia.com/docker/golang:1.22"
@@ -685,6 +717,45 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
+        stage("Rerun report") {
+            sh "rm -rf rerun && mkdir -p rerun"
+            sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
+            sh "find rerun -type f"
+            def rerunFileCount = sh(returnStdout: true, script: 'find rerun -type f | wc -l').replaceAll("\\s","").toInteger()
+            if (rerunFileCount == 0) {
+                echo "Rerun report is skipped because there is no rerun test data file."
+                return
+            }
+            def xmlFiles = findFiles(glob: 'rerun/**/*.xml')
+            def xmlFileList = xmlFiles.collect { it.path }
+            def inputfiles = xmlFileList.join(',')
+            echo "inputfiles: ${inputfiles}"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
+            sh """
+                python3 llm/tests/integration/defs/test_rerun.py \
+                generate_rerun_report \
+                --output-file=rerun/rerun_report.xml \
+                --input-files=${inputfiles}
+            """
+            trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
+            echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+            def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+            if (env.alternativeTRT || isOfficialPostMergeJob) {
+                catchError(
+                    buildResult: 'FAILURE',
+                    stageResult: 'FAILURE') {
+                    error "Some failed tests were reruned, please check the rerun report."
+                }
+            } else {
+                catchError(
+                    buildResult: 'SUCCESS',
+                    stageResult: 'UNSTABLE') {
+                    error "Some failed tests were reruned, please check the rerun report."
+                }
+            }
+        } // Rerun report stage
         try {
             stage("Test coverage") {
                 sh "ls"
