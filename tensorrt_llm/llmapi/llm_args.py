@@ -856,7 +856,7 @@ class BaseLlmArgs(BaseModel):
 
     # Quantization and calibration configurations
     quant_config: Optional[QuantConfig] = Field(
-        default_factory=QuantConfig, description="Quantization config.")
+        default=None, description="Quantization config.")
 
     # Several options from ExecutorConfig, expanded here for less hierarchy
     kv_cache_config: KvCacheConfig = Field(default_factory=KvCacheConfig,
@@ -928,7 +928,7 @@ class BaseLlmArgs(BaseModel):
     num_postprocess_workers: int = Field(
         default=0,
         description=
-        "The number of processes for generated token postprocessing, such as detokenization and so on."
+        "The number of processes used for postprocessing the generated tokens, including detokenization."
     )
 
     postprocess_tokenizer_dir: Optional[str] = Field(
@@ -984,7 +984,10 @@ class BaseLlmArgs(BaseModel):
 
     @print_traceback_on_error
     def model_post_init(self, __context: Any):
+        self._ensure_lora_config_consistency()
+
         self.max_input_len = self.max_input_len or 1024
+        self.quant_config = self.quant_config or QuantConfig()
 
         if self.skip_tokenizer_init:
             self.tokenizer = None
@@ -1055,10 +1058,6 @@ class BaseLlmArgs(BaseModel):
         # Store the model format in the values
         self._model_format = model_format
 
-        self._setup_speculative_config()
-
-
-
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "BaseLlmArgs":
         """Create `LlmArgs` instance from kwargs.
@@ -1095,7 +1094,7 @@ class BaseLlmArgs(BaseModel):
         Returns:
             dict: The dict that contains all fields of the `LlmArgs` instance.
         """
-        return self.model_dump()
+        return self.model_dump(mode='json')
 
     @staticmethod
     def _check_consistency(kwargs_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -1123,135 +1122,126 @@ class BaseLlmArgs(BaseModel):
         return v
 
     def _setup_speculative_config(self):
-        if not self.speculative_config:
-            self.decoding_config = None
-            return
+        if self.speculative_config:
+            if isinstance(self.speculative_config, LookaheadDecodingConfig):
+                lookahead_config = self.speculative_config
+                # Update the build config
+                _, _, max_draft_tokens, _ = lookahead_config.calculate_speculative_resource(
+                )
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.LOOKAHEAD_DECODING
+                if max_draft_tokens > self.build_config.max_draft_len:
+                    self.build_config.max_draft_len = max_draft_tokens
 
-        if isinstance(self.speculative_config, LookaheadDecodingConfig):
-            lookahead_config = self.speculative_config
-            # Update the build config
-            _, _, max_draft_tokens, _ = lookahead_config.calculate_speculative_resource(
-            )
-            self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.LOOKAHEAD_DECODING
-            if max_draft_tokens > self.build_config.max_draft_len:
-                self.build_config.max_draft_len = max_draft_tokens
-
-            self.decoding_config = DecodingConfig(
-                decoding_mode=DecodingMode.Lookahead(),
-                lookahead_decoding_config=PybindMirror.maybe_to_pybind(
-                    lookahead_config))
-        elif isinstance(self.speculative_config, MedusaDecodingConfig):
-            self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
-
-            assert self.speculative_config.max_draft_len > 0
-            self.build_config.max_draft_len = self.speculative_config.max_draft_len
-            self.decoding_config = DecodingConfig(
-                decoding_mode=DecodingMode.Medusa(),
-                medusa_choices=self.speculative_config.medusa_choices)
-        elif isinstance(self.speculative_config, EagleDecodingConfig):
-            self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
-            assert self.speculative_config.max_draft_len > 0
-
-            self.build_config.max_draft_len = self.speculative_config.max_draft_len
-
-            if self.backend != 'pytorch':
-                eagle_config = _EagleConfig(
-                    self.speculative_config.eagle_choices,
-                    self.speculative_config.greedy_sampling,
-                    self.speculative_config.posterior_threshold,
-                    self.speculative_config.use_dynamic_tree,
-                    self.speculative_config.dynamic_tree_max_topK)
                 self.decoding_config = DecodingConfig(
-                    decoding_mode=DecodingMode.Eagle(),
-                    eagle_config=eagle_config)
+                    decoding_mode=DecodingMode.Lookahead(),
+                    lookahead_decoding_config=PybindMirror.maybe_to_pybind(
+                        lookahead_config))
+            elif isinstance(self.speculative_config, MedusaDecodingConfig):
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
+
+                assert self.speculative_config.max_draft_len > 0
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
+                self.decoding_config = DecodingConfig(
+                    decoding_mode=DecodingMode.Medusa(),
+                    medusa_choices=self.speculative_config.medusa_choices)
+            elif isinstance(self.speculative_config, EagleDecodingConfig):
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
+                assert self.speculative_config.max_draft_len > 0
+
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
+
+                if self.backend != 'pytorch':
+                    eagle_config = _EagleConfig(
+                        self.speculative_config.eagle_choices,
+                        self.speculative_config.greedy_sampling,
+                        self.speculative_config.posterior_threshold,
+                        self.speculative_config.use_dynamic_tree,
+                        self.speculative_config.dynamic_tree_max_topK)
+                    self.decoding_config = DecodingConfig(
+                        decoding_mode=DecodingMode.Eagle(),
+                        eagle_config=eagle_config)
+                else:
+                    from tensorrt_llm._torch.speculative import Eagle3Config
+                    self.speculative_config = Eagle3Config(
+                        max_draft_tokens=self.speculative_config.max_draft_len,
+                        draft_model_path=self.speculative_config.
+                        pytorch_eagle_weights_path,
+                        eagle3_one_model=self.speculative_config.
+                        eagle3_one_model)
+            elif isinstance(self.speculative_config, NGramDecodingConfig):
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
+                assert self.backend == 'pytorch'
+                assert self.speculative_config.prompt_lookup_num_tokens > 0 and self.speculative_config.max_matching_ngram_size > 0
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
+                from tensorrt_llm._torch.speculative import NGramConfig
+                self.speculative_config = NGramConfig(
+                    prompt_lookup_num_tokens=self.speculative_config.
+                    prompt_lookup_num_tokens,
+                    max_matching_ngram_size=self.speculative_config.
+                    max_matching_ngram_size,
+                    is_keep_all=self.speculative_config.is_keep_all,
+                    is_use_oldest=self.speculative_config.is_use_oldest,
+                    is_public_pool=self.speculative_config.is_public_pool,
+                )
+            elif isinstance(self.speculative_config, MTPDecodingConfig):
+                from tensorrt_llm._torch.speculative import MTPConfig
+                self.speculative_config = MTPConfig(
+                    num_nextn_predict_layers=self.speculative_config.
+                    num_nextn_predict_layers,
+                    max_batch_size=self.build_config.max_batch_size,
+                    use_relaxed_acceptance_for_thinking=self.speculative_config.
+                    use_relaxed_acceptance_for_thinking,
+                    relaxed_topk=self.speculative_config.relaxed_topk,
+                    relaxed_delta=self.speculative_config.relaxed_delta)
             else:
-                from tensorrt_llm._torch.speculative import Eagle3Config
-                self.speculative_config = Eagle3Config(
-                    max_draft_tokens=self.speculative_config.max_draft_len,
-                    draft_model_path=self.speculative_config.
-                    pytorch_eagle_weights_path,
-                    eagle3_one_model=self.speculative_config.
-                    eagle3_one_model)
-
-        elif isinstance(self.speculative_config, NGramDecodingConfig):
-            self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
-            assert self.backend == 'pytorch'
-            assert self.speculative_config.prompt_lookup_num_tokens > 0 and self.speculative_config.max_matching_ngram_size > 0
-            self.build_config.max_draft_len = self.speculative_config.max_draft_len
-            from tensorrt_llm._torch.speculative import NGramConfig
-            self.speculative_config = NGramConfig(
-                prompt_lookup_num_tokens=self.speculative_config.
-                prompt_lookup_num_tokens,
-                max_matching_ngram_size=self.speculative_config.
-                max_matching_ngram_size,
-                is_keep_all=self.speculative_config.is_keep_all,
-                is_use_oldest=self.speculative_config.is_use_oldest,
-                is_public_pool=self.speculative_config.is_public_pool,
-            )
-        elif isinstance(self.speculative_config, MTPDecodingConfig):
-            from tensorrt_llm._torch.speculative import MTPConfig
-            self.speculative_config = MTPConfig(
-                num_nextn_predict_layers=self.speculative_config.
-                num_nextn_predict_layers,
-                max_batch_size=self.build_config.max_batch_size,
-                use_relaxed_acceptance_for_thinking=self.speculative_config.
-                use_relaxed_acceptance_for_thinking,
-                relaxed_topk=self.speculative_config.relaxed_topk,
-                relaxed_delta=self.speculative_config.relaxed_delta)
+                raise ValueError(
+                    f"Speculative config type not recognized: {self.speculative_config}"
+                )
         else:
-            raise ValueError(
-                f"Speculative config type not recognized: {self.speculative_config}"
-            )
+            self.decoding_config = None
 
+        self._speculative_model = getattr(self.speculative_config,
+                                          "speculative_model", None)
+        speculative_model_obj = _ModelWrapper(
+            self._speculative_model
+        ) if self._speculative_model is not None else None
+        if self._speculative_model and speculative_model_obj.is_local_model:
+            self._speculative_model_format = _ModelFormatKind.HF
 
-
-    @field_validator("lora_config", "enable_lora", "max_lora_rank", "max_loras",
-                     "max_cpu_loras")
-    @classmethod
-    def validate_lora_config(cls, v, info):
-        field_name = info.field_name
-        values = info.data
-
-        if field_name == "lora_config" and values.get("lora_config"):
-            if values.get("max_lora_rank") is not None:
+    def _ensure_lora_config_consistency(self):
+        if self.lora_config:
+            if self.max_lora_rank is not None:
                 logger.warning(
                     "max_lora_rank is ignored when lora_config is provided.")
-            if values.get("max_loras") != values["lora_config"].max_loras:
+            if self.max_loras != self.lora_config.max_loras:
                 logger.warning(
                     "max_loras is ignored when lora_config is provided.")
-            if values.get(
-                    "max_cpu_loras") != values["lora_config"].max_cpu_loras:
+            if self.max_cpu_loras != self.lora_config.max_cpu_loras:
                 logger.warning(
                     "max_cpu_loras is ignored when lora_config is provided.")
 
-            if len(values["lora_config"].lora_dir) == 0:
+            if len(self.lora_config.lora_dir) == 0:
                 # TODO [TRTLLM-5173]
                 logger.warning(
                     "lora_dir is empty, so custom embedding or lm head will not be applied."
                 )
 
-        if field_name == "enable_lora" and values.get(
-                "enable_lora") and values.get(
-                    "lora_config") is not None and values.get(
-                        "backend") == 'pytorch':
+        if self.enable_lora and self.lora_config is not None and self.backend == 'pytorch':
             logger.warning(
                 "enable_lora is ignored when lora_config is provided for pytorch backend."
             )
 
-        if field_name == "lora_config" and values.get(
-                "lora_config") is not None:
-            if len(values["lora_config"].lora_dir) == 0 and len(
-                    values["lora_config"].lora_target_modules) == 0:
+        if self.lora_config is not None:
+            if len(self.lora_config.lora_dir) == 0 and len(
+                    self.lora_config.lora_target_modules) == 0:
                 logger.warning(
                     "Both lora_dir and lora_target_modules are empty, so all LoRA modules will be expected. "
                     "This will lead to serious memory consumption. Please provide either lora_dir or lora_target_modules if this behavior is not what you expect."
                 )
                 default_trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules(
                 )
-                values["lora_config"].lora_target_modules = list(
+                self.lora_config.lora_target_modules = list(
                     default_trtllm_modules_to_hf_modules.keys())
-
-        return v
 
     @model_validator(mode="after")
     @classmethod
@@ -1419,20 +1409,16 @@ class TrtLlmArgs(BaseLlmArgs):
     def auto_parallel_config(self) -> AutoParallelConfig:
         return self._auto_parallel_config
 
-    @field_validator("embedding_parallel_mode")
-    @classmethod
-    def validate_embedding_parallel_mode(cls, v):
-        if v == 'NONE':
-            cls._convert_checkpoint_options['use_parallel_embedding'] = False
-        elif v == 'SHARDING_ALONG_VOCAB':
-            cls._convert_checkpoint_options['use_parallel_embedding'] = True
-            cls._convert_checkpoint_options['embedding_sharding_dim'] = 0
-        elif v == 'SHARDING_ALONG_HIDDEN':
-            cls._convert_checkpoint_options['use_parallel_embedding'] = True
-            cls._convert_checkpoint_options['embedding_sharding_dim'] = 1
-        else:
-            raise ValueError(f"Invalid embedding_parallel_mode: {v}")
-        return v
+    def _setup_embedding_parallel_mode(self):
+        if self.embedding_parallel_mode == 'NONE':
+            self._convert_checkpoint_options['use_parallel_embedding'] = False
+        elif self.embedding_parallel_mode == 'SHARDING_ALONG_VOCAB':
+            self._convert_checkpoint_options['use_parallel_embedding'] = True
+            self._convert_checkpoint_options['embedding_sharding_dim'] = 0
+        elif self.embedding_parallel_mode == 'SHARDING_ALONG_HIDDEN':
+            self._convert_checkpoint_options['use_parallel_embedding'] = True
+            self._convert_checkpoint_options['embedding_sharding_dim'] = 1
+        # No else clause needed since validation already happened
 
     @print_traceback_on_error
     def model_post_init(self, __context):
@@ -1454,27 +1440,13 @@ class TrtLlmArgs(BaseLlmArgs):
         if self.parallel_config.auto_parallel:
             self.parallel_config.world_size = self.auto_parallel_world_size
 
-    @field_validator("max_batch_size")
-    @classmethod
-    def validate_max_batch_size(cls, v, info):
-        values = info.data
-        if values.get("build_config") is not None and values[
-                "_build_config_init_method"] == "from_kwargs":
-            logger.warning(
-                f"max_batch_size [{v}] is ignored because it's specified in build_config"
-            )
-        return v
+        # Setup build config after model initialization
+        self._setup_build_config()
+        self._setup_enable_build_cache()
+        self._setup_speculative_config()
+        self._setup_embedding_parallel_mode()
 
-    @field_validator("max_beam_width")
-    @classmethod
-    def validate_max_beam_width(cls, v, info):
-        values = info.data
-        if values.get("build_config") is not None and values[
-                "_build_config_init_method"] == "from_kwargs":
-            logger.warning(
-                f"max_beam_width [{v}] is ignored because it's specified in build_config"
-            )
-        return v
+        self.calib_config = self.calib_config or CalibConfig()
 
     @field_validator("max_input_len")
     @classmethod
@@ -1487,66 +1459,69 @@ class TrtLlmArgs(BaseLlmArgs):
             )
         return v
 
-    @field_validator("enable_build_cache")
-    @classmethod
-    def validate_build_cache(cls, v):
-        if v:
-            v = BuildCacheConfig() if isinstance(v, bool) else v
-            if not isinstance(v, BuildCacheConfig):
-                raise ValueError(f"Invalid build_cache_config: {v}")
-        return v
+    def _setup_enable_build_cache(self):
+        if not self.enable_build_cache:
+            return
+        self.enable_build_cache = BuildCacheConfig() if isinstance(
+            self.enable_build_cache, bool) else self.enable_build_cache
+        if not isinstance(self.enable_build_cache, BuildCacheConfig):
+            raise ValueError(
+                f"Invalid build_cache_config: {self.enable_build_cache}")
 
-    @field_validator("build_config", mode='after')  # after model created
-    @classmethod
-    def validate_build_config(cls, v, info):
-        values = info.data
-        if v is None:
-            cls._build_config_init_method = "default"
+    def _setup_build_config(self):
+        """Setup the build configuration based on the provided parameters.
+
+        This method handles:
+        1. Creating a default BuildConfig if none is provided
+        2. Validating that runtime parameters don't exceed build-time parameters
+        3. Setting the _build_config_init_method attribute
+        """
+        if self.build_config is None:
+            self._build_config_init_method = "default"
             kwargs = {}
-            if values.get("max_batch_size"):
-                kwargs["max_batch_size"] = values["max_batch_size"]
-            if values.get("max_num_tokens"):
-                kwargs["max_num_tokens"] = values["max_num_tokens"]
-            if values.get("max_seq_len"):
-                kwargs["max_seq_len"] = values["max_seq_len"]
-            if values.get("max_beam_width"):
-                kwargs["max_beam_width"] = values["max_beam_width"]
-            if values.get("max_input_len"):
-                kwargs["max_input_len"] = values["max_input_len"]
-            return BuildConfig(**kwargs)
+            if self.max_batch_size:
+                kwargs["max_batch_size"] = self.max_batch_size
+            if self.max_num_tokens:
+                kwargs["max_num_tokens"] = self.max_num_tokens
+            if self.max_seq_len:
+                kwargs["max_seq_len"] = self.max_seq_len
+            if self.max_beam_width:
+                kwargs["max_beam_width"] = self.max_beam_width
+            if self.max_input_len:
+                kwargs["max_input_len"] = self.max_input_len
+            self.build_config = BuildConfig(**kwargs)
         else:
-            cls._build_config_init_method = cls._build_config_init_method or "from_kwargs"
+            self._build_config_init_method = self._build_config_init_method or "from_kwargs"
 
         # Note: max_batch_size and max_num_tokens in LlmArgs are for runtime,
         # which will be passed to the C++ Executor API, overwriting the values
         # from an built engine. In order to set build configuration, it is
         # recommended to use build_config instead.
-        if values.get("max_batch_size") is not None:
-            if values["max_batch_size"] > v.max_batch_size:
+        if self.max_batch_size is not None:
+            if self.max_batch_size > self.build_config.max_batch_size:
                 raise ValueError(
-                    f"max_batch_size [{values['max_batch_size']}] is greater than max_batch_size [{v.max_batch_size}] in build_config"
+                    f"max_batch_size [{self.max_batch_size}] is greater than build_config.max_batch_size [{self.build_config.max_batch_size}] in build_config"
                 )
-        if values.get("max_num_tokens") is not None:
-            if values["max_num_tokens"] > v.max_num_tokens:
+        if self.max_num_tokens is not None:
+            if self.max_num_tokens > self.build_config.max_num_tokens:
                 raise ValueError(
-                    f"max_num_tokens [{values['max_num_tokens']}] is greater than max_num_tokens [{v.max_num_tokens}] in build_config"
+                    f"max_num_tokens [{self.max_num_tokens}] is greater than build_config.max_num_tokens [{self.build_config.max_num_tokens}] in build_config"
                 )
-        if values.get("max_seq_len") is not None:
-            if values["max_seq_len"] != v.max_seq_len:
-                raise ValueError(
-                    f"max_seq_len [{values['max_seq_len']}] is overridden by max_seq_len [{v.max_seq_len}] in build_config"
+        if self.max_seq_len is not None:
+            if self.max_seq_len != self.build_config.max_seq_len:
+                logger.warning(
+                    f"max_seq_len [{self.max_seq_len}] is overridden by build_config.max_seq_len [{self.build_config.max_seq_len}] in build_config"
                 )
-        if values.get("max_beam_width") is not None:
-            if values["max_beam_width"] != v.max_beam_width:
-                raise ValueError(
-                    f"max_beam_width [{values['max_beam_width']}] is overridden by max_beam_width [{v.max_beam_width}] in build_config"
+        if self.max_beam_width is not None:
+            if self.max_beam_width != self.build_config.max_beam_width:
+                logger.warning(
+                    f"max_beam_width [{self.max_beam_width}] is overridden by build_config.max_beam_width [{self.build_config.max_beam_width}] in build_config"
                 )
-        if values.get("max_input_len") is not None:
-            if values["max_input_len"] != v.max_input_len:
-                raise ValueError(
-                    f"max_input_len [{values['max_input_len']}] is overridden by max_input_len [{v.max_input_len}] in build_config"
+        if self.max_input_len is not None:
+            if self.max_input_len != self.build_config.max_input_len:
+                logger.warning(
+                    f"max_input_len [{self.max_input_len}] is overridden by build_config.max_input_len [{self.build_config.max_input_len}] in build_config"
                 )
-        return v
 
 
 LlmArgs = TrtLlmArgs
@@ -1718,6 +1693,8 @@ class TorchLlmArgs(BaseLlmArgs):
 
         super().model_post_init(__context)
         self._model_format = _ModelFormatKind.HF
+
+        self._setup_speculative_config()
 
         if isinstance(self.moe_load_balancer, str):
             if not os.path.exists(self.moe_load_balancer):
