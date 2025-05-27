@@ -16,7 +16,6 @@
  */
 
 #include "tensorrt_llm/executor/executorImpl.h"
-#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/trtEncoderModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelFactory.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"

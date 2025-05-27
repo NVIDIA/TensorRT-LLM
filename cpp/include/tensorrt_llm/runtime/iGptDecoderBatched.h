@@ -76,8 +76,6 @@ public:
     TensorPtr batchSlotsRequestOrder;
 
     //! For Beam Search
-    //! Indices into KV cache of different rays within one beam, [maxBatchSize, maxBeamWidth, maxSeqLen], on gpu
-    TensorPtr cacheIndirection;
     //! The generation step of each request (for Variable-Beam-Width-Search), [batchSize]
     std::vector<SizeType32> generationSteps;
 
@@ -101,9 +99,6 @@ public:
     using TensorPtr = std::shared_ptr<ITensor>;
 
     Output() = default;
-
-    //! parameters for beam search, [batchSize, maxBeamWidth, maxSeqLen], on gpu
-    TensorPtr cacheIndirection;
 };
 
 } // namespace decoder_batch

@@ -451,8 +451,8 @@ void RuntimeBuffers::prepareBuffersForCudaGraph(SizeType32 maxSequenceLength)
 }
 
 void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, RequestVector const& genRequests,
-    SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers,
-    runtime::decoder::DecoderState const& decoderState, kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
+    SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, runtime::decoder::DecoderState const& decoderState,
+    kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
     kv_cache_manager::BaseKVCacheManager* crossKvCacheManagerPtr,
     rnn_state_manager::RnnStateManager* rnnStateManagerPtr, PeftTable const& peftTable,
     runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
@@ -623,7 +623,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         if (transformerBuffers && maxBeamWidth > 1)
         {
             transformerBuffers->resetCacheIndirection(contextRequests, maxBeamWidth, maxAttentionWindow,
-                decoderBuffers.cacheIndirectionInput, decoderBuffers.cacheIndirectionOutput, manager);
+                decoderState.getCacheIndirectionInput(), decoderState.getCacheIndirectionOutput(), manager);
         }
     }
 
@@ -729,7 +729,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
 
         if (transformerBuffers && maxBeamWidth > 1)
         {
-            transformerBuffers->copyCacheIndirection(genRequests, decoderBuffers.cacheIndirectionOutput, stream);
+            transformerBuffers->copyCacheIndirection(genRequests, decoderState.getCacheIndirectionOutput(), stream);
         }
 
         numSequences = numContextRequests;
@@ -925,7 +925,7 @@ void RuntimeBuffers::prepareEagleBuffers(RequestVector const& contextRequests, R
 
 std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorMap&> RuntimeBuffers::prepareStep(
     RequestVector const& contextRequests, RequestVector const& genRequests, SizeType32 maxBeamWidth,
-    SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers, runtime::decoder::DecoderState const& decoderState,
+    SizeType32 maxAttentionWindow, runtime::decoder::DecoderState const& decoderState,
     kv_cache_manager::BaseKVCacheManager* kvCacheManager, kv_cache_manager::BaseKVCacheManager* crossKvCacheManager,
     rnn_state_manager::RnnStateManager* rnnStateManager, PeftTable const& peftTable, TllmRuntime const& runtime,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
@@ -937,8 +937,8 @@ std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorM
     setBufferSizes(contextRequests, genRequests);
     reshape(runtime, modelConfig, worldConfig, gatherGenerationLogits);
 
-    setFromInputs(contextRequests, genRequests, maxBeamWidth, maxAttentionWindow, decoderBuffers, decoderState,
-        kvCacheManager, crossKvCacheManager, rnnStateManager, peftTable, runtime, modelConfig, worldConfig, trtOverlap,
+    setFromInputs(contextRequests, genRequests, maxBeamWidth, maxAttentionWindow, decoderState, kvCacheManager,
+        crossKvCacheManager, rnnStateManager, peftTable, runtime, modelConfig, worldConfig, trtOverlap,
         newOutputTokens);
 
     fillIOMaps(modelConfig, worldConfig);

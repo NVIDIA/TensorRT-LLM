@@ -33,8 +33,7 @@ using TensorPtr = MakeDecodingBatchInputOutput::TensorPtr;
 
 std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDecoderBatchInputs(
     std::vector<SizeType32> const& activeSlots, runtime::decoder::DecoderState const& decoderState,
-    std::vector<TensorPtr> const& logits, SizeType32 maxNumSequences, std::vector<TensorPtr> const& batchSlots,
-    TensorPtr const& cacheIndirectionInput)
+    std::vector<TensorPtr> const& logits, SizeType32 maxNumSequences, std::vector<TensorPtr> const& batchSlots)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -83,7 +82,6 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
 
     auto decodingInput = std::make_unique<tr::decoder_batch::Input>(logitsVec, maxActiveDecoderSteps);
     decodingInput->batchSlots = batchSlots;
-    decodingInput->cacheIndirection = cacheIndirectionInput;
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return decodingInput;
 }
@@ -132,8 +130,8 @@ MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, R
 
     auto [activeSlots, generationSteps] = getActiveSlots(contextRequests, generationRequests);
 
-    auto decodingInput = createDecoderBatchInputs(activeSlots, decoderState, inputBuffers.logits, maxNumSequences,
-        inputBuffers.forwardBatchSlots, decoderBuffers.cacheIndirectionInput);
+    auto decodingInput = createDecoderBatchInputs(
+        activeSlots, decoderState, inputBuffers.logits, maxNumSequences, inputBuffers.forwardBatchSlots);
     decodingInput->generationSteps = generationSteps;
 
     if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
@@ -159,7 +157,6 @@ MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, R
     }
 
     auto decodingOutput = std::make_unique<tr::decoder_batch::Output>();
-    decodingOutput->cacheIndirection = decoderBuffers.cacheIndirectionOutput;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return {std::move(decodingInput), std::move(decodingOutput)};

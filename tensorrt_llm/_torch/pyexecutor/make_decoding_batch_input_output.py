@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 
@@ -18,12 +18,12 @@ class MakeDecodingBatchInputOutput:
 
     @staticmethod
     def create_decoder_batch_inputs(
+        *,
         active_slots: List[int],
         decoder_state,
         logits: List[torch.Tensor],
         max_num_sequences: int,
         batch_slots: List[torch.Tensor],
-        cache_indirection_input: Optional[torch.Tensor] = None
     ) -> DecoderBatchInput:
         """Create decoder batch inputs from active slots and logits.
 
@@ -33,7 +33,6 @@ class MakeDecodingBatchInputOutput:
             logits: List of logit tensors for each slot
             max_num_sequences: Maximum number of sequences to process
             batch_slots: List of batch slot tensors for each decoding step
-            cache_indirection_input: Optional cache indirection input tensor
 
         Returns:
             DecoderBatchInput containing the prepared inputs
@@ -83,7 +82,6 @@ class MakeDecodingBatchInputOutput:
         # Create decoder batch input
         decoding_input = DecoderBatchInput(logits_vec, max_active_decoder_steps)
         decoding_input.batch_slots = batch_slots
-        decoding_input.cache_indirection = cache_indirection_input
 
         return decoding_input
 
@@ -126,9 +124,12 @@ class MakeDecodingBatchInputOutput:
 
         # Create decoder batch inputs
         decoding_input = self.create_decoder_batch_inputs(
-            active_slots, decoder_state, decoder_input_buffers.logits,
-            max_num_sequences, decoder_input_buffers.forward_batch_slots,
-            decoder_buffers.cache_indirection_input)
+            active_slots=active_slots,
+            decoder_state=decoder_state,
+            logits=decoder_input_buffers.logits,
+            max_num_sequences=max_num_sequences,
+            batch_slots=decoder_input_buffers.forward_batch_slots,
+        )
         decoding_input.generation_steps = generation_steps
 
         # Handle speculative decoding modes
@@ -151,6 +152,5 @@ class MakeDecodingBatchInputOutput:
 
         # Create decoder batch output
         decoding_output = DecoderBatchOutput()
-        decoding_output.cache_indirection = decoder_buffers.cache_indirection_output
 
         return decoding_input, decoding_output

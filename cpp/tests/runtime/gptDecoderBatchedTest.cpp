@@ -51,7 +51,6 @@ namespace
 struct DecoderInputs
 {
     std::vector<TensorPtr> logits;
-    TensorPtr srcCacheIndirection;
 };
 
 std::shared_ptr<tb::LlmRequest> createLlmRequest(SizeType32 batchSlot, SizeType32 inputLengths,
@@ -149,13 +148,6 @@ DecoderInputs createDecoderInputs(SizeType32 batchSize, SizeType32 maxBeamWidth,
         manager.setZero(*inputs.logits.back());
     }
 
-    if (maxBeamWidth > 1)
-    {
-        inputs.srcCacheIndirection
-            = manager.gpu(ITensor::makeShape({batchSize, maxBeamWidth, maxSeqLength}), TRTDataType<SizeType32>::value);
-        manager.setZero(*inputs.srcCacheIndirection);
-    }
-
     return inputs;
 }
 
@@ -166,14 +158,6 @@ decoder_batch::Output createDecoderOutputs(SizeType32 batchSize, SizeType32 maxB
 
     TLLM_CHECK(sequenceLengths.getSize() == tiledInputLengths.size());
     manager.copy(tiledInputLengths.data(), sequenceLengths);
-
-    if (maxBeamWidth > 1)
-    {
-        auto tgtCacheIndirection
-            = manager.gpu(ITensor::makeShape({batchSize, maxBeamWidth, maxSeqLength}), TRTDataType<SizeType32>::value);
-        manager.setZero(*tgtCacheIndirection);
-        outputs.cacheIndirection = std::move(tgtCacheIndirection);
-    }
 
     return outputs;
 }
@@ -354,6 +338,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
 
     auto decoderInputs = createDecoderInputs(batchSize, maxBeamWidth, maxSeqLength, vocabSizePadded, dataType,
         samplingConfigs, generatedTokensPerSteps, computeLogProbs, manager);
+    manager.setZero(*decoderState.getCacheIndirectionInput());
     auto outputs = createDecoderOutputs(
         batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths, *decoderState.getSequenceLengths(), manager);
 
@@ -380,7 +365,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     auto activeSlots = std::vector<SizeType32>(batchSize);
     std::iota(activeSlots.begin(), activeSlots.end(), 0);
     auto inputs = tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(activeSlots, decoderState,
-        decoderInputs.logits, batchSize, inputBuffers.forwardBatchSlots, decoderInputs.srcCacheIndirection);
+        decoderInputs.logits, batchSize, inputBuffers.forwardBatchSlots);
     decoder.forward(decoderState, outputs, *inputs);
 
     checkSequenceLengths(*decoderState.getSequenceLengths(), expectedLengths, manager);
@@ -492,6 +477,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
 
     auto decoderInputs = createDecoderInputs(batchSize, maxBeamWidth, maxSeqLength, vocabSizePadded, dataType,
         samplingConfigs, generatedTokensPerSteps, computeLogProbs, manager);
+    manager.setZero(*decoderState.getCacheIndirectionInput());
     auto outputs = createDecoderOutputs(
         batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths, *decoderState.getSequenceLengths(), manager);
 
@@ -516,7 +502,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
         auto activeSlots = std::vector<SizeType32>(batchIdx + 1);
         std::iota(activeSlots.begin(), activeSlots.end(), 0);
         auto inputs = tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(activeSlots, decoderState,
-            decoderInputs.logits, batchSize, inputBuffers.forwardBatchSlots, decoderInputs.srcCacheIndirection);
+            decoderInputs.logits, batchSize, inputBuffers.forwardBatchSlots);
         decoder.forward(decoderState, outputs, *inputs);
 
         advanceSequenceLengths(
@@ -539,7 +525,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     while (!std::all_of(expectedFinished.begin(), expectedFinished.end(), [](bool finish) { return finish; }))
     {
         auto inputs = tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(activeSlots, decoderState,
-            decoderInputs.logits, batchSize, inputBuffers.forwardBatchSlots, decoderInputs.srcCacheIndirection);
+            decoderInputs.logits, batchSize, inputBuffers.forwardBatchSlots);
         decoder.forward(decoderState, outputs, *inputs);
         finishedVec = getFinished(*decoderState.getFinishedSum(), samplingConfigs, manager);
 
@@ -647,6 +633,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
 
     auto decoderInputs = createDecoderInputs(batchSize, maxBeamWidth, maxSeqLength, vocabSizePadded, dataType,
         samplingConfigs, generatedTokensPerSteps, false, manager);
+    manager.setZero(*decoderState.getCacheIndirectionInput());
     auto outputs = createDecoderOutputs(
         batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths, *decoderState.getSequenceLengths(), manager);
 
@@ -676,7 +663,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     auto activeSlots = std::vector<SizeType32>(batchSize);
     std::iota(activeSlots.begin(), activeSlots.end(), 0);
     auto inputs = tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(activeSlots, decoderState,
-        decoderInputs.logits, batchSize, inputBuffers.forwardBatchSlots, decoderInputs.srcCacheIndirection);
+        decoderInputs.logits, batchSize, inputBuffers.forwardBatchSlots);
     decoder.forward(decoderState, outputs, *inputs);
     checkSequenceLengths(*decoderState.getSequenceLengths(), expectedLengths, manager);
     EXPECT_THAT(getFinished(*decoderState.getFinishedSum(), samplingConfigs, manager), ::testing::Each(false));

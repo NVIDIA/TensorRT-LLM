@@ -524,9 +524,7 @@ class TRTLLMSampler(Sampler):
             "buffer_manager":
             buffer_manager,
             "decoder_buffers":
-            DecoderBuffers(self.max_num_sequences,
-                           self.executor_config.max_beam_width,
-                           self.max_attention_window, self.MAX_DECODING_TOKENS,
+            DecoderBuffers(self.max_num_sequences, self.MAX_DECODING_TOKENS,
                            buffer_manager, self.model_config,
                            self.world_config),
             "decoder_input_buffers":

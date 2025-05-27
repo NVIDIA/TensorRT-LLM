@@ -160,8 +160,6 @@ void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, 
 
     if (maxBeamWidth > 1)
     {
-        dInput.cacheIndirection = input.cacheIndirection;
-        dOutput.cacheIndirection = output.cacheIndirection;
         dInput.generationSteps = input.generationSteps; // For Variable-Beam-Width-Search
     }
 
