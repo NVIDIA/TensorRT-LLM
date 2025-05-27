@@ -1318,7 +1318,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
     ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
     ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
     ("Nemotron-H-8B", "Nemotron-H-8B-Base-8K"),
-    ("Qwen3-30B-A3B", "Qwen3/Qwen3-30B-A3B"),
     pytest.param('Llama3.1-8B-NVFP4',
                  'nvfp4-quantized/Meta-Llama-3.1-8B',
                  marks=skip_pre_blackwell),
@@ -1343,6 +1342,9 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Mixtral-8x7B-FP8',
                  'Mixtral-8x7B-Instruct-v0.1-fp8',
                  marks=skip_pre_blackwell),
+    pytest.param('Qwen3-30B-A3B',
+                 'Qwen3/Qwen3-30B-A3B',
+                 marks=pytest.mark.skip_less_device_memory(80000)),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
