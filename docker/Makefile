@@ -31,7 +31,7 @@ DOCKER_PROGRESS    ?= auto
 PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || echo "amd64")
 CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90-real;100-real;120-real',)
 BUILD_WHEEL_OPTS   ?=
-BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))$(if $(BUILD_ARCH_ARGS), $(BUILD_ARCH_ARGS))
+BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
 TORCH_INSTALL_TYPE ?= skip
 CUDA_VERSION       ?=
 CUDNN_VERSION      ?=
@@ -173,12 +173,12 @@ jenkins-rockylinux8_%: STAGE = devel
 jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
 jenkins-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
 
-rockylinux8_%: STAGE = devel
+rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvidia/cuda
 rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
 
 # For x86_64 and aarch64
-ubuntu22_%: STAGE = devel
+ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
 ubuntu22_%: BASE_TAG = 12.9.0-devel-ubuntu22.04
 

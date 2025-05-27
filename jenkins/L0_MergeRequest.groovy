@@ -1041,11 +1041,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 stage("[Build Docker Images] Remote Run") {
                     def parameters = getCommonParameters()
                     String globalVarsJson = writeJSON returnText: true, json: globalVars
-                    def LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "XXXXXXX"
+                    def LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefined"
+                    def pr_id = globalVars[GITHUB_PR_API_URL] ? globalVars[GITHUB_PR_API_URL].split('/').last() : ""
+                    def branch = env.gitlabBranch ?: "github-pr-${pr_id}"
                     parameters += [
                         // env.gitlabBranch is set for all gitlab jobs (all postMerge job is from gitlab)
-                        // So we use github-pre-merge as default branch tag (To avoid the custom image tag be overwritten by pre-merge job)
-                        'branch': env.gitlabBranch ? env.gitlabBranch : "github-pre-merge",
+                        'branch': branch,
                         'action': "push",
                         'defaultTag': "${LLM_SHORT_COMMIT}-${branch}-${BUILD_NUMBER}",
                         'globalVars': globalVarsJson,

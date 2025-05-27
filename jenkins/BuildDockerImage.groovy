@@ -12,12 +12,12 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 }
 LLM_ROOT = "llm"
 
-LLM_BRANCH = env.gitlabBranch? env.gitlabBranch : params.branch
+LLM_BRANCH = env.gitlabBranch ?: params.branch
 LLM_BRANCH_TAG = LLM_BRANCH.replaceAll('/', '_')
 
-LLM_COMMIT_OR_BRANCH = env.gitlabCommit ?: (params.commit ? params.commit : LLM_BRANCH)
+LLM_COMMIT_OR_BRANCH = env.gitlabCommit ?: LLM_BRANCH
 
-LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "XXXXXXX"
+LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefined"
 
 LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
@@ -181,12 +181,12 @@ def buildImage(config)
     def args = config.args ?: ""
     def customTag = config.customTag
     def postTag = config.postTag
-    def dependOtherTarget = config.dependOtherTarget
+    def dependentTarget = config.dependentTarget
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
 
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
 
-    def preTargetTag = tag.replace("${arch}-${target}-", "${arch}-${dependOtherTarget}-")
+    def dependentTargetTag = tag.replace("${arch}-${target}-", "${arch}-${dependentTarget}-")
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
 
@@ -225,19 +225,20 @@ def buildImage(config)
         def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         containerGenFailure = null
 
-        if (dependOtherTarget) {
-            stage ("make ${dependOtherTarget}_${action} (${arch})") {
+        if (dependentTarget) {
+            stage ("make ${dependentTarget}_${action} (${arch})") {
                 retry(3) {
-                    sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
+                    retry(3) {
+                        sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
+                    }
+                    sh """
+                    cd ${LLM_ROOT} && make -C docker ${dependentTarget}_${action} \
+                    TORCH_INSTALL_TYPE=${torchInstallType} \
+                    IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${dependentTargetTag} \
+                    BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
+                    """
                 }
-                sh """
-                cd ${LLM_ROOT} && make -C docker ${dependOtherTarget}_${action} \
-                TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${preTargetTag} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
-                """
-
-                args += " DEVEL_IMAGE=${IMAGE_NAME}/${dependOtherTarget}:${preTargetTag}"
+                args += " DEVEL_IMAGE=${IMAGE_NAME}/${dependentTarget}:${dependentTargetTag}"
             }
         }
 
@@ -300,7 +301,7 @@ def launchBuildJobs(pipeline) {
         torchInstallType: "skip",
         arch: "amd64",
         build_wheel: false,
-        dependOtherTarget: "",
+        dependentTarget: "",
     ]
     def release_action = env.JOB_NAME ==~ /.*PostMerge.*/ ? "push" : params.action
     def buildConfigs = [
@@ -332,19 +333,19 @@ def launchBuildJobs(pipeline) {
             postTag: "-py312",
         ],
         "Build NGC devel and release (x86_64)": [
-            target: "ngc_release",
+            target: "ngc-release",
             action: release_action,
             customTag: "ngc-" + LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
-            dependOtherTarget: "devel",
+            dependentTarget: "devel",
         ],
         "Build NGC devel and release(SBSA)": [
-            target: "ngc_release",
+            target: "ngc-release",
             action: release_action,
             customTag: "ngc-" + LLM_BRANCH_TAG + "-sbsa",
             arch: "arm64",
             build_wheel: true,
-            dependOtherTarget: "devel",
+            dependentTarget: "devel",
         ],
     ]
     // Override all fields in build config with default values
@@ -411,6 +412,10 @@ pipeline {
             steps {
                 script {
                     echo "branch is: ${LLM_BRANCH}"
+                    echo "env.gitlabBranch is: ${env.gitlabBranch}"
+                    echo "params.branch is: ${params.branch}"
+                    echo "params.action is: ${params.action}"
+                    echo "env.defaultTag is: ${env.defaultTag}"
                     echo "env.gitlabCommit is: ${env.gitlabCommit}"
                     echo "LLM_REPO is: ${LLM_REPO}"
                     echo "env.globalVars is: ${env.globalVars}"
