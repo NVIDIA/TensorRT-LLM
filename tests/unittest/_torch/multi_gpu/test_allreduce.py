@@ -26,7 +26,8 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, MoEAllReduce)
+                                             AllReduceParams, MoEAllReduce,
+                                             MoEAllReduceParams)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.mapping import Mapping
@@ -381,16 +382,19 @@ def run_moe_allreduce_op(token_input: torch.Tensor, residual: torch.Tensor,
     scale_parallel = torch.chunk(scale.clone(), tensor_parallel_size, dim=0)
     scale_equalized = scale_parallel[tensor_parallel_rank]
 
+    moe_all_reduce_params = MoEAllReduceParams(
+        residual=residual,
+        norm_weight=norm_weight,
+        device_num_experts=tensor_num_device_experts,
+        expert_scale_factor=scale_equalized,
+        shared_expert_output=fc2_output,
+        eps=eps,
+        is_cutlass_min_latency=True,
+    )
+
     # Run with fusion
     output_hidden_states, output_residual = moe_allreduce(
-        residual,
-        norm_weight,
-        tensor_num_device_experts,
-        scale_equalized,
-        active_experts_token_equalized,
-        fc2_output,
-        eps,
-    )
+        active_experts_token_equalized, all_reduce_params=moe_all_reduce_params)
 
     torch_l0 = torch.nn.Linear(in_features=hidden_size,
                                out_features=hidden_size,
