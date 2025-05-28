@@ -1537,7 +1537,8 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     }
 
     TLLM_LOG_DEBUG("%s::storeNewBlock - store the last block", mLogPrefix.c_str());
-    storeBlock(blockKeys.back(), cacheBlockIds[beamIdx][blockKeys.size() - 1], prevBlock);
+    storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+    // storeBlock(blockKeys.back(), cacheBlockIds[beamIdx][blockKeys.size() - 1], prevBlock);
 }
 
 void WindowBlockManager::storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
