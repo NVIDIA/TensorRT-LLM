@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/batch_manager/mlaCacheFormatter.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -153,14 +154,25 @@ void DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
 
     RequestInfo requestInfo(requestId, mSelfState);
 
-    // TODO: remove IOFormatter and make CacheFormatter new base class
-    auto* cacheFormatter = dynamic_cast<kv_cache_manager::CacheFormatter const*>(mFormatter.get());
-    if (cacheFormatter != nullptr)
+    if (!common::getEnvDisableSelectiveCacheTransfer())
     {
-        auto* cacheManager = cacheFormatter->getCacheManager();
-        auto blockRange
-            = kv_cache_manager::BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
-        requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
+        // TODO: remove IOFormatter and make CacheFormatter new base class
+        auto* cacheFormatter = dynamic_cast<kv_cache_manager::CacheFormatter const*>(mFormatter.get());
+        auto* mlaCacheFormatter = dynamic_cast<kv_cache_manager::MLACacheFormatter const*>(mFormatter.get());
+        if (cacheFormatter != nullptr)
+        {
+            auto* cacheManager = cacheFormatter->getCacheManager();
+            auto blockRange
+                = kv_cache_manager::BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
+            requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
+        }
+        else if (mlaCacheFormatter != nullptr)
+        {
+            auto* cacheManager = mlaCacheFormatter->getCacheManager();
+            auto blockRange
+                = kv_cache_manager::BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
+            requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
+        }
     }
 
     auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
