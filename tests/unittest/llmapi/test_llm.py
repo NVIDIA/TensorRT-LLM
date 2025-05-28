@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from utils.util import skip_single_gpu
 
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.executor import (ExecutorBindingsWorker, LoRARequest,
+from tensorrt_llm.executor import (GenerationExecutorWorker, LoRARequest,
                                    PromptAdapterRequest, RequestError)
 from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
                                  GuidedDecodingParams, KvCacheConfig,
@@ -1593,7 +1593,7 @@ def check_llm_return_context_logits(tp_size=1):
 
     # Check the WAR for returning logits performance
     if tp_size == 1:
-        assert isinstance(llm._executor, ExecutorBindingsWorker)
+        assert isinstance(llm._executor, GenerationExecutorWorker)
 
 
 def check_llm_return_generation_logits(tp_size=1):
@@ -1617,7 +1617,7 @@ def check_llm_return_generation_logits(tp_size=1):
 
     # Check the WAR for returning logits performance
     if tp_size == 1:
-        assert isinstance(llm._executor, ExecutorBindingsWorker)
+        assert isinstance(llm._executor, GenerationExecutorWorker)
 
 
 def test_llm_return_context_logits():
@@ -1726,7 +1726,7 @@ def test_llm_return_logprobs_streaming():
     llm_return_logprobs_test_harness(2, 2, False, True, streaming=True)
 
 
-class DummyExecutorWorker3(ExecutorBindingsWorker):
+class DummyExecutorWorker3(GenerationExecutorWorker):
     should_raise_error = True
 
     def __init__(self, *args, **kwargs):
