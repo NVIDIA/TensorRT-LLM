@@ -746,7 +746,7 @@ class PyTorchModelEngine(ModelEngine):
         return self.spec_metadata
 
     def _get_padded_batch(self, scheduled_requests: ScheduledRequests,
-                          kv_cache_manager):
+                          kv_cache_manager) -> int:
         can_run_cuda_graph = scheduled_requests.can_run_cuda_graph
         batch_size = scheduled_requests.batch_size
         new_batch_size = batch_size
@@ -772,11 +772,12 @@ class PyTorchModelEngine(ModelEngine):
         if padding_size + scheduled_requests.batch_size > self.batch_size:
             return 0
 
-        # No padding if It would create too many concurrent requests.
+        # No padding if it would create too many concurrent requests.
         # This is not strictly required, but we should probably
         # respect the requirement just in case that changes in the future.
         if self.cuda_graph_dummy_request is None:
             available_blocks = kv_cache_manager.get_num_free_blocks()
+            # No padding if not enough KV cache space
             if available_blocks < 1:
                 return 0
 
