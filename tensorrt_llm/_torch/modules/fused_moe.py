@@ -1,3 +1,4 @@
+import copy
 import math
 import os
 import threading
@@ -9,6 +10,7 @@ from torch import nn
 
 from tensorrt_llm._mnnvl_utils import MnnvlMoe, MoEAlltoallInfo
 from tensorrt_llm._utils import get_sm_version, logger
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils.fp4_utils import (
     get_reorder_rows_for_gated_act_gemm_row_indices,
     get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices,
@@ -19,6 +21,7 @@ from ..distributed import allgather, reducescatter
 from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                      reswizzle_sf, swizzle_sf, unswizzle_sf)
+from .gated_mlp import GatedMLP
 from .linear import TensorParallelMode, load_weight_shard
 from .moe_load_balancer import MoeLoadBalancer
 
@@ -292,6 +295,189 @@ class Qwen3MoeRoutingMethod(BaseMoeRoutingMethod):
 class MoEWeightLoadingMode(Enum):
     VANILLA = 0
     FUSED_GATE_UP_PROJ = 1
+
+
+class VanillaMoE(nn.ModuleList):
+
+    def __init__(
+        self,
+        *,
+        routing_method: BaseMoeRoutingMethod,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        dtype: Optional[torch.dtype] = None,
+        reduce_results: bool = False,
+        model_config: ModelConfig = ModelConfig(),
+        aux_stream: Optional[torch.cuda.Stream] = None,
+        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
+        VANILLA,
+        apply_router_weight_on_input: bool = False,
+        enable_alltoall: bool = False,
+    ):
+        from ..distributed import AllReduce
+
+        super().__init__()
+        self.routing_method = routing_method
+        self.num_experts = num_experts
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.weight_loading_mode = weight_loading_mode
+
+        self.dtype = dtype
+        self.reduce_results = reduce_results
+        self.model_config = model_config
+        # could be modified later
+        self.quant_config = model_config.quant_config
+
+        self.cluster_rank = model_config.mapping.moe_cluster_rank
+        self.cluster_size = model_config.mapping.moe_cluster_size
+        self.smart_router = True if self.cluster_size > 1 else False
+        assert not self.smart_router, (
+            "Smart router is not supported in vanilla MoE, "
+            "please set moe_cluster_size to 1.")
+
+        self.rank = model_config.mapping.rank
+
+        self.tp_rank = model_config.mapping.moe_tp_rank
+        self.tp_size = model_config.mapping.moe_tp_size
+
+        self.ep_size = model_config.mapping.moe_ep_size
+        self.ep_rank = model_config.mapping.moe_ep_rank
+        self.moe_backend = model_config.moe_backend
+        self.use_dp = model_config.mapping.enable_attention_dp
+
+        # All ranks participate in allreduce regardless of EP/TP combination
+        self.mapping = model_config.mapping
+        self.parallel_size = self.mapping.tp_size
+
+        self.all_reduce = AllReduce(self.mapping)
+
+        self.intermediate_size_per_partition = intermediate_size // self.tp_size
+
+        self.expert_size_per_partition = num_experts // self.ep_size
+        self.expert_start = self.ep_rank * self.expert_size_per_partition
+        self.expert_end = min(
+            self.expert_start + self.expert_size_per_partition,
+            self.num_experts)
+
+        max_num_tokens = model_config.max_num_tokens
+        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
+        if self.use_dp:
+            max_num_tokens *= model_config.mapping.world_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens if model_config.moe_max_num_tokens is not None else max_num_tokens
+
+        self.enable_alltoall = False
+
+        self._weights_created = False
+        if not model_config.skip_create_weights_in_init:
+            self.create_weights()
+
+        # If True, the router weight will be multiplied on the input rather than at the end of FC2
+        self.apply_router_weight_on_input = apply_router_weight_on_input
+
+    def create_weights(self):
+        if self._weights_created:
+            return
+
+        model_config = copy.copy(self.model_config)
+        model_config.mapping = Mapping(
+            world_size=self.mapping.moe_tp_size,
+            tp_size=self.mapping.moe_tp_size,
+            rank=self.mapping.moe_tp_rank,
+        )
+        model_config.quant_config = self.quant_config
+        model_config.skip_create_weights_in_init = False
+        for expert_idx in range(self.num_experts):
+            if self.expert_start <= expert_idx < self.expert_end:
+                self[expert_idx] = GatedMLP(
+                    hidden_size=self.hidden_size,
+                    intermediate_size=self.intermediate_size,
+                    bias=False,
+                    dtype=self.dtype,
+                    config=model_config,
+                    reduce_output=False,
+                )
+            else:
+                # use identity as placeholder for unused experts
+                self[expert_idx] = nn.Identity()
+        self._weights_created = True
+
+    def load_weights(self, weights: List[Dict]):
+        from ..models.modeling_utils import filter_weights
+
+        assert self._weights_created
+        assert len(weights) == 1
+        weights = weights[0]
+        for expert_idx in range(self.expert_start, self.expert_end):
+            self[expert_idx].gate_up_proj.load_weights([
+                filter_weights(f"{expert_idx}.w1", weights),
+                filter_weights(f"{expert_idx}.w3", weights),
+            ])
+            self[expert_idx].down_proj.load_weights([
+                filter_weights(f"{expert_idx}.w2", weights),
+            ])
+
+    def reducescatter_or_allreduce(
+        self,
+        inputs,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+    ):
+        outputs = inputs
+        if self.parallel_size > 1 and not self.enable_alltoall:
+            if self.use_dp:
+                outputs = reducescatter(
+                    inputs,
+                    self.mapping,
+                    dim=0,
+                    sizes=None if use_dp_padding else all_rank_num_tokens)
+            elif self.reduce_results:
+                outputs = self.all_reduce(inputs)
+        return outputs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        assert x.shape[-1] == self.hidden_size
+        x = x.view(-1, self.hidden_size)
+
+        token_selected_experts, token_final_scales = self.routing_method.apply(
+            router_logits)
+
+        if self.use_dp and self.parallel_size > 1:
+            x, token_selected_experts, token_final_scales = allgather(
+                [x, token_selected_experts, token_final_scales],
+                self.mapping,
+                dim=0,
+                sizes=None if use_dp_padding else all_rank_num_tokens)
+
+        final_hidden_states = torch.zeros(x.shape,
+                                          dtype=x.dtype,
+                                          device=x.device)
+
+        for expert_idx in range(self.expert_start, self.expert_end):
+            if not torch.any(token_selected_experts == expert_idx):
+                continue
+            batch_idx, nth_expert = torch.where(
+                token_selected_experts == expert_idx)
+            expert_inputs = x[batch_idx]
+
+            output = self[expert_idx](expert_inputs)
+            final_hidden_states[batch_idx] += output * token_final_scales[
+                batch_idx, nth_expert, None]
+
+        final_hidden_states = self.reducescatter_or_allreduce(
+            final_hidden_states,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+        )
+        return final_hidden_states
 
 
 class FusedMoE(nn.Module):
