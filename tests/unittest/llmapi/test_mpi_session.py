@@ -9,7 +9,7 @@ import pytest
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.llmapi.mpi_session import (MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
-                                             split_mpi_env)
+                                             find_free_port, split_mpi_env)
 
 
 def task0():
@@ -53,13 +53,12 @@ def run_client(server_addr, values_to_process):
         return f"Error in client: {str(e)}"
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5179666")
 @pytest.mark.parametrize("task_type", ["submit", "submit_sync"])
 def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
     os.environ['TLLM_SPAWN_PROXY_PROCESS'] = "1"
-    os.environ['TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] = "ipc://" + str(
-        os.getpid())
+    os.environ[
+        'TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] = f"tcp://127.0.0.1:{find_free_port()}"
 
     command = [
         "mpirun", "--allow-run-as-root", "-np", "2", "trtllm-llmapi-launch",

@@ -274,6 +274,7 @@ class RemoteMpiCommSessionClient(MpiSession):
             f"RemoteMpiCommSessionClient connecting to {addr}\n", "yellow")
         self.queue = ZeroMqQueue((addr, hmac_key),
                                  is_server=False,
+                                 socket_type=zmq.PUSH,
                                  use_hmac_encryption=bool(hmac_key))
         self._is_shutdown = False
 
@@ -329,23 +330,10 @@ class RemoteMpiCommSessionClient(MpiSession):
         self.shutdown()
 
     def shutdown(self, wait=True):
-        if self._is_shutdown:
-            return
-
-        try:
-            print_colored_debug(
-                f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] send shutdown signal to server\n",
-                "green")
-            self.queue.put(None)  # ask RemoteMpiCommSessionServer to shutdown
-        except zmq.error.ZMQError as e:
-            print_colored_debug(
-                f"Error during RemoteMpiCommSessionClient shutdown: {e}\n",
-                "red")
-        finally:
-            self._is_shutdown = True
+        pass
 
     def shutdown_abort(self, grace: float = 60, reason=None):
-        self.shutdown()
+        pass
 
 
 class RemoteMpiCommSessionServer():
@@ -364,6 +352,7 @@ class RemoteMpiCommSessionServer():
         self.addr = addr
         self.queue = ZeroMqQueue((addr, hmac_key),
                                  is_server=True,
+                                 socket_type=zmq.PULL,
                                  use_hmac_encryption=bool(hmac_key))
         self.comm = comm
         self.results = []  # the results may arrive in any order
