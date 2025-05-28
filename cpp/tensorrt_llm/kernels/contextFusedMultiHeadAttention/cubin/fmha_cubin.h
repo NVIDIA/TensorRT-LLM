@@ -4997,5 +4997,3 @@ static const struct FusedMultiHeadAttentionKernelMetaInfoV2
 // clang-format on
 } // namespace kernels
 } // namespace tensorrt_llm
-
-
