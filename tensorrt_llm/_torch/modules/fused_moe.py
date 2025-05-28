@@ -315,7 +315,7 @@ class VanillaMoE(nn.ModuleList):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         enable_alltoall: bool = False,
-        pack_weights: bool = True,
+        pack_weights: bool = False,
     ):
         from ..distributed import AllReduce
 
