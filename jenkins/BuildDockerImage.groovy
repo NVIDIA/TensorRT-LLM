@@ -324,7 +324,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         "Build trtllm release (x86_64)": [
             target: "trtllm",
             action: release_action,
-            customTag: LLM_BRANCH_TAG,
+            customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
         ],
         "Build trtllm release (SBSA)": [
