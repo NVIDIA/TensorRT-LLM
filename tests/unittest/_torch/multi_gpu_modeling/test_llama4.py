@@ -19,14 +19,21 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 @pytest.mark.parametrize("tp_size", [1, 8], ids=["tp1", "tp8"])
 @pytest.mark.parametrize("use_cuda_graph", [True, False],
                          ids=["enable_graph", "disable_graph"])
+@pytest.mark.parametrize("enable_attention_dp", [True, False],
+                         ids=["enable_adp", "disable_adp"])
 @pytest.mark.parametrize("ep_size", [4, 1], ids=["ep4", "ep1"])
 @pytest.mark.parametrize("pp_size", [1, 8], ids=["pp1", "pp8"])
-def test_llama4(model_name, backend, tp_size, use_cuda_graph, ep_size, pp_size):
+def test_llama4(model_name, backend, tp_size, use_cuda_graph,
+                enable_attention_dp, ep_size, pp_size):
     if pp_size > 1 and (ep_size > 1 or tp_size > 1):
         return
 
     if pp_size == 1 and tp_size == 1:
         return
+
+    if enable_attention_dp and not (tp_size == 8 and ep_size == 4
+                                    and pp_size == 1):
+        pytest.skip("Skip this attention DP test case to avoid too many tests")
 
     prompts = [{
         "prompt": "The president of the United States is"
@@ -52,6 +59,7 @@ def test_llama4(model_name, backend, tp_size, use_cuda_graph, ep_size, pp_size):
         moe_tensor_parallel_size=tp_size // ep_size,
         pytorch_backend_config=pytorch_config,
         pipeline_parallel_size=pp_size,
+        enable_attention_dp=enable_attention_dp,
     )
     with llm:
         outputs = llm.generate(

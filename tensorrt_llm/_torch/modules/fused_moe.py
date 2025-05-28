@@ -1124,19 +1124,13 @@ class FusedMoE(nn.Module):
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
-            if x_sf is None:
-                x, token_selected_slots, token_final_scales = allgather(
-                    [x, token_selected_slots, token_final_scales],
-                    self.mapping,
-                    dim=0,
-                    sizes=None if use_dp_padding else all_rank_num_tokens)
-            else:
-                # Fp4 gemm has extra scaling factor
-                x, x_sf, token_selected_slots, token_final_scales = allgather(
-                    [x, x_sf, token_selected_slots, token_final_scales],
-                    self.mapping,
-                    dim=0,
-                    sizes=None if use_dp_padding else all_rank_num_tokens)
+            x, x_sf, token_selected_slots, token_final_scales = allgather(
+                [x, x_sf, token_selected_slots, token_final_scales],
+                self.mapping,
+                dim=0,
+                sizes=None if use_dp_padding else all_rank_num_tokens)
+            # Fp4 gemm has extra scaling factor
+            if x_sf is not None:
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
