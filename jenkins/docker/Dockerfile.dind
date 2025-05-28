@@ -1,6 +1,6 @@
-# docker buildx build -t urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:{timestamp}_docker_dind_withbash -f jenkins/docker/Dockerfile.dind . --builder=multi-builder --platform linux/arm64,linux/amd64
+# docker buildx build -t tensorrt-llm:{timestamp}_docker_dind_withbash -f jenkins/docker/Dockerfile.dind . --builder=multi-builder --platform linux/arm64,linux/amd64
 
-FROM urm.nvidia.com/docker/docker:dind
+FROM docker:dind
 
 RUN apk add --no-cache bash git make python3 py3-pip
 
