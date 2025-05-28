@@ -73,11 +73,11 @@ class Llama4Attention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
             pos_embd_params=pos_embd_params,
+            qk_norm_type=QkNormType.post_rope
+            if use_qk_norm else QkNormType.none,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
-            qk_norm_type=QkNormType.post_rope
-            if use_qk_norm else QkNormType.none,
             attention_chunk_size=attention_chunk_size,
         )
 
