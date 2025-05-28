@@ -66,10 +66,12 @@ class ModelEngine(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def forward(self, scheduled_requests: ScheduledRequests,
+    def forward(self,
+                scheduled_requests: ScheduledRequests,
                 resource_manager: ResourceManager,
                 new_tensors_device: Optional[SampleStateTensors],
-                extra_model_inputs: Optional[Dict[str, Any]]):
+                extra_model_inputs: Optional[Dict[str, Any]],
+                gather_context_logits: bool = False):
         raise NotImplementedError
 
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -1844,7 +1846,8 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests: ScheduledRequests,
                 resource_manager: ResourceManager,
                 new_tensors_device: Optional[SampleStateTensors] = None,
-                extra_model_inputs: Optional[Dict[str, Any]] = None):
+                extra_model_inputs: Optional[Dict[str, Any]] = None,
+                gather_context_logits: bool = False):
 
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -1866,7 +1869,7 @@ class PyTorchModelEngine(ModelEngine):
                 inputs.update(extra_model_inputs)
             self.last_spec_metadata = spec_metadata
 
-            return self._forward_step(inputs, gather_ids)
+            return self._forward_step(inputs, gather_ids, gather_context_logits)
 
         with self._maybe_pad_batch(scheduled_requests,
                                    kv_cache_manager) as scheduled_requests:
@@ -1893,12 +1896,15 @@ class PyTorchModelEngine(ModelEngine):
             self.iter_counter += 1
 
             if maybe_graph is None:
-                outputs = self._forward_step(inputs, gather_ids)
+                outputs = self._forward_step(inputs, gather_ids,
+                                             gather_context_logits)
             else:
                 if maybe_graph.needs_capture():
                     pool = maybe_graph.capture(
                         lambda inputs: self._forward_step(
-                            inputs, gather_ids=gather_ids),
+                            inputs,
+                            gather_ids=gather_ids,
+                            gather_context_logits=gather_context_logits),
                         self._cuda_graph_mem_pool,
                         extra_model_inputs,
                     )
@@ -1934,8 +1940,10 @@ class PyTorchModelEngine(ModelEngine):
             return self.model.forward(**kwargs)
 
     @nvtx_range("_forward_step")
-    def _forward_step(self, inputs: Dict[str, Any],
-                      gather_ids: Optional[torch.Tensor]) -> Dict[str, Any]:
+    def _forward_step(self,
+                      inputs: Dict[str, Any],
+                      gather_ids: Optional[torch.Tensor],
+                      gather_context_logits: bool = False) -> Dict[str, Any]:
         inputs = self._preprocess_inputs(inputs)
         if self.without_logits:
             outputs = self.model_forward(**inputs)
@@ -1945,7 +1953,8 @@ class PyTorchModelEngine(ModelEngine):
         # from speculative decoding.
         logits = self.model_forward(
             **inputs,
-            return_context_logits=gather_ids is not None,
+            return_context_logits=gather_ids is not None
+            or gather_context_logits,
         )
         if gather_ids is not None:
             return {'logits': logits[gather_ids]}
