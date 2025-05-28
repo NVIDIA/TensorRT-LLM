@@ -77,7 +77,6 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
 @pytest.mark.part0
 def test_llm_loading_from_ckpt_for_tp2(
         engine_from_checkpoint: tempfile.TemporaryDirectory):
-    pytest.skip(reason="https://nvbugspro.nvidia.com/bug/5273941")
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     llm_test_harness(engine_from_checkpoint.name,
                      prompts, ["D E F G H I J K"],
