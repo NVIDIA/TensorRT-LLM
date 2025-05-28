@@ -362,12 +362,13 @@ def _(
 class W4A16GemmRunner(TunableRunner):
     _runner_dict: Dict[str, torch.classes.trtllm.W4A16GemmRunner] = dict()
 
-    def __init__(self, activation_dtype: torch.dtype, quant_mode: int):
-        instance_key = (activation_dtype, quant_mode)
+    def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
+                 quant_mode: int):
+        instance_key = (activation_dtype, output_dtype, quant_mode)
         if instance_key not in W4A16GemmRunner._runner_dict:
             W4A16GemmRunner._runner_dict[
                 instance_key] = torch.classes.trtllm.W4A16GemmRunner(
-                    activation_dtype, quant_mode)
+                    activation_dtype, output_dtype, quant_mode)
         self._w4a16_gemm_runner = W4A16GemmRunner._runner_dict[instance_key]
 
     def get_valid_tactics(
@@ -402,6 +403,7 @@ def w4a16_gemm(input: torch.Tensor,
                scales: torch.Tensor,
                group_size: int,
                has_zero_point: bool,
+               output_dtype: torch.dtype,
                alpha: Optional[float] = None,
                bias: Optional[torch.Tensor] = None,
                zeros: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -416,7 +418,7 @@ def w4a16_gemm(input: torch.Tensor,
                 next_positive_power_of_2)), ))
 
     quant_mode = 1 if has_zero_point else 0
-    w4a16_gemm_runner = W4A16GemmRunner(input.dtype, quant_mode)
+    w4a16_gemm_runner = W4A16GemmRunner(input.dtype, output_dtype, quant_mode)
 
     kwargs = {
         "group_size": group_size,

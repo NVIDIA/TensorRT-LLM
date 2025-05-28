@@ -108,13 +108,16 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         cuda_q_weight = cuda_q_weight.cuda().contiguous()
 
         output = torch.ops.trtllm.w4a16_gemm(
-            activation.to(torch.float8_e4m3fn).contiguous(),
-            cuda_q_weight,
-            scale,
-            group_size,
-            has_zero,
-            fp8_alpha.item() if use_w4a8_awq else None,
-            bias,
+            input=activation.to(torch.float8_e4m3fn).contiguous(),
+            weight=cuda_q_weight,
+            scales=scale,
+            group_size=group_size,
+            has_zero_point=has_zero,
+            output_dtype=
+            activation_dtype,  # NOTE: output_dtype nneds to match activation dtype for W4A16.
+            #in W4A8 output dtype is float16/bfloat16 where activation dtype is float8_e4m3fn
+            alpha=fp8_alpha.item() if use_w4a8_awq else None,
+            bias=bias,
             zeros=zero)
 
         if use_w4a8_awq:
@@ -151,16 +154,14 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
     #                          has_bias=has_bias, use_w4a8_awq=use_w4a8_awq)
 
     @parameterized.expand(
-        [
-            (1, 1024, 128, torch.float16, True, True, True, 128, True),
-            (4, 1024, 512, torch.float16, True, True, True, 128, True),
-            (4, 1024, 512, torch.float16, True, True, True, 128, True),
-            (16, 1024, 256, torch.float16, True, True, False, 128, True),
-            #  (32, 1024, 384, 'bfloat16', True, True, True, 128, True),
-            (64, 1024, 256, torch.float16, True, True, False, 128, True),
-            (128, 2048, 384, torch.float16, True, False, True, 128, True),
-            (256, 2048, 1024, torch.float16, True, False, False, 128, True)
-        ],
+        [(1, 1024, 128, torch.float16, True, True, True, 128, True),
+         (4, 1024, 512, torch.bfloat16, True, True, True, 128, True),
+         (4, 1024, 512, torch.float16, True, True, True, 128, True),
+         (16, 1024, 256, torch.float16, True, True, False, 128, True),
+         (32, 1024, 384, torch.bfloat16, True, True, True, 128, True),
+         (64, 1024, 256, torch.float16, True, True, False, 128, True),
+         (128, 2048, 384, torch.float16, True, False, True, 128, True),
+         (256, 2048, 1024, torch.float16, True, False, False, 128, True)],
         name_func=unittest_name_func)
     @skip_neither_ada_nor_hopper_unittest
     def test_prequant_matmul_fp8_int4_input(self, m, n, k, dtype, has_pre_quant,

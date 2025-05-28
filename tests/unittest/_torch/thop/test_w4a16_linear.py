@@ -7,8 +7,8 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
-@pytest.mark.parametrize("dtype", [torch.float16], "weights_dtype",
-                         [torch.uint8])
+@pytest.mark.parametrize("weights_dtype", [torch.uint8])
+@pytest.mark.parametrize("dtype", [torch.float16])
 def test_w4a16_linear(dtype, weights_dtype, has_zero=False):
     SEQ_LEN = 10
     HIDDEN_SIZE = 128
