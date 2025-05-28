@@ -1593,6 +1593,9 @@ class PyExecutor:
                 gather_context_logits=gather_context_logits)
 
         try:
+            logger.warning(
+                f"[Executor] _forward_step: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
+            )
             gather_context_logits = any(
                 a.py_return_context_logits
                 for a in scheduled_requests.context_requests)

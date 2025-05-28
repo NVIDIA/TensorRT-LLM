@@ -495,7 +495,7 @@ class PyTorchModelEngine(ModelEngine):
 
                 # Add one dummy request with the maximum possible sequence length.
                 # The sequence length is limited by both the max_seq_len and the number of available blocks.
-                token_num = max(1, min(available_tokens, self.max_seq_len - 1))
+                token_num = max(1, min(available_tokens, kv_cache_manager.context_chunk_size + kv_cache_manager.max_attention_window))
                 max_seq_len_request = kv_cache_manager.add_dummy_requests(
                     request_ids=[batch_size - 1],
                     token_nums=[token_num],
@@ -611,7 +611,7 @@ class PyTorchModelEngine(ModelEngine):
                         for num_tokens_per_request in [
                                 1,
                                 min(self.max_num_tokens // max(bs, 1),
-                                    min(available_tokens, self.max_seq_len - 1))
+                                    min(available_tokens, kv_cache_manager.context_chunk_size + kv_cache_manager.max_attention_window))
                         ]:
                             with release_batch(
                                     get_torch_compile_warmup_request(
@@ -635,7 +635,7 @@ class PyTorchModelEngine(ModelEngine):
                     available_tokens = kv_cache_manager.get_num_available_tokens(
                         self.max_draft_len)
                     num_tokens_per_request = min(
-                        min(available_tokens, self.max_seq_len - 1),
+                        min(available_tokens, kv_cache_manager.context_chunk_size + kv_cache_manager.max_attention_window),
                         self.max_num_tokens)
                     with release_batch(
                             get_torch_compile_warmup_request(

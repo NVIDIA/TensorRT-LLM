@@ -24,6 +24,7 @@ if ENABLE_MULTI_DEVICE:
 if TYPE_CHECKING:
     from ..speculative.interface import SpecConfig
 
+TempAttentionWindowInputs = tensorrt_llm.bindings.internal.batch_manager.TempAttentionWindowInputs
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
 KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -107,6 +108,7 @@ class KVCacheManager(BaseResourceManager):
         # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
         # It's derived from the model's BuildConfig for consistency with the C++ backend.
         max_seq_len: int,
+        context_chunk_size: int,
         max_batch_size: int,
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
@@ -127,6 +129,7 @@ class KVCacheManager(BaseResourceManager):
             idx: offset
             for offset, idx in enumerate(self.pp_layers)
         }
+        self.context_chunk_size = context_chunk_size
 
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
@@ -201,6 +204,12 @@ class KVCacheManager(BaseResourceManager):
 
         # Note that this stream is unused for now. Will be used for copying to host
         # when that feature is enabled.
+
+        temp_attention_window_inputs = TempAttentionWindowInputs()
+        temp_attention_window_inputs.paged_context_fmha = True
+        temp_attention_window_inputs.max_input_len = max_seq_len
+        temp_attention_window_inputs.max_num_tokens = context_chunk_size
+
         self._stream = torch.cuda.Stream()
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
@@ -211,7 +220,7 @@ class KVCacheManager(BaseResourceManager):
             'max_num_sequences': max_batch_size,
             'max_beam_width': 1,  # TODO: more than 1 beam?
             'max_attention_window_vec': [self.max_attention_window],
-            'temp_attention_window_inputs': None,
+            'temp_attention_window_inputs': temp_attention_window_inputs,
             'dtype': dtype,
             'sink_token_length': sink_token_length,
             'stream': self._stream.cuda_stream,
@@ -256,6 +265,7 @@ class KVCacheManager(BaseResourceManager):
             head_dim=model_config.size_per_head,
             tokens_per_block=model_config.tokens_per_block,
             max_seq_len=model_config.max_seq_len,
+            context_chunk_size=model_config.max_seq_len,
             max_batch_size=model_config.max_batch_size,
             mapping=mapping,
             dtype=dtype)
@@ -296,11 +306,15 @@ class KVCacheManager(BaseResourceManager):
                         req_beam_width, req)
             else:
                 if req.is_first_context_chunk():
-                    self.impl.add_sequence(req.py_request_id, req.prompt_len,
+                    self.impl.add_sequence(req.py_request_id,
+                                           req.context_chunk_size,
                                            req_beam_width, req)
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
                     for _ in range(len(req.py_draft_tokens)):
+                        self.impl.add_token(req.py_request_id)
+                else:
+                    for _ in range(req.context_chunk_size):
                         self.impl.add_token(req.py_request_id)
 
         for req in generation_batch:

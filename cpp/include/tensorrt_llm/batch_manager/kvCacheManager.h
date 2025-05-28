@@ -96,7 +96,7 @@ struct WindowSizeMetadata
     {
         return tensorrt_llm::common::fmtstr(
             "WindowSizeMetadata{ .absolutePoolsOffset=%d, .numPools=%d, .maxTokenNum=%d, .maxBlocksPerSeq=%d, "
-            ".maxNumBlocks=%d, .temporaryAttentionWindow=%d, .numNonSinkTokensInWindow=%d }",
+            ".maxNumBlocks=%d, .temporaryAttentionWindow=%d, .numNonSinkTokensInWindow=%d}",
             absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq, maxNumBlocks, temporaryAttentionWindow,
             numNonSinkTokensInWindow);
     }
@@ -324,14 +324,7 @@ public:
         , mNumTokens(numTokens)
         , mBeamWidth(beamWidth)
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
-        // min window size + sink bubble length
-        // Why use the minimum window size:
-        // Chunked Prefill + Reuse calls `setPrepopulatedPromptLen()` which sets
-        // `mContextCurrentPosition` - this cannot be done for some windows sizes and
-        // not for others, the state needs to remain identical for all window sizes. So
-        // we currently resort to strictly disabling the reuse code path for all window
-        // sizes at once or enable it for all window sizes at once.
-        , mContextRequiresSlidingWindowKvCache(numTokens > windowSizeToMetadata.cbegin()->second.maxTokenNum)
+        , mNumBlocksRemoved(0)
     {
         auto const numWindowSizes = windowSizeToMetadata.size();
         mCacheBlockIds.reserve(numWindowSizes);
@@ -381,6 +374,14 @@ public:
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> const& getCacheBlockIds(SizeType32 windowSize) const
     {
+        {
+            auto result = mCacheBlockIds.at(windowSize)[0];
+            std::cout << "minwei getCacheBlockIds: ";
+            for (int i = 0; i < result.size(); i++) {
+                std::cout << result[i] << " ";
+            }
+            std::cout << std::endl;
+        }
         return mCacheBlockIds.at(windowSize);
     }
 
@@ -415,12 +416,20 @@ public:
         }
     }
 
-    void removeBlock(SizeType32 const blockIdx, SizeType32 windowSize)
+    void removeFirstBlock(SizeType32 windowSize)
     {
+        printf("minwei first block removed\n");
         for (auto& beamBlockIds : mCacheBlockIds.at(windowSize))
         {
-            beamBlockIds.erase(beamBlockIds.begin() + blockIdx);
+            // Do not actually remove from mCacheBlockIds; set to -1 instead.
+            beamBlockIds[mNumBlocksRemoved] = -1;
         }
+        ++mNumBlocksRemoved;
+    }
+
+    [[nodiscard]] SizeType32 numBlocksRemoved() const
+    {
+        return mNumBlocksRemoved;
     }
 
     [[nodiscard]] executor::RetentionPriority getDecodeRetentionPriority() const
@@ -433,11 +442,6 @@ public:
         return mKvCacheRetentionConfig.getDecodeDurationMs();
     }
 
-    [[nodiscard]] bool getContextRequiresSlidingWindowKvCache() const
-    {
-        return mContextRequiresSlidingWindowKvCache;
-    }
-
 private:
     // Request id of the sequence
     LlmRequest::RequestIdType mRequestId;
@@ -445,15 +449,18 @@ private:
     SizeType32 mNumTokens;
     // Number of beams
     SizeType32 mBeamWidth;
-    // List of block ids allocated per each window size, for each beam of the sequence
+    // Number of blocks removed from the beginning of the cache
+    SizeType32 mNumBlocksRemoved;
+    // List of block ids allocated per each window size, for each beam of the sequence.
+    //
+    // Removed blocks (from the beginning of the cache) are not actually removed from mCacheBlockIds, but instead
+    // the block id is set to 0. We choose such an implementation because kernels expects a linear view of the cache
+    // from the beginning.
     std::unordered_map<SizeType32, std::vector<std::vector<KVCacheBlock::IdType>>> mCacheBlockIds;
     // Tensor of block indices allocated per each window size, for each beam of the sequence
     std::unordered_map<SizeType32, runtime::ITensor::SharedPtr> mCacheBlockIndices;
     // The retention priority to assign to decode blocks
     executor::KvCacheRetentionConfig mKvCacheRetentionConfig;
-
-    // A value indicating whether or not the context is long enough to warrant the use of sliding window kv-cache.
-    bool mContextRequiresSlidingWindowKvCache{false};
 };
 
 // attach metadata to a pool pointer
@@ -569,7 +576,7 @@ public:
 
     //! \brief Add a new block to the sequence if needed
     void addSequenceBlockIfNeeded(GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength,
-        bool const enableBlockReuse, SizeType32 const numNonSinkTokensInWindow);
+        bool const enableBlockReuse, SizeType32 const numNonSinkTokensInWindow, SizeType32 const temporaryAttentionWindow);
 
     //! \brief Remove a block from the sequence if needed
     void removeSequenceBlockIfNeeded(GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength,
@@ -737,7 +744,7 @@ public:
         std::optional<TempAttentionWindowInputs> const& inputs) const
     {
 
-        if (inputs && inputs->pagedContextFMHA && (inputs->maxInputLen > mWindowSize))
+        if (inputs && inputs->pagedContextFMHA)
         {
             auto window = std::min(inputs->maxNumTokens, inputs->maxInputLen - mWindowSize);
             window = std::max(window, 0); // clamp negative values to 0

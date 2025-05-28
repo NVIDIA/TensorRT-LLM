@@ -258,6 +258,9 @@ class KVCacheManager(object):
                  beam_width: int = 1,
                  use_one_more_block: bool = False):
 
+        import traceback
+        traceback.print_stack()
+
         self.blocks_manager = BlocksManager(
             num_layers=num_layers,
             num_blocks=num_blocks,

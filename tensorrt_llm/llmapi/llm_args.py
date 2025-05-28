@@ -865,6 +865,9 @@ class BaseLlmArgs(BaseModel):
     enable_chunked_prefill: bool = Field(default=False,
                                          description="Enable chunked prefill.")
 
+    chunked_prefill_size: Optional[int] = Field(
+        default=None, description="The size of the chunked prefill.")
+
     guided_decoding_backend: Optional[str] = Field(
         default=None, description="Guided decoding backend.")
 

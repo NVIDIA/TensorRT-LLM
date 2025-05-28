@@ -242,6 +242,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
             torch_dtype_to_str(model_engine.dtype))
 
     num_hidden_layers = config.num_hidden_layers
+    context_chunk_size = executor_config.context_chunk_size if executor_config.enable_chunked_context else executor_config.max_seq_len
 
     if is_mla(config):
         kv_cache_manager = KVCacheManager(
@@ -252,6 +253,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
             head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
             tokens_per_block=executor_config.tokens_per_block,
             max_seq_len=executor_config.max_seq_len,
+            context_chunk_size=context_chunk_size,
             max_batch_size=executor_config.max_batch_size,
             mapping=mapping,
             dtype=kv_cache_dtype,
@@ -285,6 +287,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
             head_dim=head_dim,
             tokens_per_block=executor_config.tokens_per_block,
             max_seq_len=executor_config.max_seq_len,
+            context_chunk_size=context_chunk_size,
             max_batch_size=executor_config.max_batch_size,
             mapping=mapping,
             dtype=kv_cache_dtype,
@@ -299,6 +302,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
             head_dim=head_dim,
             tokens_per_block=executor_config.tokens_per_block,
             max_seq_len=executor_config.max_seq_len,
+            context_chunk_size=context_chunk_size,
             max_batch_size=executor_config.max_batch_size,
             mapping=mapping,
             dtype=kv_cache_dtype,
@@ -424,7 +428,8 @@ def create_py_executor_instance(
         two_step_lookahead=mapping.has_pp()
         or not pytorch_backend_config.disable_overlap_scheduler)
     mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
-                                           executor_config.max_num_tokens,
+        executor_config.context_chunk_size if
+        executor_config.enable_chunked_context else executor_config.max_seq_len,
                                            ctx_chunk_config)
     scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 

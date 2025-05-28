@@ -241,6 +241,8 @@ class TrtllmAttentionWrapper:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
             )
+        # import traceback; traceback.print_stack()
+        # import pdb; pdb.set_trace()
 
         self.kwargs.update(kwargs)
 

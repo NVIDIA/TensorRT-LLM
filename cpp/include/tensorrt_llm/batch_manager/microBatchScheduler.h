@@ -51,7 +51,7 @@ public:
     using ContextChunkingPolicy = tensorrt_llm::executor::ContextChunkingPolicy;
 
     explicit MicroBatchScheduler(std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig = std::nullopt,
-        std::optional<SizeType32> maxContextLength = std::nullopt,
+        std::optional<SizeType32> maxContextChunkSize = std::nullopt,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_TO_COMPLETE);
 
@@ -60,23 +60,20 @@ public:
 
     static void setCtxRequestsChunkSize(RequestVector& contextsToBeChunked, ContextChunkingPolicy ctxChunkPolicy,
         std::optional<SizeType32> ctxTokensCapacity, SizeType32 chunkUnitSize,
-        std::optional<SizeType32> const& maxContextLength);
+        std::optional<SizeType32> const& maxContextChunkSize);
 
 private:
     template <ContextChunkingPolicy tPolicy>
     static void setCtxRequestsChunkSize(RequestVector& contextsToBeChunked, std::optional<SizeType32> ctxTokensCapacity,
-        SizeType32 chunkUnitSize, std::optional<SizeType32> const& maxContextLength);
+        SizeType32 chunkUnitSize, std::optional<SizeType32> const& maxContextChunkSize);
 
     /// After the chunk sizes have been determined, this function will discard
     /// any draft tokens that don't fit.
     static void fitDraftTokens(RequestVector& contextsToBeChunked, std::optional<SizeType32> ctxTokensCapacity,
-        SizeType32 chunkUnitSize, std::optional<SizeType32> const& maxContextLength);
+        SizeType32 chunkUnitSize, std::optional<SizeType32> const& maxContextChunkSize);
 
-    /// The maximum length of the context. If the context exceeds this length,
-    /// it must be chunked, otherwise it cannot be processed. Therefore, it
-    /// needs to be set together with the chunk unit size to make sense.
-    /// When set to null, it indicates that context length is unlimited.
-    std::optional<SizeType32> mMaxContextLength;
+    /// The maximum length of the context, after chunking.
+    std::optional<SizeType32> mMaxContextChunkSize;
 
     std::optional<batch_scheduler::ContextChunkingConfig> mCtxChunkConfig;
 

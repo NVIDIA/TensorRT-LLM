@@ -1232,6 +1232,7 @@ void kernelV1Dispatch(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStrea
     constexpr bool isFP4 = false;
 #endif
 
+    assert(false);
     // Fall back to v1 kernel.
     // GPTJ Rotary embedding needs at least two elements per thread.
     // NOTE: the FP4 quantize helpers are assuming that each thread processes
@@ -1557,6 +1558,7 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     // Launch kernels for cross-attention.
     if (params.cross_attention)
     {
+        assert(false);
         TLLM_CHECK_WITH_INFO((absolute_position_embedding && params.remove_padding && params.qkv_bias == nullptr),
             "Assume cross attention has learned_absolute position embedding, remove_padding is enabled and no bias");
 #ifdef ENABLE_FP4
@@ -1593,6 +1595,7 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
         && (long_seq_rotary_support || !has_rotary_cos_sin_cache || has_sink_tokens || !support_rotary_for_v2
             || use_v1_for_mrope))
     {
+        assert(false);
         kernelV1Dispatch<T, TCache, KVCacheBuffer>(params, stream);
         return;
     }
@@ -1615,6 +1618,7 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     case 224: kernelV2DispatchHeadSize<224, 224, T, TCache, KVCacheBuffer>(params, stream); break;
     case 256: kernelV2DispatchHeadSize<256, 256, T, TCache, KVCacheBuffer>(params, stream); break;
     default:
+        assert(false);
         // Fall back to v1 kernel.
         // GPTJ Rotary embedding needs at least two elements per thread.
         kernelV1Dispatch<T, TCache, KVCacheBuffer>(params, stream);

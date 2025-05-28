@@ -487,10 +487,11 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         TLLM_CHECK(allottedPrimaryBlocks > 0); // You can't have a model with negative primary blocks...
         SizeType32 const allottedSecondaryBlocks
             = secondaryBlocksPerWindowSize ? secondaryBlocksPerWindowSize->at(windowSize) : 0;
-        mWindowBlockManagers.try_emplace(windowSize, dtype, windowSize, layersWithWindowSize, numKvHeadsPerLayer,
-            sizePerHead, tokensPerBlock, allottedPrimaryBlocks, allottedSecondaryBlocks, maxNumSequences, stream,
-            onboardBlocks, cacheType, secondaryOffloadMinPriority, mEventManager, enableHashKey, enablePartialReuse,
-            copyOnPartialReuse);
+
+        mWindowBlockManagers.try_emplace(windowSize, dtype, windowSize, layersWithWindowSize,
+            numKvHeadsPerLayer, sizePerHead, tokensPerBlock, allottedPrimaryBlocks, allottedSecondaryBlocks,
+            maxNumSequences, stream, onboardBlocks, cacheType, secondaryOffloadMinPriority, mEventManager,
+            enableHashKey, enablePartialReuse, copyOnPartialReuse);
     }
 
     auto const numAllPools = getNumPools();
@@ -505,17 +506,21 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             mAbsolutePoolToWindowSize.push_back(windowSize);
             mAbsolutePoolToRelativePoolIndex.push_back(i);
         }
-        auto const maxTokenNum = windowSize + sinkBubbleLength;
         auto const temporaryAttentionWindow = manager.calculateTemporaryAttentionWindow(tempAttentionWindowInputs);
-
         auto const numNonSinkTokensInWindow = windowSize - sinkTokenLength;
 
-        // Consider the temporaryAttentionWindow when allocating blocks.
+        // MaxNumTokens to keep in the window.
+        auto const maxTokenNum = windowSize + sinkBubbleLength + temporaryAttentionWindow;
+
+        // MaxNumBlocks for the whole sequence.
+        //
+        // CacheBlockIndices has length maxBlocksPerSeq, which is the linear view of the cache.
         auto const maxBlocksPerSeq
-            = tc::ceilDiv(maxTokenNum + temporaryAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
+            = tc::ceilDiv(maxSequenceLength.value(), tokensPerBlock) + kExtraBlockBuffer;
         TLLM_LOG_INFO("Max KV cache pages per sequence: %d [window size=%d]", maxBlocksPerSeq, windowSize);
-        mWindowSizeToMetadata[windowSize] = WindowSizeMetadata{absolutePoolsOffset, numPools, maxTokenNum,
-            maxBlocksPerSeq, manager.getMaxNumBlocks(), temporaryAttentionWindow, numNonSinkTokensInWindow};
+        mWindowSizeToMetadata[windowSize]
+            = WindowSizeMetadata{absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq, manager.getMaxNumBlocks(),
+                temporaryAttentionWindow, numNonSinkTokensInWindow};
         TLLM_LOG_DEBUG(
             "%s Metadata: %s", manager.getLogPrefix().c_str(), mWindowSizeToMetadata[windowSize].toString().c_str());
         absolutePoolsOffset += numPools;
@@ -865,6 +870,7 @@ BlockPtr WindowBlockManager::getFreeBlock(
 void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape,
     SizeType32 beamIdx, SizeType32 blockIdx, KVCacheBlock::IdType blockId) const
 {
+
     auto constexpr kIdx = 0;
     auto constexpr vIdx = 1;
 
@@ -1416,10 +1422,7 @@ void WindowBlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<
     // - Block reuse is enabled.
     // - A request was provided to this function call to identify which tokens these blocks cover
     // - Beam search is NOT enabled <=> beam width == 1
-    // - The sequence was not marked for use with sliding window kv-cache when it was added (when its context is too
-    // long to fit the max attention window).
-    bool const storeBlocksForReuse
-        = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.getContextRequiresSlidingWindowKvCache();
+    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && llmRequest.has_value();
     if (storeBlocksForReuse)
     {
         auto constexpr beamIdx = 0;
@@ -1493,13 +1496,15 @@ void WindowBlockManager::schedulingReleaseBlocks(RequestIdType requestId)
 KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead,
     SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
     SizeType32 maxNumSequences, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
-    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
-    SizeType32 sinkTokenLength, int64_t stream, std::optional<runtime::SizeType32> maxSequenceLength,
-    bool enableBlockReuse, bool onboardBlocks, CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse)
+    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs,
+    nvinfer1::DataType dtype, SizeType32 sinkTokenLength, int64_t stream,
+    std::optional<runtime::SizeType32> maxSequenceLength, bool enableBlockReuse, bool onboardBlocks,
+    CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksInPrimaryPool,
-        blocksInSecondaryPool, maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype,
-        sinkTokenLength, std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)),
-        maxSequenceLength, enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr, false, enablePartialReuse,
+        blocksInSecondaryPool, maxNumSequences, maxBeamWidth, maxAttentionWindowVec,
+        tempAttentionWindowInputs, dtype, sinkTokenLength,
+        std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
+        enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr, false, enablePartialReuse,
         copyOnPartialReuse)
 {
 }
@@ -1507,26 +1512,26 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
 KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
     SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
     SizeType32 maxNumSequences, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
-    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
-    SizeType32 sinkTokenLength, int64_t stream, std::optional<runtime::SizeType32> maxSequenceLength,
-    bool enableBlockReuse, bool onboardBlocks, CacheType cacheType,
-    std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
+    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs,
+    nvinfer1::DataType dtype, SizeType32 sinkTokenLength, int64_t stream,
+    std::optional<runtime::SizeType32> maxSequenceLength, bool enableBlockReuse, bool onboardBlocks,
+    CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse)
     : KVCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksInPrimaryPool, blocksInSecondaryPool,
-        maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
-        std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
-        enableBlockReuse, onboardBlocks, cacheType, secondaryOffloadMinPriority, eventManager, enablePartialReuse,
-        copyOnPartialReuse)
+        maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype,
+        sinkTokenLength, std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)),
+        maxSequenceLength, enableBlockReuse, onboardBlocks, cacheType, secondaryOffloadMinPriority, eventManager,
+        enablePartialReuse, copyOnPartialReuse)
 {
 }
 
 KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
     SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
     SizeType32 maxNumSequences, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
-    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
-    SizeType32 sinkTokenLength, CudaStreamPtr stream, std::optional<runtime::SizeType32> maxSequenceLength,
-    bool enableBlockReuse, bool onboardBlocks, CacheType cacheType,
-    std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
+    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs,
+    nvinfer1::DataType dtype, SizeType32 sinkTokenLength, CudaStreamPtr stream,
+    std::optional<runtime::SizeType32> maxSequenceLength, bool enableBlockReuse, bool onboardBlocks,
+    CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
     bool copyOnPartialReuse)
     : mMaxBeamWidth(maxBeamWidth)
@@ -1557,16 +1562,17 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
 KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead,
     SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
     SizeType32 maxNumSequences, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
-    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
-    SizeType32 sinkTokenLength, CudaStreamPtr stream, std::optional<runtime::SizeType32> maxSequenceLength,
-    bool enableBlockReuse, bool onboardBlocks, CacheType cacheType,
-    std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
+    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs,
+    nvinfer1::DataType dtype, SizeType32 sinkTokenLength, CudaStreamPtr stream,
+    std::optional<runtime::SizeType32> maxSequenceLength, bool enableBlockReuse, bool onboardBlocks,
+    CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
     bool copyOnPartialReuse)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksInPrimaryPool,
-        blocksInSecondaryPool, maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype,
-        sinkTokenLength, std::move(stream), maxSequenceLength, enableBlockReuse, onboardBlocks, cacheType,
-        secondaryOffloadMinPriority, std::move(eventManager), enableHashKey, enablePartialReuse, copyOnPartialReuse)
+        blocksInSecondaryPool, maxNumSequences, maxBeamWidth, maxAttentionWindowVec,
+        tempAttentionWindowInputs, dtype, sinkTokenLength, std::move(stream), maxSequenceLength, enableBlockReuse,
+        onboardBlocks, cacheType, secondaryOffloadMinPriority, std::move(eventManager), enableHashKey,
+        enablePartialReuse, copyOnPartialReuse)
 {
 }
 
@@ -1765,7 +1771,8 @@ void WindowBlockManager::cacheBlockOffsets(GenerationRequest& sequence) const
     for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
     {
         auto const& beamCacheBlock = cacheBlocks[beamIdx];
-        for (SizeType32 blockIdx = 0; blockIdx < static_cast<SizeType32>(beamCacheBlock.size()); ++blockIdx)
+        for (SizeType32 blockIdx = sequence.numBlocksRemoved();
+             blockIdx < static_cast<SizeType32>(beamCacheBlock.size()); ++blockIdx)
         {
             auto const blockId = beamCacheBlock.at(blockIdx);
             setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
@@ -1781,9 +1788,10 @@ void WindowBlockManager::detachBlock(
     auto const beamWidth = sequence.getBeamWidth();
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
     SizeType32 outOfWindowBlockIdx = sinkBlockTokenLength / getTokensPerBlock();
+    // We don't support sink attention.
+    TLLM_CHECK_WITH_INFO(outOfWindowBlockIdx == 0, "outOfWindowBlockIdx is not 0");
 
-    auto const storeBlocksForReuse
-        = enableBlockReuse && beamWidth == 1 && !sequence.getContextRequiresSlidingWindowKvCache();
+    auto const storeBlocksForReuse = (enableBlockReuse && beamWidth == 1);
 
     for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
     {
@@ -1819,7 +1827,7 @@ void WindowBlockManager::detachBlock(
     allocatedBlocks.erase(allocatedBlocks.begin() + outOfWindowBlockIdx * beamWidth,
         allocatedBlocks.begin() + (outOfWindowBlockIdx + 1) * beamWidth);
     // Remove stored block ids in sequence
-    sequence.removeBlock(outOfWindowBlockIdx, mWindowSize);
+    sequence.removeFirstBlock(mWindowSize);
 }
 
 void WindowBlockManager::cacheNewBlockOffsets(GenerationRequest& sequence) const
@@ -1847,12 +1855,12 @@ void BlockManager::addSequenceBlockIfNeeded(
     {
         auto& manager = mWindowBlockManagers.at(windowSize);
         manager.addSequenceBlockIfNeeded(
-            sequence, sinkBlockTokenLength, enableBlockReuse, metadata.numNonSinkTokensInWindow);
+            sequence, sinkBlockTokenLength, enableBlockReuse, metadata.numNonSinkTokensInWindow, metadata.temporaryAttentionWindow);
     }
 }
 
 void WindowBlockManager::addSequenceBlockIfNeeded(GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength,
-    bool const enableBlockReuse, SizeType32 const numNonSinkTokensInWindow)
+    bool const enableBlockReuse, SizeType32 const numNonSinkTokensInWindow, SizeType32 const temporaryAttentionWindow)
 {
     auto const newNumTokens = sequence.getNumTokens();
     auto const prevNumTokens = newNumTokens - 1;
@@ -1861,7 +1869,8 @@ void WindowBlockManager::addSequenceBlockIfNeeded(GenerationRequest& sequence, S
     auto const shouldAllocateBlock = isBlockBoundary;
 
     auto const numTokensWithoutSink = newNumTokens - sinkBlockTokenLength;
-    auto const minTokensForBlockDetach = numNonSinkTokensInWindow + getTokensPerBlock();
+    auto const minTokensForBlockDetach = (mWindowSize + temporaryAttentionWindow) + getTokensPerBlock();
+
     auto const canDetachBlock = (numTokensWithoutSink >= minTokensForBlockDetach)
         && ((numTokensWithoutSink - minTokensForBlockDetach) % getTokensPerBlock() == 0);
 
@@ -1927,10 +1936,10 @@ void KVCacheManager::addSequence(
         auto const maxTokenNum = metadata.maxTokenNum;
         auto const temporaryAttentionWindow = metadata.temporaryAttentionWindow;
 
-        // Consider the temporaryAttentionWindow when allocating blocks.
-        auto const effectiveInputLength = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
+        // inputLength <= contextChunkSize
+        auto const effectiveInputLength = inputLength;
         auto const numContextBlocks = tc::ceilDiv(effectiveInputLength, getTokensPerBlock());
-        if (!sequence.getContextRequiresSlidingWindowKvCache() && mEnableBlockReuse)
+        if (mEnableBlockReuse)
         {
             mBlockManager.addSequence(sequence, effectiveInputLength, numContextBlocks, *llmRequest, windowSize);
         }
@@ -1990,7 +1999,7 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
 {
     auto const requestId = llmRequest.mRequestId;
     auto& sequence = getSequence(requestId);
-    if (mEnableBlockReuse && !sequence.getContextRequiresSlidingWindowKvCache())
+    if (mEnableBlockReuse)
     {
         mBlockManager.storeContextBlocks(sequence, llmRequest);
     }

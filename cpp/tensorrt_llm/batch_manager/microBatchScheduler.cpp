@@ -25,9 +25,9 @@ namespace tensorrt_llm::batch_manager
 using SizeType32 = MicroBatchScheduler::SizeType32;
 
 MicroBatchScheduler::MicroBatchScheduler(std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig,
-    std::optional<SizeType32> maxContextLength, LlmRequestState noScheduleUntilState,
+    std::optional<SizeType32> maxContextChunkSize, LlmRequestState noScheduleUntilState,
     LlmRequestState noScheduleAfterState)
-    : mMaxContextLength(maxContextLength)
+    : mMaxContextChunkSize(maxContextChunkSize)
     , mCtxChunkConfig(ctxChunkConfig)
     , mNoScheduleUntilState(noScheduleUntilState)
     , mNoScheduleAfterState(noScheduleAfterState)
@@ -36,7 +36,7 @@ MicroBatchScheduler::MicroBatchScheduler(std::optional<batch_scheduler::ContextC
 
 void MicroBatchScheduler::fitDraftTokens(RequestVector& contextsToBeChunked,
     std::optional<SizeType32> ctxTokensCapacity, SizeType32 const chunkUnitSize,
-    std::optional<SizeType32> const& maxContextLength)
+    std::optional<SizeType32> const& maxContextChunkSize)
 {
     // How many context tokens are in this batch already?
     SizeType32 numCtxTokens{0};
@@ -57,10 +57,10 @@ void MicroBatchScheduler::fitDraftTokens(RequestVector& contextsToBeChunked,
             SizeType32 remainder = llmReq->getContextChunkSize() % chunkUnitSize;
             SizeType32 remainingSpaceForDraftTokens = remainder == 0 ? 0 : chunkUnitSize - remainder;
 
-            if (maxContextLength)
+            if (maxContextChunkSize)
             {
-                // How much space is remaining before reaching maxContextLength?
-                SizeType32 remainingContextLength = maxContextLength.value() - llmReq->getContextChunkSize();
+                // How much space is remaining before reaching maxContextChunkSize?
+                SizeType32 remainingContextLength = maxContextChunkSize.value() - llmReq->getContextChunkSize();
                 remainingSpaceForDraftTokens = std::min(remainingSpaceForDraftTokens, remainingContextLength);
             }
             if (ctxTokensCapacity)
@@ -84,7 +84,7 @@ void MicroBatchScheduler::fitDraftTokens(RequestVector& contextsToBeChunked,
 template <>
 void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextChunkingPolicy::kEQUAL_PROGRESS>(
     RequestVector& contextsToBeChunked, std::optional<SizeType32> ctxTokensCapacity, SizeType32 const chunkUnitSize,
-    std::optional<SizeType32> const& maxContextLength)
+    std::optional<SizeType32> const& maxContextChunkSize)
 {
     SizeType32 numCtxTokens{0};
     SizeType32 numTokensSingleLoop{1};
@@ -103,7 +103,7 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
             SizeType32 actualIncrement = actualChunkSize - pastChunkSize;
 
             if ((ctxTokensCapacity && numCtxTokens + actualIncrement > ctxTokensCapacity.value())
-                || (maxContextLength && actualChunkSize > maxContextLength.value()))
+                || (maxContextChunkSize && actualChunkSize > maxContextChunkSize.value()))
             {
                 llmReq->setContextChunkSize(pastChunkSize);
                 continue;
@@ -117,7 +117,7 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
 template <>
 void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED>(
     RequestVector& contextsToBeChunked, std::optional<SizeType32> ctxTokensCapacity, SizeType32 const chunkUnitSize,
-    std::optional<SizeType32> const& maxContextLength)
+    std::optional<SizeType32> const& maxContextChunkSize)
 {
     for (auto& llmReq : contextsToBeChunked)
     {
@@ -127,9 +127,9 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
         {
             actualChunkSize = std::min(ctxTokensCapacity.value(), actualChunkSize);
         }
-        if (maxContextLength)
+        if (maxContextChunkSize)
         {
-            actualChunkSize = std::min(maxContextLength.value(), actualChunkSize);
+            actualChunkSize = std::min(maxContextChunkSize.value(), actualChunkSize);
         }
         if (actualChunkSize != suggestedChunkSize)
         {
@@ -145,7 +145,7 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
 
 void MicroBatchScheduler::setCtxRequestsChunkSize(RequestVector& contextsToBeChunked,
     ContextChunkingPolicy const ctxChunkPolicy, std::optional<SizeType32> ctxTokensCapacity,
-    SizeType32 const chunkUnitSize, std::optional<SizeType32> const& maxContextLength)
+    SizeType32 const chunkUnitSize, std::optional<SizeType32> const& maxContextChunkSize)
 {
     for (auto& llmReq : contextsToBeChunked)
     {
@@ -155,17 +155,17 @@ void MicroBatchScheduler::setCtxRequestsChunkSize(RequestVector& contextsToBeChu
     {
     case ContextChunkingPolicy::kEQUAL_PROGRESS:
         setCtxRequestsChunkSize<MicroBatchScheduler::ContextChunkingPolicy::kEQUAL_PROGRESS>(
-            contextsToBeChunked, ctxTokensCapacity, chunkUnitSize, maxContextLength);
+            contextsToBeChunked, ctxTokensCapacity, chunkUnitSize, maxContextChunkSize);
         break;
     case ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED:
         setCtxRequestsChunkSize<MicroBatchScheduler::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED>(
-            contextsToBeChunked, ctxTokensCapacity, chunkUnitSize, maxContextLength);
+            contextsToBeChunked, ctxTokensCapacity, chunkUnitSize, maxContextChunkSize);
         break;
     default: TLLM_THROW("The chunked scheduling type `NO_CHUNKING` cannot be performed.");
     }
 
     // After scheduling chunk sizes, discard draft tokens that won't fit.
-    fitDraftTokens(contextsToBeChunked, ctxTokensCapacity, chunkUnitSize, maxContextLength);
+    fitDraftTokens(contextsToBeChunked, ctxTokensCapacity, chunkUnitSize, maxContextChunkSize);
 }
 
 std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(RequestVector& activeRequests,
@@ -204,9 +204,9 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         if (llmReq->isEncoderInitState())
         {
             reqNumTokens = llmReq->getEncoderOutputLen();
-            TLLM_CHECK_WITH_INFO(!mMaxContextLength || reqNumTokens <= mMaxContextLength.value(),
+            TLLM_CHECK_WITH_INFO(!mMaxContextChunkSize || reqNumTokens <= mMaxContextChunkSize.value(),
                 "The number of encoder tokens (%d) exceeds the limit value (%d)", reqNumTokens,
-                mMaxContextLength.value());
+                mMaxContextChunkSize.value());
             if (maxNumTokensRuntime && batchNumTokens + reqNumTokens > maxNumTokensRuntime.value())
             {
                 break;
@@ -222,9 +222,9 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
                 constexpr SizeType32 beam{0};
                 reqNumTokens
                     = llmReq->getNumTokens(beam) + (llmReq->hasDraftTokens() ? llmReq->getNumDraftTokens() : 0);
-                TLLM_CHECK_WITH_INFO(!mMaxContextLength || reqNumTokens <= mMaxContextLength.value(),
+                TLLM_CHECK_WITH_INFO(!mMaxContextChunkSize || reqNumTokens <= mMaxContextChunkSize.value(),
                     "The number of context tokens (%d) exceeds the limit value (%d)", reqNumTokens,
-                    mMaxContextLength.value());
+                    mMaxContextChunkSize.value());
                 if (maxNumTokensRuntime && batchNumTokens + reqNumTokens > maxNumTokensRuntime.value())
                 {
                     break;
@@ -240,12 +240,12 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
                     = (llmReq->isLastContextChunk() && llmReq->hasDraftTokens()) ? llmReq->getNumDraftTokens() : 0;
                 reqNumTokens = llmReq->getContextChunkSize() + draftTokens;
 
-                if (mMaxContextLength)
+                if (mMaxContextChunkSize)
                 {
-                    if (mMaxContextLength.value() < reqNumTokens)
+                    if (mMaxContextChunkSize.value() < reqNumTokens)
                     {
                         // The context exceeds the length limit, we need to try chunking later.
-                        reqNumTokens = mMaxContextLength.value();
+                        reqNumTokens = mMaxContextChunkSize.value();
                         allContextRequestsFit = false;
                     }
                 }
@@ -296,7 +296,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         auto const ctxTokensCapacity
             = maxNumTokensRuntime ? std::make_optional(maxNumTokensRuntime.value() - batchNumTokens) : std::nullopt;
         setCtxRequestsChunkSize(contextsToBeChunked, mCtxChunkConfig.value().chunkingPolicy, ctxTokensCapacity,
-            mCtxChunkConfig.value().chunkUnitSize, mMaxContextLength);
+            mCtxChunkConfig.value().chunkUnitSize, mMaxContextChunkSize);
     }
     for (auto const& llmReq : contextsToBeChunked)
     {

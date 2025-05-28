@@ -427,15 +427,15 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
 
     py::classh<tbk::KVCacheManager, tbk::BaseKVCacheManager>(m, "KVCacheManager")
         .def(py::init<std::vector<SizeType32> const&, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
-                 SizeType32, std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
-                 nvinfer1::DataType, SizeType32, bool, int64_t, bool, bool, tbk::CacheType,
-                 std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
-                 bool, bool>(),
+                 SizeType32, std::vector<SizeType32> const&,
+                 std::optional<tbk::TempAttentionWindowInputs> const&, nvinfer1::DataType, SizeType32, bool, int64_t,
+                 bool, bool, tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
+                 std::shared_ptr<tbk::KVCacheEventManager>, bool, bool>(),
             py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"), py::arg("tokens_per_block"),
             py::arg("blocks_in_primary_pool"), py::arg("blocks_in_secondary_pool"), py::arg("max_num_sequences"),
-            py::arg("max_beam_width"), py::arg("max_attention_window_vec"), py::arg("temp_attention_window_inputs"),
-            py::arg("dtype"), py::arg("sink_token_length"), py::arg("stream"), py::arg("max_sequence_length"),
-            py::arg("enable_block_reuse") = false, py::arg("onboard_blocks") = true,
+            py::arg("max_beam_width"), py::arg("max_attention_window_vec"),
+            py::arg("temp_attention_window_inputs"), py::arg("dtype"), py::arg("sink_token_length"), py::arg("stream"),
+            py::arg("max_sequence_length"), py::arg("enable_block_reuse") = false, py::arg("onboard_blocks") = true,
             py::arg_v("cache_type", tbk::CacheType::kSELF, "bindings.internal.batch_manager.CacheType.SELF"),
             py::arg("secondary_offload_min_priority") = std::nullopt, py::arg("event_manager") = nullptr,
             py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true);
