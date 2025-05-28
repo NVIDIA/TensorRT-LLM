@@ -55,7 +55,8 @@ BASE_ZMQ_CLASSES = {
         "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
         "FinishReason", "KvCacheConfig", "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
-        "SchedulerConfig", "DynamicBatchConfig", "ContextChunkingPolicy"
+        "SchedulerConfig", "DynamicBatchConfig", "ContextChunkingPolicy",
+        "CacheTransceiverConfig"
     ],
     "tensorrt_llm.builder": ["BuildConfig"],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
