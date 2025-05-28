@@ -2670,7 +2670,9 @@ class MultimodalModelRunner:
                         image = image.expand(
                             min(self.args.batch_size, len(input_text)), -1, -1,
                             -1).contiguous()
-        if image is not None and isinstance(image, torch.Tensor):
+        # Note: For pixtral model, image is a dict with each value being a list of tensors.
+        # Moving to device is handled above. So, it's safe to skip this for pixtral.
+        if image is not None and 'pixtral' not in self.model_type:
             image = image.to(self.device)
         # Generate decoder_input_ids for enc-dec models
         # Custom prompts can be added as:
