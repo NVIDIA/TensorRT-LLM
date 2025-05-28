@@ -136,8 +136,8 @@ bool FabricMemory::supportFbaricMemory()
     TLLM_LOG_DEBUG("FabricMemory::supportFbaricMemory fabric_handle_supported:%d", fabric_handle_supported);
     TLLM_LOG_DEBUG("FabricMemory::supportFbaricMemory gpu_direct_rdma_with_cuda_vmm_supported:%d",
         gpu_direct_rdma_with_cuda_vmm_supported);
-    if (ret0 g = CUresult::CUDA_SUCCESS || ret1 != CUresult::CUDA_SUCCESS || fabric_handle_supported == 0
-            || gpu_direct_rdma_with_cuda_vmm_supported == 0)
+    if (ret0 != CUresult::CUDA_SUCCESS || ret1 != CUresult::CUDA_SUCCESS || fabric_handle_supported == 0
+        || gpu_direct_rdma_with_cuda_vmm_supported == 0)
     {
         return false;
     }
