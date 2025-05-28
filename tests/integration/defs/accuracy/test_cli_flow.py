@@ -200,6 +200,97 @@ class TestNemotronMini4BInstruct(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
 
+# TODO: Remove the CLI tests once NIMs use PyTorch backend
+class TestLlama3_3NemotronSuper49Bv1(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
+    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1"
+    EXAMPLE_FOLDER = "models/core/nemotron_nas"
+
+    @pytest.mark.skip_less_device(2)
+    def test_auto_dtype_tp2(self):
+        self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=2, dtype='auto')
+
+    @pytest.mark.skip(
+        reason="nemotron-nas scripts have to accommodate fp8 flags")
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    def test_fp8_prequantized_tp2(self, mocker):
+        mocker.patch.object(
+            self.__class__, "MODEL_PATH",
+            f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8"
+        )
+        self.run(tasks=[MMLU(self.MODEL_NAME)],
+                 tp_size=2,
+                 quant_algo=QuantAlgo.FP8)
+
+
+class TestNemotronNano(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Llama-3.1-Nemotron-Nano-8B-v1"
+    MODEL_PATH = f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1"
+    EXAMPLE_FOLDER = "models/core/llama"
+
+    def test_auto_dtype(self):
+        self.run(tasks=[MMLU(self.MODEL_NAME)], dtype='auto')
+
+
+class TestNemotronUltra(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1"
+    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1"
+    EXAMPLE_FOLDER = "models/core/nemotron_nas"
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
+        extra_summarize_args = []
+        if cuda_graph:
+            extra_summarize_args.append("--cuda_graph_mode")
+
+        self.run(tasks=[MMLU(self.MODEL_NAME)],
+                 tp_size=tp_size,
+                 pp_size=pp_size,
+                 extra_convert_args=[
+                     f"--moe_tp_size={tp_size // ep_size}",
+                     f"--moe_ep_size={ep_size}", f"--moe_renorm_mode={0}"
+                 ],
+                 extra_build_args=["--gemm_plugin=auto", "--moe_plugin=auto"],
+                 extra_summarize_args=extra_summarize_args)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_fp8_prequantized(self, cuda_graph, tp_size, pp_size, ep_size,
+                              mocker):
+        mocker.patch.object(
+            self.__class__, "MODEL_PATH",
+            f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8"
+        )
+
+        extra_summarize_args = []
+        if cuda_graph:
+            extra_summarize_args.append("--cuda_graph_mode")
+
+        self.run(tasks=[MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.FP8,
+                 kv_cache_quant_algo=QuantAlgo.FP8,
+                 tp_size=tp_size,
+                 pp_size=pp_size,
+                 extra_convert_args=[
+                     f"--moe_tp_size={tp_size // ep_size}",
+                     f"--moe_ep_size={ep_size}", f"--moe_renorm_mode={0}"
+                 ],
+                 extra_build_args=["--gemm_plugin=auto", "--moe_plugin=auto"],
+                 extra_summarize_args=extra_summarize_args)
+
+
 @skip_post_blackwell
 class TestPhi2(CliFlowAccuracyTestHarness):
     MODEL_NAME = "microsoft/phi-2"
@@ -847,9 +938,7 @@ class TestLlama3_3_70BInstruct(CliFlowAccuracyTestHarness):
     @pytest.mark.skip_device_not_contain(["B200"])
     def test_nvfp4_prequantized_tp4(self, mocker):
         mocker.patch.object(
-            self.__class__,
-            "MODEL_PATH",
-            model_path=
+            self.__class__, "MODEL_PATH",
             f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4"
         )
         self.run(tasks=[MMLU(self.MODEL_NAME)],

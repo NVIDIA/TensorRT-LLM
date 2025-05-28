@@ -22,6 +22,7 @@ import subprocess as sp
 import tempfile
 import time
 import urllib.request
+import warnings
 from functools import wraps
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -2196,8 +2197,10 @@ def skip_by_host_memory(request):
 
 IS_UNDER_CI_ENV = 'JENKINS_HOME' in os.environ
 
+gpu_warning_threshold = 1024 * 1024 * 1024
 
-def collect_status():
+
+def collect_status(item: pytest.Item):
     if not IS_UNDER_CI_ENV:
         return
 
@@ -2210,6 +2213,22 @@ def collect_status():
         for idx in range(pynvml.nvmlDeviceGetCount())
     }
 
+    deadline = time.perf_counter() + 60  # 1 min
+    observed_used = 0
+    global gpu_warning_threshold
+
+    while time.perf_counter() < deadline:
+        observed_used = max(
+            pynvml.nvmlDeviceGetMemoryInfo(device).used
+            for device in handles.values())
+        if observed_used <= gpu_warning_threshold:
+            break
+        time.sleep(1)
+    else:
+        gpu_warning_threshold = max(observed_used, gpu_warning_threshold)
+        warnings.warn(
+            f"Test {item.name} does not free up GPU memory correctly!")
+
     gpu_memory = {}
     for idx, device in handles.items():
         total_used = pynvml.nvmlDeviceGetMemoryInfo(device).used // 1024 // 1024
@@ -2218,13 +2237,12 @@ def collect_status():
         process = {}
 
         for entry in detail:
-            host_memory_in_mbs = -1
             try:
-                host_memory_in_mbs = psutil.Process(
-                    entry.pid).memory_full_info().uss // 1024 // 1024
+                p = psutil.Process(entry.pid)
+                host_memory_in_mbs = p.memory_full_info().uss // 1024 // 1024
                 process[entry.pid] = (entry.usedGpuMemory // 1024 // 1024,
-                                      host_memory_in_mbs)
-            except:
+                                      host_memory_in_mbs, p.cmdline())
+            except Exception:
                 pass
 
         gpu_memory[idx] = {
@@ -2239,7 +2257,7 @@ def collect_status():
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(item, nextitem):
     ret = yield
-    collect_status()
+    collect_status(item)
     return ret
 
 

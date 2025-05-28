@@ -894,7 +894,8 @@ def prepare_gpt_2b_lora_engine(type, tensorrt_llm_gpt_example_root,
     return engine_dir
 
 
-def prepare_gpt_175b_engine(type, tensorrt_llm_gpt_example_root):
+def prepare_gpt_175b_engine(type, tensorrt_llm_gpt_example_root,
+                            tensorrt_llm_example_root):
     # Build GPT
     if type == "python_backend":
         engine_dir = os.path.join(tensorrt_llm_gpt_example_root, "engine_dir",
@@ -904,8 +905,7 @@ def prepare_gpt_175b_engine(type, tensorrt_llm_gpt_example_root):
                                   "gpt_175b_ifb")
 
     convert_cmd = [
-        "python3",
-        f"{tensorrt_llm_gpt_example_root}/../generate_checkpoint_config.py",
+        "python3", f"{tensorrt_llm_example_root}/generate_checkpoint_config.py",
         f"--output_path={engine_dir}/ckpt_config.json",
         "--architecture=GPTForCausalLM", "--dtype=float16",
         "--num_hidden_layers=96", "--num_attention_heads=96",
@@ -948,7 +948,8 @@ def prepare_gpt_175b_engine(type, tensorrt_llm_gpt_example_root):
     return engine_dir
 
 
-def prepare_gpt_multi_node_engine(type, tensorrt_llm_gpt_example_root):
+def prepare_gpt_multi_node_engine(type, tensorrt_llm_gpt_example_root,
+                                  tensorrt_llm_example_root):
     # Build GPT
     if type == "python_backend":
         engine_dir = os.path.join(tensorrt_llm_gpt_example_root, "engine_dir",
@@ -958,8 +959,7 @@ def prepare_gpt_multi_node_engine(type, tensorrt_llm_gpt_example_root):
                                   "gpt_multi_node_ifb")
 
     convert_cmd = [
-        "python3",
-        f"{tensorrt_llm_gpt_example_root}/../generate_checkpoint_config.py",
+        "python3", f"{tensorrt_llm_example_root}/generate_checkpoint_config.py",
         f"--output_path={engine_dir}/ckpt_config.json",
         "--architecture=GPTForCausalLM", "--dtype=float16",
         "--num_hidden_layers=96", "--num_attention_heads=96",
@@ -1111,7 +1111,8 @@ def prepare_llama_v2_13b_engine(tensorrt_llm_llama_example_root,
     return engine_dir
 
 
-def prepare_llama_v3_8b_engine(tensorrt_llm_llama_example_root,
+def prepare_llama_v3_8b_engine(tensorrt_llm_example_root,
+                               tensorrt_llm_llama_example_root,
                                llama_v3_8b_model_root,
                                workers=8,
                                data_type="bfloat16"):
@@ -1133,7 +1134,7 @@ def prepare_llama_v3_8b_engine(tensorrt_llm_llama_example_root,
     elif data_type == "fp8":
         convert_cmd = [
             "python3",
-            "../quantization/quantize.py",
+            f"{tensorrt_llm_example_root}/quantization/quantize.py",
             f"--model_dir={llama_v3_8b_model_root}",
             "--dtype=float16",
             "--qformat=fp8",
@@ -1186,6 +1187,7 @@ def prepare_llama_v3_8b_engine(tensorrt_llm_llama_example_root,
 
 
 def prepare_llama_v3_70b_engine(type,
+                                tensorrt_llm_example_root,
                                 tensorrt_llm_llama_example_root,
                                 llama_v3_70b_model_root,
                                 data_type="bfloat16"):
@@ -1211,7 +1213,7 @@ def prepare_llama_v3_70b_engine(type,
     elif data_type == "fp8":
         convert_cmd = [
             "python3",
-            "../quantization/quantize.py",
+            f"{tensorrt_llm_example_root}/quantization/quantize.py",
             f"--model_dir={llama_v3_70b_model_root}",
             "--dtype=float16",
             "--qformat=fp8",
@@ -1707,7 +1709,8 @@ def prepare_tiny_llama_1b_engine(type, tensorrt_llm_llama_example_root,
     return engine_dir, xgrammar_tokenizer_info_path
 
 
-def prepare_rcca_nvbug_4714193_engine(tensorrt_llm_mixtral_example_root,
+def prepare_rcca_nvbug_4714193_engine(tensorrt_llm_example_root,
+                                      tensorrt_llm_mixtral_example_root,
                                       mixtral_8x7b_v0_1_model_root,
                                       llm_backend_root):
     engine_dir = os.path.join(tensorrt_llm_mixtral_example_root, "engine_dir",
@@ -1718,7 +1721,7 @@ def prepare_rcca_nvbug_4714193_engine(tensorrt_llm_mixtral_example_root,
     # Quantize model
     quantize_cmd = [
         "python3",
-        "../quantization/quantize.py",
+        f"{tensorrt_llm_example_root}/quantization/quantize.py",
         f"--model_dir={mixtral_8x7b_v0_1_model_root}",
         "--dtype=float16",
         "--qformat=fp8",
