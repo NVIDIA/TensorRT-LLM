@@ -12,8 +12,7 @@ generation_servers:
     free_gpu_memory_fraction: 0.2
     enable_block_reuse: False
     enable_partial_reuse: False
-  pytorch_backend_config:
-    print_iter_log: True
+  print_iter_log: True
   urls:
       - "localhost:8002"
       - "localhost:8003"
