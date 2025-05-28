@@ -1047,6 +1047,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
 
                     parameters += [
+                        'enableFailFast': enableFailFast,
                         'branch': branch,
                         'action': "push",
                         'globalVars': globalVarsJson,

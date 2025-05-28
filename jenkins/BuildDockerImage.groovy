@@ -384,6 +384,8 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         }]
     }
 
+    echo "enableFailFast is: ${env.enableFailFast}, but we currently don't use it due to random ucxx issue"
+    //pipeline.failFast = env.enableFailFast
     pipeline.parallel buildJobs
 
 }
