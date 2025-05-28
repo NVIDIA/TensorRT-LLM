@@ -1520,15 +1520,16 @@ class FusedMoE(nn.Module):
                     x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
                                       self.scaling_vector_size)
 
-        token_selected_slots = recv_topk_idx.to(torch.int32)
-        mask = token_selected_slots == -1
-        token_selected_slots += self.num_slots // self.mapping.world_size * self.mapping.rank
-        token_selected_slots[mask] = self.num_slots
-        num_recv_token_is_zero = x.shape[0] == 0
-        if x.shape[0] == 0:
-            x = torch.zeros((1, x.shape[1]), dtype=x.dtype, device=x.device)
-            token_selected_slots = torch.full((1, token_selected_slots.shape[1]), self.num_slots, dtype=token_selected_slots.dtype, device=token_selected_slots.device)
-            token_final_scales = torch.ones((1, token_final_scales.shape[1]), dtype=token_final_scales.dtype, device=token_final_scales.device)
+        if self.enable_alltoall:
+            token_selected_slots = recv_topk_idx.to(torch.int32)
+            mask = token_selected_slots == -1
+            token_selected_slots += self.num_slots // self.mapping.world_size * self.mapping.rank
+            token_selected_slots[mask] = self.num_slots
+            num_recv_token_is_zero = x.shape[0] == 0
+            if x.shape[0] == 0:
+                x = torch.zeros((1, x.shape[1]), dtype=x.dtype, device=x.device)
+                token_selected_slots = torch.full((1, token_selected_slots.shape[1]), self.num_slots, dtype=token_selected_slots.dtype, device=token_selected_slots.device)
+                token_final_scales = torch.ones((1, token_final_scales.shape[1]), dtype=token_final_scales.dtype, device=token_final_scales.device)
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,

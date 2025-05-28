@@ -449,8 +449,8 @@ class Deepseekv3MoE(nn.Module):
         if model_config.mapping.tp_size == 1:
             return False
 
-        if not MnnvlMemory.supports_mnnvl():
-            return False
+        # if not MnnvlMemory.supports_mnnvl():
+        #     return False
 
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return False

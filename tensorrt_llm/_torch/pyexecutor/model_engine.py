@@ -905,8 +905,8 @@ class PyTorchModelEngine(ModelEngine):
 
         with timing("Model init total"):
             try:
-                # with MetaInitMode():
-                model = AutoModelForCausalLM.from_config(config)
+                with MetaInitMode():
+                    model = AutoModelForCausalLM.from_config(config)
 
                 memo = dict()
 

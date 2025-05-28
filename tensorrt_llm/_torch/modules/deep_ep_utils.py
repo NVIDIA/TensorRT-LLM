@@ -16,7 +16,7 @@ Buffer.set_num_sms(24)
 # You may call this function at the framework initialization
 def get_buffer(comm, hidden_bytes: int) -> Buffer:
     global _buffer
-    
+
     # NOTES: you may also replace `get_*_config` with your auto-tuned results via all the tests
     num_nvl_bytes, num_rdma_bytes = 0, 0
     world_size = comm.Get_size()
