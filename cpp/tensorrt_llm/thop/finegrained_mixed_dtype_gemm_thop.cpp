@@ -60,6 +60,13 @@ W4A16GemmRunner::W4A16GemmRunner(at::ScalarType activationDtype, int64_t quant_m
                 tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_bfloat16, cutlass::uint4b_t,
                     cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16>>();
         }
+
+        else if (activationDtype == at::ScalarType::Float8_e4m3fn)
+        {
+            mGemmRunner
+                = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,
+                    cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, half, half, half>>();
+        }
     }
     else if (quant_mode == 1)
     {
@@ -74,6 +81,12 @@ W4A16GemmRunner::W4A16GemmRunner(at::ScalarType activationDtype, int64_t quant_m
                 = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_bfloat16,
                     cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, __nv_bfloat16,
                     __nv_bfloat16, __nv_bfloat16>>();
+        }
+        else if (activationDtype == at::ScalarType::Float8_e4m3fn)
+        {
+            mGemmRunner
+                = std::make_shared<tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<__nv_fp8_e4m3,
+                    cutlass::uint4b_t, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS, half, half, half>>();
         }
     }
     else
@@ -167,6 +180,11 @@ at::Tensor W4A16GemmRunner::runGemm(at::Tensor const& A, at::Tensor const& B_pac
     else if (mActivationDtype == at::ScalarType::BFloat16)
     {
         output_dtype = torch::kBFloat16;
+    }
+    else if (mActivationDtype == at::ScalarType::Float8_e4m3fn)
+    {
+        output_dtype
+            = torch::kFloat16; // todo needs to check it,  as i saw the runner output dtype cany be Float8_e4m3fn.
     }
     else
     {
