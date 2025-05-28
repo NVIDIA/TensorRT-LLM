@@ -81,8 +81,7 @@ class RuntimeConfig(BaseModel):
         }
 
         if self.backend in backend_config_map:
-            llm_args["pytorch_backend_config"] = backend_config_map[
-                self.backend]()
+            llm_args.update(backend_config_map[self.backend]())
 
         return update_llm_args_with_extra_options(llm_args,
                                                   self.extra_llm_api_options)
@@ -109,7 +108,7 @@ class PerformanceOptions:
         return config
 
     def get_pytorch_perf_config(self) -> PyTorchConfig:
-        return PyTorchConfig(**self.pytorch_config)
+        return self.pytorch_config
 
     def get_autodeploy_perf_config(self) -> AutoDeployConfig:
         ad_config = AutoDeployConfig(**self.pytorch_config)

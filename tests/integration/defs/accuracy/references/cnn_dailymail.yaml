@@ -137,6 +137,8 @@ meta-llama/Llama-3.2-1B:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 27.029
+  - quant_algo: FP8
+    accuracy: 27.029
   - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
     accuracy: 27.257
   - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
@@ -310,5 +312,3 @@ Qwen3/Qwen3-8B:
     accuracy: 30
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 34.003
-nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
-  - accuracy: 27.810

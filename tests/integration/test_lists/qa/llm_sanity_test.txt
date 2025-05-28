@@ -101,6 +101,7 @@ accuracy/test_cli_flow.py::TestLlama3_1_8B::test_fp8_rowwise_tp4[disable_gemm_al
 accuracy/test_cli_flow.py::TestLlama3_1_8B::test_autoq
 accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_medusa_fp8_prequantized
 accuracy/test_cli_flow.py::TestLlama3_2_1B::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestLlama3_2_1B::test_auto_dtype
 accuracy/test_cli_flow.py::TestLlama3_3_70BInstruct::test_fp8_prequantized_tp4
 accuracy/test_cli_flow.py::TestLlama3_3_70BInstruct::test_nvfp4_prequantized_tp4
 accuracy/test_cli_flow.py::TestMistral7B::test_fp8_tp4pp2
@@ -120,14 +121,21 @@ accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_auto_dtype[tp8-c
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
 accuracy/test_llm_api_pytorch.py::TestNemotronNas::test_auto_dtype_tp8
-accuracy/test_llm_api_pytorch.py::TestNemotronSuper::test_auto_dtype_tp2
+accuracy/test_llm_api_pytorch.py::TestLlama3_3NemotronSuper49Bv1::test_auto_dtype_tp2
+accuracy/test_cli_flow.py::TestLlama3_3NemotronSuper49Bv1::test_auto_dtype_tp2
 accuracy/test_llm_api_pytorch.py::TestNemotronNano::test_auto_dtype
+accuracy/test_cli_flow.py::TestNemotronNano::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_auto_dtype[tp8-cuda_graph=False]
+accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized[tp8-cuda_graph=False]
+accuracy/test_cli_flow.py::TestNemotronUltra::test_auto_dtype[tp8-cuda_graph=False]
+accuracy/test_cli_flow.py::TestNemotronUltra::test_fp8_prequantized[tp8-cuda_graph=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8_block_scales[latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass]
+accuracy/test_llm_api_pytorch.py::TestPhi4MiniInstruct::test_auto_dtype
 
 # Pivot to Pytorch test cases.
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
