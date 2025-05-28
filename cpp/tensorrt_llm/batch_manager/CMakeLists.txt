@@ -108,7 +108,6 @@ if(ENABLE_CUFILE)
   target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${CUFILE_LIBRARY})
 endif()
 
-target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${CUDA_NVML_LIB})
 if(ENABLE_UCX)
   find_package(ucx REQUIRED)
   find_package(ucxx REQUIRED)

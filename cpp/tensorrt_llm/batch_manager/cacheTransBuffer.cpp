@@ -21,7 +21,6 @@
 #include "tensorrt_llm/common/opUtils.h"
 #include <NvInferRuntimeBase.h>
 #include <mutex>
-#include <nvml.h>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -142,20 +141,6 @@ bool FabricMemory::supportFbaricMemory()
     {
         return false;
     }
-
-    NVML_CHECK(nvmlInit());
-    // nvml
-    nvmlDevice_t nvml_device;
-    NVML_CHECK(nvmlDeviceGetHandleByIndex(mDeviceIdx, &nvml_device));
-
-    nvmlGpuFabricInfoV_t fabric_info;
-    fabric_info.version = nvmlGpuFabricInfo_v2;
-    nvmlReturn_t ret = nvmlDeviceGetGpuFabricInfoV(nvml_device, &fabric_info);
-    NVML_CHECK(nvmlShutdown());
-    if (ret != NVML_SUCCESS || fabric_info.state != NVML_GPU_FABRIC_STATE_COMPLETED)
-    {
-        return false;
-    }
     return true;
 #else
     return false;
@@ -185,7 +170,8 @@ CacheTransBufferManager::CacheTransBufferManager(
     mOnlyUseDynamicBuffer = mTransferBufferSize == 0;
     mRecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
     mSendBufferCount = common::getEnvParallelCacheSend() ? common::getEnvKVCacheSendMaxConcurrenceNum() : 1;
-    mUseFabricMemory = FabricMemory::supportFbaricMemory();
+    mUseFabricMemory = !(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer())
+        && FabricMemory::supportFbaricMemory();
     if (mUseFabricMemory)
     {
         mTransferBufferSize = FabricMemory::getAlignedSize(mTransferBufferSize);
@@ -220,7 +206,9 @@ size_t CacheTransBufferManager::preAllocBufferSize(
     {
         TransferBufferSize = maxNumTokens.value() * kvCacheSizePerToken.value();
     }
-    if (FabricMemory::supportFbaricMemory())
+    bool useFabricMemory = FabricMemory::supportFbaricMemory()
+        && (!(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer()));
+    if (useFabricMemory)
     {
         TransferBufferSize = FabricMemory::getAlignedSize(TransferBufferSize);
     }
