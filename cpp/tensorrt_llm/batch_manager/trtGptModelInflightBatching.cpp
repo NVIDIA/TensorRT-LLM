@@ -606,8 +606,7 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
 
     auto const numLayers = static_cast<SizeType32>(numKvHeadsPerLayer.size());
 
-    auto const managedLayersPerWindowSize
-        = KVCacheManager::calculateManagedLayersPerWindowSize(maxAttentionWindowVec, numLayers);
+    auto const managedLayersPerWindowSize = KVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, numLayers);
 
     auto const blocksPerWindow
         = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, isCrossAttention, kvDtype, mModelConfig, mWorldConfig,

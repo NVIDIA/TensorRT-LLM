@@ -1289,7 +1289,7 @@ public:
         return sumLocalHeads * kvFactor * modelConfig.getSizePerHead();
     }
 
-    [[nodiscard]] static std::map<SizeType32, std::vector<SizeType32>> calculateManagedLayersPerWindowSize(
+    [[nodiscard]] static std::map<SizeType32, std::vector<SizeType32>> groupLayersByWindowSize(
         std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 numLayers);
 
     [[nodiscard]] static BlocksPerWindow calculateMaxNumBlocks(KvCacheConfig const& config, bool isCrossAttention,

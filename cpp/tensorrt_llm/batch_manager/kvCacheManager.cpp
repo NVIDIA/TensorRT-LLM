@@ -409,7 +409,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     , mCacheType{cacheType}
 {
     auto const uniqueWindowSizeToLayers
-        = BaseKVCacheManager::calculateManagedLayersPerWindowSize(maxAttentionWindowVec, mNumLayers);
+        = BaseKVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, mNumLayers);
     auto const numUniqueWindowSizes = static_cast<SizeType32>(uniqueWindowSizeToLayers.size());
 
     mIsVariableWindow = numUniqueWindowSizes > 1;
@@ -2003,7 +2003,7 @@ void KVCacheManager::getBlockOffsetsOfBatch(
     }
 }
 
-std::map<SizeType32, std::vector<SizeType32>> BaseKVCacheManager::calculateManagedLayersPerWindowSize(
+std::map<SizeType32, std::vector<SizeType32>> BaseKVCacheManager::groupLayersByWindowSize(
     std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 numLayers)
 {
     auto const numNonUniqueWindowSizes = static_cast<SizeType32>(maxAttentionWindowVec.size());
@@ -2055,9 +2055,9 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
 
     auto const tokensPerBlock = modelConfig.getTokensPerBlock();
     auto const calculatePrimaryBlocks
-        = [&](SizeType32 windowSize, float windowSizeFraction, SizeType32 cacheSizeBytesPerToken)
+        = [&](SizeType32 windowSize, float windowSizeShare, SizeType32 cacheSizeBytesPerToken)
     {
-        const float fraction = freeMemFraction * kvCacheManagerFraction * windowSizeFraction;
+        const float fraction = freeMemFraction * kvCacheManagerFraction * windowSizeShare;
         auto maxTokens = static_cast<SizeType32>(finalFreeMem * fraction / static_cast<double>(cacheSizeBytesPerToken));
         if (config.maxTokens.has_value())
         {
@@ -2072,9 +2072,9 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
     };
 
     auto const calculateSecondaryBlocks
-        = [&](SizeType32 windowSize, float windowSizeFraction, SizeType32 cacheSizeBytesPerToken)
+        = [&](SizeType32 windowSize, float windowSizeShare, SizeType32 cacheSizeBytesPerToken)
     {
-        auto const fraction = kvCacheManagerFraction * windowSizeFraction;
+        auto const fraction = kvCacheManagerFraction * windowSizeShare;
         auto const finalFreeMem = config.hostCacheSize.value_or(0);
         auto const maxTokensSecondary = static_cast<SizeType32>(finalFreeMem * fraction / cacheSizeBytesPerToken);
         auto const blocksInSecondaryPool = std::max(0, maxTokensSecondary / tokensPerBlock);
