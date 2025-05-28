@@ -61,7 +61,8 @@ from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      disable_fp4_allgather)
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, register_auto_model)
+                             EagerFusionConfig, filter_weights,
+                             register_auto_model)
 
 
 @triton.jit
@@ -1115,14 +1116,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             return logits
 
     def load_weights(self, weights: Dict):
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
 
         def rename_moe_weight(weights: Dict, rename_rules: Dict):
             result = {}
