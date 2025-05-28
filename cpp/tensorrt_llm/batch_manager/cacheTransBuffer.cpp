@@ -137,18 +137,19 @@ bool FabricMemory::supportFbaricMemory()
     TLLM_LOG_DEBUG("FabricMemory::supportFbaricMemory fabric_handle_supported:%d", fabric_handle_supported);
     TLLM_LOG_DEBUG("FabricMemory::supportFbaricMemory gpu_direct_rdma_with_cuda_vmm_supported:%d",
         gpu_direct_rdma_with_cuda_vmm_supported);
-
-    if (ret0 != CUresult::CUDA_SUCCESS || ret1 != CUresult::CUDA_SUCCESS || fabric_handle_supported == 0
-        || gpu_direct_rdma_with_cuda_vmm_supported == 0)
+    if (ret0 g = CUresult::CUDA_SUCCESS || ret1 != CUresult::CUDA_SUCCESS || fabric_handle_supported == 0
+            || gpu_direct_rdma_with_cuda_vmm_supported == 0)
     {
         return false;
     }
+
     NVML_CHECK(nvmlInit());
     // nvml
     nvmlDevice_t nvml_device;
     NVML_CHECK(nvmlDeviceGetHandleByIndex(mDeviceIdx, &nvml_device));
 
     nvmlGpuFabricInfoV_t fabric_info;
+    fabric_info.version = nvmlGpuFabricInfo_v2;
     nvmlReturn_t ret = nvmlDeviceGetGpuFabricInfoV(nvml_device, &fabric_info);
     NVML_CHECK(nvmlShutdown());
     if (ret != NVML_SUCCESS || fabric_info.state != NVML_GPU_FABRIC_STATE_COMPLETED)
