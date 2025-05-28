@@ -909,9 +909,6 @@ class MultimodalModelRunner:
         elif self.model_type == 'pixtral':
             # Hold on to pixel_values and input_ids.
             dtype = str_dtype_to_torch(self.vision_precision)
-            pixel_values = image["pixel_values"].to(device="cuda", dtype=dtype)
-            input_ids = image["input_ids"].to(device="cuda")
-
             # Shape of pixel values from the processor varies with the raw image.
             # So we create a new tensor with a fixed shape as expected by the vision
             # encoder and create a corresponding attention mask.
@@ -919,19 +916,30 @@ class MultimodalModelRunner:
             patch_size = self.patch_size
             d_min = torch.finfo(dtype).min
             num_patches = (image_size // patch_size)
-            image = torch.full((1, 3, image_size, image_size),
-                               fill_value=0,
-                               dtype=dtype,
-                               device="cuda")
-            attention_mask = torch.full((1, num_patches, num_patches),
-                                        fill_value=d_min,
-                                        dtype=dtype,
-                                        device="cuda")
-            h, w = pixel_values.shape[-2:]
-            image[..., :h, :w] = pixel_values
-            attention_mask[..., :h // patch_size, :w // patch_size] = 0
+            padded_image = torch.full(
+                (self.args.batch_size, 3, image_size, image_size),
+                fill_value=0,
+                dtype=dtype,
+                device="cuda")
+            padded_attention_mask = torch.full(
+                (self.args.batch_size, num_patches, num_patches),
+                fill_value=d_min,
+                dtype=dtype,
+                device="cuda")
+            h, w, input_ids = [], [], []
+            for img_idx in range(self.args.batch_size):
+                pixel_values = image["pixel_values"][img_idx]
+                img_h, img_w = pixel_values.shape[-2:]
+                padded_image[img_idx, :, :img_h, :img_w] = pixel_values
+                padded_attention_mask[img_idx, :img_h // patch_size, :img_w //
+                                      patch_size] = 0
+                input_ids.append(image["input_ids"][img_idx])
+                h.append(img_h)
+                w.append(img_w)
+
+            image = padded_image
             other_vision_inputs = {
-                "attention_mask": attention_mask,
+                "attention_mask": padded_attention_mask,
             }
         elif self.model_type == 'llava_next':
             input = image
@@ -1150,12 +1158,29 @@ class MultimodalModelRunner:
         elif self.model_type == 'pixtral':
             relevant_patch_size = self.patch_size * self.spatial_merge_size
             output_img_size = self.image_size // relevant_patch_size
-            visual_features = visual_features.reshape(
-                output_img_size, output_img_size,
-                -1)[:h // relevant_patch_size, :w //
-                    relevant_patch_size].flatten(0, 1)
+            # Note: max_h * max_w shall serve as the `tokens_per_task` in ptuning prompt table.
+            max_h = max(h) // relevant_patch_size
+            max_w = max(w) // relevant_patch_size
+            visual_embed_dim = visual_features.shape[-1]
+            relevant_visual_features = torch.zeros(self.args.batch_size,
+                                                   max_h * max_w,
+                                                   visual_embed_dim)
+            for img_idx in range(self.args.batch_size):
+                complete_features = visual_features[img_idx]
+                complete_features = complete_features.reshape(
+                    output_img_size, output_img_size, visual_embed_dim)
+                relevant_h = h[img_idx] // relevant_patch_size
+                relevant_w = w[img_idx] // relevant_patch_size
+                flattened_features = complete_features[:relevant_h, :
+                                                       relevant_w, :].flatten(
+                                                           0, 1)
+                relevant_visual_features[img_idx, :relevant_h *
+                                         relevant_w, :] = flattened_features
+            visual_features = relevant_visual_features
             input_ids = self.ptuning_setup_pixtral(input_ids=input_ids)
-            length = input_ids.shape[1]
+            # Note: length is not used for pixtral model downstream. Setting it to a list
+            # of length of input_ids causes errors downstream. So, supplying a placeholder.
+            length = input_ids[0].shape[0]
 
         elif self.model_type == 'llava_next':
             visual_features = LlavaNextUtils.rearrange_image_features(
@@ -2027,16 +2052,19 @@ class MultimodalModelRunner:
 
     def ptuning_setup_pixtral(self, input_ids):
         # input_ids obtained from processor has token_ids for text as well as image tokens
-        # where each image token is represented the same image_token_index (10 for this model).
+        # where each image token is represented by the same image_token_index.
         image_token_index = self.image_token_index
         vocab_size = self.vocab_size
         # Replace all image tokens with a unique token_id > text_vacab_size.
         # This shall be used to lookup the prompt table.
-        replacer = vocab_size
-        for i in range(len(input_ids[0])):
-            if input_ids[0][i] == image_token_index:
-                input_ids[0][i] = replacer
-                replacer += 1
+        for img_idx in range(self.args.batch_size):
+            # Note: We reset replacer to text_vocab_size for each sample. This is as opposed to doing `replacer = vocab_size + img_idx * tokens_per_task`.
+            # That part of the look-up manipulation is done by the `task_ids` input to PromptEmbedding forward.
+            replacer = vocab_size
+            for token_idx in range(len(input_ids[img_idx])):
+                if input_ids[img_idx][token_idx] == image_token_index:
+                    input_ids[img_idx][token_idx] = replacer
+                    replacer += 1
         return input_ids
 
     def ptuning_setup_llava_next(self, visual_features, pre_prompt,
@@ -2166,7 +2194,24 @@ class MultimodalModelRunner:
                 if isinstance(image_path, str):
                     image_path = image_path.split(self.args.path_sep)
                 images = load_images(image_path)
-
+        elif "pixtral" in self.model_type:
+            if image_path is None:
+                image_urls = [
+                    "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png",
+                    "https://www.ilankelman.org/stopsigns/australia.jpg",
+                    "https://huggingface.co/microsoft/kosmos-2-patch14-224/resolve/main/snowman.png",
+                    "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+                ]
+                while len(image_urls) < self.args.batch_size:
+                    image_urls *= 2
+                image_urls = image_urls[:self.args.batch_size]
+                self.args.image_path = ",".join(image_urls)
+                images = load_images(image_urls)
+            else:
+                if isinstance(image_path, str):
+                    image_path = image_path.split(self.args.path_sep)
+                images = load_images(image_path)
+            images = [images] if not isinstance(images, list) else images
         elif "nougat" in self.model_type:
             filepath = hf_hub_download(
                 repo_id="hf-internal-testing/fixtures_docvqa",
@@ -2413,9 +2458,15 @@ class MultimodalModelRunner:
             post_prompt = "[/INST]"
             prompt = pre_prompt + input_text + post_prompt
             dtype = str_dtype_to_torch(self.vision_precision)
-            image = self.processor(text=prompt,
-                                   images=[raw_image],
-                                   return_tensors="pt").to(dtype)
+            image = {'pixel_values': [], 'input_ids': []}
+            for img_idx in range(self.args.batch_size):
+                image_info = self.processor(text=prompt,
+                                            images=[raw_image[img_idx]],
+                                            return_tensors="pt").to(dtype)
+                image['pixel_values'].append(image_info['pixel_values'].to(
+                    self.device))
+                image['input_ids'].append(image_info['input_ids'][0].to(
+                    self.device))
 
         elif 'internvl' in self.model_type:
             pre_prompt = "<|system|>\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。<|end|><|user|>\n<image>\n"
@@ -2619,7 +2670,9 @@ class MultimodalModelRunner:
                         image = image.expand(
                             min(self.args.batch_size, len(input_text)), -1, -1,
                             -1).contiguous()
-        if image is not None:
+        # Note: For pixtral model, image is a dict with each value being a list of tensors.
+        # Moving to device is handled above. So, it's safe to skip this for pixtral.
+        if image is not None and 'pixtral' not in self.model_type:
             image = image.to(self.device)
         # Generate decoder_input_ids for enc-dec models
         # Custom prompts can be added as:
