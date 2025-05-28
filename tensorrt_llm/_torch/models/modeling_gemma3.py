@@ -53,11 +53,11 @@ class Gemma3Attention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
             pos_embd_params=pos_embd_params,
+            qk_norm_type=QkNormType.pre_rope,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=False,
             config=model_config,
-            qk_norm_type=QkNormType.pre_rope,
             q_scaling=q_scaling,
         )
         self.q_norm = RMSNorm(hidden_size=config.head_dim,
