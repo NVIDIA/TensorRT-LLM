@@ -692,8 +692,6 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                self.active_requests.extend(new_requests)
-
                 if self.is_shutdown and len(self.active_requests) == 0:
                     break
 
@@ -849,7 +847,6 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                self.active_requests.extend(new_requests)
                 if self.is_shutdown and len(self.active_requests) == 0:
                     break
 
@@ -1223,7 +1220,9 @@ class PyExecutor:
 
         if not self.enable_attention_dp:
             self._update_new_active_requests_queue_latency(new_requests)
-            return self._merge_requests(new_requests)
+            new_requests = self._merge_requests(new_requests)
+            self.active_requests.extend(new_requests)
+            return new_requests
 
         num_new_requests_all_ranks = len(new_requests)
         self.expected_num_active_requests = max(
@@ -1289,7 +1288,9 @@ class PyExecutor:
         self.num_fetch_requests_cur_rank = self.num_fetch_requests_cur_rank + len(
             new_requests_cur_rank)
 
-        return self._merge_requests(new_requests_cur_rank)
+        new_requests_cur_rank = self._merge_requests(new_requests_cur_rank)
+        self.active_requests.extend(new_requests_cur_rank)
+        return new_requests_cur_rank
 
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
