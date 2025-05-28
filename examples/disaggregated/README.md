@@ -9,7 +9,7 @@ You can use multiple `trtllm-serve` commands to launch the context and generatio
 for disaggregated serving. For example, you could launch two context servers and one generation servers as follows:
 
 ```
-echo -e "pytorch_backend_config:\n  disable_overlap_scheduler: True\ncache_transceiver_config:\n  max_num_tokens: 2048" > context_extra-llm-api-config.yml
+echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\nmax_num_tokens: 2048" > context_extra-llm-api-config.yml
 echo -e "cache_transceiver_config:\n  max_num_tokens: 2048" > gen_extra-llm-api-config.yml
 
 export TRTLLM_USE_UCX_KVCACHE=1
@@ -63,9 +63,8 @@ hostname: localhost
 port: 8000
 model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 backend: "pytorch"
-pytorch_backend_config:
-  use_cuda_graph: False
-  disable_overlap_scheduler: True
+use_cuda_graph: False
+disable_overlap_scheduler: True
 context_servers:
   num_instances: 1
   tensor_parallel_size: 1

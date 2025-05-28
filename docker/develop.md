@@ -29,7 +29,7 @@ where `x.xx.x` is the version of the TensorRT-LLM container to use. This command
 NVIDIA NGC registry, sets up the local user's account within the container, and launches it with full GPU support. The
 local source code of TensorRT-LLM will be mounted inside the container at the path `/code/tensorrt_llm` for seamless
 integration. Ensure that the image version matches the version of TensorRT-LLM in your current local git branch. Not
-specifying an `IMAGE_TAG` will attempt to resolve this automatically, but the not every intermediate release might be
+specifying an `IMAGE_TAG` will attempt to resolve this automatically, but not every intermediate release might be
 accompanied by development container. In that case, use the latest version preceding the version of your development
 branch.
 

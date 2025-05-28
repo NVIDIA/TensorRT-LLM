@@ -119,8 +119,6 @@ public:
 
     void getBuffers(TensorMap& inputBuffers, TensorMap& outputBuffers, runtime::ModelConfig const& modelConfig) const;
 
-    void reshapePositionIds(std::vector<SizeType32> const& positionIdsHost, bool isChatGlm);
-
     void copyPositionIds(runtime::TllmRuntime const& runtime, std::vector<SizeType32> const& positionIdsHost,
         bool isChatGlm, TensorPtr const& decoderPositionIds);
 
