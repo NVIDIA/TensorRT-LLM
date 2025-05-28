@@ -99,9 +99,6 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
             zero_ref = zero.repeat_interleave(group_size, dim=0)[:k, :]
             ref_th_weight += zero_ref
 
-        if use_w4a8_awq:
-            activation *= fp8_alpha
-
         if has_pre_quant:
             pre_quant_scale = pre_quant_scale.repeat(m, 1)
             activation = torch.mul(activation, pre_quant_scale)
@@ -110,18 +107,22 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         bias = bias.contiguous() if has_bias else None
         cuda_q_weight = cuda_q_weight.cuda().contiguous()
 
+        output = torch.ops.trtllm.w4a16_gemm(
+            activation.to(torch.float8_e4m3fn).contiguous(),
+            cuda_q_weight,
+            scale,
+            group_size,
+            has_zero,
+            fp8_alpha.item() if use_w4a8_awq else None,
+            bias,
+            zeros=zero)
+
+        if use_w4a8_awq:
+            activation *= fp8_alpha
+
         ref = _utils.woq_groupwise_gt_matmul(activation,
                                              ref_th_weight.to(activation_dtype),
                                              bias)
-
-        output = torch.ops.trtllm.w4a16_gemm(activation.to(
-            torch.float8_e4m3fn).contiguous(),
-                                             cuda_q_weight,
-                                             scale,
-                                             group_size,
-                                             has_zero,
-                                             bias,
-                                             zeros=zero)
 
         _utils.woq_assert_near_eq(ref, output, 2)
 

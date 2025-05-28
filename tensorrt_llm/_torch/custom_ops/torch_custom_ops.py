@@ -383,6 +383,7 @@ class W4A16GemmRunner(TunableRunner):
                 **kwargs) -> torch.Tensor:
         activation, weights_packed, scales = inputs
 
+        alpha = 1.0 if kwargs.get("alpha") is None else kwargs["alpha"]
         return self._w4a16_gemm_runner.run_gemm(
             activation,
             weights_packed,
@@ -392,7 +393,7 @@ class W4A16GemmRunner(TunableRunner):
             kwargs["bias"],
             kwargs[
                 "zeros"],  # NOTE if qunant_mode is 0 (FINEGRAINED_SCALE_ONLY), zeros is not used --> needs to be None
-        )
+            alpha)
 
 
 @torch.library.custom_op("trtllm::w4a16_gemm", mutates_args=())
@@ -401,6 +402,7 @@ def w4a16_gemm(input: torch.Tensor,
                scales: torch.Tensor,
                group_size: int,
                has_zero_point: bool,
+               alpha: Optional[float] = None,
                bias: Optional[torch.Tensor] = None,
                zeros: Optional[torch.Tensor] = None) -> torch.Tensor:
 
@@ -416,7 +418,12 @@ def w4a16_gemm(input: torch.Tensor,
     quant_mode = 1 if has_zero_point else 0
     w4a16_gemm_runner = W4A16GemmRunner(input.dtype, quant_mode)
 
-    kwargs = {"group_size": group_size, "zeros": zeros, "bias": bias}
+    kwargs = {
+        "group_size": group_size,
+        "zeros": zeros,
+        "bias": bias,
+        "alpha": alpha
+    }
     _, best_tactic = tuner.choose_one("trtllm::w4a16_gemm::gemm",
                                       [w4a16_gemm_runner], tuning_config,
                                       [input, weight, scales], **kwargs)

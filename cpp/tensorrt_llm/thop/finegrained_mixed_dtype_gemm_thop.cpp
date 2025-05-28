@@ -101,7 +101,8 @@ W4A16GemmRunner::W4A16GemmRunner(at::ScalarType activationDtype, int64_t quant_m
 }
 
 at::Tensor W4A16GemmRunner::runGemm(at::Tensor const& A, at::Tensor const& B_packed, at::Tensor const& scales,
-    int64_t group_size_long, int64_t configIdx, std::optional<at::Tensor> bias, std::optional<at::Tensor> zeros) const
+    int64_t group_size_long, int64_t configIdx, std::optional<at::Tensor> bias, std::optional<at::Tensor> zeros,
+    double alpha) const
 {
     TORCH_CHECK(A.is_cuda() && B_packed.is_cuda() && scales.is_cuda(), "All input tensors must be on CUDA");
     TORCH_CHECK(A.scalar_type() == mActivationDtype, "Activation tensor A's dtype ", c10::toString(A.scalar_type()),
@@ -221,9 +222,8 @@ at::Tensor W4A16GemmRunner::runGemm(at::Tensor const& A, at::Tensor const& B_pac
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index());
 
-    mGemmRunner->gemm(A_ptr, B_ptr, scales_ptr, zeros_ptr, bias_ptr,
-        1.0f, // alpha
-        C_ptr, M, N_orig, K, group_size, gemm_config_to_use, workspace_ptr, workspace_bytes, stream);
+    mGemmRunner->gemm(A_ptr, B_ptr, scales_ptr, zeros_ptr, bias_ptr, static_cast<float>(alpha), C_ptr, M, N_orig, K,
+        group_size, gemm_config_to_use, workspace_ptr, workspace_bytes, stream);
 
     return C_tensor;
 }

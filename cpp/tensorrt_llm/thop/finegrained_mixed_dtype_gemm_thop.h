@@ -31,7 +31,7 @@ public:
 
     at::Tensor runGemm(at::Tensor const& A, at::Tensor const& B_packed, at::Tensor const& scales,
         int64_t group_size_long, int64_t configIdx = -1, std::optional<at::Tensor> bias = std::nullopt,
-        std::optional<at::Tensor> zeros = std::nullopt) const;
+        std::optional<at::Tensor> zeros = std::nullopt, double alpha = 1.0f) const;
 
     int64_t getNumConfigs() const;
 
