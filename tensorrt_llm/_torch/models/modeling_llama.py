@@ -858,11 +858,13 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
-        self.draft_model = None
-        if hasattr(
-                model_config, "spec_config"
+
+        self.is_eagle3_one_model = hasattr(
+            model_config, "spec_config"
         ) and model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
-        ):
+        )
+        self.draft_model = None
+        if self.is_eagle3_one_model:
             draft_config = ModelConfig.from_pretrained(
                 model_config.spec_config.draft_model_path,
                 trust_remote_code=True,
@@ -887,6 +889,7 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.model(
@@ -895,6 +898,7 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             spec_metadata=spec_metadata,
+            lora_params=lora_params,
         )
 
         if self.draft_model is not None:
