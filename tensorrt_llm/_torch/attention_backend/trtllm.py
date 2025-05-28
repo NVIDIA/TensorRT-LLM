@@ -922,6 +922,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
         assert metadata.max_ctx_kv_len > 0
+        assert metadata.num_ctx_cached_tokens + metadata.num_ctx_tokens == metadata.host_ctx_kv_indptr[
+            metadata.num_contexts]
 
         sink_token_length = 0
         beam_width = 1
@@ -929,6 +931,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         compressed_kv, k_pe = torch.ops.trtllm.load_paged_kv_cache_for_mla(
             out_dtype,
             metadata.num_contexts,
+            metadata.num_ctx_cached_tokens + metadata.num_ctx_tokens,
             metadata.max_ctx_kv_len,
             metadata.ctx_kv_indptr,
             metadata.kv_cache_block_offsets,

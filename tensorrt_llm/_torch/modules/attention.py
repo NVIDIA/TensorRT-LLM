@@ -906,7 +906,7 @@ class MLA(nn.Module):
         # build full_k and full_v
         tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
         # paged kv cache should be initialized to 0 to avoid NaN
-        paged_full_kv = torch.zeros([
+        paged_full_kv = torch.empty([
             attn_metadata.num_contexts, 2,
             (attn_metadata.max_ctx_kv_len + tokens_per_block - 1) //
             tokens_per_block, self.num_heads, tokens_per_block,
@@ -921,6 +921,13 @@ class MLA(nn.Module):
             full_k_pe,
             attn_metadata,
         )
+
+        # release pytorch activation memory
+        full_compressed_kv = None
+        full_k_pe = None
+        full_kv = None
+        full_k_nope = None
+        full_v = None
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Currently we use BF16 MHA for context phase
