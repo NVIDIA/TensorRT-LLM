@@ -4,7 +4,7 @@ import copy
 import json
 import os
 import subprocess
-from typing import List, Optional, Tuple
+from typing import Generator, List, Optional, Tuple
 
 import aiohttp
 import pytest
@@ -40,7 +40,7 @@ def run_disaggregated_workers(
     env: Optional[dict] = None,
     cwd: Optional[str] = None,
     num_ranks: Optional[int] = None
-) -> Tuple[subprocess.Popen, List[str], List[str]]:
+) -> Tuple[Generator[subprocess.Popen, None, None], List[str], List[str]]:
 
     ctx_servers, gen_servers = get_ctx_gen_server_urls_from_cfg(config_file)
 
@@ -509,10 +509,14 @@ def background_workers(llm_venv, config_file: str, num_ranks: int = None):
             env=llm_venv._new_env,
             cwd=cwd,
             num_ranks=num_ranks)
-        with workers_proc as proc:
-            yield ctx_servers, gen_servers
-            proc.terminate()
-            proc.wait()
+        try:
+            with workers_proc as proc:
+                yield ctx_servers, gen_servers
+        except Exception:
+            log_file.seek(0)
+            logger.error("-------- Worker output --------")
+            logger.error(log_file.read())
+            raise
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
