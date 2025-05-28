@@ -46,7 +46,7 @@ public:
         mGranularity = granularity;
         mAllocSize = (size + granularity - 1) / granularity * granularity;
         TLLM_CU_CHECK(cuMemCreate(&mHandle, mAllocSize, &prop, 0));
-        TLLM_CU_CHECK(cuMemAddressReserve(&mDevicePtr, mAllocSize, 0, 0, 0));
+        TLLM_CU_CHECK(cuMemAddressReserve(&mDevicePtr, mAllocSize, mGranularity, 0, 0));
         mPtr = (void*) mDevicePtr;
         CUmemAccessDesc accessDesc = {};
         accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
