@@ -60,6 +60,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
     factory = ModelFactoryRegistry.get(config.model_factory)(
         model=config.model,
         model_kwargs=config.model_kwargs,
+        tokenizer=config.tokenizer,
         tokenizer_kwargs=config.tokenizer_kwargs,
         skip_loading_weights=config.skip_loading_weights,
     )
