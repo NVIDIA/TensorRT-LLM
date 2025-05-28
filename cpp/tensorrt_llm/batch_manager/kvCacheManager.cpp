@@ -2116,7 +2116,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         auto const [windowSize, managedLayers] = (*managedLayersPerWindowSize.cbegin());
         auto const cacheSizePerToken = BaseKVCacheManager::calculateCacheSizePerToken(
             modelConfig, worldConfig, managedLayers, isCrossAttention, kvFactor);
-        auto const cacheSizeBytesPerToken = cacheSizePerToken * BufferDataType(dtype).getSize();
+        auto const cacheSizeBytesPerToken = cacheSizeBytesPerTokenPerWindow.at(windowSize);
         auto const blocksInPrimaryPool = calculatePrimaryBlocks(windowSize, 1.0F, cacheSizeBytesPerToken);
         auto const blocksInSecondaryPool = calculateSecondaryBlocks(windowSize, 1.0F, cacheSizeBytesPerToken);
         return BlocksPerWindow{{windowSize, std::make_tuple(blocksInPrimaryPool, blocksInSecondaryPool)}};
