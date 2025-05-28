@@ -749,6 +749,31 @@ class VanillaMoE(nn.ModuleList):
                 outputs = self.all_reduce(inputs)
         return outputs
 
+    def run_experts(
+        self,
+        input: torch.Tensor,
+        expanded_inputs: torch.Tensor,
+        expanded_scales: torch.Tensor,
+        sorted_experts: torch.Tensor,
+        batch_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        final_hidden_states = torch.zeros(
+            input.shape,
+            dtype=input.dtype,
+            device=input.device,
+        )
+        for expert_idx in range(self.expert_start, self.expert_end):
+            expert_mask = sorted_experts == expert_idx
+            if not torch.any(expert_mask):
+                continue
+            expanded_input = expanded_inputs[expert_mask]
+            batch_idx = batch_indices[expert_mask]
+            expanded_scale = expanded_scales[expert_mask]
+
+            output = self[expert_idx](expanded_input)
+            final_hidden_states[batch_idx] += output * expanded_scale
+        return final_hidden_states
+
     def forward(
         self,
         x: torch.Tensor,
@@ -770,20 +795,25 @@ class VanillaMoE(nn.ModuleList):
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
 
-        final_hidden_states = torch.zeros(x.shape,
-                                          dtype=x.dtype,
-                                          device=x.device)
+        expert_masks = ((token_selected_experts >= self.expert_start)
+                        & (token_selected_experts < self.expert_end))
+        local_selected_experts = token_selected_experts[expert_masks]
+        sort_indices = torch.argsort(local_selected_experts)
+        sorted_experts = local_selected_experts[sort_indices]
 
-        for expert_idx in range(self.expert_start, self.expert_end):
-            if not torch.any(token_selected_experts == expert_idx):
-                continue
-            batch_idx, nth_expert = torch.where(
-                token_selected_experts == expert_idx)
-            expert_inputs = x[batch_idx]
+        batch_indices, nth_experts = torch.where(expert_masks)
+        batch_indices = batch_indices[sort_indices]
+        nth_experts = nth_experts[sort_indices]
+        expanded_inputs = x[batch_indices]
+        expanded_scales = token_final_scales[batch_indices, nth_experts, None]
 
-            output = self[expert_idx](expert_inputs)
-            final_hidden_states[batch_idx] += output * token_final_scales[
-                batch_idx, nth_expert, None]
+        final_hidden_states = self.run_experts(
+            x,
+            expanded_inputs,
+            expanded_scales,
+            sorted_experts,
+            batch_indices,
+        )
 
         final_hidden_states = self.reducescatter_or_allreduce(
             final_hidden_states,
