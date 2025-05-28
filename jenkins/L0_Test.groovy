@@ -71,6 +71,8 @@ def BUILD_CONFIGS = [
 ]
 
 BUILD_JOBS = "8"
+TESTER_CORES = "12"
+
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
