@@ -6,43 +6,10 @@ from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
                                  MTPDecodingConfig, NGramDecodingConfig)
 
 example_prompts = [
-    """Question: At a birthday party, 30% of the guests are married, 50% are single, and the rest are children. If there are 1000 guests, how many more married people are there than children?
-    Answer: There are 1000 x 30/100 = <<1000*30/100=300>>300 people who are married.
-    There are 1000 x 50/100 = <<1000*50/100=500>>500 people who are single.
-    So, there are a total of 300 + 500 = <<300+500=800>>800 that are either married or single.
-    This means, 1000 - 800 = <<1000-800=200>>200 are children.
-    Therefore, there are 300 - 200 = <<300-200=100>>100 more married people than children.
-    #### 100
-
-    Question: Dulce's father has eight orange trees on his farm. If each tree has 200 fruits and Dulce picks 2/5 of the oranges from each tree, calculate the total number of fruits remaining in all the trees.
-    Answer: The total number of oranges in all the trees before Dulce picked any is 8 trees * 200 oranges/tree = <<8*200=1600>>1600 oranges.
-    If each orange tree has 200 oranges, and Dulce picks 2/5 of each tree's oranges, she picks 2/5 * 200 oranges = <<2/5*200=80>>80 oranges.
-    Since the total number of orange trees is eight, Dulce picked 8 trees * 80 oranges/tree = <<8*80=640>>640 oranges from all the trees.
-    After picking 640 oranges from the trees, the total number of oranges remaining became 1600 oranges - 640 oranges = 960 oranges.
-    #### 960
-
-    Question: Jorge has an equal number of baseball cards as Matias, who has 6 fewer cards than Carlos. If Carlos has 20 baseball cards, what is the total number of baseball cards the three have?
-    Answer: If Carlos has 20 cards, Matias has 20-6 = <<20-6=14>>14 baseball cards.
-    Since Matias and Jorge have the same amount of baseball cards, the total number of cards the three have is 14+14+20 =<<14+14+20=48>>48 cards.
-    #### 48
-
-    Question: At the end of the first quarter, the winning team had double the points of the losing team. At the end of the second quarter, the winning team had 10 more points than it started with. At the end of the third quarter, the winning team had 20 more points than the number it had in the second quarter. If the total points the winning team scored in the game was 80, and the losing team had 10 points in the first quarter, calculate the total number of points the team scored in the fourth quarter.
-    Answer: At the end of the first quarter, the winning team had double the points of the losing team, meaning the winning team had already scored 10*2=<<10*2=20>>20 points.
-    At the end of the second quarter, the winning team had 10 more points than it started with, a total of 20+10=30 points.
-    At the end of the third quarter, the winning team had 20 more points than the number it had in the second quarter, a total of 20+30=<<20+30=50>>50 points.
-    If the total points the winning team scored in the game was 80, they scored 80-50=<<80-50=30>>30 points in the fourth quarter.
-    #### 30
-
-    Question: The number of short students in a class is 2/5 of the total number of students. If there are 90 tall students, and the class has 400 students, calculate the total number of students with average height.
-    Answer: The number of short students in the class is 2/5*400 = <<2/5*400=160>>160
-    The total number of short and tall students is 160+90 = <<160+90=250>>250
-    Since there are 400 students in the class, the number of students with average height is 400-250 = <<400-250=150>>150
-    #### 150
-
-    """ * 16 +
-    """Question: Sophia and Rose went together to the market to buy onions and potatoes. Rose bought 4 times the number of onions and potatoes Sophia bought. If Rose bought 12 onions and 4 potatoes, how many onions and potatoes in total did Sophia buy at the market?
-    Answer:
-    """
+    "Hello, my name is",
+    "The president of the United States is",
+    "The capital of France is",
+    "The future of AI is",
 ]
 
 
