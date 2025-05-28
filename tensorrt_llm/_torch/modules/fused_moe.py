@@ -1,7 +1,7 @@
 import copy
 import math
 import os
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum, IntEnum
 from typing import Dict, List, NamedTuple, Optional, Union
 
@@ -1629,47 +1629,57 @@ class FusedMoE(nn.Module):
         # Even though CPython has global interpreter lock (GIL),
         # it's still faster to load weights in parallel because it can utilize
         # CPU memory bandwidth better.
-        threads = []
+        max_workers = min(
+            (self.expert_end - self.expert_start) * 2,
+            os.cpu_count() * 2,
+            16,
+        )
 
-        for local_slot_id, expert_id in enumerate(
-                self.initial_local_expert_ids):
-            # expert_idx is the local slot index of current rank
-            expert_idx = local_slot_id
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
 
-            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-                w1_weight = weights[f"{expert_id}.w1.weight"]
-                w3_weight = weights[f"{expert_id}.w3.weight"]
-                w2_weight = weights[f"{expert_id}.w2.weight"]
-            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
-                    0, 1)
-                w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
-                w2_weight = weights["down_proj"][expert_id].transpose(
-                    0, 1).contiguous()
-            else:
-                raise NotImplementedError(
-                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+            for local_slot_id, expert_id in enumerate(
+                    self.initial_local_expert_ids):
+                # expert_idx is the local slot index of current rank
+                expert_idx = local_slot_id
+
+                if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                    w1_weight = weights[f"{expert_id}.w1.weight"]
+                    w3_weight = weights[f"{expert_id}.w3.weight"]
+                    w2_weight = weights[f"{expert_id}.w2.weight"]
+                elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                    w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
+                        0, 1)
+                    w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
+                    w2_weight = weights["down_proj"][expert_id].transpose(
+                        0, 1).contiguous()
+                else:
+                    raise NotImplementedError(
+                        f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                    )
+
+                is_trtllm_nvfp4 = self.is_trtllm(
+                ) and self.quant_config.quant_mode.has_nvfp4()
+
+                future_w3_w1 = executor.submit(
+                    load_expert_w3_w1_weight,
+                    w1_weight,
+                    w3_weight,
+                    self.w3_w1_weight.data[expert_idx],
+                    is_trtllm_nvfp4,
                 )
+                futures.append(future_w3_w1)
 
-            is_trtllm_nvfp4 = self.is_trtllm(
-            ) and self.quant_config.quant_mode.has_nvfp4()
+                future_w2 = executor.submit(
+                    load_expert_w2_weight,
+                    w2_weight,
+                    self.w2_weight.data[expert_idx],
+                    is_trtllm_nvfp4,
+                )
+                futures.append(future_w2)
 
-            thread = threading.Thread(target=load_expert_w3_w1_weight,
-                                      args=(w1_weight, w3_weight,
-                                            self.w3_w1_weight.data[expert_idx],
-                                            is_trtllm_nvfp4))
-            thread.start()
-            threads.append(thread)
-
-            thread = threading.Thread(target=load_expert_w2_weight,
-                                      args=(w2_weight,
-                                            self.w2_weight.data[expert_idx],
-                                            is_trtllm_nvfp4))
-            thread.start()
-            threads.append(thread)
-
-        for thread in threads:
-            thread.join()
+            for future in futures:
+                future.result()
 
         if self.quant_config and self.quant_config.quant_mode.has_any_quant(
                 exclude_kv_cache=True):
