@@ -105,6 +105,9 @@ class AutoDeployConfig(PyTorchConfig):
     # specifies the fraction of available memory to occupy for cache
     free_mem_ratio: float = 0.8
 
+    simple_shard_only: bool = False  # if True, force simple sharding(all_gather) in TP;
+    # otherwise auto-detect and use column+row (all_reduce) sharding
+
     def __post_init__(self):
         super().__post_init__()
 

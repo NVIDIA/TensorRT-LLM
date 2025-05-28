@@ -190,7 +190,9 @@ def _simple_shard(
             _insert_sharded_matmul(gm, n, 0, rank, world_size, add_dist=True)
 
 
-def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
+def column_row_shard(
+    gm: GraphModule, rank: int, world_size: int, simple_shard_only: bool = False
+) -> GraphModule:
     """A transformation to apply sharding to the model following tensor parallelism.
 
     The transformation is based on the following steps:
@@ -278,6 +280,11 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
 
         # nothing to shard
         if len(nodes_linear) == 0:
+            continue
+
+        if simple_shard_only:
+            ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
+            _simple_shard(gm, nodes_linear, rank, world_size)
             continue
 
         # simple shard when we have != 2 groups of linear nodes

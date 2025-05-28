@@ -59,6 +59,8 @@ class SimpleConfig:
     max_seq_len: int = 512  # max sequence length for inference/cache
     max_batch_size: int = 8  # max dimension for statically allocated kv cache
     page_size: int = 64  # page size for attention
+    simple_shard_only: bool = False  # if True, force simple sharding(all_gather) in TP;
+    # otherwise auto-detect and use column+row (all_reduce) sharding
 
     ### SOME SIMPLE PROMPTING CONFIG ###############################################################
     batch_size: int = 2  # example input shape
