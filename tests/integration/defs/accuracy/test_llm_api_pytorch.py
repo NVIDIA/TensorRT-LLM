@@ -21,7 +21,7 @@ from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig, SamplingParams
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (llm_models_root, parametrize_with_ids,
+from ..conftest import (llm_models_root, parametrize_with_ids, skip_no_hopper,
                         skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
@@ -445,8 +445,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                           [0, pytest.param(2, marks=skip_pre_hopper)])
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
                       overlap_scheduler, torch_compile):
-        if torch_compile:
-            pytest.skip("https://nvbugs/5292037")
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
@@ -457,7 +455,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
             torch_compile_enabled=torch_compile,
-            torch_compile_fullgraph=True)
+            torch_compile_fullgraph=True,
+            torch_compile_piecewise_cuda_graph=cuda_graph)
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
@@ -487,8 +486,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_bfloat16_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                             attention_dp, cuda_graph, overlap_scheduler,
                             torch_compile):
-        if torch_compile:
-            pytest.skip("https://nvbugs/5292037")
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
@@ -501,7 +498,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
             torch_compile_enabled=torch_compile,
-            torch_compile_fullgraph=True)
+            torch_compile_fullgraph=True,
+            torch_compile_piecewise_cuda_graph=cuda_graph)
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
@@ -519,7 +517,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_device_not_contain(["H100", "H200"])
+    @skip_no_hopper
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
@@ -531,8 +529,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_fp8_block_scales(self, mtp_nextn, fp8kv, attention_dp, cuda_graph,
                               overlap_scheduler, torch_compile):
-        if torch_compile:
-            pytest.skip("https://nvbugs/5292037")
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
@@ -543,7 +539,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
             torch_compile_enabled=torch_compile,
-            torch_compile_fullgraph=True)
+            torch_compile_fullgraph=True,
+            torch_compile_piecewise_cuda_graph=cuda_graph)
 
         quant_config = QuantConfig()
         quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
@@ -593,7 +590,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_device_not_contain(["H100", "H200"])
+    @skip_no_hopper
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
@@ -610,8 +607,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     fp8kv, attention_dp, cuda_graph,
                                     overlap_scheduler, torch_compile):
-        if torch_compile:
-            pytest.skip("https://nvbugs/5292037")
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
@@ -624,7 +619,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
             torch_compile_enabled=torch_compile,
-            torch_compile_fullgraph=True)
+            torch_compile_fullgraph=True,
+            torch_compile_piecewise_cuda_graph=cuda_graph)
 
         quant_config = QuantConfig()
         quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
@@ -709,7 +705,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
             torch_compile_enabled=torch_compile,
-            torch_compile_fullgraph=True)
+            torch_compile_fullgraph=True,
+            torch_compile_piecewise_cuda_graph=cuda_graph)
 
         quant_config = QuantConfig()
         quant_config.quant_algo = QuantAlgo.NVFP4
@@ -760,7 +757,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
             torch_compile_enabled=torch_compile,
-            torch_compile_fullgraph=True)
+            torch_compile_fullgraph=True,
+            torch_compile_piecewise_cuda_graph=cuda_graph)
 
         quant_config = QuantConfig()
         quant_config.quant_algo = QuantAlgo.NVFP4
