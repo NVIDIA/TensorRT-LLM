@@ -914,6 +914,8 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     }
     if (validLineCount > 5) {
         error "There are more than 5 failed tests, skip the rerun step."
+    } else if (validLineCount == 0) {
+        error "No failed tests need to be rerun, skip the rerun step."
     }
 
     // Rerun tests
