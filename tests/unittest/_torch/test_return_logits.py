@@ -15,7 +15,7 @@ from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.llm_utils import BuildConfig, KvCacheConfig
 
 prompts = ["A B C"]
-global_kvcache_config = KvCacheConfig(max_tokens=256)
+global_kvcache_config = KvCacheConfig(max_tokens=2048)
 
 
 def test_LlmResponse_pickle():
@@ -101,11 +101,7 @@ def test_generate_with_return_logits(enable_trtllm_sampler: bool,
     for output in llm.generate(prompts, sampling_params=sampling_params):
         if gather_context_logits:
             assert output.context_logits is not None
-            # TODO: The intended behaviour is to return all context logits.
-            #       However, the logits received in the sampler do not contain all context logits.
-            #       For now, only the last context token logits are returned.
-            #       When it is fixed, it should be len(prompts[0].split()) + 1.
-            assert 1 == output.context_logits.shape[0]
+            assert len(prompts[0].split()) == output.context_logits.shape[0]
         else:
             assert output.context_logits is None
 
@@ -153,6 +149,7 @@ def test_generate_async_with_return_logits(enable_trtllm_sampler: bool,
                            "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
         build_config=build_config,
+        gather_context_logits=gather_context_logits,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
@@ -170,8 +167,7 @@ def test_generate_async_with_return_logits(enable_trtllm_sampler: bool,
                                streaming=True)):
         if gather_context_logits:
             assert output.context_logits is not None
-            # TODO: The intended behaviour is to return all context logits. See above.
-            assert 1 == output.context_logits.shape[0]
+            assert len(prompts[0].split()) == output.context_logits.shape[0]
         else:
             assert output.context_logits is None
 

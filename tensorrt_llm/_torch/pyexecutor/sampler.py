@@ -595,14 +595,17 @@ class TRTLLMSampler(Sampler):
         batch_size = scheduled_requests.batch_size
         beam_width = self.beam_width(scheduled_requests.all_requests)
 
-        logits = model_outputs["logits"].reshape((batch_size, beam_width, -1))
+        # TODO: Remove this unsqueezing once we get beam width support.
+        logits = model_outputs["logits"].unsqueeze(1)
 
         self.setup_sampler_step(scheduled_requests.context_requests)
 
-        # Note: In runtimeBuffers.cpp, num_context_logits is set to:
-        #       numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
-        # Revisit this when we support chunked context.
         num_context_logits = [1] * batch_size
+        for batch_index, request in enumerate(
+                scheduled_requests.context_requests):
+            num_context_logits[
+                batch_index] = request.context_chunk_size if request.py_return_context_logits else 1
+
         logits_index = self.algs.handle_context_logits(
             scheduled_requests.context_requests, num_context_logits, logits,
             self.store["decoder_buffers"])
