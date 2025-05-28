@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -ex
 
 task_with_command=("$@")
 native_mpi_rank=$OMPI_COMM_WORLD_RANK
@@ -72,6 +72,8 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
 
         # Execute the task with cleaned environment
        "${task_with_command[@]}"
+        # stop the MPI Comm server
+        python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop
     ) &
 
     log_stderr "rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_world_size) ..."
