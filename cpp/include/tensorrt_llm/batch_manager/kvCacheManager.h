@@ -79,6 +79,8 @@ struct TempAttentionWindowInputs
 
 struct WindowSizeMetadata
 {
+    SizeType32 allottedPrimaryBlocks;    // Number of primary blocks allotted to the windowSize
+    SizeType32 allottedSecondaryBlocks;  // Number of secondary blocks allotted to the windowSize
     SizeType32 absolutePoolsOffset;      // cumulative number of pools up to manager
     SizeType32 numPools;                 // number of managed pools
     SizeType32 maxTokenNum;              // Maximum token length (including bubble)
@@ -92,8 +94,9 @@ struct WindowSizeMetadata
     {
         return tensorrt_llm::common::fmtstr(
             "WindowSizeMetadata{ .absolutePoolsOffset=%d, .numPools=%d, .maxTokenNum=%d, .maxBlocksPerSeq=%d, "
-            ".maxNumBlocks=%d, .temporaryAttentionWindow=%d }",
-            absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq, maxNumBlocks, temporaryAttentionWindow);
+            ".maxNumBlocks=%d, .temporaryAttentionWindow=%d, .allottedPrimaryBlocks=%d, .allottedSecondaryBlocks=%d }",
+            absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq, maxNumBlocks, temporaryAttentionWindow,
+            allottedPrimaryBlocks, allottedSecondaryBlocks);
     }
 };
 
@@ -1541,22 +1544,22 @@ public:
     /// @param inputLength The number of input tokens in the sequence.
     /// @param outputLength The number of output tokens in the sequence.
     /// @param sinkTokenLength The number of sink tokens configured.
-    /// @param maxAttentionWindow The maximum attention window allowed by the model.
+    /// @param maxAttentionWindow The attention window size allowed by the model.
     /// @param beamWidth The number of beams to consider for the request.
     /// @param tokensPerBlock The number of tokens a single kv-cache block contains.,
     /// @return SizeType32 A number of blocks.
     [[nodiscard]] static SizeType32 calculateMaxBlockRequirements(SizeType32 inputLength, SizeType32 outputLength,
-        SizeType32 sinkTokenLength, SizeType32 maxAttentionWindow, SizeType32 beamWidth, SizeType32 tokensPerBlock);
+        SizeType32 sinkTokenLength, SizeType32 windowSize, SizeType32 beamWidth, SizeType32 tokensPerBlock);
 
     /// @brief Calculates the number of kv-cache blocks that a sequence will require, for a single beam.
     ///
     /// @param sequenceLength The total length of the sequence (input and output).
     /// @param sinkTokenLength The number of sink tokens configured.
-    /// @param maxAttentionWindow The maximum attention window allowed by the model.
+    /// @param windowSize The attention window size
     /// @param tokensPerBlock The number of tokens in a single kv-cache block.
     /// @return SizeType32 A number of blocks.
-    [[nodiscard]] static SizeType32 calculateMaxBlockRequirementsPerBeam(SizeType32 sequenceLength,
-        SizeType32 sinkTokenLength, SizeType32 maxAttentionWindow, SizeType32 tokensPerBlock);
+    [[nodiscard]] static SizeType32 calculateMaxBlockRequirementsPerBeam(
+        SizeType32 sequenceLength, SizeType32 sinkTokenLength, SizeType32 windowSize, SizeType32 tokensPerBlock);
 
     std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override;

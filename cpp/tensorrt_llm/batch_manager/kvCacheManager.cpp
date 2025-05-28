@@ -362,6 +362,11 @@ std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
     std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers,
     std::map<SizeType32, SizeType32> const& cacheSizePerTokenPerWindow)
 {
+    if (uniqueWindowSizeToLayers.size() == 1)
+    {
+        return {{uniqueWindowSizeToLayers.begin()->first, 1.0f}};
+    }
+
     std::map<SizeType32, float> windowSizeToContribution;
 
     SizeType32 cacheSizePerTokenTotal
@@ -447,8 +452,10 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         auto const temporaryAttentionWindow = manager.calculateTemporaryAttentionWindow(tempAttentionWindowInputs);
         // Consider the temporaryAttentionWindow when allocating blocks.
         auto const maxBlocksPerSeq = tc::ceilDiv(maxTokenNum + temporaryAttentionWindow, tokensPerBlock);
-        mWindowSizeToMetadata[windowSize] = WindowSizeMetadata{absolutePoolsOffset, numPools, maxTokenNum,
-            maxBlocksPerSeq, manager.getMaxNumBlocks(), temporaryAttentionWindow};
+        auto const [allottedPrimaryBlocks, allottedSecondaryBlocks] = blocksPerWindow.at(windowSize);
+        mWindowSizeToMetadata[windowSize]
+            = WindowSizeMetadata{allottedPrimaryBlocks, allottedSecondaryBlocks, absolutePoolsOffset, numPools,
+                maxTokenNum, maxBlocksPerSeq, manager.getMaxNumBlocks(), temporaryAttentionWindow};
         TLLM_LOG_DEBUG(
             "%s Metadata: %s", manager.getLogPrefix().c_str(), mWindowSizeToMetadata[windowSize].toString().c_str());
         absolutePoolsOffset += numPools;
@@ -2085,11 +2092,10 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         return blocksInSecondaryPool;
     };
 
-    auto const isHomogeneous
-        = managedLayersPerWindowSize.size() == 1 && managedLayersPerWindowSize.cbegin()->second.size() == 1;
-
     if (config.maxTokens.has_value())
     {
+        auto const isHomogeneous
+            = managedLayersPerWindowSize.size() == 1 && managedLayersPerWindowSize.cbegin()->second.size() == 1;
         TLLM_CHECK_WITH_INFO(isHomogeneous,
             "maxTokens cannot really be used when there are multiple pools, as it doesn't make sense conceptually");
         if (config.freeGpuMemoryFraction.has_value())
@@ -2110,17 +2116,6 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
     //     COMM_SESSION.allreduce(&_maxTokensRank, &_maxTokensWorld, 1, mpi::MpiType::kINT64, mpi::MpiOp::MIN);
     //     maxTokens = static_cast<SizeType32>(_maxTokensWorld);
     // }
-
-    if (isHomogeneous) // Opt out of unweildy code below for the common Homogeneous case
-    {
-        auto const [windowSize, managedLayers] = (*managedLayersPerWindowSize.cbegin());
-        auto const cacheSizePerToken = BaseKVCacheManager::calculateCacheSizePerToken(
-            modelConfig, worldConfig, managedLayers, isCrossAttention, kvFactor);
-        auto const cacheSizeBytesPerToken = cacheSizeBytesPerTokenPerWindow.at(windowSize);
-        auto const blocksInPrimaryPool = calculatePrimaryBlocks(windowSize, 1.0F, cacheSizeBytesPerToken);
-        auto const blocksInSecondaryPool = calculateSecondaryBlocks(windowSize, 1.0F, cacheSizeBytesPerToken);
-        return BlocksPerWindow{{windowSize, std::make_tuple(blocksInPrimaryPool, blocksInSecondaryPool)}};
-    }
 
     auto const windowSizeToShare
         = BlockManager::calculateWindowSizeToShare(managedLayersPerWindowSize, cacheSizeBytesPerTokenPerWindow);
@@ -2211,45 +2206,49 @@ runtime::ITensor::SharedPtr KVCacheManager::getPrimaryPool(SizeType32 layer_idx)
 
 SizeType32 KVCacheManager::getMaxCapacityBatchSize(SizeType32 inputLength, SizeType32 outputLength) const
 {
-    TLLM_CHECK_WITH_INFO(
-        !mBlockManager.isVariableWindow(), "Dynamic Batch Tuning isn't yet implemented for variable window attention");
-    auto const blockRequirementsPerSequence = KVCacheManager::calculateMaxBlockRequirements(
-        inputLength, outputLength, mSinkBlockTokenLength, mMaxAttentionWindow, mMaxBeamWidth, mTokensPerBlock);
+    auto max = 0;
+    for (auto const [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    {
+        auto const blockRequirementsPerSequence = KVCacheManager::calculateMaxBlockRequirements(
+            inputLength, outputLength, mSinkBlockTokenLength, windowSize, mMaxBeamWidth, mTokensPerBlock);
+        auto const maxBatchSize = blockRequirementsPerSequence / metadata.allottedPrimaryBlocks;
+        max = std::max(max, maxBatchSize);
+    }
 
-    return mBlockManager.getNumPrimaryBlocks() / blockRequirementsPerSequence;
+    return max;
 }
 
 SizeType32 KVCacheManager::calculateMaxBlockRequirementsPerBeam(
-    SizeType32 sequenceLength, SizeType32 sinkTokenLength, SizeType32 maxAttentionWindow, SizeType32 tokensPerBlock)
+    SizeType32 sequenceLength, SizeType32 sinkTokenLength, SizeType32 windowSize, SizeType32 tokensPerBlock)
 {
     auto const sinkBubbleLength = BaseKVCacheManager::getSinkBubbleLength(sinkTokenLength, tokensPerBlock);
-    auto const actualSeqLen = std::min(sequenceLength, maxAttentionWindow);
+    auto const actualSeqLen = std::min(sequenceLength, windowSize);
     auto actualMaxTokenNum = actualSeqLen + sinkBubbleLength;
     return tc::ceilDiv(actualMaxTokenNum, tokensPerBlock);
 }
 
 SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength, SizeType32 outputLength,
-    SizeType32 sinkTokenLength, SizeType32 maxAttentionWindow, SizeType32 beamWidth, SizeType32 tokensPerBlock)
+    SizeType32 sinkTokenLength, SizeType32 windowSize, SizeType32 beamWidth, SizeType32 tokensPerBlock)
 {
     // We split beam width > 1, as it introduces a lot of complexity.
     auto const wholeSequenceLength = inputLength + outputLength;
     if (beamWidth == 1)
     {
         return KVCacheManager::calculateMaxBlockRequirementsPerBeam(
-            wholeSequenceLength, sinkTokenLength, maxAttentionWindow, tokensPerBlock);
+            wholeSequenceLength, sinkTokenLength, windowSize, tokensPerBlock);
     }
 
     // If the whole attention window can fit in the output, then we can simply multiply the cost of a sequence of
     // length max attention window by the beam width.
-    if (maxAttentionWindow <= outputLength)
+    if (windowSize <= outputLength)
     {
         return KVCacheManager::calculateMaxBlockRequirementsPerBeam(
-                   maxAttentionWindow, sinkTokenLength, maxAttentionWindow, tokensPerBlock)
+                   windowSize, sinkTokenLength, windowSize, tokensPerBlock)
             * beamWidth;
     }
 
     // Otherwise, we calculate how many tokens will be in output blocks.
-    auto const effectiveAttentionWindow = std::min(maxAttentionWindow, wholeSequenceLength);
+    auto const effectiveAttentionWindow = std::min(windowSize, wholeSequenceLength);
     auto const numContextTokensInAttentionWindow
         = effectiveAttentionWindow - outputLength; // This is positive because we handled the other case above.
     auto const sinkBubbleLength = BaseKVCacheManager::getSinkBubbleLength(sinkTokenLength, tokensPerBlock);
