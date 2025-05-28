@@ -47,7 +47,7 @@ public:
 
     ~AllgatherOp() = default;
 
-    int initialize() noexcept
+    int initialize()
     {
         TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
         mNcclComm = getComm(mGroup);
@@ -55,7 +55,7 @@ public:
         return 0;
     }
 
-    torch::Tensor run(torch::Tensor input, torch::optional<torch::List<int64_t>> sizes) noexcept
+    torch::Tensor run(torch::Tensor input, torch::optional<torch::List<int64_t>> sizes)
     {
         TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "mNcclComm should be initialized before used");
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -78,7 +78,7 @@ public:
             for (int root = 0; root < static_cast<int>(mGroup.size()); ++root)
             {
                 auto split_size = sizes.value()[root];
-                NCCLCHECK(ncclBroadcast(input.data_ptr(),
+                NCCLCHECK_THROW(ncclBroadcast(input.data_ptr(),
                     output.index({torch::indexing::Slice(split_offset, torch::indexing::None)}).mutable_data_ptr(),
                     numel_base * split_size, (*getDtypeMap())[type], root, *mNcclComm, stream));
                 split_offset += split_size;
@@ -87,14 +87,13 @@ public:
         }
         else
         {
-            NCCLCHECK(ncclAllGather(input.data_ptr(), output.mutable_data_ptr(), input.numel(), (*getDtypeMap())[type],
-                *mNcclComm, stream));
+            NCCLCHECK_THROW(ncclAllGather(input.data_ptr(), output.mutable_data_ptr(), input.numel(),
+                (*getDtypeMap())[type], *mNcclComm, stream));
         }
         return output;
     }
 
-    std::vector<torch::Tensor> run_list(
-        torch::TensorList input_list, torch::optional<torch::List<int64_t>> sizes) noexcept
+    std::vector<torch::Tensor> run_list(torch::TensorList input_list, torch::optional<torch::List<int64_t>> sizes)
     {
         std::vector<torch::Tensor> output_list;
         output_list.reserve(input_list.size());
