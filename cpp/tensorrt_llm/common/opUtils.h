@@ -199,6 +199,16 @@ inline bool isBuilding()
         }                                                                                                              \
     } while (0)
 
+#define NCCLCHECK_THROW(cmd)                                                                                           \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        ncclResult_t r = cmd;                                                                                          \
+        if (TLLM_UNLIKELY(r != ncclSuccess))                                                                           \
+        {                                                                                                              \
+            TLLM_THROW("Failed, NCCL error %s:%d '%s'\n", __FILE__, __LINE__, ncclGetErrorString(r));                  \
+        }                                                                                                              \
+    } while (0)
+
 std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap();
 
 std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
@@ -306,5 +316,15 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
         {                                                                                                              \
             printf("Failed, NVML error %s:%d '%s'\n", __FILE__, __LINE__, nvmlErrorString(r));                         \
             exit(EXIT_FAILURE);                                                                                        \
+        }                                                                                                              \
+    } while (0)
+
+#define NVML_CHECK_THROW(cmd)                                                                                          \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        nvmlReturn_t r = cmd;                                                                                          \
+        if (TLLM_UNLIKELY(r != NVML_SUCCESS))                                                                          \
+        {                                                                                                              \
+            TLLM_THROW("Failed, NVML error %s:%d '%s'\n", __FILE__, __LINE__, nvmlErrorString(r));                     \
         }                                                                                                              \
     } while (0)
