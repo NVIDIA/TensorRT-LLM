@@ -86,6 +86,7 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.llm_utils":
     ["CachedModelLoader._node_build_task", "LlmBuildStats"],
+    "tensorrt_llm.llmapi.tokenizer": ["TransformersTokenizer"],
     "tensorrt_llm.lora_manager": ["LoraConfig"],
     "tensorrt_llm.mapping": ["Mapping"],
     "tensorrt_llm.models.modeling_utils":
