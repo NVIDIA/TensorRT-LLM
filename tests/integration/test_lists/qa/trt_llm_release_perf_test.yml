@@ -136,9 +136,6 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-float16-input_output_len:128,128-gpus:2]
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-float16-input_output_len:512,32-gpus:2]
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-streaming-float16-input_output_len:128,128-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v4_scout_instruct_17b_16e-bench-pytorch-bfloat16-input_output_len:128,128-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v4_maverick_instruct_17b_128e-bench-pytorch-bfloat16-input_output_len:128,128-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v4_maverick_instruct_17b_128e-bench-pytorch-bfloat16-input_output_len:512,32-gpus:2]
 
 - condition:
     ranges:
@@ -200,14 +197,9 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[llama_v4_scout_instruct_17b_16e-bench-pytorch-bfloat16-input_output_len:128,128-gpus:8]
   - perf/test_perf.py::test_perf[llama_v4_scout_instruct_17b_16e-bench-pytorch-bfloat16-input_output_len:128,128-con:1-gpus:8]
   - perf/test_perf.py::test_perf[llama_v4_scout_instruct_17b_16e-bench-pytorch-bfloat16-input_output_len:128,128-con:250-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v4_maverick_instruct_17b_128e-bench-pytorch-bfloat16-input_output_len:128,128-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v4_maverick_instruct_17b_128e-bench-pytorch-bfloat16-input_output_len:128,128-con:1-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v4_maverick_instruct_17b_128e-bench-pytorch-bfloat16-input_output_len:128,128-con:250-gpus:8]
   #maybe for l2 test
   - perf/test_perf.py::test_perf[llama_v4_scout_instruct_17b_16e-bench-pytorch-bfloat16-input_output_len:5000,500-gpus:8]
   - perf/test_perf.py::test_perf[llama_v4_scout_instruct_17b_16e-bench-pytorch-bfloat16-input_output_len:500,2000-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v4_maverick_instruct_17b_128e-bench-pytorch-bfloat16-input_output_len:5000,500-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v4_maverick_instruct_17b_128e-bench-pytorch-bfloat16-input_output_len:500,2000-gpus:8]
 
 - condition:
     ranges:
