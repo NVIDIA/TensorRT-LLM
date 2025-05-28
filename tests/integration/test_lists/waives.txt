@@ -83,7 +83,6 @@ full:B200_PCIe/examples/test_llama.py::test_llm_llama_v2_lora_1gpu[chinese-llama
 full:B200_PCIe/examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3-mini-128k-instruct-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1] SKIP (Disable for Blackwell)
 full:B200_PCIe/examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3-small-8k-instruct-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1] SKIP (Disable for Blackwell)
 full:B200_PCIe/examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3.5-mini-instruct-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1] SKIP (Disable for Blackwell)
-full:B200_PCIe/examples/test_qwen.py::test_llm_qwen_moe_single_gpu_summary[qwen1.5_moe_a2.7b_chat-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha] SKIP (Disable for Blackwell)
 full:B200_PCIe/unittest/trt/functional SKIP (Disable for Blackwell)
 full:B200_PCIe/unittest/trt/quantization SKIP (Disable for Blackwell)
 full:B200_PCIe/accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=False] SKIP (Disable for Blackwell)
@@ -174,7 +173,6 @@ full:B200/examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3-small-128k
 full:B200/examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3.5-mini-instruct-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1] SKIP (Disable for Blackwell)
 full:B200/examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3-mini-128k-instruct-fp8-float16] SKIP (Disable for Blackwell)
 full:B200/examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3.5-mini-instruct-fp8-float16] SKIP (Disable for Blackwell)
-full:B200/examples/test_qwen.py::test_llm_qwen_moe_single_gpu_summary[qwen1.5_moe_a2.7b_chat-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha] SKIP (Disable for Blackwell)
 full:B200/unittest/trt/functional SKIP (Disable for Blackwell)
 full:B200/unittest/trt/quantization SKIP (Disable for Blackwell)
 full:B200/accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=False] SKIP (Disable for Blackwell)
@@ -330,11 +328,6 @@ full:B200/test_e2e.py::test_ptp_quickstart_advanced[Nemotron4_4B-BF16-nemotron/M
 full:B200/test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B] SKIP (https://nvbugs/5136994)
 full:B200/test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-hf-nvfp4-False-False] SKIP (https://nvbugs/5136994)
 examples/test_multimodal.py::test_llm_multimodal_general[kosmos-2-pp:1-tp:1-float16-bs:8-cpp_e2e:True-nb:1] SKIP (https://nvbugs/5141288)
-examples/test_qwen.py::test_llm_qwen_7b_multi_gpus_summary[qwen2_vl_7b_instruct-enable_fmha_fp32_acc-enable_plugin-tp2pp2-nb:4] SKIP (https://nvbugs/5141290)
-examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2_vl_7b_instruct-enable_paged_kv_cache-enable_remove_input_padding-disable_weight_only-disable_fmha] SKIP (https://nvbugs/5141290)
-examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2_vl_7b_instruct-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha_fp32_acc] SKIP (https://nvbugs/5141290)
-examples/test_qwen.py::test_llm_qwen_awq_single_gpu_summary[qwen2_vl_7b_instruct-nb:4] SKIP (https://nvbugs/5141290)
-examples/test_qwen.py::test_llm_hf_qwen_quantization_1gpu[qwen2_vl_7b_instruct-fp8-bfloat16] SKIP (https://nvbugs/5141290)
 unittest/_torch/auto_deploy/integration/test_lm_eval.py SKIP (https://nvbugs/5144854)
 examples/test_qwen.py::test_llm_qwen1_5_moe_plugin_single_gpu_lora[qwen1.5_moe_a2.7b_chat-Upcycled-Qwen1.5-MoE2.7B-LoRA] SKIP (https://nvbugs/5155141)
 
@@ -368,7 +361,6 @@ full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[quant:w4
 full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[quant:int8_sq_per_tensor] SKIP (https://nvbugspro.nvidia.com/bug/5161074)
 full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[quant:int8_sq_per_token_channel] SKIP (https://nvbugspro.nvidia.com/bug/5161074)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5174573)
-examples/test_qwen.py::test_llm_qwen_moe_single_gpu_summary[qwen1.5_moe_a2.7b_chat-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha] SKIP (https://nvbugs/5180961)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-disable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
@@ -401,6 +393,9 @@ perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20-gpus:2] SK
 perf/test_perf.py::test_perf[t5-bench-float16-maxbs:1-input_output_len:128,20-gpus:2] SKIP
 perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:128,128-reqs:80-gpus:8] SKIP
 perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:512,32-reqs:80-gpus:8] SKIP
+full:B200/perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:512-input_output_len:128,128-ep:8-tp:8-gpus:8] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
+full:B200/perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
+full:B200/perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-tp:8-gpus:8] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
 full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float8-input_output_len:128,128] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
 full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-tp:2-gpus:2] SKIP #https://docs.google.com/spreadsheets/d/1EvwCcJ5o2zmhVxFFxAAz-49UzswMlfN2y5K37Fkyw7A/edit?gid=907483661#gid=907483661
 full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[llama_v3.3_nemotron_49b-bench-pytorch-bfloat16-input_output_len:128,128-tp:2-gpus:2] SKIP #https://docs.google.com/spreadsheets/d/1EvwCcJ5o2zmhVxFFxAAz-49UzswMlfN2y5K37Fkyw7A/edit?gid=907483661#gid=907483661
@@ -413,6 +408,7 @@ accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache SKIP (https://n
 test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-image] SKIP (https://nvbugs/5233423)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp4-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/5239087)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/5239087)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False] SKIP (https://nvbugs/5294983)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp4-mtp_nextn=2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/5239087)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[ep4-mtp_nextn=2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False] SKIP (https://nvbugs/5239087)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False] SKIP (https://nvbugs/5234002)
@@ -426,13 +422,13 @@ examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padd
 examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:2-pp:1-float16-RobertaForQuestionAnswering-bert/roberta-base-squad2] SKIP (https://nvbugs/5234058)
 disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5247271)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugspro.nvidia.com/bug/5273945)
-unittest/_torch/multi_gpu_modeling/test_llama4.py::test_llama4[pp1-ep1-enable_graph-tp8-trtllm-scout] SKIP (https://nvbugs/5274229)
+unittest/_torch/multi_gpu_modeling/test_llama4.py::test_llama4[pp1-ep1-disable_adp-enable_graph-tp8-trtllm-scout] SKIP (https://nvbugs/5274229)
+unittest/_torch/multi_gpu_modeling/test_llama4.py::test_llama4[pp1-ep4-enable_adp-enable_graph-tp8-trtllm-scout] SKIP (https://nvbugs/5274229)
 accuracy/test_cli_flow.py::TestLlama3_1_8B::test_tp4[enable_gemm_allreduce_plugin] SKIP (https://nvbugs/5247786)
 full:B200/examples/test_qwen.py::test_llm_qwen_7b_multi_gpus_summary[qwen1.5_7b_chat-enable_fmha_fp32_acc-enable_plugin-tp2pp2-nb:4] SKIP (https://nvbugs/5247837)
 full:B200/examples/test_qwen.py::test_llm_qwen_7b_multi_gpus_summary[qwen2_7b_instruct-enable_fmha_fp32_acc-enable_plugin-tp2pp2-nb:4] SKIP (https://nvbugs/5247837)
 full:B200/examples/test_qwen.py::test_llm_qwen_7b_multi_gpus_summary[qwen2.5_7b_chat-enable_fmha_fp32_acc-enable_plugin-tp2pp2-nb:4] SKIP (https://nvbugs/5247837)
 full:B200/examples/test_mixtral.py::test_llm_mixtral_pp_reduce_scatter_4gpus[Mixtral-8x7B-v0.1] SKIP (https://nvbugs/5247837)
-examples/test_qwen.py::test_llm_qwen_smooth_quant_single_gpu_summary[qwen2_vl_7b_instruct-enable_ptpc-nb:4] SKIP (https://nvbugs/5273694)
 accuracy/test_cli_flow.py::TestMixtral8x22B::test_int8_plugin_tp8[renormalize-tensor_parallel] SKIP (https://nvbugs/5273695)
 test_e2e.py::test_ptp_quickstart_advanced_8gpus[Nemotron-Ultra-253B-nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1] SKIP (https://nvbugs/5273697)
 examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoder] SKIP (https://nvbugs/5144931)
@@ -440,7 +436,6 @@ examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoderplus] SKIP (
 unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)" SKIP (https://nvbugs/5280806)
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/5244570)
 unittest/_torch/speculative/test_eagle3.py SKIP (https://nvbugs/5280806)
-test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-image] SKIP (https://nvbugs/5226211)
 triton_server/test_triton_rcca.py::test_mistral_beam_search[rcca_4714407-True-10-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-guaranteed_no_evict-1-1-1-False-ensemble] SKIP (https://nvbugs/5240060)
 triton_server/test_triton.py::test_triton_extensive[triton-extensive] SKIP
 triton_server/test_triton.py::test_gpt_speculative_decoding[gpt-speculative-decoding] SKIP

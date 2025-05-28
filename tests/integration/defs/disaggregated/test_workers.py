@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 import aiohttp
 import pytest
 import yaml
+from defs.trt_test_alternative import popen
 from transformers import AutoTokenizer
 
 from tensorrt_llm import logger
@@ -53,11 +54,11 @@ def run_disaggregated_workers(
         config_file
     ]
     logger.info(f"Running workers with command: {' '.join(workers_cmd)}")
-    workers_proc = subprocess.Popen(workers_cmd,
-                                    stdout=stdout,
-                                    stderr=subprocess.STDOUT,
-                                    env=env,
-                                    cwd=cwd)
+    workers_proc = popen(workers_cmd,
+                         stdout=stdout,
+                         stderr=subprocess.STDOUT,
+                         env=env,
+                         cwd=cwd)
     return workers_proc, ctx_servers, gen_servers
 
 
@@ -500,19 +501,18 @@ def load_default_prompts(disaggregated_example_root: str):
 @contextlib.contextmanager
 def background_workers(llm_venv, config_file: str, num_ranks: int = None):
     cwd = llm_venv.get_working_directory()
-    log_file = open(os.path.join(cwd, 'output_workers.log'), 'w')
-    workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
-        config_file=config_file,
-        stdout=log_file,
-        env=llm_venv._new_env,
-        cwd=cwd,
-        num_ranks=num_ranks)
-    try:
-        yield ctx_servers, gen_servers
-    finally:
-        workers_proc.terminate()
-        workers_proc.wait()
-        log_file.close()
+
+    with open(os.path.join(cwd, 'output_workers.log'), 'w') as log_file:
+        workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
+            config_file=config_file,
+            stdout=log_file,
+            env=llm_venv._new_env,
+            cwd=cwd,
+            num_ranks=num_ranks)
+        with workers_proc as proc:
+            yield ctx_servers, gen_servers
+            proc.terminate()
+            proc.wait()
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],

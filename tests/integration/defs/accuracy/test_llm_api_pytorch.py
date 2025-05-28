@@ -188,10 +188,11 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5292517")
     @skip_pre_hopper
-    def test_fp8_llm_decoder(self):
+    def test_fp8_llm_sampler(self):
         model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-        pytorch_config = PyTorchConfig(enable_trtllm_decoder=True)
+        pytorch_config = PyTorchConfig(enable_trtllm_sampler=True)
         llm = LLM(model_path, pytorch_backend_config=pytorch_config)
         assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
 
@@ -205,6 +206,79 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           sampling_params=sampling_params,
                           extra_acc_spec="temperature=0.8,top_p=0.95")
+
+
+class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.2-1B"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B"
+    EXAMPLE_FOLDER = "models/core/llama"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_post_blackwell
+    def test_smooth_quant(self):
+        quant_config = QuantConfig(
+            QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_post_blackwell
+    def test_smooth_quant_ootb(self):
+        quant_config = QuantConfig(QuantAlgo.W8A8_SQ_PER_CHANNEL)
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_post_blackwell
+    def test_int4_awq(self):
+        quant_config = QuantConfig(QuantAlgo.W4A16_AWQ)
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_post_blackwell
+    def test_int4_awq_int8_kv_cache(self):
+        quant_config = QuantConfig(QuantAlgo.W4A16_AWQ)
+        kv_cache_config = KvCacheConfig(quant_algo=QuantAlgo.INT8)
+        with LLM(self.MODEL_PATH,
+                 quant_config=quant_config,
+                 kv_cache_config=kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    def test_fp8(self):
+        quant_config = QuantConfig(QuantAlgo.FP8)
+        kv_cache_config = KvCacheConfig(quant_algo=QuantAlgo.FP8)
+        with LLM(self.MODEL_PATH,
+                 quant_config=quant_config,
+                 kv_cache_config=kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @pytest.mark.skip_less_device(2)
+    def test_fp8_pp2(self):
+        quant_config = QuantConfig(QuantAlgo.FP8)
+        kv_cache_config = KvCacheConfig(quant_algo=QuantAlgo.FP8)
+        with LLM(self.MODEL_PATH,
+                 pipeline_parallel_size=2,
+                 quant_config=quant_config,
+                 kv_cache_config=kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @skip_post_blackwell
+    def test_fp8_rowwise(self):
+        quant_config = QuantConfig(QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
@@ -924,13 +998,27 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.skip_less_device_memory(80000)
-class TestNemotronSuper(LlmapiAccuracyTestHarness):
+class TestLlama3_3NemotronSuper49Bv1(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
     MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1"
 
     @pytest.mark.skip_less_device(2)
     def test_auto_dtype_tp2(self):
         with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    def test_fp8_prequantized_tp2(self):
+        model_path = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8"
+        with LLM(model_path, tensor_parallel_size=2) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -946,10 +1034,61 @@ class TestNemotronNano(LlmapiAccuracyTestHarness):
 
     def test_auto_dtype(self):
         with LLM(self.MODEL_PATH) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+
+class TestNemotronUltra(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1"
+    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1"
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 use_cuda_graph=cuda_graph) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_fp8_prequantized(self, cuda_graph, tp_size, pp_size, ep_size):
+        model_path = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8"
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 use_cuda_graph=cuda_graph) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestNemotronH(LlmapiAccuracyTestHarness):
@@ -1185,3 +1324,24 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "microsoft/Phi-4-mini-instruct"
+    MODEL_PATH = f"{llm_models_root()}/Phi-4-mini-instruct"
+
+    @pytest.mark.skip(
+        reason=
+        "Temporarily skipping test_auto_dtype while resolving Phi-4's architecture issue."
+    )
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))

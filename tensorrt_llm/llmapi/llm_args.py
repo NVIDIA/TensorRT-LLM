@@ -1359,11 +1359,19 @@ class BaseLlmArgs(BaseModel):
 
 class TrtLlmArgs(BaseLlmArgs):
 
-    auto_parallel: bool = Field(default=False,
-                                description="Enable auto parallel mode.")
+    auto_parallel: bool = Field(
+        default=False,
+        description="Enable auto parallel mode.",
+        deprecated=
+        "Use tensor_parallel_size/pipeline_parallel_size/xxx_parallel_size instead.",
+    )
 
     auto_parallel_world_size: Optional[int] = Field(
-        default=None, description="The world size for auto parallel mode.")
+        default=None,
+        description="The world size for auto parallel mode.",
+        deprecated=
+        "Use tensor_parallel_size/pipeline_parallel_size/xxx_parallel_size instead.",
+    )
 
     enable_tqdm: bool = Field(default=False,
                               description="Enable tqdm for progress bar.")
