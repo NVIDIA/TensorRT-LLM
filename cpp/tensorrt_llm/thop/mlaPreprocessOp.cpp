@@ -159,7 +159,7 @@ KVBlockArray createKVBlockArray(int num_contexts, int max_blocks_per_sequence, i
 } // namespace
 
 std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, int64_t const num_contexts,
-    int64_t const max_ctx_cached_kv_len, torch::Tensor& cu_ctx_cached_kv_lens,
+    int64_t const num_ctx_cached_tokens, int64_t const max_ctx_cached_kv_len, torch::Tensor& cu_ctx_cached_kv_lens,
     torch::Tensor const& kv_cache_block_offsets, torch::Tensor const& host_kv_cache_block_offsets,
     torch::Tensor const& host_kv_cache_pool_pointers, torch::Tensor const& host_kv_cache_pool_mapping,
     torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
@@ -170,6 +170,7 @@ std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, i
     TORCH_CHECK(out_dtype == torch::kFloat16 || out_dtype == torch::kFloat32 || out_dtype == torch::kBFloat16,
         "out_dtype only support float16, float32, bfloat16");
     TLLM_CHECK(num_contexts > 0);
+    TORCH_CHECK(num_ctx_cached_tokens > 0);
     TLLM_CHECK(max_ctx_cached_kv_len > 0);
     CHECK_INPUT(cu_ctx_cached_kv_lens, torch::kInt64);
     TORCH_CHECK(cu_ctx_cached_kv_lens.dim() == 1);
@@ -197,8 +198,6 @@ std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, i
         TLLM_CHECK(kv_scale_quant_orig_ptr != nullptr);
     }
 
-    auto const num_ctx_cached_tokens = cu_ctx_cached_kv_lens.index({num_contexts}).item<int64_t>();
-    TORCH_CHECK(num_ctx_cached_tokens > 0);
     std::vector<torch::Tensor> outputs;
     // compressed_kv {num_ctx_cached_tokens, lora_size}
     outputs.push_back(torch::empty(
@@ -288,6 +287,9 @@ torch::Tensor setPagedKVCacheForMLA(torch::Tensor& output, torch::Tensor const& 
     CHECK_INPUT(cu_seq_lens, torch::kInt64);
     TORCH_CHECK(cu_seq_lens.dim() == 1);
     TORCH_CHECK(cu_seq_lens.size(0) >= num_requests + 1);
+
+    // cudaMemset is faster than torch::zeros
+    cudaMemset(output.data_ptr(), 0, output.numel() * torch::elementSize(output_dtype));
 
     if (output_dtype == torch::kFloat16)
     {
@@ -467,6 +469,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "load_paged_kv_cache_for_mla("
         "ScalarType out_dtype"
         ", int num_contexts"
+        ", int num_ctx_cached_tokens"
         ", int max_ctx_cached_kv_len"
         ", Tensor cu_ctx_cached_kv_lens"
         ", Tensor kv_cache_block_offsets"
