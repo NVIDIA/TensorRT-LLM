@@ -801,33 +801,32 @@ public:
         return mNumKvHeadsPerAttentionLayer;
     }
 
-    [[nodiscard]] std::vector<SizeType32> getNumKvHeadsPerLayerLocalRange(bool isCrossAttention,
-        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0,
-        std::optional<std::vector<SizeType32>> const& managedLayers = std::nullopt) const
+    [[nodiscard]] std::vector<SizeType32> getNumKvHeadsForGivenLayers(std::vector<SizeType32> const& layers) const
+    {
+        std::vector<SizeType32> numKvHeads;
+        numKvHeads.reserve(layers.size());
+        std::transform(layers.begin(), layers.end(), std::back_inserter(numKvHeads),
+            [this](SizeType32 layer) { return mNumKvHeadsPerAttentionLayer.at(layer); });
+        return numKvHeads;
+    }
+
+    [[nodiscard]] std::pair<std::vector<SizeType32>::const_iterator, std::vector<SizeType32>::const_iterator>
+    getNumKvHeadsPerLayerLocalRange(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0, bool isCrossAttention = false) const
     {
         TLLM_LOG_TRACE("%s start: %d", __PRETTY_FUNCTION__);
         TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
-        // TODO: previous code had bug due to precedence with cross attention?
-        auto const& nkvhPerLayer = isCrossAttention ? mNumKvHeadsPerCrossAttentionLayer : mNumKvHeadsPerAttentionLayer;
-        auto const& managed = managedLayers.has_value() ? managedLayers.value() : nkvhPerLayer;
-        auto const managedLayersSet = std::set<SizeType32>(managed.begin(), managed.end());
 
         // count number of previous non-local attention layers
         auto const numPrevAttnLayers
             = countLowerRankLayers(LayerType::kATTENTION, pipelineParallelism, pipelineParallelismRank);
+        auto const firstLocalAttentionLayerIt = isCrossAttention
+            ? mNumKvHeadsPerCrossAttentionLayer.cbegin()
+            : mNumKvHeadsPerAttentionLayer.cbegin() + numPrevAttnLayers;
         auto const numLocalAttentionLayers
             = countLocalLayers(LayerType::kATTENTION, pipelineParallelism, pipelineParallelismRank);
-        std::vector<SizeType32> localLayersNKVHeads;
-        localLayersNKVHeads.reserve(numLocalAttentionLayers);
-        for (auto i = numPrevAttnLayers; i < numPrevAttnLayers + numLocalAttentionLayers; ++i)
-        {
-            if (managedLayersSet.count(i) != 0)
-            {
-                localLayersNKVHeads.push_back(nkvhPerLayer.at(i));
-            }
-        }
         TLLM_LOG_TRACE("%s stop: %d", __PRETTY_FUNCTION__);
-        return localLayersNKVHeads;
+        return std::make_pair(firstLocalAttentionLayerIt, firstLocalAttentionLayerIt + numLocalAttentionLayers);
     }
 
     void setNumKvHeadsPerLayer(std::vector<SizeType32> const& headsPerLayer)
@@ -844,16 +843,6 @@ public:
         TLLM_CHECK_WITH_INFO(numElems == mNbAttentionLayers,
             "Length of head_per_layer (%d) must match number of attention layers (%d)", numElems, mNbAttentionLayers);
         mNumKvHeadsPerCrossAttentionLayer = headsPerLayer;
-    }
-
-    [[nodiscard]] SizeType32 getSumLocalKvHeads(bool isCrossAttention, SizeType32 pipelineParallelism = 1,
-        SizeType32 pipelineParallelismRank = 0,
-        std::optional<std::vector<SizeType32>> const& managedLayers = std::nullopt) const
-    {
-        auto const& nkvh = getNumKvHeadsPerLayerLocalRange(
-            isCrossAttention, pipelineParallelism, pipelineParallelismRank, managedLayers);
-        auto const sumLocalHeads = std::reduce(nkvh.cbegin(), nkvh.cend());
-        return sumLocalHeads;
     }
 
     [[nodiscard]] bool constexpr skipCrossAttnBlocks() const noexcept

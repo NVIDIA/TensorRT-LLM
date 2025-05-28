@@ -1281,12 +1281,12 @@ public:
         tensorrt_llm::runtime::WorldConfig const& worldConfig, std::vector<SizeType32> const& managedLayers,
         bool isCrossAttention, SizeType32 kvFactor = 2)
     {
+        auto const nkvh = modelConfig.getNumKvHeadsForGivenLayers(managedLayers);
+        auto const sumLocalHeads = std::reduce(nkvh.cbegin(), nkvh.cend());
         // NOTE: We expect the initialization of modelConfig to have already taken the tp size into account and do not
         // address it here
         // consider only local layers for the calculation
-        return modelConfig.getSumLocalKvHeads(isCrossAttention, worldConfig.getPipelineParallelism(),
-                   worldConfig.getPipelineParallelRank(), managedLayers)
-            * kvFactor * modelConfig.getSizePerHead();
+        return sumLocalHeads * kvFactor * modelConfig.getSizePerHead();
     }
 
     [[nodiscard]] static std::map<SizeType32, std::vector<SizeType32>> calculateManagedLayersPerWindowSize(

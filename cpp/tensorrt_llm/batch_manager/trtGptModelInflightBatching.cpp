@@ -570,8 +570,9 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
         getMaxBeamWidth() == 1 || !enableCyclicKvCache, "Can't support cyclic kv cache with beam search.");
 
     // init KV cache block manager
-    auto numKvHeadsPerLayer = mModelConfig.getNumKvHeadsPerLayerLocalRange(
-        isCrossAttention, mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
+    auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = mModelConfig.getNumKvHeadsPerLayerLocalRange(
+        mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank(), isCrossAttention);
+    auto numKvHeadsPerLayer = std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd);
     auto const sizePerHead = mModelConfig.getSizePerHead();
 
     // now we check if maxAttentionWindow is too large for at least one sequence to fit in kvCache
