@@ -15,7 +15,6 @@ global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
 @pytest.mark.gpu4
 def test_tinyllama_guided_decoding_tp2pp2():
-    pytest.skip(reason="https://nvbugs/5244006")
     tinyllama_guided_decoding_test_harness(
         tensor_parallel_size=2,
         pipeline_parallel_size=2,
