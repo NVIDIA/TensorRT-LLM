@@ -309,7 +309,7 @@ protected:
         auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
-        BlocksPerWindow blocksPerWindow
+        const BlocksPerWindow blocksPerWindow
             = {{maxAttentionWindow, std::make_tuple(totalNumBlocks, blocksInSecondaryPool)}};
 
         mManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
@@ -667,7 +667,7 @@ protected:
         }
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
-        BlocksPerWindow blocksPerWindow
+        const BlocksPerWindow blocksPerWindow
             = {{maxAttentionWindow, std::make_tuple(totalNumBlocks, blocksInSecondaryPool)}};
         mManager = std::make_unique<KVCacheManager>(numLayers / mPpSize, numHeadsPerRank, sizePerHead, tokensPerBlock,
             blocksPerWindow, mMaxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},

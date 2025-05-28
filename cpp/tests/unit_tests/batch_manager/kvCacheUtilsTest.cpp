@@ -90,7 +90,7 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
     auto const maxAttentionWindowVec = std::vector<BlockManager::SizeType32>{maxAttentionWindow};
 
     using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
-    BlocksPerWindow blocksPerWindow
+    const BlocksPerWindow blocksPerWindow
         = {{maxAttentionWindow, std::make_tuple(blocksInPrimaryPool, blocksInSecondaryPool)}};
 
     BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,

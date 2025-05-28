@@ -54,7 +54,6 @@ protected:
         auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
-
         const BlocksPerWindow blocksPerWindow
             = {{maxAttentionWindow, std::make_tuple(totalNumBlocks, blocksInSecondaryPool)}};
 
