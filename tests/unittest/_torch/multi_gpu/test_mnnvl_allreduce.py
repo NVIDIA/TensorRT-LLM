@@ -156,9 +156,6 @@ def row_linear_residual_norm_fusion_forward(
 )
 def test_row_linear_residual_norm_fusion(seq_len, hidden_size, fusion):
 
-    # if not fusion:
-    #     pytest.skip("skip no fusion test")
-
     torch.manual_seed(42)
     dtype = torch.bfloat16
     tensor_parallel_size = 2
@@ -191,9 +188,3 @@ def test_row_linear_residual_norm_fusion(seq_len, hidden_size, fusion):
         )
         for r in results:
             assert r is True
-
-
-if __name__ == "__main__":
-    test_row_linear_residual_norm_fusion(seq_len=1,
-                                         hidden_size=7168,
-                                         fusion=False)
