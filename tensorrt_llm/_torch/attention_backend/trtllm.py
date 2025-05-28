@@ -8,7 +8,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..utils import get_global_attrs, get_model_extra_attrs
+from ..utils import Fp4QuantizedTensor, get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         AttentionMetadata, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
@@ -811,21 +811,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         out_dtype = None
         if out_scale is not None:
-            if (self.has_fp8_qdq or self.has_nvfp4
-                    or self.has_fp8_block_wise) and self.has_fp8_kv_cache:
+            if self.has_nvfp4 and not self.is_mla_enable:
+                # Use UINT8 as the container dtype for NVFP4.
+                out_dtype = torch.uint8
+            elif (self.has_fp8_qdq or self.has_nvfp4
+                  or self.has_fp8_block_wise) and self.has_fp8_kv_cache:
                 # TODO(qijun): revisit fp8_context_fmha logic
                 out_dtype = torch.float8_e4m3fn
 
-        output = self.wrapper.run(q,
-                                  k,
-                                  v,
-                                  out_dtype=out_dtype,
-                                  is_fused_qkv=not metadata.is_cross
-                                  and k is None,
-                                  update_kv_cache=not metadata.is_cross
-                                  or k is not None,
-                                  attention_mask=attention_mask)
-        return output
+        output_act, output_sf = self.wrapper.run(
+            q,
+            k,
+            v,
+            out_dtype=out_dtype,
+            is_fused_qkv=not metadata.is_cross and k is None,
+            update_kv_cache=not metadata.is_cross or k is not None,
+            attention_mask=attention_mask)
+
+        if out_dtype == torch.uint8:
+            return Fp4QuantizedTensor(output_act, output_sf)
+        return output_act
 
     @classmethod
     def support_fused_rope(cls) -> bool:
@@ -837,6 +842,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     @classmethod
     def support_mla(cls) -> bool:
+        return True
+
+    @classmethod
+    def support_nvfp4_output(cls) -> bool:
         return True
 
     def has_cached_kv_for_mla_context(

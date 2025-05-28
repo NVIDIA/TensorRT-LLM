@@ -198,6 +198,7 @@ class Attention(nn.Module):
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
+        self.support_nvfp4_output = self.attn.support_nvfp4_output()
 
         if not config.skip_create_weights_in_init:
             self.create_weights()
@@ -265,7 +266,10 @@ class Attention(nn.Module):
         q, k, v = self.apply_rope(qkv, position_ids)
 
         out_scale = None
-        if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
+        if self.o_proj.has_nvfp4 and self.support_nvfp4_output:
+            # For NVFP4 output, the out_scale is defined as global scale for SF, which is (448*6)/amax.
+            out_scale = self.o_proj.input_scale
+        elif self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
             out_scale = self.o_proj.inv_input_scale
 
         q, k, v = self.convert_qkv(q, k, v)
