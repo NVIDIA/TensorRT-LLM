@@ -161,15 +161,15 @@ release_run: WORK_DIR = /app/tensorrt_llm
 
 # For x86_64
 jenkins_%: IMAGE_WITH_TAG = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-jenkins_%: STAGE = devel
+jenkins_%: STAGE = tritondevel
 
 # For aarch64
 jenkins-aarch64_%: IMAGE_WITH_TAG = $(shell grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-jenkins-aarch64_%: STAGE = devel
+jenkins-aarch64_%: STAGE = tritondevel
 
 # For x86_64
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell grep 'LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-jenkins-rockylinux8_%: STAGE = devel
+jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
 jenkins-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
 
