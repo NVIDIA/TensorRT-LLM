@@ -19,6 +19,8 @@ LLM_COMMIT_OR_BRANCH = env.gitlabCommit ?: LLM_BRANCH
 
 LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefined"
 
+LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
+
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
@@ -184,10 +186,8 @@ def buildImage(config, imageKeyToTag)
     def postTag = config.postTag
     def dependentTarget = config.dependentTarget
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
-    def branchTag = config.branchTag
-    def llmDefaultTag = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${branchTag}-${BUILD_NUMBER}"
 
-    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${llmDefaultTag}"
+    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
 
     def dependentTargetTag = tag.replace("${arch}-${target}-", "${arch}-${dependentTarget}-")
 
@@ -300,12 +300,6 @@ def buildImage(config, imageKeyToTag)
 
 
 def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
-    def branchTag = LLM_BRANCH_TAG
-    if (globalVars[GITHUB_PR_API_URL]) {
-        branchTag = globalVars[GITHUB_PR_API_URL].split('/').last()
-        echo "branchTag is: ${branchTag}"
-    }
-
     def defaultBuildConfig = [
         target: "tritondevel",
         action: params.action,
@@ -316,7 +310,6 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         arch: "amd64",
         build_wheel: false,
         dependentTarget: "",
-        branchTag: branchTag,
     ]
 
     def release_action = env.JOB_NAME ==~ /.*PostMerge.*/ ? "push" : params.action

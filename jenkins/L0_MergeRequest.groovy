@@ -1041,8 +1041,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 stage("[Build-Docker-Images] Remote Run") {
                     def parameters = getCommonParameters()
                     String globalVarsJson = writeJSON returnText: true, json: globalVars
+                    def branch = env.gitlabBranch ? env.gitlabBranch : "main"
+                    if (globalVars[GITHUB_PR_API_URL]) {
+                        branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                    }
+
                     parameters += [
-                        'branch': env.gitlabBranch ? env.gitlabBranch : "main",
+                        'branch': branch,
                         'action': "push",
                         'globalVars': globalVarsJson,
                     ]
