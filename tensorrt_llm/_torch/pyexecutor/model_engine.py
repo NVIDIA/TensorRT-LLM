@@ -310,11 +310,6 @@ class PyTorchModelEngine(ModelEngine):
         )
 
         attn_backend = pytorch_backend_config.attn_backend
-        # _convert_load_format should already be called by
-        # __post_init__, but call it again just in case.
-        # The config object is not a frozen data class, so it's
-        # possible the user changed it after initialization.
-        pytorch_backend_config._convert_load_format()
         self.model = self._load_model(
             model_path,
             mapping=self.mapping,
