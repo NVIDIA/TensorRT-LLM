@@ -91,8 +91,8 @@ def _run_moe_ep_test(num_experts: int, topk: int, rank: int, world_size: int):
     torch.testing.assert_close(output_trt, ref_output, rtol=5e-2, atol=5e-2)
 
 
-@pytest.mark.parametrize("num_experts", [8, 10])
-@pytest.mark.parametrize("topk", [3, 4])
+@pytest.mark.parametrize("num_experts", [10])
+@pytest.mark.parametrize("topk", [3, 10])
 @pytest.mark.parametrize("device_count", get_device_counts())
 def test_moe_ep(device_count, num_experts, topk):
     spawn_multiprocess_job(job=partial(_run_moe_ep_test, num_experts, topk), size=device_count)
