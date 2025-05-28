@@ -1295,8 +1295,8 @@ public:
     [[nodiscard]] static BlocksPerWindow calculateMaxNumBlocks(KvCacheConfig const& config, bool isCrossAttention,
         nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         tensorrt_llm::runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager,
-        std::map<SizeType32, std::vector<SizeType32>> const& managedLayersPerWindowSize, SizeType32 extraCostMemory,
-        float kvCacheManagerFraction, SizeType32 kvFactor = 2);
+        std::map<SizeType32, std::vector<SizeType32>> const& managedLayersPerWindowSize, float kvCacheManagerFraction,
+        SizeType32 kvFactor = 2, size_t extraCostMemory = 0);
 
     /// @brief Calculates the maximum batch size that can fit the kv-cache, given that all sequences in the batch have
     /// the provided input and output length.

@@ -546,8 +546,7 @@ void TrtGptModelInflightBatching::adjustMaxAttentionWindow(SizeType32 numPrimary
 }
 
 std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::createKvCacheManager(
-    KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType, SizeType32 extraCostMemory,
-    float kvCacheManagerFraction)
+    KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType, size_t extraCostMemory, float kvCacheManagerFraction)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     bool isCrossAttention = kvCacheType == KvCacheType::kCROSS;
@@ -611,7 +610,7 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
 
     auto const blocksPerWindow
         = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, isCrossAttention, kvDtype, mModelConfig, mWorldConfig,
-            mRuntime->getBufferManager(), managedLayersPerWindowSize, extraCostMemory, kvCacheManagerFraction);
+            mRuntime->getBufferManager(), managedLayersPerWindowSize, kvCacheManagerFraction, 2, extraCostMemory);
 
     auto kvCacheManager = std::make_shared<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
         blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,

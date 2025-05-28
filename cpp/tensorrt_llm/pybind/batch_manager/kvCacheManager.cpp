@@ -325,8 +325,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
     py::classh<tbk::BaseKVCacheManager, PyKvCacheManager>(m, "BaseKVCacheManager")
         .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, py::arg("config"),
             py::arg("is_cross_attention"), py::arg("dtype"), py::arg("model_config"), py::arg("world_config"),
-            py::arg("buffer_manager"), py::arg("kvFactor"), py::arg("managed_layers_per_window_size"),
-            py::arg("kv_cache_manager_fraction"), py::arg("extra_cost_memory") = 0)
+            py::arg("buffer_manager"), py::arg("managed_layers_per_window_size"), py::arg("kv_cache_manager_fraction"),
+            py::arg("kvFactor"), py::arg("extra_cost_memory") = 0)
         .def("allocate_pools", &BaseKVCacheManager::allocatePools)
         .def("release_pools", &BaseKVCacheManager::releasePools)
         .def("start_scheduling", &BaseKVCacheManager::startScheduling)

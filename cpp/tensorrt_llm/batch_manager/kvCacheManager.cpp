@@ -2023,11 +2023,12 @@ std::map<SizeType32, std::vector<SizeType32>> BaseKVCacheManager::calculateManag
 BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& config, bool isCrossAttention,
     nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     runtime::BufferManager const& bufferManager,
-    std::map<SizeType32, std::vector<SizeType32>> const& managedLayersPerWindowSize, SizeType32 extraCostMemory,
-    float kvCacheManagerFraction, SizeType32 kvFactor)
+    std::map<SizeType32, std::vector<SizeType32>> const& managedLayersPerWindowSize, float kvCacheManagerFraction,
+    SizeType32 kvFactor, size_t extraCostMemory)
 {
-    TLLM_CUDA_CHECK(::cudaDeviceSynchronize());
-    auto const [freeMem, totalMem] = tc::getDeviceMemoryInfo(config.useUvm);
+    auto const freeMemFraction = config.freeGpuMemoryFraction.value_or(KvCacheConfig::kDefaultGpuMemFraction);
+    TLLM_CHECK_WITH_INFO(freeMemFraction < 1.0F,
+        "Invalid freeMemFraction, freeMemFraction (%f) must be smaller than 1.0f", freeMemFraction);
     std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow;
     for (auto const& [windowSize, managedLayers] : managedLayersPerWindowSize)
     {
@@ -2036,6 +2037,9 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         auto const cacheSizeBytesPerToken = cacheSizePerToken * BufferDataType(dtype).getSize();
         cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
     }
+    TLLM_CUDA_CHECK(::cudaDeviceSynchronize());
+    auto const [freeMem, totalMem] = tc::getDeviceMemoryInfo(config.useUvm);
+
     auto const extraCostMemoryBytes = extraCostMemory
         * std::accumulate(cacheSizeBytesPerTokenPerWindow.cbegin(), cacheSizeBytesPerTokenPerWindow.cend(),
             SizeType32{0}, [](SizeType32 acc, auto const cost) { return cost.second; });
@@ -2049,9 +2053,6 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
     TLLM_LOG_DEBUG(
         "extraCostMemoryBytes [all windows] [Gib]: %0.2f", extraCostMemoryBytes / static_cast<double>(1 << 30));
 
-    auto const freeMemFraction = config.freeGpuMemoryFraction.value_or(KvCacheConfig::kDefaultGpuMemFraction);
-    TLLM_CHECK_WITH_INFO(freeMemFraction < 1.0F,
-        "Invalid freeMemFraction, freeMemFraction (%f) must be smaller than 1.0f", freeMemFraction);
     auto const tokensPerBlock = modelConfig.getTokensPerBlock();
     auto const calculatePrimaryBlocks
         = [&](SizeType32 windowSize, float windowSizeFraction, SizeType32 cacheSizeBytesPerToken)
