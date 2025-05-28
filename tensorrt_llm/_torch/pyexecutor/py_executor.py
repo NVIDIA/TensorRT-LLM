@@ -1960,6 +1960,10 @@ class PyExecutor:
                 left_requests.append(request)
         self.active_requests = left_requests
 
+        # When enable attention dp, each rank does not have full copy of requests
+        # so we need to remove the cancel requests not in the local rank
+        self.canceled_req_ids.clear()
+
         # enqueue the cancelled requests' responses as they are not
         # active_requests and be discarded in the sampler loop.
         self._enqueue_responses(cancelled_responses)
