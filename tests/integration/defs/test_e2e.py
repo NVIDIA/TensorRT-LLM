@@ -625,11 +625,17 @@ def temp_extra_llm_api_options_file(request):
                 }
             }
 
+            pytorch_backend_config = {}
             if request.node.callspec.params['pytorch_backend_config']:
-                extra_llm_api_options_dict["pytorch_backend_config"] = {
+                pytorch_backend_config = {
                     "use_cuda_graph": True,
-                    "cuda_graph_batch_sizes": [1, 2, 3],
+                    # trtllm-bench will set cuda_max_batch_size to
+                    # max_batch_size, so the cuda_graph_batch_sizes is not
+                    # needed.
+                    # "cuda_graph_batch_sizes": [1, 2, 3],
                 }
+            # Flatten the pytorch_backend_config
+            extra_llm_api_options_dict.update(pytorch_backend_config)
 
             with open(temp_file_path, 'w') as f:
                 yaml.dump(extra_llm_api_options_dict, f)
@@ -1981,7 +1987,6 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
 
     from tensorrt_llm import SamplingParams
     from tensorrt_llm._torch import LLM
-    from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
     from tensorrt_llm.sampling_params import SamplingParams
     prompts = [
         "Hello, my name is",
@@ -1994,8 +1999,8 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
     sampling_param = SamplingParams(max_tokens=32, return_context_logits=True)
     with LLM(
             model=model_dir,
-            pytorch_backend_config=PyTorchConfig(
-                attn_backend=backend, disable_overlap_scheduler=True),
+            attn_backend=backend,
+            disable_overlap_scheduler=True,
     ) as llm:
 
         outputs = llm.generate(prompts, sampling_params=sampling_param)

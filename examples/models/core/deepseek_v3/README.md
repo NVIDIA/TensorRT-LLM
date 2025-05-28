@@ -140,10 +140,9 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
         --num-requests 24 > /tmp/benchmarking_64k.txt
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
-pytorch_backend_config:
-  use_cuda_graph: true
-  cuda_graph_padding_enabled: true
-  cuda_graph_batch_sizes: [1, 4, 8, 12]
+use_cuda_graph: true
+cuda_graph_padding_enabled: true
+cuda_graph_batch_sizes: [1, 4, 8, 12]
 EOF
 
 trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} throughput \
@@ -168,11 +167,10 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
         --num-requests 4 > /tmp/benchmarking_128k.txt
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
-pytorch_backend_config:
-  use_cuda_graph: true
-  cuda_graph_padding_enabled: true
-  cuda_graph_batch_sizes: [1, 2]
-  moe_max_num_tokens: 16384
+use_cuda_graph: true
+cuda_graph_padding_enabled: true
+cuda_graph_batch_sizes: [1, 2]
+moe_max_num_tokens: 16384
 EOF
 
 trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} throughput \
@@ -193,8 +191,7 @@ Evaluate the model accuracy using `trtllm-eval`.
 1. (Optional) Prepare an advanced configuration file:
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-pytorch_backend_config:
-    use_cuda_graph: true
+use_cuda_graph: true
 enable_attention_dp: true
 EOF
 ```
@@ -236,21 +233,20 @@ To serve the model using `trtllm-serve`:
 
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-pytorch_backend_config:
-    use_cuda_graph: true
-    cuda_graph_padding_enabled: true
-    cuda_graph_batch_sizes:
-    - 1
-    - 2
-    - 4
-    - 8
-    - 16
-    - 32
-    - 64
-    - 128
-    - 256
-    - 384
-    print_iter_log: true
+use_cuda_graph: true
+cuda_graph_padding_enabled: true
+cuda_graph_batch_sizes:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  - 64
+  - 128
+  - 256
+  - 384
+print_iter_log: true
 enable_attention_dp: true
 EOF
 
@@ -427,21 +423,20 @@ python3 /path/to/TensorRT-LLM/benchmarks/cpp/prepare_dataset.py \
     --input-mean=1024 --output-mean=2048 --input-stdev=0 --output-stdev=0 > /tmp/dataset.txt
 
 cat >/path/to/TensorRT-LLM/extra-llm-api-config.yml <<EOF
-pytorch_backend_config:
-    use_cuda_graph: true
-    cuda_graph_padding_enabled: true
-    cuda_graph_batch_sizes:
-    - 1
-    - 2
-    - 4
-    - 8
-    - 16
-    - 32
-    - 64
-    - 128
-    - 256
-    - 384
-    print_iter_log: true
+use_cuda_graph: true
+cuda_graph_padding_enabled: true
+cuda_graph_batch_sizes:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  - 64
+  - 128
+  - 256
+  - 384
+print_iter_log: true
 enable_attention_dp: true
 EOF
 ```
@@ -605,9 +600,8 @@ To enable FP8 MLA, modify the `kv_cache_quant_algo` property. The following show
 Alternatively, configure FP8 MLA through the `kv_cache_dtype` of the PyTorch backend config. An example is to use `--kv_cache_dtype` of `quickstart_advanced.py`. Also, you can edit `extra-llm-api-config.yml` consumed by `--extra_llm_api_options` of `trtllm-serve`, `trtllm-bench` and so on:
 ```yaml
 # ...
-pytorch_backend_config:
-  kv_cache_dtype: fp8
-  # ...
+kv_cache_dtype: fp8
+# ...
 ```
 
 ### W4AFP8

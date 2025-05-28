@@ -653,21 +653,20 @@ To serve the model using `trtllm-serve`:
 
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-pytorch_backend_config:
-    use_cuda_graph: true
-    cuda_graph_padding_enabled: true
-    cuda_graph_batch_sizes:
-    - 1
-    - 2
-    - 4
-    - 8
-    - 16
-    - 32
-    - 64
-    - 128
-    - 256
-    - 384
-    print_iter_log: true
+use_cuda_graph: true
+cuda_graph_padding_enabled: true
+cuda_graph_batch_sizes:
+- 1
+- 2
+- 4
+- 8
+- 16
+- 32
+- 64
+- 128
+- 256
+- 384
+print_iter_log: true
 enable_attention_dp: true
 EOF
 

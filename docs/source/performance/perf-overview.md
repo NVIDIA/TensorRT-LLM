@@ -200,11 +200,9 @@ trtllm-bench --model $model_name throughput --dataset $dataset_file --backend py
 
 `llm_options.yml`
 ```yaml
-
- pytorch_backend_config:
-  use_cuda_graph: true
-  cuda_graph_padding_enabled: true
-  cuda_graph_batch_sizes:
+use_cuda_graph: true
+cuda_graph_padding_enabled: true
+cuda_graph_batch_sizes:
   - 1
   - 2
   - 4
