@@ -600,6 +600,7 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
             enable_flash_mla=self.model.model_config.enable_flash_mla)
+        # print("minwei self.attn_metadata: ", self.attn_metadata)
         return self.attn_metadata
 
     def _set_up_spec_metadata(
@@ -914,6 +915,7 @@ class PyTorchModelEngine(ModelEngine):
             all_prompt_tokens = request.get_tokens(0)
             draft_lens.append(0)
 
+            logger.warning(f"minwei context_chunk_size: {request.context_chunk_size}")
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
@@ -1596,6 +1598,7 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager: ResourceManager,
                 new_tensors_device: Optional[Dict[str, torch.Tensor]] = None,
                 extra_model_inputs: Optional[Dict[str, Any]] = None):
+        # logger.warning("minwei forward ", scheduled_requests.context_requests[0].__dict__)
 
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)

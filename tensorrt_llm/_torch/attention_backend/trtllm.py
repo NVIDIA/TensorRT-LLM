@@ -223,6 +223,8 @@ class TrtllmAttentionWrapper:
             self.rope_params.max_positions = max_sequence_length
             self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
             )
+        # import traceback; traceback.print_stack()
+        # import pdb; pdb.set_trace()
 
     def run(
         self,
@@ -454,6 +456,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int8,
             )
         if self.kv_cache_manager is not None:
+            # print("minwei self.max_blocks_per_seq: ", self.kv_cache_manager.max_blocks_per_seq)
             self.kv_cache_block_offsets = torch.empty(
                 [
                     self.kv_cache_manager.num_pools, self.max_num_requests, 2,
@@ -536,6 +539,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         # kv block offsets
         assert self.request_ids is not None
+        # minwei
         if self.kv_cache_manager is not None:
             self.kv_cache_manager.impl.copy_batch_block_offsets(
                 self.host_kv_cache_block_offsets, self.request_ids)

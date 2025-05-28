@@ -213,6 +213,7 @@ class LLM:
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
+        logger.warning("minwei inside generate")
         unbatched = not isinstance(inputs, list)
         if not unbatched:
             if isinstance(inputs[0], int):
@@ -335,6 +336,8 @@ class LLM:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
+
+        logger.warning("minwei prompt_token_ids length is ", len(prompt_token_ids))
 
         self._check_arguments(
             len(prompt_token_ids),

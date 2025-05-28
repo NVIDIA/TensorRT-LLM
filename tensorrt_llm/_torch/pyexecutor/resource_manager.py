@@ -97,6 +97,7 @@ class KVCacheManager(BaseResourceManager):
         # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
         # It's derived from the model's BuildConfig for consistency with the C++ backend.
         max_seq_len: int,
+        context_chunk_size: int,
         max_batch_size: int,
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
@@ -193,6 +194,7 @@ class KVCacheManager(BaseResourceManager):
             'max_num_sequences': max_batch_size,
             'max_beam_width': 1,  # TODO: more than 1 beam?
             'max_attention_window_vec': [self.max_attention_window],
+            'chunk_context_size': context_chunk_size,
             'temp_attention_window_inputs': None,
             'dtype': dtype,
             'sink_token_length': sink_token_length,
@@ -227,6 +229,7 @@ class KVCacheManager(BaseResourceManager):
                           mapping: Mapping,
                           kv_cache_type: CacheTypeCpp = CacheTypeCpp.SELF,
                           dtype: DataType = DataType.HALF) -> "KVCacheManager":
+        # minwei: change chunk size!
         return cls(
             kv_cache_config,
             kv_cache_type,
@@ -238,6 +241,7 @@ class KVCacheManager(BaseResourceManager):
             head_dim=model_config.size_per_head,
             tokens_per_block=model_config.tokens_per_block,
             max_seq_len=model_config.max_seq_len,
+            context_chunk_size=1024,
             max_batch_size=model_config.max_batch_size,
             mapping=mapping,
             dtype=dtype)
@@ -278,13 +282,21 @@ class KVCacheManager(BaseResourceManager):
                         req_beam_width, req)
             else:
                 if req.is_first_context_chunk():
-                    self.impl.add_sequence(req.py_request_id, req.prompt_len,
+                    print(f"minwei preparing resource for first chunk: {req.__dict__}")
+                    print(f"minwei req.context_chunk_size: {req.context_chunk_size}")
+                    self.impl.add_sequence(req.py_request_id, req.context_chunk_size,
                                            req_beam_width, req)
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
                     if req.py_draft_tokens is not None:
                         for _ in range(len(req.py_draft_tokens)):
                             self.impl.add_token(req.py_request_id)
+                else:
+                    # minwei
+                    # not first chunk
+                    print(f"minwei preparing resource for not first chunk: {req.__dict__}")
+                    for _ in range(req.context_chunk_size):
+                        self.impl.add_token(req.py_request_id)
 
         for req in generation_batch:
             self.impl.add_token(req.py_request_id)
@@ -306,6 +318,9 @@ class KVCacheManager(BaseResourceManager):
             sampling_params = SamplingParams()
             token_num = token_nums[
                 i] if token_nums is not None else 1 + max_num_draft_tokens
+            # minwei
+            if token_num > 3072:
+                token_num = 3072
             encoder_input_tokens = [
                 1
             ] * token_num if self.impl.cross_kv else None

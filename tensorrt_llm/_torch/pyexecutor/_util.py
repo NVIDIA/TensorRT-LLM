@@ -296,6 +296,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         else:
             if spec_config is not None:
                 num_hidden_layers += get_num_spec_layers(spec_config)
+            # minwei: change chunk size!
             return KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -304,6 +305,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 head_dim=head_dim,
                 tokens_per_block=executor_config.tokens_per_block,
                 max_seq_len=executor_config.max_seq_len,
+                context_chunk_size=1024,
                 max_batch_size=executor_config.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,

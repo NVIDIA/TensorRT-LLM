@@ -5,6 +5,7 @@ from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
                                  MTPDecodingConfig)
+from tensorrt_llm.logger import logger
 
 example_prompts = [
     "Hello, my name is",
@@ -116,6 +117,7 @@ def setup_llm(args):
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=args.kv_cache_enable_block_reuse,
         free_gpu_memory_fraction=args.kv_cache_fraction,
+        max_attention_window=[2048],
     )
 
     spec_decode_algo = args.spec_decode_algo.upper(
@@ -155,16 +157,25 @@ def setup_llm(args):
 
 
 def main():
+    logger.set_level("warning")
     args = parse_arguments()
     prompts = args.prompt if args.prompt else example_prompts
 
+    if True:
+        with open("/workspace/data/prompt_96k_success_0.txt", "r") as f:
+        # with open("/workspace/data/prompt_96k_2k.txt", "r") as f:
+            prompts = [f.read()]
+
+    count_words = len(prompts[0].split())
+
+    logger.critical("minwei count_words is ", count_words)
     llm, sampling_params = setup_llm(args)
     outputs = llm.generate(prompts, sampling_params)
 
     for i, output in enumerate(outputs):
         prompt = output.prompt
         generated_text = output.outputs[0].text
-        print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+        print(f"[{i}] Generated text: {generated_text!r}")
 
 
 if __name__ == '__main__':

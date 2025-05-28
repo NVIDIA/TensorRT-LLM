@@ -319,24 +319,26 @@ class GenerationMixin:
                                 dim_range=kv_dim_range)
                     past_key_value.append(kv)
             else:
+                ENABLE_EXTRA_BLOCK = False
+                extra_block_size = 1 if ENABLE_EXTRA_BLOCK else 0
                 if enable_ctx_gen_opt_profiles:
                     max_blocks_per_seq_range = [
                         [
-                            math.ceil(kv_cache_range[0][0] / tokens_per_block),
-                            math.ceil(kv_cache_range[0][1] / tokens_per_block),
-                            math.ceil(kv_cache_range[0][2] / tokens_per_block)
+                            math.ceil(kv_cache_range[0][0] / tokens_per_block) + extra_block_size,
+                            math.ceil(kv_cache_range[0][1] / tokens_per_block) + extra_block_size,
+                            math.ceil(kv_cache_range[0][2] / tokens_per_block) + extra_block_size,
                         ],
                         [
-                            math.ceil(kv_cache_range[1][0] / tokens_per_block),
-                            math.ceil(kv_cache_range[1][1] / tokens_per_block),
-                            math.ceil(kv_cache_range[1][2] / tokens_per_block)
+                            math.ceil(kv_cache_range[1][0] / tokens_per_block) + extra_block_size,
+                            math.ceil(kv_cache_range[1][1] / tokens_per_block) + extra_block_size,
+                            math.ceil(kv_cache_range[1][2] / tokens_per_block) + extra_block_size,
                         ]
                     ]
                 else:
                     max_blocks_per_seq_range = [[
-                        math.ceil(kv_cache_range[0][0] / tokens_per_block),
-                        math.ceil(kv_cache_range[0][1] / tokens_per_block),
-                        math.ceil(kv_cache_range[0][2] / tokens_per_block)
+                        math.ceil(kv_cache_range[0][0] / tokens_per_block) + extra_block_size,
+                        math.ceil(kv_cache_range[0][1] / tokens_per_block) + extra_block_size,
+                        math.ceil(kv_cache_range[0][2] / tokens_per_block) + extra_block_size,
                     ]] * num_profiles
 
                 NUM_KV_CACHE_POOLS = -1  # the number of unique variable window sizes, which is only known at runtime, affects the number of pools.

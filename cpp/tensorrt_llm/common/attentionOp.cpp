@@ -1581,7 +1581,24 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.packedMaskPtr = params.attention_packed_mask;
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
+            int max_blocks_per_seq = params.max_blocks_per_sequence;
             fmhaParams.pagedKvCache = kv_cache_buffer;
+            std::vector<int> data(max_blocks_per_seq * 2);
+            cudaMemcpyAsync(data.data(), kv_cache_buffer.data, max_blocks_per_seq * 2 * sizeof(int), cudaMemcpyDeviceToHost, stream);
+            sync_check_cuda_error(stream);
+            printf("minwei: ");
+            printf("qlen is: %d\n", fmhaParams.qSeqLen);
+            printf("kvlen is: %d\n", fmhaParams.kvSeqLen);
+            printf("max_blocks_per_seq: %d\n", max_blocks_per_seq);
+            printf("---\n");
+            for (int i = 0; i < max_blocks_per_seq; i++) {
+                printf("%d ", data[i]);
+            }
+            printf("\n---\n");
+            for (int i = max_blocks_per_seq; i < max_blocks_per_seq *2; i++) {
+                printf("%d ", data[i]);
+            }
+            printf("\n---\n");
         }
         fmhaParams.cuQSeqLenPtr = cu_q_seqlens;
         fmhaParams.kvSeqLenPtr = decoder_params.seqKVLengths;
@@ -2026,8 +2043,6 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
             TLLM_CHECK_WITH_INFO(false, "No available kernels are found for FP4 output.");
         }
     }
-    
-    assert(false);
 
     // This is the number of kv tokens that q needs to visit, but excluding one as it will be processed before the kv
     // loop.
