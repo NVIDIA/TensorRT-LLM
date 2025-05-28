@@ -103,7 +103,7 @@ methods:
         annotation: bool
         default: false
       kv_cache_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConfig]
+        annotation: tensorrt_llm.llmapi.llm_args.KvCacheConfig
         default: null
     return_annotation: None
   generate:

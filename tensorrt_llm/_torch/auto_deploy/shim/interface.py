@@ -106,8 +106,6 @@ class AutoDeployConfig(PyTorchConfig):
     free_mem_ratio: float = 0.8
 
     def __post_init__(self):
-        super().__post_init__()
-
         # we don't want to loose the default values for model_kwargs unless explicitly set by the
         # user. They are not preserved by the standard initialization process since they whole dict
         # gets replaced by the user provided one. We don't want that though.

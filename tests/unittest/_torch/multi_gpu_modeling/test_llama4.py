@@ -7,7 +7,6 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 
 
 @pytest.mark.parametrize(
@@ -48,8 +47,7 @@ def test_llama4(model_name, backend, tp_size, use_cuda_graph,
         " the head of state and head of government of the", " solid white"
     ]
 
-    pytorch_config = PyTorchConfig(attn_backend=backend,
-                                   use_cuda_graph=use_cuda_graph)
+    pytorch_config = dict(attn_backend=backend, use_cuda_graph=use_cuda_graph)
     model_dir = str(llm_models_root() / "llama4-models" / model_name)
 
     llm = LLM(
@@ -57,7 +55,7 @@ def test_llama4(model_name, backend, tp_size, use_cuda_graph,
         tensor_parallel_size=tp_size,
         moe_expert_parallel_size=ep_size,
         moe_tensor_parallel_size=tp_size // ep_size,
-        pytorch_backend_config=pytorch_config,
+        **pytorch_config,
         pipeline_parallel_size=pp_size,
         enable_attention_dp=enable_attention_dp,
     )

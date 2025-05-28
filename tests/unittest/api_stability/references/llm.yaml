@@ -35,7 +35,7 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
         default: null
       scheduler_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.SchedulerConfig]
+        annotation: tensorrt_llm.llmapi.llm_args.SchedulerConfig
         default: null
       extended_runtime_perf_knob_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig]
