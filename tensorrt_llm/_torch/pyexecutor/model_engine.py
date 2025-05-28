@@ -447,6 +447,7 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = KV_CACHE_MANAGER_KEY
         self.lora_model_config: Optional[LoraModelConfig] = None
+        self.cuda_graph_dummy_request = None
 
     def set_lora_model_config(self, lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str]):
@@ -744,8 +745,14 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager=spec_resource_manager)
         return self.spec_metadata
 
-    def _get_padded_batch(self, scheduled_requests: ScheduledRequests,
-                          kv_cache_manager):
+    def _maybe_pad_batch(self, scheduled_requests: ScheduledRequests,
+                         kv_cache_manager):
+        """
+        CUDA graphs can only be used for specific batch sizes.
+
+        If using CUDA graphs, this method will add dummy requests to the given
+        batch so we can always use a CUDA graph.
+        """
         can_run_cuda_graph = scheduled_requests.can_run_cuda_graph
         batch_size = scheduled_requests.batch_size
         new_batch_size = batch_size
@@ -779,40 +786,16 @@ class PyTorchModelEngine(ModelEngine):
         if available_blocks < padding_size or padding_size + scheduled_requests.batch_size > self.batch_size:
             return None
 
-        # Set the dummy request ids starting at (uint64 max value - padding_size - 1) to avoid conflict with
-        # active request IDs
-        max_req_id = MAX_UINT64 - padding_size - 1
-        generation_requests = kv_cache_manager.add_dummy_requests(
-            [max_req_id + i + 1 for i in range(padding_size)],
-            is_gen=True,
-            max_num_draft_tokens=self.max_draft_len)
-        for req in generation_requests:
-            req.is_cuda_graph_dummy = True
-        scheduled_requests.generation_requests.extend(generation_requests)
-        return generation_requests
+        if self.cuda_graph_dummy_request is None:
+            self.cuda_graph_dummy_request = kv_cache_manager.add_dummy_requests(
+                [MAX_UINT64 - 1],
+                is_gen=True,
+                max_num_draft_tokens=self.max_draft_len)[0]
+            self.cuda_graph_dummy_request.is_cuda_graph_dummy = True
 
-    @contextlib.contextmanager
-    def _maybe_pad_batch(self, scheduled_requests: ScheduledRequests,
-                         kv_cache_manager):
-        """
-        CUDA graphs can only be used for specific batch sizes.
-
-        If using CUDA graphs, this method will add dummy requests to the given
-        batch so we can always use a CUDA graph. It is a context manager
-        because the padded requests allocate KV pages that should be freed
-        when you're done with them.
-        """
-        padding_requests = self._get_padded_batch(scheduled_requests,
-                                                  kv_cache_manager)
-        try:
-            yield scheduled_requests
-        finally:
-            if padding_requests is not None:
-                padding_len = len(padding_requests)
-                scheduled_requests.generation_requests = scheduled_requests.generation_requests[:
-                                                                                                -padding_len]
-                for req in padding_requests:
-                    kv_cache_manager.free_resources(req)
+        scheduled_requests.generation_requests.extend(
+            [self.cuda_graph_dummy_request] * padded_batch_size)
+        return scheduled_requests
 
     def _round_up_batch_size(self, batch_size: int) -> int:
         """
@@ -1863,59 +1846,56 @@ class PyTorchModelEngine(ModelEngine):
 
             return self._forward_step(inputs, gather_ids)
 
-        with self._maybe_pad_batch(scheduled_requests,
-                                   kv_cache_manager) as scheduled_requests:
-            maybe_graph = self._maybe_get_cuda_graph(
-                scheduled_requests, spec_config=self.spec_config)
-            if maybe_graph is not None:
-                attn_metadata = maybe_graph.attn_metadata
-                if self.is_spec_decode:
-                    spec_metadata = maybe_graph.spec_metadata
-            else:
-                attn_metadata = self.attn_metadata
-                if self.is_spec_decode:
-                    spec_metadata = self.spec_metadata
+        scheduled_requests = self._maybe_pad_batch(scheduled_requests,
+                                                   kv_cache_manager)
+        maybe_graph = self._maybe_get_cuda_graph(scheduled_requests,
+                                                 spec_config=self.spec_config)
+        if maybe_graph is not None:
+            attn_metadata = maybe_graph.attn_metadata
+            if self.is_spec_decode:
+                spec_metadata = maybe_graph.spec_metadata
+        else:
+            attn_metadata = self.attn_metadata
+            if self.is_spec_decode:
+                spec_metadata = self.spec_metadata
 
-            inputs, gather_ids = self._prepare_inputs(scheduled_requests,
-                                                      kv_cache_manager,
-                                                      attn_metadata,
-                                                      spec_metadata,
-                                                      new_tensors_device)
-            if extra_model_inputs is not None:
-                inputs.update(extra_model_inputs)
-            self.last_spec_metadata = spec_metadata
+        inputs, gather_ids = self._prepare_inputs(scheduled_requests,
+                                                  kv_cache_manager,
+                                                  attn_metadata, spec_metadata,
+                                                  new_tensors_device)
+        if extra_model_inputs is not None:
+            inputs.update(extra_model_inputs)
+        self.last_spec_metadata = spec_metadata
 
-            self.iter_counter += 1
+        self.iter_counter += 1
+        if maybe_graph is None:
+            outputs = self._forward_step(inputs, gather_ids)
+        else:
+            if maybe_graph.needs_capture():
+                pool = maybe_graph.capture(
+                    lambda inputs: self._forward_step(inputs,
+                                                      gather_ids=gather_ids),
+                    self._cuda_graph_mem_pool,
+                    extra_model_inputs,
+                )
+                self._cuda_graph_mem_pool = pool
 
-            if maybe_graph is None:
-                outputs = self._forward_step(inputs, gather_ids)
-            else:
-                if maybe_graph.needs_capture():
-                    pool = maybe_graph.capture(
-                        lambda inputs: self._forward_step(
-                            inputs, gather_ids=gather_ids),
-                        self._cuda_graph_mem_pool,
-                        extra_model_inputs,
-                    )
-                    self._cuda_graph_mem_pool = pool
+            outputs = maybe_graph.run(inputs, extra_model_inputs)
 
-                outputs = maybe_graph.run(inputs, extra_model_inputs)
+        # Note: To overlap the CPU and GPU computation as much as possible,
+        # guided_decoder.build should be called immediately after the launch of the single step;
+        # while guided_decoder.execute should be called right before the samplings.
+        # We can insert other CPU computation between them in the future.
+        if self.mapping.is_last_pp_rank() and self.guided_decoder is not None:
+            seq_slot_manager = resource_manager.get_resource_manager(
+                "seq_slot_manager")
+            self.guided_decoder.build(scheduled_requests, seq_slot_manager)
+            self.guided_decoder.execute(scheduled_requests, outputs['logits'],
+                                        seq_slot_manager)
 
-            # Note: To overlap the CPU and GPU computation as much as possible,
-            # guided_decoder.build should be called immediately after the launch of the single step;
-            # while guided_decoder.execute should be called right before the samplings.
-            # We can insert other CPU computation between them in the future.
-            if self.mapping.is_last_pp_rank(
-            ) and self.guided_decoder is not None:
-                seq_slot_manager = resource_manager.get_resource_manager(
-                    "seq_slot_manager")
-                self.guided_decoder.build(scheduled_requests, seq_slot_manager)
-                self.guided_decoder.execute(scheduled_requests,
-                                            outputs['logits'], seq_slot_manager)
+        self._execute_logit_post_processors(scheduled_requests, outputs)
 
-            self._execute_logit_post_processors(scheduled_requests, outputs)
-
-            return outputs
+        return outputs
 
     def model_forward(self, **kwargs):
         attrs = get_model_extra_attrs()
