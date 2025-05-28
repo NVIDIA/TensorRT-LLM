@@ -87,63 +87,6 @@ class PyTorchConfig:
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
 
-    def _convert_load_format(self) -> None:
-        if isinstance(self.load_format, LoadFormat):
-            return
-        load_format = self.load_format.upper()
-        if load_format not in LoadFormat.__members__:
-            raise NotImplementedError(f"Invalid LoadFormat: {self.load_format}")
-        self.load_format = LoadFormat[load_format]
-
-    def __post_init__(self) -> None:
-        if self.torch_compile_enabled and self.torch_compile_piecewise_cuda_graph:
-            assert self.torch_compile_fullgraph, "Fullgraph must be enabled for piecewise CUDA graph."
-
-        if self.cuda_graph_batch_sizes is not None:
-            assert self.cuda_graph_max_batch_size == 0, (
-                "Please don't set both cuda_graph_batch_sizes "
-                "and cuda_graph_max_batch_size.")
-            self.cuda_graph_batch_sizes = sorted(self.cuda_graph_batch_sizes)
-        else:
-            self.cuda_graph_max_batch_size = self.cuda_graph_max_batch_size or 128
-            if self.cuda_graph_padding_enabled:
-                self.cuda_graph_batch_sizes = [1, 2, 4] + [
-                    i * 8 for i in range(1, 17)
-                ]
-            else:
-                self.cuda_graph_batch_sizes = list(range(1, 32)) + [32, 64, 128]
-            self.cuda_graph_batch_sizes += [
-                2**i for i in range(
-                    8, math.floor(math.log(self.cuda_graph_max_batch_size, 2)))
-            ]
-            self.cuda_graph_batch_sizes = [
-                size for size in self.cuda_graph_batch_sizes
-                if size <= self.cuda_graph_max_batch_size
-            ]
-            if self.cuda_graph_max_batch_size != self.cuda_graph_batch_sizes[
-                    -1]:
-                self.cuda_graph_batch_sizes.append(
-                    self.cuda_graph_max_batch_size)
-
-        if isinstance(self.moe_load_balancer, str):
-            assert os.path.exists(self.moe_load_balancer)
-            if self.moe_load_balancer.endswith(".json"):
-                with open(self.moe_load_balancer) as f:
-                    self.moe_load_balancer = json.load(f)
-            elif self.moe_load_balancer.endswith((".yaml", ".yml")):
-                with open(self.moe_load_balancer) as f:
-                    self.moe_load_balancer = yaml.safe_load(f)
-            else:
-                raise ValueError(
-                    f"Unsupported moe load balancer config file: {self.moe_load_balancer}"
-                )
-        if isinstance(self.moe_load_balancer, dict):
-            self.moe_load_balancer = MoeLoadBalancerConfig(
-                **self.moe_load_balancer)
-
-        self._convert_load_format()
-
->>>>>>> 55761a99d (Cherry-pick feat/llama4's changes)
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'backend',

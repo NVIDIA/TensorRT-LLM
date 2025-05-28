@@ -1576,6 +1576,12 @@ class TorchLlmArgs(BaseLlmArgs):
         "How to load the model weights. By default, detect the weight type from the model checkpoint."
     )
 
+    enable_min_latency: bool = Field(
+        default=False,
+        description=
+        "If true, enable min-latency mode. Currently only used for Llama4.",
+    )
+
     @field_validator('load_format', mode='before')
     @classmethod
     def convert_load_format(cls, v):
@@ -1661,7 +1667,8 @@ class TorchLlmArgs(BaseLlmArgs):
             torch_compile_enable_userbuffers,
             autotuner_enabled=self.autotuner_enabled,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
-            load_format=self.load_format)
+            load_format=self.load_format,
+            enable_min_latency=self.enable_min_latency)
 
     @field_validator('cuda_graph_max_batch_size')
     @classmethod
