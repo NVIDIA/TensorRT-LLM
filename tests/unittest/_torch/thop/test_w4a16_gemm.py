@@ -108,7 +108,8 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         cuda_q_weight = cuda_q_weight.cuda().contiguous()
 
         output = torch.ops.trtllm.w4a16_gemm(
-            input=activation.to(torch.float8_e4m3fn).contiguous(),
+            input=activation.to(activation_type).contiguous()
+            if use_w4a8_awq else activation.contiguous(),  # todo check
             weight=cuda_q_weight,
             scales=scale,
             group_size=group_size,
@@ -129,29 +130,55 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
 
         _utils.woq_assert_near_eq(ref, output, 2)
 
-    # @parameterized.expand([(3, 1024, 64, 64, True, False, True),
-    #                        (128, 1024, 256, 64, True, False, True),
-    #                        (192, 2048, 384, 64, True, False, True),
-    #                        (256, 2048, 1024, 64, True, False, True),
-    #                        (4, 1024, 128, 128, True, False, True),
-    #                        (64, 1024, 256, 128, True, False, True),
-    #                        (384, 2048, 384, 128, True, False, True),
-    #                        (512, 2048, 1024, 128, True, False, True),
-    #                        (4, 1024, 128, 128, True, True, True),
-    #                        (64, 1024, 256, 128, True, True, True),
-    #                        (384, 2048, 384, 128, True, True, True),
-    #                        (512, 2048, 1024, 128, True, True, False)])
-    # def test_matmul_fp16_int4_input(self, m, n, k, group_size, has_pre_quant,
-    #                                 has_zero, has_bias, use_w4a8_awq=True):
-    #     self._run_w4a16_gemm(m,
-    #                          n,
-    #                          k,
-    #                          group_size,
-    #                          torch.float16,
-    #                          torch.quint4x2,
-    #                          has_pre_quant=has_pre_quant,
-    #                          has_zero=has_zero,
-    #                          has_bias=has_bias, use_w4a8_awq=use_w4a8_awq)
+    @parameterized.expand([(3, 1024, 64, 64, True, False, True),
+                           (128, 1024, 256, 64, True, False, True),
+                           (192, 2048, 384, 64, True, False, True),
+                           (256, 2048, 1024, 64, True, False, True),
+                           (4, 1024, 128, 128, True, False, True),
+                           (64, 1024, 256, 128, True, False, True),
+                           (384, 2048, 384, 128, True, False, True),
+                           (512, 2048, 1024, 128, True, False, True),
+                           (4, 1024, 128, 128, True, True, True),
+                           (64, 1024, 256, 128, True, True, True),
+                           (384, 2048, 384, 128, True, True, True),
+                           (512, 2048, 1024, 128, True, True, False)])
+    def test_matmul_fp16_int4_input(self, m, n, k, group_size, has_pre_quant,
+                                    has_zero, has_bias):
+        self._run_w4a16_gemm(m,
+                             n,
+                             k,
+                             group_size,
+                             torch.float16,
+                             torch.quint4x2,
+                             has_pre_quant=has_pre_quant,
+                             has_zero=has_zero,
+                             has_bias=has_bias,
+                             use_w4a8_awq=False)
+
+    @parameterized.expand([(3, 1024, 64, 64, True, False, True),
+                           (128, 1024, 256, 64, True, False, True),
+                           (192, 2048, 384, 64, True, False, True),
+                           (256, 2048, 1024, 64, True, False, True),
+                           (4, 1024, 128, 128, True, False, True),
+                           (64, 1024, 256, 128, True, False, True),
+                           (384, 2048, 384, 128, True, False, True),
+                           (512, 2048, 1024, 128, True, False, True),
+                           (4, 1024, 128, 128, True, True, True),
+                           (64, 1024, 256, 128, True, True, True),
+                           (384, 2048, 384, 128, True, True, True),
+                           (512, 2048, 1024, 128, True, True, False)])
+    def test_matmul_bf16_int4_input(self, m, n, k, group_size, has_pre_quant,
+                                    has_zero, has_bias):
+        self._run_w4a16_gemm(m,
+                             n,
+                             k,
+                             group_size,
+                             torch.bfloat16,
+                             torch.quint4x2,
+                             has_pre_quant=has_pre_quant,
+                             has_zero=has_zero,
+                             has_bias=has_bias,
+                             use_w4a8_awq=False)
 
     @parameterized.expand(
         [(1, 1024, 128, torch.float16, True, True, True, 128, True),
@@ -177,30 +204,6 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                              has_bias=has_bias,
                              group_size=group_size,
                              use_w4a8_awq=use_w4a8_awq)
-
-    # @parameterized.expand([(3, 1024, 64, 64, True, False, True),
-    #                        (128, 1024, 256, 64, True, False, True),
-    #                        (192, 2048, 384, 64, True, False, True),
-    #                        (256, 2048, 1024, 64, True, False, True),
-    #                        (4, 1024, 128, 128, True, False, True),
-    #                        (64, 1024, 256, 128, True, False, True),
-    #                        (384, 2048, 384, 128, True, False, True),
-    #                        (512, 2048, 1024, 128, True, False, True),
-    #                        (4, 1024, 128, 128, True, True, True),
-    #                        (64, 1024, 256, 128, True, True, True),
-    #                        (384, 2048, 384, 128, True, True, True),
-    #                        (512, 2048, 1024, 128, True, True, False)])
-    # def test_matmul_bf16_int4_input(self, m, n, k, group_size, has_pre_quant,
-    #                                 has_zero, has_bias):
-    #     self._run_w4a16_gemm(m,
-    #                          n,
-    #                          k,
-    #                          group_size,
-    #                          torch.bfloat16,
-    #                          torch.quint4x2,
-    #                          has_pre_quant=has_pre_quant,
-    #                          has_zero=has_zero,
-    #                          has_bias=has_bias)
 
 
 if __name__ == "__main__":
