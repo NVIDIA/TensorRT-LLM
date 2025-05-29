@@ -40,7 +40,7 @@ from ..compilation.utils import set_enable_piecewise_cuda_graph_capture_flag
 from ..distributed import MPIDist
 from ..distributed.communicator import init_pp_comm
 from ..metadata import KVCacheParams
-from ..model_config import ModelConfig
+from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
@@ -310,11 +310,6 @@ class PyTorchModelEngine(ModelEngine):
         )
 
         attn_backend = pytorch_backend_config.attn_backend
-        # _convert_load_format should already be called by
-        # __post_init__, but call it again just in case.
-        # The config object is not a frozen data class, so it's
-        # possible the user changed it after initialization.
-        pytorch_backend_config._convert_load_format()
         self.model = self._load_model(
             model_path,
             mapping=self.mapping,
@@ -323,6 +318,7 @@ class PyTorchModelEngine(ModelEngine):
             load_format=pytorch_backend_config.load_format,
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=pytorch_backend_config.moe_max_num_tokens,
+            moe_load_balancer=pytorch_backend_config.moe_load_balancer,
             lora_config=lora_config)
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
@@ -880,7 +876,8 @@ class PyTorchModelEngine(ModelEngine):
                     checkpoint_dir: str,
                     load_format: LoadFormat,
                     max_num_tokens: int,
-                    moe_max_num_tokens: int,
+                    moe_max_num_tokens: Optional[int] = None,
+                    moe_load_balancer: Optional[MoeLoadBalancerConfig] = None,
                     lora_config: Optional[LoraConfig] = None,
                     **kwargs):
         config = ModelConfig.from_pretrained(checkpoint_dir,
@@ -889,6 +886,7 @@ class PyTorchModelEngine(ModelEngine):
         config.spec_config = self.spec_config
         config.max_num_tokens = max_num_tokens
         config.moe_max_num_tokens = moe_max_num_tokens
+        config.moe_load_balancer = moe_load_balancer
         config.lora_config = lora_config
 
         validate_and_set_kv_cache_quant(

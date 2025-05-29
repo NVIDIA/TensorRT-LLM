@@ -43,11 +43,11 @@ from .utils import (PERIODICAL_RESP_IN_AWAIT, ErrorResponse, IntraProcessQueue,
                     is_llm_response)
 
 __all__ = [
-    "ExecutorBindingsWorker",
+    "GenerationExecutorWorker",
 ]
 
 
-class ExecutorBindingsWorker(GenerationExecutor):
+class GenerationExecutorWorker(GenerationExecutor):
 
     class WorkerExit(GeneratorExit):
         pass
@@ -553,7 +553,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
             if isinstance(self.engine, tllm.Executor):
                 self.shutdown()
                 raise self.WorkerExit(
-                    "block_subordinates() should be used in a `with ExecutorBindingsWorker() as ...:` block"
+                    "block_subordinates() should be used in a `with GenerationExecutorWorker() as ...:` block"
                 )
             from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
             if isinstance(self.engine, PyExecutor):
@@ -564,7 +564,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         self.shutdown()
-        return exc_type is None or exc_type == ExecutorBindingsWorker.WorkerExit
+        return exc_type is None or exc_type == GenerationExecutorWorker.WorkerExit
 
     def __del__(self):
         self.shutdown()
@@ -577,7 +577,7 @@ def worker_main(
     log_level: str,
     executor_config: Optional[tllm.ExecutorConfig] = None,
     batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
-    worker_cls: type = ExecutorBindingsWorker,
+    worker_cls: type = GenerationExecutorWorker,
     tracer_init_kwargs: Optional[dict] = None,
     _torch_model_class_mapping: Optional[dict] = None,
     postproc_worker_config: Optional[PostprocWorkerConfig] = None,
@@ -707,7 +707,7 @@ def worker_main(
                         "green")
 
     try:
-        worker: ExecutorBindingsWorker = worker_cls(
+        worker: GenerationExecutorWorker = worker_cls(
             engine,
             executor_config,
             batched_logits_processor,
@@ -752,7 +752,7 @@ def worker_main(
 
                 notify_proxy_threads_to_quit()
 
-        except ExecutorBindingsWorker.WorkerExit as e:
+        except GenerationExecutorWorker.WorkerExit as e:
             # This will capture by the with-statement and exit normally.
             raise e
 
@@ -774,7 +774,7 @@ class AwaitResponseHelper:
         ipc_periodically = 2
         ipc_batched = 3
 
-    def __init__(self, worker: "ExecutorBindingsWorker"):
+    def __init__(self, worker: "GenerationExecutorWorker"):
         # TODO: make worker weakref
         self.worker = worker
         self.handler_kind: AwaitResponseHelper.HandlerKind = AwaitResponseHelper.HandlerKind.unknown

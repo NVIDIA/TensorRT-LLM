@@ -118,6 +118,10 @@ public:
     //! @returns [batchSize, maxBeamWidth], sequence lengths, on gpu
     [[nodiscard]] TensorPtr getSequenceLengths() const;
 
+    //! @param batchIdx index of the batch
+    //! @returns [maxBeamWidth], sequence lengths for request `batchIdx`, on gpu
+    [[nodiscard]] TensorPtr getSequenceLengths(SizeType32 batchIdx) const;
+
     //! @brief Get maxTokensPerStep tokens generated in the last forward pass
     //! @returns [maxTokensPerStep, batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
     [[nodiscard]] TensorPtr getAllNewTokens() const;
@@ -139,6 +143,8 @@ public:
 
     //! @returns [maxTokensPerStep, batchSize, beamWidth], finished states of type FinishedState, on gpu
     [[nodiscard]] TensorPtr getFinishedSteps() const;
+
+    [[nodiscard]] SizeType32 getMaxBatchSize() const;
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
 

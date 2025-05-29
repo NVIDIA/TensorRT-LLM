@@ -137,7 +137,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     , mDecodingConfig{optionalParams.decodingConfig}
     , mExtendedRuntimePerfKnobConfig{optionalParams.extendedRuntimePerfKnobConfig}
     , mDebugConfig{optionalParams.debugConfig}
-    , mAdditionalModelOutputs{optionalParams.additionalModelOutputs}
+    , mAdditionalModelOutputs{worldConfig.isLastPipelineParallelRank() ? optionalParams.additionalModelOutputs
+                                                                       : std::nullopt}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
     , mRuntime{std::make_shared<TllmRuntime>(rawEngine, mLogger.get(), optionalParams.useGpuDirectStorage,
           optionalParams.gpuWeightsPercent, modelConfig.useShapeInference())}
@@ -976,8 +977,6 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                     }
                 }
             }
-
-            utils::sortByLoraId(currRequests);
 
             (*mAssignReqSeqSlots)(*mSeqSlotManager, currRequests.contextRequests, currRequests.generationRequests);
 
@@ -1907,13 +1906,12 @@ void TrtGptModelInflightBatching::getDecoderSlotHostOutputs(
         // Make sure that postprocessing is done before copying outputIds
         mCopyBufferManager.getStream().wait(event.get());
 
-        TensorPtr sequenceLengthView
-            = ITensor::slice(mDecoder->getDecoderState().getJointDecodingOutput().lengths, seqSlot, 1);
+        auto sequenceLengths = mDecoder->getDecoderState().getSequenceLengths(seqSlot);
         auto outputIds = mDecoder->getDecoderState().getGatheredIds(seqSlot);
         auto cumLogProbs = mDecoder->getDecoderState().getCumLogProbs(seqSlot);
         auto logProbs = mDecoder->getDecoderState().getLogProbs(seqSlot);
 
-        mCopyBufferManager.copy(*sequenceLengthView, *mSlotDecoderBuffers[seqSlot]->sequenceLengths);
+        mCopyBufferManager.copy(*sequenceLengths, *mSlotDecoderBuffers[seqSlot]->sequenceLengths);
         mCopyBufferManager.copy(*outputIds, *mSlotDecoderBuffers[seqSlot]->outputIds);
         if (returnLogProbs)
         {
@@ -1928,7 +1926,7 @@ void TrtGptModelInflightBatching::getDecoderSlotHostOutputs(
 
             auto const peerSend = 0;
             mDecSlotAsyncSndHdls.emplace_back(std::make_unique<DecoderSlotAsyncSend>(
-                outputIds, sequenceLengthView, cumLogProbs, logProbs, returnLogProbs, *mMpiCommPipelinePara, peerSend));
+                outputIds, sequenceLengths, cumLogProbs, logProbs, returnLogProbs, *mMpiCommPipelinePara, peerSend));
         }
     }
     else

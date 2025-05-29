@@ -112,9 +112,6 @@ class LLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
 
         try:
-            self.pytorch_backend_config = kwargs.pop('pytorch_backend_config',
-                                                     None)
-
             llm_args_cls = TorchLlmArgs if kwargs.get(
                 'backend', None) == 'pytorch' else TrtLlmArgs
 
@@ -336,8 +333,9 @@ class LLM:
             prompt = None
             query_token_ids = inputs.get("query_token_ids", None)
         elif "prompt" in inputs:
-            prompt_token_ids, extra_processed_inputs = self.input_processor(
-                inputs, sampling_params)
+            with nvtx_range_debug("input_processor"):
+                prompt_token_ids, extra_processed_inputs = self.input_processor(
+                    inputs, sampling_params)
             prompt = inputs['prompt']
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
@@ -624,7 +622,8 @@ class LLM:
         update_executor_config(
             executor_config,
             backend=self.args.backend,
-            pytorch_backend_config=self.pytorch_backend_config,
+            pytorch_backend_config=self.args.get_pytorch_backend_config()
+            if self.args.backend == "pytorch" else None,
             mapping=self.args.parallel_config.to_mapping(),
             build_config=self.args.build_config
             if self._on_trt_backend else None,

@@ -30,6 +30,19 @@ def verify_l0_test_lists(llm_src):
         shell=True,
         check=True)
 
+    # Remove the duplicated test names
+    cleaned_lines = set()
+    with open(test_list, "r") as f:
+        lines = f.readlines()
+
+    for line in lines:
+        # Remove 'TIMEOUT (number)' and strip spaces
+        cleaned_line = line.split(" TIMEOUT ", 1)[0].strip()
+        cleaned_lines.add(cleaned_line)
+
+    with open(test_list, "w") as f:
+        f.writelines(f"{line}\n" for line in sorted(cleaned_lines))
+
     subprocess.run(
         f"cd {llm_src}/tests/integration/defs && "
         f"pytest --apply-test-list-correction --test-list={test_list} --co -q",
