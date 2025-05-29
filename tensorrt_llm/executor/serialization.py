@@ -55,7 +55,8 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm.bindings.executor": [
         "BatchingType", "CapacitySchedulerPolicy", "ContextPhaseParams",
         "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
-        "FinishReason", "KvCacheConfig", "KvCacheRetentionConfig",
+        "FinishReason", "KvCacheConfig", "KvCacheTransferMode",
+        "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig", "DynamicBatchConfig"
     ],
@@ -76,7 +77,7 @@ BASE_ZMQ_CLASSES = {
         "Logprob", "LogProbsResult", "ResponseWrapper"
     ],
     "tensorrt_llm.executor.utils": ["ErrorResponse", "WorkerCommIpcAddrs"],
-    "tensorrt_llm.executor.worker": ["ExecutorBindingsWorker", "worker_main"],
+    "tensorrt_llm.executor.worker": ["GenerationExecutorWorker", "worker_main"],
     "tensorrt_llm.llmapi.llm_args": [
         "_ModelFormatKind", "_ParallelConfig", "CalibConfig",
         "CapacitySchedulerPolicy", "KvCacheConfig", "LookaheadDecodingConfig",
