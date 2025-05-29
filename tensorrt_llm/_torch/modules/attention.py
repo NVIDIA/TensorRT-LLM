@@ -988,12 +988,10 @@ class MLA(nn.Module):
         for loop_idx in range(chunked_loop_num):
             # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim} zero padded
             # fetch `loop_idx` chunk from kv cache
-            chunked_latent_cache = trtllm_attention.load_chunked_kv_cache_for_mla(
+            chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
                 metadata=attn_metadata, chunked_idx=loop_idx, out_dtype=q.dtype)
             # assert chunked_latent_cache.shape[
             #     1] == attn_metadata.runtime_features.chunk_unit_size
-            chunked_compressed_kv, chunked_k_pe = chunked_latent_cache.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
             chunked_compressed_kv = chunked_compressed_kv.contiguous()
             # up proj to uncompressed kv
