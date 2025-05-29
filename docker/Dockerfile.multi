@@ -81,6 +81,9 @@ RUN pip3 install --upgrade --no-cache-dir \
     "tornado>=6.5.0" \
     "setuptools>=78.1.1,<80"
 
+COPY docker/common/install_deepep.sh install_deepep.sh
+RUN bash ./install_deepep.sh && rm install_deepep.sh
+
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
 FROM devel AS tritondevel
