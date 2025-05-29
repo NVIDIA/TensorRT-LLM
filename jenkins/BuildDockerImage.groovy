@@ -5,11 +5,15 @@ import groovy.transform.Field
 
 // Docker image registry
 IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging"
+NGC_IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-ngc-staging"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
     LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
 }
+
+UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+
 LLM_ROOT = "llm"
 
 LLM_BRANCH = env.gitlabBranch ?: params.branch
@@ -189,14 +193,20 @@ def buildImage(config, imageKeyToTag)
     def postTag = config.postTag
     def dependentTarget = config.dependentTarget
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
+    def imageName = IMAGE_NAME
+
+    if (target == "ngc-release" and env.triggerByPostMerge) {
+        imageName = NGC_IMAGE_NAME
+        echo "Use NGC image name: ${imageName}"
+    }
 
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
 
     def dependentTargetTag = tag.replace("${arch}-${target}-", "${arch}-${dependentTarget}-")
 
     if (target == "ngc-release") {
-        imageKeyToTag["NGC Devel Image ${config.arch}"] = "${IMAGE_NAME}/${dependentTarget}:${dependentTargetTag}"
-        imageKeyToTag["NGC Release Image ${config.arch}"] = "${IMAGE_NAME}/${target}:${tag}"
+        imageKeyToTag["NGC Devel Image ${config.arch}"] = "${imageName}/${dependentTarget}:${dependentTargetTag}"
+        imageKeyToTag["NGC Release Image ${config.arch}"] = "${imageName}/${target}:${tag}"
     }
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
@@ -245,11 +255,11 @@ def buildImage(config, imageKeyToTag)
                     sh """
                     cd ${LLM_ROOT} && make -C docker ${dependentTarget}_${action} \
                     TORCH_INSTALL_TYPE=${torchInstallType} \
-                    IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${dependentTargetTag} \
+                    IMAGE_NAME=${imageName} IMAGE_TAG=${dependentTargetTag} \
                     BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                     """
                 }
-                args += " DEVEL_IMAGE=${IMAGE_NAME}/${dependentTarget}:${dependentTargetTag}"
+                args += " DEVEL_IMAGE=${imageName}/${dependentTarget}:${dependentTargetTag}"
             }
         }
 
@@ -270,7 +280,7 @@ def buildImage(config, imageKeyToTag)
                 sh """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} \
+                IMAGE_NAME=${imageName} IMAGE_TAG=${tag} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """
             }
@@ -281,7 +291,7 @@ def buildImage(config, imageKeyToTag)
                 sh """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${customTag} \
+                IMAGE_NAME=${imageName} IMAGE_TAG=${customTag} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """
             }
@@ -315,7 +325,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         dependentTarget: "",
     ]
 
-    def release_action = env.JOB_NAME ==~ /.*PostMerge.*/ ? "push" : params.action
+    def release_action = params.action
     def buildConfigs = [
         "Build trtllm release (x86_64)": [
             target: "trtllm",
@@ -454,6 +464,9 @@ pipeline {
                     echo "imageKeyToTag is: ${imageKeyToTagJson}"
                     writeFile file: "imageKeyToTag.json", text: imageKeyToTagJson
                     archiveArtifacts artifacts: 'imageKeyToTag.json', fingerprint: true
+                    retry(3) {
+                        trtllm_utils.uploadArtifacts("imageKeyToTag.json", "${UPLOAD_PATH}/")
+                    }
                 }
             }
         }
