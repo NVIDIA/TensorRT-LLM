@@ -8,7 +8,7 @@ import torch
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.llmapi import KvCacheConfig, DraftTargetDecodingConfig
+from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
@@ -17,8 +17,7 @@ from utils.llm_data import llm_models_root
 # TODO: Add cuda graph enabled tests.
 # Cuda graph cannot currently be enabled for ngram because cuda graph requires
 # spec metadata and ngram does not have it.
-@pytest.mark.parametrize("use_cuda_graph,attn_backend",
-                         [[False, "TRTLLM"]])
+@pytest.mark.parametrize("use_cuda_graph,attn_backend", [[False, "TRTLLM"]])
 def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 31:
@@ -47,8 +46,7 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
 
     draft_len = 4
     spec_config = DraftTargetDecodingConfig(
-        max_draft_len=draft_len,
-        pytorch_weights_path=draft_model_dir)
+        max_draft_len=draft_len, pytorch_weights_path=draft_model_dir)
     llm_spec = LLM(model=target_model_dir,
                    max_batch_size=max_batch_size,
                    pytorch_backend_config=pytorch_config,
