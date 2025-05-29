@@ -771,9 +771,10 @@ def test_llm_gpt2_int8_kv_1gpu(gpt_example_root, llm_venv, llm_gpt2_model_root,
 
 @skip_pre_ada
 @pytest.mark.parametrize("quant_lm_head", [True, False])
+@pytest.mark.parametrize("qformat", ["fp8", "fp8_pc_pt"])
 def test_llm_gpt2_medium_fp8(gpt_example_root, llm_gpt2_medium_model_root,
                              llm_datasets_root, llm_rouge_root, llm_venv,
-                             cmodel_dir, engine_dir, quant_lm_head):
+                             cmodel_dir, engine_dir, quant_lm_head, qformat):
     "Build & Run gpt2-medium fp8 with 1 gpu"
     print("Quantizing and converting checkpoint...")
     dtype = "float16"
@@ -784,9 +785,10 @@ def test_llm_gpt2_medium_fp8(gpt_example_root, llm_gpt2_medium_model_root,
         f"--model_dir={llm_gpt2_medium_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={dtype}",
-        "--qformat=fp8",
+        f"--qformat={qformat}",
         f"--output_dir={ckpt_dir}",
     ]
+    print(quantize_cmd)
     if quant_lm_head:
         quantize_cmd.append("--quantize_lm_head")
     venv_check_call(llm_venv, quantize_cmd)
