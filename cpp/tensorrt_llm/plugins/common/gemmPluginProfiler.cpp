@@ -16,7 +16,6 @@
  */
 
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
-#include "fp4_gemm.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
@@ -26,6 +25,11 @@
 #include "tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.h"
 #include "tensorrt_llm/plugins/lowLatencyGemmSwigluPlugin/lowLatencyGemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.h"
+#if defined(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/fp4_gemm.h"
+#else
+#include "fp4_gemm.h"
+#endif
 
 #include <cstddef>
 
@@ -373,9 +377,17 @@ template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmC
     std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp8RowwiseGemmRunnerInterface>, GemmIdCore,
     GemmIdCoreHash>;
 
+#if defined(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
+    std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunnerInterface>, GemmIdCore,
+    GemmIdCoreHash>;
+#else
 template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
     std::shared_ptr<tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunnerInterface>, GemmIdCore,
     GemmIdCoreHash>;
+
+#endif
+
 
 template class GemmPluginProfiler<LowLatencyGemmPluginProfiler::Config, LowLatencyGemmRunnerPtr, GemmIdCore,
     GemmIdCoreHash>;

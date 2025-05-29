@@ -14,8 +14,13 @@
  * limitations under the License.
  */
 
+#if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#else
 #include "moe_gemm_kernels.h"
 #include "moe_kernels.h"
+#endif
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
@@ -202,7 +207,8 @@ public:
         torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
         std::lock_guard<std::mutex> lock(mMutex);
-
+        printf("runMoe\n");
+        printf("sadf asdf asdf asdf \n");
         // Free the profile workspace to save memory
         freeProfileWorkspace();
 
@@ -283,6 +289,7 @@ public:
         int64_t const cluster_size, int64_t const cluster_rank, bool min_latency_mode,
         torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
+        printf("runMoeMinLantency\n");
         std::lock_guard<std::mutex> lock(mMutex);
 
         // Free the profile workspace to save memory

@@ -83,6 +83,23 @@ set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
                                         ${Python3_LIBRARIES} ${SHARED_TARGET})
 
+if(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
+  target_compile_definitions(th_common PRIVATE "ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM")
+  message(STATUS "Enable open source Cutlass low latency gemm kernel")
+endif()
+
+if(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+  target_compile_definitions(th_common PRIVATE ENABLE_OPENED_CUTLASS_FP4_GEMM)
+  message(STATUS "Enable open source Cutlass fp4 gemm kernel")
+endif()
+
+if(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+  target_compile_definitions(th_common PRIVATE ENABLE_OPENED_CUTLASS_MOE_GEMM)
+  message(STATUS "Enable open source Cutlass moe gemm kernel")
+endif()
+
+# add_definitions(-DENABLE_OPENED_CUTLASS_MOE_GEMM)
+
 if(ENABLE_MULTI_DEVICE)
   target_include_directories(th_common PUBLIC ${MPI_C_INCLUDE_DIRS})
   target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB}

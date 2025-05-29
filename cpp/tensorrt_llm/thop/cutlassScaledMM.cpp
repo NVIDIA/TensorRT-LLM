@@ -14,17 +14,27 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#if defined(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/low_latency_gemm.h"
+#else 
 #include "low_latency_gemm.h"
+#endif
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <torch/extension.h>
 
 using torch::Tensor;
+#if defined(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
+using tensorrt_llm::kernels::cutlass_kernels::CutlassLowLatencyFp8GemmRunner;
+using tensorrt_llm::kernels::cutlass_kernels::CutlassLowLatencyFp8GemmRunnerInterface;
+using tensorrt_llm::kernels::cutlass_kernels::LowLatencyCutlassGemmConfig;
+using tensorrt_llm::kernels::cutlass_kernels::KernelScheduleType;
+#else
 using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassLowLatencyFp8GemmRunner;
 using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassLowLatencyFp8GemmRunnerInterface;
 using tensorrt_llm::kernels::internal_cutlass_kernels::LowLatencyCutlassGemmConfig;
 using tensorrt_llm::kernels::internal_cutlass_kernels::KernelScheduleType;
-
+#endif
 namespace torch_ext
 {
 
@@ -38,7 +48,6 @@ using FP8Type = __nv_fp8_e4m3;
 void cutlass_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
     torch::Tensor const& scale_a, torch::Tensor const& scale_b)
 {
-
     int32_t m = a.sizes()[0];
     int32_t n = b.sizes()[1];
     int32_t k = a.sizes()[1];
@@ -154,6 +163,12 @@ Tensor& cutlass_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor c
 Tensor cutlass_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
     std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype)
 {
+#if defined(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
+    printf("ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM\n");
+#else
+    printf("DISABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM\n");
+#endif
+
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
     Tensor out = at::empty({mat_a.sizes()[0], mat_b.sizes()[1]}, mat_a.options().dtype(out_dtype_));
