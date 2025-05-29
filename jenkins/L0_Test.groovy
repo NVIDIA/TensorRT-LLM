@@ -45,6 +45,64 @@ DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.04-py3"
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
 UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
 
+// from Ubuntu 22.04 /usr/share/ca-certificates/mozilla/DigiCert_Global_Root_G2.crt
+DIGICERT = """-----BEGIN CERTIFICATE-----
+MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBH
+MjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVT
+MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j
+b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI
+2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx
+1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ
+q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz
+tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ
+vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo0IwQDAP
+BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUTiJUIBiV
+5uNu5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY
+1Yl9PMWLSn/pvtsrF9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4
+NeF22d+mQrvHRAiGfzZ0JFrabA0UWTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NG
+Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91
+8rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/iyK5S9kJRaTe
+pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl
+MrY=
+-----END CERTIFICATE-----
+"""
+
+URM_PUBLIC_KEY = """-----BEGIN PGP PUBLIC KEY BLOCK-----
+Version: GnuPG v2.0.22 (GNU/Linux)
+
+mQENBGBeVgABCADSbvwhbG6HZNCLcFl6MIMCXZ13lOp31XATj2NE1mfOHV09HyGa
+q49EGxqO+obIO1W6Q0hzQMJLHDuwpktmXA1kRgkU9Gah5nWXXaqn34TMsO2JBfhu
+8pXDMDLrRWT16F5L+TeNcwKPFgSsBB6hbNjNzBpA8guHW2PUcW1e2oDUMKOJPqkx
+L8UGI9aBKLdy6fq9C6H910S3xRt1LHS+P90ckxV48oygdR2Sx3k4A1jCAjh19/nK
+8A46QbHUCBAKca9s5P3iQ2FHpkmT7VM+dUTW+3LZ/yOR4XtNOI06XyTFxbp+1ItA
+DVUFTIqH7I9Mj6ADcc0sQVkuq8ihbFqPdi/VABEBAAG0OHJwYWxhbmlzd2FteSAo
+QXJ0aWZhY3RvcnlQcm9kKSA8cnBhbGFuaXN3YW15QG52aWRpYS5jb20+iQE5BBMB
+AgAjBQJgXlYAAhsDBwsJCAcDAgEGFQgCCQoLBBYCAwECHgECF4AACgkQuQdxdYq8
+r18TBwf/ej5VDFSKgmvBkqgXx4O02ZwPl7FEfQpzCj/l0h037CkrPV+o3sdiq0mk
+oUoXvD42RwdtRz3W62MHePcK6Wy7SgUEh0n1lK2F+QM84FnPBsclHhvWIoqrNTf0
+cf86g9RSCji6RJGZVld6jn/0QoIjAAOtvgyp/sDVWuXSZdC0faDyYWMqR4bPvycF
+sujxBemQa620zSTr55QK/vB0Q2JCDlOgv+IxZNgy/r/UtdcIp+XcvUt7gVMmv6Jz
+PaxPmPp9z597XUyZaqXavDLg87yvSxRpw2PapdMy2WUk+JNV/w/g5HiXOh+kz5h0
+TgM6KJiAB1HlPKgcYpFKXfzE0JWbTbkBDQRgXlYAAQgA6S+H7eggyrkbNOmCr6aM
+JQ9k/PWqZKzE1qAfXT7GR6hwUQGErykexxUe5pmChH3QyKI5DvSqhh9Rgt0DpqjQ
+AjwY08KZN+vQWJjY26inByKCMUo5VaxBz3ODkMpb9pZTsSlXQQ84xsncQ4nzBwMG
+6Pz2Bna5hmNlRgQrKqOL4/pm1GI59jech/IeY6dmtyj/qD/GHgQW4W9pA9qUCt86
+nqPpPzVLAVJpCacdnozQxsR3JDx78rv7UaXFb5Kxps34sgayiOx8V0rA3aemHFUR
+8wOrQOBeMkJouPzl7GAUvywnNyYfQFiiae8ydJzgaWvUe8deBWJmY3t9/xFWcW67
+xwARAQABiQEfBBgBAgAJBQJgXlYAAhsMAAoJELkHcXWKvK9fO5sH/3ybE3F+m2ZC
+yY13+jE0+oQsnl0pFcCHwO3bvSc8adjh4++YOAoqawUvT6KI315apsxqHSg9pkB6
+r9hpEFlP4Tjd5uBEeVolzR/F4fY0MRbRUos10D/3upB5MyyUg3Iqkp6Yg/JIRrSg
+FStTr/xc9tbbTuBGh6V7Zinesaz3UeNxjqRsu8I9I/bkdEZsNWY51OrNrFc6hR7q
+7jwZchrM6tWFdydA42URhdQk+aiRMsbgbXBxo9NOI7q+RBpYS4yUB2QIDTObzRv8
+2gspVe5YDkM3XjVvnVjdBDN8ydIGkjD+iTmWc7/0fLCxh48KwnSEpyfmg1qjznUy
+Ccc7AFcEifQ=
+=XaBT
+-----END PGP PUBLIC KEY BLOCK-----
+"""
+
 POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
 
 // Literals for easier access.
@@ -1017,10 +1075,18 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "cat ${MODEL_CACHE_DIR}/README"
         sh "nvidia-smi -q"
         sh "df -h"
+        def isAarch64 = config.contains("aarch64")
 
         // setup HF_HOME to cache model and datasets
         // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
         sh "mkdir -p ${HF_HOME} && ls -alh ${HF_HOME}"
+        sh "mkdir -p /etc/apt/trusted.gpg.d"
+        sh "cat <<EOF > /etc/apt/trusted.gpg.d/urm_nvidia_com.asc \n${URM_PUBLIC_KEY} \nEOF"
+        if (isAarch64) {
+            sh "rm -rf /etc/apt/sources.list.d/ubuntu.sources && echo 'deb https://urm.nvidia.com/artifactory/ubuntu-ports-remote noble main restricted universe multiverse' > /etc/apt/sources.list"
+        } else {
+            sh "rm -rf /etc/apt/sources.list.d/ubuntu.sources && echo 'deb https://urm.nvidia.com/artifactory/ubuntu-remote noble main restricted universe multiverse' > /etc/apt/sources.list"
+        }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y rsync")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
@@ -1048,7 +1114,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "mkdir -p /opt/tritonserver/backends/tensorrtllm")
-        def isAarch64 = config.contains("aarch64")
         if (!isAarch64) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/libtriton_tensorrtllm.so /opt/tritonserver/backends/tensorrtllm/")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/trtllmExecutorWorker /opt/tritonserver/backends/tensorrtllm/")
@@ -1797,6 +1862,16 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         // Clean up the pip constraint file from the base NGC PyTorch image.
                         if (values[5] == DLFW_IMAGE) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
+                        }
+                        sh "mkdir -p /etc/ssl/certs /etc/apt/trusted.gpg.d"
+                        sh "cat <<EOF > /etc/ssl/certs/ca-certificates.crt \n${DIGICERT} \nEOF"
+                        sh "cat <<EOF > /etc/apt/trusted.gpg.d/urm_nvidia_com.asc \n${URM_PUBLIC_KEY} \nEOF"
+                        if (cpu_arch == AARCH64_TRIPLE) {
+                            sh "rm -rf /etc/apt/sources.list.d/ubuntu.sources && echo 'deb https://urm.nvidia.com/artifactory/ubuntu-ports-remote noble main restricted universe multiverse' > /etc/apt/sources.list"
+                        } else if (values[5] == UBUNTU_24_04_IMAGE || values[5] == DLFW_IMAGE) {
+                            sh "rm -rf /etc/apt/sources.list.d/ubuntu.sources && echo 'deb https://urm.nvidia.com/artifactory/ubuntu-remote noble main restricted universe multiverse' > /etc/apt/sources.list"
+                        } else if (values[5] == UBUNTU_22_04_IMAGE) {
+                            sh "echo 'deb https://urm.nvidia.com/artifactory/ubuntu-remote jammy main restricted universe multiverse' > /etc/apt/sources.list"
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl")
