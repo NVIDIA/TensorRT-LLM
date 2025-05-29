@@ -416,8 +416,6 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
         sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks"
-	// Build nightly package (with local version) for internal testing
-        sh "cd ${LLM_ROOT} && TRTLLM_NIGHTLY_BUILD=1 python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks"
     }
     if (is_linux_x86_64) {
         sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
