@@ -57,12 +57,20 @@ class LlavaNextInputProcessor(InputProcessor):
         hf_mm_projector = module_dict["multi_modal_projector"].to(
             self.dtype).to(self.device)
 
-        # Use TRTLLM vision tower(CLIPVisionModel)
-        vision_model_config = ModelConfig(
-            pretrained_config=model_config.vision_config, attn_backend="TRTLLM")
-        self.vision_tower = CLIPVisionModel(vision_model_config).to(
-            self.device).to(self.dtype)
-        self.vision_tower.load_weights(hf_vision_tower.state_dict())
+        # For A100 GPU, fallback to HF vision tower due to accuracy issue in TRT-LLM CLIPAttention
+        # Otherwise, use TRTLLM vision tower(CLIPVisionModel)
+        prop = torch.cuda.get_device_properties(0)
+        sm_version = prop.major * 10 + prop.minor
+        self.use_hf_vision_tower = sm_version == 80
+        if self.use_hf_vision_tower:
+            self.vision_tower = hf_vision_tower.to(self.device)
+        else:
+            vision_model_config = ModelConfig(
+                pretrained_config=model_config.vision_config,
+                attn_backend="TRTLLM")
+            self.vision_tower = CLIPVisionModel(vision_model_config).to(
+                self.device).to(self.dtype)
+            self.vision_tower.load_weights(hf_vision_tower.state_dict())
 
         # Use HF multi-modal projector
         self.mm_projector = hf_mm_projector
@@ -80,12 +88,16 @@ class LlavaNextInputProcessor(InputProcessor):
 
     @nvtx_range("[Vision] process")
     def _process(self, pixel_values):
-        attn_metadata = self.vision_tower.prepare_attn_metadata(
-            pixel_values.shape[0])
-        image_features: Tuple[torch.Tensor] = self.vision_tower(
-            pixel_values,
-            attn_metadata=attn_metadata,
-        )
+        if self.use_hf_vision_tower:
+            image_features = self.vision_tower(
+                pixel_values, output_hidden_states=True).hidden_states
+        else:
+            attn_metadata = self.vision_tower.prepare_attn_metadata(
+                pixel_values.shape[0])
+            image_features: Tuple[torch.Tensor] = self.vision_tower(
+                pixel_values,
+                attn_metadata=attn_metadata,
+            )
         selected_image_feature = image_features[-2][:, 1:]
         image_features = self.mm_projector(selected_image_feature)
         return image_features.reshape(-1, image_features.shape[-1])
