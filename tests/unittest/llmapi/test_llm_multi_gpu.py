@@ -8,7 +8,7 @@ from typing import Optional
 import pytest
 from parameterized import parameterized
 
-from tensorrt_llm.executor import ExecutorBindingsProxy
+from tensorrt_llm.executor import GenerationExecutorProxy
 from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.mapping import Mapping
@@ -373,7 +373,7 @@ class DummyExecutorMeta(type):
         return new_cls
 
 
-class DummyExecutorProxy2(ExecutorBindingsProxy):
+class DummyExecutorProxy2(GenerationExecutorProxy):
     ''' This is for testing the error occur in the thread in the Proxy. '''
 
     def __init__(
@@ -420,7 +420,7 @@ def _test_executor_handle_background_error_in_dispatch_result_thread():
     asyncio.run(task())
 
 
-class DummyExecutorProxy3(ExecutorBindingsProxy):
+class DummyExecutorProxy3(GenerationExecutorProxy):
     ''' This is for testing the error occur in a Worker process in the Proxy. '''
 
     def __init__(
