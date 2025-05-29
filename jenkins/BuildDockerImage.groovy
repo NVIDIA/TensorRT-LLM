@@ -192,9 +192,9 @@ def buildImage(config, imageKeyToTag)
     def dependentTarget = config.dependentTarget
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
 
-    llmDefaultTag = "09bd772-4294-71" // TODO: remove this
+    def tmpTag = "09bd772-4294-71" // TODO: remove this
 
-    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
+    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${tmpTag}"
 
     def dependentTargetTag = tag.replace("${arch}-${target}-", "${arch}-${dependentTarget}-")
 
