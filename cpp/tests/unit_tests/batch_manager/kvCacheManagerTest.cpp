@@ -1959,13 +1959,14 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     int requestId0 = 0;
     auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3});
     auto const inputLength0 = static_cast<SizeType32>(inputTokens0->size());
-    auto llmRequest0 = std::make_shared<LlmRequest>(requestId0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
+    auto llmRequest0
+        = std::make_shared<LlmRequest>(requestId0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId0, inputLength0, beamWidth, llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
     GenerationRequest const& seq0 = kvCacheManager.getSequence(requestId0);
 
     // Add two more blocks of generated tokens
-    for (int i = tokensPerBlock; i < 3*tokensPerBlock; ++i)
+    for (int i = tokensPerBlock; i < 3 * tokensPerBlock; ++i)
     {
         llmRequest0->addNewToken(i, beamIdx);
         kvCacheManager.addToken(requestId0);
@@ -1984,7 +1985,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     int requestId1 = 1;
     auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{100, 101, 102, 103});
     auto const inputLength1 = static_cast<SizeType32>(inputTokens1->size());
-    auto llmRequest1 = std::make_shared<LlmRequest>(requestId1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
+    auto llmRequest1
+        = std::make_shared<LlmRequest>(requestId1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId1, inputLength1, beamWidth, llmRequest1);
     kvCacheManager.storeContextBlocks(*llmRequest1);
     GenerationRequest const& seq1 = kvCacheManager.getSequence(requestId1);
@@ -2009,7 +2011,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     EXPECT_FALSE(block2->isPrimary());
 
     // Fill block
-    for (int i = 101+tokensPerBlock; i < 100+2*tokensPerBlock; ++i)
+    for (int i = 101 + tokensPerBlock; i < 100 + 2 * tokensPerBlock; ++i)
     {
         llmRequest1->addNewToken(i, beamIdx);
         kvCacheManager.addToken(requestId1);
@@ -2022,7 +2024,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
     // Write one generated token to second sequence. This will prompt block 1 to be offloaded,
     // but it cannot be because priority is lower than minimum required for offloading.
     // WindowManager::getFreeBlock will instead free and detach block 2 (secondary block).
-    llmRequest1->addNewToken(100+2*tokensPerBlock, beamIdx);
+    llmRequest1->addNewToken(100 + 2 * tokensPerBlock, beamIdx);
     kvCacheManager.addToken(requestId1);
 
     // Verify that block 2 is free, has no parent and is in secondary memory
