@@ -161,12 +161,16 @@ def prefetch_files(file_names: List[str], mapping: Mapping):
 def load_weights(
     checkpoint_dir: str,
     mapping: Mapping,
-    is_prefetch: bool = False,
 ):
     weights = {}
     weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
     if weight_files:
+        prefetch_size = sum(os.path.getsize(file) for file in weight_files)
+        is_prefetch = prefetch_size < psutil.virtual_memory().available * 0.9
         if is_prefetch:
+            logger.info(
+                f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
+            )
             prefetch_files(weight_files, mapping)
         for file in weight_files:
             logger.info(f"Loading {file}")
@@ -931,20 +935,16 @@ class PyTorchModelEngine(ModelEngine):
                 f"Rank {self.mapping.rank} uses {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
 
-            is_prefetch = rank_model_storage < psutil.virtual_memory(
-            ).available * 0.9
             if load_format == LoadFormat.AUTO:
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = load_weights(
                         model.llm_checkpoint_dir,
                         self.mapping,
-                        is_prefetch,
                     )
                 else:
                     weights = load_weights(
                         checkpoint_dir,
                         self.mapping,
-                        is_prefetch,
                     )
 
                 model.load_weights(weights)
