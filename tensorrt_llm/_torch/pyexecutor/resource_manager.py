@@ -574,6 +574,14 @@ class MambaCacheManager(BaseResourceManager):
         # mamba cache state indices
         self.state_indices: torch.Tensor = torch.Tensor()
 
+        # cumulative sequence lengths for prefill requests [batch_size+1]
+        self.cu_seqlens: torch.Tensor = torch.zeros(max_batch_size + 1,
+                                                    device=device,
+                                                    dtype=torch.int)
+
+        # sequence index for prefill requests [num_prefill_tokens] - specifies which request each token belongs to
+        self.seq_idx: torch.Tensor = torch.Tensor()
+
     def prepare_mamba_cache_blocks(self, request_ids: List[int]):
         state_indices = []
         for r in request_ids:
@@ -587,7 +595,9 @@ class MambaCacheManager(BaseResourceManager):
                 block = self.mamba_cache_free_blocks.pop()
                 self.mamba_cache_index[r] = block
                 state_indices.append(block)
-        self.state_indices = torch.as_tensor(state_indices, dtype=torch.int)
+        self.state_indices = torch.as_tensor(state_indices,
+                                             dtype=torch.int,
+                                             device=self.ssm_states.device)
 
     def free_mamba_cache_blocks(self, request_id: int):
         if request_id in self.mamba_cache_index:
@@ -604,11 +614,33 @@ class MambaCacheManager(BaseResourceManager):
         request_ids = context_ids + generation_ids
         self.prepare_mamba_cache_blocks(request_ids)
 
+        num_prefills = len(scheduled_batch.context_requests)
+        prefill_seq_lens = torch.tensor(
+            [i.py_prompt_len for i in scheduled_batch.context_requests],
+            dtype=torch.int,
+            device=self.ssm_states.device)
+        torch.cumsum(prefill_seq_lens,
+                     dim=0,
+                     dtype=torch.int,
+                     out=self.cu_seqlens[1:num_prefills + 1])
+        self.seq_idx = torch.repeat_interleave(
+            torch.arange(num_prefills,
+                         dtype=torch.int,
+                         device=self.cu_seqlens.device),
+            prefill_seq_lens,
+            output_size=self.cu_seqlens[num_prefills]).unsqueeze(0)
+
     def free_mamba_resources(self, request: LlmRequest):
         self.free_mamba_cache_blocks(request.py_request_id)
 
     def get_state_indices(self) -> torch.Tensor:
         return self.state_indices
+
+    def get_cu_seqlens(self) -> torch.Tensor:
+        return self.cu_seqlens
+
+    def get_seq_idx(self) -> torch.Tensor:
+        return self.seq_idx
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         layer_offset = self.mamba_layer_offsets[layer_idx]

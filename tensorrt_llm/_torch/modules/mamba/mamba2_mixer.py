@@ -170,8 +170,8 @@ class Mamba2Mixer(nn.Module):
         # handle warm up request
         if not is_warmup:
             state_indices_p, state_indices_d = torch.split(
-                attn_metadata.kv_cache_manager.get_state_indices().to(
-                    torch.device("cuda")), batch_split_size)
+                attn_metadata.kv_cache_manager.get_state_indices(),
+                batch_split_size)
             conv_states = attn_metadata.kv_cache_manager.get_conv_states(
                 self.layer_idx)
             ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
@@ -197,21 +197,10 @@ class Mamba2Mixer(nn.Module):
 
         if num_prefills > 0:
 
-            cu_seqlens = torch.cat(
-                [
-                    torch.zeros(1, device=attn_metadata.seq_lens_cuda.device),
-                    torch.cumsum(attn_metadata.seq_lens_cuda[:num_prefills],
-                                 dim=0)
-                ],
-                dim=0,
-            ).to(torch.int32)
-
-            seq_idx = torch.repeat_interleave(
-                torch.arange(num_prefills,
-                             dtype=torch.int32,
-                             device=cu_seqlens.device),
-                attn_metadata.seq_lens_cuda[:num_prefills],
-                output_size=num_prefill_tokens).unsqueeze(0)
+            cu_seqlens = attn_metadata.kv_cache_manager.get_cu_seqlens(
+            )[:num_prefills + 1]
+            seq_idx = attn_metadata.kv_cache_manager.get_seq_idx(
+            ) if not is_warmup else None
 
             xbc_p = causal_conv1d_fn(xbc_p.transpose(0, 1),
                                      self.conv1d.weight,
