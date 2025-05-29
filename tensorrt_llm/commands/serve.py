@@ -130,7 +130,7 @@ def get_llm_args(model: str,
 
 
 def launch_server(host: str, port: int, llm_args: dict,
-                  metadata_server_cfg: MetadataServerConfig,
+                  metadata_server_cfg: Optional[MetadataServerConfig],
                   server_role: Optional[ServerRole]):
 
     backend = llm_args["backend"]
