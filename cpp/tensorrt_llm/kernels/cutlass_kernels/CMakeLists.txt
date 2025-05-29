@@ -114,6 +114,7 @@ list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_rowwise_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_blockscale_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp4_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "allreduce_gemm/.*")
+list(FILTER ALL_SRCS EXCLUDE REGEX "low_latency_gemm/.*")
 list(REMOVE_ITEM ALL_SRCS
      "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu")
 
@@ -141,13 +142,48 @@ add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU}
 # ${GROUPED_CU_INSTANTIATIONS})
 add_library(fb_gemm_src STATIC ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS})
 add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
-add_library(
-  ar_gemm_src STATIC
-  ${ARGEMM_SRC_CU} ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/ipcNvlsMemory.cpp)
 
 set(GEMM_SWIGLU_SM90_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
 add_library(gemm_swiglu_sm90_src STATIC ${GEMM_SWIGLU_SM90_SRC_CU})
+
+if(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
+  file(GLOB LOW_LATENCY_GEMM_SRC_CU
+       "${CMAKE_CURRENT_SOURCE_DIR}/low_latency_gemm/*.cu")
+  add_library(low_latency_gemm_src STATIC ${LOW_LATENCY_GEMM_SRC_CU})
+  target_include_directories(low_latency_gemm_src
+                             PRIVATE ${3RDPARTY_DIR}/cutlass/examples)
+  set_property(TARGET low_latency_gemm_src PROPERTY POSITION_INDEPENDENT_CODE
+                                                    ON)
+
+endif()
+
+if(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+  file(GLOB FP4_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/fp4_gemm/*.cu")
+  add_library(fp4_gemm_src STATIC ${FP4_SRC_CU} ${FP4_CU_INSTANTIATIONS})
+  set_property(TARGET fp4_gemm_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+endif()
+
+if(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+  file(GLOB MOE_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/moe_gemm/*.cu")
+  add_library(moe_gemm_src STATIC ${MOE_GEMM_SRC_CU} ${GROUPED_SRC_CPP}
+                                  ${GROUPED_CU_INSTANTIATIONS})
+  target_include_directories(
+    moe_gemm_src
+    PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
+  set_property(TARGET moe_gemm_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+endif()
+
+if(ENABLE_OPENED_CUTLASS_ALLREDUCE_GEMM)
+  add_library(
+    ar_gemm_src STATIC
+    ${ARGEMM_SRC_CU}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/ipcNvlsMemory.cpp)
+  target_include_directories(
+    ar_gemm_src
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../internal_cutlass_kernels/include)
+  set_property(TARGET ar_gemm_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+endif()
 
 function(process_target target_name enable_hopper enable_blackwell)
   set_property(TARGET ${target_name} PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -189,15 +225,32 @@ function(process_target target_name enable_hopper enable_blackwell)
 
 endfunction()
 
-foreach(
-  target_name
-  ar_gemm_src;fpA_intB_gemm_src;fb_gemm_src;fp8_blockscale_gemm_src;gemm_swiglu_sm90_src
-)
+set(TARGET_LIB
+    fpA_intB_gemm_src;fb_gemm_src;fp8_blockscale_gemm_src;gemm_swiglu_sm90_src)
+if(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
+  list(APPEND TARGET_LIB low_latency_gemm_src)
+endif()
+foreach(target_name ${TARGET_LIB})
   process_target(${target_name} true false) # Name, Hopper, Blackwell
 endforeach()
 
-foreach(target_name fpA_intB_gemm_src;fb_gemm_src)
+set(TARGET_LIB fpA_intB_gemm_src;fb_gemm_src)
+if(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+  list(APPEND TARGET_LIB fp4_gemm_src)
+endif()
+foreach(target_name ${TARGET_LIB})
   process_target(${target_name} false true) # Name, Hopper, Blackwell
+endforeach()
+
+set(TARGET_LIB "")
+if(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+  list(APPEND TARGET_LIB moe_gemm_src)
+endif()
+if(ENABLE_OPENED_CUTLASS_ALLREDUCE_GEMM)
+  list(APPEND TARGET_LIB ar_gemm_src)
+endif()
+foreach(target_name ${TARGET_LIB})
+  process_target(${target_name} true true) # Name, Hopper, Blackwell
 endforeach()
 
 # foreach(target_name moe_gemm_src) process_target(${target_name} true true) #

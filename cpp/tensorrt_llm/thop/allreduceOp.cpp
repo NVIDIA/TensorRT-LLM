@@ -25,7 +25,6 @@
 #include "tensorrt_llm/kernels/communicationKernels/mnnvlTwoShotAllreduceKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
@@ -35,6 +34,11 @@
 #include "tensorrt_llm/thop/fp8Op.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "tensorrt_llm/thop/userbuffersTensor.h"
+// #if defined(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+// #include "tensorrt_llm/kernels/cutlass_kernels/fp4_gemm/fp4_gemm_template.h"
+// #else
+// #include "fp4_gemm.h"
+// #endif
 
 #if ENABLE_MULTI_DEVICE
 #include <ATen/cuda/EmptyTensor.h>

@@ -52,3 +52,7 @@ endfunction()
 
 add_benchmark(mixtureOfExpertsBackendBenchmark
               mixtureOfExpertsBackendBenchmarkLauncher.cu)
+if(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+  target_compile_definitions(mixtureOfExpertsBackendBenchmark
+                             PRIVATE ENABLE_OPENED_CUTLASS_MOE_GEMM)
+endif()

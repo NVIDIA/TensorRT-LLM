@@ -13,9 +13,29 @@
 #include <tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h>
 #include <tensorrt_llm/kernels/quantization.h>
 
-using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
+using LoraParams = tensorrt_llm::kernels::LoraParams;
+#if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+namespace kernels = tensorrt_llm::kernels::cutlass_kernels;
+using GemmProfilerBackend = tensorrt_llm::kernels::cutlass_kernels::GemmProfilerBackend;
+using MoeMinLatencyParams = tensorrt_llm::kernels::cutlass_kernels::MoeMinLatencyParams;
+using QuantParams = tensorrt_llm::kernels::cutlass_kernels::QuantParams;
+using MOEParallelismConfig = tensorrt_llm::kernels::cutlass_kernels::MOEParallelismConfig;
+using ActivationType = tensorrt_llm::kernels::cutlass_kernels::ActivationType;
+using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
+using tensorrt_llm::kernels::cutlass_kernels::isGatedActivation;
+#else
+namespace kernels = tensorrt_llm::kernels;
+using GemmProfilerBackend = tensorrt_llm::kernels::GemmProfilerBackend;
+using MoeMinLatencyParams = tensorrt_llm::kernels::MoeMinLatencyParams;
+using QuantParams = tensorrt_llm::kernels::QuantParams;
+using MOEParallelismConfig = tensorrt_llm::kernels::MOEParallelismConfig;
+using ActivationType = tensorrt_llm::ActivationType;
+using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput;
+using tensorrt_llm::isGatedActivation;
+#endif
+namespace cutlass_kernels = tensorrt_llm::kernels::cutlass_kernels;
 
 constexpr static float FP8_MAX = 448.f;
 constexpr static float FP4_MAX = 6.f;
@@ -153,7 +173,7 @@ protected:
 
     float getTolerance(float scale = 1.f)
     {
-        bool loose_fp8 = mActType != tensorrt_llm::ActivationType::Relu;
+        bool loose_fp8 = mActType != ActivationType::Relu;
         float tol = std::is_same_v<WeightType, uint8_t>     ? 0.1
             : std::is_same_v<WeightType, cutlass::uint4b_t> ? 0.1
             : std::is_same_v<GemmDataType, float>           ? 0.001
@@ -248,7 +268,7 @@ protected:
         initBiasToExpertIdGatedKernel<DataType><<<grid, block, 0, mStream->get()>>>(buffer, w);
     }
 
-    CutlassMoeFCRunner<GemmDataType, WeightType, OutputType, InputType> mMoERunner{};
+    kernels::CutlassMoeFCRunner<GemmDataType, WeightType, OutputType, InputType> mMoERunner{};
     char* mWorkspace{};
     int* mSelectedExpert;
     float* mTokenFinalScales{};
@@ -269,7 +289,6 @@ protected:
     float* mExpertFP4WeightGlobalScale1{};
     float* mExpertFP4WeightGlobalScale2{};
 
-    using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput;
     using ElementSF = TmaWarpSpecializedGroupedGemmInput::ElementSF;
     constexpr static int FP4VecSize = MX_QUANT ? TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
                                                : TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
@@ -299,7 +318,7 @@ protected:
     int64_t mGatedMultiplier = 1;
     int64_t mGroupSize = -1;
 
-    tensorrt_llm::ActivationType mActType = tensorrt_llm::ActivationType::Relu;
+    ActivationType mActType = ActivationType::Relu;
 
     float mSparseMixerEpsilon = 0.2f;
 
@@ -346,7 +365,7 @@ protected:
         check_cuda_error(cudaDeviceSynchronize()); // Sync to make sure all previous operations are resolved
 
         // Calculate the size contributions for all the large buffers to check if the GPU has enough space
-        bool const is_gated = tensorrt_llm::isGatedActivation(mActType);
+        bool const is_gated = isGatedActivation(mActType);
         size_t const num_gemms = 2 + is_gated;
         bool const useDeepseek = false;
 
@@ -395,7 +414,7 @@ protected:
         mInterSize = hidden_size * mInterSizeFraction;
         mNumExperts = num_experts;
         mK = k;
-        mIsGated = tensorrt_llm::isGatedActivation(mActType);
+        mIsGated = isGatedActivation(mActType);
         mGatedMultiplier = mIsGated ? 2 : 1;
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
@@ -565,38 +584,18 @@ protected:
         invokeBatchedFP4Quantization<WeightRawType, FP4VecSize>(num_experts, out_shape, in_shape, raw_weights,
             global_scales, reinterpret_cast<int64_t*>(quant_weights), reinterpret_cast<int32_t*>(scaling_factors),
             MX_QUANT, mMultiProcessorCount, mStream->get());
+    
+
         // for (int i = 0; i < num_experts; i++)
         // {
         //     auto* weight_start = raw_weights + i * in_shape * out_shape;
         //     auto* quant_weight_start = quant_weights + i * in_shape * out_shape / WEIGHT_ELEM_PER_BYTE;
         //     auto* scaling_factor_start
         //         = scaling_factors + i * (int64_t) padded_stride * cutlass::ceil_div(in_shape, FP4VecSize);
-        //     printf("Expert %d: Weight offset: %lld, quant_weight_offset: %lld, scaling_factor_offset: %lld\n",
-        //         (long long) i, (long long) i * in_shape * out_shape,
-        //         (long long) i * in_shape * out_shape / WEIGHT_ELEM_PER_BYTE,
-        //         (long long) i * (int64_t) padded_stride * cutlass::ceil_div(in_shape, FP4VecSize));
 
-        //     check_cuda_error(cudaStreamSynchronize(mStream->get()));
-        //     std::cout << "Quant " << i << " starting" << std::endl;
-        //     auto data = getDataFromDevice(scaling_factor_start, 4 * cutlass::ceil_div(in_shape, FP4VecSize));
-        //     for (auto v : data)
-        //     {
-        //         std::cout << (float) v << ", ";
-        //     }
-        //     std::cout << std::endl;
-
-        //     invokeFP4Quantization<WeightRawType, FP4VecSize>(out_shape, in_shape, weight_start, global_scales + i,
-        //         reinterpret_cast<int64_t*>(quant_weight_start), reinterpret_cast<int32_t*>(scaling_factor_start),
-        //         MX_QUANT, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, mStream->get());
-
-        //     // check_cuda_error(cudaStreamSynchronize(mStream->get()));
-        //     // std::cout << "Quant " << i << " done" << std::endl;
-        //     // auto data = getDataFromDevice(mInputTensor, mHiddenSize);
-        //     // for (auto v : data)
-        //     // {
-        //     //     std::cout << (float)v << ", ";
-        //     // }
-        //     // std::cout << std::endl;
+        //     invokeFP4Quantization(out_shape, in_shape, weight_start, global_scales + i,
+        //         reinterpret_cast<int64_t*>(quant_weight_start), reinterpret_cast<int32_t*>(scaling_factor_start), false,
+        //         tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, mStream->get());
         // }
     }
 
@@ -1135,13 +1134,13 @@ protected:
     template <class T>
     T actfn(T in)
     {
-        if (mActType == tensorrt_llm::ActivationType::Identity)
+        if (mActType == ActivationType::Identity)
             return in;
-        if (mActType == tensorrt_llm::ActivationType::Relu)
+        if (mActType == ActivationType::Relu)
             return std::max(in, T(0.0f));
-        if (mActType == tensorrt_llm::ActivationType::Gelu || mActType == tensorrt_llm::ActivationType::Geglu)
+        if (mActType == ActivationType::Gelu || mActType == ActivationType::Geglu)
             return (std::erf(float(in) * float(sqrt(0.5))) + 1) * 0.5f * float(in);
-        if (mActType == tensorrt_llm::ActivationType::Silu || mActType == tensorrt_llm::ActivationType::Swiglu)
+        if (mActType == ActivationType::Silu || mActType == ActivationType::Swiglu)
         {
             return (float(in) / (1.f + std::exp(-(in))));
         }
@@ -1368,7 +1367,7 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
 
     if (ANY_FP4)
     {
-        if (mActType != tensorrt_llm::ActivationType::Relu)
+        if (mActType != ActivationType::Relu)
         {
             // FP4 has far too little precision to get any sort of consistency with non-relu actfn
             GTEST_SKIP();
@@ -1437,7 +1436,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSweepNumTokens)
 TYPED_TEST(MixtureOfExpertsTest, PermuteSweepNumTokensGeglu)
 {
     this->mIsLongTest = true;
-    this->mActType = tensorrt_llm::ActivationType::Geglu;
+    this->mActType = ActivationType::Geglu;
     for (int num_tokens : {2, 8, 15, 19, 64, 73, 256})
     {
         this->BasicPermuteTest(1, this->DEFAULT_HIDDEN_SIZE, 4, num_tokens);
@@ -1456,7 +1455,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteNoBias)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteGelu)
 {
-    this->mActType = tensorrt_llm::ActivationType::Gelu;
+    this->mActType = ActivationType::Gelu;
     this->BasicPermuteTest();
     this->BasicPermuteTest(2);
     this->BasicPermuteTest(3);
@@ -1464,7 +1463,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteGelu)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteSilu)
 {
-    this->mActType = tensorrt_llm::ActivationType::Silu;
+    this->mActType = ActivationType::Silu;
     this->BasicPermuteTest();
     this->BasicPermuteTest(2);
     this->BasicPermuteTest(3);
@@ -1472,7 +1471,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSilu)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteGeglu)
 {
-    this->mActType = tensorrt_llm::ActivationType::Geglu;
+    this->mActType = ActivationType::Geglu;
     this->BasicPermuteTest();
     this->BasicPermuteTest(2);
     this->BasicPermuteTest(3);
@@ -1480,7 +1479,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteGeglu)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteSwiglu)
 {
-    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->mActType = ActivationType::Swiglu;
     this->BasicPermuteTest();
     this->BasicPermuteTest(2);
     this->BasicPermuteTest(3);
@@ -1512,7 +1511,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteNonPowerOfTwo)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteNonPowerOfTwoSwiglu)
 {
-    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->mActType = ActivationType::Swiglu;
     this->BasicPermuteTest(1, this->DEFAULT_HIDDEN_SIZE, 10);
     this->BasicPermuteTest(2, this->DEFAULT_HIDDEN_SIZE, 10);
     this->BasicPermuteTest(3, this->DEFAULT_HIDDEN_SIZE, 10);
@@ -1527,7 +1526,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteManyExperts)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluVerySmall)
 {
-    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->mActType = ActivationType::Swiglu;
     for (int i = 1; i <= 3; i++)
     {
         this->BasicPermuteTest(1, this->MINIMUM_ALIGNMENT * i);
@@ -1540,7 +1539,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteMixtral8x7b)
 {
     this->mIsLongTest = true;
     this->mUseBias = false;
-    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->mActType = ActivationType::Swiglu;
     this->BasicPermuteTest(2, 4096, 8);
 }
 
@@ -1548,7 +1547,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteDeepSeekV3)
 {
     this->mIsLongTest = true;
     this->mUseBias = false;
-    this->mActType = tensorrt_llm::ActivationType::Swiglu;
+    this->mActType = ActivationType::Swiglu;
     size_t hidden_size = 7168;
     size_t inter_size = 2048;
     this->mInterSizeFraction = float(inter_size) / hidden_size;
@@ -1592,7 +1591,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
 
     if (ANY_FP4)
     {
-        if (mActType != tensorrt_llm::ActivationType::Relu)
+        if (mActType != ActivationType::Relu)
         {
             // FP4 has far too little precision to get any sort of consistency with non-relu actfn
             GTEST_SKIP();
@@ -1701,7 +1700,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##SweepNumTokensGeglu)                                             \
     {                                                                                                                  \
         this->mIsLongTest = true;                                                                                      \
-        this->mActType = tensorrt_llm::ActivationType::Geglu;                                                          \
+        this->mActType = ActivationType::Geglu;                                                                        \
         for (int num_tokens : {2, 8, 15, 64, 73, 256})                                                                 \
         {                                                                                                              \
             this->ParallelismType##Test(1, this->DEFAULT_HIDDEN_SIZE, 4, num_tokens);                                  \
@@ -1719,21 +1718,21 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##Gelu)                                                            \
     {                                                                                                                  \
-        this->mActType = tensorrt_llm::ActivationType::Gelu;                                                           \
+        this->mActType = ActivationType::Gelu;                                                                         \
         this->ParallelismType##Test();                                                                                 \
         this->ParallelismType##Test(2);                                                                                \
         this->ParallelismType##Test(3);                                                                                \
     }                                                                                                                  \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##Silu)                                                            \
     {                                                                                                                  \
-        this->mActType = tensorrt_llm::ActivationType::Silu;                                                           \
+        this->mActType = ActivationType::Silu;                                                                         \
         this->ParallelismType##Test();                                                                                 \
         this->ParallelismType##Test(2);                                                                                \
         this->ParallelismType##Test(3);                                                                                \
     }                                                                                                                  \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##Geglu)                                                           \
     {                                                                                                                  \
-        this->mActType = tensorrt_llm::ActivationType::Geglu;                                                          \
+        this->mActType = ActivationType::Geglu;                                                                        \
         this->ParallelismType##Test();                                                                                 \
         this->ParallelismType##Test(2);                                                                                \
         this->ParallelismType##Test(3);                                                                                \
@@ -1741,7 +1740,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##Swiglu)                                                          \
     {                                                                                                                  \
-        this->mActType = tensorrt_llm::ActivationType::Swiglu;                                                         \
+        this->mActType = ActivationType::Swiglu;                                                                       \
         this->ParallelismType##Test();                                                                                 \
         this->ParallelismType##Test(2);                                                                                \
         this->ParallelismType##Test(3);                                                                                \
@@ -1751,14 +1750,14 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     {                                                                                                                  \
         this->mIsLongTest = true;                                                                                      \
         this->mUseBias = false;                                                                                        \
-        this->mActType = tensorrt_llm::ActivationType::Swiglu;                                                         \
+        this->mActType = ActivationType::Swiglu;                                                                       \
         this->ParallelismType##Test(2, 4096, 8, 8, 14336.f / 4096.f);                                                  \
     }                                                                                                                  \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##DeepSeekV3)                                                      \
     {                                                                                                                  \
         this->mIsLongTest = true;                                                                                      \
         this->mUseBias = false;                                                                                        \
-        this->mActType = tensorrt_llm::ActivationType::Swiglu;                                                         \
+        this->mActType = ActivationType::Swiglu;                                                                       \
         size_t hidden_size = 7168;                                                                                     \
         size_t inter_size = 2048;                                                                                      \
         this->mInterSizeFraction = float(inter_size) / hidden_size;                                                    \
@@ -1780,7 +1779,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwoSwiglu)                                             \
     {                                                                                                                  \
-        this->mActType = tensorrt_llm::ActivationType::Swiglu;                                                         \
+        this->mActType = ActivationType::Swiglu;                                                                       \
         this->ParallelismType##Test(1, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
         this->ParallelismType##Test(2, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
         this->ParallelismType##Test(3, this->DEFAULT_HIDDEN_SIZE, 10);                                                 \
@@ -1824,9 +1823,9 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
     };
 
     auto activation_pool = std::vector{
-        tensorrt_llm::ActivationType::Relu, tensorrt_llm::ActivationType::Swiglu, tensorrt_llm::ActivationType::Geglu};
+        ActivationType::Relu, ActivationType::Swiglu, ActivationType::Geglu};
     if (this->ANY_FP4)
-        activation_pool = {tensorrt_llm::ActivationType::Relu};
+        activation_pool = {ActivationType::Relu};
     auto configs = this->getFilteredConfigs(getSMVersion());
     for (auto const activation_type : activation_pool)
     {
@@ -1972,9 +1971,11 @@ TYPED_TEST(MixtureOfExpertsTest, RunProfiler)
         int64_t k = 2;
 
         GemmProfilerBackend backend;
-        backend.init(this->mMoERunner, gemm_to_profile, typeToDtypeID<typename TypeParam::DataType>(),
+        backend.init(this->mMoERunner, gemm_to_profile,
+            typeToDtypeID<typename TypeParam::DataType>(),
             typeToDtypeID<typename TypeParam::WeightType>(), typeToDtypeID<typename TypeParam::OutputType>(),
-            num_experts, k, this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4, this->mGroupSize,
+            num_experts, k,
+            this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4, this->mGroupSize,
             tensorrt_llm::ActivationType::Geglu, false, this->mUseLora, /*min_latency_mode=*/false,
             /*need_weights=*/true, MOEParallelismConfig{});
 

@@ -115,6 +115,16 @@ target_include_directories(
     $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
   PRIVATE ${TARGET_DIR})
 
+if(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+  target_compile_definitions(${PLUGIN_SHARED_TARGET}
+                             PRIVATE ENABLE_OPENED_CUTLASS_FP4_GEMM)
+endif()
+
+if(ENABLE_OPENED_CUTLASS_ALLREDUCE_GEMM)
+  target_compile_definitions(${PLUGIN_SHARED_TARGET}
+                             PRIVATE ENABLE_OPENED_CUTLASS_ALLREDUCE_GEMM)
+endif()
+
 if(ENABLE_MULTI_DEVICE)
   target_include_directories(${PLUGIN_SHARED_TARGET}
                              PUBLIC ${MPI_C_INCLUDE_DIRS})

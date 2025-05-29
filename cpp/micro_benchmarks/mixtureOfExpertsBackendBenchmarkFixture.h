@@ -20,7 +20,11 @@
 
 #include <nlohmann/json.hpp>
 
+#if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#else
 #include "moe_kernels.h"
+#endif
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
@@ -37,10 +41,21 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+using namespace tensorrt_llm::kernels::cutlass_kernels;
+using ActivationType = tensorrt_llm::kernels::cutlass_kernels::ActivationType;
+using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
+using tensorrt_llm::kernels::cutlass_kernels::isGatedActivation;
+#else
 using namespace tensorrt_llm::kernels;
+using ActivationType = tensorrt_llm::ActivationType;
+using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput;
+using tensorrt_llm::isGatedActivation;
+#endif
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::cutlass_extensions;
+using LoraParams = tensorrt_llm::kernels::LoraParams;
 
 static BufferManager::CudaStreamPtr streamPtr;
 static std::unique_ptr<BufferManager> bufferManager;
@@ -321,7 +336,7 @@ public:
     int64_t mNumExperts{};
     int64_t mK{};
 
-    constexpr static nvinfer1::DataType toDTypeID()
+     constexpr static nvinfer1::DataType toDTypeID()
     {
         if (FP8 || WFP4AFP8)
             return nvinfer1::DataType::kFP8;
@@ -362,6 +377,7 @@ public:
 #endif
         TLLM_THROW("Unrecognised format");
     };
+
 
     template <class T>
     constexpr static auto typeToDtypeID()
@@ -463,7 +479,7 @@ public:
     float* mExpertFP8Scale3{};
 
     float* mExpertFP4ActScale1{};
-    using ElementSF = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::ElementSF;
+    using ElementSF = TmaWarpSpecializedGroupedGemmInput::ElementSF;
     ElementSF* mExpertFP4WeightSf1{};
     float* mExpertFP4GlobalScale1{};
     float* mExpertFP4ActScale2{};
@@ -485,7 +501,7 @@ public:
     bool mIsGated = false;
     int mGatedMultiplier = 1;
 
-    tensorrt_llm::ActivationType mActType = tensorrt_llm::ActivationType::Relu;
+    ActivationType mActType = ActivationType::Relu;
 
     QuantParams mQuantParams{};
     bool mUseLora = false;
@@ -519,7 +535,7 @@ public:
         mInterSize = inter_size / parallelism_config.tp_size;
         mNumExperts = num_experts;
         mK = k;
-        mIsGated = tensorrt_llm::isGatedActivation(mActType);
+        mIsGated = isGatedActivation(mActType);
         mGatedMultiplier = mIsGated ? 2 : 1;
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
@@ -560,6 +576,7 @@ public:
         {
             mExpertFP4ActScale1 = allocBuffer<float>(1);
             mExpertFP4WeightSf1 = allocBuffer<ElementSF>(num_experts * gated_inter * mHiddenSize / FP4_VECTOR_SIZE);
+
             mExpertFP4GlobalScale1 = allocBuffer<float>(num_experts);
 
             mExpertFP4ActScale2 = allocBuffer<float>(1);
@@ -784,7 +801,7 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     int const num_tokens = state.range(7);
     mUseBias = state.range(8);
     mUseFinalScale = state.range(9);
-    mActType = static_cast<tensorrt_llm::ActivationType>(state.range(10));
+    mActType = static_cast<ActivationType>(state.range(10));
     int tactic_idx1 = state.range(11);
     int tactic_idx2 = state.range(12);
     int const routing_config = state.range(13);
