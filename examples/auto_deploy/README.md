@@ -265,7 +265,7 @@ llm = LLM(
     model=<HF_MODEL_CARD_OR_DIR>,
     backend="autodeploy",
     build_config=build_config,
-    pytorch_backend_config=ad_config,
+    auto_deploy_config=ad_config,
     tensor_parallel_size=<NUM_WORLD_RANK>,
 )
 

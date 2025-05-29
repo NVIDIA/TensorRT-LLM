@@ -40,8 +40,7 @@ runtime::CudaEvent UpdateDecoderBuffers::operator()(runtime::ModelConfig const& 
     copyBufferManager.getStream().wait(decoderFinishEvent);
 
     copyBufferManager.copy(*decoder.getDecoderState().getAllNewTokens(), *decoderOutputBuffers.newOutputTokensHost);
-    copyBufferManager.copy(
-        *decoder.getDecoderState().getJointDecodingOutput().lengths, *decoderOutputBuffers.sequenceLengthsHost);
+    copyBufferManager.copy(*decoder.getDecoderState().getSequenceLengths(), *decoderOutputBuffers.sequenceLengthsHost);
 
     auto const finishedSumDevice = decoder.getDecoderState().getFinishedSum();
     copyBufferManager.copy(*finishedSumDevice, *decoderOutputBuffers.finishedSumHost);

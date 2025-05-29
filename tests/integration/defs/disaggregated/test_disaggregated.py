@@ -18,14 +18,7 @@ import subprocess
 
 import pytest
 from defs.conftest import skip_no_hopper
-
-
-def kill_disaggregated_processes():
-    """Kill any existing disaggregated processes."""
-    try:
-        subprocess.run(['pkill', '-9', '-f', 'trtllm-serve'], check=False)
-    except Exception:
-        pass
+from defs.trt_test_alternative import check_call, popen
 
 
 def cleanup_output_files():
@@ -120,93 +113,92 @@ def run_disaggregated_test(example_dir,
                            env=None,
                            cwd=None):
     """Run disaggregated test with given configuration."""
-    kill_disaggregated_processes()
     cleanup_output_files()
 
     num_ranks, config_file = get_test_config(test_desc, example_dir,
                                              os.path.dirname(__file__))
 
-    # Start workers
     workers_cmd = [
         'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
         str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
         config_file
     ]
-    with open('output_workers.log', 'w') as f:
-        workers_proc = subprocess.Popen(workers_cmd,
-                                        stdout=f,
-                                        stderr=subprocess.STDOUT,
-                                        env=env,
-                                        cwd=cwd)
 
     server_start_timeout = 900
-    # Start server
     server_cmd = [
         'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file
     ]
-    with open('output_disagg.log', 'w') as f:
-        server_proc = subprocess.Popen(server_cmd,
-                                       stdout=f,
-                                       stderr=subprocess.STDOUT,
-                                       env=env,
-                                       cwd=cwd)
 
-    client_dir = f"{example_dir}/clients"
-    for _ in range(num_iters):
-        client_cmd = [
-            'python3', f'{client_dir}/disagg_client.py', '-c',
-            f'{example_dir}/disagg_config.yaml', '-p',
-            f'{client_dir}/prompts.json', '--ignore-eos',
-            '--server-start-timeout',
-            str(server_start_timeout)
-        ]
-        subprocess.run(client_cmd, check=True, env=env)
-
-        # Streaming client run
-        streaming_client_cmd = client_cmd + [
-            '--streaming', '-o', 'output_streaming.json'
-        ]
-        subprocess.run(streaming_client_cmd, check=True, env=env)
-
-        # Run the chat completion endpoint test only for TinyLlama
-        if test_desc == "overlap":
-            chat_client_cmd = client_cmd + [
-                '-e', 'chat', '-o', 'output_chat.json'
+    with (  # Start workers
+            open('output_workers.log', 'w') as output_workers,
+            popen(workers_cmd,
+                  stdout=output_workers,
+                  stderr=subprocess.STDOUT,
+                  env=env,
+                  cwd=cwd),
+            # Start server
+            open('output_disagg.log', 'w') as output_disagg,
+            popen(server_cmd,
+                  stdout=output_disagg,
+                  stderr=subprocess.STDOUT,
+                  env=env,
+                  cwd=cwd)):
+        client_dir = f"{example_dir}/clients"
+        for _ in range(num_iters):
+            client_cmd = [
+                'python3', f'{client_dir}/disagg_client.py', '-c',
+                f'{example_dir}/disagg_config.yaml', '-p',
+                f'{client_dir}/prompts.json', '--ignore-eos',
+                '--server-start-timeout',
+                str(server_start_timeout)
             ]
-            subprocess.run(chat_client_cmd, check=True, env=env)
+            check_call(client_cmd, env=env)
 
-            streaming_chat_client_cmd = chat_client_cmd + [
-                '--streaming', '-o', 'output_streaming_chat.json'
+            # Streaming client run
+            streaming_client_cmd = client_cmd + [
+                '--streaming', '-o', 'output_streaming.json'
             ]
-            subprocess.run(streaming_chat_client_cmd, check=True, env=env)
+            check_call(streaming_client_cmd, env=env)
 
-        # Verify outputs
-        not_expected_strings = ["Berlin Berlin"]
+            # Run the chat completion endpoint test only for TinyLlama
+            if test_desc == "overlap":
+                chat_client_cmd = client_cmd + [
+                    '-e', 'chat', '-o', 'output_chat.json'
+                ]
+                check_call(chat_client_cmd, env=env)
 
-        output_files = ['output.json', 'output_streaming.json']
-        if test_desc == "overlap":
-            # Disable streaming chat completion for overlap test
-            # due to bug
-            output_files.extend(['output_chat.json'])
+                streaming_chat_client_cmd = chat_client_cmd + [
+                    '--streaming', '-o', 'output_streaming_chat.json'
+                ]
+                check_call(streaming_chat_client_cmd, env=env)
 
-        if test_desc.startswith("gen_only"):
-            continue
+            # Verify outputs
+            not_expected_strings = ["Berlin Berlin"]
 
-        for output_file in output_files:
-            with open(output_file, 'r') as f:
-                content = f.read()
-                if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
-                    expected_strings = ["Berlin", "Asyncio is a"]
-                else:
-                    expected_strings = [
-                        "The capital of Germany is Berlin",
-                        "Asyncio is a Python library"
-                    ]
-                for expected_string in expected_strings:
-                    assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
-                for not_expected_string in not_expected_strings:
-                    assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
+            output_files = ['output.json', 'output_streaming.json']
+            if test_desc == "overlap":
+                # Disable streaming chat completion for overlap test
+                # due to bug
+                output_files.extend(['output_chat.json'])
+
+            if test_desc.startswith("gen_only"):
+                continue
+
+            for output_file in output_files:
+                with open(output_file, 'r') as f:
+                    content = f.read()
+                    if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
+                        expected_strings = ["Berlin", "Asyncio is a"]
+                    else:
+                        expected_strings = [
+                            "The capital of Germany is Berlin",
+                            "Asyncio is a Python library"
+                        ]
+                    for expected_string in expected_strings:
+                        assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
+                    for not_expected_string in not_expected_strings:
+                        assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
 
     # Print outputs
     print("------------------")
@@ -220,8 +212,6 @@ def run_disaggregated_test(example_dir,
     print("------------------")
     with open('output_disagg.log', 'r') as f:
         print(f.read())
-
-    kill_disaggregated_processes()
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
