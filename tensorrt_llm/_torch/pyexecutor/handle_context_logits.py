@@ -64,9 +64,8 @@ class HandleContextLogits:
 
             # Create a view of logits_view with shape (logits_view.shape[0], 1, logits_view.shape[1])
             # This creates a new tensor that shares the same underlying data
-            decoder_buffer_logits[
-                seq_slot] = logits_view[:logits_view.shape[0], :1, :logits_view.
-                                        shape[1]]
+            decoder_buffer_logits[seq_slot] = logits_view.reshape(
+                logits_view.shape[0], 1, logits_view.shape[1])
 
             # TODO: Implement this once return generation logits is supported
             # # Save the last token logits of context into generation logits or

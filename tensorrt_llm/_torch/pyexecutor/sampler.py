@@ -595,9 +595,6 @@ class TRTLLMSampler(Sampler):
         batch_size = scheduled_requests.batch_size
         beam_width = self.beam_width(scheduled_requests.all_requests)
 
-        # TODO: Remove this unsqueezing once we get beam width support.
-        logits = model_outputs["logits"].unsqueeze(1)
-
         self.setup_sampler_step(scheduled_requests.context_requests)
 
         num_context_logits = [1] * batch_size
@@ -607,13 +604,13 @@ class TRTLLMSampler(Sampler):
                 batch_index] = request.context_chunk_size if request.py_return_context_logits else 1
 
         logits_index = self.algs.handle_context_logits(
-            scheduled_requests.context_requests, num_context_logits, logits,
-            self.store["decoder_buffers"])
+            scheduled_requests.context_requests, num_context_logits,
+            model_outputs["logits"], self.store["decoder_buffers"])
 
         self.algs.handle_generation_logits(
             logits_index, scheduled_requests.generation_requests,
             self.store["decoder_buffers"], self.model_config,
-            self.store["buffer_manager"], logits)
+            self.store["buffer_manager"], model_outputs["logits"])
 
         decoding_input, self.decoding_output = self.algs.make_decoding_batch_input_output(
             scheduled_requests.context_requests,
@@ -658,7 +655,7 @@ class TRTLLMSampler(Sampler):
         sampler_event.record()
 
         return SampleStateTRTLLM(scheduled_requests=scheduled_requests,
-                                 logits=logits,
+                                 logits=model_outputs["logits"],
                                  device=device,
                                  host=host,
                                  sampler_event=sampler_event)
