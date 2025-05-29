@@ -6,7 +6,8 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
 from ..attention_backend.interface import AttentionInputType
 from ..autotuner import AutoTuner, TunableRunner, TuningConfig
-from ..utils import (compute_swizzled_sf_shape, get_last_power_of_2_num_tokens_buckets,
+from ..utils import (compute_swizzled_sf_shape,
+                     get_last_power_of_2_num_tokens_buckets,
                      get_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2, next_positive_power_of_2)
 
@@ -564,7 +565,7 @@ def _(
                                 dtype=torch.uint8)
     else:
         output_act = q.new_empty((num_tokens, num_heads * v_head_size),
-                             dtype=out_dtype)
+                                 dtype=out_dtype)
         output_sf = torch.empty(())  # Create a placeholder, which is not used.
 
     return output_act, output_sf
