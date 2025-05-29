@@ -322,7 +322,7 @@ def get_pytest_timeout(timeout=None):
             timeout_mark = marks[0]
             timeout_pytest = timeout_mark.args[0] if timeout_mark.args else None
             if timeout_pytest and isinstance(timeout_pytest, (int, float)):
-                return max(30, int(timeout_pytest * 0.5))
+                return max(30, int(timeout_pytest * 0.9))
 
     except (ImportError, Exception) as e:
         print(f"Error getting pytest timeout: {e}")

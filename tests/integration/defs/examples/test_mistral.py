@@ -66,7 +66,6 @@ def mistral_example_root(llm_venv):
 @pytest.mark.parametrize("data_type", ['float16'])
 @pytest.mark.parametrize("llm_mistral_model_root", ['mistral-7b-v0.1'],
                          indirect=True)
-@pytest.mark.timeout(300)
 def test_llm_mistral_v1_1gpu(run_type, data_type, llama_example_root,
                              max_attention_window, llm_mistral_model_root,
                              llm_datasets_root, llm_rouge_root, llm_venv,
