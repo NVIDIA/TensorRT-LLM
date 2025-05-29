@@ -334,6 +334,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 def launchReleaseCheck(pipeline)
 {
     stages = {
+        sh "rm -rf /etc/apt/sources.list.d/debian.sources && echo 'deb https://urm.nvidia.com/artifactory/debian-remote bookworm main' > /etc/apt/sources.list"
         trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
             python3-pip \
             -y""")
