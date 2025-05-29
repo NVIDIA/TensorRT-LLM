@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Optional
 
 import torch
@@ -7,13 +22,13 @@ from torch import nn
 from ...attention_backend import AttentionMetadata
 from ...model_config import ModelConfig
 from ..linear import Linear, TensorParallelMode
-from .causal_conv1d import causal_conv1d_update, causal_conv1d_varlen_states
+from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .selective_state_update import selective_state_update
-from .ssd_combined import mamba_split_conv1d_scan_combined
+from .ssd_combined import mamba_chunk_scan_combined
 
 
-class MambaMixer(nn.Module):
+class Mamba2Mixer(nn.Module):
 
     def __init__(
         self,
@@ -62,7 +77,6 @@ class MambaMixer(nn.Module):
         self.delta_rank = delta_rank
         self.delta_softplus = delta_softplus
         self.remove_padding = remove_padding
-        self.is_mamba2 = True
         self.apply_silu = apply_silu
 
         # tp
@@ -213,65 +227,69 @@ class MambaMixer(nn.Module):
                     dim=0,
                 ).to(torch.int32).to(torch.device("cuda")))
 
-                conv_states_out = causal_conv1d_varlen_states(
-                    xbc, cu_seqlens, state_len=self.d_conv)
+                seq_idx = torch.repeat_interleave(
+                    torch.arange(len(split_seq_lens[req_type]),
+                                 dtype=torch.int32,
+                                 device=cu_seqlens.device),
+                    cu_seqlens.diff(),
+                    output_size=cu_seqlens[-1]).unsqueeze(0)
 
-                if not is_warmup:
-                    conv_states.index_copy_(0, indices, conv_states_out)
+                current_conv_states = torch.empty_like(
+                    conv_states[indices, ...]) if not is_warmup else None
+                xbc = causal_conv1d_fn(xbc.transpose(0, 1),
+                                       self.conv1d.weight,
+                                       self.conv1d.bias,
+                                       activation="silu",
+                                       conv_states=current_conv_states,
+                                       query_start_loc=cu_seqlens).transpose(
+                                           0, 1)
 
-                # Temporary fix to make mamba layer close to original implementation
-                ctx_seq_lens = split_seq_lens[req_type].tolist()
-                ctx_zxbcdt = torch.split(split_zxbcdt[req_type],
-                                         ctx_seq_lens,
-                                         dim=0)
-                split_y = []
-                split_ssm_states = []
-                for i in range(len(ctx_zxbcdt)):
-                    y, ssm_states_out = mamba_split_conv1d_scan_combined(
-                        ctx_zxbcdt[i].unsqueeze(0),
-                        self.conv1d.weight.permute(0, 1).contiguous(),
-                        self.conv1d.bias,
-                        self.dt_bias,
-                        self.A,
-                        D=self.D,
-                        chunk_size=self.chunk_size,
-                        activation="silu",
-                        headdim=self.head_dim,
-                        ngroups=self.tp_ngroups,
-                        norm_before_gate=False,
-                        initial_states=None,
-                        return_final_states=True,
-                    )
+                x, B, C = torch.split(xbc.unsqueeze(0), [
+                    self.tp_d_inner,
+                    self.tp_ngroups * self.d_state,
+                    self.tp_ngroups * self.d_state,
+                ],
+                                      dim=-1)
 
-                    split_y.append(y.squeeze(0))
-                    split_ssm_states.append(ssm_states_out)
+                x = rearrange(x, "b l (h p) -> b l h p", h=self.tp_nheads)
+                dt = dt.unsqueeze(0)
+                B = rearrange(B, "b l (g n) -> b l g n", g=self.tp_ngroups)
+                C = rearrange(C, "b l (g n) -> b l g n", g=self.tp_ngroups)
+                z = rearrange(z.unsqueeze(0),
+                              "b l (h p) -> b l h p",
+                              h=self.tp_nheads)
 
-                y = torch.cat(split_y, dim=0)
-                ssm_states_out = torch.cat(split_ssm_states, dim=0)
-
-                # norm
-                y = self.norm(y)
+                y, current_ssm_states = mamba_chunk_scan_combined(
+                    x,
+                    dt,
+                    self.A,
+                    B,
+                    C,
+                    chunk_size=self.chunk_size,
+                    D=self.D,
+                    z=z,
+                    dt_bias=self.dt_bias,
+                    initial_states=None,
+                    dt_softplus=self.delta_softplus,
+                    cu_seqlens=cu_seqlens,
+                    seq_idx=seq_idx,
+                    return_varlen_states=True,
+                    return_final_states=False,
+                )
+                y = rearrange(y, "b l h p -> (b l) (h p)")
 
             # decode
             else:
 
                 # get conv and ssm states for decode
                 if not is_warmup:
-                    conv_states_in = conv_states[indices]
-                    ssm_states_in = ssm_states[indices]
+                    current_conv_states = conv_states[indices]
+                    current_ssm_states = ssm_states[indices]
 
                 # update conv states
-                xbc = causal_conv1d_update(
-                    xbc,
-                    conv_states_in,
-                    self.conv1d.weight.permute(0, 1).contiguous(),
-                    self.conv1d.bias,
-                    "silu",
-                )
-
-                # copy new conv states
-                if not is_warmup:
-                    conv_states.index_copy_(0, indices, conv_states_in)
+                xbc = causal_conv1d_update(xbc, current_conv_states,
+                                           self.conv1d.weight, self.conv1d.bias,
+                                           "silu")
 
                 x, B, C = torch.split(
                     xbc,
@@ -283,8 +301,6 @@ class MambaMixer(nn.Module):
                     dim=-1,
                 )
 
-                ssm_states_out = ssm_states_in.transpose(2, 3)
-
                 A = repeat(self.A,
                            "h -> h p n",
                            p=self.head_dim,
@@ -295,29 +311,30 @@ class MambaMixer(nn.Module):
                 B = rearrange(B, "b (g n) -> b g n", g=self.tp_ngroups)
                 C = rearrange(C, "b (g n) -> b g n", g=self.tp_ngroups)
                 x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.head_dim)
+                z = rearrange(z, "b (h p) -> b h p", p=self.head_dim)
 
                 y = selective_state_update(
-                    ssm_states_out,
+                    current_ssm_states,
                     x_reshaped,
                     dt,
                     A,
                     B,
                     C,
                     D,
-                    z=None,
+                    z=z,
                     dt_bias=dt_bias,
                     dt_softplus=self.delta_softplus,
                 )
 
                 y = rearrange(y, "b h p -> b (h p)")
 
-                # gated norm
-                y = self.norm(y, z)
+            # gated norm
+            y = self.norm(y)
 
-            # copy new ssm states
+            # copy new conv and ssm states
             if not is_warmup:
-                ssm_states_out = ssm_states_out.transpose(2, 3)
-                ssm_states.index_copy_(0, indices, ssm_states_out)
+                conv_states.index_copy_(0, indices, current_conv_states)
+                ssm_states.index_copy_(0, indices, current_ssm_states)
 
             # append output
             out.append(y)
