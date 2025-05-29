@@ -9,6 +9,7 @@ l0_dgx_b200:
       gpu:
       - '*b200*'
       linux_distribution_name: ubuntu*
+      cpu: x86_64
     terms:
       stage: post_merge
       backend: pytorch
