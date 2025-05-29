@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/executor/executor.h"
 #include <NvInferRuntimeBase.h>
 #include <mutex>
 
@@ -106,42 +107,82 @@ size_t FabricMemory::getSize() const
 
 size_t FabricMemory::getAlignedSize(size_t size)
 {
-    int deviceIdx = -1;
-    TLLM_CUDA_CHECK(cudaGetDevice(&deviceIdx));
-    CUmemAllocationHandleType const handle_type = CU_MEM_HANDLE_TYPE_FABRIC;
-    CUmemAllocationProp prop = {};
-    prop.requestedHandleTypes = handle_type;
-    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = deviceIdx;
-    prop.allocFlags.gpuDirectRDMACapable = 1;
 
-    size_t granularity{0};
-    TLLM_CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    auto alingedSizeFun = []()
+    {
+        int deviceIdx = -1;
+        TLLM_CUDA_CHECK(cudaGetDevice(&deviceIdx));
+        CUmemAllocationHandleType const handle_type = CU_MEM_HANDLE_TYPE_FABRIC;
+        CUmemAllocationProp prop = {};
+        prop.requestedHandleTypes = handle_type;
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = deviceIdx;
+        prop.allocFlags.gpuDirectRDMACapable = 1;
+
+        size_t granularity{0};
+        TLLM_CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+        return granularity;
+    };
+    static size_t granularity = alingedSizeFun();
+
     return (size + granularity - 1) / granularity * granularity;
 }
 
 bool FabricMemory::supportFbaricMemory()
 {
 #ifdef __aarch64__
-    int fabric_handle_supported{0};
-    int gpu_direct_rdma_with_cuda_vmm_supported{0};
-    int mDeviceIdx = 0;
-    TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceIdx));
-    CUresult ret0
-        = cuDeviceGetAttribute(&fabric_handle_supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, mDeviceIdx);
-
-    CUresult ret1 = cuDeviceGetAttribute(&gpu_direct_rdma_with_cuda_vmm_supported,
-        CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, mDeviceIdx);
-    TLLM_LOG_DEBUG("FabricMemory::supportFbaricMemory fabric_handle_supported:%d", fabric_handle_supported);
-    TLLM_LOG_DEBUG("FabricMemory::supportFbaricMemory gpu_direct_rdma_with_cuda_vmm_supported:%d",
-        gpu_direct_rdma_with_cuda_vmm_supported);
-    if (ret0 != CUresult::CUDA_SUCCESS || ret1 != CUresult::CUDA_SUCCESS || fabric_handle_supported == 0
-        || gpu_direct_rdma_with_cuda_vmm_supported == 0)
+    auto support_fun = []()
     {
+        int fabric_handle_supported{0};
+        int gpu_direct_rdma_with_cuda_vmm_supported{0};
+        int deviceIdx = 0;
+        TLLM_CUDA_CHECK(cudaGetDevice(&deviceIdx));
+        CUresult ret0 = cuDeviceGetAttribute(
+            &fabric_handle_supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, deviceIdx);
+
+        CUresult ret1 = cuDeviceGetAttribute(&gpu_direct_rdma_with_cuda_vmm_supported,
+            CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, deviceIdx);
+        TLLM_LOG_DEBUG("FabricMemory::supportFbaricMemory fabric_handle_supported:%d", fabric_handle_supported);
+        TLLM_LOG_DEBUG("FabricMemory::supportFbaricMemory gpu_direct_rdma_with_cuda_vmm_supported:%d",
+            gpu_direct_rdma_with_cuda_vmm_supported);
+        if (ret0 != CUresult::CUDA_SUCCESS || ret1 != CUresult::CUDA_SUCCESS || fabric_handle_supported == 0
+            || gpu_direct_rdma_with_cuda_vmm_supported == 0)
+        {
+            return false;
+        }
+
+        CUmemAllocationHandleType const handle_type = CU_MEM_HANDLE_TYPE_FABRIC;
+        CUmemAllocationProp prop = {};
+        prop.requestedHandleTypes = handle_type;
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = deviceIdx;
+        prop.allocFlags.gpuDirectRDMACapable = 1;
+
+        size_t granularity{0};
+        TLLM_CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+        CUmemGenericAllocationHandle handle;
+
+        auto cuRet = cuMemCreate(&handle, granularity, &prop, 0);
+
+        if (cuRet == CUresult::CUDA_SUCCESS)
+        {
+            TLLM_CU_CHECK(cuMemRelease(handle));
+            return true;
+        }
+        if (cuRet == CUresult::CUDA_ERROR_NOT_PERMITTED)
+        {
+            TLLM_LOG_WARNING("Try to creat fabric memory failed , setting imex channel may be required");
+            return false;
+        }
+        TLLM_CU_CHECK(cuRet);
+
         return false;
-    }
-    return true;
+    };
+    static bool support = support_fun();
+    return support;
+
 #else
     return false;
 #endif
