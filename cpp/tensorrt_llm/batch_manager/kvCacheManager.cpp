@@ -359,7 +359,7 @@ bool KVCacheBlock::isLeaf() const
 }
 
 std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
-    std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers,
+    std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers,
     std::map<SizeType32, SizeType32> const& cacheSizePerTokenPerWindow)
 {
     if (uniqueWindowSizeToLayers.size() == 1)
@@ -2030,16 +2030,16 @@ std::map<SizeType32, std::vector<SizeType32>> BaseKVCacheManager::groupLayersByW
 BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& config, bool isCrossAttention,
     nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     runtime::BufferManager const& bufferManager,
-    std::map<SizeType32, std::vector<SizeType32>> const& managedLayersPerWindowSize, float kvCacheManagerFraction,
+    std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, float kvCacheManagerFraction,
     SizeType32 kvFactor, size_t extraCostMemory)
 {
     auto const freeMemFraction = config.freeGpuMemoryFraction.value_or(KvCacheConfig::kDefaultGpuMemFraction);
     TLLM_CHECK_WITH_INFO(freeMemFraction < 1.0F,
         "Invalid freeMemFraction, freeMemFraction (%f) must be smaller than 1.0f", freeMemFraction);
     std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow;
-    for (auto const& [windowSize, managedLayers] : managedLayersPerWindowSize)
+    for (auto const& [windowSize, managedLayers] : windowSizeToLayers)
     {
-        auto const cacheSizePerToken = BaseKVCacheManager::calculateCacheSizePerToken(
+        auto const cacheSizePerToken = BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize(
             modelConfig, worldConfig, managedLayers, isCrossAttention, kvFactor);
         auto const cacheSizeBytesPerToken = cacheSizePerToken * BufferDataType(dtype).getSize();
         cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
@@ -2094,8 +2094,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
 
     if (config.maxTokens.has_value())
     {
-        auto const isHomogeneous
-            = managedLayersPerWindowSize.size() == 1 && managedLayersPerWindowSize.cbegin()->second.size() == 1;
+        auto const isHomogeneous = windowSizeToLayers.size() == 1 && windowSizeToLayers.cbegin()->second.size() == 1;
         TLLM_CHECK_WITH_INFO(isHomogeneous,
             "maxTokens cannot really be used when there are multiple pools, as it doesn't make sense conceptually");
         if (config.freeGpuMemoryFraction.has_value())
@@ -2118,10 +2117,10 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
     // }
 
     auto const windowSizeToShare
-        = BlockManager::calculateWindowSizeToShare(managedLayersPerWindowSize, cacheSizeBytesPerTokenPerWindow);
+        = BlockManager::calculateWindowSizeToShare(windowSizeToLayers, cacheSizeBytesPerTokenPerWindow);
 
     BlocksPerWindow windowSizeToBlocks;
-    for (auto const& [windowSize, managedLayers] : managedLayersPerWindowSize)
+    for (auto const& [windowSize, managedLayers] : windowSizeToLayers)
     {
         auto const cacheSizeBytesPerToken = cacheSizeBytesPerTokenPerWindow.at(windowSize);
         auto const windowSizeShare = windowSizeToShare.at(windowSize);

@@ -606,11 +606,11 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
 
     auto const numLayers = static_cast<SizeType32>(numKvHeadsPerLayer.size());
 
-    auto const managedLayersPerWindowSize = KVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, numLayers);
+    auto const windowSizeToLayers = KVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, numLayers);
 
     auto const blocksPerWindow
         = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, isCrossAttention, kvDtype, mModelConfig, mWorldConfig,
-            mRuntime->getBufferManager(), managedLayersPerWindowSize, kvCacheManagerFraction, 2, extraCostMemory);
+            mRuntime->getBufferManager(), windowSizeToLayers, kvCacheManagerFraction, 2, extraCostMemory);
 
     auto kvCacheManager = std::make_shared<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
         blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,

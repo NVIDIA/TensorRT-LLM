@@ -1280,11 +1280,11 @@ public:
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 
     // Sum of numLayers * kvFactor * numKvHeads * sizePerHead for each pool
-    [[nodiscard]] static SizeType32 calculateCacheSizePerToken(tensorrt_llm::runtime::ModelConfig const& modelConfig,
-        tensorrt_llm::runtime::WorldConfig const& worldConfig, std::vector<SizeType32> const& managedLayers,
-        bool isCrossAttention, SizeType32 kvFactor = 2)
+    [[nodiscard]] static SizeType32 calculateCacheSizePerTokenForSingleWindowSize(
+        tensorrt_llm::runtime::ModelConfig const& modelConfig, tensorrt_llm::runtime::WorldConfig const& worldConfig,
+        std::vector<SizeType32> const& windowSizeLayers, bool isCrossAttention, SizeType32 kvFactor = 2)
     {
-        auto const nkvh = modelConfig.getNumKvHeadsForGivenLayers(managedLayers);
+        auto const nkvh = modelConfig.getNumKvHeadsForGivenLayers(windowSizeLayers);
         auto const sumLocalHeads = std::reduce(nkvh.cbegin(), nkvh.cend());
         // NOTE: We expect the initialization of modelConfig to have already taken the tp size into account and do not
         // address it here
@@ -1298,7 +1298,7 @@ public:
     [[nodiscard]] static BlocksPerWindow calculateMaxNumBlocks(KvCacheConfig const& config, bool isCrossAttention,
         nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         tensorrt_llm::runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager,
-        std::map<SizeType32, std::vector<SizeType32>> const& managedLayersPerWindowSize, float kvCacheManagerFraction,
+        std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, float kvCacheManagerFraction,
         SizeType32 kvFactor = 2, size_t extraCostMemory = 0);
 
     /// @brief Calculates the maximum batch size that can fit the kv-cache, given that all sequences in the batch have
