@@ -259,15 +259,21 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             = optionalParams.cacheTransceiverConfig.value_or(executor::CacheTransceiverConfig());
         auto cacheTransPreAllocaSize
             = kv_cache_manager::CacheTransBufferManager::preAllocBufferSize(cacheTransceiverConfig.getMaxNumTokens());
+
+        auto const [freePrimaryMem, freeSecondaryMem]
+            = BaseKVCacheManager::calculateFreeMem(mRuntime->getBufferManager(), optionalParams.kvCacheConfig);
+
         if (mModelConfig.useCrossAttention())
         {
             TLLM_CHECK_WITH_INFO(optionalParams.kvCacheConfig.crossKvCacheFraction.has_value(),
                 "Must set crossKvCacheFraction for encoder-decoder model");
             auto const crossKvCacheFraction = optionalParams.kvCacheConfig.crossKvCacheFraction.value();
-            mKvCacheManager = createKvCacheManager(
-                optionalParams.kvCacheConfig, KvCacheType::kSELF, cacheTransPreAllocaSize, 1.0f - crossKvCacheFraction);
-            mCrossKvCacheManager = createKvCacheManager(
-                optionalParams.kvCacheConfig, KvCacheType::kCROSS, cacheTransPreAllocaSize, crossKvCacheFraction);
+            mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kSELF,
+                freePrimaryMem / (1.0f - crossKvCacheFraction), freeSecondaryMem / (1.0f - crossKvCacheFraction),
+                cacheTransPreAllocaSize);
+            mCrossKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kCROSS,
+                freePrimaryMem / crossKvCacheFraction, freeSecondaryMem / crossKvCacheFraction,
+                cacheTransPreAllocaSize);
             TLLM_LOG_INFO("This is an Encoder-Decoder model, set %0.1f cross KV cache fraction based on the config.",
                 crossKvCacheFraction);
         }
@@ -275,8 +281,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         {
             TLLM_CHECK_WITH_INFO(!optionalParams.kvCacheConfig.crossKvCacheFraction.has_value(),
                 "Do not set crossKvCacheFraction for decoder-only model");
-            mKvCacheManager
-                = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kSELF, cacheTransPreAllocaSize, 1.0f);
+            mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kSELF, freePrimaryMem,
+                freeSecondaryMem, cacheTransPreAllocaSize);
         }
 
         mCacheTransceiver
@@ -546,7 +552,8 @@ void TrtGptModelInflightBatching::adjustMaxAttentionWindow(SizeType32 numPrimary
 }
 
 std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::createKvCacheManager(
-    KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType, size_t extraCostMemory, float kvCacheManagerFraction)
+    KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType, SizeType32 freePrimaryMem, SizeType32 freeSecondaryMem,
+    size_t extraCostMemory)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     bool isCrossAttention = kvCacheType == KvCacheType::kCROSS;
@@ -608,9 +615,8 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
 
     auto const windowSizeToLayers = KVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, numLayers);
 
-    auto const blocksPerWindow
-        = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, isCrossAttention, kvDtype, mModelConfig, mWorldConfig,
-            mRuntime->getBufferManager(), windowSizeToLayers, kvCacheManagerFraction, 2, extraCostMemory);
+    auto const blocksPerWindow = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, isCrossAttention, kvDtype,
+        mModelConfig, mWorldConfig, windowSizeToLayers, freePrimaryMem, freeSecondaryMem, extraCostMemory, 2);
 
     auto kvCacheManager = std::make_shared<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
         blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
