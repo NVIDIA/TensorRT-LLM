@@ -201,11 +201,12 @@ def gqa_attention_kv_stage1(
     attn = tl.dot(q, k.trans())  # [N, seq_block]
     attn = attn.to(tl.float32)
     attn *= sm_scale
-    max_attn = tl.max(attn, axis=1)  # [N, 1]
     # Set to -inf attn values where mask is not set. This forces exp(attn) to 0.
     attn = tl.where(head_mask[:, None] * seq_mask[None, :], attn, float("-inf"))
-    exp_attn = tl.exp(attn - max_attn[:, None])
+    # compute max_attn only when invalid attn values are masked out.
+    max_attn = tl.max(attn, axis=1)  # [N, 1]
 
+    exp_attn = tl.exp(attn - max_attn[:, None])
     sumexp = tl.sum(exp_attn, axis=1)  # [N, 1]
 
     # [NUM_HEADS, seq_len] * [seq_len, V_D_HEAD], sum along axis 0
