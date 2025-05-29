@@ -33,6 +33,12 @@ MicroBatchScheduler::MicroBatchScheduler(std::optional<batch_scheduler::ContextC
     , mNoScheduleUntilState(noScheduleUntilState)
     , mNoScheduleAfterState(noScheduleAfterState)
 {
+    TLLM_LOG_WARNING("minwei mCtxChunkConfig: %s", mCtxChunkConfig.has_value() ? "has value" : "no value");
+    if (mCtxChunkConfig.has_value()) {
+        TLLM_LOG_WARNING("minwei chunkingPolicy: %d", static_cast<int>(mCtxChunkConfig->chunkingPolicy));
+        TLLM_LOG_WARNING("minwei chunkUnitSize: %d", mCtxChunkConfig->chunkUnitSize);
+    }
+    TLLM_LOG_WARNING("minwei mMaxContextLength: %s", mMaxContextLength.has_value() ? std::to_string(*mMaxContextLength).c_str() : "no value");
     // minwei: manually set mCtxChunkConfig and mMaxContextLength
     mCtxChunkConfig = batch_scheduler::ContextChunkingConfig{
         .chunkingPolicy = tle::ContextChunkingPolicy::kEQUAL_PROGRESS,

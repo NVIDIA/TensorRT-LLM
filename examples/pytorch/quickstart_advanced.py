@@ -75,6 +75,7 @@ def add_llm_args(parser):
     parser.add_argument('--enable_chunked_prefill',
                         default=False,
                         action='store_true')
+    parser.add_argument('--chunked_prefill_size', type=int, default=None)
     parser.add_argument('--use_cuda_graph', default=False, action='store_true')
     parser.add_argument('--print_iter_log',
                         default=False,
@@ -145,6 +146,7 @@ def setup_llm(args):
               moe_expert_parallel_size=args.moe_ep_size,
               moe_tensor_parallel_size=args.moe_tp_size,
               enable_chunked_prefill=args.enable_chunked_prefill,
+              chunked_prefill_size=args.chunked_prefill_size,
               speculative_config=spec_config)
 
     sampling_params = SamplingParams(

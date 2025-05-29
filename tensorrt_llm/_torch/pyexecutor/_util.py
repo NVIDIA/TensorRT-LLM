@@ -245,7 +245,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 torch_dtype_to_str(model_engine.dtype))
 
         num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
-
+        context_chunk_size = executor_config.context_chunk_size if executor_config.enable_chunked_context else executor_config.max_seq_len
         if is_mla(config):
             if spec_config is not None:
                 num_hidden_layers += get_num_spec_layers(spec_config)
@@ -259,6 +259,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
                 tokens_per_block=executor_config.tokens_per_block,
                 max_seq_len=executor_config.max_seq_len,
+                context_chunk_size=context_chunk_size,
                 max_batch_size=executor_config.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
@@ -288,6 +289,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 head_dim=head_dim,
                 tokens_per_block=executor_config.tokens_per_block,
                 max_seq_len=executor_config.max_seq_len,
+                context_chunk_size=context_chunk_size,
                 max_batch_size=executor_config.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
@@ -296,7 +298,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         else:
             if spec_config is not None:
                 num_hidden_layers += get_num_spec_layers(spec_config)
-            # minwei: change chunk size!
+            # minwei: change chunk size! (done)
             return KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -305,7 +307,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 head_dim=head_dim,
                 tokens_per_block=executor_config.tokens_per_block,
                 max_seq_len=executor_config.max_seq_len,
-                context_chunk_size=1024,
+                context_chunk_size=context_chunk_size,
                 max_batch_size=executor_config.max_batch_size,
                 mapping=mapping,
                 dtype=kv_cache_dtype,
@@ -414,8 +416,10 @@ def create_py_executor_instance(dist,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,
         num_micro_batches=num_micro_batches)
+    # minwei pass value to MicroBatchScheduler
     mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
-                                           executor_config.max_num_tokens,
+                                           # executor_config.max_num_tokens,
+                                           executor_config.context_chunk_size if executor_config.enable_chunked_context else executor_config.max_seq_len,
                                            ctx_chunk_config)
     scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 

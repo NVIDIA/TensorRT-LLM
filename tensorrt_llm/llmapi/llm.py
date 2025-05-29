@@ -477,6 +477,11 @@ class LLM:
             raise ValueError(
                 f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({build_config.max_seq_len})")
+        
+        if not self.args.enable_chunked_prefill and self.args.chunked_prefill_size is not None:
+            raise ValueError(
+                "chunked_prefill_size is not supported when enable_chunked_prefill is False"
+            )
 
         if sampling_params.beam_width > build_config.max_beam_width:
             raise ValueError(
@@ -550,6 +555,7 @@ class LLM:
 
         executor_config.normalize_log_probs = self.args.normalize_log_probs
         executor_config.enable_chunked_context = self.args.enable_chunked_prefill
+        executor_config.context_chunk_size = self.args.chunked_prefill_size
         executor_config.max_beam_width = self.args.max_beam_width or self.args.build_config.max_beam_width
         if self.args.extended_runtime_perf_knob_config is not None:
             executor_config.extended_runtime_perf_knob_config = PybindMirror.maybe_to_pybind(
