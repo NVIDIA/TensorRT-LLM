@@ -74,7 +74,8 @@ def write_to_json(filename: str, records: list) -> None:
         json.dump(records, f, cls=InfEncoder)
 
 
-def download_and_cache_file(url: str, path: Optional[str], name: str) -> str:
+def download_and_cache_file(url: str, path: Optional[str], name: str,
+                            timeout: int) -> str:
     # Adapted from
     # https://github.com/sgl-project/sglang/blob/58f10679e1850fdc86046057c23bac5193156de9/python/sglang/bench_serving.py#L586
     """Read and cache a file from a url."""
@@ -90,7 +91,7 @@ def download_and_cache_file(url: str, path: Optional[str], name: str) -> str:
     print(f"Downloading from {url} to {filename}")
 
     # Stream the response to show the progress bar
-    response = requests.get(url, stream=True)
+    response = requests.get(url, stream=True, timeout=timeout)
     response.raise_for_status()  # Check for request errors
 
     # Total size of the file in bytes

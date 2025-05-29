@@ -613,6 +613,7 @@ def main(args: argparse.Namespace):
         dataset_mapping = {
             "sharegpt":
             lambda: ShareGPTDataset(download_path=args.download_path,
+                                    download_timeout=args.download_timeout,
                                     random_seed=args.seed,
                                     dataset_path=args.dataset_path).sample(
                                         tokenizer=tokenizer,
@@ -785,6 +786,10 @@ if __name__ == "__main__":
         default=None,
         help="Path to download dataset if dataset-path is None, "
         "only sharegpt is supported for now")
+    parser.add_argument("--download-timeout",
+                        type=int,
+                        default=180,
+                        help="Timeout for downloading datasets")
     parser.add_argument(
         "--max-concurrency",
         type=int,

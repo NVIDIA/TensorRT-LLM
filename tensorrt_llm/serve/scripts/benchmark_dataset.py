@@ -245,15 +245,21 @@ class ShareGPTDataset(BenchmarkDataset):
     """
     URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
-    def __init__(self, download_path: Optional[str] = None, **kwargs) -> None:
+    def __init__(self,
+                 download_timeout: int,
+                 download_path: Optional[str] = None,
+                 **kwargs) -> None:
         super().__init__(**kwargs)
-        self.load_data(download_path)
+        self.load_data(download_timeout, download_path)
 
-    def load_data(self, download_path: Optional[str] = None) -> None:
+    def load_data(self,
+                  download_timeout: int,
+                  download_path: Optional[str] = None) -> None:
         if self.dataset_path is None:
+            logger.warning("dataset_path is not provided")
             self.dataset_path = download_and_cache_file(
                 ShareGPTDataset.URL, download_path,
-                ShareGPTDataset.URL.split("/")[-1])
+                ShareGPTDataset.URL.split("/")[-1], download_timeout)
 
         with open(self.dataset_path, encoding="utf-8") as f:
             self.data = json.load(f)
