@@ -60,32 +60,53 @@ tkc::CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k)
 template <typename T>
 void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
     at::Tensor const& mat2Scale, at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k, int64_t batch_count,
-    tkc::CutlassGemmConfig const& gemmConfig)
+    tkc::CutlassGemmConfig const& gemmConfig, bool is_w4a8_mxfp4_fp8)
 {
-    CutlassFp4GemmRunner<T> gemmRunner;
-    int64_t const wsBytes = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
+    if (is_w4a8_mxfp4_fp8)
+    {
+        CutlassFp4GemmRunner<T, true> gemmRunner;
+        int64_t const wsBytes = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
 
-    at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, mat1.device(), std::nullopt);
+        at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, mat1.device(), std::nullopt);
 
-    gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
-        mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
-        reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()));
+        gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
+            mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
+            reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()));
+    }
+    else
+    {
+        CutlassFp4GemmRunner<T, false> gemmRunner;
+        int64_t const wsBytes = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
+
+        at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, mat1.device(), std::nullopt);
+
+        gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
+            mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
+            reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()));
+    }
 }
 
-// mat1: [B, M, K / 2], FLOAT4_E2M1X2
+// mat1: [B, M, K / 2], FLOAT4_E2M1X2 or [B, M, K], FLOAT8_E4M3FN
 // mat2: [B, N, K / 2], FLOAT4_E2M1X2
 // out: [B, M, N], fp16/bf16/fp32
 // mat1Scale: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 // mat2Scale: ceil(N / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 // globalScale: [1], 1 / (((448 * 6) / mat1.abs().max()) * ((448 * 6) / mat2.abs().max()))
 // B = 1 for GEMM op as a special case
-// Only NVFP4 is currently supported
+// Only W4A4_NVFP4 and W4A8_MXFP4_FP8 are currently supported
 at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
     at::Tensor const& mat2Scale, at::Tensor const& globalScale, bool sfUseUE8M0,
     std::optional<c10::ScalarType> out_dtype, bool to_userbuffers = false,
     tkc::CutlassGemmConfig const* maybe_config = nullptr)
 {
-    CHECK_INPUT(mat1, FLOAT4_E2M1X2);
+    if (sfUseUE8M0)
+    {
+        CHECK_INPUT(mat1, torch::kFloat8_e4m3fn);
+    }
+    else
+    {
+        CHECK_INPUT(mat1, FLOAT4_E2M1X2);
+    }
     CHECK_INPUT(mat2, FLOAT4_E2M1X2);
 
     CHECK_INPUT(mat1Scale, SF_DTYPE);
@@ -93,17 +114,23 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
 
     CHECK_INPUT(globalScale, at::ScalarType::Float);
 
-    TORCH_CHECK(!sfUseUE8M0, "use UE8M0 for FP4 Block Scale Factors is not supported yet");
-
     int64_t m, n, k, b;
     if (mat1.dim() == 2)
     {
         TORCH_CHECK(mat2.dim() == 2, "mat2 must be a matrix");
-        TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[1], "mat1 and mat2 shapes cannot be multiplied (", mat1.sizes()[0],
-            "x", mat1.sizes()[1], " and ", mat2.sizes()[0], "x", mat2.sizes()[1], ")");
+        if (sfUseUE8M0)
+        {
+            TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[1] * 2, "mat1 and mat2 shapes cannot be multiplied (",
+                mat1.sizes()[0], "x", mat1.sizes()[1], " and ", mat2.sizes()[0], "x", mat2.sizes()[1], ")");
+        }
+        else
+        {
+            TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[1], "mat1 and mat2 shapes cannot be multiplied (",
+                mat1.sizes()[0], "x", mat1.sizes()[1], " and ", mat2.sizes()[0], "x", mat2.sizes()[1], ")");
+        }
         m = mat1.sizes()[0];
         n = mat2.sizes()[0];
-        k = mat1.sizes()[1] * 2;
+        k = mat1.sizes()[1] * (sfUseUE8M0 ? 1 : 2);
         b = 1;
     }
     else if (mat1.dim() == 3)
@@ -111,11 +138,19 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
         TORCH_CHECK(mat2.dim() == 3, "mat2 must be a batch of matrices");
         TORCH_CHECK(mat1.sizes()[0] == mat2.sizes()[0], "mat1 and mat2 must have the same batch size (",
             mat1.sizes()[0], " and ", mat2.sizes()[0], ")");
-        TORCH_CHECK(mat1.sizes()[2] == mat2.sizes()[2], "mat1 and mat2 shapes cannot be multiplied (", mat1.sizes()[1],
-            "x", mat1.sizes()[2], " and ", mat2.sizes()[1], "x", mat2.sizes()[2], ")");
+        if (sfUseUE8M0)
+        {
+            TORCH_CHECK(mat1.sizes()[2] == mat2.sizes()[2] * 2, "mat1 and mat2 shapes cannot be multiplied (",
+                mat1.sizes()[1], "x", mat1.sizes()[2], " and ", mat2.sizes()[1], "x", mat2.sizes()[2], ")");
+        }
+        else
+        {
+            TORCH_CHECK(mat1.sizes()[2] == mat2.sizes()[2], "mat1 and mat2 shapes cannot be multiplied (",
+                mat1.sizes()[1], "x", mat1.sizes()[2], " and ", mat2.sizes()[1], "x", mat2.sizes()[2], ")");
+        }
         m = mat1.sizes()[1];
         n = mat2.sizes()[1];
-        k = mat1.sizes()[2] * 2;
+        k = mat1.sizes()[2] * (sfUseUE8M0 ? 1 : 2);
         b = mat1.sizes()[0];
     }
     else
@@ -152,13 +187,13 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
     switch (out_dtype.value())
     {
     case at::ScalarType::Half:
-        runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config);
+        runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config, sfUseUE8M0);
         break;
     case at::ScalarType::BFloat16:
-        runGemm<__nv_bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config);
+        runGemm<__nv_bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config, sfUseUE8M0);
         break;
     case at::ScalarType::Float:
-        runGemm<float>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config);
+        runGemm<float>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config, sfUseUE8M0);
         break;
     default: C10_THROW_ERROR(NotImplementedError, "out_dtype must be one of fp16/bf16/fp32.");
     }
@@ -180,21 +215,43 @@ at::Tensor fp4_bmm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor co
 class FP4GemmRunner : public torch::CustomClassHolder
 {
 public:
-    explicit FP4GemmRunner(at::ScalarType outputDtype)
+    explicit FP4GemmRunner(at::ScalarType outputDtype, bool is_w4a8_mxfp4_fp8)
         : mOutputDtype(outputDtype)
+        , mIsW4A8MxFP4FP8(is_w4a8_mxfp4_fp8)
     {
         if (outputDtype == at::ScalarType::Half)
         {
-            mGemmRunner = std::make_unique<CutlassFp4GemmRunner<half>>();
+            if (is_w4a8_mxfp4_fp8)
+            {
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<half, true>>();
+            }
+            else
+            {
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<half, false>>();
+            }
         }
         else if (outputDtype == at::ScalarType::Float)
         {
-            mGemmRunner = std::make_unique<CutlassFp4GemmRunner<float>>();
+            if (is_w4a8_mxfp4_fp8)
+            {
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<float, true>>();
+            }
+            else
+            {
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<float, false>>();
+            }
         }
 #ifdef ENABLE_BF16
         else if (outputDtype == at::ScalarType::BFloat16)
         {
-            mGemmRunner = std::make_unique<CutlassFp4GemmRunner<__nv_bfloat16>>();
+            if (is_w4a8_mxfp4_fp8)
+            {
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<__nv_bfloat16, true>>();
+            }
+            else
+            {
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<__nv_bfloat16, false>>();
+            }
         }
 #endif
         else
@@ -232,13 +289,14 @@ private:
     std::shared_ptr<CutlassFp4GemmRunnerInterface> mGemmRunner{nullptr};
     std::vector<tkc::CutlassGemmConfig> mConfigs;
     at::ScalarType mOutputDtype;
+    bool mIsW4A8MxFP4FP8;
 };
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.class_<torch_ext::FP4GemmRunner>("FP4GemmRunner")
-        .def(torch::init<at::ScalarType>())
+        .def(torch::init<at::ScalarType, bool>())
         .def("run_gemm", &torch_ext::FP4GemmRunner::runGemm)
         .def("get_num_configs", &torch_ext::FP4GemmRunner::getNumConfigs);
 

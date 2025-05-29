@@ -63,7 +63,7 @@ public:
     virtual std::vector<tkc::CutlassGemmConfig> getConfigs() const = 0;
 };
 
-template <typename T>
+template <typename T, bool is_w4a8_mxfp4_fp8 = false>
 class CutlassFp4GemmRunner : public virtual CutlassFp4GemmRunnerInterface
 {
 public:
