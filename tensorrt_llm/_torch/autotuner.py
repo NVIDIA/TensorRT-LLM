@@ -440,13 +440,13 @@ class AutoTuner:
 
         for p in profiles:
             tensors = self._prepare_input_tensors(p, inputs)
-            is_cache_hit, runner, tactic, _ = self.search_cache(
+            is_cache_hit, runner_id, tactic, _ = self.search_cache(
                 custom_op, runners, p.get_opt_shapes(), tuning_config)
             if not is_cache_hit:
                 min_time = float('inf')
                 # Initialize runner and tactic as None in case of no valid tactic or runners are found
-                runner, tactic = None, None
-                for runner_id, r in enumerate(runners):
+                runner_id, tactic = None, None
+                for r_id, r in enumerate(runners):
                     # TODO: use FakeTensor here.
                     valid_tactics = r.get_valid_tactics(tensors)
                     runner_arg_names = {
@@ -479,19 +479,18 @@ class AutoTuner:
                             time_measured = float('inf')
                         if time_measured < min_time:
                             min_time = time_measured
-                            runner, tactic = r, tac
-                if runner is not None:
+                            runner_id, tactic = r_id, tac
+                if runner_id is not None:
                     # At least one valid (runner, tactic) pair is found
-                    cache_key = runner.get_cache_key(custom_op,
-                                                     p.get_opt_shapes(),
-                                                     tuning_config)
+                    cache_key = runners[runner_id].get_cache_key(
+                        custom_op, p.get_opt_shapes(), tuning_config)
                     # inspect call stack
                     self.profiling_cache[cache_key] = (runner_id, tactic, p)
                     self.stats.tuned_op_successful_configs[
                         custom_op] = self.stats.tuned_op_successful_configs.get(
                             custom_op, 0) + 1
                     logger.debug(
-                        f"[Autotuner]: profiling chosen runner: {runner} {tactic} for {cache_key}"
+                        f"[Autotuner]: profiling chosen runner: {runners[runner_id]} {tactic} for {cache_key}"
                     )
 
         # Get the best runner and tactic from cache

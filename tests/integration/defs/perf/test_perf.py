@@ -58,6 +58,8 @@ MODEL_PATH_DICT = {
     "llama_v3.1_nemotron_nano_8b": "Llama-3.1-Nemotron-Nano-8B-v1",
     "llama_v3.3_nemotron_super_49b":
     "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
+    "llama_v3.1_nemotron_ultra_253b":
+    "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1",
     # "llama_30b": "llama-models/llama-30b-hf",
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
@@ -106,6 +108,8 @@ HF_MODEL_PATH = {
     "llama_v3.1_nemotron_nano_8b_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
     "llama_v3.3_nemotron_super_49b_hf":
     "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+    "llama_v3.1_nemotron_ultra_253b_hf":
+    "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
     "mixtral_8x7b_v0.1_hf": "mistralai/Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct_hf": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistral_7b_v0.1_hf": "mistralai/Mistral-7B-v0.1",

@@ -7,8 +7,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from ..attention_backend.interface import AttentionInputType
 from ..autotuner import AutoTuner, TunableRunner, TuningConfig
 from ..utils import (get_last_power_of_2_num_tokens_buckets,
-                     get_power_of_2_num_tokens_buckets,
-                     last_positive_power_of_2, next_positive_power_of_2)
+                     last_positive_power_of_2)
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -134,8 +133,8 @@ def fused_moe(
     # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
     tuning_config = TuningConfig(dynamic_tensors=(
         # input, dim 0, all valid buckets, map a seq_len to power of 2 bucket index
-        (0, 0, ((8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1),
-                next_positive_power_of_2)),
+        (0, 0, (get_last_power_of_2_num_tokens_buckets(8192),
+                lambda x: min(last_positive_power_of_2(x), 8192))),
         # min_latency_tensor, dim 0, (0 for False, 1 for True), map to it self
         (2, 0, ((0, ), lambda x: x)),
     ))
@@ -320,11 +319,8 @@ def nvfp4_gemm(
     tuner = AutoTuner.get()
 
     tuning_config = TuningConfig(
-        dynamic_tensors=((0, 0, (
-            lambda x: get_power_of_2_num_tokens_buckets(8192)
-            if not to_userbuffers else get_last_power_of_2_num_tokens_buckets(
-                x), lambda x: next_positive_power_of_2(x)
-            if not to_userbuffers else last_positive_power_of_2(x))), ),
+        dynamic_tensors=((0, 0, (get_last_power_of_2_num_tokens_buckets,
+                                 last_positive_power_of_2)), ),
         constraints=((2, 0, fp4_scale_dims), ),
     )
 
