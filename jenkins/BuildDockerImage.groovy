@@ -486,7 +486,20 @@ pipeline {
 
                     echo "trigger BuildDockerImageSanityTest job, params: ${parameters}"
 
-                    def status = triggerJob("/LLM/helpers/BuildDockerImageSanityTest", parameters)
+                    def status = ""
+                    def jobName = "/LLM/helpers/BuildDockerImageSanityTest"
+                    def jobPath = trtllm_utils.resolveFullJobName(jobName).replace('/', '/job/').substring(1)
+                    def jenkinsUrl = env.JENKINS_URL
+                    def credentials = env.localJobCredentials
+                    def handle = triggerRemoteJob(
+                        job: "${jenkinsUrl}${jobPath}/",
+                        auth: CredentialsAuth(credentials: credentials),
+                        parameters: trtllm_utils.toRemoteBuildParameters(parameters),
+                        pollInterval: 60,
+                        abortTriggeredJob: true,
+                    )
+                    status = handle.getBuildResult().toString()
+
                     if (status != "SUCCESS") {
                         error "Downstream job did not succeed"
                     }
