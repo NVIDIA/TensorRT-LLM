@@ -800,7 +800,8 @@ BlockPtr WindowBlockManager::getFreeBlock(
     // 2. Eviction policy indicated block can be offloaded
     // 3. At least one free block in secondary memory
     // 4. Onboarding is enabled (allowing block to be brought back into primary)
-    if (!block->getUniqueTokens().empty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0 && mOnboardBlocks)
+    if (!block->getUniqueTokens().empty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0
+        && mOnboardBlocks)
     {
         // If we're swapping a block to secondary memory, maintain the prior priority values.
         mEvictionPolicy->claimBlock(block);

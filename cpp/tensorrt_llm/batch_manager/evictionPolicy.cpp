@@ -118,8 +118,7 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
             // It's possible to have a primary block with children in secondary memory. We handle this
             // by freeing all descendants in WindowBlockManager::getFreeBlock. This is done either by
             // offloading (preferred method) or explicitly.
-            return std::make_tuple(
-                block, cacheLevel == 0 && level >= mSecondaryOffloadMinPriority);
+            return std::make_tuple(block, cacheLevel == 0 && level >= mSecondaryOffloadMinPriority);
         }
     }
     TLLM_THROW("No free block found. This shouldn't happen!");
