@@ -2100,9 +2100,12 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
 
     if (config.maxTokens.has_value())
     {
-        auto const isHomogeneous = windowSizeToLayers.size() == 1 && windowSizeToLayers.cbegin()->second.size() == 1;
-        TLLM_CHECK_WITH_INFO(isHomogeneous,
-            "maxTokens cannot really be used when there are multiple pools, as it doesn't make sense conceptually");
+        auto const isVSWA = windowSizeToLayers.size() > 1;
+        TLLM_LOG_WARNING(!isVSWA,
+            "Semantically, when using Variable Sliding Window Attention maxTokens is a strange concept, as it limits "
+            "the number of max tokens *per window size* [limiting the sum of all window sizes is even stranger]. "
+            "Anticipating the effects of this requires quite a complex calculation, and it probably isn't the "
+            "configuration you meant to use.");
     }
 
     std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow;
