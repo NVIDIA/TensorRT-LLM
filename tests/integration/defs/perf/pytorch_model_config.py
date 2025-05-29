@@ -18,7 +18,7 @@ Model pytorch yaml config for trtllm-bench perf tests
 """
 
 
-def get_model_yaml_config(model_label: str, input_lens: list[int]) -> dict:
+def get_model_yaml_config(model_label: str) -> dict:
     """
         Return the yaml config corresponding to the model label.
         Args:
