@@ -72,6 +72,8 @@ class SpecConfig:
     spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     # The max number of draft tokens
     max_draft_tokens: int = 1024
+    # The number of extra kv tokens
+    num_extra_kv_tokens: int = 0
 
     def __post_init__(self) -> None:
         self.spec_dec_mode = SpeculativeDecodingMode.from_string(
