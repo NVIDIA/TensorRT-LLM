@@ -9,7 +9,7 @@ from simple_config import SimpleConfig
 
 from tensorrt_llm._torch.auto_deploy.models import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.shim import AutoDeployConfig, DemoLLM
-from tensorrt_llm._torch.auto_deploy.utils.benchmark import benchmark
+from tensorrt_llm._torch.auto_deploy.utils.benchmark import benchmark, store_benchmark_results
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.llmapi.llm import LLM, RequestOutput
@@ -83,11 +83,15 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
     return llm
 
 
-def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]):
+def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> List[List[str]]:
+    prompts_and_outputs: List[List[str]] = []
     if isinstance(outs, RequestOutput):
         outs = [outs]
     for i, out in enumerate(outs):
-        ad_logger.info(f"[PROMPT {i}] {out.prompt}: {out.outputs[0].text}")
+        prompt, output = out.prompt, out.outputs[0].text
+        ad_logger.info(f"[PROMPT {i}] {prompt}: {output}")
+        prompts_and_outputs.append([prompt, output])
+    return prompts_and_outputs
 
 
 @torch.inference_mode()
@@ -107,7 +111,7 @@ def main(config: Optional[SimpleConfig] = None):
             temperature=config.temperature,
         ),
     )
-    print_outputs(outs)
+    results = {"prompts_and_outputs": print_outputs(outs)}
 
     # run a benchmark for the model with batch_size == config.benchmark_bs
     if config.benchmark and config.runtime != "trtllm":
@@ -121,7 +125,7 @@ def main(config: Optional[SimpleConfig] = None):
             "benchmark_osl",
             "benchmark_num",
         ]
-        benchmark(
+        results["benchmark_results"] = benchmark(
             func=lambda: llm.generate(
                 torch.randint(0, 100, (config.benchmark_bs, config.benchmark_isl)).tolist(),
                 sampling_params=SamplingParams(
@@ -137,6 +141,10 @@ def main(config: Optional[SimpleConfig] = None):
         )
     elif config.benchmark:
         ad_logger.info("Skipping simple benchmarking for trtllm...")
+
+    if config.benchmark_store_results:
+        store_benchmark_results(results, config.benchmark_results_path)
+
     llm.shutdown()
 
 

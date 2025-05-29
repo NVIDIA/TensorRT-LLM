@@ -90,6 +90,7 @@ class SimpleConfig:
     benchmark_osl: int = 128  # output seq length for benchmarking
     benchmark_bs: int = 1  # batch size for benchmarking
     benchmark_results_path: Optional[str] = "./benchmark_results.json"
+    benchmark_store_results: bool = False  # if True, store benchmark res in benchmark_results_path
 
     ### POST INITIALIZATION ########################################################################
     def __post_init__(self):
