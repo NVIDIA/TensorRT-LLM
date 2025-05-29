@@ -2060,6 +2060,36 @@ std::tuple<SizeType32, SizeType32> BaseKVCacheManager::calculateFreeMem(
     return std::make_tuple(freePrimaryMem, freeSecondaryMem);
 }
 
+namespace
+{
+bool isSortedVectorIdenticalAcrossAllRanks(WorldConfig const& worldConfig, std::vector<SizeType32> const& vector)
+{
+    auto const numRanks = worldConfig.getSize();
+    auto const numElements = static_cast<int>(vector.size());
+    int maxNumElements = 0;
+    int minNumElements = 0;
+    COMM_SESSION.allreduce(&numElements, &maxNumElements, 1, mpi::MpiType::kINT32, mpi::MpiOp::MAX);
+    COMM_SESSION.allreduce(&numElements, &minNumElements, 1, mpi::MpiType::kINT32, mpi::MpiOp::MIN);
+    if (maxNumElements != minNumElements)
+    {
+        return false;
+    }
+    std::vector<SizeType32> allElements(numElements * numRanks);
+    COMM_SESSION.allgather(vector.data(), allElements.data(), numElements, mpi::MpiType::kUINT32);
+
+    for (int i = 0; i < numElements; ++i)
+    {
+        auto const ref = allElements.at(i);
+        for (int rank = 1; rank < numRanks; ++rank)
+        {
+            if (allElements[rank * numElements + i] != ref)
+                return false;
+        }
+    }
+    return true;
+}
+} // namespace
+
 BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& config, bool isCrossAttention,
     nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, SizeType32 allottedPrimaryMem,
@@ -2122,20 +2152,11 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         return blocksInSecondaryPool;
     };
 
-    // if (worldConfig.getSize() > 1)
-    // {
-    //     TLLM_CHECK(worldConfig.validMpiConfig());
-    //     // make sure all ranks use same value for maxTokens
-    //     int64_t _maxTokensRank{maxTokens};
-    //     int64_t _maxTokensWorld{0};
-    //     COMM_SESSION.allreduce(&_maxTokensRank, &_maxTokensWorld, 1, mpi::MpiType::kINT64, mpi::MpiOp::MIN);
-    //     maxTokens = static_cast<SizeType32>(_maxTokensWorld);
-    // }
-
     auto const windowSizeToShare
         = BlockManager::calculateWindowSizeToShare(windowSizeToLayers, cacheSizeBytesPerTokenPerWindow);
 
-    BlocksPerWindow windowSizeToBlocks;
+    std::vector<SizeType32> blocksPrimary;
+    std::vector<SizeType32> blocksSecondary;
     for (auto const& [windowSize, managedLayers] : windowSizeToLayers)
     {
         auto const cacheSizeBytesPerToken = cacheSizeBytesPerTokenPerWindow.at(windowSize);
@@ -2143,9 +2164,40 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         auto const blocksInPrimaryPool = calculatePrimaryBlocks(windowSize, windowSizeShare, cacheSizeBytesPerToken);
         auto const blocksInSecondaryPool
             = calculateSecondaryBlocks(windowSize, windowSizeShare, cacheSizeBytesPerToken);
-        windowSizeToBlocks[windowSize] = std::make_tuple(blocksInPrimaryPool, blocksInSecondaryPool);
+        blocksPrimary.push_back(blocksInPrimaryPool);
+        blocksSecondary.push_back(blocksInSecondaryPool);
     }
 
+    std::vector<SizeType32> localWindowSizes;
+    localWindowSizes.reserve(windowSizeToLayers.size());
+    for (auto const& [k, _] : windowSizeToLayers)
+    {
+        localWindowSizes.push_back(k);
+    }
+    if (worldConfig.getSize() > 1)
+    {
+        TLLM_CHECK(worldConfig.validMpiConfig());
+        TLLM_CHECK_WITH_INFO(isSortedVectorIdenticalAcrossAllRanks(
+                                 worldConfig, localWindowSizes), // sorted thanks to windowSizeToLayers being a std::map
+            "[RANK %d] Asymmetrical pipeline parallelism detected: Ranks either have a different number of window "
+            "sizes, or differing values. This is not supported with Variable Sliding Window Attention. Local window "
+            "sizes for reference: %s",
+            worldConfig.getRank(), tensorrt_llm::common::vec2str(localWindowSizes).c_str());
+
+        // make sure all ranks use same value for max blocks
+        auto const numBlocks = blocksPrimary.size();
+        std::vector<int64_t> blocksWorld(numBlocks, 0);
+        COMM_SESSION.allreduce(
+            blocksPrimary.data(), blocksWorld.data(), numBlocks, mpi::MpiType::kINT64, mpi::MpiOp::MIN);
+        COMM_SESSION.allreduce(
+            blocksSecondary.data(), blocksWorld.data(), numBlocks, mpi::MpiType::kINT64, mpi::MpiOp::MIN);
+    }
+
+    BlocksPerWindow windowSizeToBlocks;
+    for (auto const windowSize : localWindowSizes)
+    {
+        windowSizeToBlocks[windowSize] = std::make_tuple(blocksPrimary.at(windowSize), blocksSecondary.at(windowSize));
+    }
     return windowSizeToBlocks;
 }
 
