@@ -415,6 +415,8 @@ extern void run_fmha_v2_flash_attention_bf16_64_64_S_q_paged_kv_576x512_sm90_nl_
 #endif
 
 #ifndef EXCLUDE_SM_89
+extern unsigned char cubin_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_cu_cubin[];
+extern uint32_t cubin_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_cu_cubin_len;
 extern void run_fmha_v2_flash_attention_e4m3_fp32_128_128_S_qkv_32_sm89_nl(Fused_multihead_attention_params_v2& params, const Launch_params& launch_params, cudaStream_t stream);
 extern void run_fmha_v2_flash_attention_e4m3_fp32_128_128_S_q_kv_32_sm89_nl(Fused_multihead_attention_params_v2& params, const Launch_params& launch_params, cudaStream_t stream);
 extern void run_fmha_v2_flash_attention_e4m3_fp32_128_128_S_q_paged_kv_32_sm89_nl(Fused_multihead_attention_params_v2& params, const Launch_params& launch_params, cudaStream_t stream);
@@ -2717,7 +2719,7 @@ static const struct FusedMultiHeadAttentionKernelMetaInfoV2
 { DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 32, 104, 104, 0, 0, 0, kSM_89, nullptr, 0, "fmha_v2_flash_attention_bf16_64_32_S_qkv_104_sliding_or_chunked_causal_sm89_kernel_nl", 32768, 128, 64, 2, 0, false, true, false, true, true, false, false, true, run_fmha_v2_flash_attention_bf16_64_32_S_qkv_104_sm89_nl},
 { DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 32, 104, 104, 0, 0, 0, kSM_89, nullptr, 0, "fmha_v2_flash_attention_bf16_64_32_S_qkv_104_custom_mask_sm89_kernel_nl", 32768, 128, 64, 3, 0, false, true, false, true, true, false, false, true, run_fmha_v2_flash_attention_bf16_64_32_S_qkv_104_sm89_nl},
 { DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 32, 128, 128, 0, 0, 0, kSM_89, nullptr, 0, "fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_kernel_nl", 32768, 128, 64, 0, 0, false, true, false, true, true, false, false, true, run_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_nl},
-{ DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 32, 128, 128, 0, 0, 0, kSM_89, nullptr, 0, "fmha_v2_flash_attention_bf16_64_32_S_qkv_128_causal_sm89_kernel_nl", 32768, 128, 64, 1, 0, false, true, false, true, true, false, false, true, run_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_nl},
+{ DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 32, 128, 128, 0, 0, 0, kSM_89, cubin_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_cu_cubin, cubin_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_cu_cubin_len, "fmha_v2_flash_attention_bf16_64_32_S_qkv_128_causal_sm89_kernel_nl", 32768, 128, 64, 1, 0, false, true, false, true, true, false, false, true, nullptr},
 { DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 32, 128, 128, 0, 0, 0, kSM_89, nullptr, 0, "fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sliding_or_chunked_causal_sm89_kernel_nl", 32768, 128, 64, 2, 0, false, true, false, true, true, false, false, true, run_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_nl},
 { DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 32, 128, 128, 0, 0, 0, kSM_89, nullptr, 0, "fmha_v2_flash_attention_bf16_64_32_S_qkv_128_custom_mask_sm89_kernel_nl", 32768, 128, 64, 3, 0, false, true, false, true, true, false, false, true, run_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_nl},
 { DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 16, 160, 160, 0, 0, 0, kSM_89, nullptr, 0, "fmha_v2_flash_attention_bf16_64_16_S_qkv_160_causal_sm89_kernel_nl", 49152, 128, 64, 1, 0, false, true, false, true, true, false, false, true, run_fmha_v2_flash_attention_bf16_64_16_S_qkv_160_sm89_nl},
