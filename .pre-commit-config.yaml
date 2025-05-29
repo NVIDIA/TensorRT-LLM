@@ -12,7 +12,7 @@ repos:
     rev: v0.43.0
     hooks:
     -   id: yapf
-        exclude: ".*/auto_deploy/.*"
+        exclude: ".*/auto_deploy/.*|tensorrt_llm/llmapi/__init__.py"
 -   repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.1.0
     hooks:
