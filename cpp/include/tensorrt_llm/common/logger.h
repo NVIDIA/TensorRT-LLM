@@ -23,6 +23,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/common/timestampUtils.h"
 
 namespace tensorrt_llm::common
 {
@@ -97,7 +98,7 @@ public:
     }
 
 private:
-    static auto constexpr kPREFIX = "[TensorRT-LLM]";
+    static auto constexpr kPREFIX = "[TRT-LLM]";
 
 #ifndef NDEBUG
     Level const DEFAULT_LOG_LEVEL = DEBUG;
@@ -112,11 +113,11 @@ private:
     {
         switch (level)
         {
-        case TRACE: return "TRACE";
-        case DEBUG: return "DEBUG";
-        case INFO: return "INFO";
-        case WARNING: return "WARNING";
-        case ERROR: return "ERROR";
+        case TRACE: return "[V]"; // VERBOSE to align with Python logger
+        case DEBUG: return "[D]";
+        case INFO: return "[I]";
+        case WARNING: return "[W]";
+        case ERROR: return "[E]";
         }
 
         TLLM_THROW("Unknown log level: %d", level);
@@ -124,12 +125,12 @@ private:
 
     static inline std::string getPrefix(Level const level)
     {
-        return fmtstr("%s[%s] ", kPREFIX, getLevelName(level));
+        return fmtstr("%s %s %s ", common::getCurrentTimestamp().c_str(), kPREFIX, getLevelName(level));
     }
 
     static inline std::string getPrefix(Level const level, int const rank)
     {
-        return fmtstr("%s[%s][%d] ", kPREFIX, getLevelName(level), rank);
+        return fmtstr("%s %s %s [%d] ", common::getCurrentTimestamp().c_str(), kPREFIX, getLevelName(level), rank);
     }
 };
 

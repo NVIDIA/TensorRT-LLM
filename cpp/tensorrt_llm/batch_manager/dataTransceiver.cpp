@@ -111,6 +111,8 @@ public:
         {
             {
                 std::unique_lock lkResp(mResponderMutex);
+                TLLM_LOG_INFO(
+                    mpi::MpiComm::world().getRank(), "Context request %zu sends cache.", llmRequest.mRequestId);
                 mReadyResponses.emplace(
                     llmRequest.mRequestId, Response{std::addressof(llmRequest), std::move(promise)});
             }
@@ -369,9 +371,9 @@ private:
         mReceiver->receiveSync(llmRequest);
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
 
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
-            llmRequest.getContextPhaseParams().value().getReqId());
+        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+            "Generation request %zu received cache from context request %zu. cost time: %f ms.", llmRequest.mRequestId,
+            llmRequest.getContextPhaseParams().value().getReqId(), llmRequest.getKvCacheTransferTimeMS());
     }
 
     struct RequestAndPromise
