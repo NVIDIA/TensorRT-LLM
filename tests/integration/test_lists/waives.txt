@@ -516,3 +516,4 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_llm_decoder 
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False] SKIP (https://nvbugs/5303573)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True] SKIP (https://nvbugs/5303573)
 test_e2e.py::test_openai_multi_chat_example SKIP (https://nvbugs/5236980)
+examples/test_gemma.py::test_llm_hf_gemma_quantization_1gpu_vswa[gemma-3-1b-it-fp8-bfloat16-8] SKIP (https://nvbugs/5312477)
