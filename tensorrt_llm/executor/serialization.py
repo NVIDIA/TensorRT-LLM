@@ -8,8 +8,10 @@ import pickle  # nosec B403
 # it is only needed in a single instance the class can be added at runtime
 # using register_approved_ipc_class.
 BASE_ZMQ_CLASSES = {
-    "builtins": ["Exception", "ValueError"
-                 ],  # each Exception Error class needs to be added explicitly
+    "builtins": [
+        "Exception", "ValueError", "NotImplementedError", "AttributeError",
+        "AssertionError"
+    ],  # each Exception Error class needs to be added explicitly
     "collections": ["OrderedDict"],
     "datetime": ["timedelta"],
     "pathlib": ["PosixPath"],
@@ -53,10 +55,12 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm.bindings.executor": [
         "BatchingType", "CapacitySchedulerPolicy", "ContextPhaseParams",
         "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
-        "FinishReason", "KvCacheConfig", "KvCacheRetentionConfig",
+        "FinishReason", "KvCacheConfig", "KvCacheTransferMode",
+        "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig", "DynamicBatchConfig"
     ],
+    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig"],
     "tensorrt_llm.builder": ["BuildConfig"],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
     "tensorrt_llm.executor.postproc_worker": [
@@ -73,11 +77,11 @@ BASE_ZMQ_CLASSES = {
         "Logprob", "LogProbsResult", "ResponseWrapper"
     ],
     "tensorrt_llm.executor.utils": ["ErrorResponse", "WorkerCommIpcAddrs"],
-    "tensorrt_llm.executor.worker": ["ExecutorBindingsWorker", "worker_main"],
+    "tensorrt_llm.executor.worker": ["GenerationExecutorWorker", "worker_main"],
     "tensorrt_llm.llmapi.llm_args": [
         "_ModelFormatKind", "_ParallelConfig", "CalibConfig",
         "CapacitySchedulerPolicy", "KvCacheConfig", "LookaheadDecodingConfig",
-        "TrtLlmArgs", "SchedulerConfig"
+        "TrtLlmArgs", "SchedulerConfig", "LoadFormat"
     ],
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.llm_utils":

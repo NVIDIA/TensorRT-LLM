@@ -1,14 +1,17 @@
 import json
 import math
+import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
+                    Union)
 
 import torch
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr, validator
+from pydantic import (BaseModel, Field, PrivateAttr, field_validator,
+                      model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -17,6 +20,9 @@ from tensorrt_llm.lora_manager import (LoraConfig,
 
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 
 # yapf: disable
 # isort: off
@@ -36,6 +42,8 @@ from ..bindings.executor import (
                                  PeftCacheConfig as _PeftCacheConfig,
                                  SchedulerConfig as _SchedulerConfig) # isort: skip
 # isort: on
+from transformers import PreTrainedTokenizerBase
+
 # yapf: enable
 from ..builder import BuildConfig, EngineConfig
 from ..logger import logger
@@ -549,7 +557,9 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
         get_default_lookahead_decoding_verification_set(),
         description="Number of NGrams in verification branch per step.")
 
-    @validator('max_window_size', 'max_ngram_size', 'max_verification_set_size')
+    @field_validator('max_window_size', 'max_ngram_size',
+                     'max_verification_set_size')
+    @classmethod
     def validate_positive_values(cls, v):
         if v <= 0:
             raise ValueError(f"Value must be positive, got {v}")
@@ -848,8 +858,8 @@ class BaseLlmArgs(BaseModel):
         default=None, description="Quantization config.")
 
     # Several options from ExecutorConfig, expanded here for less hierarchy
-    kv_cache_config: Optional[KvCacheConfig] = Field(
-        default=None, description="KV cache config.")
+    kv_cache_config: KvCacheConfig = Field(default_factory=KvCacheConfig,
+                                           description="KV cache config.")
 
     enable_chunked_prefill: bool = Field(default=False,
                                          description="Enable chunked prefill.")
@@ -876,8 +886,8 @@ class BaseLlmArgs(BaseModel):
     peft_cache_config: Optional[PeftCacheConfig] = Field(
         default=None, description="PEFT cache config.")
 
-    scheduler_config: Optional[SchedulerConfig] = Field(
-        default=None, description="Scheduler config.")
+    scheduler_config: SchedulerConfig = Field(default_factory=SchedulerConfig,
+                                              description="Scheduler config.")
 
     cache_transceiver_config: Optional[CacheTransceiverConfig] = Field(
         default=None, description="Cache transceiver config.")
@@ -991,10 +1001,6 @@ class BaseLlmArgs(BaseModel):
             enable_attention_dp=self.enable_attention_dp,
             cp_config=self.cp_config)
 
-        self.kv_cache_config = self.kv_cache_config or KvCacheConfig()
-
-        self.scheduler_config = self.scheduler_config or SchedulerConfig()
-
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "BaseLlmArgs":
         """Create `LlmArgs` instance from kwargs.
@@ -1016,8 +1022,7 @@ class BaseLlmArgs(BaseModel):
         Returns:
             dict: The dict that contains all fields of the `LlmArgs` instance.
         """
-        return dict(
-            (field.name, getattr(self, field.name)) for field in fields(self))
+        return self.model_dump()
 
     @staticmethod
     def _maybe_update_config_for_consistency(
@@ -1444,6 +1449,12 @@ LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(LlmArgs,
                                                             indent=' ' * 4)
 
 
+class LoadFormat(Enum):
+    AUTO = 0
+    # Initialize all weights randomly.
+    DUMMY = 1
+
+
 class TorchLlmArgs(BaseLlmArgs):
 
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
@@ -1453,11 +1464,274 @@ class TorchLlmArgs(BaseLlmArgs):
         exclude_from_json=True,
         json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
 
+    # PyTorch backend specific configurations
+
+    use_cuda_graph: bool = Field(
+        default=False,
+        description=
+        "If true, use CUDA graphs for decoding. CUDA graphs are only created for the batch sizes in cuda_graph_batch_sizes, and are enabled for batches that consist of decoding requests *only* (the reason is that it's hard to capture a single graph with prefill requests since the input shapes are a function of the sequence lengths). Note that each CUDA graph can use up to 200 MB of extra memory."
+    )
+
+    cuda_graph_batch_sizes: Optional[List[int]] = Field(
+        default=None,
+        description="List of batch sizes to create CUDA graphs for.")
+
+    cuda_graph_max_batch_size: int = Field(
+        default=0, description="Maximum batch size for CUDA graphs.")
+
+    cuda_graph_padding_enabled: bool = Field(
+        default=False,
+        description=
+        "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
+    )
+
+    disable_overlap_scheduler: bool = Field(
+        default=False, description="Disable the overlap scheduler.")
+
+    moe_max_num_tokens: Optional[int] = Field(
+        default=None,
+        description=
+        "If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used."
+    )
+
+    moe_load_balancer: Optional[Union[object, dict, str]] = Field(
+        default=None,
+        description="Configuration for MoE load balancing.",
+        json_schema_extra={"type": f"Union[MoeLoadBalancerConfig, dict, str]"})
+
+    attn_backend: str = Field(default='TRTLLM',
+                              description="Attention backend to use.")
+
+    moe_backend: str = Field(default='CUTLASS',
+                             description="MoE backend to use.")
+
+    mixed_sampler: bool = Field(
+        default=False,
+        description=
+        "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc."
+    )
+
+    enable_trtllm_sampler: bool = Field(
+        default=False,
+        description=
+        "If true, will use the TRTLLM sampler instead of the PyTorch sampler. The TRTLLM sampler has a wide coverage of sampling strategies."
+    )
+
+    kv_cache_dtype: str = Field(default="auto",
+                                description="Data type for KV cache.")
+
+    use_kv_cache: bool = Field(default=True,
+                               description="Whether to use KV cache.")
+
+    enable_iter_perf_stats: bool = Field(
+        default=False, description="Enable iteration performance statistics.")
+
+    enable_iter_req_stats: bool = Field(
+        default=False,
+        description=
+        "If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats."
+    )
+
+    print_iter_log: bool = Field(default=False,
+                                 description="Print iteration logs.")
+
+    torch_compile_enabled: bool = Field(
+        default=False, description="Enable torch.compile optimization.")
+
+    torch_compile_fullgraph: bool = Field(
+        default=True,
+        description="Enable full graph compilation in torch.compile.")
+
+    torch_compile_inductor_enabled: bool = Field(
+        default=False, description="Enable inductor backend in torch.compile.")
+
+    torch_compile_piecewise_cuda_graph: bool = Field(
+        default=False,
+        description="Enable piecewise CUDA graph in torch.compile.")
+
+    torch_compile_enable_userbuffers: bool = Field(
+        default=True,
+        description=
+        "When torch compile is enabled, userbuffers is enabled by default.")
+
+    autotuner_enabled: bool = Field(
+        default=True,
+        description="Enable autotuner only when torch compile is enabled.")
+
+    enable_layerwise_nvtx_marker: bool = Field(
+        default=False, description="If true, enable layerwise nvtx marker.")
+
+    auto_deploy_config: Optional[object] = Field(
+        default=None,
+        description="Auto deploy config.",
+        exclude_from_json=True,
+        json_schema_extra={"type": f"Optional[AutoDeployConfig]"})
+
+    load_format: Union[str, LoadFormat] = Field(
+        default=LoadFormat.AUTO,
+        description=
+        "How to load the model weights. By default, detect the weight type from the model checkpoint."
+    )
+
+    @field_validator('load_format', mode='before')
+    @classmethod
+    def convert_load_format(cls, v):
+        if isinstance(v, LoadFormat):
+            return v
+        load_format = v.upper()
+        if load_format not in LoadFormat.__members__:
+            raise ValueError(f"Invalid LoadFormat: {v}")
+        return LoadFormat[load_format]
+
+    # Extra resource managers to use in addition to the KV cache manager.
+    # Each manager's prepare_resources method is called before the forward pass,
+    # and update_resources() is called after the pass finishes. free_resources()
+    # is called when a request finishes. The KV cache manager is guaranteed to
+    # be invoked after all of these extra managers in all stages.
+    _extra_resource_managers: Dict[str,
+                                   object] = PrivateAttr(default_factory=dict, )
+
+    @property
+    def extra_resource_managers(self) -> Dict[str, object]:
+        return self._extra_resource_managers
+
+    @extra_resource_managers.setter
+    def extra_resource_managers(self, value: Dict[str, object]) -> None:
+        self._extra_resource_managers = value
+
     @print_traceback_on_error
     def model_post_init(self, __context):
-        super().model_post_init(__context)
+        from .._torch.model_config import MoeLoadBalancerConfig
 
+        super().model_post_init(__context)
         self.model_format = _ModelFormatKind.HF
+
+        if isinstance(self.moe_load_balancer, str):
+            assert os.path.exists(self.moe_load_balancer)
+            if self.moe_load_balancer.endswith(".json"):
+                with open(self.moe_load_balancer) as f:
+                    self.moe_load_balancer = json.load(f)
+            elif self.moe_load_balancer.endswith((".yaml", ".yml")):
+                with open(self.moe_load_balancer) as f:
+                    self.moe_load_balancer = yaml.safe_load(f)
+            else:
+                raise ValueError(
+                    f"Unsupported moe load balancer config file: {self.moe_load_balancer}"
+                )
+        if isinstance(self.moe_load_balancer, dict):
+            self.moe_load_balancer = MoeLoadBalancerConfig(
+                **self.moe_load_balancer)
+
+    # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
+    def get_pytorch_backend_config(self) -> "PyTorchConfig":
+        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+
+        # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
+        # Just a WAR to support the auto_deploy
+        if self.auto_deploy_config is not None:
+            return self.auto_deploy_config
+
+        return PyTorchConfig(
+            extra_resource_managers=self.extra_resource_managers,
+            use_cuda_graph=self.use_cuda_graph,
+            cuda_graph_batch_sizes=self.cuda_graph_batch_sizes,
+            cuda_graph_max_batch_size=self.cuda_graph_max_batch_size,
+            cuda_graph_padding_enabled=self.cuda_graph_padding_enabled,
+            disable_overlap_scheduler=self.disable_overlap_scheduler,
+            moe_max_num_tokens=self.moe_max_num_tokens,
+            moe_load_balancer=self.moe_load_balancer,
+            attn_backend=self.attn_backend,
+            moe_backend=self.moe_backend,
+            mixed_sampler=self.mixed_sampler,
+            enable_trtllm_sampler=self.enable_trtllm_sampler,
+            kv_cache_dtype=self.kv_cache_dtype,
+            use_kv_cache=self.use_kv_cache,
+            enable_iter_perf_stats=self.enable_iter_perf_stats,
+            enable_iter_req_stats=self.enable_iter_req_stats,
+            print_iter_log=self.print_iter_log,
+            torch_compile_enabled=self.torch_compile_enabled,
+            torch_compile_fullgraph=self.torch_compile_fullgraph,
+            torch_compile_inductor_enabled=self.torch_compile_inductor_enabled,
+            torch_compile_piecewise_cuda_graph=self.
+            torch_compile_piecewise_cuda_graph,
+            torch_compile_enable_userbuffers=self.
+            torch_compile_enable_userbuffers,
+            autotuner_enabled=self.autotuner_enabled,
+            enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
+            load_format=self.load_format)
+
+    @field_validator('cuda_graph_max_batch_size')
+    @classmethod
+    def validate_cuda_graph_max_batch_size(cls, v):
+        """Validate cuda_graph_max_batch_size is non-negative."""
+        if v < 0:
+            raise ValueError("cuda_graph_max_batch_size must be non-negative")
+        return v
+
+    @staticmethod
+    def _generate_cuda_graph_batch_sizes(max_batch_size: int,
+                                         padding_enabled: bool) -> List[int]:
+        """Generate a list of batch sizes for CUDA graphs.
+
+        Args:
+            max_batch_size: Maximum batch size to generate up to
+            padding_enabled: Whether padding is enabled, which affects the batch size distribution
+
+        Returns:
+            List of batch sizes to create CUDA graphs for
+        """
+        if padding_enabled:
+            batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
+        else:
+            batch_sizes = list(range(1, 32)) + [32, 64, 128]
+
+        # Add powers of 2 up to max_batch_size
+        batch_sizes += [
+            2**i for i in range(8, math.floor(math.log(max_batch_size, 2)))
+        ]
+
+        # Filter and sort batch sizes
+        batch_sizes = sorted(
+            [size for size in batch_sizes if size <= max_batch_size])
+
+        # Add max_batch_size if not already included
+        if max_batch_size != batch_sizes[-1]:
+            batch_sizes.append(max_batch_size)
+
+        return batch_sizes
+
+    @model_validator(mode='after')
+    def validate_cuda_graph_config(self) -> 'TorchLlmArgs':
+        """Validate CUDA graph configuration.
+
+        Ensures that:
+        1. If cuda_graph_batch_sizes is provided, cuda_graph_max_batch_size must be 0
+        2. If cuda_graph_batch_sizes is not provided, it is generated based on cuda_graph_max_batch_size
+        3. If both are provided, cuda_graph_batch_sizes must match the generated values
+        """
+        if self.cuda_graph_batch_sizes is not None:
+            self.cuda_graph_batch_sizes = sorted(self.cuda_graph_batch_sizes)
+            if self.cuda_graph_max_batch_size != 0:
+                if self.cuda_graph_batch_sizes != self._generate_cuda_graph_batch_sizes(
+                        self.cuda_graph_max_batch_size,
+                        self.cuda_graph_padding_enabled):
+                    raise ValueError(
+                        "Please don't set both cuda_graph_batch_sizes "
+                        "and cuda_graph_max_batch_size.\n"
+                        f"cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}, "
+                        f"cuda_graph_max_batch_size: {self.cuda_graph_max_batch_size}"
+                    )
+            else:
+                self.cuda_graph_max_batch_size = max(
+                    self.cuda_graph_batch_sizes)
+        else:
+            max_batch_size = self.cuda_graph_max_batch_size or 128
+            generated_sizes = self._generate_cuda_graph_batch_sizes(
+                max_batch_size, self.cuda_graph_padding_enabled)
+            self.cuda_graph_batch_sizes = generated_sizes
+            self.cuda_graph_max_batch_size = max_batch_size
+
+        return self
 
 
 def update_llm_args_with_extra_dict(
