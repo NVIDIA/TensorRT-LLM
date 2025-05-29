@@ -434,7 +434,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                  std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
                  bool, bool>(),
             py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"), py::arg("tokens_per_block"),
-            py::arg("blocks_per_window_size"), py::arg("max_num_sequences"), py::arg("max_beam_width"),
+            py::arg("blocks_per_window"), py::arg("max_num_sequences"), py::arg("max_beam_width"),
             py::arg("max_attention_window_vec"), py::arg("temp_attention_window_inputs"), py::arg("dtype"),
             py::arg("sink_token_length"), py::arg("stream"), py::arg("max_sequence_length"),
             py::arg("enable_block_reuse") = false, py::arg("onboard_blocks") = true,
