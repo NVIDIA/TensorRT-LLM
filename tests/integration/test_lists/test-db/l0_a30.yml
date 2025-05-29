@@ -43,12 +43,12 @@ l0_a30:
   - cpp/test_unit_tests.py::test_unit_tests[common-80]
   - cpp/test_unit_tests.py::test_unit_tests[executor-80]
   - cpp/test_unit_tests.py::test_unit_tests[kernels-80]
-  - cpp/test_unit_tests.py::test_unit_tests[layers-80]
+  - cpp/test_unit_tests.py::test_unit_tests[layers-80] TIMEOUT (45)
   - cpp/test_unit_tests.py::test_unit_tests[runtime-80]
   - cpp/test_unit_tests.py::test_unit_tests[thop-80]
   - cpp/test_unit_tests.py::test_unit_tests[utils-80]
-  - cpp/test_e2e.py::test_model[-gpt-80]
-  - cpp/test_e2e.py::test_model[-gpt_executor-80]
+  - cpp/test_e2e.py::test_model[-gpt-80] TIMEOUT (45)
+  - cpp/test_e2e.py::test_model[-gpt_executor-80] TIMEOUT (60)
   - cpp/test_e2e.py::test_model[-gpt_tests-80]
 - condition:
     ranges:
@@ -199,7 +199,7 @@ l0_a30:
   - triton_server/test_triton.py::test_mistral[mistral]
   - triton_server/test_triton.py::test_whisper[whisper]
   - triton_server/test_triton.py::test_t5_ib[t5-ib]
-  - triton_server/test_triton.py::test_mistral_ib[mistral-ib]
+  - triton_server/test_triton.py::test_mistral_ib[mistral-ib] TIMEOUT (70)
   - triton_server/test_triton.py::test_mistral_ib_streaming[mistral-ib-streaming]
   - triton_server/test_triton.py::test_mistral_ib_mm[mistral-ib-mm]
   - triton_server/test_triton.py::test_gpt_ib_streaming[gpt-ib-streaming]
