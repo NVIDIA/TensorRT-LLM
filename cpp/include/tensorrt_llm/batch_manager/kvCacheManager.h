@@ -1292,9 +1292,30 @@ public:
         return sumLocalHeads * kvFactor * modelConfig.getSizePerHead();
     }
 
+    /// @brief Groups model layers by their attention window size.
+    /// @param maxAttentionWindowVec Vector of maximum attention window sizes per layer (may have fewer elements than
+    /// numLayers, in which case it cycles)
+    /// @param numLayers Total number of layers in the model
+    /// @return Map from window size to vector of layer indices that use that window size
     [[nodiscard]] static std::map<SizeType32, std::vector<SizeType32>> groupLayersByWindowSize(
         std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 numLayers);
 
+    /// @brief Calculate the maximum number of KV cache blocks that can be allocated based on available GPU memory.
+    /// @details This function computes how many blocks each WindowBlockManager should receive based on the weighted
+    /// share
+    ///          of memory requirements. The weighting considers both the window size and the number of
+    ///          layers using each window size, as well as the sum of cache sizes per token for each window.
+    /// @param config KV cache configuration parameters
+    /// @param isCrossAttention Whether this is for cross-attention KV cache
+    /// @param dtype Data type used for KV cache values
+    /// @param modelConfig Model configuration containing layer and head information
+    /// @param worldConfig World configuration for multi-GPU setups
+    /// @param bufferManager Buffer manager for memory operations
+    /// @param windowSizeToLayers Map from attention window size to vector of layer indices using that window size
+    /// @param kvCacheManagerFraction Fraction of available memory to use for this KV cache manager
+    /// @param kvFactor Factor for KV cache size calculation (typically 2 for key+value)
+    /// @param extraCostMemory Additional memory cost to account for CacheTransBufferManager::preAllocBufferSize
+    /// @return Map from window size to tuple of (primary blocks, secondary blocks)
     [[nodiscard]] static BlocksPerWindow calculateMaxNumBlocks(KvCacheConfig const& config, bool isCrossAttention,
         nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         tensorrt_llm::runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager,

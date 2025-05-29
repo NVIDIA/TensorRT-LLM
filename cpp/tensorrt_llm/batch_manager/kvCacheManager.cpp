@@ -360,25 +360,25 @@ bool KVCacheBlock::isLeaf() const
 
 std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
     std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers,
-    std::map<SizeType32, SizeType32> const& cacheSizePerTokenPerWindow)
+    std::map<SizeType32, SizeType32> const& windowSizeToCacheSizePerToken)
 {
-    if (uniqueWindowSizeToLayers.size() == 1)
+    if (windowSizeToLayers.size() == 1)
     {
-        return {{uniqueWindowSizeToLayers.begin()->first, 1.0f}};
+        return {{windowSizeToLayers.begin()->first, 1.0f}};
     }
 
     std::map<SizeType32, float> windowSizeToContribution;
 
     SizeType32 cacheSizePerTokenTotal
-        = std::accumulate(cacheSizePerTokenPerWindow.begin(), cacheSizePerTokenPerWindow.end(), SizeType32{0},
+        = std::accumulate(windowSizeToCacheSizePerToken.begin(), windowSizeToCacheSizePerToken.end(), SizeType32{0},
             [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
-    for (auto const& [windowSize, cacheSizePerToken] : cacheSizePerTokenPerWindow)
+    for (auto const& [windowSize, cacheSizePerToken] : windowSizeToCacheSizePerToken)
     {
         auto const cacheSizeWeight = static_cast<float>(cacheSizePerToken) / cacheSizePerTokenTotal;
         windowSizeToContribution[windowSize] = cacheSizeWeight;
     }
 
-    for (auto const& [windowSize, layers] : uniqueWindowSizeToLayers)
+    for (auto const& [windowSize, layers] : windowSizeToLayers)
     {
         windowSizeToContribution.at(windowSize) *= windowSize * layers.size();
     }
