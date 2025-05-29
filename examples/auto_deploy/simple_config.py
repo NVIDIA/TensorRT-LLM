@@ -38,9 +38,6 @@ class SimpleConfig:
     # An example model config class can be found [here](https://github.com/huggingface/transformers/blob/c409cd81777fb27aadc043ed3d8339dbc020fb3b/src/transformers/models/llama/configuration_llama.py#L26).
     model_kwargs: Dict = field(default_factory=dict)
 
-    # TODO: temp fix for dashboard to modify the number of hidden layers
-    num_hidden_layers: int = -1
-
     ### TOKENIZER EXTRA KWARGS #####################################################################
     # Extra kwargs for the tokenizer class to customize the tokenizer. Same as model_kwargs.
     # For example, the default HF Llama tokenizer can be initialized with the arguments specified
@@ -137,6 +134,3 @@ class SimpleConfig:
         # replicate prompts to get to batch_size
         prompts = self.prompt * (self.batch_size // len(self.prompt) + 1)
         self.prompt = prompts[: self.batch_size]
-
-        if self.num_hidden_layers != -1:
-            self.model_kwargs["num_hidden_layers"] = self.num_hidden_layers

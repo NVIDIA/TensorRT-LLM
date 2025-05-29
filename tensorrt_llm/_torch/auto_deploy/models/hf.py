@@ -330,6 +330,12 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             "max_position_embeddings"
         ]
 
+        # additional heuristic to propagate use of num_hidden_layers
+        # TODO (lucaslie): WAR until we have better support on dashboard to control model_kwargs
+        nhl_key = "num_hidden_layers"
+        if nhl_key in self.model_kwargs:
+            self.model_kwargs["text_config"][nhl_key] = self.model_kwargs[nhl_key]
+
     @property
     def automodel_from_config(self):
         return AutoModelForImageTextToText.from_config
