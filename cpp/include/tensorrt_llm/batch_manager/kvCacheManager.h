@@ -290,9 +290,6 @@ private:
     // Next block(s) in sequence(s)
     NextBlockMap mNextBlocks;
 
-    // Iterator pointing to this block in mFreeBlocks.
-    std::optional<FreeBlocksQueue::iterator> mFreeBlockIterator;
-
     // Flag indicating if block is full
     bool mIsFull;
 
