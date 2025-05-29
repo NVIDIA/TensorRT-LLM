@@ -139,6 +139,7 @@ class LLaMADecoderLayer(Module):
                 attention_params=None,
                 lora_layer_params=None,
                 next_layer_input_layernorm_args=None):
+        print(f"hidden_states: {hidden_states}")
         assert not (
             default_net().plugin_config.reduce_fusion and self.has_residual_mlp
         ), "Custom all reduce and residual mlp can't be enabled at the same time."
@@ -153,14 +154,18 @@ class LLaMADecoderLayer(Module):
         ), "Reduce fusion and quant fusion can't be enabled at the same time."
         if default_net(
         ).plugin_config.reduce_fusion and self.local_layer_idx > 0:
+            print(f"reduce_fusion and self.local_layer_idx > 0")
             hidden_states, residual = hidden_states
         elif default_net(
         ).plugin_config.norm_quant_fusion and self.local_layer_idx > 0:
+            print(f"norm_quant_fusion and self.local_layer_idx > 0")
             hidden_states, residual = hidden_states
         else:
+            print(f"else")
             residual = hidden_states
             if (self.config.use_input_layernorm_in_first_layer
                     and self.layer_idx == 0) or self.layer_idx > 0:
+                print(f"input_layernorm")
                 hidden_states = self.input_layernorm(hidden_states)
 
         reduce_fusion_op = AllReduceFusionOp.NONE
