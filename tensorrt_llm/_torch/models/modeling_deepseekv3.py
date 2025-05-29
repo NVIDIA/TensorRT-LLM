@@ -41,6 +41,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -51,10 +52,10 @@ from ..models.modeling_utils import ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import DeepSeekV3MoeRoutingMethod, FusedMoE
+from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoeLoadBalancer,
+                                 create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
-from ..modules.moe_load_balancer import MoeLoadBalancer
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
@@ -342,6 +343,7 @@ class Deepseekv3MoE(nn.Module):
                  aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig(),
+                 override_quant_config: Optional[QuantConfig] = None,
                  moe_load_balancer: Optional[MoeLoadBalancer] = None,
                  layer_idx: Optional[int] = None):
         from ..distributed import AllReduce
@@ -365,7 +367,7 @@ class Deepseekv3MoE(nn.Module):
             fuse_routing_kernel=True,
             apply_routing=False,
             moe_backend=model_config.moe_backend)
-        self.experts = FusedMoE(
+        self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
             hidden_size=hidden_size,
@@ -374,6 +376,7 @@ class Deepseekv3MoE(nn.Module):
             reduce_results=
             False,  # In both low‑latency and attention‑DP modes, FusedMoE skips the in‑op all‑reduce.
             model_config=model_config,
+            override_quant_config=override_quant_config,
             aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
             enable_alltoall=self.enable_alltoall,
             moe_load_balancer=moe_load_balancer,
@@ -569,7 +572,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.enable_fusion &= not self.enable_attention_dp
 
         # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
-        self.is_nvfp4 = model_config.quant_config.layer_quant_mode.has_nvfp4()
+        quant_config = self._get_decoder_layer_quant_config(
+            model_config, layer_idx)
+        self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
         has_tp = mapping.has_tp()
 
         if (config.n_routed_experts is not None
@@ -588,13 +593,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 self.num_shared_experts,
                 dtype=config.torch_dtype,
                 model_config=model_config,
+                override_quant_config=quant_config,
                 aux_stream_dict=aux_stream_dict,
                 moe_load_balancer=moe_load_balancer,
                 layer_idx=layer_idx)
         else:
             block_size = 1
-            if model_config.quant_config and model_config.quant_config.group_size is not None:
-                block_size = model_config.quant_config.group_size
+            if quant_config and quant_config.group_size is not None:
+                block_size = quant_config.group_size
             self.mlp_tp_size = self._compute_mlp_tp_size(
                 config.intermediate_size, block_size)
 
@@ -626,6 +632,24 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.allreduce = AllReduce(self.mapping, dtype=config.torch_dtype)
         self.moe_allreduce = MoEAllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
+
+    def _get_decoder_layer_quant_config(
+            self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
+        """
+        The MTP layer in the nvfp4 checkpoint is unquantized. Because the TRTLLM
+        moe_backend only supports fp8/fp4 quantization, we need to override
+        the quant_config for the MTP layer.
+        """
+        config = model_config.pretrained_config
+        quant_config = model_config.quant_config
+        is_mtp_layer = layer_idx >= config.num_hidden_layers
+        if is_mtp_layer and model_config.moe_backend == 'TRTLLM':
+            return QuantConfig(
+                quant_algo=None,
+                kv_cache_quant_algo=quant_config.kv_cache_quant_algo,
+            )
+        else:
+            return model_config.quant_config
 
     def _compute_mlp_tp_size(self, intermediate_size: int,
                              block_size: int) -> int:
