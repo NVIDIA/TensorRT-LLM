@@ -1,10 +1,8 @@
-from dataclasses import dataclass, field
-from itertools import chain
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
-from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
 

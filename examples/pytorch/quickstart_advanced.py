@@ -2,8 +2,9 @@ import argparse
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
-                                 MTPDecodingConfig, NGramDecodingConfig, DraftTargetDecodingConfig)
+from tensorrt_llm.llmapi import (DraftTargetDecodingConfig, EagleDecodingConfig,
+                                 KvCacheConfig, MTPDecodingConfig,
+                                 NGramDecodingConfig)
 
 example_prompts = [
     "Hello, my name is",
@@ -101,7 +102,10 @@ def add_llm_args(parser):
     # Speculative decoding
     parser.add_argument('--spec_decode_algo', type=str, default=None)
     parser.add_argument('--spec_decode_nextn', type=int, default=1)
-    parser.add_argument('--draft_model_dir', '--eagle_model_dir', type=str, default=None)
+    parser.add_argument('--draft_model_dir',
+                        '--eagle_model_dir',
+                        type=str,
+                        default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
 
     # Relaxed acceptance

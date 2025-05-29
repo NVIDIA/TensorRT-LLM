@@ -281,6 +281,7 @@ class NGramDecodingConfig(DecodingBaseConfig):
 
     decoding_type: ClassVar[str] = "NGram"
 
+
 class DraftTargetDecodingConfig(DecodingBaseConfig):
     pytorch_weights_path: Optional[str] = None
 
@@ -903,10 +904,11 @@ class BaseLlmArgs(BaseModel):
         default=None, description="Cache transceiver config.")
 
     # Speculative decoding parameters
-    speculative_config: Optional[Union[
-        LookaheadDecodingConfig, MedusaDecodingConfig, EagleDecodingConfig,
-        MTPDecodingConfig, NGramDecodingConfig, DraftTargetDecodingConfig]] = Field(
-            default=None, description="Speculative decoding config.")
+    speculative_config: Optional[
+        Union[LookaheadDecodingConfig, MedusaDecodingConfig,
+              EagleDecodingConfig, MTPDecodingConfig, NGramDecodingConfig,
+              DraftTargetDecodingConfig]] = Field(
+                  default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
                                                   description="Batching type.")
@@ -1239,7 +1241,8 @@ class BaseLlmArgs(BaseModel):
                 from tensorrt_llm._torch.speculative import DraftTargetConfig
                 self.speculative_config = DraftTargetConfig(
                     max_draft_tokens=self.speculative_config.max_draft_len,
-                    pytorch_weights_path=self.speculative_config.pytorch_weights_path)
+                    pytorch_weights_path=self.speculative_config.
+                    pytorch_weights_path)
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 from tensorrt_llm._torch.speculative import MTPConfig
                 self.speculative_config = MTPConfig(

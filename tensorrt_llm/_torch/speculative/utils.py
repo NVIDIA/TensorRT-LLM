@@ -21,9 +21,10 @@ def get_spec_metadata(spec_config,
                                   num_layers=spec_config.num_layers,
                                   hidden_size=spec_config.hidden_size)
     elif spec_config.spec_dec_mode.is_draft_target():
-        return DraftTargetSpecMetadata(max_draft_tokens=spec_config.max_draft_tokens,
-                                      spec_dec_mode=spec_config.spec_dec_mode,
-                                      max_num_requests=max_num_requests)
+        return DraftTargetSpecMetadata(
+            max_draft_tokens=spec_config.max_draft_tokens,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests)
     else:
         return None
 
