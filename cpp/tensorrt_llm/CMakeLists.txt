@@ -210,6 +210,25 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 add_library(${SHARED_TARGET} SHARED)
 
+if(ENABLE_CUFILE)
+  find_library(
+    CUFILE_LIBRARY cufile HINTS /usr/local/cuda-12.6/targets/x86_64-linux/lib
+                                /usr/lib/x86_64-linux-gnu /usr/local/lib)
+  if(NOT CUFILE_LIBRARY)
+    # FATAL_ERROR if user explicitly requests with GDS if CUDA's libcufile.so is
+    # not found.
+    message(
+      FATAL_ERROR
+        "cuFile library not found. Set -DENABLE_CUFILE=OFF if cufile isn't required."
+    )
+  else()
+    message(STATUS "Linking with cufile: ${CUFILE_LIBRARY}")
+    target_link_libraries(${SHARED_TARGET} PUBLIC ${CUFILE_LIBRARY})
+  endif()
+else()
+  message(STATUS "ENABLE_CUFILE=OFF, skipping GDS linkage.")
+endif()
+
 set_target_properties(
   ${SHARED_TARGET}
   PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"

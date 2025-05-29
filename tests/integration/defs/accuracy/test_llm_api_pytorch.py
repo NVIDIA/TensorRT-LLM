@@ -329,7 +329,7 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Maverick-17B-128E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Maverick-17B-128E-Instruct"
 
-    @skip_pre_hopper
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
     @parametrize_with_ids("cuda_graph", [False, True])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
