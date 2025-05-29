@@ -1014,9 +1014,16 @@ class FusedMoE(nn.Module):
             self.use_postquant_alltoall = (os.environ.get(
                 "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
                                            == "1") and qm.has_nvfp4()
-        self.deep_ep_buffer = deep_ep_utils.get_buffer(
+        # self.deep_ep_buffer = deep_ep_utils.get_buffer(
+        #     MnnvlMemory.get_comm(model_config.mapping),
+        #     deep_ep_utils.get_hidden_bytes(torch.empty(1, hidden_size, dtype=dtype))
+        # )
+        self.deep_ep_max_num_tokens = min(model_config.max_num_tokens, self.moe_max_num_tokens)
+        self.deep_ep_buffer = deep_ep_utils.low_latency_get_buffer(
             MnnvlMemory.get_comm(model_config.mapping),
-            deep_ep_utils.get_hidden_bytes(torch.empty(1, hidden_size, dtype=dtype))
+            self.deep_ep_max_num_tokens,
+            hidden_size,
+            self.num_slots,
         )
 
         self._weights_created = False
@@ -1437,9 +1444,24 @@ class FusedMoE(nn.Module):
 
         if self.enable_alltoall:
             if not self.use_postquant_alltoall:
-                x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deepep_handle, event = \
-                    deep_ep_utils.dispatch_forward(x, token_selected_slots.to(torch.int64), token_final_scales, self.num_slots)
-                event.current_stream_wait()
+                # x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deepep_handle, event = \
+                #     deep_ep_utils.dispatch_forward(x, token_selected_slots.to(torch.int64), token_final_scales, self.num_slots)
+                # event.current_stream_wait()
+                token_selected_slots_bak = token_selected_slots
+                token_final_scales_bak = token_final_scales
+                x, recv_expert_count, deepep_handle = \
+                    deep_ep_utils.low_latency_dispatch(x, token_selected_slots.to(torch.int64), self.deep_ep_max_num_tokens, self.num_slots)
+                # x shape: [#local experts, #max recv tokens, hidden_size]
+                # recv_expert_count shape: [#local experts]
+                mask = torch.arange(x.shape[1], dtype=torch.int32, device=x.device).expand(x.shape[0], x.shape[1]) < recv_expert_count.unsqueeze(1)
+                token_selected_slots = torch.full((x.shape[0], x.shape[1], self.routing_method.top_k), self.num_slots, dtype=torch.int32, device=x.device)
+                token_selected_slots[:, :, 0] = torch.where(
+                    mask,
+                    torch.arange(x.shape[0] * self.mapping.moe_ep_rank, x.shape[0] * (self.mapping.moe_ep_rank + 1), dtype=torch.int32, device=x.device).unsqueeze(1),
+                    self.num_slots)
+                x = x.view(x.shape[0] * x.shape[1], x.shape[2])
+                token_selected_slots = token_selected_slots.view(x.shape[0], self.routing_method.top_k)
+                token_final_scales = torch.ones_like(token_selected_slots, dtype=token_final_scales.dtype)
 
         x_sf = None
         if self.has_any_quant:
@@ -1520,16 +1542,16 @@ class FusedMoE(nn.Module):
                     x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
                                       self.scaling_vector_size)
 
-        if self.enable_alltoall:
-            token_selected_slots = recv_topk_idx.to(torch.int32)
-            mask = token_selected_slots == -1
-            token_selected_slots += self.num_slots // self.mapping.world_size * self.mapping.rank
-            token_selected_slots[mask] = self.num_slots
-            num_recv_token_is_zero = x.shape[0] == 0
-            if x.shape[0] == 0:
-                x = torch.zeros((1, x.shape[1]), dtype=x.dtype, device=x.device)
-                token_selected_slots = torch.full((1, token_selected_slots.shape[1]), self.num_slots, dtype=token_selected_slots.dtype, device=token_selected_slots.device)
-                token_final_scales = torch.ones((1, token_final_scales.shape[1]), dtype=token_final_scales.dtype, device=token_final_scales.device)
+        # if self.enable_alltoall:
+        #     token_selected_slots = recv_topk_idx.to(torch.int32)
+        #     mask = token_selected_slots == -1
+        #     token_selected_slots += self.expert_size_per_partition * self.mapping.moe_ep_rank
+        #     token_selected_slots[mask] = self.num_slots
+        #     num_recv_token_is_zero = x.shape[0] == 0
+        #     if x.shape[0] == 0:
+        #         x = torch.zeros((1, x.shape[1]), dtype=x.dtype, device=x.device)
+        #         token_selected_slots = torch.full((1, token_selected_slots.shape[1]), self.num_slots, dtype=token_selected_slots.dtype, device=token_selected_slots.device)
+        #         token_final_scales = torch.ones((1, token_final_scales.shape[1]), dtype=token_final_scales.dtype, device=token_final_scales.device)
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
@@ -1564,11 +1586,15 @@ class FusedMoE(nn.Module):
         if not self.enable_alltoall:
             return final_hidden_states
         else:
-            if num_recv_token_is_zero:
-                final_hidden_states = final_hidden_states[:0]
-            combined_x, event = deep_ep_utils.combine_forward(final_hidden_states, deepep_handle)
-            event.current_stream_wait()
-            return combined_x
+            # if num_recv_token_is_zero:
+            #     final_hidden_states = final_hidden_states[:0]
+            # combined_x, event = deep_ep_utils.combine_forward(final_hidden_states, deepep_handle)
+            # event.current_stream_wait()
+            # return combined_x
+            combined_hidden_states = \
+                deep_ep_utils.low_latency_combine(final_hidden_states.view(self.expert_size_per_partition, self.deep_ep_max_num_tokens * self.mapping.moe_ep_size, final_hidden_states.shape[1]),
+                        token_selected_slots_bak.to(torch.int64), token_final_scales_bak, deepep_handle)
+            return combined_hidden_states
 
     def forward(
         self,

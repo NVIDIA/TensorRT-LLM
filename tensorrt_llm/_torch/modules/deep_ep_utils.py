@@ -75,3 +75,47 @@ def combine_forward(x: torch.Tensor, handle: Tuple, previous_event: Optional[Eve
 
     # For event management, please refer to the docs of the `EventOverlap` class
     return combined_x, event
+
+
+# You may call this function at the framework initialization
+def low_latency_get_buffer(comm, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> Buffer:
+    # NOTES: the low-latency mode will consume much more space than the normal mode
+    # So we recommend that `num_max_dispatch_tokens_per_rank` (the actual batch size in the decoding engine) should be less than 256
+    global _buffer
+    world_size = comm.Get_size()
+    num_rdma_bytes = Buffer.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, world_size, num_experts)
+
+    # Allocate a buffer if not existed or not enough buffer size
+    if _buffer is None or not _buffer.low_latency_mode or _buffer.num_rdma_bytes < num_rdma_bytes:
+        # NOTES: for best performance, the QP number **must** be equal to the number of the local experts
+        assert num_experts % world_size == 0
+        _buffer = Buffer(None, 0, num_rdma_bytes, low_latency_mode=True, num_qps_per_rank=num_experts // world_size, comm=comm)
+    return _buffer
+
+
+def low_latency_dispatch(hidden_states: torch.Tensor, topk_idx: torch.Tensor, num_max_dispatch_tokens_per_rank: int, num_experts: int):
+    global _buffer
+
+    # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
+    recv_hidden_states, recv_expert_count, handle, event, hook = \
+        _buffer.low_latency_dispatch(hidden_states, topk_idx, num_max_dispatch_tokens_per_rank, num_experts,
+                                     use_fp8=False, async_finish=False, return_recv_hook=False)
+
+    # NOTES: the actual tensor will not be received only if you call `hook()`,
+    # it is useful for double-batch overlapping, but **without any SM occupation**
+    # If you don't want to overlap, please set `return_recv_hook=False`
+    # Later, you can use our GEMM library to do the computation with this specific format
+    return recv_hidden_states, recv_expert_count, handle
+
+
+def low_latency_combine(hidden_states: torch.Tensor,
+                        topk_idx: torch.Tensor, topk_weights: torch.Tensor, handle: Tuple):
+    global _buffer
+
+    # Do MoE combine, compatible with CUDA graph (but you may restore some buffer status once you replay)
+    combined_hidden_states, event_overlap, hook = \
+        _buffer.low_latency_combine(hidden_states, topk_idx, topk_weights, handle,
+                                    async_finish=False, return_recv_hook=False)
+
+    # NOTES: the same behavior as described in the dispatch kernel
+    return combined_hidden_states
