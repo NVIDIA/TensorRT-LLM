@@ -275,10 +275,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
+    (IMAGE_KEY_TO_TAG): [:],
 ]
 
 String getShortenedJobName(String path)
@@ -1977,6 +1980,70 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     return parallelJobsFiltered
 }
 
+
+
+def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
+    def testConfigs = [
+        "NGC Devel Image amd64": [
+            name: "NGC Devel Image amd64 Sanity Test",
+            gpuType: "A10",
+            k8sArch: "amd64",
+            wheelInstalled: false,
+        ],
+        "NGC Devel Image arm64": [
+            name: "NGC Devel Image arm64 Sanity Test",
+            gpuType: "GH200",
+            k8sArch: "arm64",
+            wheelInstalled: false,
+        ],
+        "NGC Release Image amd64": [
+            name: "NGC Release Image amd64 Sanity Test",
+            gpuType: "A10",
+            k8sArch: "amd64",
+            wheelInstalled: true,
+        ],
+        "NGC Release Image arm64": [
+            name: "NGC Release Image arm64 Sanity Test",
+            gpuType: "GH200",
+            k8sArch: "arm64",
+            wheelInstalled: true,
+        ],
+    ]
+    // Update testConfigs image field using the map from globalVars
+    testConfigs.each { key, config ->
+        if (globalVars[IMAGE_KEY_TO_TAG] && globalVars[IMAGE_KEY_TO_TAG][key]) {
+            config.image = globalVars[IMAGE_KEY_TO_TAG][key]
+        }
+    }
+    // Filter out all configs that don't have image set
+    testConfigs = testConfigs.findAll { key, config ->
+        return config.image != null
+    }
+
+    echo "Filtered test configs with images:"
+    println testConfigs
+
+    def testJobs = testConfigs.collectEntries { key, values -> [values.name, {
+        if (values.wheelInstalled) {
+            stage(values.name) {
+                echo "Run ${values.name} sanity test."
+                imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
+                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                    sh "env | sort"
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", config, false, "values.name" , 1, 1, true, null)
+                })
+            }
+        } else {
+            stage(values.name) {
+                runLLMBuildFromPackage(pipeline, values.k8sArch, false, "imageTest/")
+            }
+        }
+    }]}
+
+    return testJobs
+}
+
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("", "agent")
@@ -2030,7 +2097,11 @@ pipeline {
         stage("Test") {
             steps {
                 script {
-                    parallelJobs = launchTestJobs(this, testFilter)
+                    if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
+                        parallelJobs = launchTestJobsForImagesSanityCheck(this, globalVars)
+                    } else {
+                        parallelJobs = launchTestJobs(this, testFilter)
+                    }
 
                     singleGpuJobs = parallelJobs
                     dgxJobs = [:]

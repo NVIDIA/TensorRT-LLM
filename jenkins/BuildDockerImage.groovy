@@ -21,6 +21,8 @@ LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefi
 
 LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
+RUN_SANITY_CHECK = env.runSanityCheck ?: false
+
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
@@ -33,10 +35,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
+    (IMAGE_KEY_TO_TAG): [:],
 ]
 
 @Field
@@ -187,6 +192,8 @@ def buildImage(config, imageKeyToTag)
     def dependentTarget = config.dependentTarget
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
 
+    llmDefaultTag = "09bd772-4294-71" // TODO: remove this
+
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
 
     def dependentTargetTag = tag.replace("${arch}-${target}-", "${arch}-${dependentTarget}-")
@@ -195,6 +202,7 @@ def buildImage(config, imageKeyToTag)
         imageKeyToTag["NGC Devel Image ${config.arch}"] = "${IMAGE_NAME}/${dependentTarget}:${dependentTargetTag}"
         imageKeyToTag["NGC Release Image ${config.arch}"] = "${IMAGE_NAME}/${target}:${tag}"
     }
+    return // TODO: remove this
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
 
@@ -391,6 +399,17 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
 }
 
 
+def getCommonParameters()
+{
+    return [
+        'gitlabSourceRepoHttpUrl': LLM_REPO,
+        'gitlabCommit': env.gitlabCommit,
+        'artifactPath': env.artifactPath,
+        'uploadPath': env.uploadPath,
+    ]
+}
+
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("agent")
@@ -444,13 +463,33 @@ pipeline {
                 }
             }
         }
-        stage("Upload Artifacts") {
+        stage("Sanity Check") {
             steps {
                 script {
                     String imageKeyToTagJson = writeJSON returnText: true, json: imageKeyToTag
                     echo "imageKeyToTag is: ${imageKeyToTagJson}"
                     writeFile file: "imageKeyToTag.json", text: imageKeyToTagJson
                     archiveArtifacts artifacts: 'imageKeyToTag.json', fingerprint: true
+
+                    if (!RUN_SANITY_CHECK) {
+                        echo "Sanity check is disabled"
+                        return
+                    }
+
+                    globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
+                    def parameters = getCommonParameters()
+                    parameters += [
+                        'branch': LLM_BRANCH,
+                        'globalVars': globalVarsJson,
+                    ]
+
+                    echo "trigger BuildDockerImageSanityTest job, params: ${parameters}"
+
+                    def status = triggerJob("/LLM/helpers/BuildDockerImageSanityTest", parameters)
+                    if (status != "SUCCESS") {
+                        error "Downstream job did not succeed"
+                    }
                 }
             }
         }
