@@ -1630,7 +1630,22 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-4_GPUs-PyTorch-[Post-Merge]-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
+        "GB200-PyTorch-[Post-Merge]-1": ["gb200", "l0_gb200", 1, 6, 1],
+        "GB200-PyTorch-[Post-Merge]-2": ["gb200", "l0_gb200", 2, 6, 1],
+        "GB200-PyTorch-[Post-Merge]-3": ["gb200", "l0_gb200", 3, 6, 1],
+        "GB200-PyTorch-[Post-Merge]-4": ["gb200", "l0_gb200", 4, 6, 1],
+        "GB200-PyTorch-[Post-Merge]-5": ["gb200", "l0_gb200", 5, 6, 1],
+        "GB200-PyTorch-[Post-Merge]-6": ["gb200", "l0_gb200", 6, 6, 1],
+        "GB200-4_GPUs-PyTorch-[Post-Merge]-1": ["gb200-4-gpus", "l0_gb200", 1, 10, 4],
+        "GB200-4_GPUs-PyTorch-[Post-Merge]-2": ["gb200-4-gpus", "l0_gb200", 2, 10, 4],
+        "GB200-4_GPUs-PyTorch-[Post-Merge]-3": ["gb200-4-gpus", "l0_gb200", 3, 10, 4],
+        "GB200-4_GPUs-PyTorch-[Post-Merge]-4": ["gb200-4-gpus", "l0_gb200", 4, 10, 4],
+        "GB200-4_GPUs-PyTorch-[Post-Merge]-5": ["gb200-4-gpus", "l0_gb200", 5, 10, 4],
+        "GB200-4_GPUs-PyTorch-[Post-Merge]-6": ["gb200-4-gpus", "l0_gb200", 6, 10, 4],
+        "GB200-4_GPUs-PyTorch-[Post-Merge]-7": ["gb200-4-gpus", "l0_gb200", 7, 10, 4],
+        "GB200-4_GPUs-PyTorch-[Post-Merge]-8": ["gb200-4-gpus", "l0_gb200", 8, 10, 4],
+        "GB200-4_GPUs-PyTorch-[Post-Merge]-9": ["gb200-4-gpus", "l0_gb200", 9, 10, 4],
+        "GB200-4_GPUs-PyTorch-[Post-Merge]-10": ["gb200-4-gpus", "l0_gb200", 10, 10, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
