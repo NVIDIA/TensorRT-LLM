@@ -482,6 +482,7 @@ pipeline {
                     parameters += [
                         'branch': LLM_BRANCH,
                         'globalVars': globalVarsJson,
+                        'targetArch': "aarch64-linux-gnu",
                     ]
 
                     echo "trigger BuildDockerImageSanityTest job, params: ${parameters}"
