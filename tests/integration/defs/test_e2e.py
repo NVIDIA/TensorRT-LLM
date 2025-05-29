@@ -768,7 +768,7 @@ def test_trtllm_bench_mgmn(llm_root, llm_venv):
                                              skip_engine_build=True)
 
     benchmark_cmd = \
-            f"mpirun -n 2 trtllm-llmapi-launch trtllm-bench --model {model_name} " \
+            f"mpirun --allow-run-as-root -n 2 trtllm-llmapi-launch trtllm-bench --model {model_name} " \
             f"--model_path {llama_model_dir} " \
             f"throughput " \
             f"--dataset {str(dataset_path)} --backend pytorch --tp 2"
