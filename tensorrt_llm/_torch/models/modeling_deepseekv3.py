@@ -45,7 +45,7 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, allgather)
+                           MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import MLA
@@ -743,15 +743,20 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             num_activated_experts_per_node = hidden_states[2]
             experts_to_token_score = hidden_states[3]
 
+            moe_all_reduce_params = MoEAllReduceParams(
+                residual=residual,
+                norm_weight=self.next_layer_layernorm.weight,
+                device_num_experts=num_activated_experts_per_node,
+                expert_scale_factor=experts_to_token_score,
+                shared_expert_output=shared_output,
+                eps=self.next_layer_layernorm.variance_epsilon,
+                is_cutlass_min_latency=True,
+            )
+
             # MoE_finalize is fused into allreduce
             hidden_states, residual = self.moe_allreduce(
-                residual,
-                self.next_layer_layernorm.weight,
-                device_num_experts=num_activated_experts_per_node,
-                scale_input=experts_to_token_score,
-                active_experts_token_input=hidden_states_activated_experts,
-                token_input=shared_output,
-                eps=self.next_layer_layernorm.variance_epsilon,
+                hidden_states_activated_experts,
+                all_reduce_params=moe_all_reduce_params,
             )
         else:
             if self.fusion_config.PRE_MOE_FUSION:
