@@ -132,10 +132,12 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float* merged_softmax
     }
 }
 
-// kv_output {b, chunked_unit_size, h, d}
+// kv_output {b, chunked_unit_size, h=1, d_lora}
+// k_pe_output {b, chunked_unit_size, h=1, d_rope}
 template <typename T>
-__global__ void loadChunkedKVCacheForMLAKernel(T* kv_output, const tensorrt_llm::kernels::KVBlockArray kv_cache,
-    int64_t const* cu_ctx_cached_kv_lens, int chunked_unit_size, int chunked_idx)
+__global__ void loadChunkedKVCacheForMLAKernel(T* output_kv_ptr, T* output_k_pe_ptr,
+    const tensorrt_llm::kernels::KVBlockArray kv_cache, int64_t const* cu_ctx_cached_kv_lens, int chunked_unit_size,
+    int chunked_idx)
 {
     using KT = loadChunkedKVKernelTraits<T>;
     int const batch_idx = static_cast<int>(blockIdx.y);
@@ -145,7 +147,7 @@ __global__ void loadChunkedKVCacheForMLAKernel(T* kv_output, const tensorrt_llm:
     size_t const head_dim_idx = head_dim_vec_idx * KT::kElemPerLoad;
 
     int64_t const cache_kv_len = cu_ctx_cached_kv_lens[batch_idx + 1] - cu_ctx_cached_kv_lens[batch_idx];
-
+    bool const is_valid_kv = head_dim_vec_idx < KT::kKVThreadPerHead;
     for (int local_token_idx = (threadIdx.x / KT::kThreadPerHead) + blockIdx.x * KT::kTokenPerBlock;
          local_token_idx < chunked_unit_size; local_token_idx += gridDim.x * KT::kTokenPerBlock)
     {
@@ -157,12 +159,21 @@ __global__ void loadChunkedKVCacheForMLAKernel(T* kv_output, const tensorrt_llm:
             // head_idx === 0
             auto kvBlockIdx
                 = kv_cache.getKVLocalIdx(token_idx_in_kv_cache, 0, KT::kVecPerHead, static_cast<int>(head_dim_vec_idx));
-            auto kv_data = (reinterpret_cast<typename KT::VecT*>(kvSrc))[kvBlockIdx];
-
-            // kv_output {b, chunked_unit_size, h=1, d}
-            int const global_st_idx
-                = batch_idx * chunked_unit_size * KT::kHeadSize + local_token_idx * KT::kHeadSize + head_dim_idx;
-            *reinterpret_cast<typename KT::VecT*>(kv_output + global_st_idx) = kv_data;
+            auto ld_data = (reinterpret_cast<typename KT::VecT*>(kvSrc))[kvBlockIdx];
+            if (is_valid_kv)
+            {
+                // kv_output {b, chunked_unit_size, h=1, d}
+                int const global_st_idx
+                    = batch_idx * chunked_unit_size * KT::kLoraSize + local_token_idx * KT::kLoraSize + head_dim_idx;
+                *reinterpret_cast<typename KT::VecT*>(output_kv_ptr + global_st_idx) = ld_data;
+            }
+            else
+            {
+                // k_pe_output {b, chunked_unit_size, h=1, d_rope}
+                int const global_st_idx = batch_idx * chunked_unit_size * KT::kRopeSize
+                    + local_token_idx * KT::kRopeSize + (head_dim_idx - KT::kLoraSize);
+                *reinterpret_cast<typename KT::VecT*>(output_k_pe_ptr + global_st_idx) = ld_data;
+            }
         }
     }
 }
@@ -265,15 +276,18 @@ void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_sum, T* co
 
 // load single chunk kv from kv_cache for each request
 template <typename T>
-void invokeMLALoadChunkedKV(T* kv_output, KVBlockArray const& kv_cache, int const num_contexts,
-    int64_t const* cu_ctx_cached_kv_lens, int head_dim, int chunked_unit_size, int chunked_idx, cudaStream_t stream)
+void invokeMLALoadChunkedKV(T* output_kv_ptr, T* output_k_pe_ptr, KVBlockArray const& kv_cache, int const num_contexts,
+    int64_t const* cu_ctx_cached_kv_lens, int lora_size, int rope_size, int chunked_unit_size, int chunked_idx,
+    cudaStream_t stream)
 {
     using KT = loadChunkedKVKernelTraits<T>;
-    TLLM_CHECK_WITH_INFO(head_dim == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
+    TLLM_CHECK_WITH_INFO(lora_size + rope_size == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
+    TLLM_CHECK_WITH_INFO(lora_size == KT::kLoraSize, "lora dim should be equal to %d", KT::kLoraSize);
+    TLLM_CHECK_WITH_INFO(rope_size == KT::kRopeSize, "rope dim should be equal to %d", KT::kRopeSize);
     // {chunked_unit_size / token_per_block, batch_size, head_num}
     dim3 grid(static_cast<int>(tensorrt_llm::common::divUp(chunked_unit_size, KT::kTokenPerBlock)), num_contexts, 1);
     loadChunkedKVCacheForMLAKernel<T><<<grid, KT::kBlockSize, 0, stream>>>(
-        kv_output, kv_cache, cu_ctx_cached_kv_lens, chunked_unit_size, chunked_idx);
+        output_kv_ptr, output_k_pe_ptr, kv_cache, cu_ctx_cached_kv_lens, chunked_unit_size, chunked_idx);
 }
 
 // output_kv {B, 2, ceil(chunked_unit_size / kv_cache_tokens_per_block), h, kv_cache_tokens_per_block, d}, padding with
@@ -300,9 +314,9 @@ void invokeMLASetChunkedKV(T* output_kv, T* const kv, T* const k_pe, int const b
     template void invokeMergeAttnWithSoftmax<T>(T * merged_attn, float* merged_softmax_sum, T* const pre_attn,         \
         float* const pre_softmax_sum, T* const curr_attn, float* const curr_softmax_sum, int const batch_size,         \
         int const chunked_token_size, int const num_heads, int const head_size, cudaStream_t stream);                  \
-    template void invokeMLALoadChunkedKV<T>(T * kv_output, KVBlockArray const& kv_cache, int const num_contexts,       \
-        int64_t const* cu_ctx_cached_kv_lens, int head_dim, int chunked_unit_size, int chunked_idx,                    \
-        cudaStream_t stream);                                                                                          \
+    template void invokeMLALoadChunkedKV<T>(T * output_kv_ptr, T * output_k_pe_ptr, KVBlockArray const& kv_cache,      \
+        int const num_contexts, int64_t const* cu_ctx_cached_kv_lens, int lora_size, int rope_size,                    \
+        int chunked_unit_size, int chunked_idx, cudaStream_t stream);                                                  \
     template void invokeMLASetChunkedKV<T>(T * output_kv, T* const kv, T* const k_pe, int const batch_size,            \
         int const max_seq_len, int const num_heads, int uncompressed_head_size, int rope_size,                         \
         int64_t* const cu_seq_lens, int const kv_cache_tokens_per_block, cudaStream_t stream);

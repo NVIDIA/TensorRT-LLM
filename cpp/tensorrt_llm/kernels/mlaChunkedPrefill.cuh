@@ -13,8 +13,9 @@ void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_sum, T* co
 
 // load single chunk kv from kv_cache for each request
 template <typename T>
-void invokeMLALoadChunkedKV(T* kv_output, KVBlockArray const& kv_cache, int const num_contexts,
-    int64_t const* cu_ctx_cached_kv_lens, int head_dim, int chunked_unit_size, int chunked_idx, cudaStream_t stream);
+void invokeMLALoadChunkedKV(T* output_kv_ptr, T* output_k_pe_ptr, KVBlockArray const& kv_cache, int const num_contexts,
+    int64_t const* cu_ctx_cached_kv_lens, int lora_size, int rope_size, int chunked_unit_size, int chunked_idx,
+    cudaStream_t stream);
 
 // output_kv {B, 2, ceil(chunked_unit_size / kv_cache_tokens_per_block), h, kv_cache_tokens_per_block, d}, padding with
 // zero

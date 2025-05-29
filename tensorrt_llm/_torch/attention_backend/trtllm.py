@@ -982,7 +982,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sink_token_length = 0
         beam_width = 1
 
-        output = torch.ops.trtllm.load_chunked_kv_cache_for_mla(
+        output_kv, output_k_pe = torch.ops.trtllm.load_chunked_kv_cache_for_mla(
             out_dtype,
             metadata.num_contexts,
             metadata.metadata.ctx_cached_token_indptr,
@@ -1001,7 +1001,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             beam_width,
             self.wrapper.quant_mode,
         )
-        return output
+        return output_kv, output_k_pe
 
     def set_paged_kv_cache_for_mla(
         self,
