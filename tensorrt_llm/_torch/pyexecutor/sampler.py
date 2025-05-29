@@ -191,6 +191,9 @@ class TorchSampler(Sampler):
     def __init__(self, max_seq_len: int, mixed_sampler: bool = False):
         self.max_seq_len = max_seq_len
         self.mixed_sampler = mixed_sampler
+        self.na = 0
+        self.nd = 0
+        self.enable_draft_hack = False
 
     def _meet_max_token_stop_criteria(self, request: LlmRequest,
                                       num_tokens: int):
@@ -313,10 +316,16 @@ class TorchSampler(Sampler):
                 # token exactly.
                 num_accepted = 0
                 new_tokens = [new_token]
+                if not self.enable_draft_hack:
+                    self.nd += 1
+                al = 1
                 for draft_token in request.py_draft_tokens:
-                    if draft_token != new_token:
+                    if (not self.enable_draft_hack
+                            and draft_token != new_token) or draft_token == 0:
                         # Reject.
                         break
+                    if not self.enable_draft_hack:
+                        al += 1
                     num_accepted += 1
                     new_token = new_tokens_list[token_idx + num_accepted]
                     num_tokens = request.add_new_token(new_token, beam_idx)
@@ -329,6 +338,9 @@ class TorchSampler(Sampler):
                 request.py_decoding_iter += 1
                 request.py_num_accepted_draft_tokens = num_accepted
                 request.py_rewind_len = request.py_draft_pages_allocated - num_accepted
+            if not self.enable_draft_hack:
+                self.na += al
+                print(self.na / self.nd)
             advance_idx(len(request.py_draft_tokens) + 1)
 
         for request in generation_requests:

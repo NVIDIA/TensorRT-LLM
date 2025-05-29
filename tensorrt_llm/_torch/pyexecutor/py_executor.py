@@ -1727,7 +1727,7 @@ class PyExecutor:
         """
         try:
             draft_batch = ScheduledRequests()
-            req_id_to_num_rejected_tokens = {}
+            req_id_to_num_padding_tokens = {}
 
             for request in scheduled_requests.generation_requests:
                 if request.py_draft_pages_allocated == 0:
@@ -1743,7 +1743,7 @@ class PyExecutor:
                                               "py_num_accepted_draft_tokens", 0)
                 num_rejected_tokens = num_draft_tokens - num_accepted_tokens
                 assert num_rejected_tokens >= 0
-                req_id_to_num_rejected_tokens[
+                req_id_to_num_padding_tokens[
                     request.py_request_id] = num_rejected_tokens
 
                 spec_config = self.model_engine.spec_config
@@ -1764,34 +1764,31 @@ class PyExecutor:
                         is_streaming=False)
 
                     draft_batch.context_requests.append(new_request)
-                elif getattr(request, "py_num_accepted_draft_tokens", 0) == 0:
-                    new_request = LlmRequest(
-                        request_id=request.py_request_id,
-                        max_new_tokens=request.py_max_new_tokens,
-                        input_tokens=input_tokens[:-1],
-                        sampling_config=request.sampling_config,
-                        is_streaming=False)
-                    # Explicitly add the last token so get_last_tokens() returns
-                    # the right value
-                    new_request.add_new_token(input_tokens[-1], beam_idx)
-                    new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
-                    draft_batch.generation_requests.append(new_request)
                 else:
                     new_request = LlmRequest(
                         request_id=request.py_request_id,
                         max_new_tokens=request.py_max_new_tokens,
-                        input_tokens=input_tokens,
+                        input_tokens=input_tokens[:-1 - num_accepted_tokens],
                         sampling_config=request.sampling_config,
                         is_streaming=False)
-                    new_request.context_chunk_size = num_accepted_tokens + 1
-                    new_request.context_current_position = len(
-                        input_tokens) - num_accepted_tokens - 1
+                    # Explicitly add the last token so get_last_tokens() returns
+                    # the right value
+                    new_request.add_new_token(
+                        input_tokens[-1 - num_accepted_tokens], beam_idx)
 
-                    draft_batch.context_requests.append(new_request)
+                    new_request.py_draft_pages_allocated = request.py_draft_pages_allocated
+                    if num_accepted_tokens > 0:
+                        new_request.py_draft_tokens = input_tokens[
+                            -num_accepted_tokens:] + [0] * num_rejected_tokens
+                    else:
+                        new_request.py_draft_tokens = [0] * num_rejected_tokens
+
+                    new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
+                    draft_batch.generation_requests.append(new_request)
 
                 new_request.py_stop_words_list = request.py_stop_words_list
 
-            return draft_batch, req_id_to_num_rejected_tokens
+            return draft_batch, req_id_to_num_padding_tokens
 
         except Exception as e:
             traceback.print_exc()
@@ -1802,7 +1799,7 @@ class PyExecutor:
     @nvtx_range("_prepare_draft_tokens")
     def _prepare_draft_tokens(self, scheduled_requests: ScheduledRequests):
         try:
-            draft_batch, num_rejected_tokens = self._prepare_draft_batch(
+            draft_batch, req_id_to_num_padding_tokens = self._prepare_draft_batch(
                 scheduled_requests)
 
             if draft_batch.batch_size == 0:
@@ -1816,8 +1813,8 @@ class PyExecutor:
 
             spec_metadata = self.model_engine.last_spec_metadata
 
-            hidden_states = spec_metadata.get_hidden_states(
-                draft_batch, num_rejected_tokens)
+            hidden_states = spec_metadata.get_hidden_states(draft_batch,
+                                                            is_context=True)
 
             if spec_metadata.spec_dec_mode.is_eagle3():
                 # Hack for eagle3. We might need to run a matmul to reduce
@@ -1842,7 +1839,9 @@ class PyExecutor:
 
             self._update_request_states(draft_batch)
 
+            self.sampler.enable_draft_hack = True
             self._update_requests(sample_state)
+            self.sampler.enable_draft_hack = False
 
             def _process_decoded_tokens():
                 new_requests = []
@@ -1855,6 +1854,10 @@ class PyExecutor:
                             target_model_req.py_draft_tokens
                     ) < target_model_req.py_draft_pages_allocated:
                         new_requests.append(req)
+                        req.py_draft_tokens = [
+                            0
+                        ] * target_model_req.py_draft_pages_allocated
+                        req.py_draft_pages_allocated = target_model_req.py_draft_pages_allocated
 
                 return new_requests
 
@@ -1876,10 +1879,13 @@ class PyExecutor:
             draft_batch.generation_requests = new_requests
             draft_batch.context_requests = []
 
-            for _ in range(spec_metadata.max_draft_tokens - 1):
+            for i in range(spec_metadata.max_draft_tokens - 1):
                 draft_spec_metadata = self.draft_model_engine.last_spec_metadata
                 hidden_states = draft_spec_metadata.get_hidden_states(
-                    draft_batch)
+                    draft_batch,
+                    is_context=False,
+                    num_padding_tokens=req_id_to_num_padding_tokens
+                    if i == 0 else None)
                 extra_model_inputs = {'hidden_states': hidden_states}
 
                 outputs = self.draft_model_engine.forward(
@@ -1893,7 +1899,9 @@ class PyExecutor:
                         'd2t'] = self.draft_model_engine.model.model.d2t.data
                 sample_state = self._sample_async(draft_batch, outputs)
                 self._update_request_states(draft_batch)
+                self.sampler.enable_draft_hack = True
                 self._update_requests(sample_state)
+                self.sampler.enable_draft_hack = False
 
                 new_requests = _process_decoded_tokens()
                 if not new_requests:

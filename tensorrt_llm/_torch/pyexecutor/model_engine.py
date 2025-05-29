@@ -669,7 +669,8 @@ class PyTorchModelEngine(ModelEngine):
                     self.forward(batch,
                                  new_tensors_device=None,
                                  resource_manager=resource_manager,
-                                 extra_model_inputs=_create_extra_inputs(bs, 1))
+                                 extra_model_inputs=_create_extra_inputs(
+                                     bs, 1 + self.max_draft_len))
                     torch.cuda.synchronize()
 
                 if self._torch_compile_piecewise_cuda_graph:
