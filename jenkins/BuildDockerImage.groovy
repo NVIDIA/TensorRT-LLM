@@ -193,6 +193,7 @@ def buildImage(config, imageKeyToTag)
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
 
     // def tmpTag = "09bd772-4294-71" // TODO: remove this
+    def tmpTag = LLM_DEFAULT_TAG
 
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${tmpTag}"
 
