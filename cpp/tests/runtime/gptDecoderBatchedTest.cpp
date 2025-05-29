@@ -56,21 +56,26 @@ struct DecoderInputs
 
 void newRequests(TensorPtr const& batchSlots, std::vector<decoder_batch::Request> const& requests,
     std::vector<SamplingConfig> const& samplingConfigs, ModelConfig const& modelConfig, GptDecoderBatched& decoder,
-    std::shared_ptr<CudaStream> runtimeStream, SizeType32 maxSequenceLength)
+    CudaStream const& runtimeStream, SizeType32 maxSequenceLength)
 {
-    auto newRequestsAlgo = tb::CreateNewDecoderRequests();
-    newRequestsAlgo(batchSlots, requests, samplingConfigs, modelConfig, decoder, *runtimeStream, maxSequenceLength);
+    auto const& decoderStream = *decoder.getDecoderStream();
+
+    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots);
+    auto const localBatchSize = batchSlots->getSize();
+    for (size_t bi = 0; bi < localBatchSize; ++bi)
+    {
+        tb::CreateNewDecoderRequests::newRequest(batchSlotsRange[bi], requests[bi], samplingConfigs[bi], modelConfig,
+            decoder.getDecoderState(), runtimeStream, decoderStream, maxSequenceLength);
+    }
 
     // Setup underlying decoder.
-    auto const localBatchSize = batchSlots->getSize();
     auto samplingConfig = SamplingConfig(samplingConfigs);
     decoder.getUnderlyingDecoder().setup(
         samplingConfig, localBatchSize, batchSlots, {decoder.getDecoderState().getJointDecodingOutput()}, {requests});
 
-    auto const& stream = decoder.getDecoderStream();
     CudaEvent event{};
-    stream->record(event);
-    runtimeStream->wait(event);
+    decoderStream.record(event);
+    runtimeStream.wait(event);
 }
 
 DecoderInputs createDecoderInputs(SizeType32 batchSize, SizeType32 maxBeamWidth, SizeType32 maxSeqLength,
@@ -320,14 +325,15 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     auto decoderInputs = createDecoderInputs(batchSize, maxBeamWidth, maxSeqLength, vocabSizePadded, dataType,
         samplingConfigs, generatedTokensPerSteps, computeLogProbs, manager);
     auto outputs = createDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths,
-        *decoder.getDecoderState().getJointDecodingOutput().lengths, manager);
+        *decoder.getDecoderState().getSequenceLengths(), manager);
 
     std::vector<decoder_batch::Request> decoderRequests;
-    newRequests(inputBuffers.setupBatchSlots, requests, samplingConfigs, modelConfig, decoder, streamPtr, maxSeqLength);
+    newRequests(
+        inputBuffers.setupBatchSlots, requests, samplingConfigs, modelConfig, decoder, *streamPtr, maxSeqLength);
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;
-    checkSequenceLengths(*decoder.getDecoderState().getJointDecodingOutput().lengths, expectedLengths, manager);
+    checkSequenceLengths(*decoder.getDecoderState().getSequenceLengths(), expectedLengths, manager);
 
     auto const& finished = getFinished(*decoder.getDecoderState().getFinishedSum(), samplingConfigs, manager);
     EXPECT_EQ(finished.size(), batchSize);
@@ -346,7 +352,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
         decoderInputs.logits, batchSize, inputBuffers.forwardBatchSlots, decoderInputs.srcCacheIndirection);
     decoder.forward(outputs, *inputs);
 
-    checkSequenceLengths(*decoder.getDecoderState().getJointDecodingOutput().lengths, expectedLengths, manager);
+    checkSequenceLengths(*decoder.getDecoderState().getSequenceLengths(), expectedLengths, manager);
     EXPECT_THAT(
         getFinished(*decoder.getDecoderState().getFinishedSum(), samplingConfigs, manager), ::testing::Each(false));
 
@@ -357,7 +363,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     advanceSequenceLengths(expectedLengths, acceptedTokensPerStep, samplingConfigs,
         getFinished(*decoder.getDecoderState().getFinishedSum(), samplingConfigs, manager), batchSize, maxBeamWidth);
     decoder.forward(outputs, *inputs);
-    checkSequenceLengths(*decoder.getDecoderState().getJointDecodingOutput().lengths, expectedLengths, manager);
+    checkSequenceLengths(*decoder.getDecoderState().getSequenceLengths(), expectedLengths, manager);
     EXPECT_THAT(
         getFinished(*decoder.getDecoderState().getFinishedSum(), samplingConfigs, manager), ::testing::Each(true));
 
@@ -365,11 +371,11 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
         maxSeqLength, inputTokenId, expectedTokenId, endId);
 
     EXPECT_NO_THROW(decoder.forward(outputs, *inputs));
-    checkSequenceLengths(*decoder.getDecoderState().getJointDecodingOutput().lengths, expectedLengths, manager);
+    checkSequenceLengths(*decoder.getDecoderState().getSequenceLengths(), expectedLengths, manager);
 
     TensorPtr batchSlotsView = ITensor::slice(inputBuffers.setupBatchSlots, 0, 1);
     std::vector<SamplingConfig> singleConfig = {samplingConfigs[0]};
-    newRequests(batchSlotsView, {requests[0]}, singleConfig, modelConfig, decoder, streamPtr, maxSeqLength);
+    newRequests(batchSlotsView, {requests[0]}, singleConfig, modelConfig, decoder, *streamPtr, maxSeqLength);
     EXPECT_FALSE(getFinished(*decoder.getDecoderState().getFinishedSum(), samplingConfigs, manager)[0]);
 }
 
@@ -448,7 +454,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     auto decoderInputs = createDecoderInputs(batchSize, maxBeamWidth, maxSeqLength, vocabSizePadded, dataType,
         samplingConfigs, generatedTokensPerSteps, computeLogProbs, manager);
     auto outputs = createDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths,
-        *decoder.getDecoderState().getJointDecodingOutput().lengths, manager);
+        *decoder.getDecoderState().getSequenceLengths(), manager);
 
     std::vector<SizeType32> const expectedSteps(batchSize, 0);
     auto expectedLengths = tiledInputLengths;
@@ -464,7 +470,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     {
         TensorPtr const newBatchSlot = ITensor::slice(inputBuffers.setupBatchSlots, batchIdx, 1);
         std::vector<SamplingConfig> const singleConfig = {samplingConfigs[batchIdx]};
-        newRequests(newBatchSlot, {requests[batchIdx]}, singleConfig, modelConfig, decoder, streamPtr, maxSeqLength);
+        newRequests(newBatchSlot, {requests[batchIdx]}, singleConfig, modelConfig, decoder, *streamPtr, maxSeqLength);
 
         auto activeSlots = std::vector<SizeType32>(batchIdx + 1);
         std::iota(activeSlots.begin(), activeSlots.end(), 0);
@@ -474,7 +480,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
 
         advanceSequenceLengths(
             expectedLengths, acceptedTokensPerStep, samplingConfigs, expectedFinished, batchIdx + 1, maxBeamWidth);
-        checkSequenceLengths(*decoder.getDecoderState().getJointDecodingOutput().lengths, expectedLengths, manager);
+        checkSequenceLengths(*decoder.getDecoderState().getSequenceLengths(), expectedLengths, manager);
 
         for (auto bi = 0; bi <= batchIdx; ++bi)
         {
@@ -498,7 +504,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
 
         advanceSequenceLengths(
             expectedLengths, acceptedTokensPerStep, samplingConfigs, expectedFinished, batchSize, maxBeamWidth);
-        checkSequenceLengths(*decoder.getDecoderState().getJointDecodingOutput().lengths, expectedLengths, manager);
+        checkSequenceLengths(*decoder.getDecoderState().getSequenceLengths(), expectedLengths, manager);
 
         for (auto bi = 0; bi < batchSize; ++bi)
         {
@@ -593,16 +599,17 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     auto decoderInputs = createDecoderInputs(batchSize, maxBeamWidth, maxSeqLength, vocabSizePadded, dataType,
         samplingConfigs, generatedTokensPerSteps, false, manager);
     auto outputs = createDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths,
-        *decoder.getDecoderState().getJointDecodingOutput().lengths, manager);
+        *decoder.getDecoderState().getSequenceLengths(), manager);
 
     auto batchSlotsRange = BufferRange<SizeType32>(*inputBuffers.setupBatchSlots);
     std::iota(batchSlotsRange.begin(), batchSlotsRange.end(), 0);
 
-    newRequests(inputBuffers.setupBatchSlots, requests, samplingConfigs, modelConfig, decoder, streamPtr, maxSeqLength);
+    newRequests(
+        inputBuffers.setupBatchSlots, requests, samplingConfigs, modelConfig, decoder, *streamPtr, maxSeqLength);
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;
-    checkSequenceLengths(*decoder.getDecoderState().getJointDecodingOutput().lengths, expectedLengths, manager);
+    checkSequenceLengths(*decoder.getDecoderState().getSequenceLengths(), expectedLengths, manager);
 
     auto const& finished = getFinished(*decoder.getDecoderState().getFinishedSum(), samplingConfigs, manager);
     EXPECT_EQ(finished.size(), batchSize);
@@ -620,7 +627,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     auto inputs = tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(activeSlots, decoder.getDecoderState(),
         decoderInputs.logits, batchSize, inputBuffers.forwardBatchSlots, decoderInputs.srcCacheIndirection);
     decoder.forward(outputs, *inputs);
-    checkSequenceLengths(*decoder.getDecoderState().getJointDecodingOutput().lengths, expectedLengths, manager);
+    checkSequenceLengths(*decoder.getDecoderState().getSequenceLengths(), expectedLengths, manager);
     EXPECT_THAT(
         getFinished(*decoder.getDecoderState().getFinishedSum(), samplingConfigs, manager), ::testing::Each(false));
 

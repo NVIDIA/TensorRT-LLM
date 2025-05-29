@@ -19,44 +19,61 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/EmptyTensor.h>
+#include <ATen/ops/index_select.h>
 
 namespace torch_ext
 {
 namespace tg = trtllm::gen;
+using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 
-torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits, torch::Tensor const& routing_bias,
-    torch::Tensor const& hidden_states, torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
+torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
+    torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
+    torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
     torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm2_weights,
     torch::Tensor const& gemm2_weights_scale, torch::Tensor const& output1_scales_scalar,
     torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& output2_scales_scalar,
-    int64_t const num_experts, int64_t const top_k, int64_t const n_group, int64_t const topk_group,
-    int64_t const intermediate_size, int64_t const local_expert_offset, int64_t const local_num_experts,
-    double const routed_scaling_factor)
+    int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
+    std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
+    int64_t const local_num_experts, std::optional<double> const routed_scaling_factor,
+    int64_t const routing_method_type)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 100, "Only SM100 is supported by FP4 block scale MOE");
-    TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float, "routing_logits must be float.");
+    TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float
+            || routing_logits.scalar_type() == at::ScalarType::BFloat16,
+        "routing_logits must be float or bfloat16.");
     TORCH_CHECK(routing_logits.dim() == 2, "routing_logits must be 2D.");
     TORCH_CHECK(routing_logits.sizes()[1] == num_experts, "routing_logits has incorrect shape.");
-    TORCH_CHECK(routing_bias.scalar_type() == at::ScalarType::BFloat16, "routing_bias must be bfloat16.");
-    TORCH_CHECK(routing_bias.dim() == 1, "routing_bias must be 1D.");
-    TORCH_CHECK(routing_bias.sizes()[0] == num_experts, "routing_bias has incorrect shape.");
-
+    if (routing_bias.has_value())
+    {
+        TORCH_CHECK(routing_bias.value().scalar_type() == at::ScalarType::BFloat16, "routing_bias must be bfloat16.");
+        TORCH_CHECK(routing_bias.value().dim() == 1, "routing_bias must be 1D.");
+        TORCH_CHECK(routing_bias.value().sizes()[0] == num_experts, "routing_bias has incorrect shape.");
+    }
     TORCH_CHECK(top_k == 8, "Current routing kernel only supports top_k=8.");
-    TORCH_CHECK(topk_group == 4, "Current routing kernel only supports topk_group=4.");
+    if (topk_group.has_value())
+    {
+        TORCH_CHECK(topk_group.value() == 4, "Current routing kernel only supports topk_group=4.");
+    }
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
-    TORCH_CHECK(num_experts % n_group == 0, "num_experts must be divisible by n_group");
+    if (n_group.has_value())
+    {
+        TORCH_CHECK(num_experts % n_group.value() == 0, "num_experts must be divisible by n_group");
+    }
     TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
     // This check ensures we have enough experts in the selected groups to handle the top_k routing
-    TORCH_CHECK(top_k < (topk_group * num_experts / n_group),
-        "top_k must be less than total number of experts in selected groups");
+    if (topk_group.has_value() && n_group.has_value())
+    {
+        TORCH_CHECK(top_k < (topk_group.value() * num_experts / n_group.value()),
+            "top_k must be less than total number of experts in selected groups");
+    }
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoERunnerArgs args;
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
 
     // setup args
     args.mDtypeElt = tg::Dtype::E2m1;
-    args.routing_logits = routing_logits.data_ptr<float>();
-    args.routing_bias = routing_bias.data_ptr();
+    args.routing_logits = routing_logits.data_ptr();
+    args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
     args.hidden_states = hidden_states.data_ptr();
     args.hidden_states_scale = hidden_states_scale.data_ptr();
     args.gemm1_weights = gemm1_weights.data_ptr();
@@ -68,11 +85,11 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits, to
     // * 2 to compensate for the fact that sizeof(hidden_states.dtype) is 1 because we pack 2 e2m1 into 1 byte.
     args.hidden_size = hidden_states.sizes()[1] * 2;
     args.top_k = top_k;
-    args.n_group = n_group;
-    args.topk_group = topk_group;
+    args.n_group = n_group.value_or(1);
+    args.topk_group = topk_group.value_or(top_k);
     args.local_expert_offset = local_expert_offset;
     args.local_num_experts = local_num_experts;
-    args.routed_scaling_factor = routed_scaling_factor;
+    args.routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args.intermediate_size = intermediate_size;
 
     // allocate workspace for routing kernel
@@ -121,19 +138,25 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits, to
     at::Tensor hidden_states_scale_linear = at::detail::empty_cuda(
         hidden_states_scale_linear_size, at::ScalarType::Float8_e4m3fn, hidden_states.device(), std::nullopt);
 
+    //
+    // TopK routing
+    //
+
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner;
     auto const& stream = at::cuda::getCurrentCUDAStream(routing_logits.get_device());
-    routing_runner.run(routing_logits.data_ptr<float>(), routing_bias.data_ptr(), args.num_tokens, args.num_experts,
-        args.top_k, args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
-        args.routed_scaling_factor, expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(),
-        total_num_padded_tokens.data_ptr<int>(), expanded_idx_to_permuted_idx.data_ptr<int>(),
-        nullptr, /*permuted_idx_to_expanded_idx.data_ptr<int>(),*/
+    routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
+        args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts, args.routed_scaling_factor,
+        expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
+        expanded_idx_to_permuted_idx.data_ptr<int>(), nullptr, /*permuted_idx_to_expanded_idx.data_ptr<int>(),*/
         permuted_idx_to_token_idx.data_ptr<int>(), expert_weights.data_ptr(), num_tokens_per_expert.data_ptr<int>(),
         cta_idx_xy_to_batch_idx.data_ptr<int>(), cta_idx_xy_to_mn_limit.data_ptr<int>(),
         num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt, false /* use_routing_scales_on_input */,
-        false /* use_deep_seek_fp8 */, stream);
+        false /* use_deep_seek_fp8 */, static_cast<RoutingMethodType>(routing_method_type), stream);
 
-    // MoE kernel except routing
+    //
+    // FC13 (gemm1) + FC2 (gemm2)
+    //
+
     TORCH_CHECK(hidden_states.scalar_type() == FLOAT4_E2M1X2, "hidden_states must be byte.");
     TORCH_CHECK(hidden_states_scale.scalar_type() == at::ScalarType::Float8_e4m3fn, "hidden_states_scale must be fp8.");
 
@@ -234,6 +257,12 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits, to
     moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream);
     return output;
 }
+
+torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
+{
+    return torch::index_select(matrix, 0, permuteIndices);
+}
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -241,7 +270,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "fp4_block_scale_moe_runner("
         "Tensor routing_logits,"
-        "Tensor routing_bias,"
+        "Tensor? routing_bias,"
         "Tensor hidden_states,"
         "Tensor hidden_states_scale,"
         "Tensor gemm1_weights,"
@@ -253,15 +282,20 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor output2_scale_scalar,"
         "int num_experts,"
         "int top_k,"
-        "int n_group,"
-        "int topk_group,"
+        "int? n_group,"
+        "int? topk_group,"
         "int intermediate_size,"
         "int local_expert_offset,"
         "int local_num_experts,"
-        "float routed_scaling_factor) -> Tensor");
+        "float? routed_scaling_factor,"
+        "int routing_method_type) -> Tensor");
 }
 
+// Accepts CUDA tensor only
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fp4_block_scale_moe_runner", &torch_ext::fp4_block_scale_moe_runner);
 }
+
+// Accepts both CPU and CUDA tensors
+static auto shuffle_matrix = torch::RegisterOperators("trtllm::shuffle_matrix", &torch_ext::shuffleMatrix);

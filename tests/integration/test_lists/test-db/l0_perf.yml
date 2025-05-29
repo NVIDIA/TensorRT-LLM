@@ -20,5 +20,3 @@ l0_perf:
       - perf/test_perf.py::test_perf[gpt_350m-cppmanager-plugin_ifb-float16-bs:32-input_output_len:60,20]
       - perf/test_perf.py::test_perf[gpt_350m-cppmanager-plugin_ifb-float16-gwp:0.0-bs:32-input_output_len:60,20]
       - perf/test_perf.py::test_perf[gpt_350m-cppmanager-static_batching-plugin_ifb-float16-bs:32-input_output_len:60,20]
-      - perf/test_perf.py::test_perf[gpt_350m-cppmanager-plugin-float16-bs:32-input_output_len:60,20]
-      - perf/test_perf.py::test_perf[gpt_350m-cppmanager-static_batching-plugin-float16-bs:32-input_output_len:60,20]

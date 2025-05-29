@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -21,7 +21,7 @@ from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_clip import CLIPVisionModel
 from .modeling_multimodal_utils import fuse_input_embeds
-from .modeling_utils import ModelConfig, register_auto_model
+from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 
 class LlavaNextInputProcessor(InputProcessor):
@@ -223,15 +223,6 @@ class LlavaNextModel(PreTrainedModel):
         self.is_loaded = True
 
     def load_weights(self, weights):
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v.to(self.dtype)
-                    assert result[new_k] is not None
-            return result
 
         weights = filter_weights("language_model", weights)
         self.llm.load_weights(weights)

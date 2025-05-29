@@ -8,7 +8,6 @@ import yaml
 from torch.cuda import device_count
 
 from tensorrt_llm._torch.llm import LLM as PyTorchLLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (LLM, BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
                                  SchedulerConfig)
@@ -41,16 +40,13 @@ def get_llm_args(model: str,
         gpus_per_node = device_count()
         if gpus_per_node == 0:
             raise ValueError("No GPU devices found on the node")
-
     build_config = BuildConfig(max_batch_size=max_batch_size,
                                max_num_tokens=max_num_tokens,
                                max_beam_width=max_beam_width,
                                max_seq_len=max_seq_len)
-
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=free_gpu_memory_fraction)
 
-    pytorch_backend_config = PyTorchConfig() if backend == "pytorch" else None
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
         enable_max_num_tokens_tuning=False,
@@ -70,9 +66,12 @@ def get_llm_args(model: str,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
         "build_config": build_config,
+        "max_batch_size": max_batch_size,
+        "max_num_tokens": max_num_tokens,
+        "max_beam_width": max_beam_width,
+        "max_seq_len": max_seq_len,
         "kv_cache_config": kv_cache_config,
         "backend": backend if backend == "pytorch" else None,
-        "pytorch_backend_config": pytorch_backend_config,
         "_num_postprocess_workers": num_postprocess_workers,
         "_postprocess_tokenizer_dir": tokenizer or model,
         "_reasoning_parser": reasoning_parser,

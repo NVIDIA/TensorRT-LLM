@@ -1,9 +1,14 @@
+import pickle
+import sys
 from itertools import product
 from typing import Dict, List, Optional
 
+import cloudpickle
 import pytest
 import torch
 import torch.nn as nn
+from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 from utils.util import (skip_neither_ada_nor_hopper_unittest,
                         skip_pre_blackwell, skip_pre_hopper)
 
@@ -12,22 +17,36 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
                                                    DefaultMoeRoutingMethod,
                                                    FusedMoE,
-                                                   RenormalizeMoeRoutingMethod)
+                                                   RenormalizeMoeRoutingMethod,
+                                                   VanillaMoE)
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+cloudpickle.register_pickle_by_value(sys.modules[__name__])
+MPI.pickle.__init__(
+    cloudpickle.dumps,
+    cloudpickle.loads,
+    pickle.HIGHEST_PROTOCOL,
+)
 
 
 @pytest.mark.parametrize(
-    "dtype, experts, RoutingMethodCls",
-    product([torch.float16, torch.bfloat16], [3, 8, 512],
+    "moe_cls, dtype, experts, RoutingMethodCls",
+    product([FusedMoE, VanillaMoE], [torch.float16, torch.bfloat16],
+            [3, 8, 512],
             [DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod]))
-def test_fused_moe(dtype, experts, RoutingMethodCls):
+def test_fused_moe(moe_cls, dtype, experts, RoutingMethodCls, mapping=None):
     SEQ_LEN = 8
     HIDDEN_SIZE = 64
     INTERMEDIATE_SIZE = 32
     NUM_EXPERTS = experts
     TOP_K = 2
     routing_method = RoutingMethodCls(top_k=TOP_K)
+    mapping = mapping or Mapping()
+    mapping.rank = mpi_rank()
+    torch.cuda.set_device(mapping.rank)
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
@@ -44,13 +63,15 @@ def test_fused_moe(dtype, experts, RoutingMethodCls):
         weights[f"{expert_id}.w1.weight"] = w1_weight
         weights[f"{expert_id}.w2.weight"] = w2_weight
         weights[f"{expert_id}.w3.weight"] = w3_weight
-    fused_moe = FusedMoE(num_experts=NUM_EXPERTS,
-                         routing_method=routing_method,
-                         hidden_size=HIDDEN_SIZE,
-                         intermediate_size=INTERMEDIATE_SIZE,
-                         dtype=dtype,
-                         reduce_results=False,
-                         model_config=ModelConfig())
+    fused_moe = moe_cls(
+        num_experts=NUM_EXPERTS,
+        routing_method=routing_method,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        dtype=dtype,
+        reduce_results=True,
+        model_config=ModelConfig(mapping=mapping),
+    )
     fused_moe.load_weights([weights])
     fused_moe.cuda()
 
@@ -81,6 +102,26 @@ def test_fused_moe(dtype, experts, RoutingMethodCls):
         torch.cuda.synchronize()
         torch.testing.assert_close(output, ref_output, rtol=0.2, atol=0.2)
         m //= 2
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4,
+                    reason="needs 4 GPUs to run this test")
+@pytest.mark.parametrize("moe_cls", [FusedMoE, VanillaMoE])
+@pytest.mark.parametrize("ep_size", [1, 2, 4])
+def test_fused_moe_multi_gpu(moe_cls, ep_size):
+    world_size = 4
+    with MPIPoolExecutor(max_workers=world_size) as executor:
+        results = executor.map(
+            test_fused_moe,
+            *zip(*[(moe_cls, torch.bfloat16, 512, DefaultMoeRoutingMethod,
+                    Mapping(world_size=world_size,
+                            tp_size=world_size,
+                            moe_ep_size=ep_size,
+                            moe_tp_size=world_size // ep_size))] * world_size),
+        )
+        for r in results:
+            assert r is True
 
 
 @skip_pre_hopper

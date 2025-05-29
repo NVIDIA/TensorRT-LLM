@@ -18,8 +18,9 @@
 #pragma once
 
 #include "nixl.h"
-#include "tensorrt_llm/executor/cache_transmission/nixl_utils/interfaces.h"
 #include "tensorrt_llm/executor/transferAgent.h"
+#include <atomic>
+#include <thread>
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -50,15 +51,18 @@ private:
 class NixlTransferAgent final : public BaseTransferAgent
 {
 public:
-    NixlTransferAgent(BaseAgentConfig const& config, AgentRegistrar* registrar);
+    NixlTransferAgent(BaseAgentConfig const& config);
+    ~NixlTransferAgent();
 
     void registerMemory(RegisterDescs const& descs) override;
 
     void deregisterMemory(RegisterDescs const& descs) override;
 
-    void loadRemoteAgent(char const* name) override;
+    void loadRemoteAgent(std::string const& name, AgentDesc const& agentDesc) override;
 
-    void invalidateRemoteAgent(char const* name) override;
+    AgentDesc getLocalAgentDesc() override;
+
+    void invalidateRemoteAgent(std::string const& name) override;
 
     [[nodiscard]] std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) override;
 
@@ -72,12 +76,39 @@ public:
         return &mExtraParams;
     }
 
+    void notifySyncMessage(std::string const& name, SyncMessage const& syncMessage) override;
+
+    [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> getNotifiedSyncMessages() override;
+
+    ConnectionInfoType getConnectionInfo() override;
+
+    void connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) override;
+
+    bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) override;
+
 private:
     std::unique_ptr<nixlAgent> mRawAgent;
     nixlBackendH* mRawBackend{};
-    AgentRegistrar* mRegistrar{};
     nixl_opt_args_t mExtraParams;
     std::string mName;
+    std::string mAddress;
+
+    std::vector<char> mDRamSrcBuffer;
+    std::vector<char> mDRamDstBuffer;
 };
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
+#endif
+
+extern "C"
+{
+    [[nodiscard]] std::unique_ptr<BaseTransferAgent> createNixlTransferAgent(BaseAgentConfig const* config);
+}
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 } // namespace tensorrt_llm::executor::kv_cache

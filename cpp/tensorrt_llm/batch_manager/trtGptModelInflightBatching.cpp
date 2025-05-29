@@ -25,7 +25,6 @@
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
-#include "tensorrt_llm/batch_manager/generateRequestOptions.h"
 #include "tensorrt_llm/batch_manager/guidedDecoder.h"
 #include "tensorrt_llm/batch_manager/handleContextLogits.h"
 #include "tensorrt_llm/batch_manager/handleGenerationLogits.h"
@@ -138,7 +137,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     , mDecodingConfig{optionalParams.decodingConfig}
     , mExtendedRuntimePerfKnobConfig{optionalParams.extendedRuntimePerfKnobConfig}
     , mDebugConfig{optionalParams.debugConfig}
-    , mAdditionalModelOutputs{optionalParams.additionalModelOutputs}
+    , mAdditionalModelOutputs{worldConfig.isLastPipelineParallelRank() ? optionalParams.additionalModelOutputs
+                                                                       : std::nullopt}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
     , mRuntime{std::make_shared<TllmRuntime>(rawEngine, mLogger.get(), optionalParams.useGpuDirectStorage,
           optionalParams.gpuWeightsPercent, modelConfig.useShapeInference())}
@@ -441,7 +441,6 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     mPauseRequests = std::make_unique<PauseRequests>(getMaxInputLen());
     mAssignReqSeqSlots = std::make_unique<AssignReqSeqSlots>();
     mAllocateKvCache = std::make_unique<AllocateKvCache>();
-    mCreateNewDecoderRequests = std::make_unique<CreateNewDecoderRequests>();
 
     if (isCudaGraphMode())
     {
@@ -463,7 +462,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
     }
 
-    mGenerateRequestOptions = std::make_unique<GenerateRequestOptions>(
+    mCreateNewDecoderRequests = std::make_unique<CreateNewDecoderRequests>(
         mSpeculativeDecodingFastLogits, mIsLeaderInOrchMode, isNormalizeLogProbs());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -979,8 +978,6 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 }
             }
 
-            utils::sortByLoraId(currRequests);
-
             (*mAssignReqSeqSlots)(*mSeqSlotManager, currRequests.contextRequests, currRequests.generationRequests);
 
             if (mKvCacheManager)
@@ -1484,6 +1481,16 @@ void TrtGptModelInflightBatching::prepareDisaggGenInitRequests(
     // Initiate KV cache transfer
     auto timeStart = std::chrono::steady_clock::now();
 
+    if (tc::getEnvDisaggBenchmarkGenOnly())
+    {
+        TLLM_LOG_DEBUG("Disaggregated generation only benchmark mode is enabled");
+        for (auto& req : newGenReqs)
+        {
+            req->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
+        }
+        return;
+    }
+
     auto const genInitReqNum = std::count_if(activeRequests.begin(), activeRequests.end(),
         [](auto const& req) { return req->isDisaggGenerationInitState(); });
 
@@ -1766,17 +1773,13 @@ void TrtGptModelInflightBatching::setupDecoderStep(
     {
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
 
-        auto [batchSlots, decoderRequests, samplingConfigs] = (*mGenerateRequestOptions)(mModelConfig, mWorldConfig,
+        auto [batchSlots, decoderRequests, samplingConfigs] = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig,
             mDecodingConfig, contextRequests, mRuntime->getBufferManager(), logitsType, inputBuffers,
-            mDecoder->getDecoderState(), mOperatingBeamWidth, mRuntime->getStream(), buffers);
+            mDecoder->getDecoderState(), mRuntime->getStream(), *mDecoder->getDecoderStream(), getMaxSequenceLen(),
+            mOperatingBeamWidth, buffers.medusaBuffers);
 
         if (!decoderRequests.empty())
         {
-            NVTX3_SCOPED_RANGE(decoderNewRequests);
-
-            (*mCreateNewDecoderRequests)(batchSlots, decoderRequests, samplingConfigs, mModelConfig, *mDecoder,
-                mRuntime->getStream(), getMaxSequenceLen());
-
             // Setup underlying decoder.
             auto const localBatchSize = batchSlots->getSize();
             auto samplingConfig = SamplingConfig(samplingConfigs);
@@ -1903,13 +1906,12 @@ void TrtGptModelInflightBatching::getDecoderSlotHostOutputs(
         // Make sure that postprocessing is done before copying outputIds
         mCopyBufferManager.getStream().wait(event.get());
 
-        TensorPtr sequenceLengthView
-            = ITensor::slice(mDecoder->getDecoderState().getJointDecodingOutput().lengths, seqSlot, 1);
+        auto sequenceLengths = mDecoder->getDecoderState().getSequenceLengths(seqSlot);
         auto outputIds = mDecoder->getDecoderState().getGatheredIds(seqSlot);
         auto cumLogProbs = mDecoder->getDecoderState().getCumLogProbs(seqSlot);
         auto logProbs = mDecoder->getDecoderState().getLogProbs(seqSlot);
 
-        mCopyBufferManager.copy(*sequenceLengthView, *mSlotDecoderBuffers[seqSlot]->sequenceLengths);
+        mCopyBufferManager.copy(*sequenceLengths, *mSlotDecoderBuffers[seqSlot]->sequenceLengths);
         mCopyBufferManager.copy(*outputIds, *mSlotDecoderBuffers[seqSlot]->outputIds);
         if (returnLogProbs)
         {
@@ -1924,7 +1926,7 @@ void TrtGptModelInflightBatching::getDecoderSlotHostOutputs(
 
             auto const peerSend = 0;
             mDecSlotAsyncSndHdls.emplace_back(std::make_unique<DecoderSlotAsyncSend>(
-                outputIds, sequenceLengthView, cumLogProbs, logProbs, returnLogProbs, *mMpiCommPipelinePara, peerSend));
+                outputIds, sequenceLengths, cumLogProbs, logProbs, returnLogProbs, *mMpiCommPipelinePara, peerSend));
         }
     }
     else

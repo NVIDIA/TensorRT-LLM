@@ -11,14 +11,14 @@ from .trt_test_alternative import call, check_call
 @pytest.fixture(autouse=True)
 def stop_triton_server():
     # Make sure Triton server are killed before each test.
-    call(f"pkill -9 tritonserver", shell=True)
-    call(f"pkill -9 trtllmExecutorWorker", shell=True)
-    call(f"pkill -9 mpirun", shell=True)
+    call(f"pkill -9 -f tritonserver", shell=True)
+    call(f"pkill -9 -f trtllmExecutorWorker", shell=True)
+    call(f"pkill -9 -f mpirun", shell=True)
     time.sleep(2)
     yield
     # Gracefully terminate Triton Server after each test.
-    call(f"pkill tritonserver", shell=True)
-    call(f"pkill trtllmExecutorWorker", shell=True)
+    call(f"pkill -f tritonserver", shell=True)
+    call(f"pkill -f trtllmExecutorWorker", shell=True)
     time.sleep(8)
 
 
@@ -86,7 +86,8 @@ def test_valgrind_llama_v2_13b(
 
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build engine
-    ENGINE_PATH = prepare_llama_v2_13b_engine(tensorrt_llm_llama_example_root,
+    ENGINE_PATH = prepare_llama_v2_13b_engine(tensorrt_llm_example_root,
+                                              tensorrt_llm_llama_example_root,
                                               llama_v2_tokenizer_model_root)
 
     # Prepare model repo

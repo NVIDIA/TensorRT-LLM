@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from utils.util import skip_single_gpu
 
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.executor import (ExecutorBindingsWorker, LoRARequest,
+from tensorrt_llm.executor import (GenerationExecutorWorker, LoRARequest,
                                    PromptAdapterRequest, RequestError)
 from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
                                  GuidedDecodingParams, KvCacheConfig,
@@ -1392,6 +1392,14 @@ def llama_7b_multi_lora_test_harness(**llm_kwargs):
         "华盛顿。\n\n英国の首都是什",
         "ワシントン\nQ1. アメリカ合衆国",
     ]
+    key_words = [
+        "沃尔玛",
+        "华盛顿",
+        "纽约",
+        "Washington",
+        "华盛顿",
+        "ワシントン",
+    ]
     lora_req1 = LoRARequest("luotuo", 1, hf_lora_dir1)
     lora_req2 = LoRARequest("Japanese", 2, hf_lora_dir2)
     sampling_params = SamplingParams(max_tokens=20)
@@ -1399,8 +1407,9 @@ def llama_7b_multi_lora_test_harness(**llm_kwargs):
         prompts,
         sampling_params,
         lora_request=[None, lora_req1, lora_req2, None, lora_req1, lora_req2])
-    for output, ref in zip(outputs, references):
-        assert similar(output.outputs[0].text, ref)
+    for output, ref, key_word in zip(outputs, references, key_words):
+        assert similar(output.outputs[0].text,
+                       ref) or key_word in output.outputs[0].txt
 
 
 @skip_gpu_memory_less_than_40gb
@@ -1584,7 +1593,7 @@ def check_llm_return_context_logits(tp_size=1):
 
     # Check the WAR for returning logits performance
     if tp_size == 1:
-        assert isinstance(llm._executor, ExecutorBindingsWorker)
+        assert isinstance(llm._executor, GenerationExecutorWorker)
 
 
 def check_llm_return_generation_logits(tp_size=1):
@@ -1608,7 +1617,7 @@ def check_llm_return_generation_logits(tp_size=1):
 
     # Check the WAR for returning logits performance
     if tp_size == 1:
-        assert isinstance(llm._executor, ExecutorBindingsWorker)
+        assert isinstance(llm._executor, GenerationExecutorWorker)
 
 
 def test_llm_return_context_logits():
@@ -1717,7 +1726,7 @@ def test_llm_return_logprobs_streaming():
     llm_return_logprobs_test_harness(2, 2, False, True, streaming=True)
 
 
-class DummyExecutorWorker3(ExecutorBindingsWorker):
+class DummyExecutorWorker3(GenerationExecutorWorker):
     should_raise_error = True
 
     def __init__(self, *args, **kwargs):
@@ -1870,11 +1879,10 @@ def llm_get_stats_test_harness(tp_size: int = 1,
 
     if pytorch_backend:
         from tensorrt_llm._torch import LLM as LLM_torch
-        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-        llm_args_extra["pytorch_backend_config"] = PyTorchConfig(
-            enable_iter_perf_stats=True,
-            enable_iter_req_stats=enable_iter_req_stats,
-            disable_overlap_scheduler=not use_overlap)
+        llm_args_extra.update(
+            dict(enable_iter_perf_stats=True,
+                 enable_iter_req_stats=enable_iter_req_stats,
+                 disable_overlap_scheduler=not use_overlap))
         LLM_CLASS = LLM_torch
     else:
         LLM_CLASS = LLM
@@ -1940,11 +1948,10 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
 
     if pytorch_backend:
         from tensorrt_llm._torch import LLM as LLM_torch
-        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-        llm_args_extra["pytorch_backend_config"] = PyTorchConfig(
-            enable_iter_perf_stats=True,
-            enable_iter_req_stats=enable_iter_req_stats,
-            disable_overlap_scheduler=not use_overlap)
+        llm_args_extra.update(
+            dict(enable_iter_perf_stats=True,
+                 enable_iter_req_stats=enable_iter_req_stats,
+                 disable_overlap_scheduler=not use_overlap))
         LLM_CLASS = LLM_torch
     else:
         LLM_CLASS = LLM

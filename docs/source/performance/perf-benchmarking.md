@@ -628,8 +628,7 @@ If you would like to force the KV cache quantizaton, you can specify the followi
 when the checkpoint precision is `null`:
 
 ```yaml
-pytorch_backend_config:
-  kv_cache_dtype: "fp8"
+kv_cache_dtype: "fp8"
 ```
 
 ```{tip}

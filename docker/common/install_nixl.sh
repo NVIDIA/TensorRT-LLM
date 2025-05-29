@@ -12,13 +12,6 @@ NIXL_VERSION="0.2.0"
 UCX_REPO="https://github.com/openucx/ucx.git"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
 
-UCX_MIRROR="https://gitlab-master.nvidia.com/ftp/GitHubSync/ucx.git"
-NIXL_MIRROR="https://gitlab-master.nvidia.com/ftp/GitHubSync/nixl.git"
-
-if [ -n "${GITHUB_MIRROR}" ]; then
-  UCX_REPO=${UCX_MIRROR}
-  NIXL_REPO=${NIXL_MIRROR}
-fi
 
 if [ ! -d ${UCX_INSTALL_PATH} ]; then
   git clone --depth 1 -b ${UCX_VERSION} ${UCX_REPO}

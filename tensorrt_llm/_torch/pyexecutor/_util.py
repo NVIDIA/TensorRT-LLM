@@ -139,13 +139,17 @@ def get_token_num_for_estimation(executor_config, model_config):
         return None
 
 
-def estimate_max_kv_cache_tokens(
-        py_executor: PyExecutor, model_engine: PyTorchModelEngine,
-        executor_config: ExecutorConfig, mapping: Mapping, origin_seq_len: int,
-        ctx_chunk_config,
-        draft_model_engine: PyTorchModelEngine) -> Optional[int]:
+def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
+                                 model_engine: PyTorchModelEngine,
+                                 executor_config: ExecutorConfig,
+                                 mapping: Mapping, origin_seq_len: int,
+                                 ctx_chunk_config,
+                                 draft_model_engine: PyTorchModelEngine) -> int:
     # TODO: support CP by generating dummy requests for it.
     if 'cp_type' in mapping.cp_config:
+        # This is called from create_py_executor, which ensures that
+        # executor_config.max_num_tokens is set.
+        assert executor_config.max_num_tokens is not None
         return executor_config.max_num_tokens
 
     vocab_size = model_engine.model.model_config.pretrained_config.vocab_size

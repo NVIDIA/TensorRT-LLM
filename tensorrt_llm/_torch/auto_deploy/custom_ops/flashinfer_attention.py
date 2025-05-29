@@ -9,6 +9,7 @@ from torch.fx import Node
 
 from ..utils.cuda_graph import cuda_graph_state
 from ..utils.logger import ad_logger
+from ..utils.node_utils import extract_op_args
 from .attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -71,8 +72,7 @@ class _FlashInferPlanner:
 
         self.workspace_buffer = workspace_buffer
         # NOTE (lucaslie): flashinfer fa3 backend has accuracy issue + illegal memory access issues
-        # on H100 PCIe, see https://github.com/NVIDIA/TensorRT-LLM/pull/3686 and
-        # https://github.com/flashinfer-ai/flashinfer/issues/924
+        # on H100 PCIe, see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer,
             "NHD",
@@ -400,7 +400,9 @@ class FlashInferAttention(AttentionDescriptor):
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         # Double check other arguments
-        attn_mask, dropout_p, is_causal = source_attn_node.args[3:6]
+        attn_mask, dropout_p, is_causal = extract_op_args(
+            source_attn_node, "attn_mask", "dropout_p", "is_causal"
+        )
         if attn_mask is not None or dropout_p != 0.0 or not is_causal:
             ad_logger.warning(
                 "Unsupported attention arguments for "

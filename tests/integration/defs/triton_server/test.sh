@@ -15,7 +15,6 @@ nvidia-smi
 pushd $LLM_BACKEND_ROOT
 source tools/utils.sh
 TRITON_REPO="triton_repo"
-export PYTHONPATH=$(pwd):$PYTHONPATH
 
 kill_triton_server () {
     pkill -9 -f trtllmExecutorWorker || true

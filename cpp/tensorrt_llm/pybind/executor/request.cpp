@@ -60,6 +60,11 @@ void initRequestBindings(pybind11::module_& m)
         .value("TIMED_OUT", tle::FinishReason::kTIMED_OUT)
         .value("CANCELLED", tle::FinishReason::kCANCELLED);
 
+    py::enum_<tle::KvCacheTransferMode>(m, "KvCacheTransferMode")
+        .value("DRAM", tle::KvCacheTransferMode::DRAM)
+        .value("GDS", tle::KvCacheTransferMode::GDS)
+        .value("POSIX_DEBUG_FALLBACK", tle::KvCacheTransferMode::POSIX_DEBUG_FALLBACK);
+
     auto samplingConfigGetstate = [](tle::SamplingConfig const& self)
     {
         return py::make_tuple(self.getBeamWidth(), self.getTopK(), self.getTopP(), self.getTopPMin(),
@@ -326,18 +331,19 @@ void initRequestBindings(pybind11::module_& m)
     };
     auto kvCacheRetentionConfigGetstate = [](tle::KvCacheRetentionConfig const& self)
     {
-        return py::make_tuple(
-            self.getTokenRangeRetentionConfigs(), self.getDecodeRetentionPriority(), self.getDecodeDurationMs());
+        return py::make_tuple(self.getTokenRangeRetentionConfigs(), self.getDecodeRetentionPriority(),
+            self.getDecodeDurationMs(), self.getTransferMode(), self.getDirectory());
     };
     auto kvCacheRetentionConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 5)
         {
             throw std::runtime_error("Invalid state!");
         }
         return tle::KvCacheRetentionConfig(
             state[0].cast<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>>(),
-            state[1].cast<tle::RetentionPriority>(), state[2].cast<std::optional<std::chrono::milliseconds>>());
+            state[1].cast<tle::RetentionPriority>(), state[2].cast<std::optional<std::chrono::milliseconds>>(),
+            state[3].cast<tle::KvCacheTransferMode>(), state[4].cast<std::optional<std::string>>());
     };
 
     auto kvCacheRetentionConfig = py::class_<tle::KvCacheRetentionConfig>(m, "KvCacheRetentionConfig");
@@ -359,14 +365,17 @@ void initRequestBindings(pybind11::module_& m)
     // TokenRangeRetentionPriority bindings have been defined.
     kvCacheRetentionConfig
         .def(py::init<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>, tle::RetentionPriority,
-                 std::optional<std::chrono::milliseconds>>(),
+                 std::optional<std::chrono::milliseconds>, tle::KvCacheTransferMode, std::optional<std::string>>(),
             py::arg("token_range_retention_configs"),
             py::arg("decode_retention_priority") = tle::KvCacheRetentionConfig::kDefaultRetentionPriority,
-            py::arg("decode_duration_ms") = py::none())
+            py::arg("decode_duration_ms") = py::none(),
+            py::arg_v("transfer_mode", tle::KvCacheTransferMode::DRAM, "DRAM"), py::arg("directory") = py::none())
         .def_property_readonly(
             "token_range_retention_configs", &tle::KvCacheRetentionConfig::getTokenRangeRetentionConfigs)
         .def_property_readonly("decode_retention_priority", &tle::KvCacheRetentionConfig::getDecodeRetentionPriority)
         .def_property_readonly("decode_duration_ms", &tle::KvCacheRetentionConfig::getDecodeDurationMs)
+        .def_property_readonly("transfer_mode", &tle::KvCacheRetentionConfig::getTransferMode)
+        .def_property_readonly("directory", &tle::KvCacheRetentionConfig::getDirectory)
         .def(py::pickle(kvCacheRetentionConfigGetstate, kvCacheRetentionConfigSetstate))
         .def("__eq__", &tle::KvCacheRetentionConfig::operator==);
 

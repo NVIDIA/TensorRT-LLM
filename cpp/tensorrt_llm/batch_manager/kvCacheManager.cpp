@@ -2174,7 +2174,7 @@ std::vector<std::vector<std::vector<SizeType32>>> KVCacheManager::getBatchCacheB
 std::vector<SizeType32> KVCacheManager::getNewlyAllocatedBlockIds(
     LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
 {
-    return mBlockManager.getNewlyAllocatedBlockIds(mSequences.at(requestId), windowSize);
+    return mBlockManager.getNewlyAllocatedBlockIds(getSequence(requestId), windowSize);
 }
 
 runtime::ITensor::SharedPtr KVCacheManager::getPrimaryPool(SizeType32 layer_idx) const

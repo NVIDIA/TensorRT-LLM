@@ -352,7 +352,7 @@ class DemoLLM(LLM):
         **kwargs: Any,
     ):
         try:
-            self.pytorch_backend_config = kwargs.pop("pytorch_backend_config", None)
+            self.pytorch_backend_config = kwargs.pop("auto_deploy_config", None)
             self.args = LlmArgs.from_kwargs(
                 model=model,
                 tokenizer=tokenizer,

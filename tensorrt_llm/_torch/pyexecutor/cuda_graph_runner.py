@@ -52,10 +52,10 @@ class DecodingCUDAGraphRunner:
         # Using ones instead of zeros prevents NaNs in e.g. Deepseek
         self.input_ids = torch.ones((batch_size * token_per_request, ),
                                     device=device,
-                                    dtype=torch.int64)
+                                    dtype=torch.int32)
         self.position_ids = torch.zeros((1, batch_size * token_per_request),
                                         device=device,
-                                        dtype=torch.int64)
+                                        dtype=torch.int32)
 
         self.extra_model_inputs = {}
         self.attn_metadata = attn_metadata

@@ -21,7 +21,8 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             duplicate_kv_weight, register_auto_model)
+                             duplicate_kv_weight, filter_weights,
+                             register_auto_model)
 
 
 class Gemma3Attention(Attention):
@@ -52,11 +53,11 @@ class Gemma3Attention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
             pos_embd_params=pos_embd_params,
+            qk_norm_type=QkNormType.pre_rope,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=False,
             config=model_config,
-            qk_norm_type=QkNormType.pre_rope,
             q_scaling=q_scaling,
         )
         self.q_norm = RMSNorm(hidden_size=config.head_dim,
@@ -300,14 +301,6 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
         head_dim = getattr(
             self.config, "head_dim",
             self.config.hidden_size // self.config.num_attention_heads)
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
 
         params_map = {
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],

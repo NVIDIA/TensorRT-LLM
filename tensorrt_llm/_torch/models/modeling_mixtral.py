@@ -16,7 +16,7 @@ from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             register_auto_model)
+                             filter_weights, register_auto_model)
 
 
 class MixtralMoE(nn.Module):
@@ -213,14 +213,6 @@ class MixtralForCausalLM(DecoderModelForCausalLM[MixtralModel,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
     def load_weights(self, weights: Dict):
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
 
         params_map = {
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],

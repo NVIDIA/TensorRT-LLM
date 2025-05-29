@@ -22,7 +22,7 @@ from ..distributed.communicator import pp_recv, pp_send
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import FusedMoE
+from ..modules.fused_moe import FusedMoE, VanillaMoE
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
@@ -428,7 +428,7 @@ class DecoderModelForCausalLM(nn.Module,
         quant_config_dict = self.model_config.quant_config_dict
         if quant_config_dict is not None:
             for name, module in self.named_modules():
-                if isinstance(module, FusedMoE):
+                if isinstance(module, (FusedMoE, VanillaMoE)):
                     for n, q in quant_config_dict.items():
                         # all linear layers inside FusedMoE share the same quant config
                         if name in n:
@@ -631,6 +631,15 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
     return renamed_weights
 
 
+def filter_weights(prefix, weights: Dict):
+    result = {}
+    for k, v in weights.items():
+        if k.startswith(prefix):
+            new_k = k[len(prefix) + 1:]
+            result[new_k] = v
+    return result
+
+
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
                        params_map: Optional[Dict[str, str]] = None):
@@ -648,14 +657,6 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     head_dim = getattr(
         model.config, "head_dim",
         model.config.hidden_size // model.config.num_attention_heads)
-
-    def filter_weights(prefix, weights: Dict):
-        result = {}
-        for k, v in weights.items():
-            if k.startswith(prefix):
-                new_k = k[len(prefix) + 1:]
-                result[new_k] = v
-        return result
 
     params_map = {
         'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
