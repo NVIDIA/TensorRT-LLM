@@ -80,7 +80,7 @@ BASE_ZMQ_CLASSES = {
         "Logprob", "LogProbsResult", "ResponseWrapper"
     ],
     "tensorrt_llm.executor.utils": ["ErrorResponse", "WorkerCommIpcAddrs"],
-    "tensorrt_llm.executor.worker": ["ExecutorBindingsWorker", "worker_main"],
+    "tensorrt_llm.executor.worker": ["GenerationExecutorWorker", "worker_main"],
     "tensorrt_llm.llmapi.llm_args": [
         "_ModelFormatKind", "_ParallelConfig", "CalibConfig",
         "CapacitySchedulerPolicy", "KvCacheConfig", "LookaheadDecodingConfig",
@@ -89,7 +89,7 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.llm_utils":
     ["CachedModelLoader._node_build_task", "LlmBuildStats"],
-    "tensorrt_llm.llmapi.tokenizer": ["TransformersTokenizer "],
+    "tensorrt_llm.llmapi.tokenizer": ["TransformersTokenizer"],
     "tensorrt_llm.lora_manager": ["LoraConfig"],
     "tensorrt_llm.mapping": ["Mapping"],
     "tensorrt_llm.models.modeling_utils":
