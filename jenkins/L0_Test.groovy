@@ -2040,11 +2040,13 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                 imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
                 trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
                     sh "env | sort"
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
                     runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", config, false, "values.name" , 1, 1, true, null)
                 })
             }
         } else {
             stage(values.name) {
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
                 runLLMBuildFromPackage(pipeline, values.k8sArch, false, "imageTest/")
             }
         }
