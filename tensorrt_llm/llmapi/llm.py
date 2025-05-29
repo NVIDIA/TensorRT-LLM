@@ -93,12 +93,7 @@ LLM_DOCSTRING = LLMARGS_EXPLICIT_DOCSTRING + """
 """
 
 
-@append_docstring(LLM_DOCSTRING)
-class LLM:
-    """LLM class is the main class for running a LLM model.
-
-    Parameters:
-"""
+class BaseLLM:
 
     def __init__(self,
                  model: Union[str, Path],
@@ -186,6 +181,8 @@ class LLM:
             if self._on_trt_backend:
                 self._workspace = tempfile.TemporaryDirectory(
                     suffix="-llm-workspace", dir=self.args.workspace)
+            else:
+                self._workspace = None
 
             self._hf_model_dir: Optional[Path] = None
 
@@ -201,10 +198,6 @@ class LLM:
 
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
-
-    @property
-    def workspace(self) -> Path:
-        return Path(self._workspace.name) if self._on_trt_backend else None
 
     @property
     def llm_id(self) -> str:
@@ -584,7 +577,7 @@ class LLM:
     def _build_model(self):
         model_loader = CachedModelLoader(self.args,
                                          mpi_session=self.mpi_session,
-                                         workspace=self.workspace,
+                                         workspace=self._workspace,
                                          llm_build_stats=weakref.proxy(
                                              self.llm_build_stats))
         self._engine_dir, self._hf_model_dir = model_loader()
@@ -766,31 +759,6 @@ class LLM:
     def tokenizer(self, tokenizer: TokenizerBase):
         self._tokenizer = tokenizer
 
-    def save(self, engine_dir: str) -> None:
-        """Save the built engine to the given path.
-
-        Args:
-            engine_dir (str): The path to save the engine.
-        """
-        logger.info(f"Save model to {engine_dir}")
-        if self._engine_dir is None:
-            raise RuntimeError("The engine is not built yet.")
-
-        if self._engine_dir.absolute() == os.path.abspath(engine_dir):
-            return
-
-        if not self.mpi_session or not self.mpi_session.is_comm_session():
-            shutil.copytree(self._engine_dir, engine_dir, dirs_exist_ok=True)
-        else:
-            # NFS is fragile, so we copy files one by one
-            target_engine_dir = Path(engine_dir)
-            target_engine_dir.mkdir(parents=True, exist_ok=True)
-            # copy files one by one
-            for file in self._engine_dir.iterdir():
-                print_colored_debug(
-                    f"Copying {file} to {target_engine_dir / file.name}\n")
-                shutil.copy(file, target_engine_dir / file.name)
-
     def shutdown(self) -> None:
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
@@ -820,3 +788,78 @@ class LLM:
 
     def __del__(self):
         self.shutdown()
+
+
+@append_docstring(LLM_DOCSTRING)
+class LLM(BaseLLM):
+    """LLM class is the main class for running a LLM model.
+
+    Parameters:
+"""
+
+    def __init__(self,
+                 model: Union[str, Path],
+                 tokenizer: Optional[Union[str, Path, TokenizerBase,
+                                           PreTrainedTokenizerBase]] = None,
+                 tokenizer_mode: Literal['auto', 'slow'] = 'auto',
+                 skip_tokenizer_init: bool = False,
+                 trust_remote_code: bool = False,
+                 tensor_parallel_size: int = 1,
+                 dtype: str = "auto",
+                 revision: Optional[str] = None,
+                 tokenizer_revision: Optional[str] = None,
+                 **kwargs: Any) -> None:
+        super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
+                         trust_remote_code, tensor_parallel_size, dtype,
+                         revision, tokenizer_revision, **kwargs)
+
+    @property
+    def workspace(self) -> Path:
+        return Path(self._workspace.name) if self._on_trt_backend else None
+
+    def save(self, engine_dir: str) -> None:
+        """Save the built engine to the given path.
+
+        Args:
+            engine_dir (str): The path to save the engine.
+        """
+        logger.info(f"Save model to {engine_dir}")
+        if self._engine_dir is None:
+            raise RuntimeError("The engine is not built yet.")
+
+        if self._engine_dir.absolute() == os.path.abspath(engine_dir):
+            return
+
+        if not self.mpi_session or not self.mpi_session.is_comm_session():
+            shutil.copytree(self._engine_dir, engine_dir, dirs_exist_ok=True)
+        else:
+            # NFS is fragile, so we copy files one by one
+            target_engine_dir = Path(engine_dir)
+            target_engine_dir.mkdir(parents=True, exist_ok=True)
+            # copy files one by one
+            for file in self._engine_dir.iterdir():
+                print_colored_debug(
+                    f"Copying {file} to {target_engine_dir / file.name}\n")
+                shutil.copy(file, target_engine_dir / file.name)
+
+
+class TorchLLM(BaseLLM):
+
+    def __init__(self,
+                 model: Union[str, Path],
+                 tokenizer: Optional[Union[str, Path, TokenizerBase,
+                                           PreTrainedTokenizerBase]] = None,
+                 tokenizer_mode: Literal['auto', 'slow'] = 'auto',
+                 skip_tokenizer_init: bool = False,
+                 trust_remote_code: bool = False,
+                 tensor_parallel_size: int = 1,
+                 dtype: str = "auto",
+                 revision: Optional[str] = None,
+                 tokenizer_revision: Optional[str] = None,
+                 **kwargs: Any) -> None:
+
+        kwargs_dict = dict(kwargs)
+        kwargs_dict['backend'] = 'pytorch'
+        super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
+                         trust_remote_code, tensor_parallel_size, dtype,
+                         revision, tokenizer_revision, **kwargs_dict)
