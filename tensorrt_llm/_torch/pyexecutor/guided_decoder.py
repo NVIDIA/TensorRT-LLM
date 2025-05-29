@@ -129,8 +129,7 @@ class GuidedDecoder:
                                     scheduled_requests.generation_requests)):
                 if llm_req.guided_decoding_params is None:
                     continue
-                if llm_req.is_context_init_state and not llm_req.is_last_context_chunk(
-                ):
+                if llm_req.is_context_init_state and not llm_req.is_last_context_chunk:
                     continue
                 batched_logits.append(logits[i])
                 slot = resource_manager.slot_manager.get_slot(
