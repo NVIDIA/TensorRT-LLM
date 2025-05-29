@@ -509,7 +509,7 @@ class MoEAllReduce(nn.Module):
             mapping (Mapping):  The parallel mapping config.
 
         Notes:
-            min latency mode:
+            * min latency mode:
 
             Support pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
             expert_reduction = torch.sum(active_experts_token_input *
@@ -519,7 +519,7 @@ class MoEAllReduce(nn.Module):
             output_residual = output_add + residual
             output_hidden_states = rms_norm(output_residual, norm_weight, eps)
 
-            regular mode:
+            * regular mode:
 
             Support pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
             expert_reduction = local_reduction(input, expanded_idx_to_permuted_idx, expert_scale_factor)
