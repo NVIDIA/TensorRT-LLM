@@ -1,6 +1,6 @@
 # How to launch Llama4 Maverick + Eagle3 TRTLLM server with feat/llama4
 
-Artificial Analysis has benchmarked the Llama4 Maverick + Eagle3 TRTLLM server with feat/llama4 branch running at over 1000 tokens per second per user on 8xB200 GPUs. This implementation leverages NVIDIA's TensorRT-LLM, an optimization framework that accelerates LLM inference on NVIDIA GPUs, combined with speculative decoding using the Eagle3 model to further boost performance.
+Artificial Analysis has benchmarked the Llama4 Maverick + Eagle3 TRTLLM server with feat/llama4 branch running at over [1000 tokens per second per user on 8xB200 GPUs](https://developer.nvidia.com/blog/blackwell-breaks-the-1000-tps-user-barrier-with-metas-llama-4-maverick/). This implementation leverages NVIDIA's TensorRT-LLM combined with speculative decoding using the Eagle3 model to further boost performance.
 
 In the guide below, we will walk you through how to launch your own high-performance Llama4 Maverick + Eagle3 TRTLLM server, from build to deployment.  (Note that your specific performance numbers may vary—speculative decoding speedups depend upon the dataset!)
 
@@ -22,9 +22,9 @@ In [Step 4: Start the TensorRT-LLM server](#step-4-start-the-tensorrt-llm-server
 
 ## Launching the server
 
-### Step 1: Clone the repository and checkout the special feat/llama4 branch
+### Step 1: Clone the repository and checkout the `feat/llama4` feature branch
 
-This branch contains optimizations specifically for Llama4 models that aren't in the main branch yet.
+This branch contains optimizations specifically for Llama4 models that aren't in the main branch as of May 29, 2025.
 
 ```
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
@@ -98,7 +98,7 @@ curl localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '
 
 The server exposes a standard OpenAI-compatible API endpoint that accepts JSON requests. You can adjust parameters like `max_tokens`, `temperature`, and others according to your needs.
 
-Note that for the moment, the context for this endpoint is limited to 8K tokens. We will be raising this to 128K in the coming week.
+Note that for the moment, the context for this endpoint is limited to 8K tokens. We expect to lift that limitation by early June.
 
 ### Step 6: (Optional) Monitor server logs
 
