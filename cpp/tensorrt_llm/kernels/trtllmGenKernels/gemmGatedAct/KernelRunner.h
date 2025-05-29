@@ -19,7 +19,7 @@
 #include <cuda.h>
 #include <optional>
 
-#include "tensorrt_llm/kernels/trtllmGenKernels/common/Dtype.h"
+#include "trtllmGen_gatedAct_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm
 {
@@ -28,8 +28,8 @@ namespace kernels
 
 struct TrtllmGenGemmGatedActRunnerOptions
 {
-    Dtype eltType;
-    Dtype outputType;
+    trtllm::gen::Dtype eltType;
+    trtllm::gen::Dtype outputType;
     bool deepSeekFp8{false};
     bool transposeMmaOutput{false};
 };

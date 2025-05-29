@@ -45,6 +45,9 @@
 
 #endif
 
+namespace batchedGemm
+{
+
 namespace gemmGatedAct
 {
 
@@ -108,7 +111,7 @@ inline bool checkAndUpdateGemmGatedActOptions(
 
     if (options.mUseTmaStore)
     {
-        TLLM_CHECK_ERROR(hiddenEpilogueTileSize * tg::dtypeGetNumBits(options.mDtypeElt) / /* bits */ 8 % 32 == 0,
+        TLLM_CHECK_ERROR(hiddenEpilogueTileSize * tg::dtypeGetNumBits(options.mDtypeC) / /* bits */ 8 % 32 == 0,
             "Unsupported output hidden tile size");
     }
 
@@ -190,3 +193,5 @@ struct GemmGatedActConfig
 #undef TLLM_LOG_INFO
 #undef TLLM_LOG_ERROR
 #endif // TLLM_GEN_EXPORT_INTERFACE
+
+} // namespace batchedGemm
