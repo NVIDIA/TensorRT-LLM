@@ -2036,8 +2036,10 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
             }
         } else {
             stage(values.name) {
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                runLLMBuildFromPackage(pipeline, values.k8sArch, false, "imageTest/")
+                imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
+                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                    runLLMBuildFromPackage(pipeline, values.k8sArch, false, "imageTest/")
+                })
             }
         }
     }]}
