@@ -612,7 +612,8 @@ def main(args: argparse.Namespace):
         # For datasets that follow a similar structure, use a mapping.
         dataset_mapping = {
             "sharegpt":
-            lambda: ShareGPTDataset(random_seed=args.seed,
+            lambda: ShareGPTDataset(download_path=args.download_path,
+                                    random_seed=args.seed,
                                     dataset_path=args.dataset_path).sample(
                                         tokenizer=tokenizer,
                                         num_requests=args.num_prompts,
@@ -778,6 +779,12 @@ if __name__ == "__main__":
                         default=None,
                         help="Path to the sharegpt/sonnet dataset. "
                         "Or the huggingface dataset ID if using HF dataset.")
+    parser.add_argument(
+        "--download-path",
+        type=str,
+        default=None,
+        help="Path to download dataset if dataset-path is None, "
+        "only sharegpt is supported for now")
     parser.add_argument(
         "--max-concurrency",
         type=int,
