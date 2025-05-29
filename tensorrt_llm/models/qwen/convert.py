@@ -27,8 +27,6 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
-from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
-from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLDecoderLayer
 from transformers.pytorch_utils import Conv1D
 
 from ..._utils import pad_vocab_size, str_dtype_to_torch
@@ -104,6 +102,9 @@ def smooth_qwen_model(model, scales, alpha, qwen_qkv_para, qwen_smoother):
 def smooth_qwen2_model(model, scales, alpha, qwen_qkv_para, qwen_smoother):
     # Smooth the activation and weights with smoother = $\diag{s}$
     for name, module in model.named_modules():
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import \
+            Qwen2VLDecoderLayer
         if not isinstance(module, Qwen2DecoderLayer) and not isinstance(
                 module, Qwen2VLDecoderLayer):
             continue
