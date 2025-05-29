@@ -1593,6 +1593,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     slurmX86Configs = [
         "RTXPro6000-PyTorch-[Post-Merge]-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
+        "DGX_B200-4_GPUs-PyTorch-[Post-Merge]-1": ["b200-4-gpus", "l0_dgx_b200", 1, 1, 4],
     ]
     fullSet += slurmX86Configs.keySet()
 
@@ -2037,7 +2038,7 @@ pipeline {
 
                     def testPhase2StageName = env.testPhase2StageName
                     if (testPhase2StageName) {
-                        def dgxSigns = ["DGX_H100", "DGX_H200", "GB200"]
+                        def dgxSigns = ["DGX_H100", "DGX_H200", "GB200", "DGX_B200"]
                         singleGpuJobs = parallelJobs.findAll{!dgxSigns.any{sign -> it.key.contains(sign)}}
                         dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
                     }
