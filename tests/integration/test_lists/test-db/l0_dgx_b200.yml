@@ -1,5 +1,5 @@
 version: 0.0.1
-l0_gb200:
+l0_dgx_b200:
 - condition:
     ranges:
       system_gpu_count:
@@ -7,9 +7,9 @@ l0_gb200:
         lte: 4
     wildcards:
       gpu:
-      - '*gb200*'
+      - '*b200*'
       linux_distribution_name: ubuntu*
-      cpu: aarch64
+      cpu: x86_64
     terms:
       stage: post_merge
       backend: pytorch

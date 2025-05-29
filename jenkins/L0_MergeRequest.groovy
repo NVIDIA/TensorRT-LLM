@@ -1035,6 +1035,43 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             }
         },
     ]
+    def dockerBuildJob = [
+        "Build-Docker-Images": {
+            script {
+                stage("[Build-Docker-Images] Remote Run") {
+                    def parameters = getCommonParameters()
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
+                    def branch = env.gitlabBranch ? env.gitlabBranch : "main"
+                    if (globalVars[GITHUB_PR_API_URL]) {
+                        branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                    }
+
+                    parameters += [
+                        'enableFailFast': enableFailFast,
+                        'branch': branch,
+                        'action': "push",
+                        'globalVars': globalVarsJson,
+                    ]
+
+                    echo "trigger BuildDockerImages job, params: ${parameters}"
+
+                    def status = triggerJob("/LLM/helpers/BuildDockerImages", parameters)
+                    if (status != "SUCCESS") {
+                        error "Downstream job did not succeed"
+                    }
+                }
+            }
+        }
+    ]
+    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+        stages += dockerBuildJob
+    }
+    if (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") || testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images")) {
+        stages += dockerBuildJob
+        testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
+        testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
+        echo "Will run Build-Docker-Images job"
+    }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
