@@ -34,7 +34,11 @@ This patch will only update the metrics that had a difference which was over the
 
 ## Running locally
 Given a `target_perf_csv_path` you can compare it to another perf csv file.
-You can run it:
+First make sure you install the dependencies:
+```
+pip install -r tests/integration/defs/perf/requirements.txt
+```
+Then, you can run it with:
 ```
 sanity_perf_check.py <target_perf_csv_path> <base_perf_csv_path>
 ```
