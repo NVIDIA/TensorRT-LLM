@@ -45,22 +45,25 @@ namespace tensorrt_llm::batch_manager
  */
 enum class LlmRequestState : int32_t
 {
-    kUNKNOWN = 0,                              ///< Unknown state
-    kENCODER_INIT = 1,                         ///< Encoder phase starts (for encoder-decoder models)
+    kUNKNOWN = 0,                             ///< Unknown state
+    kENCODER_INIT = 1,                        ///< Encoder phase starts (for encoder-decoder models)
 
-    kCONTEXT_INIT = 10,                        ///< Context phase starts
-    kDISAGG_CONTEXT_INIT_AND_TRANS = 11,       ///< Context phase starts and cache transmission is in progress,
-                                               /// used in layer-wise transmission
-    kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 12,    ///< Waiting context-only request transmitting the kv cache,
-                                               /// after computation finished
-    kDISAGG_CONTEXT_COMPLETE = 13,             ///< Context-only request finished kv cache transmission.
+    kDISAGG_GENERATION_INIT = 8,              ///< New Generation request arrived at generation model
+    kDISAGG_GENERATION_TRANS_IN_PROGRESS = 9, ///< Transmitting the kv cache
 
-    kDISAGG_GENERATION_INIT = 20,              ///< New Generation request arrived at generation model
-    kDISAGG_GENERATION_TRANS_IN_PROGRESS = 21, ///< Transmitting the kv cache
-    kDISAGG_GENERATION_TRANS_COMPLETE = 22,    ///< Kv cache transmission are finished
-    kGENERATION_IN_PROGRESS = 23,              ///< Generation phase is in progress
-    kGENERATION_TO_COMPLETE = 24,              ///< Generation phase is to be completed
-    kGENERATION_COMPLETE = 25,                 ///< Generation phase completed
+    // schedulable states starts
+    kCONTEXT_INIT = 10,                     ///< Context phase starts
+    kDISAGG_CONTEXT_INIT_AND_TRANS = 11,    ///< Context phase starts and cache transmission is in progress,
+                                            /// used in layer-wise transmission
+    kDISAGG_GENERATION_TRANS_COMPLETE = 12, ///< Kv cache transmission are finished
+    kGENERATION_IN_PROGRESS = 13,           ///< Generation phase is in progress
+    kGENERATION_TO_COMPLETE = 14,           ///< Generation phase is to be completed
+
+    // schedulable states ends
+    kGENERATION_COMPLETE = 20,              ///< Generation phase completed
+    kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 21, ///< Waiting context-only request transmitting the kv cache,
+                                            /// after computation finished
+    kDISAGG_CONTEXT_COMPLETE = 22,          ///< Context-only request finished kv cache transmission.
 };
 
 enum LlmRequestType
