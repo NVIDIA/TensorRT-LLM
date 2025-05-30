@@ -209,14 +209,14 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
         kv_cache_max_tokens = min(kv_cache_max_tokens, kv_cache_max_tokens_in)
 
     logger.info(f"Estimated max tokens in KV cache : {kv_cache_max_tokens}")
-    py_executor.set_gather_responses(False)
-    py_executor.enable_iter_perf_stats = origin_iter_stats
 
     py_executor.resource_manager.resource_managers.get(
         "kv_cache_manager").shutdown()
 
-    py_executor.is_warmup = False
     py_executor.shutdown()
+    py_executor.is_warmup = False
+    py_executor.set_gather_responses(False)
+    py_executor.enable_iter_perf_stats = origin_iter_stats
 
     return kv_cache_max_tokens
 
