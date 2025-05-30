@@ -1444,6 +1444,14 @@ def test_eagle_config_pickle():
     assert config.use_dynamic_tree == config_copy.use_dynamic_tree
     assert config.greedy_sampling == config_copy.greedy_sampling
 
+    config = trtllm.EagleConfig(None, False, 0.5, True, 3)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config.eagle_choices == config_copy.eagle_choices
+    assert config.greedy_sampling == config_copy.greedy_sampling
+    assert config.posterior_threshold == config_copy.posterior_threshold
+    assert config.use_dynamic_tree == config_copy.use_dynamic_tree
+    assert config.dynamic_tree_max_topK == config_copy.dynamic_tree_max_topK
+
 
 def test_decoding_mode():
     mode = trtllm.DecodingMode.Auto()

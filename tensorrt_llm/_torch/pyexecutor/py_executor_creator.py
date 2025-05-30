@@ -18,7 +18,7 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
-from ..speculative import Eagle3Config, NGramConfig, get_spec_resource_manager
+from ..speculative import NGramConfig, get_spec_resource_manager
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
                     instantiate_sampler, is_mla)
@@ -177,7 +177,9 @@ def create_py_executor(executor_config: ExecutorConfig,
     dist = MPIDist(mapping=mapping)
 
     spec_config = executor_config.speculative_config
-    has_draft_model_engine = isinstance(spec_config, Eagle3Config)
+    has_draft_model_engine = False
+    if spec_config is not None:
+        has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
     has_ngram_drafter = isinstance(spec_config, NGramConfig)
 
     attn_runtime_features = AttentionRuntimeFeatures(
@@ -186,6 +188,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         has_speculative_draft_tokens=has_draft_model_engine
         or has_ngram_drafter,
     )
+    logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
     mem_monitor = _ExecutorMemoryMonitor()
     with mem_monitor.observe_creation_stage(
@@ -213,7 +216,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             draft_spec_config.max_draft_tokens = 0
 
             draft_model_engine = PyTorchModelEngine(
-                spec_config.eagle_weights_path,
+                spec_config.draft_model_path,
                 pytorch_backend_config,
                 batch_size=executor_config.max_batch_size,
                 max_num_tokens=executor_config.max_num_tokens,
@@ -333,11 +336,16 @@ def create_py_executor(executor_config: ExecutorConfig,
             origin_seq_len, ctx_chunk_config, draft_model_engine)
         del py_executor  # free before constructing new
         del kv_cache_manager  # free before constructing new
+        del resources[KV_CACHE_MANAGER_KEY]
 
         executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
 
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.KV_CACHE):
+            # Before estimating KV cache size, a minimal KV cache has been allocated using
+            # create_kv_cache_manager above, which caps executor_config.max_seq_len. Restoring
+            # the original value before creating the final KV cache.
+            executor_config.max_seq_len = max_seq_len
             kv_cache_manager = create_kv_cache_manager(model_engine, mapping,
                                                        executor_config)
             resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
@@ -350,6 +358,7 @@ def create_py_executor(executor_config: ExecutorConfig,
 
             if draft_model_engine is not None:
                 del draft_kv_cache_manager  # free before constructing new
+                del resources[DRAFT_KV_CACHE_MANAGER_KEY]
                 draft_kv_cache_manager = create_kv_cache_manager(
                     draft_model_engine, mapping, executor_config)
                 resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
