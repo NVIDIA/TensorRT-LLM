@@ -1307,7 +1307,7 @@ class Eagle3LlamaForCausalLM(DecoderModelForCausalLM[Eagle3LlamaDraftModel,
                                 num_tokens: int) -> Dict[str, Any]:
 
         hidden_states = torch.empty(batch_size * num_tokens,
-                                    self.model.hidden_size_in,
+                                    self.model.hidden_size,
                                     dtype=self.model.dtype,
                                     device='cuda')
 
