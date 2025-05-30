@@ -770,7 +770,7 @@ public:
     void init(CutlassMoeFCRunnerInterface& runner, GemmToProfile gemm_to_profile, nvinfer1::DataType dtype,
         nvinfer1::DataType wtype, nvinfer1::DataType otype, int num_experts, int k, int64_t hidden_size,
         int64_t inter_size, int64_t group_size, ActivationType activation_type, bool bias, bool use_lora,
-        bool min_latency_mode, MOEParallelismConfig parallelism_config)
+        bool min_latency_mode, bool need_weights, MOEParallelismConfig parallelism_config)
     {
         mInterface = &runner;
         mGemmToProfile = gemm_to_profile;
@@ -787,17 +787,19 @@ public:
         mBias = bias;
         mUseLora = false;
         mMinLatencyMode = min_latency_mode;
+        mNeedWeights = need_weights;
         mParallelismConfig = parallelism_config;
         mSM = common::getSMVersion();
         mSorter.updateNumExperts(mNumExpertsPerNode);
     }
 
-    void prepare(int num_tokens, char* workspace, cudaStream_t stream);
+    void prepare(int num_tokens, char* workspace, void const* expert_weights, cudaStream_t stream);
 
     std::map<std::string, std::pair<size_t, size_t>> getProfilerWorkspaces(int maxM, bool is_tma_ws);
     size_t getWorkspaceSize(int maxM);
 
-    void runProfiler(int num_tokens, Config const& tactic, char* workspace_ptr_char, cudaStream_t const& stream);
+    void runProfiler(int num_tokens, Config const& tactic, char* workspace_ptr_char, void const* expert_weights,
+        cudaStream_t const& stream);
 
     CutlassMoeFCRunnerInterface* mInterface;
     CubKeyValueSorter mSorter;
@@ -829,11 +831,12 @@ public:
     bool mBias{};
     bool mUseLora{};
     bool mMinLatencyMode{};
+    bool mNeedWeights{};
 
 private:
     void prepareRouting(int num_tokens, char* workspace, cudaStream_t stream);
     void prepareQuantParams(int num_tokens, char* workspace, cudaStream_t stream);
-    void prepareTmaWsInputs(int num_tokens, char* workspace, cudaStream_t stream);
+    void prepareTmaWsInputs(int num_tokens, char* workspace, void const* expert_weights, cudaStream_t stream);
 };
 
 // Populates a buffer with random values for use with MOE benchmarking
