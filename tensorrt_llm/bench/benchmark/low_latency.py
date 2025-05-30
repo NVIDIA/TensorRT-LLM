@@ -139,6 +139,7 @@ def latency_command(
     checkpoint_path: Path = bench_env.checkpoint_path or bench_env.model
     engine_dir: Path = params.pop("engine_dir")
     concurrency: int = params.pop("concurrency")
+    beam_width: int = params.pop("beam_width")
     warmup: int = params.get("warmup")
     # Engine configuration parsing
     exec_settings, build_cfg = get_settings_from_engine(engine_dir)
@@ -159,7 +160,7 @@ def latency_command(
     exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
     exec_settings["settings_config"]["max_batch_size"] = 1
     exec_settings["settings_config"]["max_num_tokens"] = engine_tokens
-    exec_settings["settings_config"]["beam_width"] = params.pop("beam_width")
+    exec_settings["settings_config"]["beam_width"] = beam_width
     exec_settings["settings_config"]["chunking"] = False
     exec_settings["settings_config"][
         "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
@@ -214,7 +215,8 @@ def latency_command(
         sampling_params = SamplingParams(
             end_id=eos_id,
             pad_id=pad_id,
-            n=1,
+            n=beam_width,
+            use_beam_search=beam_width > 1,
         )
         llm = LLM(**kwargs)
 
