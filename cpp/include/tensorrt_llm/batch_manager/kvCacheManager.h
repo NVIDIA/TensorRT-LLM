@@ -1303,8 +1303,8 @@ public:
     /// @brief Calculate the free memory available for KV cache allocation.
     /// @param bufferManager Buffer manager for memory operations
     /// @param config KV cache configuration parameters
-    /// @return Tuple containing the {.freePrimaryMem, .freeSecondaryMem}
-    [[nodiscard]] static std::tuple<SizeType32, SizeType32> calculateFreeMem(
+    /// @return Tuple containing the {.freePrimaryMemBytes, .freeSecondaryMemBytes}
+    [[nodiscard]] static std::tuple<uint64_t, uint64_t> calculateFreeMemBytes(
         runtime::BufferManager const& bufferManager, KvCacheConfig const& config);
 
     /// @brief Calculate the maximum number of KV cache blocks that can be allocated based on available GPU memory.
@@ -1319,16 +1319,16 @@ public:
     /// @param worldConfig World configuration for multi-GPU setups
     /// @param bufferManager Buffer manager for memory operations
     /// @param windowSizeToLayers Map from attention window size to vector of layer indices using that window size
-    /// @param allottedPrimaryMem Allotted primary memory
-    /// @param allottedSecondaryMem Allotted secondary memory
+    /// @param allottedPrimaryMemBytes Allotted primary memory
+    /// @param allottedSecondaryMemBytes Allotted secondary memory
     /// @param kvFactor Factor for KV cache size calculation (typically 2 for key+value)
     /// @param extraCostMemory Additional memory cost to account for CacheTransBufferManager::preAllocBufferSize
     /// @return Map from window size to tuple of (primary blocks, secondary blocks)
     [[nodiscard]] static BlocksPerWindow calculateMaxNumBlocks(KvCacheConfig const& config, bool isCrossAttention,
         nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         tensorrt_llm::runtime::WorldConfig const& worldConfig,
-        std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, SizeType32 allottedPrimaryMem,
-        SizeType32 allottedSecondaryMem, size_t extraCostMemory, SizeType32 kvFactor = 2);
+        std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
+        uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor = 2);
 
     /// @brief Calculates the maximum batch size that can fit the kv-cache, given that all sequences in the batch have
     /// the provided input and output length.
