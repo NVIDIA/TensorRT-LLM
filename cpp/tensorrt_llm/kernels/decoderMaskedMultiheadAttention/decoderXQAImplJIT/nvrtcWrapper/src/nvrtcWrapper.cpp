@@ -14,8 +14,8 @@
 
 #include <cstring>
 #include <cuda.h>
-#include <nvrtc.h>
 #include <nvPTXCompiler.h>
+#include <nvrtc.h>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -96,7 +96,7 @@ std::string getSMFlag(int SM)
 std::string getPTXSMFlag(int SM)
 {
     // For SM120, we use compute_89 for PTX generation
-    if (SM == 120)
+    if (SM == 120 || SM == 121)
     {
         return "-arch=compute_89";
     }
@@ -293,14 +293,17 @@ tllmXqaJitStatus createProgram(tllmXqaJitProgram* prog, tllmXqaJitContext const*
 
 tllmXqaJitStatus compileProgram(tllmXqaJitProgram prog)
 {
-    bool needsTwoStageCompilation = (prog->context->sm == 120) && (prog->context->kernel_type == TLLM_XQA_JIT_HMMA);
-    
+    bool needsTwoStageCompilation
+        = (prog->context->sm == 120 || prog->context->sm == 121) && (prog->context->kernel_type == TLLM_XQA_JIT_HMMA);
+
     if (needsTwoStageCompilation)
     {
 #ifndef NDEBUG
-        // Two-stage compilation avoids accuracy regressions and cubin compatibility issues on SM120
+        // Two-stage compilation avoids accuracy regressions and cubin compatibility issues on SM120/SM121
         // by using compute_89 for PTX generation then targeting sm_120 for final cubin
-        printf("Using two-stage compilation for SM120: NVRTC (C++ -> PTX compute_89) + nvPTXCompiler (PTX -> cubin sm_120)\n");
+        printf(
+            "Using two-stage compilation for SM120/SM121: NVRTC (C++ -> PTX compute_89) + nvPTXCompiler (PTX -> cubin "
+            "sm_120)\n");
 #endif
         // Stage 1: Compile C++ to PTX using compute_89
         std::vector<std::string> ptx_options;
@@ -336,7 +339,7 @@ tllmXqaJitStatus compileProgram(tllmXqaJitProgram prog)
         nvPTXCompilerHandle ptx_compiler;
         CHECK_NVPTX_ERROR(nvPTXCompilerCreate(&ptx_compiler, ptx_size, ptx_data.data()));
 
-        std::vector<const char*> ptx_compile_options = {"--gpu-name=sm_120"};
+        std::vector<char const*> ptx_compile_options = {"--gpu-name=sm_120"};
         CHECK_NVPTX_ERROR(nvPTXCompilerCompile(ptx_compiler, ptx_compile_options.size(), ptx_compile_options.data()));
 
         size_t cubin_size;
@@ -377,7 +380,7 @@ tllmXqaJitStatus compileProgram(tllmXqaJitProgram prog)
         }
 #endif
     }
-    
+
     return TLLM_XQA_JIT_SUCCESS;
 }
 
@@ -406,7 +409,7 @@ tllmXqaJitStatus tllmXqaJitGetCUBINSize(tllmXqaJitProgram prog, size_t* cubinSiz
 }
 
 tllmXqaJitStatus tllmXqaJitGetCUBIN(tllmXqaJitProgram prog, char* cubin)
-{   
+{
     // For SM120 two-stage compilation, copy stored cubin data
     if (prog->use_stored_cubin)
     {
