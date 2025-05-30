@@ -336,11 +336,16 @@ def create_py_executor(executor_config: ExecutorConfig,
             origin_seq_len, ctx_chunk_config, draft_model_engine)
         del py_executor  # free before constructing new
         del kv_cache_manager  # free before constructing new
+        del resources[KV_CACHE_MANAGER_KEY]
 
         executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
 
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.KV_CACHE):
+            # Before estimating KV cache size, a minimal KV cache has been allocated using
+            # create_kv_cache_manager above, which caps executor_config.max_seq_len. Restoring
+            # the original value before creating the final KV cache.
+            executor_config.max_seq_len = max_seq_len
             kv_cache_manager = create_kv_cache_manager(model_engine, mapping,
                                                        executor_config)
             resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
@@ -353,6 +358,7 @@ def create_py_executor(executor_config: ExecutorConfig,
 
             if draft_model_engine is not None:
                 del draft_kv_cache_manager  # free before constructing new
+                del resources[DRAFT_KV_CACHE_MANAGER_KEY]
                 draft_kv_cache_manager = create_kv_cache_manager(
                     draft_model_engine, mapping, executor_config)
                 resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
