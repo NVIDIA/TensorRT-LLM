@@ -293,14 +293,16 @@ tllmXqaJitStatus createProgram(tllmXqaJitProgram* prog, tllmXqaJitContext const*
 
 tllmXqaJitStatus compileProgram(tllmXqaJitProgram prog)
 {
-    bool needsTwoStageCompilation = (prog->context->sm == 120);
+    bool needsTwoStageCompilation = (prog->context->sm == 120) && (prog->context->kernel_type == TLLM_XQA_JIT_HMMA);
     
     if (needsTwoStageCompilation)
     {
 #ifndef NDEBUG
+        // Two-stage compilation avoids accuracy regressions and cubin compatibility issues on SM120
+        // by using compute_89 for PTX generation then targeting sm_120 for final cubin
         printf("Using two-stage compilation for SM120: NVRTC (C++ -> PTX compute_89) + nvPTXCompiler (PTX -> cubin sm_120)\n");
 #endif
-        // Stage 1: Compile C++ to PTX using compute_89 (Yao's suggestion)
+        // Stage 1: Compile C++ to PTX using compute_89
         std::vector<std::string> ptx_options;
         CHECK_TLLM_XQA_JIT_ERROR(getBuildOptionsPTX(prog, &ptx_options));
         std::vector<char const*> ptx_options_cstr;
