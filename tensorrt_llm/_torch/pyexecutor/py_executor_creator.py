@@ -31,6 +31,7 @@ class _ExecutorCreationStage(enum.Enum):
     SAMPLER = "Sampler"
     INIT_KV_CACHE = "Initial KV cache (temporary for KV cache size estimation)"
     INIT_EXTRA_RESOURCES = "Additional executor resources (temporary for KV cache size estimation)"
+    MODEL_EXTRA = "Model resources created during usage"
     EXTRA_RESOURCES = "Additional executor resources"
     KV_CACHE = "KV cache"
     MODEL_ENGINE_MAIN = "Model"
@@ -85,6 +86,8 @@ class _ExecutorMemoryMonitor():
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES:
             "reduce max_num_tokens",
             _ExecutorCreationStage.EXTRA_RESOURCES:
+            "reduce max_num_tokens",
+            _ExecutorCreationStage.MODEL_EXTRA:
             "reduce max_num_tokens",
         }
 
@@ -334,7 +337,9 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
-        kv_cache_creator.estimate_max_tokens(py_executor)
+        with mem_monitor.observe_creation_stage(
+                _ExecutorCreationStage.MODEL_EXTRA):
+            kv_cache_creator.estimate_max_tokens(py_executor)
         kv_cache_creator.teardown_managers(resources)
         del py_executor  # free before constructing new
 

@@ -20,6 +20,7 @@ from ..model_config import ModelConfig
 from ..speculative import get_spec_decoder
 from .config_utils import is_mla, is_nemotron_hybrid
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
+from .llm_request import ExecutorResponse
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
 from .py_executor import PyExecutor
@@ -203,16 +204,29 @@ class KvCacheCreator:
         req_ids = py_executor.dist.broadcast(req_ids, root=0)
         py_executor.is_warmup = True
         py_executor.start_worker()
-        py_executor.await_responses(req_ids)
+        try:
+            responses = py_executor.await_responses(req_ids)
+            for response_or_list in responses:
+                response_list = [response_or_list] if isinstance(
+                    response_or_list, ExecutorResponse) else response_or_list
+                for response in response_list:
+                    if response.has_error():
+                        raise RuntimeError(response.error_msg)
 
-        torch_peak_memory = torch.cuda.memory_stats(
-        )["allocated_bytes.all.peak"]
+            torch_peak_memory = torch.cuda.memory_stats(
+            )["allocated_bytes.all.peak"]
 
-        # Clear the caching allocator before measuring the current memory usage
-        torch.cuda.empty_cache()
-        end, total_gpu_memory = torch.cuda.mem_get_info()
-        torch_used_bytes = torch.cuda.memory_stats(
-        )["allocated_bytes.all.current"]
+            # Clear the caching allocator before measuring the current memory usage
+            torch.cuda.empty_cache()
+            end, total_gpu_memory = torch.cuda.mem_get_info()
+            torch_used_bytes = torch.cuda.memory_stats(
+            )["allocated_bytes.all.current"]
+        finally:
+            py_executor.shutdown()
+            py_executor.is_warmup = False
+            py_executor.enable_iter_perf_stats = origin_iter_stats
+            py_executor.set_gather_responses(False)
+
         total_used_bytes = total_gpu_memory - end
         activation_bytes = torch_peak_memory - model_bytes
         extra_cost = max(total_used_bytes - torch_used_bytes, 0)
@@ -235,15 +249,6 @@ class KvCacheCreator:
                                       self._max_kv_tokens_in)
 
         logger.info(f"Estimated max tokens in KV cache : {kv_cache_max_tokens}")
-
-        py_executor.resource_manager.resource_managers.get(
-            "kv_cache_manager").shutdown()
-
-        py_executor.shutdown()
-        py_executor.is_warmup = False
-        py_executor.set_gather_responses(False)
-        py_executor.enable_iter_perf_stats = origin_iter_stats
-
         executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
 
     def _create_kv_cache_manager(
