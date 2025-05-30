@@ -11,6 +11,8 @@
  */
 
 #include <cstdint>
+#include <cuda_runtime_api.h>
+
 #pragma once
 
 #if CUDART_VERSION >= 11080

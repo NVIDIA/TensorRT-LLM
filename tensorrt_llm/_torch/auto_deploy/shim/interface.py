@@ -28,19 +28,9 @@ class CachedSequenceInterface:
         return (*self.info.args, *self._caches.values())
 
     @property
-    def args_original(self) -> Tuple[torch.Tensor, ...]:
-        """Return the original graph arguments expected by the model."""
-        return self.info.args_original
-
-    @property
     def dynamic_shapes(self) -> Tuple[Dict[int, Any], ...]:
         """Return the dynamic shapes of all graph arguments owned by this interface (all static)."""
         return self.info.dynamic_shapes + ({},) * len(self._caches)
-
-    @property
-    def original_dynamic_shapes(self) -> Tuple[Dict[int, Any], ...]:
-        """Return the dynamic shapes of the original graph arguments."""
-        return self.info.original_dynamic_shapes
 
     def to(self, *args, **kwargs) -> None:
         self.info.to(*args, **kwargs)
@@ -116,8 +106,6 @@ class AutoDeployConfig(PyTorchConfig):
     free_mem_ratio: float = 0.8
 
     def __post_init__(self):
-        super().__post_init__()
-
         # we don't want to loose the default values for model_kwargs unless explicitly set by the
         # user. They are not preserved by the standard initialization process since they whole dict
         # gets replaced by the user provided one. We don't want that though.

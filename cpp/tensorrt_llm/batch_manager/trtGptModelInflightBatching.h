@@ -264,7 +264,7 @@ private:
     void createDecoder(std::optional<executor::DecodingMode> const& decodingModeOpt);
     void createBuffers(executor::DecodingConfig const& decodingConfig,
         std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs);
-    std::shared_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType,
+    std::unique_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType,
         uint64_t freePrimaryMemBytes, uint64_t freeSecondaryMemBytes, size_t extraCostMemory);
     void createRnnStateManager();
     void createCustomAllReduceWorkspace();
@@ -446,9 +446,9 @@ private:
     /******************** Components ********************/
     std::shared_ptr<nvinfer1::ILogger> mLogger;
     // Runner for the TRT engine. The engine produces logits.
-    std::shared_ptr<runtime::TllmRuntime> mRuntime;
+    std::unique_ptr<runtime::TllmRuntime> mRuntime;
     // Decoder that generates new tokens from the logits.
-    std::shared_ptr<runtime::GptDecoderBatched> mDecoder;
+    std::unique_ptr<runtime::GptDecoderBatched> mDecoder;
     // Synchronization handles for decoder
     std::vector<std::optional<runtime::CudaEvent>> mDecoderFinishedEvents;
 
@@ -459,7 +459,7 @@ private:
     // KV cache manager for cross attention in enc-dec models (optional)
     std::shared_ptr<BaseKVCacheManager> mCrossKvCacheManager = nullptr;
     // RNN state manager for recurrent layers (optional)
-    std::shared_ptr<RnnStateManager> mRnnStateManager;
+    std::unique_ptr<RnnStateManager> mRnnStateManager;
     // PEFT cache manager for LoRA tasks (optional)
     std::shared_ptr<BasePeftCacheManager> mPeftCacheManager;
     // BufferManager using a separate stream for async copy operations.
