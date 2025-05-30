@@ -1912,6 +1912,64 @@ def test_llm_get_stats(return_context_logits, enable_iter_req_stats):
                                enable_iter_req_stats=enable_iter_req_stats)
 
 
+def test_llm_get_queued_stats():
+
+    enable_iter_req_stats = True
+    use_overlap = False
+    tp_size = 1
+
+    num_requests = 3000
+    repeated_prompts = ["A B C D E F G H I J K L M"] * num_requests
+
+    llm_args_extra = {}
+    sampling_args_extra = {}
+
+    from tensorrt_llm._torch import LLM as LLM_torch
+    from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+
+    llm_args_extra["pytorch_backend_config"] = PyTorchConfig(
+        enable_iter_perf_stats=True,
+        enable_iter_req_stats=enable_iter_req_stats,
+        disable_overlap_scheduler=not use_overlap,
+    )
+
+    llm = LLM_torch(model=llama_model_path,
+                    kv_cache_config=global_kvcache_config,
+                    tensor_parallel_size=tp_size,
+                    fast_build=True,
+                    **llm_args_extra)
+
+    max_tokens = 10
+    sampling_params = SamplingParams(max_tokens=max_tokens,
+                                     **sampling_args_extra)
+
+    max_tries = 10
+    has_queue_requests = False
+
+    while not has_queue_requests and max_tries > 0:
+        max_tries -= 1
+        # Generate outputs, which will queue requests
+        outputs = llm.generate(repeated_prompts,
+                               sampling_params=sampling_params)
+
+        results = llm.get_stats(2)
+
+        for index, result in enumerate(results):
+            if "requestStats" in result:
+                for requestStat in result["requestStats"]:
+                    if requestStat["stage"] == "QUEUED":
+                        has_queue_requests = True
+                        assert requestStat["numGeneratedTokens"] == 0
+
+        if not has_queue_requests:
+            print("No queued requests found, retrying...")
+            asyncio.sleep(1)
+        else:
+            print("Found queued requests, breaking out of the loop.")
+
+    assert has_queue_requests
+
+
 def llm_get_stats_async_test_harness(tp_size: int = 1,
                                      return_context_logits: bool = False,
                                      pytorch_backend: bool = False,
