@@ -106,9 +106,8 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
     // diff end
     auto reqId = llmRequest.mRequestId;
 
-    constexpr SizeType32 beam{0};
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
-    auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId, beam);
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
 
     int blockNum = 0;
     std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
@@ -283,8 +282,7 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
     // diff start
     auto pickUpConnections = pickRecvConnections(connections, selfConfig, selfIdx, destConfig);
     // diff end
-    constexpr SizeType32 beam{0};
-    auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId, beam);
+    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
