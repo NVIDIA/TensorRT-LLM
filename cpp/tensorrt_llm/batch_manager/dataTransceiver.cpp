@@ -101,6 +101,7 @@ public:
     {
         TLLM_CHECK(mSender);
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
+        mCurrentRequest = std::nullopt;
         mResponseFuture = std::async(std::launch::async, &Impl::response, this);
     }
 
@@ -220,13 +221,10 @@ private:
                 }
                 else
                 {
-                    if (mCurrentRequest.has_value())
-                    {
-                        TLLM_LOG_ERROR(
-                            "This executor does not have a prepared KV cache for request ID: %zu, and the "
-                            "mReadyResponses size is: %zu.",
-                            mCurrentRequest.value(), mReadyResponses.size());
-                    }
+                    TLLM_CHECK_WITH_INFO(!mCurrentRequest.has_value(),
+                        "This executor does not have a prepared KV cache for request ID: %zu, and the "
+                        "mReadyResponses size is: %zu. mpi rank :%d     ",
+                        mCurrentRequest.value(), mReadyResponses.size(), mpi::MpiComm::world().getRank());
                     std::unique_lock lk(mCondMutex);
                     mResponderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
                 }
