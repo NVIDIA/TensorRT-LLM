@@ -171,6 +171,7 @@ def _register_fake():
         global_scale: torch.Tensor,
         sf_vec_size: int,
         sf_use_ue8m0=False,
+        swizzled_layout=True,
     ):
         output_shape, scale_shape = fp4_utils.get_fp4_shape(
             input.shape, sf_vec_size)
@@ -397,3 +398,75 @@ def _register_fake():
         pad_slot_id: int,
     ) -> None:
         pass
+
+    @torch.library.register_fake("trtllm::allgather_list")
+    def _(input_list, sizes, group):
+        assert len(input_list) > 0
+
+        def create_output_tensor(i):
+            shape = list(i.shape)
+            if sizes is None:
+                shape[0] *= len(group)
+            else:
+                shape[0] = sum(sizes)
+            return i.new_empty(shape)
+
+        return [create_output_tensor(i) for i in input_list]
+
+    @torch.library.register_fake("trtllm::reducescatter")
+    def _(input, sizes, group):
+        import tensorrt_llm
+        local_rank = tensorrt_llm.mpi_rank()
+
+        shape = list(input.shape)
+        if sizes is None:
+            shape[0] = shape[0] // len(group)
+        else:
+            shape[0] = sizes[local_rank]
+        return input.new_empty(shape)
+
+    @torch.library.register_fake("trtllm::fp4_block_scale_moe_runner")
+    def _(
+        routing_logits,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        output1_scale_scalar,
+        output1_scale_gate_scalar,
+        output2_scale_scalar,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        tile_tokens_dim,
+        routing_method_type,
+        do_finalize,
+    ) -> List[torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[1] * 2
+        print(f"do_finalize: {do_finalize}")
+        if do_finalize:
+            return [
+                hidden_states.new_empty((num_tokens, hidden_size),
+                                        dtype=torch.bfloat16)
+            ]
+
+        expanded_row_count = num_tokens * top_k
+        max_padding_required = (tile_tokens_dim - 1) * num_experts
+        max_num_padded_tokens = fp4_utils.pad_up(
+            expanded_row_count + max_padding_required, tile_tokens_dim)
+        wt_dtype = routing_bias.dtype if routing_bias is not None else torch.bfloat16
+        return [
+            hidden_states.new_empty((max_num_padded_tokens, hidden_size),
+                                    dtype=torch.bfloat16),
+            hidden_states.new_empty((num_tokens, top_k), dtype=wt_dtype),
+            hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32)
+        ]
