@@ -68,7 +68,7 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
     {
         return false;
     }
-    if (xqaParams.max_past_kv_length > xqaParams.chunked_attention_size)
+    if (xqaParams.chunked_attention_size != INT_MAX)
     {
         // TODO: chunked attention is not supported yet.
         return false;
