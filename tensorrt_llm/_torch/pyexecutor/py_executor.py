@@ -61,15 +61,16 @@ class RequestQueueItem:
         return self.id == SHUTDOWN_REQUEST_ID
 
 
-def _get_from_request_queue(request_queue, timeout: datetime.timedelta,
-                            max_req_count: int):
+def _get_from_request_queue(request_queue,
+                            timeout: Optional[datetime.timedelta],
+                            max_req_count: int) -> List[RequestQueueItem]:
     items = []
-    timeout = timeout.total_seconds() if timeout is not None else None
+    timeout_secs = timeout.total_seconds() if timeout is not None else None
     req_count = 0
     try:
-        if request_queue.empty() and (timeout is None or timeout > 0):
+        if request_queue.empty() and (timeout_secs is None or timeout_secs > 0):
             # if queue is empty and want to wait, wait
-            items.append(request_queue.get(timeout=timeout))
+            items.append(request_queue.get(timeout=timeout_secs))
         else:
             # if not empty or don't want to wait, just return all items in queue
             while req_count < max_req_count:
@@ -174,7 +175,7 @@ class PyExecutor:
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
-        self.request_queue = queue.Queue()
+        self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
 
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
@@ -550,9 +551,9 @@ class PyExecutor:
                 req_stat.dis_serving_stats.kv_cache_size = req.kv_cache_size
             return req_stat
 
-        def get_queued_req_stats(req: LlmRequest) -> RequestStats:
+        def get_queued_req_stats(req: RequestQueueItem) -> RequestStats:
             req_stat = RequestStats()
-            req_stat.id = req.request_id
+            req_stat.id = req.id
             req_stat.context_prefill_position = 0
             req_stat.num_generated_tokens = 0
             req_stat.avg_num_decoded_tokens_per_iter = 0
@@ -571,7 +572,7 @@ class PyExecutor:
 
         for req in list(self.request_queue.queue):
             req_stat = get_queued_req_stats(req)
-            req.stage = RequestStage.QUEUED
+            req_stat.stage = RequestStage.QUEUED
             req_stats.append(req_stat)
 
         for req in finished_requests:
@@ -1030,22 +1031,15 @@ class PyExecutor:
                 if scheduled_batch.batch_size > 0:
                     self.resource_manager.prepare_resources(scheduled_batch)
 
-                    generation_requests = scheduled_batch.generation_requests
-
                     # The generation requests that are do not have batch_idx,
                     # needs to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
-                    new_generation_requests = []
-                    for req in generation_requests:
-                        if req.py_batch_idx is None:
-                            new_generation_requests.append(req)
-
-                    for req in generation_requests:
-                        if req.py_batch_idx is not None:
-                            new_generation_requests.append(req)
-                    scheduled_batch.generation_requests = new_generation_requests
+                    scheduled_batch.generation_requests = sorted(  # stable sort
+                        scheduled_batch.generation_requests,
+                        key=lambda req: int(req.py_batch_idx is not None),
+                    )
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1129,7 +1123,8 @@ class PyExecutor:
             sampler_event=sampler_event,
         )
 
-    def _update_new_active_requests_queue_latency(self, new_requests):
+    def _update_new_active_requests_queue_latency(
+            self, new_requests: List[RequestQueueItem]):
         if self.enable_iter_perf_stats and self.dist.rank == 0:
             now = time.time()
             for req_item in new_requests:
@@ -1140,9 +1135,9 @@ class PyExecutor:
     @nvtx_range("_broadcast_new_requests")
     def _broadcast_new_requests(
         self,
-        new_requests: List[ExecutorRequest],
-        py_request_objects: tuple[str, dict] = None
-    ) -> tuple[List[ExecutorRequest], Optional[tuple[str, dict]]]:
+        new_requests: List[RequestQueueItem],
+        py_request_objects: Optional[tuple[str, dict]] = None,
+    ) -> tuple[List[RequestQueueItem], Optional[tuple[str, dict]]]:
         """Broadcasts new_requests and optional Python-only metadata (`py_request_objects`) across pipeline stages.
            `py_request_objects` is a tuple of (attribute_name, {request_id: object}).
         """
@@ -1168,7 +1163,7 @@ class PyExecutor:
         return payloads
 
     @nvtx_range("_fetch_new_requests")
-    def _fetch_new_requests(self):
+    def _fetch_new_requests(self) -> List[RequestQueueItem]:
         if self.enable_attention_dp:
             all_ranks_num_active_requests = []
             responses_list = self.dist.tp_allgather(len(self.active_requests))
@@ -2040,7 +2035,7 @@ class PyExecutor:
                 self.ctx_in_transmission_requests.remove(request)
 
     def _await_any_response(self,
-                            timeout: Union[float, None] = None
+                            timeout: Optional[float] = None
                             ) -> List[ExecutorResponse]:
 
         def any_responses_ready():
@@ -2058,7 +2053,7 @@ class PyExecutor:
     def _await_single_response(
             self,
             id: int,
-            timeout: Union[float, None] = None) -> List[ExecutorResponse]:
+            timeout: Optional[float] = None) -> List[ExecutorResponse]:
         with self.response_cv:
 
             def key_has_response():
