@@ -214,11 +214,13 @@ def test_fused_moe_alltoall(alltoall_method_type):
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
+                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
                 ref_output = ref_model.forward(
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
+                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
 
             # Evaluate outputs
@@ -547,17 +549,17 @@ def test_fused_moe_nvfp4(dtype):
 
         w1_weight_nvfp4, w1_sf_block = torch.ops.trtllm.fp4_quantize(
             w1_weight, w3_w1_global, SCALING_VECTOR_SIZE, False)
-        w1_sf_block_unswizzled = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(
+        w1_sf_block_unswizzled = torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(
             w1_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
 
         w2_weight_nvfp4, w2_sf_block = torch.ops.trtllm.fp4_quantize(
             w2_weight, w2_sf_global, SCALING_VECTOR_SIZE, False)
-        w2_sf_block_unswizzled = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(
+        w2_sf_block_unswizzled = torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(
             w2_sf_block.cpu().view(HIDDEN_SIZE, -1))
 
         w3_weight_nvfp4, w3_sf_block = torch.ops.trtllm.fp4_quantize(
             w3_weight, w3_w1_global, SCALING_VECTOR_SIZE, False)
-        w3_sf_block_unswizzled = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(
+        w3_sf_block_unswizzled = torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(
             w3_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
 
         w1_input_scale = x_sf_global.cuda()
