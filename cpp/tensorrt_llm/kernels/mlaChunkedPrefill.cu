@@ -58,7 +58,6 @@ struct setChunkedKVKernelTraits
     static constexpr int kElemPerLoad = kBytesPerLoad / kBytesPerElem;
     static_assert((kHeadSize * kBytesPerElem) % kBytesPerLoad == 0,
         "kHeadSize * kBytesPerElem must be multiple of kBytesPerLoad (16Bytes)");
-    static constexpr int kNumHeads = 128;
     static constexpr int kThreadPerHead = (kHeadSize * kBytesPerElem) / kBytesPerLoad;
     static constexpr int kKVThreadPerHead = (kQKNopeSize * kBytesPerElem) / kBytesPerLoad;
     static constexpr int kCpTokenPerBlock = 16;
@@ -132,12 +131,12 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float* merged_softmax
     }
 }
 
-// kv_output {b, chunked_unit_size, h=1, d_lora}
-// k_pe_output {b, chunked_unit_size, h=1, d_rope}
+// kv_output {total_chunk_token=b*chunk_size, h=1, d_lora}
+// k_pe_output {total_chunk_token, h=1, d_rope}
 template <typename T>
 __global__ void loadChunkedKVCacheForMLAKernel(T* output_kv_ptr, T* output_k_pe_ptr,
-    const tensorrt_llm::kernels::KVBlockArray kv_cache, int64_t const* cu_ctx_cached_kv_lens, int chunked_unit_size,
-    int chunked_idx)
+    tensorrt_llm::kernels::KVBlockArray const kv_cache, int64_t const* cu_ctx_cached_kv_lens,
+    int64_t const* cu_ctx_chunked_len, int chunked_size, int chunked_idx)
 {
     using KT = loadChunkedKVKernelTraits<T>;
     int const batch_idx = static_cast<int>(blockIdx.y);
@@ -147,9 +146,14 @@ __global__ void loadChunkedKVCacheForMLAKernel(T* output_kv_ptr, T* output_k_pe_
     size_t const head_dim_idx = head_dim_vec_idx * KT::kElemPerLoad;
 
     int64_t const cache_kv_len = cu_ctx_cached_kv_lens[batch_idx + 1] - cu_ctx_cached_kv_lens[batch_idx];
+    int64_t const real_chunked_size = cu_ctx_chunked_len[batch_idx + 1] - cu_ctx_chunked_len[batch_idx];
+    if (real_chunked_size <= 0)
+    {
+        return; // no kv cache for this batch
+    }
     bool const is_valid_kv = head_dim_vec_idx < KT::kKVThreadPerHead;
     for (int local_token_idx = (threadIdx.x / KT::kThreadPerHead) + blockIdx.x * KT::kTokenPerBlock;
-         local_token_idx < chunked_unit_size; local_token_idx += gridDim.x * KT::kTokenPerBlock)
+         local_token_idx < real_chunked_size; local_token_idx += gridDim.x * KT::kTokenPerBlock)
     {
         int token_idx_in_kv_cache = (chunked_idx * chunked_unit_size) + local_token_idx;
         bool const valid_token = (local_token_idx < chunked_unit_size) && (token_idx_in_kv_cache < cache_kv_len);
