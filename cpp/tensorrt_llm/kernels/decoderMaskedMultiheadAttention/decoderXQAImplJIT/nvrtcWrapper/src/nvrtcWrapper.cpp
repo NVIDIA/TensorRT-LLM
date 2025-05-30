@@ -123,9 +123,15 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
         macros["INPUT_FP16"] = "0";
         macros["DTYPE"] = "__nv_bfloat16";
     }
+    else if (context->data_type == tensorrt_llm::kernels::DATA_TYPE_E4M3)
+    {
+        TLLM_CHECK(context->kernel_type == TLLM_XQA_JIT_MLA);
+    }
     else
     {
-        setErrorString("data_type is neither DATA_TYPE_FP16 nor DATA_TYPE_BF16");
+        setErrorString(
+            "data_type must be DATA_TYPE_FP16 or DATA_TYPE_BF16 for non-MLA kernels and DATA_TYPE_E4M3 for the MLA "
+            "kernel");
         return TLLM_XQA_JIT_INVALID_INPUT;
     }
 

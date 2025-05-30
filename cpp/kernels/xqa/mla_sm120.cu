@@ -1714,14 +1714,14 @@ static_assert(smemSize <= 99 * 1024, "Shared memory size exceeded");
 #ifndef GENERATE_CUBIN
 #if IS_MLA
 CUtensorMap makeTensorMapForQ(
-    void const* addr, CUtensorMapDataType_enum dataType, uint32_t headElems, uint32_t totalNbHeads)
+    void const* addr, CUtensorMapDataType_enum dataType, uint32_t headElems, uint32_t totalNbHeads, uint32_t partElems)
 {
     CUtensorMap tensorMap{};
     uint64_t const globalDims[] = {headElems, totalNbHeads};
     uint32_t elemBytes = getElemBytes(dataType);
     uint32_t const headBytes = elemBytes * headElems;
     uint64_t const globalStrides[] = {headBytes};
-    uint32_t const boxDims[] = {partElemsK, headGrpSize};
+    uint32_t const boxDims[] = {partElems, headGrpSize};
     uint32_t const elemStrides[] = {1, 1};
     auto const swizzle = CU_TENSOR_MAP_SWIZZLE_64B;
 
@@ -1807,11 +1807,12 @@ void launchMLA(cudaDeviceProp const& prop,
         throw std::runtime_error("unsupported cache element type");
     }();
 
-    auto const tensorMapQ = makeTensorMapForQ(q, dtype, validElemsPerHead, headGrpSize * inputSeqLen * batchSize);
-    auto const tensorMapK
-        = makeTensorMapForPagedKVCache(pool, dtype, validElemsPerHead, nbKHeads, tokensPerPage, 64, tokensPerTile);
-    auto const tensorMapV
-        = makeTensorMapForPagedKVCache(pool, dtype, validElemsPerHead, nbKHeads, tokensPerPage, 128, tokensPerTile);
+    auto const tensorMapQ
+        = makeTensorMapForQ(q, dtype, validElemsPerHead, headGrpSize * inputSeqLen * batchSize, partElemsK);
+    auto const tensorMapK = makeTensorMapForPagedKVCache(
+        pool, dtype, validElemsPerHead, nbKHeads, tokensPerPage, partElemsK, tokensPerTile);
+    auto const tensorMapV = makeTensorMapForPagedKVCache(
+        pool, dtype, validElemsPerHead, nbKHeads, tokensPerPage, partElemsV, tokensPerTile);
 
     uint32_t const nbCgas = exactDiv(dimGrid.x, 4) * dimGrid.y * dimGrid.z;
     auto const cgaXBuf = static_cast<Vec<CgaXBuffer, nbProducerCtasPerCga>*>(scratch);

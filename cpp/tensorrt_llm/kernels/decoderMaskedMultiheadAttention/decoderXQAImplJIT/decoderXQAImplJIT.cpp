@@ -13,15 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
 
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
 #include "compileEngine.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/decoderXQAImplJIT.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/tensorMapUtils.h"
@@ -57,13 +56,18 @@ bool DecoderXQAImplJIT::supportConfig(XQAParams const& xqaParams, bool forConfig
 {
 
     return jit::supportConfigQGMMA(xqaParams, mSM, forConfigurePlugin)
-        || jit::supportConfigHMMA(xqaParams, mSM, forConfigurePlugin);
+        || jit::supportConfigHMMA(xqaParams, mSM, forConfigurePlugin)
+        || jit::supportConfigMLA(xqaParams, mSM, forConfigurePlugin);
 }
 
 bool DecoderXQAImplJIT::mayHavePerfGain(XQAParams const& xqaParams) const
 {
     // NOTE: only XQA supports multi_query_tokens (Medusa mode).
     if (mForceXQA || xqaParams.multi_query_tokens)
+    {
+        return true;
+    }
+    if (xqaParams.head_size == 576 && xqaParams.num_q_heads == 128 && xqaParams.num_kv_heads == 1) // MLA
     {
         return true;
     }
@@ -188,8 +192,11 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     TLLM_CHECK(cubinObj != nullptr && cubinObj->isInitialized());
     bool const isSpecDec = xqaParams.multi_query_tokens;
     bool const isGMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kHOPPER_WARP_SPECIALIZED);
+    bool const isMLAKernel = (cubinObj->getKernelType() == XQAKernelType::kSM120_MLA);
     TLLM_CHECK_WITH_INFO(
-        !isSpecDec || isGMMAKernel, "speculative decoding is available for GMMA kernel only in JIT path for now.");
+        !isSpecDec || isGMMAKernel || (isMLAKernel && !xqaParams.spec_decoding_is_generation_length_variable),
+        "speculative decoding is available for GMMA/MLA kernel only in JIT path for now. For MLA, the input sequence "
+        "length must be uniform and draft tokens must be linear.");
     TLLM_CHECK_DEBUG(isGMMAKernel == jit::supportConfigQGMMA(xqaParams, mSM, false));
     // @fixme: also embed these compile-time flags in cubin directly
     // Whether RoPE is fused into the XQA kernel.
@@ -330,61 +337,93 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         TLLM_CHECK(idxNextParam < kMAX_NB_KERNEL_PARAMS);
         kernelParams[idxNextParam++] = const_cast<void*>(static_cast<void const*>(p));
     };
-    appendParam(&launchParams.num_k_heads);
-    bool const allowSlidingWindow = !isSpecDec;
-    if (allowSlidingWindow)
+    void const* const kernel_input_tokens
+        = (applyRoPEInXqaKernel ? &launchParams.qkv : const_cast<void const**>(&xqa_q_input_ptr));
+    if (isMLAKernel)
     {
-        appendParam(&launchParams.slidingWindowSize);
+        CUtensorMap const tensorMapQ = makeTensorMapForXqaMlaQ(mDriver, xqaParams, kernel_input_tokens);
+        appendParam(&tensorMapQ);
+        CUtensorMap const tensorMapK = makeTensorMapForXqaMlaKVCache(mDriver, xqaParams, kv_cache_buffer, true);
+        appendParam(&tensorMapK);
+        CUtensorMap const tensorMapV = makeTensorMapForXqaMlaKVCache(mDriver, xqaParams, kv_cache_buffer, false);
+        appendParam(&tensorMapV);
+        appendParam(&launchParams.qScale);
+        appendParam(&launchParams.output);
+        appendParam(&launchParams.kvCacheParams);
+        appendParam(&launchParams.batch_size);
+        appendParam(&launchParams.kv_scale_quant_orig);
+        appendParam(&launchParams.scratch);
+        appendParam(&launchParams.semaphores);
+        constexpr uint32_t cgaXBufSize = 8704 * 2;
+        uint32_t const multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
+        std::byte* const partialResults = static_cast<std::byte*>(launchParams.scratch)
+            + cgaXBufSize * multi_block * xqaParams.total_num_input_tokens;
+        appendParam(&partialResults);
+        kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
+        uint32_t const inputSeqLen
+            = xqaParams.multi_query_tokens ? static_cast<uint32_t>(xqaParams.generation_input_length) : 1U;
+        dim3 const dimGrid{4 * inputSeqLen, multi_block, xqaParams.batch_size};
+        dim3 const blockDim(128 * 3, 1, 1);
+        cubinObj->launch(dimGrid, blockDim, stream, kernelParams);
     }
-    appendParam(&launchParams.qScale);
-    appendParam(&launchParams.output);
-    if (isFp8Out && !needOutputCvt)
+    else
     {
-        appendParam(&launchParams.rcpOutScale);
+        appendParam(&launchParams.num_k_heads);
+        bool const allowSlidingWindow = !isSpecDec;
+        if (allowSlidingWindow)
+        {
+            appendParam(&launchParams.slidingWindowSize);
+        }
+        appendParam(&launchParams.qScale);
+        appendParam(&launchParams.output);
+        if (isFp8Out && !needOutputCvt)
+        {
+            appendParam(&launchParams.rcpOutScale);
+        }
+        appendParam(kernel_input_tokens);
+        if (applyRoPEInXqaKernel)
+        {
+            appendParam(&launchParams.ropeCosSin);
+        }
+        appendParam(&launchParams.kvCacheParams);
+        if (xqaParams.beam_width > 1)
+        {
+            appendParam(&launchParams.beamSearchParams.value());
+        }
+        appendParam(&launchParams.batch_size);
+        appendParam(&launchParams.kv_scale_quant_orig);
+        CUtensorMap tensorMap{};
+        if (isGMMAKernel)
+        {
+            tensorMap = makeTensorMapForHopperXqaKVCache(mDriver, xqaParams, kv_cache_buffer);
+            appendParam(&tensorMap);
+        }
+        uint32_t specDecBlocks = 1;
+        SpecDecParams specDecParams{};
+        if (isSpecDec)
+        {
+            TLLM_CHECK_WITH_INFO(
+                isGMMAKernel, "speculative decoding is available for GMMA kernel only in JIT path for now.");
+            TLLM_CHECK_DEBUG_WITH_INFO(xqaParams.max_past_kv_length + 1 <= xqaParams.cyclic_attention_window_size,
+                "SWA and speculative decoding cannot be used at the same time for now.");
+            specDecParams = makeSpecDecParams();
+            appendParam(&specDecParams);
+            specDecBlocks = divUp(specDecParams.qSeqLen, 64 / num_q_heads_over_kv);
+        }
+        appendParam(&launchParams.semaphores);
+        appendParam(&launchParams.scratch);
+        kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
+        uint32_t multi_block = 1;
+        if (xqaParams.multi_block_mode)
+        {
+            multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
+        }
+        uint32_t const nbKVHeads = xqaParams.num_kv_heads;
+        auto const gridDim = (isGMMAKernel ? dim3{specDecBlocks, multi_block, nbKVHeads * xqaParams.batch_size}
+                                           : dim3{multi_block, nbKVHeads, xqaParams.batch_size});
+        dim3 const blockDim(128, 1, isGMMAKernel ? 3 : 2);
+        cubinObj->launch(gridDim, blockDim, stream, kernelParams);
     }
-    appendParam(applyRoPEInXqaKernel ? &launchParams.qkv : const_cast<void const**>(&xqa_q_input_ptr));
-    if (applyRoPEInXqaKernel)
-    {
-        appendParam(&launchParams.ropeCosSin);
-    }
-    appendParam(&launchParams.kvCacheParams);
-    if (xqaParams.beam_width > 1)
-    {
-        appendParam(&launchParams.beamSearchParams.value());
-    }
-    appendParam(&launchParams.batch_size);
-    appendParam(&launchParams.kv_scale_quant_orig);
-    CUtensorMap tensorMap{};
-    if (isGMMAKernel)
-    {
-        tensorMap = makeTensorMapForKVCache(mDriver, xqaParams, kv_cache_buffer);
-        appendParam(&tensorMap);
-    }
-    uint32_t specDecBlocks = 1;
-    SpecDecParams specDecParams{};
-    if (isSpecDec)
-    {
-        TLLM_CHECK_WITH_INFO(
-            isGMMAKernel, "speculative decoding is available for GMMA kernel only in JIT path for now.");
-        TLLM_CHECK_DEBUG_WITH_INFO(xqaParams.max_past_kv_length + 1 <= xqaParams.cyclic_attention_window_size,
-            "SWA and speculative decoding cannot be used at the same time for now.");
-        specDecParams = makeSpecDecParams();
-        appendParam(&specDecParams);
-        specDecBlocks = divUp(specDecParams.qSeqLen, 64 / num_q_heads_over_kv);
-    }
-    appendParam(&launchParams.semaphores);
-    appendParam(&launchParams.scratch);
-    kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
-    uint32_t multi_block = 1;
-    if (xqaParams.multi_block_mode)
-    {
-        multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
-    }
-    uint32_t const nbKVHeads = xqaParams.num_kv_heads;
-    auto const gridDim = (isGMMAKernel ? dim3{specDecBlocks, multi_block, nbKVHeads * xqaParams.batch_size}
-                                       : dim3{multi_block, nbKVHeads, xqaParams.batch_size});
-    dim3 const blockDim(128, 1, isGMMAKernel ? 3 : 2);
-    cubinObj->launch(gridDim, blockDim, stream, kernelParams);
     sync_check_cuda_error(stream);
 
     if (needOutputCvt)

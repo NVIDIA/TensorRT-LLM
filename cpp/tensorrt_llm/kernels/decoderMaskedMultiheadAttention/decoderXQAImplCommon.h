@@ -368,5 +368,10 @@ inline int computeMultiBlockCount(XQAParams const& xqaParams, int batch_size, in
     return multi_block_count;
 }
 
+inline int computeMultiBlockCountForMLA(XQAParams const& xqaParams, int multiprocessor_count)
+{
+    return 1; // disable multi-block for MLA kernel for now.
+}
+
 } // namespace kernels
 } // namespace tensorrt_llm
