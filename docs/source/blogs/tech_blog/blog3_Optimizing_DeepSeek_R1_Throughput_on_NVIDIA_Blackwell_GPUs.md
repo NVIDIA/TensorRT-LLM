@@ -1,7 +1,21 @@
 # Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers
 
 By NVIDIA TensorRT-LLM team
+## Table of Contents
+  - [Introduction](#introduction)
+  - [Precision strategy](#precision-strategy)
+  - [Parallel strategy](#parallel-strategy)
+    - [Weights absorb and MQA](#weights-absorb-and-mqa)
+    - [Data Parallel for Attention module (ADP)](#data-parallel-for-attention-module-adp)
+    - [Expert parallel for MOE (EP)](#expert-parallel-for-moe-ep)
+  - [MLA Layers Optimizations](#mla-layers-optimizations)
+  - [MoE Layers Optimizations](#moe-layers-optimizations)
+  - [Runtime Optimizations](#runtime-optimizations)
+  - [How to reproduce](#how-to-reproduce)
+  - [Future Works](#future-works)
+  - [Acknowledgment](#acknowledgment)
 
+## Introduction
 The open source DeepSeek R1 model's innovative architecture including the multi-head latent attention (MLA) and large sparse Mixture-of-Experts (MoE) significantly improved the inference efficiency of the LLM models. However, harnessing the full potential of such an innovative structure requires equally important hardware/software co-optimization. This post delves into the optimization strategies for DeepSeek R1 throughput oriented scenarios (TPS/GPU), developed by NVIDIA within TensorRT-LLM on NVIDIA's Blackwell B200 GPUs. We will explore the rationale behind each enhancement. [The other min-latency optimization blog](./blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) explained in detail how TensorRT-LLM optimizes the R1 performance to achieve the best of the TPS/USER.
 
 These optimizations have significantly boosted DeepSeek R1 throughput on Blackwell. Performance increased from approximately 2000 TPS/GPU in February to 4600 TPS/GPU on ISL/OSL 1K/2K dataset. The optimizations are general and applicable to other ISL/OSL configs too. These optimization items were broadly categorized into three areas: MLA layers, MoE layers, and runtime.
