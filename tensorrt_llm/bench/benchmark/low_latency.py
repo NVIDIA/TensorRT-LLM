@@ -76,6 +76,12 @@ from tensorrt_llm.sampling_params import SamplingParams
                 cls=MutuallyExclusiveOptionGroup,
                 help="Limits how requests are loaded.")
 @optgroup.option(
+    "--beam_width",
+    type=int,
+    default=1,
+    help="Number of search beams.",
+)
+@optgroup.option(
     "--concurrency",
     type=int,
     default=1,
@@ -153,7 +159,7 @@ def latency_command(
     exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
     exec_settings["settings_config"]["max_batch_size"] = 1
     exec_settings["settings_config"]["max_num_tokens"] = engine_tokens
-    exec_settings["settings_config"]["beam_width"] = 1
+    exec_settings["settings_config"]["beam_width"] = params.pop("beam_width")
     exec_settings["settings_config"]["chunking"] = False
     exec_settings["settings_config"][
         "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
