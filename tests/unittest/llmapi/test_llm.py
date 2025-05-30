@@ -1918,25 +1918,25 @@ def test_llm_get_queued_stats():
     use_overlap = False
     tp_size = 1
 
-    num_requests = 10
+    num_requests = 3000
     repeated_prompts = ["A B C D E F G H I J K L M"] * num_requests
 
     llm_args_extra = {}
     sampling_args_extra = {}
 
     from tensorrt_llm._torch import LLM as LLM_torch
+    from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 
-    llm_args_extra.update(
-        dict(enable_iter_perf_stats=True,
-             enable_iter_req_stats=enable_iter_req_stats,
-             disable_overlap_scheduler=not use_overlap))
-    LLM_CLASS = LLM_torch
+    llm_args_extra["pytorch_backend_config"] = PyTorchConfig(
+        enable_iter_perf_stats=True,
+        enable_iter_req_stats=enable_iter_req_stats,
+        disable_overlap_scheduler=not use_overlap,
+    )
 
-    llm = LLM_CLASS(model=llama_model_path,
+    llm = LLM_torch(model=llama_model_path,
                     kv_cache_config=global_kvcache_config,
                     tensor_parallel_size=tp_size,
                     fast_build=True,
-                    max_batch_size=1,
                     **llm_args_extra)
 
     max_tokens = 10
@@ -1949,9 +1949,8 @@ def test_llm_get_queued_stats():
     while not has_queue_requests and max_tries > 0:
         max_tries -= 1
         # Generate outputs, which will queue requests
-        for output in llm.generate(repeated_prompts,
-                                   sampling_params=sampling_params):
-            print(output)
+        outputs = llm.generate(repeated_prompts,
+                               sampling_params=sampling_params)
 
         results = llm.get_stats(2)
 
