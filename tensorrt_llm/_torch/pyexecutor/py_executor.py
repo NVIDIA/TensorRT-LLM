@@ -914,6 +914,9 @@ class PyExecutor:
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
+                        # Return the first token to the client
+                        self._handle_first_token_response(scheduled_batch)
+
                     batch_outputs = self._forward_step(scheduled_batch)
 
                     sample_state = self._sample_async(scheduled_batch,
@@ -1045,6 +1048,9 @@ class PyExecutor:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
+
+                        # Return the first token to the client
+                        self._handle_first_token_response(scheduled_batch)
 
                     previous_tensors_device = self.previous_batch and self.previous_batch.sample_state.device
 
@@ -1983,6 +1989,19 @@ class PyExecutor:
                         self.responses.update({req_id: [resp]})
                 self.response_cv.notify_all()
 
+    @nvtx_range("_handle_first_token_response")
+    def _handle_first_token_response(self, scheduled_batch):
+        new_responses = {}
+        for req in scheduled_batch.generation_requests:
+            if req.py_decoding_iter == 1:
+                logger.debug(
+                    f'Send first token response for request {req.py_request_id}'
+                )
+                response = req.create_response(False, self.dist.rank)
+                new_responses.update({req.py_request_id: response})
+
+        self._enqueue_responses(new_responses)
+
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
         new_responses = {}
@@ -2000,7 +2019,8 @@ class PyExecutor:
 
             if request.is_generation_only_request:
                 # If request is in transmission, so we don't need to emit a response
-                # Also, for the first iteration with overlap, we should skip since first token has already been emitted by context server
+                # Also, for the first iteration with overlap, we should skip since first
+                # token has already been emitted previously
                 if request.is_disagg_generation_transmission_in_progress or (
                         not self.disable_overlap_scheduler
                         and request.py_decoding_iter <= 1):
