@@ -1,5 +1,5 @@
 import copy
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from PIL.Image import Image
@@ -33,7 +33,8 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..speculative import Eagle3SpecMetadata, SpecMetadata
+from ..speculative import SpecMetadata, get_spec_worker
+from ..utils import Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, register_auto_model)
@@ -129,17 +130,22 @@ class Llama4Attention(Attention):
     def _forward_nope(
         self,
         position_ids: Optional[torch.LongTensor],
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
         mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
+        skip_attn_scaling: bool = False,
     ):
+
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = self.split_qkv(qkv)
-        if self.attn_temperature_tuning:
+
+        q, k, v = qkv, None, None
+        if self.attn_temperature_tuning and not skip_attn_scaling:
+            q, k, v = self.split_qkv(q, k, v)
             q = self._attention_scaling(q, position_ids)
+
         out_scale = None
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
             out_scale = self.o_proj.inv_input_scale
@@ -161,7 +167,7 @@ class Llama4Attention(Attention):
     def forward(
         self,
         position_ids: Optional[torch.LongTensor],
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
@@ -233,6 +239,18 @@ class Llama4MoE(nn.Module):
         config = model_config.pretrained_config
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.top_k = top_k
+
+        # Create shared_expert before experts because in min-latency mode the experts depend on the scaling factors of
+        # shared_expert.
+        self.shared_expert = GatedMLP(
+            hidden_size=hidden_size,
+            intermediate_size=shared_expert_intermediate_size,
+            bias=False,
+            dtype=dtype,
+            config=model_config,
+            overridden_tp_size=1 if self.enable_attention_dp else None,
+            reduce_output=False)
+
         self.experts = FusedMoE(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
             num_experts=num_experts,
@@ -244,15 +262,6 @@ class Llama4MoE(nn.Module):
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             model_config=model_config,
             apply_router_weight_on_input=True)
-
-        self.shared_expert = GatedMLP(
-            hidden_size=hidden_size,
-            intermediate_size=shared_expert_intermediate_size,
-            bias=False,
-            dtype=dtype,
-            config=model_config,
-            overridden_tp_size=1 if self.enable_attention_dp else None,
-            reduce_output=False)
 
         self.router = Linear(hidden_size,
                              num_experts,
@@ -324,6 +333,11 @@ class Llama4DecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.is_quanted = model_config.quant_config and model_config.quant_config.quant_mode.has_any_quant(
         )
+        self.is_fp8_quant = self.is_quanted and model_config.quant_config.quant_mode.has_fp8_qdq(
+        )
+        self.is_nvfp4 = self.is_quanted and model_config.quant_config.quant_mode.has_nvfp4(
+        )
+
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
 
         self.fusion_config = EagerFusionConfig()
@@ -346,9 +360,10 @@ class Llama4DecoderLayer(DecoderLayer):
             aux_stream=aux_stream,
             attention_chunk_size=attention_chunk_size)
 
-        is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0
+        self.is_mlp_layer = (layer_idx +
+                             1) % config.interleave_moe_layer_step != 0
 
-        if is_mlp_layer:
+        if self.is_mlp_layer:
             self.feed_forward = GatedMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size_mlp,
@@ -387,13 +402,14 @@ class Llama4DecoderLayer(DecoderLayer):
         self.mapping = model_config.mapping
         self.all_reduce = AllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
+        self.next_attn: LlamaAttention = None
 
         self.moe_allreduce = MoEAllReduce(self.mapping)
 
     def forward(
         self,
         position_ids: torch.LongTensor,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
@@ -448,6 +464,7 @@ class Llama4DecoderLayer(DecoderLayer):
                 or self.mapping.tp_size == 1 or self.enable_attention_dp)),
             cutlass_min_latency_mode=cutlass_min_latency_mode,
         )
+
         if spec_metadata is not None:
             # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
             # PyExecutor will extract these from the model engine's spec metadata.
@@ -613,10 +630,15 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
         )
 
+        if config.model_type == "llama4_text":
+            inter_size = config.intermediate_size_mlp
+        else:
+            inter_size = config.intermediate_size
+
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            bias=config.mlp_bias,
+            intermediate_size=inter_size,
+            bias=getattr(config, "mlp_bias", False),
             dtype=config.torch_dtype,
             config=model_config,
         )
@@ -657,7 +679,6 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
-        assert isinstance(spec_metadata, Eagle3SpecMetadata)
         # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
         # PyExecutor will extract these from the draft model engine's spec metadata.
         # They will be passed to the draft model engine on the next iteration.
@@ -676,6 +697,7 @@ class Llama4Model(DecoderModel):
         self.padding_idx = config.pad_token_id
         self.num_hidden_layers = config.num_hidden_layers
         self.aux_stream = torch.cuda.Stream()
+        self.mapping = model_config.mapping
 
         if self.model_config.mapping.enable_attention_dp:
             self.embed_tokens = Embedding(config.vocab_size,
@@ -691,8 +713,14 @@ class Llama4Model(DecoderModel):
                 gather_output=True,
             )
 
+        # If enable_min_latency is True, we will use min-latency mode.
+        DecoderLayerClass = Llama4DecoderLayer
+        if model_config.pytorch_backend_config.enable_min_latency:
+            from .modeling_llama_min_latency import Llama4MinLatencyDecoderLayer
+            DecoderLayerClass = Llama4MinLatencyDecoderLayer
+
         self.layers = nn.ModuleList([
-            Llama4DecoderLayer(
+            DecoderLayerClass(
                 model_config,
                 layer_idx,
                 self.aux_stream,
@@ -722,7 +750,8 @@ class Llama4Model(DecoderModel):
         hidden_states = inputs_embeds
         residual = None
 
-        for decoder_layer in self.layers[:self.num_hidden_layers]:
+        for idx, decoder_layer in enumerate(
+                self.layers[:self.num_hidden_layers]):
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -830,22 +859,73 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
+        self.is_eagle3_one_model = hasattr(
+            model_config, "spec_config"
+        ) and model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
+        )
+        self.draft_model = None
+        if self.is_eagle3_one_model:
+            draft_config = ModelConfig.from_pretrained(
+                model_config.spec_config.draft_model_path,
+                trust_remote_code=True,
+                attn_backend=model_config.attn_backend,
+                moe_backend=model_config.moe_backend,
+                mapping=model_config.mapping)
+            draft_config.spec_config = model_config.spec_config
+            draft_config.max_num_tokens = model_config.max_num_tokens
+            draft_config.moe_max_num_tokens = model_config.moe_max_num_tokens
+            draft_config.quant_config.kv_cache_quant_algo = \
+                model_config.quant_config.kv_cache_quant_algo
+            self.draft_model = Eagle3LlamaForCausalLM(
+                draft_config, model_config.pretrained_config.num_hidden_layers)
+            self.spec_worker = get_spec_worker(model_config.spec_config,
+                                               model_config.mapping)
 
-@register_auto_model("Llama4ForCausalLM")
-class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
-
-    def __init__(
+    def forward(
         self,
-        model_config: ModelConfig[Llama4Config],
-    ):
-        model_config = copy.copy(model_config)
-        architectures = model_config.pretrained_config.architectures
-        model_config.pretrained_config = model_config.pretrained_config.text_config
-        model_config.pretrained_config.architectures = architectures
-        super().__init__(Llama4Model(model_config),
-                         config=model_config,
-                         hidden_size=model_config.pretrained_config.hidden_size,
-                         vocab_size=model_config.pretrained_config.vocab_size)
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.LongTensor = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        hidden_states = self.model(
+            input_ids=input_ids,
+            attn_metadata=attn_metadata,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            spec_metadata=spec_metadata,
+            lora_params=lora_params,
+        )
+
+        if self.draft_model is not None:
+            # get logits
+            logits = self.logits_processor.forward(
+                hidden_states[spec_metadata.gather_ids],
+                self.lm_head,
+                attn_metadata,
+                True,
+            )
+            # get accepted tokens and next draft tokens
+            return self.spec_worker(input_ids=input_ids,
+                                    position_ids=position_ids,
+                                    hidden_states=hidden_states,
+                                    logits=logits,
+                                    attn_metadata=attn_metadata,
+                                    spec_metadata=spec_metadata,
+                                    draft_model=self.draft_model)
+        else:
+            logits = self.logits_processor.forward(
+                hidden_states,
+                self.lm_head,
+                attn_metadata,
+                return_context_logits,
+            )
+
+        return logits
 
     def infer_max_seq_len(self):
         if self.model_config.attn_backend.upper() != 'TRTLLM':
@@ -857,23 +937,11 @@ class Llama4ForCausalLM(DecoderModelForCausalLM[Llama4Model, Llama4Config]):
         return super().infer_max_seq_len()
 
     def load_weights(self, weights: Dict):
-        new_weights = {}
-        for key, tensor in weights.items():
-            if key.startswith("language_model."):
-                new_key = key[len("language_model."):]
-                new_weights[new_key] = tensor
-            else:
-                new_weights[key] = tensor
+        super().load_weights(weights, skip_modules=["draft_model"])
 
-        super().load_weights(new_weights)
-
-        for idx, layer in enumerate(
-                self.model.layers[:self.config.num_hidden_layers]):
-            if idx == self.config.num_hidden_layers - 1:
-                layer.next_layer_layernorm = self.model.norm
-            else:
-                layer.next_layer_layernorm = self.model.layers[
-                    idx + 1].input_layernorm
+    def load_draft_weights(self, weights: Dict):
+        self.draft_model.load_weights(weights)
+        self.draft_model.load_weights_from_target_model(self)
 
 
 class Llama4InputProcessor(InputProcessor):
@@ -938,31 +1006,129 @@ class Llama4InputProcessor(InputProcessor):
 
 @register_auto_model("Llama4ForConditionalGeneration")
 @register_input_processor(Llama4InputProcessor)
-class Llama4ForConditionalGeneration(Llama4ForCausalLM):
+class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
+                                                             Llama4Config]):
 
-    @torch.inference_mode()
+    def __init__(
+        self,
+        model_config: ModelConfig[Llama4Config],
+    ):
+        # TODO: figure out a better way to handle multimodality.
+        model_config = copy.copy(model_config)
+        architectures = model_config.pretrained_config.architectures
+        model_config.pretrained_config = model_config.pretrained_config.text_config
+        model_config.pretrained_config.architectures = architectures
+        super().__init__(Llama4Model(model_config),
+                         config=model_config,
+                         hidden_size=model_config.pretrained_config.hidden_size,
+                         vocab_size=model_config.pretrained_config.vocab_size)
+
+        self.is_eagle3_one_model = hasattr(
+            model_config, "spec_config"
+        ) and model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
+        )
+        self.draft_model = None
+        if self.is_eagle3_one_model:
+            draft_config = ModelConfig.from_pretrained(
+                model_config.spec_config.draft_model_path,
+                trust_remote_code=True,
+                attn_backend=model_config.attn_backend,
+                moe_backend=model_config.moe_backend,
+                mapping=model_config.mapping)
+            draft_config.spec_config = model_config.spec_config
+            draft_config.max_num_tokens = model_config.max_num_tokens
+            draft_config.moe_max_num_tokens = model_config.moe_max_num_tokens
+            draft_config.quant_config.kv_cache_quant_algo = \
+                model_config.quant_config.kv_cache_quant_algo
+            self.draft_model = Eagle3LlamaForCausalLM(
+                draft_config, model_config.pretrained_config.num_hidden_layers)
+            self.spec_worker = get_spec_worker(model_config.spec_config,
+                                               model_config.mapping)
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        return_context_logits: Optional[bool] = False,
+        return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        mm_embed = kwargs.get("multi_modal_data", [])
-        input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
-                                                     input_ids, mm_embed)
-        logits = super().forward(
-            attn_metadata,
-            input_ids,
-            position_ids,
-            inputs_embeds,
-            spec_metadata=spec_metadata,
-            return_context_logits=return_context_logits,
-        )
-        return logits
+        if self.is_eagle3_one_model:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                spec_metadata=spec_metadata,
+            )
+
+            if self.draft_model is not None:
+                # get logits
+                logits = self.logits_processor.forward(
+                    hidden_states[spec_metadata.gather_ids],
+                    self.lm_head,
+                    attn_metadata,
+                    True,
+                )
+                # get accepted tokens and next draft tokens
+                return self.spec_worker(input_ids=input_ids,
+                                        position_ids=position_ids,
+                                        hidden_states=hidden_states,
+                                        logits=logits,
+                                        attn_metadata=attn_metadata,
+                                        spec_metadata=spec_metadata,
+                                        draft_model=self.draft_model)
+            else:
+                logits = self.logits_processor.forward(
+                    hidden_states,
+                    self.lm_head,
+                    attn_metadata,
+                    return_context_logits,
+                )
+
+            return logits
+        else:
+            mm_embed = kwargs.get("multi_modal_data", [])
+            input_ids, inputs_embeds = fuse_input_embeds(
+                self.model.embed_tokens, input_ids, mm_embed)
+            logits = super().forward(
+                attn_metadata,
+                input_ids,
+                position_ids,
+                inputs_embeds,
+                spec_metadata=spec_metadata,
+                return_context_logits=return_context_logits)
+            return logits
+
+    def infer_max_seq_len(self):
+        # TODO: implement chunked attention to support 10M context length
+        return 8192
+
+    def load_weights(self, weights: Dict):
+        new_weights = {}
+        for key, tensor in weights.items():
+            if key.startswith("language_model."):
+                new_key = key[len("language_model."):]
+                new_weights[new_key] = tensor
+            else:
+                new_weights[key] = tensor
+
+        super().load_weights(new_weights, skip_modules=["draft_model"])
+
+        for idx, layer in enumerate(
+                self.model.layers[:self.config.num_hidden_layers]):
+            if idx == self.config.num_hidden_layers - 1:
+                layer.next_layer_layernorm = self.model.norm
+            else:
+                layer.next_layer_layernorm = self.model.layers[
+                    idx + 1].input_layernorm
+                layer.next_attn = self.model.layers[idx + 1].self_attn
+
+    def load_draft_weights(self, weights: Dict):
+        self.draft_model.load_weights(weights)
+        self.draft_model.load_weights_from_target_model(self)
 
 
 @register_auto_model("MistralForCausalLM")
@@ -988,12 +1154,16 @@ class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
 class Eagle3LlamaDraftModel(DecoderModel):
 
-    def __init__(self, model_config: ModelConfig[LlamaConfig]) -> None:
+    def __init__(self,
+                 model_config: ModelConfig[LlamaConfig],
+                 start_layer_idx: int = 0) -> None:
         super().__init__(model_config)
 
         config = model_config.pretrained_config
+        self.spec_config = model_config.spec_config
         self.dtype = config.torch_dtype
         self.hidden_size = config.hidden_size
+        self.mapping = model_config.mapping
 
         if hasattr(config, "target_hidden_size"):
             self.hidden_size_in = config.target_hidden_size
@@ -1002,18 +1172,19 @@ class Eagle3LlamaDraftModel(DecoderModel):
 
         self.fc = Linear(self.hidden_size_in * 3,
                          config.hidden_size,
-                         bias=False,
+                         bias=getattr(config, "bias", False),
                          dtype=config.torch_dtype)
 
-        self.midlayer = Eagle3LlamaDecoderLayer(model_config, 0)
+        self.midlayer = Eagle3LlamaDecoderLayer(model_config, start_layer_idx)
 
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
 
-        self.d2t = nn.Parameter(torch.empty((config.draft_vocab_size, ),
-                                            dtype=torch.int64),
-                                requires_grad=False)
+        if config.vocab_size != config.draft_vocab_size:
+            self.d2t = nn.Parameter(torch.empty((config.draft_vocab_size, ),
+                                                dtype=torch.int64),
+                                    requires_grad=False)
 
         if self.hidden_size_in != config.hidden_size:
             self.embed_tokens = Embedding(
@@ -1059,8 +1230,11 @@ class Eagle3LlamaDraftModel(DecoderModel):
                                                 attn_metadata=attn_metadata,
                                                 spec_metadata=spec_metadata)
 
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        hidden_states, hidden_states_to_save = self.norm(
+            hidden_states, residual)
+        if self.spec_config.spec_dec_mode.is_eagle3():
+            spec_metadata.maybe_capture_hidden_states(1, hidden_states_to_save)
+        return hidden_states, hidden_states_to_save
 
 
 @register_auto_model("EAGLE3LlamaForCausalLM")
@@ -1070,9 +1244,10 @@ class Eagle3LlamaForCausalLM(DecoderModelForCausalLM[Eagle3LlamaDraftModel,
     def __init__(
         self,
         model_config: ModelConfig[LlamaConfig],
+        start_layer_idx: int = 0,
     ):
         super().__init__(
-            Eagle3LlamaDraftModel(model_config),
+            Eagle3LlamaDraftModel(model_config, start_layer_idx),
             config=model_config,
             hidden_size=model_config.pretrained_config.hidden_size,
             vocab_size=model_config.pretrained_config.draft_vocab_size)
@@ -1088,7 +1263,7 @@ class Eagle3LlamaForCausalLM(DecoderModelForCausalLM[Eagle3LlamaDraftModel,
         hidden_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        output = self.model(
+        output, _ = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
             position_ids=position_ids,
