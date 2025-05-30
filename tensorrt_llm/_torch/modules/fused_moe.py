@@ -1402,7 +1402,7 @@ class FusedMoE(nn.Module):
         else:
             output_dtype = x.dtype
 
-        use_fp8_block_scaling = False
+        use_deepseek_fp8_block_scale = False
         use_w4a8_group_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
 
@@ -1459,7 +1459,7 @@ class FusedMoE(nn.Module):
                             False)
 
             elif self.has_fp8_block_scales:
-                use_fp8_block_scaling = True
+                use_deepseek_fp8_block_scale = True
             elif self.has_w4afp8:
                 use_w4a8_group_scaling = True
                 weight_dtype = torch.quint4x2
@@ -1521,7 +1521,7 @@ class FusedMoE(nn.Module):
             ep_rank=ep_rank,
             cluster_size=cluster_size,
             cluster_rank=cluster_rank,
-            use_fp8_block_scaling=use_fp8_block_scaling,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
             use_w4a8_group_scaling=use_w4a8_group_scaling,
             min_latency_mode=cutlass_min_latency_mode,
             tune_max_num_tokens=self.tune_max_num_tokens,
