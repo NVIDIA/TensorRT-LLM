@@ -8,100 +8,15 @@ import pickle  # nosec B403
 # it is only needed in a single instance the class can be added at runtime
 # using register_approved_ipc_class.
 BASE_ZMQ_CLASSES = {
-    "builtins": [
-        "Exception", "ValueError", "NotImplementedError", "AttributeError",
-        "AssertionError"
-    ],  # each Exception Error class needs to be added explicitly
-    "collections": ["OrderedDict"],
-    "datetime": ["timedelta"],
-    "pathlib": ["PosixPath"],
-    "llmapi.run_llm_with_postproc": ["perform_faked_oai_postprocess"
-                                     ],  # only used in tests
+    "builtins":
+    ["*"],  # each Exception Error class needs to be added explicitly
+    "collections": ["*"],
+    "datetime": ["*"],
+    "pathlib": ["*"],
+    "llmapi.run_llm_with_postproc": ["*"],  # only used in tests
     ### starting import of torch models classes. They are used in test_llm_multi_gpu.py.
-    "tensorrt_llm._torch.models.modeling_bert":
-    ["BertForSequenceClassification"],
-    "tensorrt_llm._torch.models.modeling_clip": ["CLIPVisionModel"],
-    "tensorrt_llm._torch.models.modeling_deepseekv3": ["DeepseekV3ForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_gemma3": ["Gemma3ForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_llama": [
-        "Eagle3LlamaForCausalLM",
-        "LlamaForCausalLM",
-        "Llama4ForCausalLM",
-        "Llama4ForConditionalGeneration",
-    ],
-    "tensorrt_llm._torch.models.modeling_llava_next": ["LlavaNextModel"],
-    "tensorrt_llm._torch.models.modeling_mistral": ["MistralForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_mixtral": ["MixtralForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_mllama":
-    ["MllamaForConditionalGeneration"],
-    "tensorrt_llm._torch.models.modeling_nemotron": ["NemotronForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_nemotron_h": ["NemotronHForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_nemotron_nas":
-    ["NemotronNASForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_qwen":
-    ["Qwen2ForCausalLM", "Qwen2ForProcessRewardModel", "Qwen2ForRewardModel"],
-    "tensorrt_llm._torch.models.modeling_qwen2vl":
-    ["Qwen2VLModel", "Qwen2_5_VLModel"],
-    "tensorrt_llm._torch.models.modeling_qwen3": ["Qwen3ForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_qwen3_moe": ["Qwen3MoeForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_qwen_moe": ["Qwen2MoeForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_siglip": ["SiglipVisionModel"],
-    "tensorrt_llm._torch.models.modeling_vila": ["VilaModel"],
-    ### ending import of torch models classes
-    "tensorrt_llm._torch.pyexecutor.llm_request":
-    ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
-    "tensorrt_llm.auto_parallel.config": ["AutoParallelConfig", "CostModel"],
-    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
-    "tensorrt_llm.bindings.executor": [
-        "BatchingType", "CapacitySchedulerPolicy", "ContextPhaseParams",
-        "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
-        "FinishReason", "KvCacheConfig", "KvCacheTransferMode",
-        "KvCacheRetentionConfig",
-        "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
-        "SchedulerConfig", "DynamicBatchConfig"
-    ],
-    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig"],
-    "tensorrt_llm.builder": ["BuildConfig"],
-    "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
-    "tensorrt_llm.executor.postproc_worker": [
-        "PostprocArgs", "PostprocParams", "PostprocWorkerConfig",
-        "PostprocWorker.Input", "PostprocWorker.Output"
-    ],
-    "tensorrt_llm.executor.request": [
-        "CancellingRequest", "GenerationRequest", "LoRARequest",
-        "PromptAdapterRequest"
-    ],
-    "tensorrt_llm.executor.result": [
-        "CompletionOutput", "DetokenizedGenerationResultBase",
-        "GenerationResult", "GenerationResultBase", "IterationResult",
-        "Logprob", "LogProbsResult", "ResponseWrapper"
-    ],
-    "tensorrt_llm.executor.utils": ["ErrorResponse", "WorkerCommIpcAddrs"],
-    "tensorrt_llm.executor.worker": ["GenerationExecutorWorker", "worker_main"],
-    "tensorrt_llm.llmapi.llm_args": [
-        "_ModelFormatKind", "_ParallelConfig", "CalibConfig",
-        "CapacitySchedulerPolicy", "KvCacheConfig", "LookaheadDecodingConfig",
-        "TrtLlmArgs", "SchedulerConfig", "LoadFormat"
-    ],
-    "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
-    "tensorrt_llm.llmapi.llm_utils":
-    ["CachedModelLoader._node_build_task", "LlmBuildStats"],
-    "tensorrt_llm.llmapi.tokenizer": ["TransformersTokenizer"],
-    "tensorrt_llm.lora_manager": ["LoraConfig"],
-    "tensorrt_llm.mapping": ["Mapping"],
-    "tensorrt_llm.models.modeling_utils":
-    ["QuantConfig", "SpeculativeDecodingMode"],
-    "tensorrt_llm.plugin.plugin": ["PluginConfig"],
-    "tensorrt_llm.sampling_params":
-    ["SamplingParams", "GuidedDecodingParams", "GreedyDecodingParams"],
-    "tensorrt_llm.serve.postprocess_handlers": [
-        "chat_response_post_processor", "chat_stream_post_processor",
-        "completion_stream_post_processor",
-        "completion_response_post_processor", "CompletionPostprocArgs",
-        "ChatPostprocArgs"
-    ],
-    "torch._utils": ["_rebuild_tensor_v2"],
-    "torch.storage": ["_load_from_bytes"],
+    "tensorrt_llm.*": ["*"],
+    "torch.*": ["*"],
 }
 
 
@@ -127,13 +42,23 @@ class Unpickler(pickle.Unpickler):
 
     # only import approved classes, this is the security boundary.
     def find_class(self, module, name):
-        if name not in self.approved_imports.get(module, []):
-            # If this is triggered when it shouldn't be, then the module
-            # and class should be added to the approved_imports. If the class
-            # is being used as part of a routine scenario, then it should be added
-            # to the appropriate base classes above.
-            raise ValueError(f"Import {module} | {name} is not allowed")
-        return super().find_class(module, name)
+        # First check for exact module match
+        if module in self.approved_imports:
+            if name in self.approved_imports[
+                    module] or "*" in self.approved_imports[module]:
+                return super().find_class(module, name)
+
+        # Then check for wildcard module patterns
+        for approved_module, approved_names in self.approved_imports.items():
+            if approved_module.endswith(".*"):
+                # Convert pattern to prefix for matching
+                module_prefix = approved_module[:-2]  # Remove ".*"
+                if module.startswith(module_prefix):
+                    if "*" in approved_names or name in approved_names:
+                        return super().find_class(module, name)
+
+        # If we get here, the import was not approved
+        raise ValueError(f"Import {module} | {name} is not allowed")
 
 
 # these are taken from the pickle module to allow for this to be a drop in replacement
