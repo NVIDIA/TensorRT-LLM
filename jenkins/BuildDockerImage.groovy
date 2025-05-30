@@ -485,65 +485,68 @@ pipeline {
             }
             steps {
                 script {
-                    // 安装wget工具
-                    trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get install -y wget")
-                    // 轮询检查构建产物文件是否存在
-                    def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
-                    def requiredFiles = [
-                        "TensorRT-LLM-GH200.tar.gz",
-                        "tensorrt-llm-release-src-",
-                        "tensorrt-llm-sbsa-release-src-",
-                        "TensorRT-LLM.tar.gz"
-                    ]
-                    def maxWaitMinutes = 180
-                    def pollIntervalSeconds = 60
+                    collectResultPodSpec = createKubernetesPodConfig("", "agent")
+                    trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
+                        // 安装wget工具
+                        trtllm_utils.llmExecStepWithRetry(this, script: "apk add --no-cache wget")
+                        // 轮询检查构建产物文件是否存在
+                        def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
+                        def requiredFiles = [
+                            "TensorRT-LLM-GH200.tar.gz",
+                            "tensorrt-llm-release-src-",
+                            "tensorrt-llm-sbsa-release-src-",
+                            "TensorRT-LLM.tar.gz"
+                        ]
+                        def maxWaitMinutes = 180
+                        def pollIntervalSeconds = 60
 
-                    echo "开始等待构建产物文件..."
-                    echo "需要等待的文件: ${requiredFiles}"
-                    echo "检查路径: ${artifactBaseUrl}"
+                        echo "开始等待构建产物文件..."
+                        echo "需要等待的文件: ${requiredFiles}"
+                        echo "检查路径: ${artifactBaseUrl}"
 
-                    def startTime = System.currentTimeMillis()
-                    def maxWaitMs = maxWaitMinutes * 60 * 1000
+                        def startTime = System.currentTimeMillis()
+                        def maxWaitMs = maxWaitMinutes * 60 * 1000
 
-                    while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
-                        def missingFiles = []
+                        while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
+                            def missingFiles = []
 
-                        try {
-                            // 只下载一次目录索引
-                            trtllm_utils.llmExecStepWithRetry(this, script: "wget ${artifactBaseUrl} -O index.html", allowStepFailed: true)
-                            def indexContent = sh(script: "cat index.html 2>/dev/null || echo ''", returnStdout: true).trim()
+                            try {
+                                // 只下载一次目录索引
+                                trtllm_utils.llmExecStepWithRetry(this, script: "wget ${artifactBaseUrl} -O index.html", allowStepFailed: true)
+                                def indexContent = sh(script: "cat index.html 2>/dev/null || echo ''", returnStdout: true).trim()
 
-                            // 检查所有需要的文件
-                            for (file in requiredFiles) {
-                                if (!indexContent.contains(file)) {
-                                    missingFiles.add(file)
+                                // 检查所有需要的文件
+                                for (file in requiredFiles) {
+                                    if (!indexContent.contains(file)) {
+                                        missingFiles.add(file)
+                                    }
                                 }
+
+                                // 删除index文件
+                                sh(script: "rm -f index.html", returnStdout: false)
+
+                            } catch (Exception e) {
+                                echo "检查构建产物时出错: ${e.message}"
+                                // 如果出错，假设所有文件都缺失
+                                missingFiles = requiredFiles.clone()
+                                // 确保删除可能存在的index文件
+                                sh(script: "rm -f index.html", returnStdout: false)
                             }
 
-                            // 删除index文件
-                            sh(script: "rm -f index.html", returnStdout: false)
+                            if (missingFiles.isEmpty()) {
+                                echo "所有构建产物文件都已就绪!"
+                                return
+                            }
 
-                        } catch (Exception e) {
-                            echo "检查构建产物时出错: ${e.message}"
-                            // 如果出错，假设所有文件都缺失
-                            missingFiles = requiredFiles.clone()
-                            // 确保删除可能存在的index文件
-                            sh(script: "rm -f index.html", returnStdout: false)
-                        }
-
-                        if (missingFiles.isEmpty()) {
-                            echo "所有构建产物文件都已就绪!"
-                            return
+                            def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                            echo "等待中... (已等待 ${elapsedMinutes.intValue()} 分钟)"
+                            echo "缺失的文件: ${missingFiles}"
+                            sleep(pollIntervalSeconds)
                         }
 
                         def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                        echo "等待中... (已等待 ${elapsedMinutes.intValue()} 分钟)"
-                        echo "缺失的文件: ${missingFiles}"
-                        sleep(pollIntervalSeconds)
-                    }
-
-                    def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                    error "等待构建产物超时 (${elapsedMinutes.intValue()} 分钟)，部分文件仍未就绪"
+                        error "等待构建产物超时 (${elapsedMinutes.intValue()} 分钟)，部分文件仍未就绪"
+                    })
                 }
             }
         }
