@@ -16,6 +16,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
+from ..._utils import get_sm_version
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
 from ...sampling_params import SamplingParams
@@ -936,15 +937,6 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
         return logits
 
-    def infer_max_seq_len(self):
-        if self.model_config.attn_backend.upper() != 'TRTLLM':
-            logger.warning(
-                f"Attention backend {self.model_config.attn_backend} "
-                "does not support chunked attention. Sequence length "
-                "will be limited to 8192.")
-            return 8192
-        return super().infer_max_seq_len()
-
     def load_weights(self, weights: Dict):
         super().load_weights(weights, skip_modules=["draft_model"])
 
@@ -1112,8 +1104,20 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
             return logits
 
     def infer_max_seq_len(self):
-        # TODO: implement chunked attention to support 10M context length
-        return 8192
+        if self.model_config.attn_backend.upper() != 'TRTLLM':
+            logger.warning(
+                f"Attention backend {self.model_config.attn_backend} "
+                "does not support chunked attention. Sequence length "
+                "will be limited to 8192.")
+            return 8192
+
+        elif get_sm_version() != 90:
+            logger.warning(
+                "Chunked attention only supported on Hopper, max_seq_len will be set to 8192."
+            )
+            return 8192
+
+        return super().infer_max_seq_len()
 
     def load_weights(self, weights: Dict):
         new_weights = {}
