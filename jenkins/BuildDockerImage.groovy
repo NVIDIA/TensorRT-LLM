@@ -481,6 +481,7 @@ pipeline {
                     String globalVarsJson = writeJSON returnText: true, json: globalVars
                     def parameters = getCommonParameters()
                     parameters += [
+                        'enableFailFast': false,
                         'branch': LLM_BRANCH,
                         'globalVars': globalVarsJson,
                         'targetArch': "aarch64-linux-gnu",
