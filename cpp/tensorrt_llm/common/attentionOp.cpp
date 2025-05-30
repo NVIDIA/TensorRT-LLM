@@ -203,6 +203,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     }
     else if (mKVCacheQuantMode.hasFp8KvCache())
     {
+        xqaParams.data_type = DATA_TYPE_E4M3;
         xqaParams.kv_cache_data_type = DATA_TYPE_E4M3;
     }
     else

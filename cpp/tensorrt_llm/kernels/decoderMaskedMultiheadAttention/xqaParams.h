@@ -173,6 +173,11 @@ struct XQAParams
 
         return ss.str();
     }
+
+    bool isMLA() const
+    {
+        return head_size == 576 && num_q_heads == 128 && num_kv_heads == 1;
+    }
 };
 
 } // namespace kernels

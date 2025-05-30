@@ -71,7 +71,7 @@ std::string getMacroFlag(std::string const& name, std::string const& value)
 std::string getSMFlag(int SM)
 {
     std::string smStr = std::to_string(SM);
-    if (SM == 90)
+    if (SM == 90 || SM == 120)
     {
         smStr += "a";
     }

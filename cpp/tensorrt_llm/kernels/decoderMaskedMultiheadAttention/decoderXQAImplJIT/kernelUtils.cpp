@@ -15,6 +15,8 @@
  */
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/common/utils.h"
+#include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include <list>
 
 namespace tensorrt_llm
 {
@@ -178,7 +180,7 @@ bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugi
     {
         return false;
     }
-    if (!contains({DATA_TYPE_FP16, DATA_TYPE_BF16}, xqaParams.data_type))
+    if (xqaParams.data_type != DATA_TYPE_E4M3)
     {
         return false;
     }
@@ -190,11 +192,7 @@ bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugi
     {
         return false;
     }
-    if (xqaParams.head_size != 576)
-    {
-        return false;
-    }
-    if (xqaParams.num_q_heads != 128 || xqaParams.num_kv_heads != 1)
+    if (!xqaParams.isMLA())
     {
         return false;
     }

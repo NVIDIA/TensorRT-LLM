@@ -67,7 +67,7 @@ bool DecoderXQAImplJIT::mayHavePerfGain(XQAParams const& xqaParams) const
     {
         return true;
     }
-    if (xqaParams.head_size == 576 && xqaParams.num_q_heads == 128 && xqaParams.num_kv_heads == 1) // MLA
+    if (xqaParams.isMLA())
     {
         return true;
     }

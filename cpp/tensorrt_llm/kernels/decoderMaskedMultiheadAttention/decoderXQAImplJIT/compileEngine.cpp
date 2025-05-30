@@ -98,8 +98,8 @@ CubinObj CompileEngine::compile() const
         /*paged_kv_cache=*/mXqaParams.paged_kv_cache,
         /*data_type=*/static_cast<int>(mXqaParams.data_type),
         /*kv_cache_data_type=*/static_cast<int>(mXqaParams.kv_cache_data_type),
-        /*kernel_type=*/mXqaParams.head_size == 576 ? TLLM_XQA_JIT_MLA
-                                                    : (useQGMMAKernel ? TLLM_XQA_JIT_QGMMA : TLLM_XQA_JIT_HMMA),
+        /*kernel_type=*/mXqaParams.isMLA() ? TLLM_XQA_JIT_MLA
+                                           : (useQGMMAKernel ? TLLM_XQA_JIT_QGMMA : TLLM_XQA_JIT_HMMA),
         /*fp8_output=*/mXqaParams.is_fp8_output,
         // If applyRoPEInXqaKernel, no scratch is needed for storing intermediate RoPE result. Use input KV instead of
         // scratch in this case.
