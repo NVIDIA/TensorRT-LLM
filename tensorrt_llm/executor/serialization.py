@@ -50,13 +50,16 @@ BASE_ZMQ_CLASSES = {
     ### ending import of torch models classes
     "tensorrt_llm._torch.pyexecutor.llm_request":
     ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
+    "tensorrt_llm._torch.speculative.mtp": ["MTPConfig"],
+    "tensorrt_llm._torch.speculative.interface": ["SpeculativeDecodingMode"],
+    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm.auto_parallel.config": ["AutoParallelConfig", "CostModel"],
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm.bindings.executor": [
         "BatchingType", "CapacitySchedulerPolicy", "ContextPhaseParams",
         "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
         "FinishReason", "KvCacheConfig", "KvCacheTransferMode",
-        "KvCacheRetentionConfig",
+        "KvCacheRetentionConfig", "CacheTransceiverConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig", "DynamicBatchConfig"
     ],
