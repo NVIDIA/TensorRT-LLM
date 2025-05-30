@@ -433,7 +433,6 @@ accuracy/test_cli_flow.py::TestMixtral8x22B::test_int8_plugin_tp8[renormalize-te
 test_e2e.py::test_ptp_quickstart_advanced_8gpus[Nemotron-Ultra-253B-nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1] SKIP (https://nvbugs/5273697)
 examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoder] SKIP (https://nvbugs/5144931)
 examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoderplus] SKIP (https://nvbugs/5144931)
-unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)" SKIP (https://nvbugs/5280806)
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/5244570)
 unittest/_torch/speculative/test_eagle3.py SKIP (https://nvbugs/5280806)
 triton_server/test_triton_rcca.py::test_mistral_beam_search[rcca_4714407-True-10-False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-guaranteed_no_evict-1-1-1-False-ensemble] SKIP (https://nvbugs/5240060)
