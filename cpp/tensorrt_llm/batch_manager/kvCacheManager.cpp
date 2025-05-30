@@ -2200,9 +2200,10 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
     }
 
     BlocksPerWindow windowSizeToBlocks;
-    for (auto const windowSize : localWindowSizes)
+    for (size_t i = 0; i < localWindowSizes.size(); ++i)
     {
-        windowSizeToBlocks[windowSize] = std::make_tuple(blocksPrimary.at(windowSize), blocksSecondary.at(windowSize));
+        auto const windowSize = localWindowSizes.at(i);
+        windowSizeToBlocks[windowSize] = {blocksPrimary.at(i), blocksSecondary.at(i)};
     }
     return windowSizeToBlocks;
 }
