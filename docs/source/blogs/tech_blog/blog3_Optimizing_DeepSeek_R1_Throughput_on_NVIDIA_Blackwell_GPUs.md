@@ -7,7 +7,7 @@ By NVIDIA TensorRT-LLM team
   - [Parallel strategy](#parallel-strategy)
     - [Weights absorb and MQA](#weights-absorb-and-mqa)
     - [Data Parallel for Attention module (ADP)](#data-parallel-for-attention-module-adp)
-    - [Expert parallel for MOE (EP)](#expert-parallel-for-moe-ep)
+    - [Expert parallel for MoE (EP)](#expert-parallel-for-moe-ep)
   - [MLA Layers Optimizations](#mla-layers-optimizations)
   - [MoE Layers Optimizations](#moe-layers-optimizations)
   - [Runtime Optimizations](#runtime-optimizations)
@@ -31,15 +31,15 @@ The checkpoint used in this blog is hosted in [nvidia/DeepSeek-R1-FP4](https://h
 
 | Precision | GPQA Diamond | MATH-500
 | :-- | :-- | :-- |
-| TRTLLM FP8 | 0.697	| 0.954 |
-| TRTLLM FP4 | 0.705	| 0.96 |
+| TensorRT-LLM FP8 | 0.697	| 0.954 |
+| TensorRT-LLM FP4 | 0.705	| 0.96 |
 
 ** Note there are some run-to-run variance for these evaluations, so FP4 data is slight higher here. We think FP4 has comparable accuracy with FP8 on these datasets.
 
 The MoE layers inside this checkpoint have been quantized into FP4. Quantizing the MoE layer weights into FP4 has the following benefits:
 
 * Fully utilize the 5th generation Tensor Core FLOPS of the NVIDIA Blackwell GPUs
-* Reduce the memory load needs of the weights by almost half for MoE. Since the MOE parts are still memory bound for the decoding phase for the scenario, and 97% of the weights in the DeepSeek R1 model are from MOE layers.
+* Reduce the memory load needs of the weights by almost half for MoE. Since the MoE parts are still memory bound for the decoding phase for the scenario, and 97% of the weights in the DeepSeek R1 model are from MoE layers.
 * Reduce the memory footprint of the model weights, thus freeing more GPU memories for KV cache and then increasing the max concurrency. [The original FP8 model checkpoint of the DeepSeek R1 model](https://huggingface.co/deepseek-ai/DeepSeek-R1) is about 640GB, while the NVIDIA provided [DeepSeek R1 FP4 quantized model](https://huggingface.co/nvidia/DeepSeek-R1-FP4) is only about 400 GB.
 
 The precision of FP8 KV cache and FP8 attention kernels are evaluated on the GSM8K dataset, with no obvious accuracy drops. For the accuracy numbers, please see the table in the FP8 KV cache section. Users can still opt-out to use BF16 KV cache and attention if on their dataset some accuracy differences are observed.
@@ -75,7 +75,7 @@ For DeepSeek R1 FP4 checkpoint with 8 B200 GPUs, the weights and activation occu
 
 Silicon experiments show the attention DP technique provides a significant **400% speedup** in the max throughput cases, when keeping all other factors the same.
 
-### Expert parallel for MOE (EP)
+### Expert parallel for MoE (EP)
 
 The DeepSeek R1 MoE design features 256 small sparse experts and 1 shared expert, the GEMM problem size of these experts are as follows.
 
