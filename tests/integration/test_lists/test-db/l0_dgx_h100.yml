@@ -202,6 +202,8 @@ l0_dgx_h100:
   - unittest/llmapi/test_llm_multi_gpu.py -m "not (gpu2 or gpu4)"
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:2-nb:1-enable_fp8]
   - llmapi/test_llm_e2e.py::test_llmapi_exit_multi_gpu
+  - test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b]
+  - test_e2e.py::test_trtllm_bench_llmapi_launch[trt_backend-llama-v3-llama3-8b]
   - examples/test_nemotron_nas.py::test_nemotron_nas_summary_2gpu[DeciLM-7B]
   - llmapi/test_llm_examples.py::test_llmapi_example_distributed_tp2
   - unittest/trt/functional/test_allreduce_norm.py
@@ -243,5 +245,4 @@ l0_dgx_h100:
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:2-pp:2-nb:1-disable_fp8]
   - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_py_session-tp2]
   - unittest/llmapi/apps/_test_openai_multi_gpu.py -m "part0"
-  - test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b]
-  - test_e2e.py::test_trtllm_bench_llmapi_launch[trt_backend-llama-v3-llama3-8b]
+  - test_e2e.py::test_trtllm_bench_mgmn

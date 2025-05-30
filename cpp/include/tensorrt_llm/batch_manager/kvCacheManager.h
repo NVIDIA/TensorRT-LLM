@@ -742,6 +742,10 @@ private:
     SizeType32 loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
         GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions);
 
+    //! \brief Free block and all it's descendants. This makes block a claimed leaf block.
+    void freeChildren(BlockPtr const& block, executor::RetentionPriority priority,
+        std::optional<std::chrono::milliseconds> durationMs);
+
     //! \brief Find block least likely to be reused, free it if necessary and return.
     [[nodiscard]] BlockPtr getFreeBlock(
         executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,

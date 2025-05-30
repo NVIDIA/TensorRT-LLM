@@ -250,8 +250,8 @@ template <typename LayoutIndexType>
 void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d, float* scales_a,
     float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, uint32_t block_m, uint32_t block_n,
     uint32_t block_k, uint32_t num_groups, uint32_t num_tma_multicast, GemmType gemm_type,
-    LayoutIndexType* problem_m_offsets, LayoutIndexType* problem_m_padded_offsets, cudaStream_t stream, int num_sms,
-    uint32_t smem_size, uint32_t max_shape_m_padded)
+    LayoutIndexType* problem_m_offsets, cudaStream_t stream, int num_sms, uint32_t smem_size,
+    uint32_t max_shape_m_padded)
 {
     auto tma_a_desc = make_2d_tma_a_desc(
         reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m, block_k, num_groups, gemm_type);
@@ -281,7 +281,6 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
 
     GroupedWithOffsetSchedulerInput input;
     input.problem_m_offsets = problem_m_offsets;
-    input.problem_m_padded_offsets = problem_m_padded_offsets;
 
     // Launch
     auto status = cudaLaunchKernelEx(&config, kernel, reinterpret_cast<__nv_bfloat16*>(mat_d), scales_b, input,
@@ -293,9 +292,8 @@ template <typename LayoutIndexType>
 void runGemmSwapAB(cudaKernel_t kernel, void* mat_a /* weight*/, int ld_a, void* mat_b /* act*/, int ld_b, void* mat_d,
     int ld_d, float* scales_a /* weight scales*/, float* scales_b /* act scales*/, uint32_t shape_m, uint32_t shape_n,
     uint32_t shape_k, uint32_t block_m, uint32_t block_n, uint32_t block_k, uint32_t num_groups,
-    uint32_t num_tma_multicast, GemmType gemm_type, LayoutIndexType* problem_n_offsets,
-    LayoutIndexType* problem_n_padded_offsets, cudaStream_t stream, int num_sms, uint32_t smem_size,
-    uint32_t max_shape_n_padded)
+    uint32_t num_tma_multicast, GemmType gemm_type, LayoutIndexType* problem_n_offsets, cudaStream_t stream,
+    int num_sms, uint32_t smem_size, uint32_t max_shape_n_padded)
 {
     // Create tensor mappings using swapAB version functions, note the parameter order
     auto tma_a_desc = make_2d_tma_a_desc_swapAB(
@@ -327,7 +325,6 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a /* weight*/, int ld_a, void*
     // Update input structure to use N dimension offsets
     GroupedWithOffsetSchedulerInputSwapAB input;
     input.problem_n_offsets = problem_n_offsets; // Now offsets are for N dimension
-    input.problem_n_padded_4_offsets = problem_n_padded_offsets;
 
     auto status = cudaLaunchKernelEx(&config, kernel, reinterpret_cast<__nv_bfloat16*>(mat_d), scales_a, input,
         tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc);

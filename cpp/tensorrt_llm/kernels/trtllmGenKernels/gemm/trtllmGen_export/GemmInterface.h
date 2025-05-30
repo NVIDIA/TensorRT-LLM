@@ -444,7 +444,9 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
 
     // Run the kernel.
     auto result = trtllm::gen::launchKernel((void*) &kernelParams, cudaStream, config.mSharedMemSize, cuFunction,
-        block3, grid3, cluster3, config.mOptions.mGridWaitForPrimary);
+        block3, grid3, cluster3,
+        config.mOptions.mGridWaitForPrimaryEarlyExit | config.mOptions.mGridWaitForPrimaryA
+            | config.mOptions.mGridWaitForPrimaryB);
     if (result != CUDA_SUCCESS)
     {
         return -1;

@@ -127,15 +127,15 @@ public:
         bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, mpi::MpiComm const& commSession, int root);
 
 private:
-    std::shared_ptr<mpi::MpiRequest> mRequest1;
-    std::shared_ptr<mpi::MpiRequest> mRequest2;
-    std::shared_ptr<mpi::MpiRequest> mRequest3;
-    std::shared_ptr<mpi::MpiRequest> mRequest4;
-    std::shared_ptr<mpi::MpiRequest> mRequest5;
-    std::shared_ptr<mpi::MpiRequest> mRequest6;
-    std::shared_ptr<mpi::MpiRequest> mRequest7;
-    std::shared_ptr<mpi::MpiRequest> mRequest8;
-    std::shared_ptr<mpi::MpiRequest> mRequest9;
+    std::unique_ptr<mpi::MpiRequest> mRequest1;
+    std::unique_ptr<mpi::MpiRequest> mRequest2;
+    std::unique_ptr<mpi::MpiRequest> mRequest3;
+    std::unique_ptr<mpi::MpiRequest> mRequest4;
+    std::unique_ptr<mpi::MpiRequest> mRequest5;
+    std::unique_ptr<mpi::MpiRequest> mRequest6;
+    std::unique_ptr<mpi::MpiRequest> mRequest7;
+    std::unique_ptr<mpi::MpiRequest> mRequest8;
+    std::unique_ptr<mpi::MpiRequest> mRequest9;
 };
 
 class SlotDecoderBuffers
@@ -174,10 +174,10 @@ public:
         SlotDecoderBuffers const& slotDecoderBuffers, bool returnLogProbs, mpi::MpiComm const& commSession, int peer);
 
 private:
-    std::shared_ptr<mpi::MpiRequest> mRequest1;
-    std::shared_ptr<mpi::MpiRequest> mRequest2;
-    std::shared_ptr<mpi::MpiRequest> mRequest3;
-    std::shared_ptr<mpi::MpiRequest> mRequest4;
+    std::unique_ptr<mpi::MpiRequest> mRequest1;
+    std::unique_ptr<mpi::MpiRequest> mRequest2;
+    std::unique_ptr<mpi::MpiRequest> mRequest3;
+    std::unique_ptr<mpi::MpiRequest> mRequest4;
 };
 
 } // namespace tensorrt_llm::batch_manager

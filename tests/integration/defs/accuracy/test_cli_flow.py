@@ -466,6 +466,33 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
                  ],
                  extra_summarize_args=extra_summarize_args)
 
+    @skip_post_blackwell
+    @parametrize_with_ids("cuda_graph,chunked_context", [(False, False),
+                                                         (True, True),
+                                                         (True, False)])
+    def test_eagle_2(self, cuda_graph, chunked_context, mocker):
+        mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "eagle")
+        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
+
+        extra_summarize_args = [
+            "--eagle_use_dynamic_tree", "--eagle_dynamic_tree_max_top_k=10"
+        ]
+        if cuda_graph:
+            extra_summarize_args.append("--cuda_graph_mode")
+        if chunked_context:
+            extra_summarize_args.append("--enable_chunked_context")
+
+        self.run(spec_dec_algo=EagleDecodingConfig.decoding_type,
+                 extra_convert_args=[
+                     f"--eagle_model_dir={self.EAGLE_MODEL_PATH}",
+                     "--max_draft_len=63", "--num_eagle_layers=4",
+                     "--max_non_leaves_per_layer=10"
+                 ],
+                 extra_build_args=[
+                     "--speculative_decoding_mode=eagle", "--max_draft_len=63"
+                 ],
+                 extra_summarize_args=extra_summarize_args)
+
 
 class TestLlama7B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "llama-7b-hf"

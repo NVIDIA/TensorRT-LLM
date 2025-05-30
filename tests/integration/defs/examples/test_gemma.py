@@ -80,6 +80,7 @@ VSWA_MODELS = VSWA_ATTENTION.keys()
 GEMMA2_MODELS = {GEMMA_2_9B_IT, GEMMA_2_27B_IT}
 
 
+@skip_pre_hopper
 @skip_post_blackwell
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("data_type", ['bfloat16'])

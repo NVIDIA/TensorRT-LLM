@@ -4,7 +4,7 @@ import copy
 import json
 import os
 import subprocess
-from typing import List, Optional, Tuple
+from typing import Generator, List, Optional, Tuple
 
 import aiohttp
 import pytest
@@ -40,7 +40,7 @@ def run_disaggregated_workers(
     env: Optional[dict] = None,
     cwd: Optional[str] = None,
     num_ranks: Optional[int] = None
-) -> Tuple[subprocess.Popen, List[str], List[str]]:
+) -> Tuple[Generator[subprocess.Popen, None, None], List[str], List[str]]:
 
     ctx_servers, gen_servers = get_ctx_gen_server_urls_from_cfg(config_file)
 
@@ -424,7 +424,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             # send a dummy request for initialization
             dummy_request = {
                 "model": MODEL_NAME,
-                "prompt": [3] * 100,
+                "prompt": [3] * 200,
                 "max_tokens": 1,
                 "ignore_eos": True,
                 "temperature": 0.0,
@@ -509,10 +509,14 @@ def background_workers(llm_venv, config_file: str, num_ranks: int = None):
             env=llm_venv._new_env,
             cwd=cwd,
             num_ranks=num_ranks)
-        with workers_proc as proc:
-            yield ctx_servers, gen_servers
-            proc.terminate()
-            proc.wait()
+        try:
+            with workers_proc as proc:
+                yield ctx_servers, gen_servers
+        except Exception:
+            log_file.seek(0)
+            logger.error("-------- Worker output --------")
+            logger.error(log_file.read())
+            raise
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -552,7 +556,6 @@ def test_workers_kv_cache_events(disaggregated_test_root,
 def test_workers_kv_cache_aware_router(disaggregated_test_root,
                                        disaggregated_example_root, llm_venv,
                                        llama_model_root):
-    pytest.skip("https://nvbugspro.nvidia.com/bug/5301492")
     config_file = os.path.join(
         disaggregated_test_root,
         'test_configs/disagg_config_cache_aware_balance.yaml')
@@ -562,7 +565,7 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
                             4) as (ctx_servers, gen_servers):
         tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
-        asyncio.run(tester.test_multi_round_request(prompts, 6, 4))
+        asyncio.run(tester.test_multi_round_request(prompts, 16, 4))
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],

@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 
@@ -9,10 +8,9 @@ from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 @dataclass
 class DraftTargetConfig(SpecConfig):
     spec_dec_name: str = "DRAFT_TARGET"
-    pytorch_weights_path: Optional[str] = None
 
     def __post_init__(self):
-        if self.pytorch_weights_path is None:
+        if self.draft_model_path is None:
             raise ValueError("Path to Draft weights must be specified.")
 
         self.spec_dec_mode = SpeculativeDecodingMode.from_string(

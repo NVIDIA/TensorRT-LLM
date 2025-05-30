@@ -240,6 +240,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     num_eagle_layers: Optional[int] = None
     max_non_leaves_per_layer: Optional[int] = None
     pytorch_weights_path: Optional[str] = None
+    eagle3_one_model: Optional[bool] = True
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1216,8 +1217,10 @@ class BaseLlmArgs(BaseModel):
                     from tensorrt_llm._torch.speculative import Eagle3Config
                     self.speculative_config = Eagle3Config(
                         max_draft_tokens=self.speculative_config.max_draft_len,
-                        pytorch_weights_path=self.speculative_config.
-                        pytorch_weights_path)
+                        draft_model_path=self.speculative_config.
+                        pytorch_weights_path,
+                        eagle3_one_model=self.speculative_config.
+                        eagle3_one_model)
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
                 assert self.backend == 'pytorch'
@@ -1241,7 +1244,7 @@ class BaseLlmArgs(BaseModel):
                 from tensorrt_llm._torch.speculative import DraftTargetConfig
                 self.speculative_config = DraftTargetConfig(
                     max_draft_tokens=self.speculative_config.max_draft_len,
-                    pytorch_weights_path=self.speculative_config.
+                    draft_model_path=self.speculative_config.
                     pytorch_weights_path)
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 from tensorrt_llm._torch.speculative import MTPConfig
@@ -1595,6 +1598,12 @@ class TorchLlmArgs(BaseLlmArgs):
         "How to load the model weights. By default, detect the weight type from the model checkpoint."
     )
 
+    enable_min_latency: bool = Field(
+        default=False,
+        description=
+        "If true, enable min-latency mode. Currently only used for Llama4.",
+    )
+
     @field_validator('load_format', mode='before')
     @classmethod
     def convert_load_format(cls, v):
@@ -1680,7 +1689,8 @@ class TorchLlmArgs(BaseLlmArgs):
             torch_compile_enable_userbuffers,
             autotuner_enabled=self.autotuner_enabled,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
-            load_format=self.load_format)
+            load_format=self.load_format,
+            enable_min_latency=self.enable_min_latency)
 
     @field_validator('cuda_graph_max_batch_size')
     @classmethod
