@@ -433,9 +433,11 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             )
             self.max_draft_len = spec_config.max_draft_tokens
+            self.is_ngram = self.spec_config.spec_dec_mode.is_ngram()
         else:
             self.without_logits = False
             self.max_draft_len = 0
+            self.is_ngram = False
         self.iter_counter = 0
 
         # We look up this key in resource_manager during forward to find the
@@ -1081,6 +1083,9 @@ class PyTorchModelEngine(ModelEngine):
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
 
+        if self.is_ngram:
+            placeholder_map = {}
+
         # Requests with draft tokens are treated like extend requests.
         extend_requests = []
         generation_requests = []
@@ -1109,6 +1114,8 @@ class PyTorchModelEngine(ModelEngine):
             if next_draft_tokens_device is None or request.py_batch_idx is None:
                 num_draft_tokens = len(request.py_draft_tokens)
                 input_ids.append(request.get_last_tokens(0))
+                if self.is_ngram:
+                    placeholder_map[request.py_batch_idx] = len(input_ids)
                 gather_ids.append(len(input_ids) - 1)
                 sequence_lengths.append(1 + num_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
@@ -1238,16 +1245,22 @@ class PyTorchModelEngine(ModelEngine):
                 self.previous_pos_id_offsets_cuda *= 0
                 self.previous_kv_lens_offsets_cuda *= 0
         elif new_tokens_device is not None:
-            previous_batch_tokens = len(previous_batch_indices)
-            previous_batch_indices = torch.tensor(previous_batch_indices,
-                                                  dtype=torch.int,
-                                                  pin_memory=True)
-            self.previous_batch_indices_cuda[:previous_batch_tokens].copy_(
-                previous_batch_indices, non_blocking=True)
-            self.input_ids_cuda[num_tokens:num_tokens + previous_batchs].copy_(
-                new_tokens_device[
-                    self.previous_batch_indices_cuda[:previous_batchs]],
-                non_blocking=True)
+            if self.is_ngram and not self._disable_overlap_scheduler:  # TODO: simplify here
+                for py_batch_idx, index in placeholder_map.items():
+                    self.previous_batch_indices_cuda[index] = new_tokens_device[
+                        py_batch_idx]
+            else:
+                previous_batch_tokens = len(previous_batch_indices)
+                previous_batch_indices = torch.tensor(previous_batch_indices,
+                                                      dtype=torch.int,
+                                                      pin_memory=True)
+                self.previous_batch_indices_cuda[:previous_batch_tokens].copy_(
+                    previous_batch_indices, non_blocking=True)
+                self.input_ids_cuda[
+                    num_tokens:num_tokens + previous_batchs].copy_(
+                        new_tokens_device[
+                            self.previous_batch_indices_cuda[:previous_batchs]],
+                        non_blocking=True)
 
         total_num_tokens = len(position_ids)
         position_ids = torch.tensor(position_ids,
