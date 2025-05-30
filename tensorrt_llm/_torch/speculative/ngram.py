@@ -186,7 +186,7 @@ class NGramSampler(TorchSampler):
         index = 0  # Index for each request to get corresponding tokens from `new_tokens`.
         sorted_requests = sorted(scheduled_requests.generation_requests,
                                  key=lambda x: x.py_batch_idx)
-        for py_batch_idx, request in enumerate(sorted_requests):
+        for request in sorted_requests:
             # Add new token to a copy of the generated tokens to find new daft tokens
             prefix = list(request.get_tokens()[0])  # Get a copy
             if request.py_draft_tokens is not None:
@@ -217,11 +217,16 @@ class NGramSampler(TorchSampler):
             if draft_tokens is not None:
                 pad_length = self.max_num_draft_tokens - len(draft_tokens)
                 draft_tokens.extend([request.py_end_id] * pad_length)
-            # Do not save in member `py_draft_tokens` since `update_request()` needs that.
             request.py_next_draft_tokens = None
             if self.is_overlap_scheduler:
+                # In overlap-scheduler mode, the program comes here just before the forward computation.
+                request.py_last_draft_tokens = request.py_draft_tokens
                 request.py_draft_tokens = draft_tokens
             else:
+                # In non-overlap-scheduler mode, current `request.py_draft_tokens` will be used in
+                # `PyExecutor._update_requests()` (called after `NGramSampler.sample_async()`).
+                # So the draft tokens of next step is stored into `request.py_next_draft_tokens` temporarily,
+                # and is moved back in `PyExecutor._prepare_draft_requests()`.
                 request.py_next_draft_tokens = draft_tokens
             request.py_draft_pages_allocated = self.max_num_draft_tokens
 
