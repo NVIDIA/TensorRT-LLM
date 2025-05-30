@@ -491,8 +491,7 @@ private:
         // chunked attention size.
         // This is supported by causal-mask context kernels and generation-phase kernels.
         if ((selectKernelParams.mMaskType == TrtllmGenAttentionMaskType::Causal || !isContextKernel(params.mKernelType))
-            && (params.mMaxSeqLenKv > params.mAttentionWindowSize
-                || params.mMaxSeqLenKv > params.mChunkedAttentionSize))
+            && (params.mMaxSeqLenKv > params.mAttentionWindowSize || params.mChunkedAttentionSize != INT_MAX))
         {
             TLLM_CHECK_WITH_INFO(params.mMaxSeqLenKv <= params.mAttentionWindowSize
                     || params.mMaxSeqLenKv <= params.mChunkedAttentionSize,

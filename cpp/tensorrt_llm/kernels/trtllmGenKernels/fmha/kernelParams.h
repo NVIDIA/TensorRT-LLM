@@ -744,7 +744,7 @@ struct KernelParams
 
         params.mAttentionWindowSize = options.mAttentionWindowSize;
         if (isSlidingOrChunkedCausalMask(static_cast<TrtllmGenAttentionMaskType>(kernelMeta.mMaskType))
-            && options.mMaxSeqLenKv > options.mChunkedAttentionSize)
+            && options.mChunkedAttentionSize != INT_MAX)
         {
             TLLM_CHECK_WITH_INFO((options.mChunkedAttentionSize & (options.mChunkedAttentionSize - 1)) == 0,
                 "Chunked attention size must be a power of 2");
