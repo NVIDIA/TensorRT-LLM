@@ -1930,6 +1930,111 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockTest)
     EXPECT_THROW(kvCacheManager.addSequence(4, inputLength4, beamWidth, llmRequest4), std::exception);
 }
 
+TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockWithDependentTest)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numHeads = 6;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxBlocksPerSeq = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 1;
+    auto constexpr onboardBlocks = true;
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    auto constexpr beamWidth = 1;
+    auto constexpr beamIdx = 0;
+    SizeType32 constexpr maxNewTokens = 8;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto const maxAttentionWindow = tokensPerBlock * maxBlocksPerSeq;
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksInPrimaryPool,
+        blocksInSecondaryPool, maxNumSequences, beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
+        std::nullopt, nvinfer1::DataType::kHALF, false, stream, true, onboardBlocks);
+    kvCacheManager.allocatePools(false);
+
+    // Create sequence with one block worth of context tokens
+    int requestId0 = 0;
+    auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3});
+    auto const inputLength0 = static_cast<SizeType32>(inputTokens0->size());
+    auto llmRequest0
+        = std::make_shared<LlmRequest>(requestId0, maxNewTokens, inputTokens0, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(requestId0, inputLength0, beamWidth, llmRequest0);
+    kvCacheManager.storeContextBlocks(*llmRequest0);
+    GenerationRequest const& seq0 = kvCacheManager.getSequence(requestId0);
+
+    // Add two more blocks of generated tokens
+    for (int i = tokensPerBlock; i < 3 * tokensPerBlock; ++i)
+    {
+        llmRequest0->addNewToken(i, beamIdx);
+        kvCacheManager.addToken(requestId0);
+    }
+
+    // Verify
+    auto cacheBlockIds0 = seq0.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
+    EXPECT_THAT(cacheBlockIds0, ::testing::ElementsAreArray({0, 1, 2}));
+
+    // Lower priority of middle block to prevent offloading
+    auto const blockManager = kvCacheManager.getBlockManager();
+    auto middleBlock = blockManager.getBlockById(cacheBlockIds0[1], maxAttentionWindow);
+    middleBlock->setPriority(0);
+
+    // Create another sequence with one block worth of context tokens (no reuse).
+    int requestId1 = 1;
+    auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{100, 101, 102, 103});
+    auto const inputLength1 = static_cast<SizeType32>(inputTokens1->size());
+    auto llmRequest1
+        = std::make_shared<LlmRequest>(requestId1, maxNewTokens, inputTokens1, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(requestId1, inputLength1, beamWidth, llmRequest1);
+    kvCacheManager.storeContextBlocks(*llmRequest1);
+    GenerationRequest const& seq1 = kvCacheManager.getSequence(requestId1);
+
+    // Verify that all primary blocks are in use
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), 0);
+
+    // Free first sequence
+    kvCacheManager.removeSequence(requestId0, llmRequest0);
+
+    // Verify that 3 primary blocks are free.
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), 3);
+
+    // Write one generated token to second sequence. This will prompt block 2 to be offloaded.
+    llmRequest1->addNewToken(104, beamIdx);
+    kvCacheManager.addToken(requestId1);
+
+    // Verify that block 2 has block 1 as parent and is in secondary memory
+    auto block2 = blockManager.getBlockById(2, maxAttentionWindow);
+    EXPECT_TRUE(block2->getPrevBlock() != nullptr);
+    EXPECT_EQ(block2->getPrevBlock()->getBlockId(), 1);
+    EXPECT_FALSE(block2->isPrimary());
+
+    // Fill block
+    for (int i = 101 + tokensPerBlock; i < 100 + 2 * tokensPerBlock; ++i)
+    {
+        llmRequest1->addNewToken(i, beamIdx);
+        kvCacheManager.addToken(requestId1);
+    }
+
+    // Verify
+    auto cacheBlockIds1 = seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
+    EXPECT_THAT(cacheBlockIds1, ::testing::ElementsAreArray({3, 4}));
+
+    // Write one generated token to second sequence. This will prompt block 1 to be offloaded,
+    // but it cannot be because priority is lower than minimum required for offloading.
+    // WindowManager::getFreeBlock will instead free and detach block 2 (secondary block).
+    llmRequest1->addNewToken(100 + 2 * tokensPerBlock, beamIdx);
+    kvCacheManager.addToken(requestId1);
+
+    // Verify that block 2 is free, has no parent and is in secondary memory
+    EXPECT_EQ(block2->getPrevBlock(), nullptr);
+    EXPECT_FALSE(block2->isPrimary());
+
+    // Cleanup
+    kvCacheManager.removeSequence(requestId1, llmRequest1);
+}
+
 TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerAllocationTest)
 {
     using DType = half;
