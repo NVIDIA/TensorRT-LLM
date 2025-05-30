@@ -485,6 +485,8 @@ pipeline {
             }
             steps {
                 script {
+                    // 安装wget工具
+                    trtllm_utils.llmExecStepWithRetry(this, script: "apk add --no-cache wget")
                     // 轮询检查构建产物文件是否存在
                     def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
                     def requiredFiles = [
