@@ -192,8 +192,8 @@ def buildImage(config, imageKeyToTag)
     def dependentTarget = config.dependentTarget
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
 
-    // def tmpTag = "09bd772-4294-71" // TODO: remove this
-    def tmpTag = LLM_DEFAULT_TAG
+    def tmpTag = "3391161-github-pr-4656-83" // TODO: remove this
+    // def tmpTag = LLM_DEFAULT_TAG
 
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${tmpTag}"
 
@@ -203,7 +203,7 @@ def buildImage(config, imageKeyToTag)
         imageKeyToTag["NGC Devel Image ${config.arch}"] = "${IMAGE_NAME}/${dependentTarget}:${dependentTargetTag}"
         imageKeyToTag["NGC Release Image ${config.arch}"] = "${IMAGE_NAME}/${target}:${tag}"
     }
-    // return // TODO: remove this
+    return // TODO: remove this
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
 
