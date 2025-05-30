@@ -2000,28 +2000,28 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
     def testConfigs = [
         "NGC Devel Image amd64": [
-            name: "NGC Devel Image amd64 Sanity Test",
+            name: "NGC-Devel-Image-amd64-Sanity-Test",
             gpuType: "A10",
             k8sArch: "amd64",
             wheelInstalled: false,
             fromSource: true,
         ],
         "NGC Devel Image arm64": [
-            name: "NGC Devel Image arm64 Sanity Test",
+            name: "NGC-Devel-Image-arm64-Sanity-Test",
             gpuType: "GH200",
             k8sArch: "arm64",
             wheelInstalled: false,
             fromSource: true,
         ],
         "NGC Release Image amd64": [
-            name: "NGC Release Image amd64 Sanity Test",
+            name: "NGC-Release-Image-amd64-Sanity-Test",
             gpuType: "A10",
             k8sArch: "amd64",
             wheelInstalled: true,
             config: VANILLA_CONFIG,
         ],
         "NGC Release Image arm64": [
-            name: "NGC Release Image arm64 Sanity Test",
+            name: "NGC-Release-Image-arm64-Sanity-Test",
             gpuType: "GH200",
             k8sArch: "arm64",
             wheelInstalled: true,
