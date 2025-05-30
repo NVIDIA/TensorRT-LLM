@@ -1153,6 +1153,32 @@ int AttentionOp::mlaGeneration(
     }
     else
     {
+        // Try XQA optimization first when CP is not used.
+        if (mCpSize == 1)
+        {
+            // NOTE: input_seq_length = num_medusa_tokens + 1 (new generated one from the original LM head)
+            // self attn
+            XQAParams xqaParams{};
+            this->template convertMMHAParamsToXQAParams<T, decltype(kv_cache_buffer)>(
+                xqaParams, generation_params, /*forConfigurePlugin=*/false);
+            if (mEnableXQA && mXqaDispatcher->shouldUse(xqaParams))
+            {
+                TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
+                xqaParams.stream = stream;
+                mXqaDispatcher->run(xqaParams, kv_cache_buffer);
+                return 0;
+            }
+            else if (mIsSpecDecodingEnabled && mUseSpecDecoding)
+            {
+                TLLM_CHECK_WITH_INFO(false, "No available XQA kernels are found for speculative decoding mode.");
+            }
+            else if (mFuseFp4Quant)
+            {
+                TLLM_CHECK_WITH_INFO(false, "No available kernels are found for FP4 output.");
+            }
+        }
+
+        // Use FMHA otherwise.
         MHARunnerParams fmhaParams{};
         fmhaParams.b = batch_beam;
         fmhaParams.numGroupedHeads = params.head_num;
@@ -2502,7 +2528,7 @@ int AttentionOp::initialize() noexcept
         // Deepseek-V2 Generation needs a differ fmha with different argumments
         if (mIsMLAEnabled)
         {
-            mEnableXQA = false;
+            mEnableXQA = (mSM == kSM_120);
             if (mUseTllmGen)
             {
                 Data_type qDataType = DATA_TYPE_FP32;

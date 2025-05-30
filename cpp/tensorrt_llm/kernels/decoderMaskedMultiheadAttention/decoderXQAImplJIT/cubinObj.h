@@ -33,9 +33,9 @@ public:
     // Default constructor constructs an empty unusable CubinObj instance.
     CubinObj() = default;
     // Constructs from raw cubin content.
-    explicit CubinObj(std::string const& content);
+    explicit CubinObj(std::string const& content, bool use_mla = false);
     // Deserializes from a serialization buffer.
-    CubinObj(void const* buffer, size_t buffer_size);
+    CubinObj(void const* buffer, size_t buffer_size, bool use_mla = false);
 
     CubinObj(CubinObj const& other);
     CubinObj& operator=(CubinObj const& other);
@@ -65,10 +65,12 @@ public:
 
 private:
     static constexpr char const* kFuncName = "kernel_mha";
+    static constexpr char const* kFuncNameMLA = "xqa_mla";
     static constexpr char const* kSmemName = "smemSize";
     static constexpr char const* kKernelTypeName = "kernelType";
     // Constructors should populate mContent.
     std::string mContent;
+    bool mUseMLA;
 
     // Fields below are undefined prior to initialize() call.
     bool mInitialized;

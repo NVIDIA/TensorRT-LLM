@@ -25,8 +25,9 @@
 namespace tensorrt_llm::kernels::jit
 {
 
-CubinObj::CubinObj(void const* buffer_, size_t buffer_size)
-    : mInitialized(false)
+CubinObj::CubinObj(void const* buffer_, size_t buffer_size, bool use_mla)
+    : mUseMLA(use_mla)
+    , mInitialized(false)
 {
     uint8_t const* buffer = static_cast<uint8_t const*>(buffer_);
     size_t remaining_buffer_size = buffer_size;
@@ -36,8 +37,9 @@ CubinObj::CubinObj(void const* buffer_, size_t buffer_size)
     memcpy(mContent.data(), buffer, len);
 }
 
-CubinObj::CubinObj(std::string const& content)
+CubinObj::CubinObj(std::string const& content, bool use_mla)
     : mContent(content)
+    , mUseMLA(use_mla)
     , mInitialized(false)
 {
 }
@@ -48,6 +50,7 @@ CubinObj::CubinObj(CubinObj const& other)
     TLLM_CHECK(!other.mInitialized);
 
     this->mContent = other.mContent;
+    this->mUseMLA = other.mUseMLA;
     this->mInitialized = false;
 }
 
@@ -62,6 +65,7 @@ CubinObj& CubinObj::operator=(CubinObj const& other)
     TLLM_CHECK(!other.mInitialized);
 
     this->mContent = other.mContent;
+    this->mUseMLA = other.mUseMLA;
     this->mInitialized = false;
 
     return *this;
@@ -70,6 +74,7 @@ CubinObj& CubinObj::operator=(CubinObj const& other)
 CubinObj::CubinObj(CubinObj&& other)
 {
     this->mContent = std::move(other.mContent);
+    this->mUseMLA = other.mUseMLA;
     if (other.mInitialized)
     {
         this->mInitialized = true;
@@ -95,6 +100,7 @@ CubinObj& CubinObj::operator=(CubinObj&& other)
     }
 
     this->mContent = std::move(other.mContent);
+    this->mUseMLA = other.mUseMLA;
     if (other.mInitialized)
     {
         this->mInitialized = true;
@@ -152,7 +158,7 @@ void CubinObj::initialize()
         TLLM_CU_CHECK(mDriver->cuModuleLoadData(&mModule, mContent.c_str()));
         TLLM_CHECK(mModule != nullptr);
         mFunction = nullptr;
-        TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&mFunction, mModule, kFuncName));
+        TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&mFunction, mModule, mUseMLA ? kFuncNameMLA : kFuncName));
         TLLM_CHECK(mFunction != nullptr);
 
         // Populate mSharedMemBytes and mKernelType.

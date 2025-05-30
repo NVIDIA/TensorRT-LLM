@@ -63,7 +63,7 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
         return false;
     }
     if (!contains({PositionEmbeddingType::kROPE_GPTJ, PositionEmbeddingType::kROPE_GPT_NEOX,
-                      PositionEmbeddingType::kROPE_M, PositionEmbeddingType::kLONG_ROPE},
+                      PositionEmbeddingType::kROPE_M, PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kYARN},
             xqaParams.position_embedding_type))
     {
         return false;
@@ -162,6 +162,43 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
         return false;
     }
     if (xqaParams.paged_kv_cache && !contains({16, 32, 64, 128}, xqaParams.tokens_per_block))
+    {
+        return false;
+    }
+    return true;
+}
+
+bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin)
+{
+    if (!supportConfigCommon(xqaParams, forConfigurePlugin))
+    {
+        return false;
+    }
+    if (SM != kSM_120)
+    {
+        return false;
+    }
+    if (!contains({DATA_TYPE_FP16, DATA_TYPE_BF16}, xqaParams.data_type))
+    {
+        return false;
+    }
+    if (xqaParams.kv_cache_data_type != DATA_TYPE_E4M3)
+    {
+        return false;
+    }
+    if (xqaParams.beam_width != 1)
+    {
+        return false;
+    }
+    if (xqaParams.head_size != 576)
+    {
+        return false;
+    }
+    if (xqaParams.num_q_heads != 128 || xqaParams.num_kv_heads != 1)
+    {
+        return false;
+    }
+    if (xqaParams.paged_kv_cache && !contains({8, 16, 32, 64, 128}, xqaParams.tokens_per_block))
     {
         return false;
     }

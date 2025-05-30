@@ -224,8 +224,10 @@ tllmXqaJitStatus createProgram(tllmXqaJitProgram* prog, tllmXqaJitContext const*
     *prog = new _tllmXqaJitProgram;
     (*prog)->context = context;
 
-    char const* src_content = context->kernel_type == TLLM_XQA_JIT_QGMMA ? tensorrt_llm::kernels::mha_sm90_cu_content
-                                                                         : tensorrt_llm::kernels::mha_cu_content;
+    char const* src_content = context->kernel_type == TLLM_XQA_JIT_MLA
+        ? tensorrt_llm::kernels::mla_sm120_cu_content
+        : (context->kernel_type == TLLM_XQA_JIT_QGMMA ? tensorrt_llm::kernels::mha_sm90_cu_content
+                                                      : tensorrt_llm::kernels::mha_cu_content);
 
     std::vector<char const*> headers_content, headers_name;
     for (auto x : tensorrt_llm::kernels::xqa_headers_content)
