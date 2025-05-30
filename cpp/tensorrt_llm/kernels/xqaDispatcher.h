@@ -105,6 +105,8 @@ protected:
     void runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buffer);
 };
 
+constexpr uint32_t xqaMlaCgaXBufSize = 8704 * 2;
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace tensorrt_llm::kernels

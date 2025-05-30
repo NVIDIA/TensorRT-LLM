@@ -91,6 +91,7 @@ size_t XqaDispatcher::getWorkspaceSize(int max_num_tokens)
     // output conversion.
     workspace_size = roundUp<size_t>(
         workspace_size + kXQA_OUT_ELEM_SIZE * mFixedParams.headSize * mFixedParams.numQHeads * max_num_tokens, 128);
+    workspace_size = roundUp<size_t>(workspace_size, 128) + xqaMlaCgaXBufSize * kXQA_MAX_NUM_SUB_SEQ;
     if (mFixedParams.multiBlockMode)
     {
         int workspaces[4];

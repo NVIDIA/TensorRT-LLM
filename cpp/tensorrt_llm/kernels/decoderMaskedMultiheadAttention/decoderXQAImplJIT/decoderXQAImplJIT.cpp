@@ -25,6 +25,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/tensorMapUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
+#include "tensorrt_llm/kernels/xqaDispatcher.h"
 
 namespace
 {
@@ -353,10 +354,9 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         appendParam(&launchParams.kv_scale_quant_orig);
         appendParam(&launchParams.scratch);
         appendParam(&launchParams.semaphores);
-        constexpr uint32_t cgaXBufSize = 8704 * 2;
         uint32_t const multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
         std::byte* const partialResults = static_cast<std::byte*>(launchParams.scratch)
-            + cgaXBufSize * multi_block * xqaParams.total_num_input_tokens;
+            + xqaMlaCgaXBufSize * multi_block * xqaParams.total_num_input_tokens;
         appendParam(&partialResults);
         kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
         uint32_t const inputSeqLen

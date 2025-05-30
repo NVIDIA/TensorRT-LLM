@@ -757,6 +757,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
     int const batch_beam = max_num_seq;
 
     // Compute the workspace size for MLA.
+    size_t fmha_v2_mla_workspace_size = 0;
     if (mIsMLAEnabled)
     {
         size_t flash_mla_workspace_size = 0;
@@ -809,7 +810,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         workspaces[8] = sizeof(float) * 256 * mMultiProcessorCount;
         workspaces[9] = flash_mla_workspace_size;
 
-        return tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
+        fmha_v2_mla_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     }
 
     size_t generation_workspace_size = 0;
@@ -859,7 +860,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
             = tc::calculateTotalWorkspaceSize(xqa_workspaces, XQA_NUM_BUFFERS, mXqaDispatcher->getWorkspaceAlignment());
     }
 
-    return std::max(generation_workspace_size, xqa_workspace_size);
+    return std::max(std::max(generation_workspace_size, xqa_workspace_size), fmha_v2_mla_workspace_size));
 }
 
 int AttentionOp::getMaxNumSeqLenTile(int batch_beam_size) const
