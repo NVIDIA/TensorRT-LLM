@@ -337,8 +337,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         TLLM_CHECK(idxNextParam < kMAX_NB_KERNEL_PARAMS);
         kernelParams[idxNextParam++] = const_cast<void*>(static_cast<void const*>(p));
     };
-    void const* const kernel_input_tokens
-        = (applyRoPEInXqaKernel ? &launchParams.qkv : const_cast<void const**>(&xqa_q_input_ptr));
+    void const* const kernel_input_tokens = (applyRoPEInXqaKernel ? launchParams.qkv : xqa_q_input_ptr);
     if (isMLAKernel)
     {
         CUtensorMap const tensorMapQ = makeTensorMapForXqaMlaQ(mDriver, xqaParams, kernel_input_tokens);
