@@ -29,6 +29,10 @@ ENV LD_LIBRARY_PATH=/usr/local/tensorrt/lib:${LD_LIBRARY_PATH}
 COPY docker/common/install_polygraphy.sh install_polygraphy.sh
 RUN bash ./install_polygraphy.sh && rm install_polygraphy.sh
 
+# Install mpi4py
+COPY docker/common/install_mpi4py.sh install_mpi4py.sh
+RUN bash ./install_mpi4py.sh && rm install_mpi4py.sh
+
 # Install PyTorch
 ARG TORCH_INSTALL_TYPE="skip"
 COPY docker/common/install_pytorch.sh install_pytorch.sh

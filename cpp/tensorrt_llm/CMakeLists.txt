@@ -51,35 +51,49 @@ if(NOT WIN32) # Linux
   endif()
 else() # Windows
   # AMD64, IA64, ARM64, EM64T, X86
-  set(BATCH_MANAGER_TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}-WINDOWS")
-  string(TOLOWER ${BATCH_MANAGER_TARGET_ARCH} ${BATCH_MANAGER_TARGET_ARCH})
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64")
+    set(BATCH_MANAGER_TARGET_ARCH "x86_64-windows-msvc")
+  else()
+    message(
+      FATAL_ERROR
+        "The system processor type is unsupported: ${CMAKE_SYSTEM_PROCESSOR}")
+  endif()
 endif()
 
 if(BUILD_BATCH_MANAGER)
   add_subdirectory(batch_manager)
 else()
   add_library(${BATCH_MANAGER_TARGET} STATIC IMPORTED)
-  execute_process(
-    COMMAND ${Python3_EXECUTABLE} "-c"
-            "import torch; print(torch.compiled_with_cxx11_abi(),end='');"
-    RESULT_VARIABLE _PYTHON_SUCCESS
-    OUTPUT_VARIABLE USE_CXX11_ABI)
+  if(NOT WIN32) # Linux
+    execute_process(
+      COMMAND ${Python3_EXECUTABLE} "-c"
+              "import torch; print(torch.compiled_with_cxx11_abi(),end='');"
+      RESULT_VARIABLE _PYTHON_SUCCESS
+      OUTPUT_VARIABLE USE_CXX11_ABI)
 
-  message(STATUS "USE_CXX11_ABI: ${USE_CXX11_ABI}")
+    message(STATUS "USE_CXX11_ABI: ${USE_CXX11_ABI}")
 
-  if(USE_CXX11_ABI)
+    if(USE_CXX11_ABI)
+      set_property(
+        TARGET ${BATCH_MANAGER_TARGET}
+        PROPERTY
+          IMPORTED_LOCATION
+          "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/${BATCH_MANAGER_TARGET_ARCH}/libtensorrt_llm_batch_manager_static.a"
+      )
+    else()
+      set_property(
+        TARGET ${BATCH_MANAGER_TARGET}
+        PROPERTY
+          IMPORTED_LOCATION
+          "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/${BATCH_MANAGER_TARGET_ARCH}/libtensorrt_llm_batch_manager_static.pre_cxx11.a"
+      )
+    endif()
+  else() # Windows
     set_property(
       TARGET ${BATCH_MANAGER_TARGET}
       PROPERTY
         IMPORTED_LOCATION
-        "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/${BATCH_MANAGER_TARGET_ARCH}/libtensorrt_llm_batch_manager_static.a"
-    )
-  else()
-    set_property(
-      TARGET ${BATCH_MANAGER_TARGET}
-      PROPERTY
-        IMPORTED_LOCATION
-        "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/${BATCH_MANAGER_TARGET_ARCH}/libtensorrt_llm_batch_manager_static.pre_cxx11.a"
+        "${CMAKE_CURRENT_SOURCE_DIR}/batch_manager/${BATCH_MANAGER_TARGET_ARCH}/tensorrt_llm_batch_manager_static.lib"
     )
   endif()
 endif()
