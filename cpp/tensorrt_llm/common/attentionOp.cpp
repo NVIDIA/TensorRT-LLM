@@ -1653,6 +1653,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.oSfScalePtr = params.attention_output_sf_scale;
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
+        fmhaParams.softmaxStatsPtr = params.softmaxStatsPtr;
 
         if (mAttentionChunkSize)
         {
