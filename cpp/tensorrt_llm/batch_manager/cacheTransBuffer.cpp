@@ -30,8 +30,8 @@ class FabricMemory::Impl
 {
 public:
     Impl(size_t size)
+        : mSize(size)
     {
-        mSize = size;
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceIdx));
         CUmemAllocationHandleType const handle_type = CU_MEM_HANDLE_TYPE_FABRIC;
         CUmemAllocationProp prop = {};
@@ -47,7 +47,7 @@ public:
         mAllocSize = (size + granularity - 1) / granularity * granularity;
         TLLM_CU_CHECK(cuMemCreate(&mHandle, mAllocSize, &prop, 0));
         TLLM_CU_CHECK(cuMemAddressReserve(&mDevicePtr, mAllocSize, mGranularity, 0, 0));
-        mPtr = (void*) mDevicePtr;
+        mPtr = reinterpret_cast<void*>(mDevicePtr);
         CUmemAccessDesc accessDesc = {};
         accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
