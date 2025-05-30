@@ -55,9 +55,11 @@ add_library(
   fp4BatchedQuantize.cpp
   fp8BlockScalingGemm.cpp
   fp8Quantize.cpp
+  fusedQKNormRopeOp.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
+  llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp

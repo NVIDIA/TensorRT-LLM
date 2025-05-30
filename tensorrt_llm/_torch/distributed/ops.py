@@ -1,12 +1,16 @@
 import math
 import os
 import threading
+from itertools import accumulate
 from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
-from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
+from tensorrt_llm._utils import mpi_barrier
+from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
+from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
+                                     AllReduceStrategy)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
@@ -45,6 +49,57 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
     return
 
 
+def get_allreduce_mnnvl_workspace(
+    mapping: Mapping, dtype: torch.dtype
+) -> Tuple[McastGPUBuffer, torch.Tensor, torch.Tensor, int]:
+    if not hasattr(_thread_local,
+                   f'allreduce_mnnvl_workspaces_{mapping.pp_rank}'):
+        setattr(_thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}',
+                {})
+
+    force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
+
+    allreduce_mnnvl_workspaces = getattr(
+        _thread_local, f'allreduce_mnnvl_workspaces_{mapping.pp_rank}')
+    if mapping not in allreduce_mnnvl_workspaces:
+        # buffer shape: [3, 2, buffer_tokens, hidden_dim]
+        stride = 3 * 2 * dtype.itemsize
+        # LCM for hidden_dim: 2048, 4096, 5120, 7168, 8192 = 286720
+        # max_num_elements must be a multiple of 286720
+        lcm_hidden_dim = 286720
+        buffer_size_in_bytes = math.ceil(
+            12_000_000 / (lcm_hidden_dim * stride)) * (lcm_hidden_dim * stride)
+        max_num_elements = buffer_size_in_bytes // stride
+
+        mcast_buffer = McastGPUBuffer(
+            buffer_size_in_bytes,
+            mapping.tp_size,
+            mapping.tp_rank,
+            torch.device("cuda", mapping.local_rank),
+            mapping.is_multi_node() or force_mn,
+        )
+
+        buffer = mcast_buffer.get_uc_buffer(mapping.tp_rank,
+                                            (3, 2, max_num_elements), dtype, 0)
+        # Only initialize the buffer when we need to resize it
+        buffer.fill_(-0.0)
+        # CPU barrier since we assume this should not be called in cuda graph
+        torch.cuda.synchronize()
+        mpi_barrier()
+
+        # This is a buffer to maintain the state of this allreduce Op
+        # Should have the same lifetime with self._buffer
+        # [Buffer_ptr, Clear_ptr, Buffer_size, atomic access counter]
+        buffer_flags = torch.tensor([0, 2, max_num_elements, 0],
+                                    dtype=torch.uint32,
+                                    device=torch.device("cuda",
+                                                        mapping.local_rank))
+
+        allreduce_mnnvl_workspaces[mapping] = (mcast_buffer, buffer,
+                                               buffer_flags, max_num_elements)
+    return allreduce_mnnvl_workspaces[mapping]
+
+
 def userbuffers_allreduce_finalize(
         input: torch.Tensor,
         force_applying_finalize: bool = False) -> torch.Tensor:
@@ -60,6 +115,24 @@ def get_output_info(input: torch.Tensor, dim: int) -> List[int]:
     ]
     numel_base = -math.prod(output_shape)
     return {'output_shape': output_shape, 'numel_base': numel_base}
+
+
+def filter_valid_input(
+        input_list: List[torch.Tensor]
+) -> Tuple[List[torch.Tensor], List[bool]]:
+    func_valid = lambda x: x is not None
+    valid_list = list(map(func_valid, input_list))
+    input_list = list(filter(func_valid, input_list))
+    return input_list, valid_list
+
+
+def restore_full_output(output_list: List[torch.Tensor],
+                        valid_list: List[bool]) -> List[torch.Tensor]:
+    index_list = list(accumulate(map(int, valid_list)))
+    output_list = list(
+        map(lambda valid, index: output_list[index - 1]
+            if valid else None, valid_list, index_list))
+    return output_list
 
 
 def allgather(
@@ -101,8 +174,10 @@ def allgather(
         if isinstance(input, torch.Tensor):
             assert input.shape[dim] == sizes[mapping.tp_rank]
         else:
-            assert all(
-                [val.shape[dim] == sizes[mapping.tp_rank] for val in input])
+            assert all([
+                val.shape[dim] == sizes[mapping.tp_rank] for val in input
+                if val is not None
+            ])
         # 'sizes' is not needed if all inputs in the same TP group have the same shape
         for split_size in sizes[1:]:
             if split_size != sizes[0]:
@@ -116,6 +191,7 @@ def allgather(
         output_info = get_output_info(input, dim)
         input = input.contiguous().view(-1, output_info['numel_base'])
     else:
+        input, valid = filter_valid_input(input)
         torch_op = torch.ops.trtllm.allgather_list
         output_info = [get_output_info(val, dim) for val in input]
         input = [
@@ -148,6 +224,7 @@ def allgather(
             convert_output(val, val_info)
             for val, val_info in zip(output, output_info)
         ]
+        output = restore_full_output(output, valid)
     return output
 
 
@@ -166,7 +243,10 @@ def reducescatter(
         if isinstance(input, torch.Tensor):
             assert input.shape[dim] == sum_split_size
         else:
-            assert all([val.shape[dim] == sum_split_size for val in input])
+            assert all([
+                val.shape[dim] == sum_split_size for val in input
+                if val is not None
+            ])
         # 'sizes' is not needed if all outputs in the same TP group have the same shape
         for split_size in sizes[1:]:
             if split_size != sizes[0]:
@@ -191,6 +271,7 @@ def reducescatter(
         output_info = get_output_info(input, dim)
         input = convert_input(input, output_info)
     else:
+        input, valid = filter_valid_input(input)
         torch_op = torch.ops.trtllm.reducescatter_list
         output_info = [get_output_info(val, dim) for val in input]
         input = [
@@ -211,14 +292,92 @@ def reducescatter(
             val.view(val_info['output_shape'])
             for val, val_info in zip(output, output_info)
         ]
+        output = restore_full_output(output, valid)
     return output
+
+
+class MNNVLAllReduce(nn.Module):
+    """A specialized AllReduce implementation for Multi-Node NVLink communication.
+
+    This class handles the MNNVL-specific allreduce operations, which can be more efficient
+    for certain operations when using NVLink for multi-node communication.
+    """
+
+    def __init__(self, mapping: Mapping, dtype: torch.dtype):
+        super().__init__()
+        self.mapping = mapping
+        self.dtype = dtype
+        self.enable_mnnvl = (os.environ.get("TRTLLM_MNNVL_AR_ENABLED",
+                                            "0") == "1"
+                             and dtype in [torch.bfloat16, torch.float32]
+                             and (not mapping.has_cp()))
+
+        if self.enable_mnnvl:
+            self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
+                self.mapping, dtype)
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        all_reduce_params: AllReduceParams,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """Forward pass for MNNVL AllReduce.
+
+        Args:
+            input (torch.Tensor): Input tensor to be reduced
+            all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations
+
+        Returns:
+            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
+        """
+        if not self.enable_mnnvl or input.numel() > self.max_num_elements_mnnvl:
+            return None
+
+        fusion_op = all_reduce_params.fusion_op
+
+        shape = input.shape
+
+        if self.buffer_mnnvl.shape[-1] % shape[-1] != 0:
+            return None
+
+        input = input.view(-1, shape[-1])
+        output = torch.empty_like(input)
+        buffer_mnnvl = self.buffer_mnnvl.view(3, 2, -1, shape[-1])
+
+        if fusion_op == AllReduceFusionOp.NONE:
+            torch.ops.trtllm.mnnvl_twoshot_allreduce(
+                output,
+                input,
+                buffer_mnnvl,
+                self.buffer_flags_mnnvl,
+                True,
+            )
+            return output.view(shape)
+        elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+            torch.ops.trtllm.mnnvl_twoshot_allreduce(
+                output,
+                input,
+                buffer_mnnvl,
+                self.buffer_flags_mnnvl,
+                False,
+            )
+            residual_in = all_reduce_params.residual
+            residual_out = torch.empty_like(input)
+
+            torch.ops.trtllm.mnnvl_twoshot_rmsnorm(
+                residual_out, output, buffer_mnnvl,
+                all_reduce_params.norm_weight, all_reduce_params.eps,
+                residual_in, self.buffer_flags_mnnvl)
+            return output.view(shape), residual_out.view(shape)
+        return None
 
 
 class AllReduce(nn.Module):
 
     def __init__(self,
                  mapping: Mapping,
-                 strategy: AllReduceStrategy = AllReduceStrategy.AUTO):
+                 strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+                 dtype: Optional[torch.dtype] = None):
         super().__init__()
         """
         AllReduce is a module that performs an all-reduce operation on a tensor.
@@ -274,6 +433,10 @@ class AllReduce(nn.Module):
                     allocate_low_presicion_allreduce_workspace(self.mapping)
                 self.workspace = get_allreduce_workspace(self.mapping)
 
+            # Initialize MNNVL AllReduce if needed
+            self.mnnvl_allreduce = MNNVLAllReduce(mapping,
+                                                  dtype) if dtype else None
+
     def forward(
         self,
         input: torch.Tensor,
@@ -308,10 +471,17 @@ class AllReduce(nn.Module):
                                          == False):
             return input
 
-        # Assume using no fusion allreduce here
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
+        # Try MNNVL AllReduce first if available
+        if self.mnnvl_allreduce:
+            mnnvl_output = self.mnnvl_allreduce(
+                input, all_reduce_params=all_reduce_params)
+            if mnnvl_output is not None:
+                return mnnvl_output
+
+        # Fall back to regular AllReduce if MNNVL is not available or not applicable
         output = torch.ops.trtllm.allreduce(
             input=input,
             residual=all_reduce_params.residual,

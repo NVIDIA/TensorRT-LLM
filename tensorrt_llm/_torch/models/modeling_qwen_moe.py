@@ -19,7 +19,8 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             duplicate_kv_weight, register_auto_model)
+                             duplicate_kv_weight, filter_weights,
+                             register_auto_model)
 
 
 class QwenMoE(nn.Module):
@@ -255,14 +256,6 @@ class Qwen2MoeForCausalLM(DecoderModelForCausalLM[QwenMoeModel,
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size
         head_dim = self.config.hidden_size // self.config.num_attention_heads
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
 
         params_map = {
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],

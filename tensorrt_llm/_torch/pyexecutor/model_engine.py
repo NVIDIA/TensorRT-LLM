@@ -40,7 +40,7 @@ from ..compilation.utils import set_enable_piecewise_cuda_graph_capture_flag
 from ..distributed import MPIDist
 from ..distributed.communicator import init_pp_comm
 from ..metadata import KVCacheParams
-from ..model_config import ModelConfig
+from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
@@ -310,11 +310,6 @@ class PyTorchModelEngine(ModelEngine):
         )
 
         attn_backend = pytorch_backend_config.attn_backend
-        # _convert_load_format should already be called by
-        # __post_init__, but call it again just in case.
-        # The config object is not a frozen data class, so it's
-        # possible the user changed it after initialization.
-        pytorch_backend_config._convert_load_format()
         self.model = self._load_model(
             model_path,
             mapping=self.mapping,
@@ -323,6 +318,7 @@ class PyTorchModelEngine(ModelEngine):
             load_format=pytorch_backend_config.load_format,
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=pytorch_backend_config.moe_max_num_tokens,
+            moe_load_balancer=pytorch_backend_config.moe_load_balancer,
             lora_config=lora_config)
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
@@ -434,10 +430,11 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda = torch.zeros((batch_size, ),
                                                              dtype=torch.int,
                                                              device='cuda')
-            self.is_mtp = self.spec_config.spec_dec_mode.is_mtp()
+            self.without_logits = self.spec_config.spec_dec_mode.without_logits(
+            )
             self.max_draft_len = spec_config.max_draft_tokens
         else:
-            self.is_mtp = False
+            self.without_logits = False
             self.max_draft_len = 0
         self.iter_counter = 0
 
@@ -446,6 +443,7 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = KV_CACHE_MANAGER_KEY
         self.lora_model_config: Optional[LoraModelConfig] = None
+        self.cuda_graph_dummy_request = None
 
     def set_lora_model_config(self, lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str]):
@@ -733,6 +731,7 @@ class PyTorchModelEngine(ModelEngine):
             return get_spec_metadata(
                 self.spec_config,
                 self.batch_size,
+                max_num_tokens=self.max_num_tokens,
                 spec_resource_manager=spec_resource_manager)
 
         if self.spec_metadata is not None:
@@ -740,11 +739,12 @@ class PyTorchModelEngine(ModelEngine):
         self.spec_metadata = get_spec_metadata(
             self.spec_config,
             self.batch_size,
+            max_num_tokens=self.max_num_tokens,
             spec_resource_manager=spec_resource_manager)
         return self.spec_metadata
 
     def _get_padded_batch(self, scheduled_requests: ScheduledRequests,
-                          kv_cache_manager):
+                          kv_cache_manager) -> int:
         can_run_cuda_graph = scheduled_requests.can_run_cuda_graph
         batch_size = scheduled_requests.batch_size
         new_batch_size = batch_size
@@ -760,35 +760,35 @@ class PyTorchModelEngine(ModelEngine):
         if (not self._run_cuda_graphs or not self._cuda_graph_padding_enabled
                 or not can_run_cuda_graph
                 or new_batch_size > self._max_cuda_graph_batch_size):
-            return None
+            return 0
 
         padded_batch_size = self._round_up_batch_size(new_batch_size)
         if batch_size == padded_batch_size:
-            return None
+            return 0
 
         padding_size = padded_batch_size - batch_size
+        if padding_size + scheduled_requests.batch_size > self.batch_size:
+            return 0
 
-        available_blocks = kv_cache_manager.get_num_free_blocks()
-
-        # No padding if:
-        # 1) Not enough KV cache space.
-        # 2) It would create too many concurrent requests.
-        # 2 is not strictly required, but we should probably
+        # No padding if it would create too many concurrent requests.
+        # This is not strictly required, but we should probably
         # respect the requirement just in case that changes in the future.
-        if available_blocks < padding_size or padding_size + scheduled_requests.batch_size > self.batch_size:
-            return None
+        if self.cuda_graph_dummy_request is None:
+            available_blocks = kv_cache_manager.get_num_free_blocks()
+            # No padding if not enough KV cache space
+            if available_blocks < 1:
+                return 0
 
-        # Set the dummy request ids starting at (uint64 max value - padding_size - 1) to avoid conflict with
-        # active request IDs
-        max_req_id = MAX_UINT64 - padding_size - 1
-        generation_requests = kv_cache_manager.add_dummy_requests(
-            [max_req_id + i + 1 for i in range(padding_size)],
-            is_gen=True,
-            max_num_draft_tokens=self.max_draft_len)
-        for req in generation_requests:
-            req.is_cuda_graph_dummy = True
-        scheduled_requests.generation_requests.extend(generation_requests)
-        return generation_requests
+            self.cuda_graph_dummy_request = kv_cache_manager.add_dummy_requests(
+                [MAX_UINT64 - 1],
+                is_gen=True,
+                max_num_draft_tokens=self.max_draft_len)[0]
+            self.cuda_graph_dummy_request.is_cuda_graph_dummy = True
+
+        scheduled_requests.generation_requests.extend(
+            [self.cuda_graph_dummy_request] * padding_size)
+
+        return padding_size
 
     @contextlib.contextmanager
     def _maybe_pad_batch(self, scheduled_requests: ScheduledRequests,
@@ -798,20 +798,16 @@ class PyTorchModelEngine(ModelEngine):
 
         If using CUDA graphs, this method will add dummy requests to the given
         batch so we can always use a CUDA graph. It is a context manager
-        because the padded requests allocate KV pages that should be freed
-        when you're done with them.
+        because the padded requests will be removed from scheduled requests.
         """
-        padding_requests = self._get_padded_batch(scheduled_requests,
-                                                  kv_cache_manager)
+        padding_size = self._get_padded_batch(scheduled_requests,
+                                              kv_cache_manager)
         try:
             yield scheduled_requests
         finally:
-            if padding_requests is not None:
-                padding_len = len(padding_requests)
+            if padding_size > 0:
                 scheduled_requests.generation_requests = scheduled_requests.generation_requests[:
-                                                                                                -padding_len]
-                for req in padding_requests:
-                    kv_cache_manager.free_resources(req)
+                                                                                                -padding_size]
 
     def _round_up_batch_size(self, batch_size: int) -> int:
         """
@@ -880,15 +876,18 @@ class PyTorchModelEngine(ModelEngine):
                     checkpoint_dir: str,
                     load_format: LoadFormat,
                     max_num_tokens: int,
-                    moe_max_num_tokens: int,
+                    moe_max_num_tokens: Optional[int] = None,
+                    moe_load_balancer: Optional[MoeLoadBalancerConfig] = None,
                     lora_config: Optional[LoraConfig] = None,
                     **kwargs):
         config = ModelConfig.from_pretrained(checkpoint_dir,
                                              trust_remote_code=True,
                                              **kwargs)
+        config.pytorch_backend_config = self.pytorch_backend_config
         config.spec_config = self.spec_config
         config.max_num_tokens = max_num_tokens
         config.moe_max_num_tokens = moe_max_num_tokens
+        config.moe_load_balancer = moe_load_balancer
         config.lora_config = lora_config
 
         validate_and_set_kv_cache_quant(
@@ -936,6 +935,12 @@ class PyTorchModelEngine(ModelEngine):
                     weights = load_weights(checkpoint_dir, self.mapping)
 
                 model.load_weights(weights)
+
+                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                ):
+                    weights = load_weights(self.spec_config.draft_model_path,
+                                           self.mapping)
+                    model.load_draft_weights(weights)
 
             elif load_format == LoadFormat.DUMMY:
                 initialize_dummy_weights(model)
@@ -1071,7 +1076,7 @@ class PyTorchModelEngine(ModelEngine):
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
-            if self.is_mtp:
+            if self.without_logits:
                 assert isinstance(new_tensors_device, SampleStateTensorsMTP)
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
@@ -1159,11 +1164,11 @@ class PyTorchModelEngine(ModelEngine):
                 range(len(position_ids),
                       len(position_ids) + len(generation_requests))))
         for request in generation_requests:
-            if new_tokens_device is None or request.py_batch_idx is None:
+            if new_tokens_device is None or request.py_batch_idx is None or request.is_cuda_graph_dummy:
                 # the request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
-                # (2) request.py_batch_idx is None, which means the request has no previous batch.
-                # the second condition includes dummy generation requests created for CUDA graph padding.
+                # (2) request.py_batch_idx is None, which means the request has no previous batch; or
+                # (3) request.is_cuda_graph_dummy, which means dummy generation requests created for CUDA graph padding.
                 # these dummy generation requests should be at the end of generation_requests.
                 # skip adding their input_ids so that new_tokens_device can be aligned to the correct positions.
                 if not request.is_cuda_graph_dummy:
@@ -1720,13 +1725,13 @@ class PyTorchModelEngine(ModelEngine):
                 continue
 
             for module in request.py_lora_task_layer_module_configs:
-                module_id = module.moduleId
-                layer_id = module.layerId
-                adapter_size = module.adapterSize
-                is_dora = module.scalingVecPointer == 0
-                weights_in_pointer = module.weightsInPointer
-                weights_out_pointer = module.weightsOutPointer
-                scaling_vec_pointer = module.scalingVecPointer
+                module_id = module.module_id
+                layer_id = module.layer_id
+                adapter_size = module.adapter_size
+                is_dora = module.scaling_vec_pointer == 0
+                weights_in_pointer = module.weights_in_pointer
+                weights_out_pointer = module.weights_out_pointer
+                scaling_vec_pointer = module.scaling_vec_pointer
                 if weights_in_pointer is None:
                     weights_in_pointer = 0
                 if weights_out_pointer is None:
@@ -1929,7 +1934,7 @@ class PyTorchModelEngine(ModelEngine):
     def _forward_step(self, inputs: Dict[str, Any],
                       gather_ids: Optional[torch.Tensor]) -> Dict[str, Any]:
         inputs = self._preprocess_inputs(inputs)
-        if self.is_mtp:
+        if self.without_logits:
             outputs = self.model_forward(**inputs)
             return outputs
 

@@ -398,6 +398,28 @@ size_t Serialization::serializedSize(kv_cache::SocketState const& state)
     return totalSize;
 }
 
+// AgentState
+kv_cache::AgentState Serialization::deserializeAgentState(std::istream& is)
+{
+    auto agentName = su::deserialize<decltype(kv_cache::AgentState::mAgentName)>(is);
+    auto connectionInfo = su::deserialize<decltype(kv_cache::AgentState::mConnectionInfo)>(is);
+    return kv_cache::AgentState{std::move(agentName), std::move(connectionInfo)};
+}
+
+void Serialization::serialize(kv_cache::AgentState const& state, std::ostream& os)
+{
+    su::serialize(state.mAgentName, os);
+    su::serialize(state.mConnectionInfo, os);
+}
+
+size_t Serialization::serializedSize(kv_cache::AgentState const& state)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(state.mAgentName);
+    totalSize += su::serializedSize(state.mConnectionInfo);
+    return totalSize;
+}
+
 // CommState
 kv_cache::CommState Serialization::deserializeCommState(std::istream& is)
 {
@@ -405,6 +427,7 @@ kv_cache::CommState Serialization::deserializeCommState(std::istream& is)
     auto variantIdx = su::deserialize<std::size_t>(is);
     constexpr std::size_t mpiIdx{1};
     constexpr std::size_t socketIdx{2};
+    constexpr std::size_t agentIdx{3};
     static_assert(
         std::is_same_v<kv_cache::MpiState, std::variant_alternative_t<mpiIdx, decltype(kv_cache::CommState::mState)>>);
     static_assert(std::is_same_v<std::vector<kv_cache::SocketState>,
@@ -417,6 +440,11 @@ kv_cache::CommState Serialization::deserializeCommState(std::istream& is)
     if (variantIdx == socketIdx)
     {
         auto state = su::deserialize<std::vector<kv_cache::SocketState>>(is);
+        return kv_cache::CommState{std::move(state), selfIdx};
+    }
+    if (variantIdx == agentIdx)
+    {
+        auto state = su::deserialize<std::vector<kv_cache::AgentState>>(is);
         return kv_cache::CommState{std::move(state), selfIdx};
     }
     return {};
@@ -433,6 +461,10 @@ void Serialization::serialize(kv_cache::CommState const& state, std::ostream& os
     else if (state.isSocketState())
     {
         su::serialize(state.getSocketState(), os);
+    }
+    else if (state.isAgentState())
+    {
+        su::serialize(state.getAgentState(), os);
     }
     else
     {
@@ -452,6 +484,10 @@ size_t Serialization::serializedSize(kv_cache::CommState const& state)
     else if (state.isSocketState())
     {
         totalSize += su::serializedSize(state.getSocketState());
+    }
+    else if (state.isAgentState())
+    {
+        totalSize += su::serializedSize(state.getAgentState());
     }
     else
     {
@@ -1503,8 +1539,11 @@ KvCacheRetentionConfig Serialization::deserializeKvCacheRetentionConfig(std::ist
         = su::deserialize<std::vector<executor::KvCacheRetentionConfig::TokenRangeRetentionConfig>>(is);
     auto decodePriority = su::deserialize<executor::RetentionPriority>(is);
     auto decodeDurationMs = intToDuration(su::deserialize<std::optional<size_t>>(is));
+    auto transferMode = su::deserialize<executor::KvCacheTransferMode>(is);
+    auto directory = su::deserialize<std::optional<std::string>>(is);
 
-    return KvCacheRetentionConfig{tokenRangeRetentionPriorities, decodePriority, decodeDurationMs};
+    return KvCacheRetentionConfig{
+        tokenRangeRetentionPriorities, decodePriority, decodeDurationMs, transferMode, directory};
 }
 
 void Serialization::serialize(KvCacheRetentionConfig const& kvCacheRetentionConfig, std::ostream& os)
@@ -1512,6 +1551,8 @@ void Serialization::serialize(KvCacheRetentionConfig const& kvCacheRetentionConf
     su::serialize(kvCacheRetentionConfig.getTokenRangeRetentionConfigs(), os);
     su::serialize(kvCacheRetentionConfig.getDecodeRetentionPriority(), os);
     su::serialize(durationToInt(kvCacheRetentionConfig.getDecodeDurationMs()), os);
+    su::serialize(kvCacheRetentionConfig.getTransferMode(), os);
+    su::serialize(kvCacheRetentionConfig.getDirectory(), os);
 }
 
 size_t Serialization::serializedSize(KvCacheRetentionConfig const& config)
@@ -1520,6 +1561,8 @@ size_t Serialization::serializedSize(KvCacheRetentionConfig const& config)
     totalSize += su::serializedSize(config.getTokenRangeRetentionConfigs());
     totalSize += su::serializedSize(config.getDecodeRetentionPriority());
     totalSize += su::serializedSize(durationToInt(config.getDecodeDurationMs()));
+    totalSize += su::serializedSize(config.getTransferMode());
+    totalSize += su::serializedSize(config.getDirectory());
     return totalSize;
 }
 

@@ -292,3 +292,9 @@ def apply_chat_template(
         chat_template=hf_chat_template,
         **(chat_template_kwargs or {}),
     )
+
+
+def check_multiple_response(n: int, backend: Optional[str]):
+    if n > 1 and backend == "pytorch":
+        raise ValueError(
+            "Multiple response is not supported in PyTorch workflow")

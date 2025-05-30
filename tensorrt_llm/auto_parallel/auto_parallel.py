@@ -149,6 +149,9 @@ def infer_builder_flags(network):
 
 
 def auto_parallel(network: Network, config: AutoParallelConfig):
+    logger.warning(
+        "auto_parallel is deprecated, "
+        "please use explicit parallelism like tp_size/pp_size instead.")
     debug_mode = config.debug_mode
     memory_budget = config.get_cluster_info(
     ).memory_budget_per_device * 1024 * 1024 * 1024
