@@ -1833,7 +1833,8 @@ class PyExecutor:
                 self.resource_manager,
                 extra_model_inputs=extra_model_inputs)
 
-            if spec_metadata.spec_dec_mode.is_eagle3():
+            if spec_metadata.spec_dec_mode.is_eagle3() and hasattr(
+                    self.draft_model_engine.model.model, 'd2t'):
                 outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
             sample_state = self._sample_async(draft_batch, outputs)
@@ -1885,7 +1886,8 @@ class PyExecutor:
                     self.resource_manager,
                     extra_model_inputs=extra_model_inputs)
 
-                if spec_metadata.spec_dec_mode.is_eagle3():
+                if spec_metadata.spec_dec_mode.is_eagle3() and hasattr(
+                        self.draft_model_engine.model.model, 'd2t'):
                     outputs[
                         'd2t'] = self.draft_model_engine.model.model.d2t.data
                 sample_state = self._sample_async(draft_batch, outputs)

@@ -1036,6 +1036,7 @@ class FusedMoE(nn.Module):
 
         if self.is_trtllm():
             # trtllm_gen backend only support min-latency mode now
+            assert not self.apply_router_weight_on_input, "TRTLLM backend does not support applying router weight on input yet."
             assert not self.reduce_results
             assert self.quant_config and (
                 self.quant_config.quant_mode.has_nvfp4()
@@ -1421,6 +1422,8 @@ class FusedMoE(nn.Module):
         assert token_selected_slots.dtype == torch.int32
 
         if self.apply_router_weight_on_input:
+            assert self.routing_method.top_k == 1, "Current workaround only supports top-1 routing"
+            assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
             x = x * token_final_scales.to(x.dtype)
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
@@ -1521,6 +1524,7 @@ class FusedMoE(nn.Module):
             use_fp8_block_scaling=use_fp8_block_scaling,
             use_w4a8_group_scaling=use_w4a8_group_scaling,
             min_latency_mode=cutlass_min_latency_mode,
+            tune_max_num_tokens=self.tune_max_num_tokens,
         )
 
         if cutlass_min_latency_mode:
@@ -1578,6 +1582,7 @@ class FusedMoE(nn.Module):
             num_rows = sum(all_rank_num_tokens)
         else:
             num_rows = x.shape[0]
+
         # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = (num_rows + self.moe_max_num_tokens -
                       1) // self.moe_max_num_tokens
@@ -2204,9 +2209,18 @@ class FusedMoE(nn.Module):
             dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
 
         for expert_id in range(self.num_experts):
-            w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
-            w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
-            w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
+                w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
+                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_input_scale = weights["gate_up_proj_input_scale"]
+                w3_input_scale = weights["gate_up_proj_input_scale"]
+                w2_input_scale = weights["down_proj_input_scale"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                )
 
             load_expert_fc31_input_scale_nvfp4(w1_input_scale, w3_input_scale,
                                                tmp_fc31_input_scale[expert_id])

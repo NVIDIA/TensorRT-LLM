@@ -339,7 +339,7 @@ void CudaGraphExecutor::clear()
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void CudaGraphExecutor::prepareNextGraph(std::shared_ptr<runtime::TllmRuntime>& runtime, SizeType32 nextContextId)
+void CudaGraphExecutor::prepareNextGraph(std::unique_ptr<runtime::TllmRuntime>& runtime, SizeType32 nextContextId)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& stream = runtime->getStream();
@@ -385,7 +385,7 @@ void CudaGraphExecutorCache::put(BatchState const& state, std::shared_ptr<CudaGr
     {
         mCache.erase(it->second);
     }
-    mCache.emplace_front(BatchStateGraphExecutorPair{state, value});
+    mCache.emplace_front(state, value);
     mMap[state] = mCache.begin();
 
     if (static_cast<runtime::SizeType32>(mMap.size()) > mCapacity)
