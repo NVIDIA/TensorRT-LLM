@@ -449,7 +449,7 @@ void initRequestBindings(pybind11::module_& m)
         {
             throw std::runtime_error("Invalid EagleConfig state!");
         }
-        return tle::EagleConfig(state[0].cast<tle::EagleChoices>(), state[1].cast<bool>(),
+        return tle::EagleConfig(state[0].cast<std::optional<tle::EagleChoices>>(), state[1].cast<bool>(),
             state[2].cast<std::optional<float>>(), state[3].cast<bool>(), state[4].cast<std::optional<SizeType32>>());
     };
     py::class_<tle::EagleConfig>(m, "EagleConfig")
