@@ -802,6 +802,8 @@ def convert_scheduler_policy(batch_scheduler_policy: str):
         return trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
     elif batch_scheduler_policy.lower() == "guaranteed_no_evict":
         return trtllm.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+    elif batch_scheduler_policy.lower() == "static_batch":
+        return trtllm.CapacitySchedulerPolicy.STATIC_BATCH
     raise pb_utils.TritonModelException(
         f"batch_scheduler_policy value of '{batch_scheduler_policy}' is not supported."
     )
@@ -814,8 +816,6 @@ def convert_batching_type(gpt_model_type: str):
     ) == "inflight_fused_batching" or gpt_model_type.lower(
     ) == "inflight_batching":
         return trtllm.BatchingType.INFLIGHT
-    elif gpt_model_type.lower() == "v1":
-        return trtllm.BatchingType.STATIC
     raise pb_utils.TritonModelException(
         f"gpt_model_type value of '{gpt_model_type}' is not supported.")
 
@@ -1102,7 +1102,7 @@ class TritonPythonModel:
             description="TRT LLM KV cache block metrics",
             kind=pb_utils.MetricFamily.GAUGE,
         )
-        model_type = "v1" if is_v1_model else "inflight_batcher"
+        model_type = "inflight_batcher" if is_v1_model else "v1"
         self.model_type_metric_family = pb_utils.MetricFamily(
             name=f"nv_trt_llm_{model_type}_metrics",
             description=f"TRT LLM {model_type}-specific metrics",
@@ -1311,8 +1311,8 @@ class TritonPythonModel:
 
         self.create_metrics(args["model_name"],
                             args["model_version"],
-                            is_v1_model=executor_config.batching_type ==
-                            trtllm.BatchingType.STATIC)
+                            is_v1_model=executor_config.batch_scheduler_policy
+                            == trtllm.CapacitySchedulerPolicy.STATIC_BATCH)
         self.triton_user_id_to_req_ids = {}
         self.triton_req_id_to_req_ids = {}
         self.req_id_to_request_data = {}

@@ -32,8 +32,9 @@ def stop_triton_server():
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
+@pytest.mark.parametrize(
+    "BATCH_SCHEDULER_POLICY",
+    ["max_utilization", "guaranteed_no_evict", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -81,11 +82,9 @@ def test_llama_v2_7b_ifb(
     llama_v2_tokenizer_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
-    if BATCHING_STRATEGY == "V1" and FEATURE_NAME == "test_embedding_bias":
-        pytest.skip("Skipping. V1 doesn't support embedding_bias tensor yet.")
+    if BATCH_SCHEDULER_POLICY == "static_batch" and FEATURE_NAME == "test_embedding_bias":
+        pytest.skip(
+            "Skipping. static batch doesn't support embedding_bias tensor yet.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -165,8 +164,9 @@ def test_llama_v2_7b_ifb(
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", ["4096"])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
+@pytest.mark.parametrize(
+    "BATCH_SCHEDULER_POLICY",
+    ["max_utilization", "guaranteed_no_evict", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -209,8 +209,8 @@ def test_mistral_v1_7b_ifb(
     mistral_v1_tokenizer_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
+    if BATCH_SCHEDULER_POLICY == "static_batch":
+        pytest.skip("Skipping. static batch is not supported.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -282,8 +282,9 @@ def test_mistral_v1_7b_ifb(
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", ["4096"])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
+@pytest.mark.parametrize(
+    "BATCH_SCHEDULER_POLICY",
+    ["max_utilization", "guaranteed_no_evict", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -326,9 +327,6 @@ def test_mistral_v1_multi_models(
     mistral_v1_tokenizer_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
@@ -469,8 +467,9 @@ def test_mistral_v1_7b_python_backend(
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
+@pytest.mark.parametrize(
+    "BATCH_SCHEDULER_POLICY",
+    ["max_utilization", "guaranteed_no_evict", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -513,9 +512,6 @@ def test_llama_v2_70b_ifb(
     llama_v2_tokenizer_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
 
@@ -637,9 +633,6 @@ def test_llama_v2_70b_ifb_lad(
     llama_v2_tokenizer_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
 
     # Build Engine
@@ -712,8 +705,9 @@ def test_llama_v2_70b_ifb_lad(
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
+@pytest.mark.parametrize(
+    "BATCH_SCHEDULER_POLICY",
+    ["max_utilization", "guaranteed_no_evict", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -759,8 +753,6 @@ def test_medusa_vicuna_7b_ifb(
     llm_backend_dataset_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -884,8 +876,6 @@ def test_eagle_vicuna_7b_ifb(
     llm_backend_dataset_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -1038,8 +1028,9 @@ def test_gpt_350m_python_backend(
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
+@pytest.mark.parametrize(
+    "BATCH_SCHEDULER_POLICY",
+    ["max_utilization", "guaranteed_no_evict", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -1087,11 +1078,9 @@ def test_gpt_350m_ifb(
     gpt_tokenizer_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
-    if BATCHING_STRATEGY == "V1" and FEATURE_NAME == "test_embedding_bias":
-        pytest.skip("Skipping. V1 doesn't support embedding_bias tensor yet.")
+    if BATCH_SCHEDULER_POLICY == "static_batch" and FEATURE_NAME == "test_embedding_bias":
+        pytest.skip(
+            "Skipping. static batch doesn't support embedding_bias tensor yet.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -1223,11 +1212,9 @@ def test_t5_small_enc_dec_ifb(
     t5_small_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
-    if BATCHING_STRATEGY == "V1" and FEATURE_NAME == "test_embedding_bias":
-        pytest.skip("Skipping. V1 doesn't support embedding_bias tensor yet.")
+    if BATCH_SCHEDULER_POLICY == "static_batch" and FEATURE_NAME == "test_embedding_bias":
+        pytest.skip(
+            "Skipping. static batch doesn't support embedding_bias tensor yet.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -1344,11 +1331,9 @@ def test_whisper_large_v3_ifb(
     whisper_large_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
-    if BATCHING_STRATEGY == "V1" and FEATURE_NAME == "test_embedding_bias":
-        pytest.skip("Skipping. V1 doesn't support embedding_bias tensor yet.")
+    if BATCH_SCHEDULER_POLICY == "static_batch" and FEATURE_NAME == "test_embedding_bias":
+        pytest.skip(
+            "Skipping. static batch doesn't support embedding_bias tensor yet.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -1440,8 +1425,9 @@ def test_whisper_large_v3_ifb(
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
+@pytest.mark.parametrize(
+    "BATCH_SCHEDULER_POLICY",
+    ["max_utilization", "guaranteed_no_evict", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -1486,9 +1472,9 @@ def test_gpt_gather_logits_ifb(
     gpt_tokenizer_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
+    if BATCH_SCHEDULER_POLICY == "static_batch" and FEATURE_NAME == "test_embedding_bias":
+        pytest.skip(
+            "Skipping. static batch doesn't support embedding_bias tensor yet.")
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build engine
     ENGINE_PATH = prepare_gpt_gather_logits_engine(
@@ -1564,8 +1550,9 @@ def test_gpt_gather_logits_ifb(
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
+@pytest.mark.parametrize(
+    "BATCH_SCHEDULER_POLICY",
+    ["max_utilization", "guaranteed_no_evict", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -1610,8 +1597,9 @@ def test_gpt_350m_speculative_decoding(
     llm_backend_dataset_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1":
-        pytest.skip("Skipping. Speculative decoding is not supported in V1.")
+    if BATCH_SCHEDULER_POLICY == "static_batch" and FEATURE_NAME == "test_embedding_bias":
+        pytest.skip(
+            "Skipping. static batch doesn't support embedding_bias tensor yet.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -1754,8 +1742,9 @@ def test_gpt_350m_speculative_decoding(
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
+@pytest.mark.parametrize(
+    "BATCH_SCHEDULER_POLICY",
+    ["max_utilization", "guaranteed_no_evict", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -1800,8 +1789,6 @@ def test_gpt_350m_speculative_decoding_return_logits(
     llm_backend_dataset_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1":
-        pytest.skip("Skipping. Speculative decoding is not supported in V1.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -1945,8 +1932,9 @@ def test_gpt_350m_speculative_decoding_return_logits(
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["guaranteed_no_evict", "max_utilization"])
+@pytest.mark.parametrize(
+    "BATCH_SCHEDULER_POLICY",
+    ["guaranteed_no_evict", "max_utilization", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -1993,8 +1981,6 @@ def test_gpt_speculative_decoding_bls(
     llm_backend_dataset_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1":
-        pytest.skip("Skipping. Speculative decoding is not supported in V1.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -2100,7 +2086,8 @@ def test_gpt_speculative_decoding_bls(
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY", ["guaranteed_no_evict"])
+@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
+                         ["guaranteed_no_evict", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -2152,9 +2139,6 @@ def test_llama_v3_speculative_decoding_bls(
 ):
     if DATA_TYPE == "fp8" and getSMVersion() < 89:
         pytest.skip("Skipping fp8 test on pre-Ada architecture")
-
-    if BATCHING_STRATEGY == "V1":
-        pytest.skip("Skipping. Speculative decoding is not supported in V1.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -2273,8 +2257,9 @@ def test_llama_v3_speculative_decoding_bls(
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
+@pytest.mark.parametrize(
+    "BATCH_SCHEDULER_POLICY",
+    ["max_utilization", "guaranteed_no_evict", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -2318,8 +2303,6 @@ def test_gpt_175b_dummyWeights_ifb(
     gpt_tokenizer_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -2389,8 +2372,9 @@ def test_gpt_175b_dummyWeights_ifb(
 @pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
 @pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
+@pytest.mark.parametrize(
+    "BATCH_SCHEDULER_POLICY",
+    ["max_utilization", "guaranteed_no_evict", "static_batch"])
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.7"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
@@ -2434,8 +2418,6 @@ def test_llava(
     llm_backend_multimodal_example_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -2570,8 +2552,6 @@ def test_llava_onevision(
     test_video_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -2724,8 +2704,6 @@ def test_mllama(
     llm_backend_multimodal_example_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1":
-        pytest.skip("Skipping. mllama is not supported with V1.")
 
     if BATCH_SCHEDULER_POLICY == "max_utilization":
         pytest.skip(
@@ -2904,8 +2882,6 @@ def test_gpt_next_ptuning_ifb(
     gpt_next_ptuning_model_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -3082,8 +3058,6 @@ def test_gpt_2b_lora_ifb(
     models_root,
     llm_backend_venv,
 ):
-    if BATCHING_STRATEGY == "V1":
-        pytest.skip("Skipping. LoRA is not supported in V1.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -3379,11 +3353,9 @@ def test_gpt_disaggregated_serving_bls(
     # Enable disaggregated serving.
     monkeypatch.setenv("TRTLLM_USE_MPI_KVCACHE", "1")
 
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
-    if BATCHING_STRATEGY == "V1" and FEATURE_NAME == "test_embedding_bias":
-        pytest.skip("Skipping. V1 doesn't support embedding_bias tensor yet.")
+    if BATCH_SCHEDULER_POLICY == "static_batch" and FEATURE_NAME == "test_embedding_bias":
+        pytest.skip(
+            "Skipping. static batch doesn't support embedding_bias tensor yet.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
