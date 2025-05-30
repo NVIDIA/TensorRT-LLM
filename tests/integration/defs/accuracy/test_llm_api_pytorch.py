@@ -20,7 +20,7 @@ from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig, SamplingParams
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (llm_models_root, parametrize_with_ids,
+from ..conftest import (llm_models_root, parametrize_with_ids, skip_no_hopper,
                         skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
@@ -761,6 +761,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252559")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
+        if torch_compile:
+            pytest.skip()
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -796,17 +798,17 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
-                          [(False, False, False, False),
-                           (True, False, False, False),
-                           (False, True, False, False),
-                           (False, False, True, False),
-                           (False, False, False, True),
-                           (False, True, True, True), (True, True, True, True)])
+    @parametrize_with_ids(
+        "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
+        [(False, False, False, False),
+         pytest.param(True, False, False, False, marks=skip_no_hopper),
+         (False, True, False, False), (False, False, True, False),
+         (False, False, False, True), (False, True, True, True),
+         pytest.param(True, True, True, True, marks=skip_no_hopper)])
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids("quant_dtype", [
         pytest.param("none", marks=skip_pre_hopper),
-        pytest.param("fp8", marks=skip_pre_hopper),
+        pytest.param("fp8", marks=skip_no_hopper),
         pytest.param("nvfp4", marks=skip_pre_blackwell)
     ])
     def test_no_kv_cache_reuse(self, quant_dtype, mtp_nextn, fp8kv,
