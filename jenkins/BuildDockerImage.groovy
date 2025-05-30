@@ -485,7 +485,7 @@ pipeline {
             }
             steps {
                 script {
-                    collectResultPodSpec = createKubernetesPodConfig("", "agent")
+                    collectResultPodSpec = createKubernetesPodConfig("agent")
                     trtllm_utils.launchKubernetesPod(this, collectResultPodSpec, "alpine", {
                         // 安装wget工具
                         trtllm_utils.llmExecStepWithRetry(this, script: "apk add --no-cache wget")
