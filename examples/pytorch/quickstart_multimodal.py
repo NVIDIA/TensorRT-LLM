@@ -45,6 +45,11 @@ def add_multimodal_args(parser):
                         type=int,
                         default=8,
                         help="The number of video frames to be sampled.")
+    parser.add_argument("--image_format",
+                        type=str,
+                        choices=["pt", "pil"],
+                        default="pt",
+                        help="The format of the image.")
     return parser
 
 
@@ -72,7 +77,7 @@ def main():
 
     llm, sampling_params = setup_llm(args)
 
-    image_format = "pt"  # ["pt", "pil"]
+    image_format = args.image_format
     if args.model_type is not None:
         model_type = args.model_type
     else:
@@ -92,7 +97,7 @@ def main():
     outputs = llm.generate(inputs, sampling_params)
 
     for i, output in enumerate(outputs):
-        prompt = inputs[i]['prompt']
+        prompt = args.prompt[i]
         generated_text = output.outputs[0].text
         print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
 

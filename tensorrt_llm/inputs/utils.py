@@ -58,7 +58,7 @@ def load_image(image: str,
         image = _load_and_convert_image(image)
 
     if format == "pt":
-        return ToTensor()(image).to(device=device)
+        return PILToTensor()(image).to(device=device)
     else:
         return image
 
@@ -82,7 +82,7 @@ async def async_load_image(
         image = _load_and_convert_image(Path(parsed_url.path))
 
     if format == "pt":
-        return ToTensor()(image).to(device=device)
+        return PILToTensor()(image).to(device=device)
     else:
         return image
 
@@ -130,7 +130,7 @@ def load_video(
         frames[index] = Image.fromarray(frame)
 
     return [
-        ToTensor()(frames[index]).to(
+        PILToTensor()(frames[index]).to(
             device=device) if format == "pt" else frames[index]
         for index in indices if index in frames
     ]

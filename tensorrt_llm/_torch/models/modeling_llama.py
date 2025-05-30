@@ -2,7 +2,6 @@ import copy
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-from PIL.Image import Image
 from torch import nn
 from transformers import (AutoProcessor, Llama4Config, Llama4VisionModel,
                           LlamaConfig)
@@ -972,12 +971,11 @@ class Llama4InputProcessor(InputProcessor):
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
             "multi_modal_data")
-        images, do_rescale = None, True
+        images = None
 
         if mm_data and mm_data.get("image"):
             images = mm_data["image"]
             img_type = type(mm_data["image"][0])
-            do_rescale = (img_type == Image)
             assert all(isinstance(img, img_type) for img in mm_data["image"])
 
         truncate_kwargs = {}
@@ -992,7 +990,6 @@ class Llama4InputProcessor(InputProcessor):
             images=images,
             return_tensors="pt",
             device="cuda",
-            do_rescale=do_rescale,
             add_special_tokens=sampling_params.add_special_tokens,
             **truncate_kwargs)
         if images:
@@ -1003,7 +1000,7 @@ class Llama4InputProcessor(InputProcessor):
             mm_embeds = self.encoder.multi_modal_projector(mm_embeds)
             # for fuse_input_embeds
             token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
-            return token_ids.tolist(), {"mm_embedding": mm_embeds}
+            return token_ids.tolist(), {"mm_embedding": mm_embeds.to('cpu')}
         else:
             return processed["input_ids"].squeeze().tolist(), {}
 

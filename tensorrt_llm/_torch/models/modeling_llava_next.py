@@ -72,7 +72,6 @@ class LlavaNextInputProcessor(InputProcessor):
         return [
             self.processor(text="dummy",
                            images=image,
-                           do_rescale=not isinstance(image, torch.Tensor),
                            return_tensors="pt",
                            device=self.device)['pixel_values'][0].to(
                                self.device) for image in images
@@ -187,7 +186,7 @@ class LlavaNextInputProcessor(InputProcessor):
             [self._process(tensor) for tensor in mm_tensor])
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_features
+            "mm_embedding": mm_features.to('cpu')
         }
 
 

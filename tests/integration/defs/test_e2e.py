@@ -1825,6 +1825,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
     ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
     ("qwen2-vl-7b-instruct", "Qwen2-VL-7B-Instruct"),
     ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
+    ("hyperclovax-seed-instruct-3b", "HyperCLOVAX-SEED-Vision-Instruct-3B"),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality):
@@ -1913,6 +1914,11 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 ["earth", "rotating", "night", "lights", "cities"],
             ],
         },
+        "hyperclovax-seed-instruct-3b": {
+            "image": [['흐린', '거친', '구름', '파도', '거품'],
+                      ["화창한", "푸른색", "구름", "화강암", "절벽"],
+                      ["도로", "교통", "차량", "주행", "차선"]],
+        },
     }
 
     cmd = [
@@ -1928,7 +1934,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         "--disable_kv_cache_reuse",
     ]
     # NOTE
-    # Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens.
+    # Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens for video.
     if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
                       ] and modality == "video":
         cmd.append("--max_num_tokens=16384")
