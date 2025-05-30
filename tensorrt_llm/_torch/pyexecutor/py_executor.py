@@ -1733,8 +1733,7 @@ class PyExecutor:
                 ) if request.py_last_draft_tokens is not None else 0
                 request.py_draft_tokens = []
 
-                num_accepted_tokens = getattr(request,
-                                              "py_num_accepted_draft_tokens", 0)
+                num_accepted_tokens = request.py_num_accepted_draft_tokens
                 num_rejected_tokens = num_draft_tokens - num_accepted_tokens
                 assert num_rejected_tokens >= 0
                 req_id_to_num_rejected_tokens[
@@ -1758,7 +1757,7 @@ class PyExecutor:
                         is_streaming=False)
 
                     draft_batch.context_requests.append(new_request)
-                elif getattr(request, "py_num_accepted_draft_tokens", 0) == 0:
+                elif num_accepted_tokens == 0:
                     new_request = LlmRequest(
                         request_id=request.py_request_id,
                         max_new_tokens=request.py_max_new_tokens,
@@ -1809,36 +1808,22 @@ class PyExecutor:
             }
 
             spec_metadata = self.model_engine.last_spec_metadata
-
-            hidden_states = spec_metadata.get_hidden_states(
-                draft_batch, num_rejected_tokens)
-
-            if spec_metadata.spec_dec_mode.is_eagle3():
-                # Hack for eagle3. We might need to run a matmul to reduce
-                # the dimensionality of the hidden states on the first pass
-                # through the draft model. Shape dependent control flow will
-                # not work with CUDA graphs. So we just do it here.
-                hidden_states = self.draft_model_engine.model.apply_eagle3_fc(
-                    hidden_states)
-
-            extra_model_inputs = {'hidden_states': hidden_states}
-
-            outputs = self.draft_model_engine.forward(
-                draft_batch,
-                self.resource_manager,
-                extra_model_inputs=extra_model_inputs)
+            draft_model_spec_metadata = self.draft_model_engine.get_spec_metadata(
+                draft_batch, self.resource_manager)
+            draft_model_spec_metadata.update_from_target_metadata(spec_metadata)
+            outputs = self.draft_model_engine.forward(draft_batch,
+                                                      self.resource_manager)
 
             if spec_metadata.spec_dec_mode.is_eagle3() and hasattr(
                     self.draft_model_engine.model.model, 'd2t'):
                 outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
             sample_state = self._sample_async(draft_batch, outputs)
+            previous_batch = sample_state
 
             self._update_request_states(draft_batch)
 
-            self._update_requests(sample_state)
-
-            def _process_decoded_tokens():
+            def _process_decoded_tokens(draft_batch):
                 new_requests = []
                 for req in chain(draft_batch.context_requests,
                                  draft_batch.generation_requests):
@@ -1862,24 +1847,17 @@ class PyExecutor:
                     req.py_draft_tokens.extend(
                         0 for _ in range(max_draft_tokens - num_draft_tokens))
 
-            new_requests = _process_decoded_tokens()
-            if not new_requests:
-                _pad_to_max_draft_tokens()
-                return
-
-            draft_batch.generation_requests = new_requests
+            draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
             draft_batch.context_requests = []
 
             for _ in range(spec_metadata.max_draft_tokens - 1):
-                draft_spec_metadata = self.draft_model_engine.last_spec_metadata
-                hidden_states = draft_spec_metadata.get_hidden_states(
-                    draft_batch)
-                extra_model_inputs = {'hidden_states': hidden_states}
+                if len(draft_batch.generation_requests) == 0:
+                    break
 
                 outputs = self.draft_model_engine.forward(
                     draft_batch,
                     self.resource_manager,
-                    extra_model_inputs=extra_model_inputs)
+                    new_tensors_device=previous_batch.device)
 
                 if spec_metadata.spec_dec_mode.is_eagle3() and hasattr(
                         self.draft_model_engine.model.model, 'd2t'):
@@ -1887,14 +1865,16 @@ class PyExecutor:
                         'd2t'] = self.draft_model_engine.model.model.d2t.data
                 sample_state = self._sample_async(draft_batch, outputs)
                 self._update_request_states(draft_batch)
-                self._update_requests(sample_state)
-
-                new_requests = _process_decoded_tokens()
-                if not new_requests:
-                    break
+                self._update_requests(previous_batch)
+                new_requests = _process_decoded_tokens(
+                    previous_batch.scheduled_requests)
                 draft_batch.generation_requests = new_requests
+                previous_batch = sample_state
+            self._update_requests(previous_batch)
 
             _pad_to_max_draft_tokens()
+            new_requests = _process_decoded_tokens(
+                previous_batch.scheduled_requests)
 
         except Exception as e:
             traceback.print_exc()

@@ -563,8 +563,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        self.prompt_lens_cuda[:self.num_seqs].copy_(
-            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -573,16 +571,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         ) if self.kv_cache_params.use_cache else None
 
-        if self.enable_flash_mla:
-            self.prepare_flash_mla()
         # number of tokens needed in the kv cache for each sequence after the next pass
         kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
         # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(
-            kv_lens[:self.num_seqs].pin_memory(), non_blocking=True)
         self.host_request_types[:self.num_contexts].fill_(0)
         self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
 
@@ -590,16 +584,27 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_paged_context_mla:
             self.prepare_paged_context_mla(cached_token_lens, kv_lens)
 
-        # kv block offsets
+        # prepare kv cache
+        if self.enable_flash_mla:
+            self.prepare_flash_mla()
         assert self.request_ids is not None
         if self.kv_cache_manager is not None:
             self.kv_cache_manager.impl.copy_batch_block_offsets(
                 self.host_kv_cache_block_offsets, self.request_ids)
+            assert self.kv_lens[:self.num_seqs].max(
+            ) <= self.kv_cache_manager.max_seq_len, f"Please set max_seq_len to at least {self.kv_lens[:self.num_seqs].max()} for kv cache manager."
+
+    def prepare_device(self) -> None:
+        self.prompt_lens_cuda[:self.num_seqs].copy_(
+            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+        self.kv_lens_cuda[:self.num_seqs].copy_(
+            self.kv_lens[:self.num_seqs] -
+            self.kv_cache_params.num_extra_kv_tokens,
+            non_blocking=True)
+        if self.kv_cache_manager is not None:
             self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
                 self.host_kv_cache_block_offsets[:, :self.num_seqs],
                 non_blocking=True)
-            assert self.kv_lens[:self.num_seqs].max(
-            ) <= self.kv_cache_manager.max_seq_len, f"Please set max_seq_len to at least {self.kv_lens[:self.num_seqs].max()} for kv cache manager."
 
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
         self.kv_lens_runtime = self.kv_lens[:self.num_seqs]
