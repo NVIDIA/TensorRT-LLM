@@ -700,9 +700,11 @@ class Llama4Model(DecoderModel):
         self.mapping = model_config.mapping
 
         if self.model_config.mapping.enable_attention_dp:
-            self.embed_tokens = Embedding(config.vocab_size,
-                                          config.hidden_size,
-                                          dtype=config.torch_dtype)
+            self.embed_tokens = Embedding(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=config.torch_dtype,
+            )
         else:
             self.embed_tokens = Embedding(
                 config.vocab_size,
@@ -785,14 +787,21 @@ class LlamaModel(DecoderModel):
                 weight = lora_loader.embed_tokens
                 self.has_custom_embed_tokens = True
 
-        self.embed_tokens = Embedding(
-            vocab_size,
-            config.hidden_size,
-            dtype=config.torch_dtype,
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
-        )
+        if self.model_config.mapping.enable_attention_dp:
+            self.embed_tokens = Embedding(
+                vocab_size,
+                config.hidden_size,
+                dtype=config.torch_dtype,
+            )
+        else:
+            self.embed_tokens = Embedding(
+                vocab_size,
+                config.hidden_size,
+                dtype=config.torch_dtype,
+                mapping=model_config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+            )
 
         if self.has_custom_embed_tokens:
             with torch.no_grad():
