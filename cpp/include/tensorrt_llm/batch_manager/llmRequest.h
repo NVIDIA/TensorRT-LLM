@@ -1812,6 +1812,16 @@ public:
         return mRequestedBlockHashes;
     }
 
+    void setIsDummyRequest(bool isDummyRequest)
+    {
+        mIsDummyRequest = isDummyRequest;
+    }
+
+    [[nodiscard]] bool isDummyRequest() const
+    {
+        return mIsDummyRequest;
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -1980,6 +1990,8 @@ protected:
 
     // Context request only. The hashes of the blocks that are requested by the corresponding generation request.
     std::vector<size_t> mRequestedBlockHashes;
+
+    bool mIsDummyRequest{false};
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
