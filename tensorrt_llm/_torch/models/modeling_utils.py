@@ -1,8 +1,10 @@
 import contextlib
+import itertools
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, Generic, List, Optional, Tuple, Type, TypeVar, Union
+from typing import (Dict, Generic, Iterable, List, Optional, Tuple, Type,
+                    TypeVar, Union)
 
 import torch
 from torch import nn
@@ -631,9 +633,199 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
     return renamed_weights
 
 
+class WeightsLoader:
+
+    def __init__(self, model: Union[nn.Module,
+                                    DecoderModelForCausalLM]) -> None:
+        if not hasattr(model, 'model_config') or not isinstance(
+                model.model_config, ModelConfig):
+            raise ValueError("model must have a model_config attribute")
+        if not hasattr(model, 'config'):
+            raise ValueError("model must have a config attribute")
+
+        self.model = model
+        self.weights_dict = None
+
+        self.params_map = {
+            'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
+            'gate_up_proj': ['gate_proj', 'up_proj'],
+        }
+
+        # TODO: rename
+        self.sub_to_fused_param = {
+            sub_name: fused_name
+            for fused_name, sub_names in self.params_map.items()
+            for sub_name in sub_names
+        }
+
+    def _get_full_param_name(self, *parts: str) -> str:
+        return ".".join(p for p in parts if p)
+
+    def _fuse_weights(self, base_prefix: str,
+                      child_prefix: str) -> Optional[tuple[str, Iterable[str]]]:
+        fused_param_name = self.sub_to_fused_param[child_prefix]
+        fused_weights = []
+
+        for suffix in ['weight']:  # 'bias'
+            module_weights = []
+            for param_name in self.params_map[fused_param_name]:
+                param_name = self._get_full_param_name(base_prefix, param_name,
+                                                       suffix)
+                if param_name in self.weights_dict:
+                    module_weights.append(self.weights_dict[param_name])
+
+            if module_weights:
+                fused_weights.append((suffix, module_weights))
+
+        return fused_param_name, fused_weights
+
+    def _groupby_prefix(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+    ) -> Iterable[Tuple[str, Iterable[Tuple[str, torch.Tensor]]]]:
+        weights_by_parts = ((weight_name.split(".", 1), weight_data)
+                            for weight_name, weight_data in weights)
+
+        for prefix, group in itertools.groupby(weights_by_parts,
+                                               key=lambda x: x[0][0]):
+            yield (
+                prefix,
+                (("" if len(parts) == 1 else parts[1], weights_data)
+                 for parts, weights_data in group),
+            )
+
+    def _can_skip(self, name: str) -> bool:
+        # skip load weights if tie word embeddings is enabled and layer is lm_head
+        if self.model.config.tie_word_embeddings and name.startswith("lm_head"):
+            return True
+
+        # Skip loading weights for embedding and lm_head if LoRA is enabled
+        if hasattr(
+                self.model.model_config, 'lora_config'
+        ) and self.model.model_config.lora_config is not None and len(
+                self.model.model_config.lora_config.lora_dir) == 1 and (
+                    name == "model.embed_tokens" or name == "lm_head"):
+            return True
+
+        if hasattr(self.model, 'has_custom_lm_head'
+                   ) and self.model.has_custom_lm_head and name == "lm_head":
+            return True
+
+        # WAR: better solution is that llama has its own load_weights function.
+        if 'next_layer_layernorm' in name:
+            return True
+
+        # Skip if parameter belongs to a missing layer
+        # if missing_layer_parameter(name, model):
+        #     return True
+
+        return False
+
+    def _load_param(
+            self,
+            base_prefix: str,
+            param: nn.Parameter,
+            weights: Iterable[Tuple[str, torch.Tensor]],
+            module: nn.Module,  # parent module. TODO: cleanup
+    ) -> Iterable[str]:
+        for weight_name, weight_data in weights:
+            weight_qualname = self._get_full_param_name(base_prefix,
+                                                        weight_name)
+            if self._can_skip(weight_qualname):
+                continue
+
+            def weight_loader(param: torch.Tensor,
+                              loaded_weight: torch.Tensor) -> None:
+                if not isinstance(loaded_weight, List):
+                    assert param.size() == loaded_weight.size(), (
+                        f"Attempted to load weight ({loaded_weight.size()}) "
+                        f"into parameter ({param.size()})")
+                    param.data.copy_(loaded_weight)
+                else:
+                    # use customzied loader
+                    module.load_weights(weights=[{
+                        "weight": w
+                    } for w in loaded_weight])  # TODO
+
+            weight_loader(param, weight_data)
+
+            logger.debug("Loaded weight %s with shape %s", weight_qualname,
+                         param.shape)
+
+            yield weight_qualname
+
+    def _load_module(
+        self,
+        base_prefix: str,
+        module: nn.Module,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+    ) -> Iterable[str]:
+
+        # TODO: use custom load_weights function if any
+
+        child_modules = dict(module.named_children())
+        child_params = dict(module.named_parameters(recurse=False))
+
+        # traverse the incoming weights recursively
+        for child_prefix, child_weights in self._groupby_prefix(weights):
+            prefix = self._get_full_param_name(base_prefix, child_prefix)
+
+            if child_prefix in child_modules:
+                if self._can_skip(prefix + "."):
+                    continue
+
+                yield from self._load_module(prefix,
+                                             child_modules[child_prefix],
+                                             child_weights)
+            elif child_prefix in child_params:
+                if self._can_skip(prefix):
+                    continue
+
+                yield from self._load_param(prefix, child_params[child_prefix],
+                                            child_weights, module)
+            else:
+                # check whether the weight belongs to fused layers
+                if child_prefix in self.sub_to_fused_param:
+                    fused_param_name, fused_weights = self._fuse_weights(
+                        base_prefix, child_prefix)
+
+                    assert fused_param_name in child_modules, f"Fused param {fused_param_name} not in child_modules: {child_modules}"
+                    yield from self._load_module(
+                        prefix, child_modules[fused_param_name], fused_weights)
+                    continue
+
+                if self._can_skip(prefix + ".") or self._can_skip(prefix):
+                    continue
+
+                msg = f"No module or parameter named '{prefix}'"
+                raise ValueError(msg)
+
+    def load_weights(self,
+                     weights: Iterable[Tuple[str, torch.Tensor]],
+                     params_map: Optional[Dict[str, str]] = None) -> set[str]:
+        print(f"Using WIP weightloader")
+        if params_map is not None:
+            weights = rename_weights_with_regex(params_map, weights)
+            logger.info(f"Renamed weights with map: {params_map}")
+
+        self.weights_dict = weights
+        # convert into an iteratable for streaming weight udpates
+        weights = weights.items()
+
+        loaded_weights = set(self._load_module("", self.model, weights))
+        return loaded_weights
+
+
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
                        params_map: Optional[Dict[str, str]] = None):
+
+    # TODO: TMP WIP
+    weight_loader = WeightsLoader(model)
+    weight_loader.load_weights(weights)
+    return
+    # =======
+
     if not hasattr(model, 'model_config') or not isinstance(
             model.model_config, ModelConfig):
         raise ValueError("model must have a model_config attribute")
