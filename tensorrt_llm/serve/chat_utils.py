@@ -79,26 +79,32 @@ class AsyncMultimodalDataTracker:
                                         current_count: int) -> Optional[str]:
         """Get the appropriate placeholder for a given modality and model type."""
         model_type = self.model_config.model_type
-
+        add_front = True
         if modality == "image":
             if model_type in ("qwen2_vl", "qwen2_5_vl"):
-                return "<|vision_start|><|image_pad|><|vision_end|>"
+                return "<|vision_start|><|image_pad|><|vision_end|>", add_front
             elif model_type in ("mllama", "llama4"):
-                return "<|image|>"
+                return "<|image|>", add_front
+            elif model_type in ("hyperclovax_vlm"):
+                add_front = False
+                return '<im_end>\n<|im_start|>user (mime) \n{"type": "image/jpeg", "filename": ""}<|im_end|>\n' + \
+                    '<|im_start|>user (vector)\n<|dummy3|><|im_end|>\n' + \
+                    '<|im_start|>image/aux\n다음 중 ocr은 사진에서 검출된 글자이고, lens_keyword는 사진에서 추출된 keyword와 bbox 위치입니다.' + \
+                    'bbox는 0~1 사이로 정규화된 [x1, y1, x2, y2]의 형태입니다. 참고하여 답변하세요. {"ocr": "", "lens_keywords": "", "lens_local_keywords": ""}', add_front
             raise TypeError(f"Unknown {modality} model type: {model_type}")
         elif modality == "video":
             if model_type in ("qwen2_vl", "qwen2_5_vl"):
-                return "<|vision_start|><|video_pad|><|vision_end|>"
+                return "<|vision_start|><|video_pad|><|vision_end|>", add_front
             raise TypeError(f"Unknown {modality} model type: {model_type}")
         raise TypeError(f"Unknown modality: {modality}")
 
     def add_mm_data(self, media_type: str, data: Coroutine):
         current_count = len(self.mm_data[media_type]) + 1
-        placeholder = self.retrieve_multimodal_placeholder(
+        placeholder, add_front = self.retrieve_multimodal_placeholder(
             media_type, current_count)
         self.mm_data[media_type].append(data)
         if placeholder:
-            self.mm_placeholder_counts[placeholder] += 1
+            self.mm_placeholder_counts[(placeholder, add_front)] += 1
 
     def mm_data_counts(self) -> Dict[str, int]:
         """Get the count of multimodal placeholders."""
@@ -108,10 +114,17 @@ class AsyncMultimodalDataTracker:
 def add_multimodal_placeholders(text_prompt: str,
                                 mm_placeholder_counts: dict[str, int]) -> str:
     """Add multimodal placeholders to the text prompt."""
-    placeholders = []
-    for placeholder in mm_placeholder_counts:
-        placeholders.extend([placeholder] * mm_placeholder_counts[placeholder])
-    return "\n".join(placeholders + [text_prompt])
+    front_placeholders = []
+    back_placeholders = []
+    for placeholder, add_front in mm_placeholder_counts:
+        if add_front:
+            front_placeholders.extend(
+                [placeholder] * mm_placeholder_counts[(placeholder, True)])
+        else:
+            back_placeholders.extend(
+                [placeholder] * mm_placeholder_counts[(placeholder, False)])
+
+    return "\n".join(front_placeholders + [text_prompt] + back_placeholders)
 
 
 def _parse_chat_message_content_mm_part(
@@ -257,7 +270,7 @@ def resolve_hf_chat_template(
 
     # 3. If tool is provided, use the tool
     try:
-        return tokenizer.get_chat_template(chat_template, tools=tools)
+        return tokenizer.tokenizer.get_chat_template(chat_template, tools=tools)
     except Exception:
         logger.debug("Failed to load AutoTokenizer chat template for %s",
                      tokenizer.name_or_path)

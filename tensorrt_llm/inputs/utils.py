@@ -10,8 +10,8 @@ import numpy as np
 import requests
 import torch
 from PIL import Image
-from torchvision.transforms import ToTensor
-from transformers import AutoProcessor
+from torchvision.transforms import PILToTensor
+from transformers import AutoProcessor, AutoTokenizer
 
 
 def _load_and_convert_image(image):
@@ -44,7 +44,7 @@ def load_image(image: str,
         image = _load_and_convert_image(image)
 
     if format == "pt":
-        return ToTensor()(image).to(device=device)
+        return PILToTensor()(image).to(device=device)
     else:
         return image
 
@@ -76,7 +76,7 @@ async def async_load_image(
         image = _load_and_convert_image(Path(parsed_url.path))
 
     if format == "pt":
-        return ToTensor()(image).to(device=device)
+        return PILToTensor()(image).to(device=device)
     else:
         return image
 
@@ -124,7 +124,7 @@ def load_video(
         frames[index] = Image.fromarray(frame)
 
     return [
-        ToTensor()(frames[index]).to(
+        PILToTensor()(frames[index]).to(
             device=device) if format == "pt" else frames[index]
         for index in indices if index in frames
     ]
@@ -274,6 +274,42 @@ def format_qwen2_vl_input(model_dir, inputs):
     return inputs
 
 
+def format_hyperclovax_vlm_input(model_dir, inputs):
+    """
+    This function formats the input for the Hyperclovax VLM model.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+
+    def apply_template(prompt, multimodal_data):
+        conversation = [
+            {
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": prompt
+                },
+            },
+            *[{
+                "role": "user",
+                "content": {
+                    "type": "image",
+                    "filename": "temp.png",
+                    "image": image,
+                }
+            } for image in multimodal_data["image"]],
+        ]
+        return tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    for input in inputs:
+        input["prompt"] = apply_template(input["prompt"],
+                                         input["multi_modal_data"])
+    return inputs
+
+
 def default_image_loader(prompts: List[str],
                          images: Union[List[List[str]], List[str]],
                          image_data_format: str = "pt"):
@@ -324,4 +360,5 @@ INPUT_FORMATTER_MAP = {
     "qwen2_vl": format_qwen2_vl_input,
     "qwen2_5_vl": format_qwen2_vl_input,
     "llama4": format_generic_input,
+    "hyperclovax_vlm": format_hyperclovax_vlm_input,
 }

@@ -52,8 +52,8 @@ class OpenAIServer:
         self.tokenizer = llm.tokenizer
         try:
             hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
-            self.processor = AutoProcessor.from_pretrained(hf_tokenizer_path)
-            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path)
+            self.processor = AutoProcessor.from_pretrained(hf_tokenizer_path, trust_remote_code=True)
+            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path, trust_remote_code=True)
         except Exception:
             logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
             self.processor = None
