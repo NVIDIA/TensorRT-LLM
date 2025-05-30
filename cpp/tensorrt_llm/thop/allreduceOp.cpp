@@ -1095,7 +1095,8 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, to
         expert_scale_factor.has_value() ? expert_scale_factor.value().scalar_type() : input.scalar_type());
     TORCH_CHECK(
         expanded_idx_to_permuted_idx.scalar_type() == torch::kInt32, "expanded_idx_to_permuted_idx must be int32");
-    allreduce_fusion_params.expanded_idx_to_permuted_idx = static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr());
+    allreduce_fusion_params.expanded_idx_to_permuted_idx
+        = static_cast<int32_t*>(expanded_idx_to_permuted_idx.data_ptr());
     allreduce_fusion_params.shared_expert_output
         = shared_expert_output.has_value() ? shared_expert_output.value().data_ptr() : nullptr;
 

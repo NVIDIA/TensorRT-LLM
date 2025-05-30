@@ -96,7 +96,7 @@ struct MoeFinalizeAllReduceFusionParams : public AllReduceFusionParams
     void* expert_scale_factor = nullptr;
     void* shared_expert_output = nullptr;
     // [num_tokens, top_k]
-    int* expanded_idx_to_permuted_idx = nullptr;
+    int32_t* expanded_idx_to_permuted_idx = nullptr;
     // allreduce_in [maxPermutedPaddedCount, hidden_dim]
 };
 

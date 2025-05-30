@@ -552,7 +552,7 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
         for (int k = 0; k < top_k; k++)
         {
             int const expanded_idx = token_id * top_k + k;
-            int const permuted_idx = params.expanded_idx_to_permuted_idx[expanded_idx];
+            int32_t const permuted_idx = params.expanded_idx_to_permuted_idx[expanded_idx];
 
             if (permuted_idx == -1)
                 continue;

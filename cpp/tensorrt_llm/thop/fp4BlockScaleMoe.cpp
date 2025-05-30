@@ -102,7 +102,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     at::Tensor total_num_padded_tokens
         = at::empty({}, at::TensorOptions().device(routing_logits.device()).dtype(at::ScalarType::Int));
     at::Tensor expanded_idx_to_permuted_idx = at::detail::empty_cuda(
-        {args.num_tokens * args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
+        {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
 
     at::Tensor permuted_idx_to_token_idx
         = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
