@@ -1061,12 +1061,15 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq.append(past_seen_token_num)
             multimodal_embedding = request.multimodal_embedding()
             if multimodal_embedding is not None:
-                multi_modal_data.append(multimodal_embedding)
+                multimodal_embedding = multimodal_embedding.pin_memory()
+                multi_modal_data.append(
+                    multimodal_embedding.to('cuda', non_blocking=True))
 
             mrope_rotary_cos_sin = request.get_mrope_rotary_cos_sin()
             if mrope_rotary_cos_sin is not None:
+                mrope_rotary_cos_sin = mrope_rotary_cos_sin.pin_memory()
                 mrope_config['mrope_rotary_cos_sin'].append(
-                    mrope_rotary_cos_sin)
+                    mrope_rotary_cos_sin.to('cuda', non_blocking=True))
             request.py_batch_idx = batch_idx
             batch_idx += 1
 
@@ -1092,10 +1095,11 @@ class PyTorchModelEngine(ModelEngine):
 
             mrope_position_deltas = request.mrope_position_deltas
             if mrope_position_deltas is not None:
+                mrope_position_deltas = torch.tensor([mrope_position_deltas],
+                                                     dtype=torch.int32,
+                                                     pin_memory=True)
                 mrope_config['mrope_position_deltas'].append(
-                    torch.tensor([mrope_position_deltas],
-                                 dtype=torch.int32).to('cuda',
-                                                       non_blocking=True))
+                    mrope_position_deltas.to('cuda', non_blocking=True))
 
         if not self._disable_overlap_scheduler and self.is_spec_decode:
             spec_dec_mode = self.spec_config.spec_dec_mode

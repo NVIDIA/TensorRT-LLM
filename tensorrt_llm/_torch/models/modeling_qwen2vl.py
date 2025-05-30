@@ -301,8 +301,8 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         concat_cos_sin = torch.concatenate((cos, sin), axis=-1)
         concat_cos_sin = concat_cos_sin.reshape(concat_cos_sin.shape[0], -1)
         mrope_config = {}
-        mrope_config['mrope_rotary_cos_sin'] = concat_cos_sin
-        mrope_config['mrope_position_deltas'] = mrope_position_deltas
+        mrope_config['mrope_rotary_cos_sin'] = concat_cos_sin.to('cpu')
+        mrope_config['mrope_position_deltas'] = mrope_position_deltas.to('cpu')
         return mrope_config
 
     @torch.inference_mode()
@@ -314,8 +314,6 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
                         inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
 
-        # NOTE: Since we are passed in Tensor images, we don't need to rescale them.
-        mm_processor_kwargs['do_rescale'] = False
         processed_inputs = self._preprocess(text_prompt, mm_data,
                                             mm_processor_kwargs).to(self.device)
         if mm_data:
@@ -338,7 +336,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         fused_input_ids = self._postprocess(input_ids[0])
 
         return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_features,
+            "mm_embedding": mm_features.to('cpu'),
             "mrope_config": mrope_config
         }
 
