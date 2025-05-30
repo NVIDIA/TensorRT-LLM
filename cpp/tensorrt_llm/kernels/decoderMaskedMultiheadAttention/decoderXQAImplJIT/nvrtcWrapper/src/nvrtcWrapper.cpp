@@ -54,7 +54,7 @@
         nvPTXCompileResult status_ = content;                                                                          \
         if (status_ != NVPTXCOMPILE_SUCCESS)                                                                           \
         {                                                                                                              \
-            setErrorString("nvPTXCompiler Internal Error");                                                           \
+            setErrorString("nvPTXCompiler Internal Error");                                                            \
             return TLLM_XQA_JIT_INTERNAL_ERROR;                                                                        \
         }                                                                                                              \
     } while (0)
@@ -95,12 +95,12 @@ std::string getSMFlag(int SM)
 
 std::string getPTXSMFlag(int SM)
 {
-    // For SM120, we use compute_89 for PTX generation (Yao's suggestion)
+    // For SM120, we use compute_89 for PTX generation
     if (SM == 120)
     {
         return "-arch=compute_89";
     }
-    // For other architectures, use compute_ version
+
     std::string smStr = std::to_string(SM);
     if (SM == 90)
     {
@@ -327,7 +327,6 @@ tllmXqaJitStatus compileProgram(tllmXqaJitProgram prog)
         }
 #endif
 
-        // Get PTX from NVRTC
         size_t ptx_size;
         CHECK_NVRTC_ERROR(nvrtcGetPTXSize(prog->program, &ptx_size));
         std::vector<char> ptx_data(ptx_size);
@@ -337,19 +336,16 @@ tllmXqaJitStatus compileProgram(tllmXqaJitProgram prog)
         nvPTXCompilerHandle ptx_compiler;
         CHECK_NVPTX_ERROR(nvPTXCompilerCreate(&ptx_compiler, ptx_size, ptx_data.data()));
 
-        // Set target architecture for SM120
         std::vector<const char*> ptx_compile_options = {"--gpu-name=sm_120"};
         CHECK_NVPTX_ERROR(nvPTXCompilerCompile(ptx_compiler, ptx_compile_options.size(), ptx_compile_options.data()));
 
-        // Get compiled cubin size and data
         size_t cubin_size;
         CHECK_NVPTX_ERROR(nvPTXCompilerGetCompiledProgramSize(ptx_compiler, &cubin_size));
-        
+
         prog->cubin_data.resize(cubin_size);
         CHECK_NVPTX_ERROR(nvPTXCompilerGetCompiledProgram(ptx_compiler, prog->cubin_data.data()));
         prog->use_stored_cubin = true;
 
-        // Clean up PTX compiler
         CHECK_NVPTX_ERROR(nvPTXCompilerDestroy(&ptx_compiler));
 
 #ifndef NDEBUG
@@ -358,7 +354,6 @@ tllmXqaJitStatus compileProgram(tllmXqaJitProgram prog)
     }
     else
     {
-        // Original single-stage compilation for other architectures
         std::vector<std::string> options;
         CHECK_TLLM_XQA_JIT_ERROR(getBuildOptions(prog, &options));
         std::vector<char const*> options_cstr;
@@ -397,31 +392,29 @@ tllmXqaJitStatus tllmXqaJitCreateAndCompileProgram(tllmXqaJitProgram* prog, tllm
 
 tllmXqaJitStatus tllmXqaJitGetCUBINSize(tllmXqaJitProgram prog, size_t* cubinSizeRet)
 {
+    // For SM120 two-stage compilation, return stored cubin size
     if (prog->use_stored_cubin)
     {
-        // For SM120 two-stage compilation, return stored cubin size
         *cubinSizeRet = prog->cubin_data.size();
         return TLLM_XQA_JIT_SUCCESS;
     }
     else
     {
-        // For other architectures, use NVRTC
         CHECK_NVRTC_ERROR(nvrtcGetCUBINSize(prog->program, cubinSizeRet));
         return TLLM_XQA_JIT_SUCCESS;
     }
 }
 
 tllmXqaJitStatus tllmXqaJitGetCUBIN(tllmXqaJitProgram prog, char* cubin)
-{
+{   
+    // For SM120 two-stage compilation, copy stored cubin data
     if (prog->use_stored_cubin)
     {
-        // For SM120 two-stage compilation, copy stored cubin data
         std::memcpy(cubin, prog->cubin_data.data(), prog->cubin_data.size());
         return TLLM_XQA_JIT_SUCCESS;
     }
     else
     {
-        // For other architectures, use NVRTC
         CHECK_NVRTC_ERROR(nvrtcGetCUBIN(prog->program, cubin));
         return TLLM_XQA_JIT_SUCCESS;
     }
