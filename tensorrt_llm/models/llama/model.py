@@ -478,7 +478,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                 }
             elif "vila" in model_name:
                 hf_model_dir += "/llm"
-            elif "exaone" in model_name.lower():
+            elif "exaone" in config.architecture.lower():
                 custom_dict = {
                     "transformer": "transformer",
                     "layers": "h",
