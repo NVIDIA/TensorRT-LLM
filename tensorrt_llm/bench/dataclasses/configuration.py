@@ -41,39 +41,27 @@ class RuntimeConfig(BaseModel):
         model = self.engine_dir or self.model_path or self.model
 
         llm_args = {
-            "scheduler_config":
-            self.settings_config.get_scheduler_config(),
-            "model":
-            model,
-            "skip_tokenizer_init":
-            True,
-            "pipeline_parallel_size":
-            self.world_config.pp_size,
-            "tensor_parallel_size":
-            self.world_config.tp_size,
-            "gpus_per_node":
-            self.world_config.gpus_per_node,
-            "moe_expert_parallel_size":
-            self.world_config.ep_size,
-            "moe_cluster_parallel_size":
-            self.world_config.cluster_size,
-            "trust_remote_code":
-            True,
-            "kv_cache_config":
-            self.settings_config.get_kvcache_config(),
-            "enable_chunked_prefill":
-            self.settings_config.chunking,
-            "extended_runtime_perf_knob_config":
-            self.performance_options.get_perf_config(),
-            "decoding_config":
-            self.decoding_config.get_decoding_config(),
-            "batching_type":
-            BatchingType.INFLIGHT,
-            "max_batch_size":
-            self.settings_config.max_batch_size,
-            "max_num_tokens":
-            self.settings_config.max_num_tokens,
+            "scheduler_config": self.settings_config.get_scheduler_config(),
+            "model": model,
+            "skip_tokenizer_init": True,
+            "pipeline_parallel_size": self.world_config.pp_size,
+            "tensor_parallel_size": self.world_config.tp_size,
+            "gpus_per_node": self.world_config.gpus_per_node,
+            "moe_expert_parallel_size": self.world_config.ep_size,
+            "moe_cluster_parallel_size": self.world_config.cluster_size,
+            "trust_remote_code": True,
+            "kv_cache_config": self.settings_config.get_kvcache_config(),
+            "enable_chunked_prefill": self.settings_config.chunking,
+            "decoding_config": self.decoding_config.get_decoding_config(),
+            "batching_type": BatchingType.INFLIGHT,
+            "max_batch_size": self.settings_config.max_batch_size,
+            "max_num_tokens": self.settings_config.max_num_tokens,
         }
+
+        if self.backend not in ["pytorch", "autodeploy"]:
+            llm_args[
+                "extended_runtime_perf_knob_config"] = self.performance_options.get_perf_config(
+                )
 
         backend_config_map = {
             "pytorch": self.performance_options.get_pytorch_perf_config,
