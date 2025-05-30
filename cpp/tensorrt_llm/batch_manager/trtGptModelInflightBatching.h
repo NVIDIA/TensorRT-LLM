@@ -358,12 +358,13 @@ private:
         return static_cast<bool>(mGuidedDecoder);
     }
 
+    using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
     /// @brief Based on the KV-cache manager's capacity and configuration, we adjust the maximum supported attention
     /// window.
     ///
     /// @param numPrimaryBlocks The number of blocks in the kv-cache's primary pool.
     /// @param numTokensPerBlock The number of tokens per kv-cache block.
-    void adjustMaxAttentionWindow(SizeType32 numPrimaryBlocks, SizeType32 numTokensPerBlock);
+    [[nodiscard]] BlocksPerWindow clampWindowSizesToFitAtLeastOneSequence(BlocksPerWindow const& blocksPerWindow);
 
     /// @brief Change the speculative decoding mode.
     void changeSpecDecMode(ScheduledRequests const& scheduledRequests);
