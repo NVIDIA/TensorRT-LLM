@@ -15,8 +15,8 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig
-from tensorrt_llm.bench.build.tuning import calc_engine_setting
+from tensorrt_llm.bench.build.dataclasses import ModelConfig
+from tensorrt_llm.bench.benchmark.tuning.utils import calc_engine_setting
 
 TUNED_QUANTS = {
     QuantAlgo.NVFP4, QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES,
@@ -75,22 +75,6 @@ def get_benchmark_engine_settings(
         raise RuntimeError(f"Unable to obtain correct settings for benchmark.")
 
     return max_batch_size, max_num_tokens
-
-
-def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
-    """ Obtain the model-related parameters from Hugging Face.
-    Args:
-        model_name (str): Huggingface model name.
-        model_path (Path): Path to a local Huggingface checkpoint.
-
-    Raises:
-        ValueError: When model is not supported.
-    """
-    if is_nemotron_hybrid(
-            AutoConfig.from_pretrained(model_path or model_name,
-                                       trust_remote_code=True)):
-        return NemotronHybridConfig.from_hf(model_name, model_path)
-    return ModelConfig.from_hf(model_name, model_path)
 
 
 def apply_build_mode_settings(params):

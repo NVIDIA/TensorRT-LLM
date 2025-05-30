@@ -1,11 +1,17 @@
+import math
 from typing import Tuple
 
+from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
+from tensorrt_llm.bench.build.dataclasses import ModelConfig
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.automodel import AutoConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig
 from .utils import get_device_memory
 import math
+
+from ...build.utils import get_device_memory
 
 BYTES_PER_ELEM = {
     QuantAlgo.NO_QUANT: 2.0,
@@ -13,6 +19,22 @@ BYTES_PER_ELEM = {
     QuantAlgo.FP8_BLOCK_SCALES: 1.0,
     QuantAlgo.NVFP4: .5,
 }
+
+
+def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
+    """ Obtain the model-related parameters from Hugging Face.
+    Args:
+        model_name (str): Huggingface model name.
+        model_path (Path): Path to a local Huggingface checkpoint.
+
+    Raises:
+        ValueError: When model is not supported.
+    """
+    if is_nemotron_hybrid(
+            AutoConfig.from_pretrained(model_path or model_name,
+                                       trust_remote_code=True)):
+        return NemotronHybridConfig.from_hf(model_name, model_path)
+    return ModelConfig.from_hf(model_name, model_path)
 
 
 def calc_engine_setting(

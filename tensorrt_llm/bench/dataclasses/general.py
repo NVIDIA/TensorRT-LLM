@@ -10,12 +10,6 @@ from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.executor.request import LoRARequest
 
 
-class BenchmarkEnvironment(BaseModel):
-    model: str
-    checkpoint_path: Optional[Path]
-    workspace: Path
-
-
 class InferenceRequest(BaseModel):
     task_id: int
     prompt: Optional[Union[str, Any]] = None
