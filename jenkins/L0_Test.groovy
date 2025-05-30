@@ -1306,7 +1306,7 @@ def checkPipInstall(pipeline, wheel_path)
 }
 
 
-def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312", fromSource=false)
+def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312")
 {
     def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${linuxPkgName}"
 
@@ -1323,14 +1323,10 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
     }
     sh "pwd && ls -alh"
 
-    sh "env | sort"
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
 
-    if (fromSource) {
-        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", true, true)
-    } else {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
-        sh "tar -zvxf ${linuxPkgName}"
-    }
+    sh "env | sort"
+    sh "tar -zvxf ${linuxPkgName}"
 
     // Check for prohibited files in the package
     sh '''
@@ -2004,14 +2000,14 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
             gpuType: "A10",
             k8sArch: "amd64",
             wheelInstalled: false,
-            fromSource: true,
+            config: VANILLA_CONFIG,
         ],
         "NGC Devel Image arm64": [
             name: "NGC-Devel-Image-arm64-Sanity-Test",
             gpuType: "GH200",
             k8sArch: "arm64",
             wheelInstalled: false,
-            fromSource: true,
+            config: LINUX_AARCH64_CONFIG,
         ],
         "NGC Release Image amd64": [
             name: "NGC-Release-Image-amd64-Sanity-Test",
@@ -2057,7 +2053,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
             stage(values.name) {
                 imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
                 trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
-                    runLLMBuildFromPackage(pipeline, values.k8sArch, false, "imageTest/", "cp312", values.fromSource)
+                    runLLMBuildFromPackage(pipeline, values.k8sArch, false, "imageTest/")
                 })
             }
         }
