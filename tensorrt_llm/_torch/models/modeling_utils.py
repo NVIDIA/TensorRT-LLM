@@ -528,8 +528,8 @@ class DecoderModelForCausalLM(nn.Module,
             return_context_logits,
         )
 
-    def load_weights(self, weights: Dict):
-        _load_weights_impl(self, weights)
+    def load_weights(self, weights: Dict, skip_modules: List[str] = []):
+        _load_weights_impl(self, weights, skip_modules)
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
@@ -642,6 +642,7 @@ def filter_weights(prefix, weights: Dict):
 
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
+                       skip_modules: List[str] = [],
                        params_map: Optional[Dict[str, str]] = None):
     if not hasattr(model, 'model_config') or not isinstance(
             model.model_config, ModelConfig):
@@ -666,6 +667,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     for name, module in tqdm(list(model.named_modules()),
                              desc="Loading weights"):
         if len(module._parameters) > 0:
+            # skip load weights if module is in skip_modules
+            if any(skip_module in name for skip_module in skip_modules):
+                continue
+
             # skip load weights if tie word embeddings is enabled and layer is lm_head
             if model.config.tie_word_embeddings and name.startswith("lm_head"):
                 continue

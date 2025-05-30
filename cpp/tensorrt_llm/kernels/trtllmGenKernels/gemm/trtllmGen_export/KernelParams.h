@@ -75,12 +75,14 @@ struct KernelParams
     // Must be setup using gemm::buildSfTmaDescriptor with shapes and strides from
     // makeTmaShapeStrideSfAb.
     // The layout of scaling factors for A is always R128c4
-    // M must be a multiple of 128.
-    // K must be a multiple of 64.
-    // The "logical" shape is: [M, K / 16].
-    // The R128c4 layout is: [M / 128, K / 16 / 4, 512].
-    // The shape we use for TMA is: [M / 128, K / 16 / 4, 2, 256].
-    // Dtype is Dtype::E4m3.
+    //
+    // Let P be the number of elements per SF. P=16 for NvFp4, P=32 for Mx formats.
+    // K must be a multiple of 4P.
+    // The "logical" shape is: [M, K / P].
+    // The R128c4 layout is: [⌈M / 128⌉, K / P / 4, 512].
+    // The shape we use for TMA is: [⌈M / 128⌉, K / P / 4, 2, 256].
+    //
+    // Dtype is Dtype::E4m3 for NvFp4, Dtype::UE8m0 for Mx formats.
     CUtensorMap tmaSfA;
 
     // TMA descriptor for the block scaling factors for B, for MxFp{4,8} and NvFp4 formats.
@@ -88,22 +90,21 @@ struct KernelParams
     // makeTmaShapeStrideSfAb.
     // The layout of scaling factors for B is controlled by options.mSfLayoutB.
     //
-    // The "logical" shape is: [N, K / 16]
+    // Let P be the number of elements per SF. P=16 for NvFp4, P=32 for Mx formats.
+    // The "logical" shape is: [N, K / P]
     //
     // If the layout is R128c4,
-    //    N must be a multiple of 128.
-    //    K must be a multiple of 64.
-    //    The R128c4 layout is: [N / 128, K / 16 / 4, 512]
-    //    The shape we use for TMA is: [N / 128, K / 16 / 4, 2, 256]
+    //    K must be a multiple of 4P.
+    //    The R128c4 layout is: [⌈N / 128⌉, K / P / 4, 512]
+    //    The shape we use for TMA is: [⌈N / 128⌉, K / P / 4, 2, 256]
     //
     // If the layout is R8c4,
-    //    N must be a multiple of 8.
-    //    K must be a multiple of 64.
-    //    The R8c4 layout is: [N / 8, K / 16 / 4, 32]
-    //    The shape we use for TMA is: [N / 8, K / 16 / 4 / repeats, repeats * 32]
-    //    where repeats = min(tileK / 16 / 4, 8)
+    //    K must be a multiple of 4P.
+    //    The R8c4 layout is: [⌈N / 8⌉, K / P / 4, 32]
+    //    The shape we use for TMA is: [⌈N / 8⌉, K / P / 4 / r, r * 32]
+    //    where r = min(tileK / P / 4, 8)
     //
-    // Dtype is Dtype::E4m3.
+    // Dtype is Dtype::E4m3 for NvFp4, Dtype::UE8m0 for Mx formats.
     CUtensorMap tmaSfB;
 
     // The output matrix C. The data type is controlled by options.mDtypeC.
@@ -317,7 +318,7 @@ struct KernelParams
         // The inner tile dimension.
         auto hiddenSizePerTile = options.mTileK;
         // Number of elements per scaling factor.
-        int32_t const numEltsPerSf = 16;
+        int32_t const numEltsPerSf = (options.mDtypeElt == tg::Dtype::E2m1) ? 16 : 32;
 
         switch (layout)
         {
@@ -330,9 +331,9 @@ struct KernelParams
             // Additionally, we have to meet constraints of TMA that the box dimensions are less
             // than 256 and boxDim[0] is a multiple of 16B.
             //
-            // The "logical" tensor is:      [outer,       inner / numEltsPerSf]
-            // The aforementioned format is: [outer / 128, inner / numEltsPerSf / 4,    512]
-            // The shape we use for TMA is:  [outer / 128, inner / numEltsPerSf / 4, 2, 256]
+            // The "logical" tensor is:      [outer,        inner / numEltsPerSf]
+            // The aforementioned format is: [⌈outer / 128⌉, inner / (4 * numEltsPerSf),    512]
+            // The shape we use for TMA is:  [⌈outer / 128⌉, inner / (4 * numEltsPerSf), 2, 256]
 
             auto shape = std::vector<uint64_t>{256, 2, static_cast<uint64_t>(tg::ceilDiv(hiddenSize, numEltsPerSf * 4)),
                 static_cast<uint64_t>(tg::ceilDiv(numTokens, 128))};
@@ -357,11 +358,11 @@ struct KernelParams
             //
             // As the inner dimension (k) is required to be a multiple of the tile size, we
             // can reshape to use fewer read requests, if the tile dimensions allow.
-            // I.e., let's define repeats = min(hiddenSizePerTile / numEltsPerSf / 4, 8)
+            // I.e., let's define r = min(⌈hiddenSizePerTile / (numEltsPerSf * 4)⌉, 8)
             //
-            // The "logical" tensor is: [outer,     inner / numEltsPerSf]
-            // The 8x4 SF layout is:    [outer / 8, inner / numEltsPerSf / 4, 32]
-            // The TMA tensor shape is: [outer / 8, inner / numEltsPerSf / 4 / repeats, repeats * 32]
+            // The "logical" tensor is: [outer,        inner / numEltsPerSf]
+            // The 8x4 SF layout is:    [⌈outer / 128⌉, inner / (4 * numEltsPerSf), 32]
+            // The TMA tensor shape is: [⌈outer / 128⌉, inner / (4 * numEltsPerSf * r), r * 32]
 
             int const repeats = std::min(tg::ceilDiv(hiddenSizePerTile, numEltsPerSf * 4), 8);
 
@@ -420,9 +421,9 @@ struct KernelParams
             const_cast<void*>(ptrB),
             /* swizzle */ !options.mSliceK);
 
-        if (options.mDtypeElt == tg::Dtype::E2m1)
+        if (options.mDtypeElt == tg::Dtype::E2m1 || options.mDtypeElt == tg::Dtype::MxE4m3)
         {
-            tg::Dtype const dTypeSf = tg::Dtype::E4m3;
+            tg::Dtype const dTypeSf = (options.mDtypeElt == tg::Dtype::E2m1) ? tg::Dtype::E4m3 : tg::Dtype::UE8m0;
 
             // Build TMA descriptor for gmem A block scaling factors.
             auto [shapeSfA, strideSfA, tileShapesSfA]

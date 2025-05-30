@@ -519,9 +519,9 @@ class ReportUtility:
                 ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
 
             perf_stats += (
-                f"Average time-to-first-token [TTFT] (ms):   {streaming['avg_ttft_ms']:.4f}\n"
-                f"Average time-per-output-token [TPOT] (ms): {streaming['avg_tpot_ms']:.4f}\n"
-                f"Per User Output Speed (tps/user):          {streaming['token_output_speed_tok_s']:.4f}\n"
+                f"Average time-to-first-token [TTFT] (ms):          {streaming['avg_ttft_ms']:.4f}\n"
+                f"Average time-per-output-token [TPOT] (ms):        {streaming['avg_tpot_ms']:.4f}\n"
+                f"Per User Output Speed (tps/user):                 {streaming['token_output_speed_tok_s']:.4f}\n"
                 "\n-- Per-Request Time-per-Output-Token [TPOT] Breakdown (ms)\n\n"
                 f"{tpot_stats}\n"
                 "\n-- Per-Request Time-to-First-Token [TTFT] Breakdown (ms) \n\n"

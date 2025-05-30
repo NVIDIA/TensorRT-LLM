@@ -24,7 +24,7 @@ from .test_llm import (
     llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
     llama_v2_13b_lora_test_harness, llm_check_output,
     llm_get_stats_async_test_harness, llm_get_stats_test_harness,
-    llm_test_harness, mixtral_model_name, prompts,
+    llm_test_harness, mixtral_model_name, prompts, test_llm_api_eagle,
     tinyllama_guided_decoding_test_harness,
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
     run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
@@ -281,6 +281,13 @@ def test_llama_7b_multi_lora_tp2():
 def test_llama_v2_7b_prompt_adapter_tp2():
     llama_v2_7b_prompt_adapter_test_harness(
         tensor_parallel_size=2, kv_cache_config=global_kv_cache_config_no_reuse)
+
+
+@pytest.mark.gpu2
+@pytest.mark.part0
+def test_llm_api_eagle_tp2():
+    test_llm_api_eagle(tensor_parallel_size=2,
+                       kv_cache_config=global_kv_cache_config)
 
 
 def run_command(command: str):

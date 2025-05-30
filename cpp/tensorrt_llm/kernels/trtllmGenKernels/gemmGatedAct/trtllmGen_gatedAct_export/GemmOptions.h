@@ -50,7 +50,7 @@ void printArgs(T first, Args... args)
 
 #define TLLM_LOG_ERROR(...) TLLM_CHECK_ERROR(false, __VA_ARGS__)
 
-#define TLLM_CHECK_ERROR_FMT(...) TLLM_CHECK_ERROR(false, __VA_ARGS__)
+#define TLLM_CHECK_ERROR_FMT(cond, ...) TLLM_CHECK_ERROR(cond, __VA_ARGS__)
 
 #define TLLM_CHECK_WARNING(cond, ...)                                                                                  \
     if (!(cond))                                                                                                       \
@@ -100,18 +100,24 @@ struct GemmOptions
     tg::Dtype mDtypeC{tg::Dtype::Void};
     // Whether to enable early exit.
     bool mEnablesEarlyExit{false};
+    // Whether to enable early exit.
+    bool mEnablesDelayedEarlyExit{false};
     // Whether to enable the global PTX knobs for guiding the compiler optimizations.
     bool mEnablesGlobalPtxKnobs{true};
     // Tile size for the epilogue in M dimension.
     int mEpilogueTileM{128};
     // Tile size for the epilogue in N dimension.
     int mEpilogueTileN{32};
-    // Whether A or B load task triggers grid dependency controls.
-    bool mGridDepTriggerA{false};
-    // Whether we should trigger a grid dependency.
-    bool mGridTriggerSecondary{false};
-    // Whether we should wait on a grid dependency.
-    bool mGridWaitForPrimary{false};
+    // Whether load task A triggers the next grid.
+    bool mGridTriggerSecondaryA{false};
+    // Whether load task B triggers the next grid.
+    bool mGridTriggerSecondaryB{false};
+    // Whether the loads that check for an early exit should wait on a grid dependency.
+    bool mGridWaitForPrimaryEarlyExit{true};
+    // Whether the load of A should wait on a grid dependency.
+    bool mGridWaitForPrimaryA{true};
+    // Whether the load of B should wait on a grid dependency.
+    bool mGridWaitForPrimaryB{true};
     // Whether to hoist the mbarrier try_waits (e.g., mma.prodAcq, smemAb.consWait) in the MMA task.
     bool mHoistMmaTaskTryWaits{false};
     // The K dimension of GEMM.
@@ -139,10 +145,15 @@ struct GemmOptions
     int mNumSlicesForSliceK{1};
     // The depth of the mainloop pipeline.
     int mNumStages{2};
-    // The depth of the mma pipeline.
+    // The depth of the mma pipeline. Equals numStagesMmaWithinWorkTile * numStagesMmaAcrossWorkTile.
     int mNumStagesMma{1};
-    // The depth of the work id pipeline.
-    int mNumStagesWorkId{2};
+    // The depth of the mma pipeline within work tile. Only GmemC classes with "WithAccInReg" suffix
+    // are allowed to be greater than 1.
+    int mNumStagesMmaWithinWorkTile{-1};
+    // The depth of the mma pipeline across work tiles in the persistent loop.
+    int mNumStagesMmaAcrossWorkTile{-1};
+    // The depth of the work id pipeline and the work throttle pipeline.
+    int mNumStagesWorkId{3};
     // Whether to output debug tensors.
     bool mOutputDebugTensors{false};
     // Reorder rows/cols in the A matrix for the better memory accesses in the M-major epilogue.
@@ -163,6 +174,10 @@ struct GemmOptions
     bool mUseUnrollLoop2xForMma{true};
     // Use custom MMA schedule optimized for low-latency.
     bool mUseCustomMmaSchedule{false};
+    // The purpose of hoisting trywaits is to opportunistically peek at the availability of the next
+    // k-block. It benefits when the next k-block is already available and thus sustaining the
+    // momentum, but it adds latency to the first k-block for smaller k-loop.
+    bool mUseHoistTryWaitForCustomMmaSchedule{false};
     // Use DeepSeek Fp8.
     bool mUseDeepSeekFp8{false};
     // Apply per-token scales from A
@@ -256,12 +271,15 @@ inline std::string dumpOptions(GemmOptions const& options)
        << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeC) << ")"
        << "," << std::endl;
     ss << "mEnablesEarlyExit=" << options.mEnablesEarlyExit << "," << std::endl;
+    ss << "mEnablesDelayedEarlyExit=" << options.mEnablesDelayedEarlyExit << "," << std::endl;
     ss << "mEnablesGlobalPtxKnobs=" << options.mEnablesGlobalPtxKnobs << "," << std::endl;
     ss << "mEpilogueTileM=" << options.mEpilogueTileM << "," << std::endl;
     ss << "mEpilogueTileN=" << options.mEpilogueTileN << "," << std::endl;
-    ss << "mGridDepTriggerA=" << options.mGridDepTriggerA << "," << std::endl;
-    ss << "mGridTriggerSecondary=" << options.mGridTriggerSecondary << "," << std::endl;
-    ss << "mGridWaitForPrimary=" << options.mGridWaitForPrimary << "," << std::endl;
+    ss << "mGridTriggerSecondaryA=" << options.mGridTriggerSecondaryA << "," << std::endl;
+    ss << "mGridTriggerSecondaryB=" << options.mGridTriggerSecondaryB << "," << std::endl;
+    ss << "mGridWaitForPrimaryEarlyExit=" << options.mGridWaitForPrimaryEarlyExit << "," << std::endl;
+    ss << "mGridWaitForPrimaryA=" << options.mGridWaitForPrimaryA << "," << std::endl;
+    ss << "mGridWaitForPrimaryB=" << options.mGridWaitForPrimaryB << "," << std::endl;
     ss << "mHoistMmaTaskTryWaits=" << options.mHoistMmaTaskTryWaits << "," << std::endl;
     ss << "mK=" << options.mK << "," << std::endl;
     ss << "mKernelTraits={}"
@@ -276,6 +294,8 @@ inline std::string dumpOptions(GemmOptions const& options)
     ss << "mNumSlicesForSliceK=" << options.mNumSlicesForSliceK << "," << std::endl;
     ss << "mNumStages=" << options.mNumStages << "," << std::endl;
     ss << "mNumStagesMma=" << options.mNumStagesMma << "," << std::endl;
+    ss << "mNumStagesMmaWithinWorkTile=" << options.mNumStagesMmaWithinWorkTile << "," << std::endl;
+    ss << "mNumStagesMmaAcrossWorkTile=" << options.mNumStagesMmaAcrossWorkTile << "," << std::endl;
     ss << "mNumStagesWorkId=" << options.mNumStagesWorkId << "," << std::endl;
     ss << "mOutputDebugTensors=" << options.mOutputDebugTensors << "," << std::endl;
     ss << "mUseShuffledMatrixA=" << options.mUseShuffledMatrixA << "," << std::endl;
@@ -289,6 +309,7 @@ inline std::string dumpOptions(GemmOptions const& options)
     ss << "mTileK=" << options.mTileK << "," << std::endl;
     ss << "mUseUnrollLoop2xForMma=" << options.mUseUnrollLoop2xForMma << "," << std::endl;
     ss << "mUseCustomMmaSchedule=" << options.mUseCustomMmaSchedule << "," << std::endl;
+    ss << "mUseHoistTryWaitForCustomMmaSchedule=" << options.mUseHoistTryWaitForCustomMmaSchedule << "," << std::endl;
     ss << "mUseDeepSeekFp8=" << options.mUseDeepSeekFp8 << "," << std::endl;
     ss << "mUsePerTokenSfA=" << options.mUsePerTokenSfA << "," << std::endl;
     ss << "mUsePerTokenSfB=" << options.mUsePerTokenSfB << "," << std::endl;
@@ -350,20 +371,41 @@ inline bool checkAndUpdateGemmOptions(
         }
     }
 
-    // NvFp4 constraints
-    if (options.mDtypeElt == tg::Dtype::E2m1)
+    // Constraints for NvFp4 and MxFp8.
+    if ((options.mDtypeElt == tg::Dtype::E2m1 || options.mDtypeElt == tg::Dtype::MxE4m3
+            || options.mDtypeC == tg::Dtype::MxE4m3)
+        && options.mMmaM != 128)
     {
-        TLLM_CHECK_ERROR(isBlackwell, "FP4 is only supported on Blackwell");
+        // MMA M must be 128 when the input uses block scaling, or when the output is an Mx format.
+        int newTileM = 128 * divUp(options.mTileM, 128);
+        TLLM_LOG_WARNING("Unsupported MmaM (", options.mMmaM, ") for dtypeElt=", gemm::toString(options.mDtypeElt),
+            ", dtypeC=", gemm::toString(options.mDtypeC), ". Setting MmaM to 128 and TileM to ", newTileM);
+        if (updateOptions)
+        {
+            options.mMmaM = 128;
+            options.mTileM = newTileM;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    if (options.mDtypeElt == tg::Dtype::E2m1 || options.mDtypeElt == tg::Dtype::MxE4m3)
+    {
+        TLLM_CHECK_ERROR(isBlackwell, "Block scaling is only supported on Blackwell");
+
         TLLM_CHECK_ERROR(options.mSfLayoutB == tg::SfLayout::R128c4 || options.mSfLayoutB == tg::SfLayout::R8c4,
             "Only the 128x4 and 8x4 SF layouts are supported for B, got ", tg::sfLayoutToString(options.mSfLayoutB));
-        if (options.mMmaK != 64)
+
+        int const mmaK = (options.mDtypeElt == tg::Dtype::E2m1) ? 64 : 32;
+        if (options.mMmaK != mmaK)
         {
-            int newTileK = 64 * divUp(options.mTileK, 64);
+            int newTileK = mmaK * divUp(options.mTileK, mmaK);
             TLLM_LOG_WARNING("Unsupported MmaK (", options.mMmaK, ") for ", gemm::toString(options.mDtypeElt),
-                ". Setting MmaK to 64 and TileK to ", newTileK);
+                ". Setting MmaK to ", mmaK, " and TileK to ", newTileK);
             if (updateOptions)
             {
-                options.mMmaK = 64;
+                options.mMmaK = mmaK;
                 options.mTileK = newTileK;
             }
             else
@@ -371,33 +413,22 @@ inline bool checkAndUpdateGemmOptions(
                 return false;
             }
         }
-        if (options.mMmaM != 128)
-        {
-            int newTileM = 128 * divUp(options.mTileM, 128);
-            TLLM_LOG_WARNING("Unsupported MmaM (", options.mMmaM, ") for ", gemm::toString(options.mDtypeElt),
-                ". Setting MmaM to 128 and TileM to ", newTileM);
-            if (updateOptions)
-            {
-                options.mMmaM = 128;
-                options.mTileM = newTileM;
-            }
-            else
-            {
-                return false;
-            }
-        }
+
         // TileN must be a multiple of the number of rows per SF tile.
-        // TODO: relax this restriction.
         int const numSfTileRowsB = options.mSfLayoutB == tg::SfLayout::R128c4 ? 128 : 8;
         TLLM_CHECK_ERROR(options.mTileN % numSfTileRowsB == 0, "TileN (", options.mTileN, ") must be a multiple of ",
             numSfTileRowsB, " for B SF layout ", tg::sfLayoutToString(options.mSfLayoutB));
         // The MMA N may only be smaller than 64 if it is equal to the tile N.
         TLLM_CHECK_ERROR(options.mMmaN >= 64 || options.mMmaN == options.mTileN, "MmaN (", options.mMmaN,
             ") must be >= 64 or equal to TileN (", options.mTileN, ") for ", gemm::toString(options.mDtypeElt));
+
+        int numEltsPerSf = tg::dtypeNumEltsPerSf(options.mDtypeElt);
+        TLLM_CHECK_ERROR(options.mTileK % (4 * numEltsPerSf) == 0, "TileK (", options.mTileK,
+            ") must be a multiple of ", (4 * numEltsPerSf), " for type ", gemm::toString(options.mDtypeElt));
     }
-    if (options.mDtypeC == tg::Dtype::E2m1)
+    if (options.mDtypeC == tg::Dtype::E2m1 || options.mDtypeC == tg::Dtype::MxE4m3)
     {
-        TLLM_CHECK_ERROR(isBlackwell, "FP4 is only supported on Blackwell");
+        TLLM_CHECK_ERROR(isBlackwell, "Block scaling is only supported on Blackwell");
 
         TLLM_CHECK_ERROR(options.mSfLayoutC == tg::SfLayout::R128c4 || options.mSfLayoutC == tg::SfLayout::R8c4,
             "Only the 128x4 and 8x4 SF layouts are supported for C.");
@@ -406,9 +437,11 @@ inline bool checkAndUpdateGemmOptions(
             numSfTileRowsC, " for C SF layout ", tg::sfLayoutToString(options.mSfLayoutC));
 
         int const hiddenDim = options.mTransposeMmaOutput ? options.mM : options.mN;
-        TLLM_CHECK_ERROR(hiddenDim % 64 == 0, "Hidden dim (", hiddenDim, ") must be a multiple of 64 for FP4 outputs.");
+        int const hiddenGranularity = 4 * tg::dtypeNumEltsPerSf(options.mDtypeC);
+        TLLM_CHECK_ERROR(hiddenDim % hiddenGranularity == 0, "Hidden dim (", hiddenDim, ") must be a multiple of ",
+            hiddenGranularity, " for block-scaled outputs.");
         TLLM_CHECK_ERROR(!options.mTransposeMmaOutput || options.mUseShuffledMatrixA,
-            "Transposing FP4 outputs requires shuffled A.");
+            "Transposing block-scaled outputs requires shuffled A.");
     }
 
     // If dtypeC is unspecified (Dtype::Void), assign to the input dtype.
@@ -589,10 +622,61 @@ inline bool checkAndUpdateGemmOptions(
             "CGA size must be equal to the number of slices in split-k");
     }
 
+    // Maps numStagesMma to (stagesWithinWorkTile, stagesAcrossWorkTile) if not already set.
+    // If (-1, -1) -> (numStagesMma / min(2, numStagesMma), min(2, numStagesMma))
+    // If ( m, -1) -> (m, numStagesMma / m)
+    // If (-1,  n) -> (numStagesMma / n, n)
+    if (options.mNumStagesMmaWithinWorkTile == -1 && options.mNumStagesMmaAcrossWorkTile == -1)
+    {
+        if (updateOptions)
+        {
+            options.mNumStagesMmaAcrossWorkTile = std::min(2, options.mNumStagesMma);
+            options.mNumStagesMmaWithinWorkTile = options.mNumStagesMma / options.mNumStagesMmaAcrossWorkTile;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    else if (options.mNumStagesMmaWithinWorkTile == -1)
+    {
+        if (updateOptions)
+        {
+            options.mNumStagesMmaWithinWorkTile = options.mNumStagesMma / options.mNumStagesMmaAcrossWorkTile;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    else if (options.mNumStagesMmaAcrossWorkTile == -1)
+    {
+        if (updateOptions)
+        {
+            options.mNumStagesMmaAcrossWorkTile = options.mNumStagesMma / options.mNumStagesMmaWithinWorkTile;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    // Check mma stages.
+    TLLM_CHECK_ERROR_FMT(
+        options.mNumStagesMmaWithinWorkTile * options.mNumStagesMmaAcrossWorkTile == options.mNumStagesMma
+            && options.mNumStagesMmaAcrossWorkTile <= 2,
+        "Condition numStagesMmaWithinWorkTile (%d) * numStagesMmaAcrossWorkTile "
+        "(%d) == numStagesMma (%d) && numStagesMmaAcrossWorkTile (%d) <= 2 must be "
+        "satisfied. Check arguments.",
+        options.mNumStagesMmaWithinWorkTile, options.mNumStagesMmaAcrossWorkTile, options.mNumStagesMma,
+        options.mNumStagesMmaAcrossWorkTile);
+    // Mma stage must be 1 for pre-Hopper.
+    TLLM_CHECK_ERROR(
+        isBlackwell || options.mNumStagesMma == 1, "Mma stage must be 1 for pre-Hopper. Found ", options.mNumStagesMma);
     // DeepSeek Fp8
     if (!options.mUseDeepSeekFp8)
     {
-        TLLM_CHECK_ERROR(options.mNumStagesMma == 1, "Non-DeepSeekFp8 requires numStagesMma == 1");
+        TLLM_CHECK_ERROR(
+            options.mNumStagesMmaWithinWorkTile == 1, "Non-DeepSeekFp8 requires numStagesMmaWithinWorkTile == 1");
     }
     if (options.mUseDeepSeekFp8)
     {
@@ -610,7 +694,8 @@ inline bool checkAndUpdateGemmOptions(
         auto hiddenDimPerEpilogueTile = options.mTransposeMmaOutput ? options.mEpilogueTileM : options.mEpilogueTileN;
         auto hiddenDimPerMma = options.mTransposeMmaOutput ? options.mMmaM : options.mMmaN;
         auto hiddenDimName = options.mTransposeMmaOutput ? "M" : "N";
-        TLLM_CHECK_WARNING(options.mNumStagesMma > 1, "DeepSeekFp8 recommends >1 MMA accumulator stages.");
+        TLLM_CHECK_WARNING(options.mNumStagesMmaWithinWorkTile > 1,
+            "DeepSeekFp8 recommends setting \"-numStagesMmaWithinWorkTile 2\".");
         // Update the number of stages of the MMA accumulator pipeline. TODO: enable by default for
         // deepseek.
         // options.mNumStagesMma = 2;
@@ -707,6 +792,42 @@ inline bool checkAndUpdateGemmOptions(
             return false;
         }
     }
+
+    if (options.mEnablesDelayedEarlyExit && options.mEnablesEarlyExit)
+    {
+        TLLM_LOG_WARNING(
+            "Only one of early exit and delayed early exit should be enabled. Disabling "
+            "delayed early exit");
+        if (updateOptions)
+        {
+            options.mEnablesDelayedEarlyExit = false;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+    // This check prevents the triggering of the secondary (PREEXIT) from executing before the wait
+    // for primary (ACQBULK). This could lead to the following confusing situation, which we want to
+    // avoid:
+    //
+    // Kernel 3 is written with the assumption that it can read the output of
+    // kernel 1 *without* ACQBULK and the output of kernel 2 *with* ACQBULK.
+    // However, when we allow PREEXIT and ACQBULK to be executed out of order,
+    // this is not guaranteed.
+    //
+    // Time:      ---->
+    //
+    // Kernel 1:  ----PREEXIT-----------FLUSH
+    // Kernel 2:      -------PREEXIT----ACQBULK---FLUSH
+    // Kernel 3:  Warp 0:           ---- (!) Output of 1,2 is not yet visible -----------------------
+    //            Warp 1:           ---- (!) We normally assume that 1 is visible is not yet visible-
+    //            Warp 2:           -------------------ACQBULK-- Kernel 1,2 output visible ----------
+    TLLM_CHECK_ERROR((options.mGridWaitForPrimaryA || !options.mGridTriggerSecondaryA),
+        "A: If a task triggers a secondary kernel, it must also wait for primary kernel.");
+    TLLM_CHECK_ERROR((options.mGridWaitForPrimaryB || !options.mGridTriggerSecondaryB),
+        "B: If a task triggers a secondary kernel, it must also wait for primary kernel.");
 
     if (updateOptions)
     {
