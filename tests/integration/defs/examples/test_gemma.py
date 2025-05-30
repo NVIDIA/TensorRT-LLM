@@ -17,8 +17,9 @@ from pathlib import Path
 import pytest
 from defs.common import (generate_summary_cmd, test_multi_lora_support,
                          venv_check_call)
-from defs.conftest import (get_device_memory, skip_fp8_pre_ada,
-                           skip_post_blackwell, skip_pre_hopper)
+from defs.conftest import (get_device_memory, get_gpu_device_list,
+                           skip_fp8_pre_ada, skip_post_blackwell,
+                           skip_pre_hopper)
 from defs.trt_test_alternative import check_call
 
 
@@ -226,6 +227,10 @@ def test_llm_gemma_1gpu_summary(batch_size, data_type, gemma_model_root,
                                 llm_venv, cmodel_dir, engine_dir,
                                 gemma_example_root, llm_datasets_root,
                                 llm_rouge_root, test_case):
+    if "27b" in gemma_model_root and "GH200" in get_gpu_device_list(
+    )[0] and "other" in test_case:
+        pytest.skip("OOM on GH200. https://nvbugs/5250460")
+
     gemma_1gpu_summary(batch_size, data_type, gemma_model_root, llm_venv,
                        cmodel_dir, engine_dir, gemma_example_root,
                        llm_datasets_root, llm_rouge_root, test_case)
