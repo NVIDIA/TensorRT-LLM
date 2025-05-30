@@ -514,26 +514,7 @@ def load_default_prompts(disaggregated_example_root: str):
 @contextlib.contextmanager
 def background_workers(llm_venv, config_file: str, num_ranks: int = None):
     cwd = llm_venv.get_working_directory()
-    log_file = open(os.path.join(cwd, 'output_workers.log'), 'w+')
-    workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
-        config_file=config_file,
-        stdout=log_file,
-        env=llm_venv._new_env,
-        cwd=cwd,
-        num_ranks=num_ranks)
-    try:
-        yield ctx_servers, gen_servers
-    except Exception:
-        log_file.seek(0)
-        logger.error("Worker output:")
-        logger.error(log_file.read())
-        raise
-    finally:
-        workers_proc.terminate()
-        workers_proc.wait()
-        log_file.close()
-
-    with open(os.path.join(cwd, 'output_workers.log'), 'w') as log_file:
+    with open(os.path.join(cwd, 'output_workers.log'), 'w+') as log_file:
         workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
             config_file=config_file,
             stdout=log_file,
