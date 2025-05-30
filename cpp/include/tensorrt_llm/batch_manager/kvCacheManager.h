@@ -847,11 +847,11 @@ public:
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true);
 
-    //! \brief Calculate the number of blocks each window size heap receives of blocksIn{Primary/Secondary}Pool
-    //! \details Example:       (total=16384, uniqueWindowSizeToLayers={1024: [1], 4096: [0, 4, 5], 8192: [2, 3]})
-    //!          Would Return:  {1024: 565, 4096: 6780, 8192: 9039} [sums to total].
-    //!          See: TEST_F(KVCacheManagerTest, BlockManagerTestBlocksPerWindowSize).
-    //! \return Map<windowSize, numBlocks>
+    //! \brief Calculate the proportional share each window size receives of the total memory pool
+    //! \details Example:       (uniqueWindowSizeToLayers={1024: [1], 4096: [0, 4, 5], 8192: [2, 3]})
+    //!          Would Return:  {1024: 0.0345, 4096: 0.4138, 8192: 0.5517} [sums to 1.0].
+    //!          See: TEST_F(KVCacheManagerTest, BlockManagerTestWindowSizeToShare).
+    //! \return Map<windowSize, share> where share is a float between 0 and 1. Shares sum to 1.0.
     static std::map<SizeType32, float> calculateWindowSizeToShare(
         std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers,
         std::map<SizeType32, SizeType32> const& cacheSizePerTokenPerWindowSize);

@@ -399,7 +399,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyFP8)
 }
 #endif
 
-TEST_F(KVCacheManagerTest, BlockManagerTestBlocksPerWindowSize)
+TEST_F(KVCacheManagerTest, BlockManagerTestWindowSizeToShare)
 {
     auto constexpr numPrimaryBlocks = 16384;
     // Single window size
@@ -445,12 +445,83 @@ TEST_F(KVCacheManagerTest, BlockManagerTestBlocksPerWindowSize)
             expectedShares[windowSize] = static_cast<float>(contribution) / totalContribution;
             EXPECT_NEAR(result.at(windowSize), expectedShares[windowSize], 1e-6f);
         }
-        // Additional check: integer allocations replicate previous behaviour (rounded to nearest int).
+
+        // Verify the exact hard-coded values mentioned in the comment
+        EXPECT_NEAR(result.at(1024), 0.0345f, 1e-4f);
+        EXPECT_NEAR(result.at(4096), 0.4138f, 1e-4f);
+        EXPECT_NEAR(result.at(8192), 0.5517f, 1e-4f);
+
+        // Verify that when shares are converted to actual block counts, they match expected values.
         auto getRoundedBlocks
             = [&](float share) { return static_cast<SizeType32>(std::round(share * numPrimaryBlocks)); };
         EXPECT_EQ(getRoundedBlocks(result.at(1024)), 565);
         EXPECT_EQ(getRoundedBlocks(result.at(4096)), 6780);
         EXPECT_EQ(getRoundedBlocks(result.at(8192)), 9039);
+    }
+
+    // Variable window size with different cache sizes per token per window
+    {
+        std::map<SizeType32, std::vector<SizeType32>> windowSizeToLayers{
+            {1024, {1}},       // contribution = 1024*1*2 = 2048 (cache size per token = 2)
+            {4096, {0, 4, 5}}, // contribution = 4096*3*4 = 49152 (cache size per token = 4)
+            {8192, {2, 3}},    // contribution = 8192*2*1 = 16384 (cache size per token = 1)
+        };
+        // Different cache sizes per token per window
+        std::map<SizeType32, SizeType32> cacheSizePerTokenPerWindow{{1024, 2}, {4096, 4}, {8192, 1}};
+
+        auto result = BlockManager::calculateWindowSizeToShare(windowSizeToLayers, cacheSizePerTokenPerWindow);
+        EXPECT_EQ(result.size(), 3);
+
+        // Ensure the shares sum to 1.
+        auto const sumShares = std::accumulate(
+            result.begin(), result.end(), 0.0f, [](float sum, auto const& kv) { return sum + kv.second; });
+        EXPECT_NEAR(sumShares, 1.0f, 1e-6f);
+
+        // Calculate expected shares based on contributions with different cache sizes per token.
+        std::map<SizeType32, float> expectedShares;
+        std::map<SizeType32, SizeType32> contributions;
+        for (auto const& [windowSize, layers] : windowSizeToLayers)
+        {
+            auto const cacheSizePerToken = cacheSizePerTokenPerWindow.at(windowSize);
+            contributions[windowSize] = windowSize * static_cast<SizeType32>(layers.size()) * cacheSizePerToken;
+        }
+        auto const totalContribution = std::accumulate(contributions.begin(), contributions.end(), 0.0f,
+            [](float sum, auto const& kv) { return sum + kv.second; });
+
+        for (auto const& [windowSize, contribution] : contributions)
+        {
+            expectedShares[windowSize] = static_cast<float>(contribution) / totalContribution;
+            EXPECT_NEAR(result.at(windowSize), expectedShares[windowSize], 1e-6f);
+        }
+
+        // Verify the calculated shares for different cache sizes per token
+        EXPECT_NEAR(result.at(1024), 2048.0f / (2048.0f + 49152.0f + 16384.0f), 1e-6f);  // ~0.0303
+        EXPECT_NEAR(result.at(4096), 49152.0f / (2048.0f + 49152.0f + 16384.0f), 1e-6f); // ~0.7273
+        EXPECT_NEAR(result.at(8192), 16384.0f / (2048.0f + 49152.0f + 16384.0f), 1e-6f); // ~0.2424
+    }
+
+    // Edge case: Single layer per window with varying cache sizes
+    {
+        std::map<SizeType32, std::vector<SizeType32>> windowSizeToLayers{
+            {1024, {0}}, // contribution = 1024*1*8 = 8192 (cache size per token = 8)
+            {4096, {1}}, // contribution = 4096*1*2 = 8192 (cache size per token = 2)
+            {8192, {2}}, // contribution = 8192*1*1 = 8192 (cache size per token = 1)
+        };
+        // Equal contributions but different cache sizes per token
+        std::map<SizeType32, SizeType32> cacheSizePerTokenPerWindow{{1024, 8}, {4096, 2}, {8192, 1}};
+
+        auto result = BlockManager::calculateWindowSizeToShare(windowSizeToLayers, cacheSizePerTokenPerWindow);
+        EXPECT_EQ(result.size(), 3);
+
+        // All should have equal shares since contributions are equal
+        EXPECT_NEAR(result.at(1024), 1.0f / 3.0f, 1e-6f);
+        EXPECT_NEAR(result.at(4096), 1.0f / 3.0f, 1e-6f);
+        EXPECT_NEAR(result.at(8192), 1.0f / 3.0f, 1e-6f);
+
+        // Ensure the shares sum to 1.
+        auto const sumShares = std::accumulate(
+            result.begin(), result.end(), 0.0f, [](float sum, auto const& kv) { return sum + kv.second; });
+        EXPECT_NEAR(sumShares, 1.0f, 1e-6f);
     }
 }
 
