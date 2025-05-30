@@ -558,8 +558,8 @@ class PyExecutor:
             req_stats.append(req_stat)
 
         for req in list(self.request_queue.queue):
-            if isinstance(req, RequestQueueItem):
-                req_stat = get_queued_req_stats(req.id)
+            if isinstance(req, Tuple):
+                req_stat = get_queued_req_stats(req[0])
                 req_stat.stage = RequestStage.QUEUED
                 req_stats.append(req_stat)
 
