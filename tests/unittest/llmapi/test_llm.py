@@ -1919,17 +1919,17 @@ def test_llm_get_queued_stats():
     tp_size = 1
 
     num_requests = 10
-    repeated_prompts = ["A B C"] * num_requests
+    repeated_prompts = ["A B C D E F G H I J K L M"] * num_requests
 
     llm_args_extra = {}
     sampling_args_extra = {}
 
     from tensorrt_llm._torch import LLM as LLM_torch
-    from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-    llm_args_extra["pytorch_backend_config"] = PyTorchConfig(
-        enable_iter_perf_stats=True,
-        enable_iter_req_stats=enable_iter_req_stats,
-        disable_overlap_scheduler=not use_overlap)
+
+    llm_args_extra.update(
+        dict(enable_iter_perf_stats=True,
+             enable_iter_req_stats=enable_iter_req_stats,
+             disable_overlap_scheduler=not use_overlap))
     LLM_CLASS = LLM_torch
 
     llm = LLM_CLASS(model=llama_model_path,
@@ -1939,22 +1939,34 @@ def test_llm_get_queued_stats():
                     max_batch_size=1,
                     **llm_args_extra)
 
-    max_tokens = 5
+    max_tokens = 10
     sampling_params = SamplingParams(max_tokens=max_tokens,
                                      **sampling_args_extra)
 
-    for output in llm.generate(repeated_prompts,
-                               sampling_params=sampling_params):
-        print(output)
+    max_tries = 10
+    has_queue_requests = False
 
-    results = llm.get_stats(2)
+    while not has_queue_requests and max_tries > 0:
+        max_tries -= 1
+        # Generate outputs, which will queue requests
+        for output in llm.generate(repeated_prompts,
+                                   sampling_params=sampling_params):
+            print(output)
 
-    for index, result in enumerate(results):
-        if "requestStats" in result:
-            for requestStat in result["requestStats"]:
-                if requestStat["stage"] == "QUEUED":
-                    has_queue_requests = True
-                    assert requestStat["numGeneratedTokens"] == 0
+        results = llm.get_stats(2)
+
+        for index, result in enumerate(results):
+            if "requestStats" in result:
+                for requestStat in result["requestStats"]:
+                    if requestStat["stage"] == "QUEUED":
+                        has_queue_requests = True
+                        assert requestStat["numGeneratedTokens"] == 0
+
+        if not has_queue_requests:
+            print("No queued requests found, retrying...")
+            asyncio.sleep(1)
+        else:
+            print("Found queued requests, breaking out of the loop.")
 
     assert has_queue_requests
 
