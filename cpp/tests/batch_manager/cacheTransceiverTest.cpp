@@ -1203,7 +1203,8 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
         int requestId = 0;
         for (auto len : {30, 10, 60, 30, 60, 10})
         {
-            requests.emplace_back(makeLlmRequestWithDP(len, requestId++, requestId % contextTp));
+            requests.emplace_back(makeLlmRequestWithDP(len, requestId, requestId % contextTp));
+            requestId++;
         }
         std::vector<std::future<void>> contextFutures;
         std::vector<std::future<void>> generationFutures;
@@ -1216,7 +1217,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
             {
                 for (int i = 0; i < requests.size(); i++)
                 {
-                    if (i % mTpSize == mTpRank)
+                    if ((i) % mTpSize == mTpRank)
                     {
                         // round robin
                         contextRequests.push_back(requests[i]);
@@ -1239,7 +1240,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
             {
                 for (int i = 0; i < requests.size(); i++)
                 {
-                    if (i % mTpSize == mTpRank)
+                    if ((i) % mTpSize == mTpRank)
                     {
                         generationRequests.push_back(requests[i]);
                     }
