@@ -9,8 +9,12 @@ import pickle  # nosec B403
 # using register_approved_ipc_class.
 BASE_ZMQ_CLASSES = {
     "builtins": [
-        "Exception", "ValueError", "NotImplementedError", "AttributeError",
-        "AssertionError"
+        "Exception",
+        "ValueError",
+        "NotImplementedError",
+        "AttributeError",
+        "AssertionError",
+        "RuntimeError",
     ],  # each Exception Error class needs to be added explicitly
     "collections": ["OrderedDict"],
     "datetime": ["timedelta"],
