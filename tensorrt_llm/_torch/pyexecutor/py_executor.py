@@ -551,9 +551,9 @@ class PyExecutor:
                 req_stat.dis_serving_stats.kv_cache_size = req.kv_cache_size
             return req_stat
 
-        def get_queued_req_stats(req: RequestQueueItem) -> RequestStats:
+        def get_queued_req_stats(request_id: int) -> RequestStats:
             req_stat = RequestStats()
-            req_stat.id = req.id
+            req_stat.id = request_id
             req_stat.context_prefill_position = 0
             req_stat.num_generated_tokens = 0
             req_stat.avg_num_decoded_tokens_per_iter = 0
@@ -571,9 +571,10 @@ class PyExecutor:
             req_stats.append(req_stat)
 
         for req in list(self.request_queue.queue):
-            req_stat = get_queued_req_stats(req)
-            req_stat.stage = RequestStage.QUEUED
-            req_stats.append(req_stat)
+            if isinstance(req, RequestQueueItem):
+                req_stat = get_queued_req_stats(req.id)
+                req_stat.stage = RequestStage.QUEUED
+                req_stats.append(req_stat)
 
         for req in finished_requests:
             req_stat = get_req_stats(req)
