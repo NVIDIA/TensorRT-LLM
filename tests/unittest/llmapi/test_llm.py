@@ -1891,12 +1891,12 @@ def llm_get_stats_test_harness(tp_size: int = 1,
                  disable_overlap_scheduler=not use_overlap))
         LLM_CLASS = LLM_torch
     else:
+        llm_args_extra["fast_build"] = True
         LLM_CLASS = LLM
 
     llm = LLM_CLASS(model=llama_model_path,
                     kv_cache_config=global_kvcache_config,
                     tensor_parallel_size=tp_size,
-                    fast_build=True,
                     **llm_args_extra)
 
     max_tokens = 5
@@ -1960,12 +1960,12 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
                  disable_overlap_scheduler=not use_overlap))
         LLM_CLASS = LLM_torch
     else:
+        llm_args_extra["fast_build"] = True
         LLM_CLASS = LLM
 
     llm = LLM_CLASS(model=llama_model_path,
                     kv_cache_config=global_kvcache_config,
                     tensor_parallel_size=tp_size,
-                    fast_build=True,
                     **llm_args_extra)
 
     max_tokens = 6
@@ -2133,7 +2133,8 @@ def run_llm_with_postprocess_parallel_and_result_handler(
               tensor_parallel_size=tp_size,
               _num_postprocess_workers=2,
               _postprocess_tokenizer_dir=llama_model_path,
-              fast_build=True)
+              **(dict(fast_build=True)
+                 if backend not in ["pytorch", "autodeploy"] else {}))
     golden_result = "DEFGHI"
     for i, output in enumerate(
             llm.generate_async(prompts[0],

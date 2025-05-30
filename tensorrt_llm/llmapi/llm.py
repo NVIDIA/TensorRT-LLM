@@ -113,7 +113,7 @@ class LLM:
 
         try:
             llm_args_cls = TorchLlmArgs if kwargs.get(
-                'backend', None) == 'pytorch' else TrtLlmArgs
+                'backend', None) in ["pytorch", "autodeploy"] else TrtLlmArgs
 
             self.args = llm_args_cls.from_kwargs(
                 model=model,

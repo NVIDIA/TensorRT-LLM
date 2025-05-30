@@ -753,7 +753,7 @@ class BaseLlmArgs(BaseModel):
     """
     model_config = {
         "arbitrary_types_allowed": True,
-        "extra": "allow",
+        "extra": "forbid",
     }
 
     # Explicit arguments
@@ -959,6 +959,32 @@ class BaseLlmArgs(BaseModel):
         exclude=True,  # exclude from serialization
         alias="_mpi_session")
 
+    _parallel_config: _ParallelConfig = PrivateAttr()
+
+    @property
+    def parallel_config(self) -> _ParallelConfig:
+        return self._parallel_config
+
+    _model_format: _ModelFormatKind = PrivateAttr()
+
+    @property
+    def model_format(self) -> _ModelFormatKind:
+        return self._model_format
+
+    _speculative_model_format: _ModelFormatKind = PrivateAttr()
+
+    @property
+    def speculative_model_format(self) -> _ModelFormatKind:
+        return self._speculative_model_format
+
+    _speculative_model: Any = PrivateAttr()
+
+    @property
+    def speculative_model(self) -> Any:
+        return self._speculative_model
+
+    _pretrained_config: PretrainedConfig = PrivateAttr()
+
     @print_traceback_on_error
     def model_post_init(self, __context: Any):
 
@@ -991,7 +1017,7 @@ class BaseLlmArgs(BaseModel):
         if self.moe_expert_parallel_size is None:
             self.moe_expert_parallel_size = -1
 
-        self.parallel_config = _ParallelConfig(
+        self._parallel_config = _ParallelConfig(
             tp_size=self.tensor_parallel_size,
             pp_size=self.pipeline_parallel_size,
             cp_size=self.context_parallel_size,
@@ -1081,8 +1107,8 @@ class BaseLlmArgs(BaseModel):
                     f"Invalid build_cache_config: {self.enable_build_cache}")
         model_obj = _ModelWrapper(self.model)
 
-        self.speculative_model = getattr(self.speculative_config,
-                                         "speculative_model", None)
+        self._speculative_model = getattr(self.speculative_config,
+                                          "speculative_model", None)
         speculative_model_obj = _ModelWrapper(
             self.speculative_model
         ) if self.speculative_model is not None else None
@@ -1090,7 +1116,7 @@ class BaseLlmArgs(BaseModel):
                 'pytorch', 'autodeploy'
         ]:
             # Load parallel_config from the engine.
-            self.model_format = get_model_format(self.model)
+            self._model_format = get_model_format(self.model)
 
             if self.model_format is _ModelFormatKind.TLLM_ENGINE:
                 if self.build_config is not None:
@@ -1107,10 +1133,10 @@ class BaseLlmArgs(BaseModel):
             elif self.model_format is _ModelFormatKind.TLLM_CKPT:
                 self._load_config_from_ckpt(model_obj.model_dir)
         else:
-            self.model_format = _ModelFormatKind.HF
+            self._model_format = _ModelFormatKind.HF
 
         if self.speculative_model and speculative_model_obj.is_local_model:
-            self.speculative_model_format = _ModelFormatKind.HF
+            self._speculative_model_format = _ModelFormatKind.HF
 
         self.quant_config = self.quant_config or QuantConfig()
 
@@ -1302,7 +1328,7 @@ class BaseLlmArgs(BaseModel):
             raise ValueError(
                 f"cp_size {self.parallel_config.cp_size} is not consistent with the engine's cp_size {mapping.cp_size}"
             )
-        self.parallel_config = _ParallelConfig(
+        self._parallel_config = _ParallelConfig(
             tp_size=mapping.tp_size,
             pp_size=mapping.pp_size,
             cp_size=mapping.cp_size,
@@ -1341,7 +1367,7 @@ class BaseLlmArgs(BaseModel):
                 f"auto parallel with world_size {self.parallel_config.world_size} does not support checkpoint with "
                 "world_size {world_size} > 1")
         if not self.parallel_config.auto_parallel:
-            self.parallel_config = _ParallelConfig(
+            self._parallel_config = _ParallelConfig(
                 tp_size=tp_size,
                 pp_size=pp_size,
                 cp_size=cp_size,
@@ -1613,7 +1639,7 @@ class TorchLlmArgs(BaseLlmArgs):
         from .._torch.model_config import MoeLoadBalancerConfig
 
         super().model_post_init(__context)
-        self.model_format = _ModelFormatKind.HF
+        self._model_format = _ModelFormatKind.HF
 
         if isinstance(self.moe_load_balancer, str):
             assert os.path.exists(self.moe_load_balancer)

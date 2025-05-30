@@ -353,8 +353,8 @@ def throughput_command(
     llm = None
     try:
         logger.info("Setting up throughput benchmark.")
-        kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['backend'] = backend
+        kwargs = kwargs | runtime_config.get_llm_args()
 
         if backend == "pytorch":
             kwargs["enable_iter_perf_stats"] = True
