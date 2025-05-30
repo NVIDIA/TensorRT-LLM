@@ -432,6 +432,7 @@ class Tensor(object):
         '''
         Returns the rank (i.e. the number of dimensions) of the tensor.
         '''
+        print(f'Tensor shape: {self.trt_tensor.shape}')
         return len(self.trt_tensor.shape)
 
     def ndim(self):
@@ -661,6 +662,43 @@ relu = partial(activation, act_type=trt.ActivationType.RELU)
 tanh = partial(activation, act_type=trt.ActivationType.TANH)
 sigmoid = partial(activation, act_type=trt.ActivationType.SIGMOID)
 
+
+def logsigmoid(input: Tensor) -> Tensor:
+    '''
+    Add a LogSigmoid operation.
+
+    Parameters:
+        input : Tensor
+            The input tensor on which the activation function is applied
+
+    Returns:
+        The tensor produced by the activation layer.
+    '''
+
+    return log(sigmoid(input=input))
+
+
+def selu(input: Tensor) -> Tensor:
+    '''
+    Add a SeLU operation.
+
+    Parameters:
+        input : Tensor
+            The input tensor on which the activation function is applied.
+
+    Returns:
+        The tensor produced by the activation layer.
+    '''
+
+    alpha = 1.6732632423543772848170429916717
+    scale = 1.0507009873554804934193349852946
+
+    selu_layer = default_trtnet().add_activation(input.trt_tensor,
+                                               trt.ActivationType.SELU)
+    selu_layer.alpha = alpha
+    selu_layer.beta = scale
+
+    return _create_tensor(selu_layer.get_output(0), selu_layer)
 
 def silu(input: Tensor) -> Tensor:
     '''
@@ -1744,6 +1782,63 @@ def softmax(input: Tensor, dim: Optional[int] = None) -> Tensor:
     return _create_tensor(layer.get_output(0), layer)
 
 
+def softmin(x: Tensor, dim: Optional[int] = None) -> Tensor: 
+    '''
+    Add an operation to compute softmin on a tensor.
+
+    That operation computes the softmin on the input tensor in the dimension
+    'dim' if specified. Otherwise, it is applied on the last dimension.
+
+    It inserts a ISoftmaxLayer to the TensorRT graph.
+
+    Parameters:
+        x : Tensor
+            The input tensor on which to apply softmin.
+
+        dim : Optional[int]
+            The dimension used to apply softmin.
+
+    Returns:
+        The output tensor of the softmin layer.
+    '''
+    if dim is None:
+        dim = x.ndim() - 1
+    if dim < 0:
+        dim = x.ndim() + dim
+
+    return softmax(input=neg(x), dim=dim)
+
+
+def logsoftmax(x: Tensor, dim: Optional[int] = None) -> Tensor:
+    '''
+    Add an operation to compute logsoftmax on a tensor.
+
+    Parameters:
+        x : Tensor
+            The input tensor on which to apply logsoftmax.
+
+        dim: Optional[int]
+
+    Returns:
+        The output tensor of the logsoftmax layer.
+    ''' 
+
+    dim_param = dim if dim else -1
+    dim = dim_resolve_negative(dim_param, x.ndim())
+    axes = dim_to_trt_axes(dim)
+
+    sum_layer = default_trtnet().add_reduce(exp(x).trt_tensor,
+                                        trt.ReduceOperation.SUM,
+                                        axes,
+                                        keep_dims=True)
+
+    summed_tensor = _create_tensor(sum_layer.get_output(0), sum_layer)
+
+    # log-sum-exp trick for numerical stability
+    return x - log(summed_tensor)
+
+
+
 def _lookup_plugin(input: Tensor, weight: Tensor, rank: int) -> Tensor:
     '''
     Add an operation to perform lookup in a tensor.
@@ -2113,6 +2208,8 @@ def unary(input: Tensor, op: trt.UnaryOperation) -> Tensor:
         sin     for op=trt.UnaryOperation.SIN
         cos     for op=trt.UnaryOperation.COS
         abs     for op=trt.UnaryOperation.ABS
+        log     for op=trt.UnaryOperation.LOG
+        neg     for op=trt.UnaryOperation.NEG
 
     It is implemented using the IUnaryLayer from TensorRT.
 
@@ -2136,6 +2233,8 @@ exp = partial(unary, op=trt.UnaryOperation.EXP)
 sin = partial(unary, op=trt.UnaryOperation.SIN)
 cos = partial(unary, op=trt.UnaryOperation.COS)
 abs = partial(unary, op=trt.UnaryOperation.ABS)
+log = partial(unary, op=trt.UnaryOperation.LOG)
+neg = partial(unary, op=trt.UnaryOperation.NEG)
 
 
 def mean(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
@@ -2274,6 +2373,23 @@ def argmax(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
     return _create_tensor(layer.get_output(0), layer)
 
 
+def relu6(input: Tensor) -> Tensor:
+    '''
+    Add a ReLU6 operation. 
+
+    Applies ReLU with an lower bound of 6
+
+    Parameters:
+        input : Tensor
+            The input tensor on which the activation function is applied.
+
+    Returns:
+        The tensor produced by the activation layer.
+    '''
+
+    return relu(input)
+
+
 def gelu(x: Tensor) -> Tensor:
     '''
     Add a GELU operation.
@@ -2324,6 +2440,17 @@ def geglu(x: Tensor) -> Tensor:
     '''
     a, b = chunk(x, 2, dim=-1)
     return a * gelu(b)
+
+
+def tanhshrink(input: Tensor) -> Tensor:
+    '''
+    Add a Tanhshrink operation.
+
+    Returns:
+        The tensor produced by the activation layer.
+    '''
+
+    return input - tanh(input)
 
 
 def group_norm(input: Tensor,
@@ -3765,11 +3892,17 @@ ACT2FN = {
     'gelu_new': gelu,
     'gelu_fast': gelu,
     'geglu': geglu,
+    'logsigmoid': logsigmoid,
+    'logsoftmax': logsoftmax,
+    'relu6': relu6,
+    'selu': selu,
     'silu': silu,
+    'softmin': softmin,
     'softplus': softplus,
     'squared-relu': squared_relu,
     'swiglu': swiglu,
     'fast-swiglu': swiglu,
+    'tanhshrink': tanhshrink,
 }
 
 GATED_ACT_2_ACT = {

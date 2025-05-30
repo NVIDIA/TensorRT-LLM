@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ..functional import softplus, tanh
+from ..functional import softplus, tanh, tanhshrink, logsoftmax, softmin, selu
 from ..module import Module
 
 
@@ -20,3 +20,28 @@ class Mish(Module):
 
     def forward(self, input):
         return input * tanh(softplus(input, beta=1.0, threshold=20.0))
+
+class Tanhshrink(Module):
+
+    def forward(self, input):
+        return tanhshrink(input=input)
+    
+class LogSoftmax(Module):
+
+    def forward(self, input):
+        return logsoftmax(input=input)
+    
+class Softmin(Module):
+
+    def forward(self, input):
+        return softmin(input=input)
+    
+class SELU(Module):
+
+    def forward(self, input):
+        return selu(input=input)
+
+class LogSigmoid(Module):
+
+    def forward(self, input):
+        return selu(input=input)
