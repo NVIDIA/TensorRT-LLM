@@ -1344,7 +1344,7 @@ void {sliding_or_chunked_causal_kernel_name}_nl({params_type} params){{
 
 #endif // sliding_or_chunked_causal_mask
 
-void {launcher_name}_nl({params_type} &params,
+void {launcher_name}_nl({fused_multihead_attention_params_v2_str} &params,
     const Launch_params& launch_params, cudaStream_t stream){{
   constexpr int loop_iters = {seq_len} / {noloop_step};
   static_assert(loop_iters * {noloop_step} == {seq_len}, "");
@@ -3213,7 +3213,7 @@ def get_cubin_header(kernel_traits, specs_names):
                         return 'nullptr'
                     lname = kname.replace('_kernel', '')
                     mask_types = [
-                        '_sliding_window_causal', '_custom_mask', '_causal'
+                        '_sliding_or_chunked_causal', '_custom_mask', '_causal'
                     ]
                     for mask_type in mask_types:
                         lname = lname.replace(mask_type, '')
@@ -3226,6 +3226,12 @@ def get_cubin_header(kernel_traits, specs_names):
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, {cubin_name}, \
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
+{attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
+{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {lname}}}\
+'''.format(**locals()) if 'sage' in kname and 'sm90' in kname else '''\
+{{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
+{sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
+0, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
 {is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {lname}}}\
 '''.format(**locals())
