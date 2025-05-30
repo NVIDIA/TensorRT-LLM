@@ -21,7 +21,8 @@ import torch._dynamo.config
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
-from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
+from tensorrt_llm._utils import (is_trace_enabled, local_mpi_rank,
+                                 local_mpi_size, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.logger import logger
@@ -147,8 +148,8 @@ def prefetch_files(file_names: List[str], mapping: Mapping):
     """
 
     # Find out the files to prefetch for the current rank.
-    # Each rank loads files with indices rank, rank + world_size, rank + 2*world_size, etc.
-    local_file_names = file_names[mapping.rank::mapping.world_size]
+    # Each rank loads files with indices local_rank, local_rank + local_mpi_size, local_rank + 2*local_mpi_size, etc.
+    local_file_names = file_names[local_mpi_rank()::local_mpi_size()]
 
     max_processes = min(multiprocessing.cpu_count() * 2, 16)
     with multiprocessing.Pool(processes=max_processes) as pool:
