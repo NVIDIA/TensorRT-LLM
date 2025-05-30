@@ -1,3 +1,4 @@
+import os
 import weakref
 from dataclasses import dataclass, field
 from typing import Optional
@@ -157,6 +158,8 @@ class TrtllmAttentionWrapper:
         kv_scale_orig_quant: Optional[torch.Tensor] = None,
         kv_scale_quant_orig: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
+        out_scale_sf: Optional[torch.Tensor] = None,
+        use_nvfp4_output: bool = False,
         use_paged_context_fmha: bool = False,
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
         latent_cache: Optional[torch.Tensor] = None,
@@ -193,6 +196,7 @@ class TrtllmAttentionWrapper:
             kv_scale_orig_quant (torch.Tensor): The tensor to store the scaling factor for quantization to INT8/FP8 in the KV cache, with shape (1) on GPU.
             kv_scale_quant_orig (torch.Tensor): The tensor to store the scaling factor for dequantization from INT8/FP8 in the KV cache, with shape (1) on GPU.
             out_scale (torch.Tensor): The tensor to store the scaling factor to quantize output, with shape (1) on GPU.
+            out_scale_sf (torch.Tensor): The tensor to store the global scale for NVFP4 scaling factors, with shape (1) on GPU.
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
             mla_context_paged_kv (torch.Tensor): The paged KV cache for MLA context, for kv cache reuse/chunked context.
@@ -219,7 +223,9 @@ class TrtllmAttentionWrapper:
         self.kv_scale_orig_quant = kv_scale_orig_quant
         self.kv_scale_quant_orig = kv_scale_quant_orig
         self.out_scale = out_scale
+        self.out_scale_sf = out_scale_sf
         self.use_paged_context_fmha = use_paged_context_fmha
+        self.use_nvfp4_output = use_nvfp4_output
         self.attention_input_type = int(attention_input_type)
         self.latent_cache = latent_cache
         self.q_pe = q_pe
@@ -350,7 +356,7 @@ class TrtllmAttentionWrapper:
             self.cache_indirection,
             self.kv_scale_orig_quant,
             self.kv_scale_quant_orig,
-            self.out_scale,
+            self.out_scale_sf if self.use_nvfp4_output else self.out_scale,
             self.rotary_inv_freq,
             self.rotary_cos_sin,
             self.latent_cache,
@@ -398,6 +404,42 @@ class TrtllmAttentionWrapper:
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
         return output
+
+    def is_nvfp4_output_kernel_available(
+        self,
+        *,
+        tokens_per_block: Optional[int] = None,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
+        CAUSAL,
+        use_paged_context_fmha: bool = False,
+        is_mla_enable: bool = False,
+        **kwargs,
+    ):
+        """
+        Runtime check whether the NVFP4 output kernel is available.
+        Args:
+            tokens_per_block (int): Token number per KV cache block.
+            attention_mask (PredefinedAttentionMask): The attention mask type.
+            use_paged_context_fmha (bool): Whether to use paged context FMHA.
+            is_mla_enable (bool): Whether to use MLA.
+        """
+        if attention_mask == PredefinedAttentionMask.CAUSAL:
+            mask_type = AttentionMaskType.causal
+        elif attention_mask == PredefinedAttentionMask.FULL:
+            mask_type = AttentionMaskType.padding
+        else:
+            raise ValueError("Unexpected attention mask type")
+
+        return torch.ops.trtllm.attention_supports_nvfp4_output(
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            tokens_per_block,
+            int(mask_type),
+            self.quant_mode,
+            use_paged_context_fmha,
+            is_mla_enable,
+        )
 
 
 @dataclass(kw_only=True)
@@ -747,6 +789,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         v: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
         out_scale: Optional[torch.Tensor] = None,
+        out_scale_sf: Optional[torch.Tensor] = None,
         *,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
@@ -775,6 +818,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             use_paged_context_fmha = use_paged_context_fmha and self.has_cached_kv_for_mla_context(
                 metadata)
 
+        use_nvfp4_output = False
+        if self.has_nvfp4 and self.support_nvfp4_output():
+            # Runtime check whether the NVFP4 output kernel is available.
+            use_nvfp4_output = self.wrapper.is_nvfp4_output_kernel_available(
+                tokens_per_block=metadata.tokens_per_block,
+                attention_mask=attention_mask,
+                use_paged_context_fmha=use_paged_context_fmha,
+                is_mla_enable=self.is_mla_enable,
+            )
+
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,
@@ -800,6 +853,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_scale_orig_quant=self.kv_scale_orig_quant,
             kv_scale_quant_orig=self.kv_scale_quant_orig,
             out_scale=out_scale,
+            out_scale_sf=out_scale_sf,
+            use_nvfp4_output=use_nvfp4_output,
             use_paged_context_fmha=use_paged_context_fmha,
             attention_input_type=attention_input_type,
             latent_cache=latent_cache,
@@ -811,7 +866,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         out_dtype = None
         if out_scale is not None:
-            if self.has_nvfp4 and not self.is_mla_enable:
+            if use_nvfp4_output:
                 # Use UINT8 as the container dtype for NVFP4.
                 out_dtype = torch.uint8
             elif (self.has_fp8_qdq or self.has_nvfp4
@@ -846,7 +901,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     @classmethod
     def support_nvfp4_output(cls) -> bool:
-        return True
+        # Default enabled, but allow manual disabling through `TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0`
+        return os.environ.get("TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT",
+                              "1") == "1"
 
     def has_cached_kv_for_mla_context(
         self,

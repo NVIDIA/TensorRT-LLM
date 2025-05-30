@@ -624,6 +624,54 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
 }
 
+bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
+    std::optional<int64_t> const tokens_per_block, int64_t const mask_type, int64_t const quant_mode,
+    bool const use_paged_context_fmha, bool is_mla_enable)
+{
+    // Only Blackwell supports NVFP4 output.
+    if (tensorrt_llm::common::getSMVersion() < 100)
+    {
+        return false;
+    }
+
+    // MLA is not supported.
+    if (is_mla_enable)
+    {
+        return false;
+    }
+
+    auto op = std::make_shared<AttentionOp>();
+    op->mType = nvinfer1::DataType::kHALF;
+    op->mNumHeads = num_heads;
+    op->mNumKVHeads = num_kv_heads;
+    op->mHeadSize = head_size;
+    op->mMaskType = static_cast<tensorrt_llm::kernels::AttentionMaskType>(int32_t(mask_type));
+    op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
+    op->mFP8ContextFMHA = op->mKVCacheQuantMode.hasFp8KvCache();
+    op->mUseKVCache = true;
+    op->mPagedKVCache = true;
+    op->mTokensPerBlock = tokens_per_block.value_or(0);
+    op->mFuseFp4Quant = true;
+    op->mPagedContextFMHA = use_paged_context_fmha;
+
+    auto cache_key = op->data();
+    using CacheKey = decltype(cache_key);
+    static std::unordered_map<CacheKey, bool, hash<CacheKey>> op_cache;
+    if (auto it = op_cache.find(cache_key); it != op_cache.end())
+    {
+        TLLM_LOG_TRACE("Attention op runtime check is cached");
+        return it->second;
+    }
+    else
+    {
+        TLLM_LOG_TRACE("Caching attention op runtime check with cache key: %s", to_string(cache_key).c_str());
+        op->initialize();
+        op_cache[cache_key] = op->supportsNvFp4Output();
+    }
+
+    return op->supportsNvFp4Output();
+}
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -694,6 +742,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? mla_context_kv_cache_block_offsets"
         ", int? attention_chunk_size"
         ") -> ()");
+
+    m.def("attention_supports_nvfp4_output", &torch_ext::attention_supports_nvfp4_output);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
