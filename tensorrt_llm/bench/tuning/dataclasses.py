@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 
@@ -8,22 +9,30 @@ from pydantic import (AliasChoices, AliasPath, BaseModel, Field, computed_field,
                       field_validator, model_validator)
 from transformers import AutoConfig
 
-from tensorrt_llm.bench.benchmark.tuning.utils import get_model_config
+from tensorrt_llm.bench.tuning.utils import get_model_config
 from tensorrt_llm.bench.build.utils import get_safetensors_metadata
 
 
 class BenchmarkSpecification(BaseModel):
-    environment: BenchmarkEnvironment
+    constraints: Optional[TuningConstraints] = Field(
+        default=None,
+        description="The tuning criteria to use for benchmarking.")
+    dataset_path: Optional[str] = Field(
+        default=None, description="The path to the dataset to use for benchmarking.")
     engine_dir: Optional[Path] = Field(
         default=None,
         description="The path to the engine to use for benchmarking.")
+    environment: BenchmarkEnvironment
+    modality: Optional[Literal["text", "image", "video"]] = Field(
+        default="text", description="The modality of the model being used.")
+    mode: Literal["build", "benchmark"] = Field(
+        default="benchmark",
+        description="The path tuning is being accessed from.")
     scenario: Optional[ScenarioSpecification] = Field(
         default=None, description="The scenario to use for benchmarking.")
     world: Optional[WorldConfig] = Field(
         default=None, description="The world to use for benchmarking.")
-    constraints: Optional[TuningConstraints] = Field(
-        default=None,
-        description="The tuning criteria to use for benchmarking.")
+
 
 
 class BenchmarkEnvironment(BaseModel):
@@ -35,31 +44,47 @@ class BenchmarkEnvironment(BaseModel):
     workspace: Path = Field(
         default="/tmp", description="The workspace to use for engine building.")
 
+    @cached_property
     @computed_field(
         description=
-        "The type of model being used, derived from the model configuration.")
+        "The type of model being used, derived from the model configuration.",
+    )
     def model_type(self) -> str:
         return get_model_config(self.model, self.checkpoint_path).model_type
 
+    @computed_field(
+        description=
+        "The type of model being used, derived from the model configuration.",
+    )
+    def checkpoint_path(self) -> Path:
+        return self.checkpoint_path or self.model
+
 
 class ScenarioSpecification(BaseModel):
+    backend: Optional[Literal["pytorch", "autodeploy", "trt"]] = Field(
+        default="pytorch", description="The backend to use for benchmarking.")
+    beam_width: Optional[int] = Field(
+        default=None, description="The beam width to use for benchmarking.")
+    concurrency: Optional[int] = Field(
+        default=None, description="The number of concurrent requests to benchmarking.")
+    eos_id: Optional[int] = Field(
+        default=-1, description="The end-of-sequence token to use for benchmarking.")
+    pad_id: Optional[int] = Field(
+        default=None, description="The padding token to use for benchmarking.")
     extra_llm_api_options: Optional[Dict[str, Any]] = Field(
         default_factory=dict,
-        description="A dictionary of extra LLM API options to use for tuning.")
-    concurrency: Optional[int] = Field(
-        default=None, description="The number of concurrent requests to serve.")
+        description="A dictionary of extra LLM API options to use for benchmarking.")
     kv_cache_free_gpu_mem_fraction: Optional[float] = Field(
         default=.9,
         description=
         "The percentage of memory to use for KV Cache after model load.")
-    backend: Optional[Literal["pytorch", "autodeploy", "trt"]] = Field(
-        default="pytorch", description="The backend to use for benchmarking.")
 
     class Config:
         extra = "ignore"
 
     @field_validator("extra_llm_api_options", mode="before")
-    def validate_extra_llm_api_options(self, v) -> Dict[str, Any]:
+    @classmethod
+    def validate_extra_llm_api_options(cls, v) -> Dict[str, Any]:
         if v is None:
             return None
         else:
@@ -70,6 +95,8 @@ class ScenarioSpecification(BaseModel):
                         f"extra_llm_api_options file {p} does not exist.")
                 with open(p, "r") as f:
                     v = yaml.safe_load(f)
+
+                return v
             elif isinstance(v, dict):
                 for key, _ in v.items():
                     if not isinstance(key, str):
@@ -84,13 +111,6 @@ class ScenarioSpecification(BaseModel):
 
 
 class TuningConstraints(BaseModel):
-    mode: Literal["build", "benchmark"] = Field(
-        default="benchmark",
-        description="The path tuning is being accessed from.")
-    modality: Optional[Literal["text", "image", "video"]] = Field(
-        default="text", description="The modality of the model being used.")
-    dataset_path: Optional[str] = Field(
-        default=None, description="The path to the dataset to use for tuning.")
     target_input_len: Optional[int] = Field(
         default=None, description="The target input length to use for tuning.")
     target_output_len: Optional[int] = Field(
@@ -108,8 +128,6 @@ class TuningConstraints(BaseModel):
     max_seq_len: Optional[int] = Field(
         default=None,
         description="The maximum sequence length to use for tuning.")
-    beam_width: Optional[int] = Field(
-        default=None, description="The beam width to use for tuning.")
 
     class Config:
         extra = "ignore"
