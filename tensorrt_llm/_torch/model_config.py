@@ -80,6 +80,20 @@ class ModelConfig(Generic[TConfig]):
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
+    _frozen: bool = field(default=False, init=False, repr=False)
+
+    def __setattr__(self, key, value):
+        """
+        Prevent modification of frozen instance attributes.
+        However, we allow modification of 'extra_attrs' attributes for torch.compile.
+        All the other attributes are frozen.
+        This can be bypassed by manually setting '_frozen' to False. The design is
+        to discourage modifying the attributes unintentionally.
+        """
+        if self._frozen and key not in ('_frozen', 'extra_attrs'):
+            raise AttributeError(f"Cannot modify '{key}' - instance is frozen")
+        super().__setattr__(key, value)
+
     def __post_init__(self):
         if self.pretrained_config and hasattr(self.pretrained_config,
                                               "architectures"):
@@ -219,10 +233,12 @@ class ModelConfig(Generic[TConfig]):
                     128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
                 quant_config.group_size = block_size[0]
 
-        return cls(pretrained_config=pretrained_config,
-                   quant_config=quant_config,
-                   quant_config_dict=layer_quant_config,
-                   **kwargs)
+        model_config = cls(pretrained_config=pretrained_config,
+                           quant_config=quant_config,
+                           quant_config_dict=layer_quant_config,
+                           **kwargs)
+        model_config._frozen = True
+        return model_config
 
     def get_bindings_model_config(self) -> "ModelConfigCpp":
         """
