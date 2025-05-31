@@ -860,7 +860,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
             = tc::calculateTotalWorkspaceSize(xqa_workspaces, XQA_NUM_BUFFERS, mXqaDispatcher->getWorkspaceAlignment());
     }
 
-    return std::max(std::max(generation_workspace_size, xqa_workspace_size), fmha_v2_mla_workspace_size));
+    return std::max(std::max(generation_workspace_size, xqa_workspace_size), fmha_v2_mla_workspace_size);
 }
 
 int AttentionOp::getMaxNumSeqLenTile(int batch_beam_size) const

@@ -170,6 +170,7 @@ def setup_llm(args):
               max_seq_len=args.max_seq_len,
               max_batch_size=args.max_batch_size,
               max_num_tokens=args.max_num_tokens,
+              tensor_parallel_size=args.tp_size,
               enable_attention_dp=args.enable_attention_dp,
               moe_expert_parallel_size=args.moe_ep_size,
               moe_tensor_parallel_size=args.moe_tp_size,
