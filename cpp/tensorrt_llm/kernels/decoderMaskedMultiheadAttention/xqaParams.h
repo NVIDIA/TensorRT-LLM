@@ -42,6 +42,7 @@ struct XQAParams
     void* workspaces = nullptr;
     uint32_t batch_size = 0;
     int32_t beam_width = 0;
+    int32_t chunked_attention_size = INT_MAX;
     int32_t max_attention_window_size = 0;
     int32_t cyclic_attention_window_size = 0;
     int32_t sink_token_length = 0;
