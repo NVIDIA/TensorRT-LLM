@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 from typing import Tuple
 
 from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
@@ -11,7 +12,7 @@ from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConf
 from .utils import get_device_memory
 import math
 
-from ...build.utils import get_device_memory
+from tensorrt_llm.bench.build.utils import get_device_memory
 
 BYTES_PER_ELEM = {
     QuantAlgo.NO_QUANT: 2.0,
