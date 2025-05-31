@@ -241,7 +241,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::moe_load_balance_routing")
     def _(single_layer_load_balancer_ptr: int,
-          token_selected_experts: torch.Tensor):
+          token_selected_experts: torch.Tensor, offset_by_ep_rank: bool):
         return torch.empty_like(token_selected_experts)
 
     @torch.library.custom_op("trtllm::group_rms_norm_base",
