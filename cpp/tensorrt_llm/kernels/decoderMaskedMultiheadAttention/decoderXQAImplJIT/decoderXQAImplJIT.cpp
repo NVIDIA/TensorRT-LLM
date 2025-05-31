@@ -380,6 +380,12 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     {
         multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
     }
+    // A WAR to enable Hopper XQA multi-token multi_block mode
+    if (isSpecDec && isGMMAKernel)
+    {
+        multi_block
+            = computeMultiBlockCountSpecDecGMMA(xqaParams, xqaParams.batch_size, multiprocessor_count, specDecBlocks);
+    }
     uint32_t const nbKVHeads = xqaParams.num_kv_heads;
     auto const gridDim = (isGMMAKernel ? dim3{specDecBlocks, multi_block, nbKVHeads * xqaParams.batch_size}
                                        : dim3{multi_block, nbKVHeads, xqaParams.batch_size});
