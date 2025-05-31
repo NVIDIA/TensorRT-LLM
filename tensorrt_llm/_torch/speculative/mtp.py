@@ -99,7 +99,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
         context_batch = scheduled_batch.context_requests
         # allocate hidden state tensors
         for req in context_batch:
-            if req.is_first_context_chunk():
+            if req.is_first_context_chunk:
                 slot_id = self.slot_manager.add_slot(req.request_id)
                 if self.use_relaxed_acceptance_for_thinking:
                     self.mtp_relaxed_delta_pool[slot_id] = 0.
@@ -251,7 +251,7 @@ class MTPSampler(TorchSampler):
             assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
             assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
             assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
-            if request.get_context_remaining_length() != 0:
+            if request.context_remaining_length != 0:
                 idx += 1
                 continue
 

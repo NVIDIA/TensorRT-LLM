@@ -1071,11 +1071,11 @@ class PyExecutor:
                     # This is necessary because _forward_step updates the state before _update_requests is executed.
                     scheduled_batch.chunked_requests = [
                         r for r in scheduled_batch.context_requests
-                        if r.get_context_remaining_length() != 0
+                        if r.context_remaining_length != 0
                     ]
                     scheduled_batch.context_requests = [
                         r for r in scheduled_batch.context_requests
-                        if r.get_context_remaining_length() == 0
+                        if r.context_remaining_length == 0
                     ]
 
                     if self.enable_iter_perf_stats:
@@ -1583,14 +1583,20 @@ class PyExecutor:
         @nvtx_range(
             f"[Executor] _forward_step: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
         )
-        def forward(scheduled_requests, resource_manager, new_tensors_device):
-            return self.model_engine.forward(scheduled_requests,
-                                             resource_manager,
-                                             new_tensors_device)
+        def forward(scheduled_requests, resource_manager, new_tensors_device,
+                    gather_context_logits):
+            return self.model_engine.forward(
+                scheduled_requests,
+                resource_manager,
+                new_tensors_device,
+                gather_context_logits=gather_context_logits)
 
         try:
+            gather_context_logits = any(
+                a.py_return_context_logits
+                for a in scheduled_requests.context_requests)
             outputs = forward(scheduled_requests, self.resource_manager,
-                              new_tensors_device)
+                              new_tensors_device, gather_context_logits)
             return outputs
         except Exception as e:
             traceback.print_exc()
@@ -1611,7 +1617,7 @@ class PyExecutor:
 
         for request in scheduled_requests.context_requests:
             request.move_to_next_context_chunk()
-            if request.get_context_remaining_length() == 0:
+            if request.context_remaining_length == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
 
     def _update_request_states_star_attention(
