@@ -14,6 +14,8 @@ from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
+from ..model_config import ModelConfig
+
 _thread_local = threading.local()
 
 
@@ -307,14 +309,17 @@ class MNNVLAllReduce(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
-        self.enable_mnnvl = (os.environ.get("TRTLLM_MNNVL_AR_ENABLED",
-                                            "0") == "1"
-                             and dtype in [torch.bfloat16, torch.float32]
-                             and (not mapping.has_cp()))
+        assert (
+            dtype in MNNVLAllReduce.get_supported_dtype()
+            and (not mapping.has_cp())
+        ), "MNNVL all reduce only support dtype {MNNVLAllReduce.get_supported_dtype()} and without cp."
 
-        if self.enable_mnnvl:
-            self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
-                self.mapping, dtype)
+        self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
+            self.mapping, dtype)
+
+    @staticmethod
+    def get_supported_dtype():
+        return [torch.bfloat16, torch.float32]
 
     def forward(
         self,
@@ -330,7 +335,7 @@ class MNNVLAllReduce(nn.Module):
         Returns:
             Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
         """
-        if not self.enable_mnnvl or input.numel() > self.max_num_elements_mnnvl:
+        if input.numel() > self.max_num_elements_mnnvl:
             return None
 
         fusion_op = all_reduce_params.fusion_op
@@ -375,38 +380,38 @@ class MNNVLAllReduce(nn.Module):
 class AllReduce(nn.Module):
 
     def __init__(self,
-                 mapping: Mapping,
-                 strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
-                 dtype: Optional[torch.dtype] = None):
+                 dtype: Optional[torch.dtype] = None,
+                 model_config: ModelConfig = ModelConfig()):
         super().__init__()
         """
         AllReduce is a module that performs an all-reduce operation on a tensor.
 
         Args:
-            mapping (Mapping):  The parallel mapping config.
-            strategy (AllReduceStrategy):
-                The following all-reduce strategies are supported:
+            model_config (ModelConfig): mapping and strategy in it are used.
+                mapping (Mapping):  The parallel mapping config.
+                strategy (AllReduceStrategy):
+                    The following all-reduce strategies are supported:
 
-                - UB: AllReduce uses user-buffer based all-reduce kernel.
+                    - UB: AllReduce uses user-buffer based all-reduce kernel.
 
-                - NCCL: Use NCCL allreduce.
+                    - NCCL: Use NCCL allreduce.
 
-                - MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel.
+                    - MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel.
 
-                - AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
+                    - AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
 
-                - LOWPRECISION: AllReduce quantizes data to lower precision for transmission.
-                  Should only be used on topologies with PCIe switches and without NVLink.
-                  This strategy may result in some precision loss but can improve performance
-                  on specific hardware configurations.
+                    - LOWPRECISION: AllReduce quantizes data to lower precision for transmission.
+                    Should only be used on topologies with PCIe switches and without NVLink.
+                    This strategy may result in some precision loss but can improve performance
+                    on specific hardware configurations.
 
-            All strategies support the following operations:
-                - NONE (AllReduce only)
-                - RESIDUAL_RMS_NORM
-                - RESIDUAL_RMS_NORM_QUANT_FP8
-                - RESIDUAL_RMS_NORM_QUANT_NVFP4
-                - RESIDUAL_RMS_NORM_OUT_QUANT_FP8
-                - RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
+                All strategies support the following operations:
+                    - NONE (AllReduce only)
+                    - RESIDUAL_RMS_NORM
+                    - RESIDUAL_RMS_NORM_QUANT_FP8
+                    - RESIDUAL_RMS_NORM_QUANT_NVFP4
+                    - RESIDUAL_RMS_NORM_OUT_QUANT_FP8
+                    - RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
 
             Note: NCCL, UB, and LOWPRECISION strategies only support consequent kernel calls
         instead of fused operations.
@@ -420,22 +425,26 @@ class AllReduce(nn.Module):
             the AUTO strategy.
         """
 
-        self.mapping = mapping
+        self.mapping = model_config.mapping
         self.workspace = None
-        self.strategy = strategy
+        self.strategy = model_config.allreduce_backend
+        self.mnnvl_allreduce = None
 
         self.force_low_precision_env = os.environ.get(
             "FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY")
         if self.mapping.tp_size > 1:
             # When Strategy is UB, it is guaranteed that the workspace is not used.
             if self.strategy != AllReduceStrategy.UB:
-                if self.strategy == AllReduceStrategy.LOWPRECISION or self.force_low_precision_env is not None:
+                if self.strategy == AllReduceStrategy.LOWPRECISION:
                     allocate_low_presicion_allreduce_workspace(self.mapping)
                 self.workspace = get_allreduce_workspace(self.mapping)
 
             # Initialize MNNVL AllReduce if needed
-            self.mnnvl_allreduce = MNNVLAllReduce(mapping,
-                                                  dtype) if dtype else None
+            if self.strategy == AllReduceStrategy.MNNVL and (
+                    dtype and dtype in MNNVLAllReduce.get_supported_dtype()
+            ) and (not self.mapping.has_cp()):
+                self.mnnvl_allreduce = MNNVLAllReduce(self.mapping,
+                                                      dtype) if dtype else None
 
     def forward(
         self,
