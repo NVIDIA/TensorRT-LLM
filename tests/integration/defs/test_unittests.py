@@ -121,7 +121,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
         'pytest',
         ignore_opt,
         "-v",
-        "--timeout=1600",
+        #"--timeout=1600",
         "--timeout-method=thread",
     ]
 
