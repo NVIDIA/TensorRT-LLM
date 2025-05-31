@@ -1583,14 +1583,20 @@ class PyExecutor:
         @nvtx_range(
             f"[Executor] _forward_step: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
         )
-        def forward(scheduled_requests, resource_manager, new_tensors_device):
-            return self.model_engine.forward(scheduled_requests,
-                                             resource_manager,
-                                             new_tensors_device)
+        def forward(scheduled_requests, resource_manager, new_tensors_device,
+                    gather_context_logits):
+            return self.model_engine.forward(
+                scheduled_requests,
+                resource_manager,
+                new_tensors_device,
+                gather_context_logits=gather_context_logits)
 
         try:
+            gather_context_logits = any(
+                a.py_return_context_logits
+                for a in scheduled_requests.context_requests)
             outputs = forward(scheduled_requests, self.resource_manager,
-                              new_tensors_device)
+                              new_tensors_device, gather_context_logits)
             return outputs
         except Exception as e:
             traceback.print_exc()
