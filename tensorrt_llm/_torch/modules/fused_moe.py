@@ -1546,20 +1546,21 @@ class FusedMoE(nn.Module):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        cutlass_min_latency_mode: bool = False,
+        do_finalize: bool = True,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
     ) -> torch.Tensor:
         """
-        cutlass_min_latency_mode has no effect when trtllm_gen backend is enabled.
+        In cutlass mode, if do_finalize is False, it means that the cutlass_min_latency_mode is enabled.
+        In trtllm_gen mode, if do_finalize is False, it means that it will not do the finalize.
         """
         if self.is_cutlass():
-            return self.forward_cutlass(x, router_logits,
-                                        cutlass_min_latency_mode, output_dtype,
-                                        all_rank_num_tokens, use_dp_padding)
+            return self.forward_cutlass(x, router_logits, not do_finalize,
+                                        output_dtype, all_rank_num_tokens,
+                                        use_dp_padding)
         elif self.is_trtllm():
-            return self.forward_trtllmgen(x, router_logits)
+            return self.forward_trtllmgen(x, router_logits, do_finalize)
         else:
             raise NotImplementedError(
                 f"FusedMoE only supports CUTLASS or TRTLLM backends, not {self.moe_backend}"
@@ -1704,8 +1705,10 @@ class FusedMoE(nn.Module):
             outputs = outputs[:all_rank_num_tokens[rank]]
         return outputs
 
-    def forward_trtllmgen(self, x: torch.Tensor,
-                          router_logits: torch.Tensor) -> torch.Tensor:
+    def forward_trtllmgen(self,
+                          x: torch.Tensor,
+                          router_logits: torch.Tensor,
+                          do_finalize: bool = True) -> torch.Tensor:
         assert self.is_trtllm()
         assert x.dtype == torch.bfloat16
 
@@ -1727,6 +1730,7 @@ class FusedMoE(nn.Module):
         #       here we just route the I/Os for moe_runner
         if self.quant_config and self.quant_config.quant_mode.has_fp8_block_scales(
         ):
+            assert do_finalize, "fp8_block_scale_moe_runner does not support do_finalize=False"
             x_val, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
 
             final_hidden_states = torch.ops.trtllm.fp8_block_scale_moe_runner(
@@ -1756,7 +1760,7 @@ class FusedMoE(nn.Module):
                 x, self.fc31_input_scale, 16, scale_factor_use_ue8m0,
                 is_scale_factor_swizzled)
 
-            final_hidden_states = torch.ops.trtllm.fp4_block_scale_moe_runner(
+            outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
                 hidden_states_fp4,
@@ -1778,7 +1782,14 @@ class FusedMoE(nn.Module):
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
+                do_finalize=do_finalize,
             )
+
+            if not do_finalize:
+                assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
+                return outputs
+            else:
+                final_hidden_states = outputs[0]
         else:
             raise NotImplementedError(
                 "The TRTLLM backend of FusedMoE only supports fp8_block_scaling and nvfp4 dtypes."

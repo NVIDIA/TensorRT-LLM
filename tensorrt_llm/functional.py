@@ -3891,7 +3891,7 @@ class AllReduceFusionOp(IntEnum):
     RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5
     RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
-    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
+    MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
 
 
 class AllReduceParams():
@@ -3932,6 +3932,45 @@ class AllReduceParams():
         if self.strategy == AllReduceStrategy.AUTO and default_net(
         ).plugin_config.user_buffer:
             self.strategy = AllReduceStrategy.UB
+
+
+class MoEAllReduceParams(AllReduceParams):
+
+    def __init__(self,
+                 device_num_experts: Optional[Tensor] = None,
+                 expert_scale_factor: Optional[Tensor] = None,
+                 expanded_idx_to_permuted_idx: Optional[Tensor] = None,
+                 shared_expert_output: Optional[Tensor] = None,
+                 bias: Optional[Tensor] = None,
+                 residual: Optional[Tensor] = None,
+                 norm_weight: Optional[Tensor] = None,
+                 scale: Optional[Tensor] = None,
+                 norm_pre_residual_weight: Optional[Tensor] = None,
+                 eps: float = 1e-06,
+                 enable_allreduce: bool = True,
+                 is_cutlass_min_latency: bool = False):
+        super().__init__(
+            bias=bias,
+            residual=residual,
+            norm_weight=norm_weight,
+            scale=scale,
+            norm_pre_residual_weight=norm_pre_residual_weight,
+            eps=eps,
+            enable_allreduce=enable_allreduce,
+        )
+        self.device_num_experts = device_num_experts
+        self.expert_scale_factor = expert_scale_factor
+        self.expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx
+        self.shared_expert_output = shared_expert_output
+        self.is_cutlass_min_latency = is_cutlass_min_latency
+
+    def is_valid(self):
+        if self.is_cutlass_min_latency:
+            return (self.device_num_experts is not None
+                    and self.expert_scale_factor is not None
+                    and self.shared_expert_output is not None)
+        else:
+            return (self.expanded_idx_to_permuted_idx is not None)
 
 
 def create_allreduce_plugin(
