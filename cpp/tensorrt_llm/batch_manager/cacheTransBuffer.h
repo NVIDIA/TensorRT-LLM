@@ -59,8 +59,7 @@ public:
     CacheTransBufferManager(
         KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens = std::nullopt);
 
-    static size_t preAllocBufferSize(
-        std::optional<size_t> maxNumTokens = std::nullopt, std::optional<size_t> kvCacheSizePerToken = std::nullopt);
+    static size_t preAllocBufferSize(std::optional<size_t> maxNumTokens = std::nullopt);
 
     std::optional<int> assignBufferIndexForSend();
     void freeBufferIndexForSend(std::optional<int> bufferId);
