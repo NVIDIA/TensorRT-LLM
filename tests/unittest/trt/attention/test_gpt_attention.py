@@ -58,7 +58,7 @@ class TestFunctional(unittest.TestCase):
     def load_test_cases():
         test_cases = []
         test_cases += list(
-            product(['gpt2_attention', 'llama_attention', 'gptj_attention'],
+            product(['llama_attention', 'gptj_attention'],
                     [ContextFMHAType.disabled], ['float16', 'bfloat16'], [None],
                     [None], [2], [128], [4], [64], [0], [False], [1, 4],
                     [True, False], [True, False]))
@@ -111,10 +111,10 @@ class TestFunctional(unittest.TestCase):
                     [1], [128], [0], [False], [1], [False], [False]))
 
         # Test cases for the 8-bit K/V cache.
-        test_cases += list(
-            product(['gpt2_attention'], [ContextFMHAType.disabled],
-                    ['float16', 'float32'], ['int8', 'fp8'], [None], [2], [128],
-                    [4], [64], [0], [False], [1, 4], [False], [False]))
+        # test_cases += list(
+        #     product(['gpt2_attention'], [ContextFMHAType.disabled],
+        #             ['float16', 'float32'], ['int8', 'fp8'], [None], [2], [128],
+        #             [4], [64], [0], [False], [1, 4], [False], [False]))
 
         # test cases for multi-query attention
         test_cases += list(

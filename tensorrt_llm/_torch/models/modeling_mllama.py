@@ -338,7 +338,19 @@ class MllamaForConditionalGeneration(nn.Module):
         def filter_weights(prefix, weights: Dict):
             result = {}
             for k, v in weights.items():
-                if k.startswith(prefix):
+
+                if k.startswith("model.language_model."):
+                    # Apply the specific replacement for this pattern
+                    new_prefix = "model.language_model"
+                    if k.startswith(
+                            prefix.replace("language_model.model", new_prefix,
+                                           1)):
+                        new_k = k[len(
+                            prefix.
+                            replace("language_model.model。", new_prefix, 1)) +
+                                  1:]
+                        result[new_k] = v
+                elif k.startswith(prefix):
                     new_k = k[len(prefix) + 1:]
                     result[new_k] = v
             return result
@@ -382,6 +394,12 @@ class MllamaForConditionalGeneration(nn.Module):
                         for k in module_weights.keys():
                             v = module_weights[k][:]
                             module_weights[k] = v.view(v.shape[0], -1)
+                    elif 'lm_head' in name:
+                        name = 'lm_head'
+                        module_weights = filter_weights(name, weights)
+                    elif "multi_modal_projector" in name:
+                        name = "model.multi_modal_projector"
+                        module_weights = filter_weights(name, weights)
                     else:
                         module_weights = filter_weights(name, weights)
 
