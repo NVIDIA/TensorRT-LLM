@@ -289,18 +289,22 @@ class SingleLayerMoeLoadBalancer:
             gathered_raw_expert_ids, enabled,
             self.single_layer_load_balancer_ptr, is_first_stage, is_last_stage)
 
-    def route(self, token_selected_experts: torch.Tensor) -> torch.Tensor:
+    def route(self,
+              token_selected_experts: torch.Tensor,
+              offset_by_ep_rank: bool = False) -> torch.Tensor:
         """
         Route the tokens to experts.
 
         Args:
             token_selected_experts: The experts selected by each token
+            offset_by_ep_rank: Whether to offset the round robin position by ep_rank
 
         Returns:
             A tensor of routed slot IDs
         """
         return torch.ops.trtllm.moe_load_balance_routing(
-            token_selected_experts, self.single_layer_load_balancer_ptr)
+            token_selected_experts, offset_by_ep_rank,
+            self.single_layer_load_balancer_ptr)
 
     def py_pre_shutdown_cleanup(self):
         """
