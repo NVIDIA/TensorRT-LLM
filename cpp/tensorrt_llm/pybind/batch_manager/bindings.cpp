@@ -102,6 +102,7 @@ void initBindings(pybind11::module_& m)
         .def("get_tokens", py::overload_cast<>(&GenLlmReq::getTokens, py::const_))
         .def("get_last_tokens", py::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getLastTokens), py::arg("beam"))
         .def("get_last_tokens", py::overload_cast<>(&GenLlmReq::getLastTokens))
+        .def("get_beam_width_by_iter", &GenLlmReq::getBeamWidthByIter, py::arg("for_next_iteration") = false)
         .def_property_readonly("max_num_generated_tokens", &GenLlmReq::getMaxNumGeneratedTokens)
         .def("add_new_token", &GenLlmReq::addNewToken, py::arg("token"), py::arg("beam"))
         .def("add_new_tokens", &GenLlmReq::addNewTokens, py::arg("beam_tokens"))
@@ -109,114 +110,17 @@ void initBindings(pybind11::module_& m)
         .def("set_generated_tokens", &GenLlmReq::setGeneratedTokens, py::arg("generated_beam_tokens"))
         .def("pause", &GenLlmReq::pause, py::arg("max_input_len"))
         .def_property("max_sent_token_len", &GenLlmReq::getMaxSentTokenLen, &GenLlmReq::setMaxSentTokenLen)
-        .def("prompt_embedding_table",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getPromptEmbeddingTable();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            })
-        .def("multimodal_embedding",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getMultimodalEmbedding();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            })
-        .def("get_mrope_rotary_cos_sin",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getMropeRotaryCosSin();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            })
-        .def("bad_words_list",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getBadWordsList();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            })
-        .def_property(
-            "draft_logits",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getDraftLogits();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            },
-            [](GenLlmReq& self, at::Tensor& logits)
-            { self.setDraftLogits(std::make_optional<GenLlmReq::TensorPtr>(tr::TorchView::of(logits))); })
-        .def("embedding_bias",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getEmbeddingBias();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            })
-        .def_property(
-            "lora_config",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getLoraConfig();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            },
-            [](GenLlmReq& self, at::Tensor& loraConfig)
-            { self.setLoraConfig(static_cast<GenLlmReq::TensorPtr>(tr::TorchView::of(loraConfig))); })
-        .def_property(
-            "lora_weights",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getLoraWeights();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            },
-            [](GenLlmReq& self, at::Tensor& loraWeights)
-            { self.setLoraWeights(static_cast<GenLlmReq::TensorPtr>(tr::TorchView::of(loraWeights))); })
-        .def("stop_words_list",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                auto tensor = self.getStopWordsList();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(*tensor);
-                }
-                return value;
-            })
+        .def_property_readonly("prompt_embedding_table", &GenLlmReq::getPromptEmbeddingTable)
+        .def_property_readonly("multimodal_embedding", &GenLlmReq::getMultimodalEmbedding)
+        .def_property_readonly("mrope_rotary_cos_sin", &GenLlmReq::getMropeRotaryCosSin)
+        .def_property_readonly("bad_words_list", &GenLlmReq::getBadWordsList)
+        .def_property("draft_logits", &GenLlmReq::getDraftLogits, &GenLlmReq::setDraftLogits)
+        .def_property_readonly("embedding_bias", &GenLlmReq::getEmbeddingBias)
+        .def_property("lora_config", &GenLlmReq::getLoraConfig, &GenLlmReq::setLoraConfig)
+        .def_property("lora_weights", &GenLlmReq::getLoraWeights, &GenLlmReq::setLoraWeights)
+        .def_property_readonly("stop_words_list", &GenLlmReq::getStopWordsList)
+        .def_property_readonly("context_logits", &GenLlmReq::getContextLogitsHost)
+        .def_property_readonly("generation_logits", &GenLlmReq::getGenerationLogitsHost)
         .def_property_readonly("prompt_vocab_size", &GenLlmReq::getPromptVocabSize)
         .def_property_readonly("mrope_position_deltas", &GenLlmReq::getMropePositionDeltas)
         .def_property_readonly("lora_task_id", &GenLlmReq::getLoraTaskId)
@@ -253,6 +157,8 @@ void initBindings(pybind11::module_& m)
         .def("is_last_context_chunk", py::overload_cast<>(&GenLlmReq::isLastContextChunk, py::const_))
         .def("is_first_context_chunk", py::overload_cast<>(&GenLlmReq::isFirstContextChunk, py::const_))
         .def("get_context_remaining_length", py::overload_cast<>(&GenLlmReq::getContextRemainingLength, py::const_))
+        .def_property_readonly("context_logits", &GenLlmReq::getContextLogitsHost)
+        .def_property_readonly("num_draft_tokens", &GenLlmReq::getNumDraftTokens)
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, py::arg("finish_reason"), py::arg("beam"))
         .def_property_readonly("is_finished", &GenLlmReq::isFinished)
         .def_property_readonly("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
@@ -280,6 +186,7 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("avg_decoded_tokens_per_iter", &GenLlmReq::getAvgDecodedTokensPerIter)
         .def_property_readonly("alloc_total_blocks", &GenLlmReq::getAllocTotalBlocksPerRequest)
         .def_property_readonly("alloc_new_blocks", &GenLlmReq::getAllocNewBlocksPerRequest)
+        .def("alloc_context_logits", &GenLlmReq::allocContextLogitsHost, py::arg("vocab_size"), py::arg("logit_dtype"))
         .def_property_readonly("reused_blocks", &GenLlmReq::getReusedBlocksPerRequest)
         .def_property_readonly("missed_blocks", &GenLlmReq::getMissedBlocksPerRequest)
         .def_property_readonly("kv_cache_hit_rate", &GenLlmReq::getKVCacheHitRatePerRequest)
@@ -311,20 +218,7 @@ void initBindings(pybind11::module_& m)
                 {
                     self.setDraftTokens(std::make_shared<GenLlmReq::VecTokens>(draftTokens.value()));
                 }
-            })
-        .def_property(
-            "context_logits",
-            [](GenLlmReq& self)
-            {
-                std::optional<at::Tensor> value{std::nullopt};
-                GenLlmReq::TensorPtr const& tensor = self.getContextLogitsHost();
-                if (tensor)
-                {
-                    value = tr::Torch::tensor(tensor);
-                }
-                return value;
-            },
-            [](GenLlmReq& self, at::Tensor& logits) { self.setContextLogitsHost(tr::TorchView::of(logits)); });
+            });
 
     py::classh<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", pybind11::dynamic_attr())
         .def(py::init(
