@@ -92,7 +92,7 @@ public:
     }
 
     void clear();
-    void prepareNextGraph(std::shared_ptr<runtime::TllmRuntime>& runtime, SizeType32 nextContextId);
+    void prepareNextGraph(std::unique_ptr<runtime::TllmRuntime>& runtime, SizeType32 nextContextId);
     void launch(runtime::CudaStream const& stream);
 
 private:

@@ -67,13 +67,14 @@ enum class Dtype : uint32_t
   Int32    = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 1u, /*int*/ 1u, /*bits*/  32u, /*uid*/ 11u),
   Int64    = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 1u, /*int*/ 1u, /*bits*/  64u, /*uid*/ 12u),
   MxE2m1   = TLLM_ENCODE_DTYPE(/*block*/ 1u, /*signed*/ 1u, /*int*/ 0u, /*bits*/   4u, /*uid*/ 13u),
-  UE8m0    = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 0u, /*bits*/   8u, /*uid*/ 14u),
-  UInt8    = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/   8u, /*uid*/ 15u),
-  UInt16   = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/  16u, /*uid*/ 16u),
-  UInt32   = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/  32u, /*uid*/ 17u),
-  UInt64   = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/  64u, /*uid*/ 18u),
-  UInt128  = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/ 128u, /*uid*/ 19u),
-  Void     = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 1u, /*int*/ 0u, /*bits*/   0u, /*uid*/ 20u),
+  MxE4m3   = TLLM_ENCODE_DTYPE(/*block*/ 1u, /*signed*/ 1u, /*int*/ 0u, /*bits*/   8u, /*uid*/ 14u),
+  UE8m0    = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 0u, /*bits*/   8u, /*uid*/ 15u),
+  UInt8    = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/   8u, /*uid*/ 16u),
+  UInt16   = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/  16u, /*uid*/ 17u),
+  UInt32   = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/  32u, /*uid*/ 18u),
+  UInt64   = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/  64u, /*uid*/ 19u),
+  UInt128  = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/ 128u, /*uid*/ 20u),
+  Void     = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 1u, /*int*/ 0u, /*bits*/   0u, /*uid*/ 21u),
 // clang-format on
 
 #undef TLLM_ENCODE_DTYPE
@@ -151,6 +152,7 @@ inline std::string dtypeToString(Dtype dtype)
     case Dtype::Int8: return "Int8";
     case Dtype::Int32: return "Int32";
     case Dtype::Int64: return "Int64";
+    case Dtype::MxE4m3: return "MxE4m3";
     case Dtype::UE8m0: return "UE8m0";
     case Dtype::UInt8: return "UInt8";
     case Dtype::UInt16: return "UInt16";
@@ -159,6 +161,45 @@ inline std::string dtypeToString(Dtype dtype)
     case Dtype::UInt128: return "UInt128";
     case Dtype::Void: return "Void";
     default: assert(false); return "Unsupported type";
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline Dtype dtypeEltType(Dtype dtype)
+{
+    switch (dtype)
+    {
+    case Dtype::MxE2m1: return Dtype::E2m1;
+    case Dtype::MxE4m3: return Dtype::E4m3;
+    default: return dtype;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int dtypeNumEltsPerSf(Dtype dtype)
+{
+    switch (dtype)
+    {
+    case Dtype::E2m1: return 16;
+    case Dtype::MxE2m1:
+    case Dtype::MxE4m3: return 32;
+    default: assert(false); return -1;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Returns the dtype of scaling factors, if applicable.
+inline Dtype dtypeGetBlockSfType(Dtype dtype)
+{
+    switch (dtype)
+    {
+    case Dtype::E2m1: return Dtype::E4m3;
+    case Dtype::MxE2m1:
+    case Dtype::MxE4m3: return Dtype::UE8m0;
+    default: assert(false); return Dtype::Void;
     }
 }
 
