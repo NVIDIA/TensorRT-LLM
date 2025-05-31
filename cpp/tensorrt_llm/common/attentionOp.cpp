@@ -1164,6 +1164,8 @@ int AttentionOp::mlaGeneration(
             this->template convertMMHAParamsToXQAParams<T, decltype(kv_cache_buffer)>(
                 xqaParams, generation_params, /*forConfigurePlugin=*/false);
             xqaParams.quant_q_buffer_ptr = quant_q_buffer_ptr;
+            xqaParams.q_scaling = mQScaling * sqrtf((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))
+                / sqrtf((float) (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim));
             if (mEnableXQA && mXqaDispatcher->shouldUse(xqaParams))
             {
                 TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
