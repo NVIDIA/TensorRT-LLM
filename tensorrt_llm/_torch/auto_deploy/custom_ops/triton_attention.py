@@ -381,6 +381,12 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
         else:
             scale = source_attn_node.kwargs.get("scale", None)
 
+        # do a sanity check on the scale if it is not None, we only support the default scale
+        # of 1/sqrt(head_dim) and so we should do an approximate check for that one
+        if not isinstance(scale, float):
+            ad_logger.warning("Provided scale is not a float, Using default scale instead.")
+            scale = None
+
         return [
             scale,  # softmax scale
         ]
