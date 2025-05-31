@@ -9,7 +9,7 @@ from utils.util import getSMVersion
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 
@@ -55,6 +55,8 @@ def test_deepseek_trtllmgen(model_name):
         "The president of the United States is",
     ] * 4
 
+    spec_config = MTPDecodingConfig(num_nextn_predict_layers=1, )
+
     pytorch_config = dict(
         disable_overlap_scheduler=True,
         use_cuda_graph=False,
@@ -76,7 +78,9 @@ def test_deepseek_trtllmgen(model_name):
               moe_expert_parallel_size=-1,
               moe_tensor_parallel_size=-1,
               enable_attention_dp=False,
-              kv_cache_config=KvCacheConfig(enable_block_reuse=False))
+              speculative_config=spec_config,
+              kv_cache_config=KvCacheConfig(enable_block_reuse=False,
+                                            free_gpu_memory_fraction=0.4))
 
     sampling_params = SamplingParams(max_tokens=20)
 
