@@ -83,7 +83,7 @@ def collect_and_clean_myelin_time(log: str):
 
 class PerfMetricType(str, Enum):
     """
-    An string-enum type to define what kind of perf metric it is. While it is not used by TURTLE, it is used by QA to
+    An string-enum type to define what kind of perf metric it is. It is used by QA to
     set up special threshold criteria for each type of metrics (like >50MB for engine size increase, etc.).
     """
     INFERENCE_TIME = "INFERENCE_TIME"
@@ -352,13 +352,12 @@ class AbstractPerfScriptTestClass(abc.ABC):
         """
         Get the absolute threshold used to flag a perf regression compared to perf baseline.
         Perf comparison will only fail if it exceeds both relative and absolute thresholds.
-        Note: This is not honored by TURTLE for now, but we can add the support later.
         """
         return 0.0
 
     def get_metric_type(self) -> PerfMetricType:
         """
-        Get the type of perf metric. This does not affect TURTLE for now, but QA uses this field to set up special
+        Get the type of perf metric. QA uses this field to set up special
         threshold criteria depending on the metric type.
         """
         return PerfMetricType.INFERENCE_TIME

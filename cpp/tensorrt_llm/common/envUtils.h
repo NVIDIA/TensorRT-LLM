@@ -92,6 +92,8 @@ size_t getEnvKVCacheRecvBufferCount();
 
 bool getEnvKVCacheTransferUseAsyncBuffer();
 
+bool getEnvKVCacheTransferUseSyncBuffer();
+
 size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();

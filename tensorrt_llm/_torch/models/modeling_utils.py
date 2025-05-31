@@ -11,11 +11,9 @@ from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
 from tensorrt_llm.lora_manager import HfLoraLoader
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...logger import logger
-from ...mapping import Mapping
 from ...models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed.communicator import pp_recv, pp_send
@@ -356,13 +354,6 @@ class DecoderModelForCausalLM(nn.Module,
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
-                mapping=Mapping(
-                    world_size=1,
-                    tp_size=1,
-                    rank=0,
-                ),
-                tensor_parallel_mode=None,
-                gather_output=False,
             )
         else:
             # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
