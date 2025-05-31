@@ -16,8 +16,8 @@ Set up some environment variables:
 export MODEL_PATH=<YOUR_MODEL_PATH>
 # Set the expert statistic data path
 export EXPERT_STATISTIC_PATH=./expert_statistic
-# Enable counting of routed expert IDs from iteration 50 to iteration 100
-export EXPERT_STATISTIC_ITER_RANGE=50-100
+# Enable counting of routed expert IDs from iteration 100 to iteration 200
+export EXPERT_STATISTIC_ITER_RANGE=100-200
 ```
 
 Prepare a configuration file and run inference on GSM8K:
@@ -25,8 +25,7 @@ Prepare a configuration file and run inference on GSM8K:
 ```bash
 cat > ./extra_llm_api_options.yaml <<EOF
 enable_attention_dp: true
-pytorch_backend_config:
-    use_cuda_graph: true
+use_cuda_graph: true
 EOF
 
 trtllm-eval --model $MODEL_PATH \
@@ -63,9 +62,8 @@ Prepare a new configuration file that incorporates the generated EPLB configurat
 ```bash
 cat > ./extra_llm_api_options_eplb.yaml <<EOF
 enable_attention_dp: true
-pytorch_backend_config:
-    use_cuda_graph: true
-    moe_load_balancer: ./moe_load_balancer.yaml
+use_cuda_graph: true
+moe_load_balancer: ./moe_load_balancer.yaml
 EOF
 
 trtllm-eval --model $MODEL_PATH \

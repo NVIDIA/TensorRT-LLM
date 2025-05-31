@@ -1410,8 +1410,6 @@ class FusedMoE(nn.Module):
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
             router_logits)
-        ExpertStatistic.set_layer(self.layer_idx)
-        ExpertStatistic.maybe_add_info(self.num_experts, token_selected_experts)
         if self.balancer_layer is None:
             token_selected_slots = token_selected_experts
         else:
@@ -1419,6 +1417,11 @@ class FusedMoE(nn.Module):
             # so we need to offset the round robin position by ep_rank
             token_selected_slots = self.balancer_layer.route(
                 token_selected_experts, offset_by_ep_rank=self.use_dp)
+
+        # If load balancer is disabled, the statistics are collected from expert IDs.
+        # If load balancer is enabled, the statistics are collected from expert slot IDs.
+        ExpertStatistic.set_layer(self.layer_idx)
+        ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
 
         assert token_selected_slots.shape[
             1] == self.routing_method.experts_per_token
