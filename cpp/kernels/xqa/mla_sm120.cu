@@ -887,13 +887,6 @@ __device__ inline void Producer::sendX()
         smem.cgaXBufConsumed.wait_parity(toParity<1>(iter));
         if (warpElectSync())
         {
-            if (blockIdx.x / 4 == 1)
-            {
-                for (uint32_t i = 0; i < headGrpSize; i++)
-                {
-                    auto& x = reinterpret_cast<__nv_fp8_e4m3(&)[2]>(smem.x[idxBuf].template at<true>(i, 0));
-                }
-            }
             auto& dst = args.cgaXBuf[nbSubSeq * idxInputTokenGlobal + idxSubSeq][ctaRank];
             tma::store1DAsync(&dst.x, &smem.x[idxBuf], sizeof(XBuffer));
             tma::store1DAsync(&dst.rowSum, &smem.rowSum[idxBuf], sizeof(smem.rowSum[0]));
