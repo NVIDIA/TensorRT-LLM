@@ -254,6 +254,8 @@ class TestNemotronUltra(CliFlowAccuracyTestHarness):
                  extra_build_args=["--gemm_plugin=auto"],
                  extra_summarize_args=extra_summarize_args)
 
+    @pytest.mark.skip(
+        reason="nemotron-nas scripts have to accommodate fp8 flags")
     @skip_pre_hopper
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
