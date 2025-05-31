@@ -2203,7 +2203,7 @@ def test_llm_abort_request(llm_for_sampling_params,
 
 
 def test_llm_sampling_params_n_lt_max_batch_size():
-    sampling_params = SamplingParams(n=2, best_of=1)
+    sampling_params = SamplingParams(n=2, top_p=0.95)
     build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,
