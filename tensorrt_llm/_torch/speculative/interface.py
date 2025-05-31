@@ -17,6 +17,7 @@ class SpeculativeDecodingMode(IntEnum):
     EAGLE3 = auto()
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
+    DRAFT_TARGET = auto()
     NONE = auto()
 
     def is_mtp(self):
@@ -36,6 +37,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
+
+    def is_draft_target(self):
+        return self == SpeculativeDecodingMode.DRAFT_TARGET
 
     def without_logits(self):
         return self.is_mtp() or self.is_eagle3_one_model()
@@ -59,6 +63,9 @@ class SpeculativeDecodingMode(IntEnum):
     def has_spec_decoder(self):
         return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
 
+    def has_pytorch_model(self):
+        return self.is_eagle3() or self.is_draft_target()
+
     def extend_ctx(self, attention_backend: AttentionBackend):
         """
         If true, treat generation requests with draft tokens as
@@ -67,7 +74,7 @@ class SpeculativeDecodingMode(IntEnum):
         """
 
         # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
-        return (self.is_eagle3()
+        return ((self.is_eagle3() or self.is_draft_target())
                 and not (isinstance(attention_backend, TrtllmAttention)
                          and get_sm_version() == 100)) or self.is_ngram()
 
