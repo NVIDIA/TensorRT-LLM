@@ -295,7 +295,7 @@ class TorchSampler(Sampler):
         extend_requests = []
         generation_requests = []
         for request in scheduled_requests.generation_requests:
-            if request.py_draft_tokens is not None:
+            if len(request.py_draft_tokens) > 0:
                 extend_requests.append(request)
             else:
                 generation_requests.append(request)
@@ -359,7 +359,9 @@ class TorchSampler(Sampler):
         for request in scheduled_requests.generation_requests:
             if request.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
-            assert request.py_draft_tokens is None, "Speculative decoding not supported in SeparateDecoder."
+            assert len(
+                request.py_draft_tokens
+            ) == 0, "Speculative decoding not supported in SeparateDecoder."
             token_logits = logits[idx:idx + 1, :]
             new_token, probs = decode_single_request(request, token_logits)
             new_tokens_device_array.append(new_token)
