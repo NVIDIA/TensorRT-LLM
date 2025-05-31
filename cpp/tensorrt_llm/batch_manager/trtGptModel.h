@@ -116,9 +116,7 @@ public:
             ? optionalParams.kvCacheConfig.sinkTokenLength.value()
             : 0;
 
-        auto const numBatches
-            = worldConfig.isPipelineParallel() ? worldConfig.getPipelineParallelism() : (mEnableTrtOverlap ? 2 : 1);
-        mMaxNumSequences = numBatches * mMaxBatchSize;
+        mMaxNumSequences = mMaxBatchSize * worldConfig.getPipelineParallelism();
 
         auto const numTotalAttenLayers = modelConfig.getNbAttentionLayers();
         auto const numRepeatsAttenWindow = numTotalAttenLayers / mMaxAttentionWindowVec.size();

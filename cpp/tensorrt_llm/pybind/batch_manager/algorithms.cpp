@@ -56,7 +56,7 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
     py::class_<CapacityScheduler>(m, CapacityScheduler::name)
         .def(py::init<SizeType32, executor::CapacitySchedulerPolicy, bool, bool, LlmRequestState, LlmRequestState>(),
             py::arg("max_num_requests"), py::arg("capacity_scheduler_policy"), py::arg("has_kv_cache_manager"),
-            py::arg("many_micro_batches") = false,
+            py::arg("two_step_lookahead") = false,
             py::arg_v("no_schedule_until_state", LlmRequestState::kCONTEXT_INIT, "LlmRequestState.CONTEXT_INIT"),
             py::arg_v("no_schedule_after_state", LlmRequestState::kGENERATION_COMPLETE,
                 "LlmRequestState.GENERATION_COMPLETE"))
