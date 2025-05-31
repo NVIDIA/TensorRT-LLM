@@ -766,6 +766,25 @@ void WindowBlockManager::claimLeafBlock(BlockPtr const& block, std::optional<exe
     block->freeLeafBlock();
 }
 
+void WindowBlockManager::freeChildren(
+    BlockPtr const& block, executor::RetentionPriority priority, std::optional<std::chrono::milliseconds> durationMs)
+{
+    // Free all descendants of block
+    for (auto const& p : block->getNextBlocks())
+    {
+        auto childBlock = p.second;
+        freeChildren(childBlock, priority, durationMs);
+    }
+
+    // Free block
+    if (mEventManager && blockInRadixTree(block))
+    {
+        mEventManager->enqueueRemovedEvent(block);
+    }
+
+    claimLeafBlock(block, priority, durationMs);
+}
+
 BlockPtr WindowBlockManager::getFreeBlock(
     executor::RetentionPriority priority, std::optional<std::chrono::milliseconds> durationMs)
 {
@@ -776,7 +795,13 @@ BlockPtr WindowBlockManager::getFreeBlock(
         ++mAllocNewBlocks;
     }
     ++mAllocTotalBlocks;
-    if (!block->getUniqueTokens().empty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
+    // Offloading is an option only when these conditions are met:
+    // 1. Block contains state (evidenced by presence of tokens)
+    // 2. Eviction policy indicated block can be offloaded
+    // 3. At least one free block in secondary memory
+    // 4. Onboarding is enabled (allowing block to be brought back into primary)
+    if (!block->getUniqueTokens().empty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0
+        && mOnboardBlocks)
     {
         // If we're swapping a block to secondary memory, maintain the prior priority values.
         mEvictionPolicy->claimBlock(block);
@@ -795,12 +820,12 @@ BlockPtr WindowBlockManager::getFreeBlock(
         block = offloadBlock;
     }
 
-    if (mEventManager && blockInRadixTree(block))
-    {
-        mEventManager->enqueueRemovedEvent(block);
-    }
-
-    claimLeafBlock(block, priority, durationMs);
+    // Ensure that returned block is a leaf block by freeing all it's children.
+    // Most blocks returned by mEvictionPolicy->getFreeBlock will be leaf blocks,
+    // but there are situations where they are not. One example is when a primary
+    // block has children in secondary memory and offloading is not possible
+    // because there are no free secondary blocks.
+    freeChildren(block, priority, durationMs);
 
     return block;
 }
