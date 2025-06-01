@@ -2766,7 +2766,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     auto constexpr enableBlockReuse = true;
     auto constexpr onboardBlocks = true;
 
-    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+        {minAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
         maxBeamWidth, maxAttentionWindowVec, std::nullopt, dtype, sinkTokenLength, stream, std::nullopt,
@@ -2776,7 +2777,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     auto const& blockManager = kvCacheManager.getBlockManager();
 
     auto const allBlocksInPrimaryPools = blockManager.getNumPrimaryBlocks();
-    EXPECT_THAT(allBlocksInPrimaryPools, blocksInPrimaryPool);
+    EXPECT_THAT(allBlocksInPrimaryPools, blocksInPrimaryPool * 2);
 
     ASSERT_EQ(blockManager.isVariableWindow(), true);
     ASSERT_EQ(blockManager.isVariableGQA(), false);
