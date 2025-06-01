@@ -21,6 +21,7 @@ def _register_fake():
         strategy,
         op,
         eps,
+        trigger_completion_at_end,
     ):
         from tensorrt_llm.functional import AllReduceFusionOp
         if op == int(AllReduceFusionOp.NONE):
