@@ -42,9 +42,6 @@
 namespace tensorrt_llm::runtime
 {
 
-// Define a constant for an invalid or very large distance
-int const INVALID_NUMA_DISTANCE = std::numeric_limits<int>::max();
-
 TopologyDetector::TopologyDetector()
 {
     std::lock_guard<std::mutex> lock(mDetectionMutex);
