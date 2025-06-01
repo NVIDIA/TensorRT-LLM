@@ -3,6 +3,9 @@ on:
   issues:
     types:
       - labeled
+  pull_request:
+    types:
+      - labeled
 
 jobs:
   assign_issue:
@@ -38,6 +41,12 @@ jobs:
           result-encoding: string
 
       - name: Assign
-        run: gh issue edit ${{ github.event.issue.number }} --add-label "triaged" --add-label "investigating" --add-assignee ${{ steps.get-assignee.outputs.result }}
+        if: steps.get-assignee.outputs.result != ''
+        run: |
+          if [ "${{ github.event_name }}" == "issues" ]; then
+            gh issue edit ${{ github.event.issue.number }} --add-label "triaged" --add-label "investigating" --add-assignee ${{ steps.get-assignee.outputs.result }}
+          elif [ "${{ github.event_name }}" == "pull_request" ]; then
+            gh pr edit ${{ github.event.pull_request.number }} --add-label "triaged" --add-label "investigating" --add-assignee ${{ steps.get-assignee.outputs.result }}
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
