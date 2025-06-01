@@ -391,17 +391,18 @@ class MTPWorker(nn.Module):
                                               **draft_inputs)
             new_draft_token = self.draft_sampler(logits)
             next_draft_tokens.append(new_draft_token)
-
+            # shift input_ids and hidden_states
             input_ids = draft_inputs["input_ids"]
-            new_input_ids = torch.empty_like(input_ids,
-                                             dtype=torch.int32,
-                                             device="cuda")
-            new_input_ids[:-1].copy_(input_ids[1:])
-            new_input_ids[last_tokens_idx] = new_draft_token
+            input_ids[:-1] = input_ids[1:].clone()
+            input_ids[last_tokens_idx] = new_draft_token
+            draft_hidden_states = draft_inputs["hidden_states"]
+            draft_hidden_states[:-1] = draft_hidden_states[1:].clone()
+            draft_hidden_states[last_tokens_idx] = hidden_states[
+                last_tokens_idx, :]
             draft_inputs = {
-                "input_ids": new_input_ids,
+                "input_ids": input_ids,
                 "position_ids": draft_inputs["position_ids"],
-                "hidden_states": hidden_states,
+                "hidden_states": draft_hidden_states,
                 "attn_metadata": draft_inputs["attn_metadata"],
                 "spec_metadata": draft_inputs["spec_metadata"],
             }
