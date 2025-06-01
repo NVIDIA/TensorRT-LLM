@@ -12,7 +12,7 @@
 
 #include "moe_gemm_template_dispatch.h"
 
-namespace tensorrt_llm
+namespace tensorrt_llm::kernels::cutlass_kernels
 {
 #ifdef ENABLE_FP8
 template class MoeGemmRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half>;
@@ -20,4 +20,4 @@ template class MoeGemmRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half>;
 template class MoeGemmRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16>;
 #endif
 #endif
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::cutlass_kernels

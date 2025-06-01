@@ -60,6 +60,6 @@ template class CutlassFp4GemmRunner<__nv_bfloat16>;
 
 #endif
 
-} // namespace internal_cutlass_kernels
+} // namespace cutlass_kernels
 } // namespace kernels
 } // namespace tensorrt_llm

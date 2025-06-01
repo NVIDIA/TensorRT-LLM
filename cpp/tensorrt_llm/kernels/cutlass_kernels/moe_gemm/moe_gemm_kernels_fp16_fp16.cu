@@ -12,7 +12,7 @@
 
 #include "moe_gemm_template_dispatch.h"
 
-namespace tensorrt_llm
+namespace tensorrt_llm::kernels::cutlass_kernels
 {
 template class MoeGemmRunner<half, half, half>;
 }

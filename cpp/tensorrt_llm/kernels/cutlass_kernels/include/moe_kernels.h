@@ -35,7 +35,59 @@
 
 namespace tensorrt_llm::kernels
 {
+// Change to following declarations must sync with lora.h in public repo
+class LoraImpl;
 
+int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
+    void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* workspace, cudaStream_t stream);
+
+struct LoraParams
+{
+    using LoraImplPtr = std::shared_ptr<LoraImpl>;
+
+    int32_t const* fc1_lora_ranks = nullptr;
+    void const* const* fc1_lora_weight_ptrs = nullptr;
+
+    int32_t const* fc2_lora_ranks = nullptr;
+    void const* const* fc2_lora_weight_ptrs = nullptr;
+
+    int32_t const* gated_lora_ranks = nullptr;
+    void const* const* gated_lora_weight_ptrs = nullptr;
+
+    // used to calculate split group gemm workspace
+    int num_reqs;
+
+    // fc1 and gated use the same impl
+    LoraImplPtr fc1_lora_impl;
+    LoraImplPtr fc2_lora_impl;
+
+    void* workspace;
+
+    cudaEvent_t* memcpy_event_ptr;
+
+    LoraParams() = default;
+
+    LoraParams(int num_reqs, int32_t const* fc1_lora_ranks, void const* const* fc1_lora_weight_ptrs,
+        int32_t const* fc2_lora_ranks, void const* const* fc2_lora_weight_ptrs, LoraImplPtr fc1_lora_impl,
+        LoraImplPtr fc2_lora_impl, void* workspace, cudaEvent_t* memcpy_event_ptr,
+        int32_t const* gated_lora_ranks = nullptr, void const* const* gated_lora_weight_ptrs = nullptr)
+        : fc1_lora_ranks(fc1_lora_ranks)
+        , fc1_lora_weight_ptrs(fc1_lora_weight_ptrs)
+        , fc2_lora_ranks(fc2_lora_ranks)
+        , fc2_lora_weight_ptrs(fc2_lora_weight_ptrs)
+        , gated_lora_ranks(gated_lora_ranks)
+        , gated_lora_weight_ptrs(gated_lora_weight_ptrs)
+        , num_reqs(num_reqs)
+        , fc1_lora_impl(fc1_lora_impl)
+        , fc2_lora_impl(fc2_lora_impl)
+        , workspace(workspace)
+        , memcpy_event_ptr(memcpy_event_ptr)
+    {
+    }
+};
+
+namespace cutlass_kernels
+{
 static inline size_t pad_to_multiple_of_16(size_t const& input)
 {
     static constexpr int ALIGNMENT = 16;
@@ -248,57 +300,6 @@ struct QuantParams
     static QuantParams FP8BlockScaling(float const* fc1_scales, float const* fc2_scales)
     {
         return QuantParams{{}, {}, {}, {}, {fc1_scales, fc2_scales}};
-    }
-};
-
-// Change to following declarations must sync with lora.h in public repo
-class LoraImpl;
-
-int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
-    void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* workspace, cudaStream_t stream);
-
-struct LoraParams
-{
-    using LoraImplPtr = std::shared_ptr<LoraImpl>;
-
-    int32_t const* fc1_lora_ranks = nullptr;
-    void const* const* fc1_lora_weight_ptrs = nullptr;
-
-    int32_t const* fc2_lora_ranks = nullptr;
-    void const* const* fc2_lora_weight_ptrs = nullptr;
-
-    int32_t const* gated_lora_ranks = nullptr;
-    void const* const* gated_lora_weight_ptrs = nullptr;
-
-    // used to calculate split group gemm workspace
-    int num_reqs;
-
-    // fc1 and gated use the same impl
-    LoraImplPtr fc1_lora_impl;
-    LoraImplPtr fc2_lora_impl;
-
-    void* workspace;
-
-    cudaEvent_t* memcpy_event_ptr;
-
-    LoraParams() = default;
-
-    LoraParams(int num_reqs, int32_t const* fc1_lora_ranks, void const* const* fc1_lora_weight_ptrs,
-        int32_t const* fc2_lora_ranks, void const* const* fc2_lora_weight_ptrs, LoraImplPtr fc1_lora_impl,
-        LoraImplPtr fc2_lora_impl, void* workspace, cudaEvent_t* memcpy_event_ptr,
-        int32_t const* gated_lora_ranks = nullptr, void const* const* gated_lora_weight_ptrs = nullptr)
-        : fc1_lora_ranks(fc1_lora_ranks)
-        , fc1_lora_weight_ptrs(fc1_lora_weight_ptrs)
-        , fc2_lora_ranks(fc2_lora_ranks)
-        , fc2_lora_weight_ptrs(fc2_lora_weight_ptrs)
-        , gated_lora_ranks(gated_lora_ranks)
-        , gated_lora_weight_ptrs(gated_lora_weight_ptrs)
-        , num_reqs(num_reqs)
-        , fc1_lora_impl(fc1_lora_impl)
-        , fc2_lora_impl(fc2_lora_impl)
-        , workspace(workspace)
-        , memcpy_event_ptr(memcpy_event_ptr)
-    {
     }
 };
 
@@ -839,4 +840,5 @@ private:
 // Populates a buffer with random values for use with MOE benchmarking
 void populateRandomBuffer(void* buffer_void, size_t size, cudaStream_t stream);
 
-} // namespace tensorrt_llm
+} // namespace cutlass_kernels
+} // namespace tensorrt_llm::kernels

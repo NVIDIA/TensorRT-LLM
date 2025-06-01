@@ -33,8 +33,7 @@ namespace tensorrt_llm::plugins
 {
 
 #if defined(ENABLE_OPENED_CUTLASS_FP4_GEMM)
-using Fp4GemmRunnerPtr
-    = std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunnerInterface>;
+using Fp4GemmRunnerPtr = std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunnerInterface>;
 #else
 using Fp4GemmRunnerPtr
     = std::shared_ptr<tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunnerInterface>;

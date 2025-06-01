@@ -33,7 +33,7 @@
 #include <cuda_fp4.h>
 #endif
 
-namespace tensorrt_llm
+namespace tensorrt_llm::kernels::cutlass_kernels
 {
 template <class T>
 constexpr auto transpose_stride(T const& t)

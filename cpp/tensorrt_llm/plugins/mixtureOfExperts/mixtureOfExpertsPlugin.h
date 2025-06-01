@@ -18,7 +18,11 @@
 #define TRT_MIXTURE_OF_EXPERTS_PLUGIN_H
 
 #include "NvInferPlugin.h"
+#if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#else
 #include "moe_kernels.h"
+#endif
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
@@ -103,7 +107,13 @@ struct GemmIDMoeHash
 class MixtureOfExpertsPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
+#if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+    using MOEParallelismConfig = tensorrt_llm::kernels::cutlass_kernels::MOEParallelismConfig;
+    using QuantParams = tensorrt_llm::kernels::cutlass_kernels::QuantParams;
+#else
     using MOEParallelismConfig = tensorrt_llm::kernels::MOEParallelismConfig;
+    using QuantParams = tensorrt_llm::kernels::QuantParams;
+#endif
     using LoraPluginProfilerPtr = std::shared_ptr<CublasLtGemmPluginProfiler>;
     using LoraImplPtr = std::shared_ptr<kernels::LoraImpl>;
 
@@ -225,8 +235,8 @@ private:
     int64_t getNumTokens(nvinfer1::PluginTensorDesc const* input_tensor) const;
     WorkspaceInfo setupWorkspace(void* base_ptr, int64_t num_tokens, int num_reqs = 0) const;
 
-    kernels::MOEParallelismConfig getParallelismConfig() const;
-    kernels::QuantParams getQuantParams(nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs,
+    MOEParallelismConfig getParallelismConfig() const;
+    QuantParams getQuantParams(nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs,
         int scale_1_idx = -1, int scale_2_idx = -1, int scale_3_idx = -1, int scale_4_idx = -1, int scale_5_idx = -1,
         int scale_6_idx = -1, int scale_7_idx = -1, int scale_8_idx = -1) const;
 

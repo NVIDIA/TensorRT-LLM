@@ -68,7 +68,7 @@
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+namespace tensorrt_llm::kernels::cutlass_kernels
 {
 /**
  * Takes the input maps and prepares the expanded maps for min latency
@@ -1829,7 +1829,6 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
     : blockscale_gemm_runner_{std::make_unique<
         kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>>()}
 {
-    printf("CutlassMoeFCRunner");
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
@@ -2651,14 +2650,16 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     int64_t num_valid_tokens = host_expert_first_token_offset[num_experts_per_node];
     int64_t num_reqs_lora = std::min(num_valid_tokens, static_cast<int64_t>(num_reqs * num_experts_per_node));
 
-    Lora_run(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora, input, host_permuted_fc1_lora_ranks.data(),
-        host_permuted_fc1_weight_ptrs.data(), 0, &tmp_lora_fc_result, lora_workspace, stream);
+    ::tensorrt_llm::kernels::Lora_run(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
+        host_permuted_fc1_lora_ranks.data(), host_permuted_fc1_weight_ptrs.data(), 0, &tmp_lora_fc_result,
+        lora_workspace, stream);
 
     if (is_gated_activation)
     {
         void* tmp_lora_gated_result = static_cast<void*>(lora_gated_out);
-        Lora_run(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora, input, host_permuted_gated_lora_ranks.data(),
-            host_permuted_gated_weight_ptrs.data(), 0, &tmp_lora_gated_result, lora_workspace, stream);
+        ::tensorrt_llm::kernels::Lora_run(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
+            host_permuted_gated_lora_ranks.data(), host_permuted_gated_weight_ptrs.data(), 0, &tmp_lora_gated_result,
+            lora_workspace, stream);
     }
 
     // add bias and reorder
@@ -2711,8 +2712,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     void* tmp_lora_fc_result = static_cast<void*>(lora_fc2_result_);
     int64_t num_reqs_lora = std::min(num_valid_tokens, static_cast<int64_t>(num_reqs * num_experts_per_node));
 
-    Lora_run(fc2_lora_impl.get(), num_valid_tokens, num_reqs_lora, input, host_permuted_fc2_lora_ranks.data(),
-        host_permuted_fc2_weight_ptrs.data(), 0, &tmp_lora_fc_result, lora_workspace, stream);
+    ::tensorrt_llm::kernels::Lora_run(fc2_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
+        host_permuted_fc2_lora_ranks.data(), host_permuted_fc2_weight_ptrs.data(), 0, &tmp_lora_fc_result,
+        lora_workspace, stream);
     sync_check_cuda_error(stream);
 }
 
@@ -2727,7 +2729,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     LoraParams& lora_params, bool use_fp8_block_scaling, bool min_latency_mode, MoeMinLatencyParams& min_latency_params,
     cudaStream_t stream)
 {
-    printf("kernel runMoe\n");
     static constexpr bool int_scales_required
         = std::is_same<WeightType, uint8_t>::value || std::is_same<WeightType, cutlass::uint4b_t>::value;
     static constexpr bool fp8_scales_required
@@ -3928,4 +3929,4 @@ template class CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16, _
 #endif
 #endif
 
-} // namespace tensorrt_llm::kernels
+} // namespace tensorrt_llm::kernels::cutlass_kernels

@@ -12,9 +12,9 @@
 
 #pragma once
 
+#include "../include/moe_gemm_kernels.h"
 #include "cutlass/arch/mma_sm90.h"
 #include "cutlass_extensions/epilogue_helpers.h"
-#include "../include/moe_gemm_kernels.h"
 
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
@@ -30,8 +30,7 @@ template <typename T, typename WeightType, typename EpilogueTag = cutlass_extens
 constexpr bool isValidSM120MOESpecialisation()
 {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) // TODO Is there a better choice
-    return cutlass::platform::is_same<T, __nv_fp4_e2m1>::value
-        && cutlass::platform::is_same<T, WeightType>::value
+    return cutlass::platform::is_same<T, __nv_fp4_e2m1>::value && cutlass::platform::is_same<T, WeightType>::value
         && cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value
         && Fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
 #else
@@ -60,9 +59,9 @@ template <typename T, typename WeightType, typename EpilogueTag = cutlass_extens
 constexpr bool isValidHopperMOESpecialisation()
 {
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
-    return (cutlass::platform::is_same<T, WeightType>::value 
-        || (cutlass::platform::is_same<cutlass::uint4b_t, WeightType>::value
-        && cutlass::platform::is_same<T, __nv_fp8_e4m3>::value))
+    return (cutlass::platform::is_same<T, WeightType>::value
+               || (cutlass::platform::is_same<cutlass::uint4b_t, WeightType>::value
+                   && cutlass::platform::is_same<T, __nv_fp8_e4m3>::value))
 #ifdef ENABLE_FP4
         && !cutlass::platform::is_same<T, __nv_fp4_e2m1>::value
 #endif

@@ -30,20 +30,20 @@
 #include "cutlass/util/distribution.h"
 #include "cutlass/util/host_tensor.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/tensor_view_io.h"
 #include "cutlass/util/reference/device/gemm.h"
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/device/tensor_fill.h"
-#include "cutlass/util/reference/host/tensor_fill.h"
-#include "cutlass/util/reference/host/tensor_copy.h"
-#include "cutlass/util/reference/host/tensor_compare.h"
-#include "cutlass/util/reference/host/tensor_norm.h"
 #include "cutlass/util/reference/host/gett.hpp"
+#include "cutlass/util/reference/host/tensor_compare.h"
+#include "cutlass/util/reference/host/tensor_copy.h"
+#include "cutlass/util/reference/host/tensor_fill.h"
+#include "cutlass/util/reference/host/tensor_norm.h"
+#include "cutlass/util/tensor_view_io.h"
 
 #include "cutlass_extensions/compute_occupancy.h"
 #include "cutlass_extensions/epilogue_helpers.h"
+#include "cutlass_extensions/gemm/collective/collective_builder_mixed_input.hpp"
 #include "cutlass_extensions/gemm_configs.h"
-#include "cutlass_extensions/collective_builder_mixed_input.hpp"
 
 #ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
@@ -56,7 +56,6 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 #include "moe_gemm_tma_ws_mixed_input_launcher.h"
-
 
 namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
@@ -71,8 +70,10 @@ namespace cutlass_kernels
 {
 
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag, typename CTAShape,
-    typename ClusterShape, typename MainloopScheduleType, typename EpilogueScheduleType, cutlass::WeightOnlyQuantOp QuantOp>
-void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs, TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size)
+    typename ClusterShape, typename MainloopScheduleType, typename EpilogueScheduleType,
+    cutlass::WeightOnlyQuantOp QuantOp>
+void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
+    TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
@@ -83,14 +84,17 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
     // A matrix configuration
     // using ElementA = typename TllmToCutlassTypeAdapter<T>::type;
     using ElementA = cutlass::float_e4m3_t;
-    using         LayoutA     = cutlass::layout::RowMajor;                      // Layout type for A matrix operand
-    constexpr int AlignmentA  = 128 / cutlass::sizeof_bits<ElementA>::value;    // Alignment of A matrix in units of elements (up to 16 bytes)
+    using LayoutA = cutlass::layout::RowMajor;         // Layout type for A matrix operand
+    constexpr int AlignmentA
+        = 128 / cutlass::sizeof_bits<ElementA>::value; // Alignment of A matrix in units of elements (up to 16 bytes)
 
     // B matrix configuration
     // using ElementB = typename TllmToCutlassTypeAdapter<WeightType>::type;
     using ElementB = typename cutlass::int4b_t;
-    using         LayoutB     = cutlass::layout::ColumnMajor;                   // Layout type for B matrix operand
-    constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // Memory access granularity/alignment of B matrix in units of elements (up to 16 bytes)
+    using LayoutB = cutlass::layout::ColumnMajor;      // Layout type for B matrix operand
+    constexpr int AlignmentB
+        = 128 / cutlass::sizeof_bits<ElementB>::value; // Memory access granularity/alignment of B matrix in units of
+                                                       // elements (up to 16 bytes)
 
     // This example manually swaps and transposes, so keep transpose of input layouts
     using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
@@ -102,56 +106,56 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
 
     // Scale configuration
     constexpr int PackedScalesNum = get<2>(CTAShape{}) / 128;
-    using ElementScalePacked = cutlass::Array<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA, PackedScalesNum>;
+    using ElementScalePacked
+        = cutlass::Array<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA, PackedScalesNum>;
     using LayoutScale = cutlass::layout::RowMajor;
 
     // C/D matrix configuration
     using ElementC = typename TllmToCutlassTypeAdapter<GemmOutputType>::type;
-    using         LayoutC     = cutlass::layout::RowMajor;                      // Layout type for C and D matrix operands
-    constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
+    using LayoutC = cutlass::layout::RowMajor;         // Layout type for C and D matrix operands
+    constexpr int AlignmentC
+        = 128 / cutlass::sizeof_bits<ElementC>::value; // Memory access granularity/alignment of C matrix in units of
+                                                       // elements (up to 16 bytes)
 
     // D matrix configuration
-    using         ElementD    = ElementC;
-    using         LayoutD     = LayoutC;
-    constexpr int AlignmentD  = 128 / cutlass::sizeof_bits<ElementD>::value;
+    using ElementD = ElementC;
+    using LayoutD = LayoutC;
+    constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
     // Core kernel configurations
-    using ElementAccumulator  = float;                                          // Element type for internal accumulation
-    using ArchTag             = cutlass::arch::Sm90;                            // Tag indicating the minimum SM that supports the intended feature
-    using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-    using TileShape           = CTAShape;                                       // Threadblock-level tile size
-    using StageCountType = cutlass::gemm::collective::StageCountAuto;           // Stage count maximized based on the tile size
-    using KernelSchedule = std::conditional_t<std::is_same_v<MainloopScheduleType, cutlass::gemm::KernelTmaWarpSpecializedPingpong>, cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong, cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative>;
-    using EpilogueSchedule = std::conditional_t<std::is_same_v<KernelSchedule, cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>, cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong, cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative>; // Epilogue to launch
+    using ElementAccumulator = float;    // Element type for internal accumulation
+    using ArchTag = cutlass::arch::Sm90; // Tag indicating the minimum SM that supports the intended feature
+    using OperatorClass = cutlass::arch::OpClassTensorOp;             // Operator class tag
+    using TileShape = CTAShape;                                       // Threadblock-level tile size
+    using StageCountType = cutlass::gemm::collective::StageCountAuto; // Stage count maximized based on the tile size
+    using KernelSchedule
+        = std::conditional_t<std::is_same_v<MainloopScheduleType, cutlass::gemm::KernelTmaWarpSpecializedPingpong>,
+            cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong,
+            cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative>;
+    using EpilogueSchedule
+        = std::conditional_t<std::is_same_v<KernelSchedule, cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>,
+            cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong,
+            cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative>; // Epilogue to launch
 
-    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-        cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
-        TileShape, ClusterShape,
-        cutlass::epilogue::collective::EpilogueTileAuto,
-        ElementAccumulator, ElementAccumulator,
-        ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type *, AlignmentC,
-        ElementD, typename cutlass::layout::LayoutTranspose<LayoutD>::type *, AlignmentD,
-        EpilogueSchedule
-    >::CollectiveOp;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp, TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator, ElementAccumulator, ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
+        AlignmentC, ElementD, typename cutlass::layout::LayoutTranspose<LayoutD>::type*, AlignmentD,
+        EpilogueSchedule>::CollectiveOp;
 
-    // =========================================================== MIXED INPUT WITH SCALES ===========================================================================
-    // The Scale information must get paired with the operand that will be scaled. In this example, B is scaled so we make a tuple of B's information and the scale information.
-    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilderMixedInput<
-        ArchTag, OperatorClass,
-        cute::tuple<ElementB, ElementScalePacked>, LayoutB_Transpose *, AlignmentB,
-        ElementA, LayoutA_Transpose *, AlignmentA,
-        ElementAccumulator,
-        TileShape, ClusterShape,
-        cutlass::gemm::collective::StageCountAutoCarveout<
-        static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-        KernelSchedule
-    >::CollectiveOp;
+    // =========================================================== MIXED INPUT WITH SCALES
+    // =========================================================================== The Scale information must get paired
+    // with the operand that will be scaled. In this example, B is scaled so we make a tuple of B's information and the
+    // scale information.
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilderMixedInput<ArchTag, OperatorClass,
+        cute::tuple<ElementB, ElementScalePacked>, LayoutB_Transpose*, AlignmentB, ElementA, LayoutA_Transpose*,
+        AlignmentA, ElementAccumulator, TileShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+            sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        KernelSchedule>::CollectiveOp;
 
-    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-        cutlass::gemm::GroupProblemShape<Shape<int,int,int>>, 
-        CollectiveMainloop,
-        CollectiveEpilogue
-    >;
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<cutlass::gemm::GroupProblemShape<Shape<int, int, int>>,
+        CollectiveMainloop, CollectiveEpilogue>;
 
     using GemmGrouped = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
     using StrideC = typename GemmKernel::InternalStrideC;
@@ -179,56 +183,35 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
 
     if (workspace_size != nullptr)
     {
-        const Args args {
-            cutlass::gemm::GemmUniversalMode::kGrouped,
-            {
-                inputs.num_experts,
-                hopper_inputs.int4_groupwise_params.shape.problem_shapes,
-                nullptr
-            },
-            {
-                reinterpret_cast<const ElementB**>(hopper_inputs.ptr_b), hopper_inputs.stride_b,
-                reinterpret_cast<const ElementA**>(hopper_inputs.ptr_a), hopper_inputs.stride_a,
-                reinterpret_cast<const ElementScalePacked**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
-                hopper_inputs.int4_groupwise_params.stride_s_a,
-                int(inputs.groupwise_quant_group_size)
-            },
-            {
-                fusion_args,
-                reinterpret_cast<const ElementC**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,
+        const Args args{cutlass::gemm::GemmUniversalMode::kGrouped,
+            {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
+            {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_b), hopper_inputs.stride_b,
+                reinterpret_cast<ElementA const**>(hopper_inputs.ptr_a), hopper_inputs.stride_a,
+                reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
+                hopper_inputs.int4_groupwise_params.stride_s_a, int(inputs.groupwise_quant_group_size)},
+            {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,
                 reinterpret_cast<ElementD**>(hopper_inputs.default_epilogue.ptr_d),
-                hopper_inputs.default_epilogue.stride_d
-            },
+                hopper_inputs.default_epilogue.stride_d},
             hw_info};
         *workspace_size = gemm.get_workspace_size(args);
         return;
-    } 
-    
-    arguments = Args {
-        cutlass::gemm::GemmUniversalMode::kGrouped,
-        {
-            inputs.num_experts,
-            hopper_inputs.int4_groupwise_params.shape.problem_shapes,
-            nullptr
-        },
-        {
-            reinterpret_cast<const ElementB**>(hopper_inputs.ptr_b), hopper_inputs.stride_b,
-            reinterpret_cast<const ElementA**>(hopper_inputs.ptr_a), hopper_inputs.stride_a,
-            reinterpret_cast<const ElementScalePacked**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
-            hopper_inputs.int4_groupwise_params.stride_s_a,
-            int(inputs.groupwise_quant_group_size)
-        },
-        {
-            fusion_args,
-            reinterpret_cast<const ElementC**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,
+    }
+
+    arguments = Args{cutlass::gemm::GemmUniversalMode::kGrouped,
+        {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
+        {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_b), hopper_inputs.stride_b,
+            reinterpret_cast<ElementA const**>(hopper_inputs.ptr_a), hopper_inputs.stride_a,
+            reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
+            hopper_inputs.int4_groupwise_params.stride_s_a, int(inputs.groupwise_quant_group_size)},
+        {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,
             reinterpret_cast<ElementD**>(hopper_inputs.default_epilogue.ptr_d),
-            hopper_inputs.default_epilogue.stride_d
-        },
+            hopper_inputs.default_epilogue.stride_d},
         hw_info};
 
     if (gemm.get_workspace_size(arguments) > hopper_inputs.gemm_workspace_size)
     {
-        TLLM_LOG_ERROR("[Mixed dtype WS grouped GEMM] given workspace size insufficient, %d < %d.", gemm.get_workspace_size(arguments), hopper_inputs.gemm_workspace_size);
+        TLLM_LOG_ERROR("[Mixed dtype WS grouped GEMM] given workspace size insufficient, %d < %d.",
+            gemm.get_workspace_size(arguments), hopper_inputs.gemm_workspace_size);
     }
 
     auto can_implement = gemm.can_implement(arguments);
@@ -251,8 +234,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
     auto run_status = gemm.run(inputs.stream);
     if (run_status != cutlass::Status::kSuccess)
     {
-        std::string err_msg
-            = "Failed to run cutlass mixed dtype WS grouped gemm. Error: " + std::string(cutlassGetStatusString(run_status));
+        std::string err_msg = "Failed to run cutlass mixed dtype WS grouped gemm. Error: "
+            + std::string(cutlassGetStatusString(run_status));
         throw std::runtime_error("[Mixed dtype WS grouped GEMM] " + err_msg);
     }
     return;
@@ -261,4 +244,3 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
 } // namespace cutlass_kernels
 } // namespace kernels
 } // namespace tensorrt_llm
-

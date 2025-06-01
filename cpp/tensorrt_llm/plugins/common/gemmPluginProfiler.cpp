@@ -379,15 +379,12 @@ template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmC
 
 #if defined(ENABLE_OPENED_CUTLASS_FP4_GEMM)
 template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
-    std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunnerInterface>, GemmIdCore,
-    GemmIdCoreHash>;
+    std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunnerInterface>, GemmIdCore, GemmIdCoreHash>;
 #else
 template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
     std::shared_ptr<tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunnerInterface>, GemmIdCore,
     GemmIdCoreHash>;
-
 #endif
-
 
 template class GemmPluginProfiler<LowLatencyGemmPluginProfiler::Config, LowLatencyGemmRunnerPtr, GemmIdCore,
     GemmIdCoreHash>;

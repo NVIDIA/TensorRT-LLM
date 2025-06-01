@@ -20,7 +20,11 @@
 
 #include <nlohmann/json.hpp>
 
+#if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#else
 #include "moe_kernels.h"
+#endif
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
@@ -37,7 +41,11 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+using namespace tensorrt_llm::kernels::cutlass_kernels;
+#else
 using namespace tensorrt_llm::kernels;
+#endif
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::cutlass_extensions;

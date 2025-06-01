@@ -160,9 +160,9 @@ size_t dispatchFP4GemmClusterShapeSm120(T* D, void const* A, void const* B, void
     switch (gemmConfig.cluster_shape)
     {
     case tkc::ClusterShape::ClusterShape_1x1x1:
-        return genericFp4GemmKernelLauncherSm120<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<1>, cute::Int<1>>(
-            D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
-            stream, occupancy);
+        return genericFp4GemmKernelLauncherSm120<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<1>, cute::Int<1>>(D,
+            A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream,
+            occupancy);
         break;
     default:
         throw std::runtime_error(
@@ -199,7 +199,8 @@ size_t dispatchFP4GemmCTAShapeSm120(T* D, void const* A, void const* B, void con
             "heuristic.");
         break;
     default:
-        throw std::runtime_error("[TensorRT-LLM Error][FP4][sm120][dispatch_gemm_cta_shape] Config is invalid for FP4 GEMM.");
+        throw std::runtime_error(
+            "[TensorRT-LLM Error][FP4][sm120][dispatch_gemm_cta_shape] Config is invalid for FP4 GEMM.");
         break;
     }
 }
@@ -261,7 +262,7 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp4GemmRunner<T>::getConfigs() const
     using tkc::CutlassGemmConfig;
 
     std::vector<CutlassGemmConfig> candidateConfigs;
-    
+
     if (mSm == 100)
     {
         std::vector<tkc::CutlassTileConfigSM100> tilesSm100 = {
@@ -296,7 +297,7 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp4GemmRunner<T>::getConfigs() const
             // tkc::CutlassTileConfigSM120::CtaShape128x128x128B,
             tkc::CutlassTileConfigSM120::CtaShape128x128x256B,
             tkc::CutlassTileConfigSM120::CtaShape256x128x128B,
-        
+
         };
         tkc::ClusterShape clusterShape = tkc::ClusterShape::ClusterShape_1x1x1;
         for (auto const& tile_config : tilesSm120)

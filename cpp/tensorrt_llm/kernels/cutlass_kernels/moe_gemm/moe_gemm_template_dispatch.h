@@ -56,12 +56,12 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 #include "../include/moe_gemm_kernels.h"
+#include "launchers/fused_moe_gemm_launcher_sm80.h"
+#include "launchers/moe_gemm_tma_ws_launcher.h"
+#include "launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
 #include "moe_gemm_template_dispatch_tma_ws.h"
 #include "moe_gemm_template_dispatch_tma_ws_mixed_dtype.h"
 #include "moe_tma_warp_specialized_traits.h"
-#include "launchers/moe_gemm_tma_ws_launcher.h"
-#include "launchers/fused_moe_gemm_launcher_sm80.h"
-#include "launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
 
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -219,7 +219,6 @@ struct genericMoeGemmKernelLauncher<__nv_bfloat16, __nv_fp8_e4m3, GemmOutputType
     {
     }
 };
-} // namespace kernels::cutlass_kernels
 
 template <typename T, typename WeightType, typename GemmOutputType, typename Arch, typename EpilogueTag,
     typename ThreadblockShape, typename WarpShape, int Stages>
@@ -645,15 +644,15 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
         if constexpr (use_fp8)
         {
             if (sm_ >= 120)
-            {       
+            {
                 dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm89, EpilogueTag>(
                     inputs, multi_processor_count_);
                 return;
             }
         }
 
-        if constexpr (kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType,
-                          EpilogueTag>() && !use_w4afp8)
+        if constexpr (kernels::cutlass_kernels::isValidTmaWarpSpecializedMOESpecialisation<T, WeightType, EpilogueTag>()
+            && !use_w4afp8)
         {
             // We allow both tma warp specialized and SM80 configurations to coexist because for some cases with small
             // numbers of tokens SM80 is faster. We check here to see which is selected
@@ -700,15 +699,21 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
                 // EpilogueTag is ignored
                 if (inputs.k % 512 == 0)
                 {
-                    sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType, cutlass_extensions::EpilogueOpDefault, 4>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                    sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+                        cutlass_extensions::EpilogueOpDefault, 4>(
+                        inputs, hopper_inputs, multi_processor_count_, nullptr);
                 }
                 else if (inputs.k % 256 == 0)
                 {
-                    sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType, cutlass_extensions::EpilogueOpDefault, 2>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                    sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+                        cutlass_extensions::EpilogueOpDefault, 2>(
+                        inputs, hopper_inputs, multi_processor_count_, nullptr);
                 }
                 else if (inputs.k % 128 == 0)
                 {
-                    sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType, cutlass_extensions::EpilogueOpDefault, 1>(inputs, hopper_inputs, multi_processor_count_, nullptr);
+                    sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<T, WeightType, ScaleBiasType,
+                        cutlass_extensions::EpilogueOpDefault, 1>(
+                        inputs, hopper_inputs, multi_processor_count_, nullptr);
                 }
                 else
                 {
@@ -769,7 +774,8 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
 {
     if constexpr (use_w4afp8)
     {
-        return calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput<T, WeightType, OutputType>(num_experts, multi_processor_count_);
+        return calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput<T, WeightType, OutputType>(
+            num_experts, multi_processor_count_);
     }
     if (!supportsTmaWarpSpecialized())
     {
@@ -848,4 +854,5 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemm(
     runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
 }
 
+} // namespace kernels::cutlass_kernels
 } // namespace tensorrt_llm

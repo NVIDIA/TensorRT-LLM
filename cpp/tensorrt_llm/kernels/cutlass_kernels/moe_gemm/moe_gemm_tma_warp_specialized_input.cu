@@ -21,7 +21,7 @@
 
 #include "tensorrt_llm/common/logger.h"
 
-namespace tensorrt_llm
+namespace tensorrt_llm::kernels::cutlass_kernels
 {
 std::array<size_t, 17> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(int num_experts)
 {
@@ -39,7 +39,8 @@ std::array<size_t, 17> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(int 
     size_t stride_sf_a_size = sizeof(LayoutScalingFactorsA) * num_experts;
     size_t stride_sf_b_size = sizeof(LayoutScalingFactorsB) * num_experts;
 
-    size_t int4_groupwise_problem_shape_size = sizeof(INT4GroupwiseParams::ProblemShapeInt::UnderlyingProblemShape) * num_experts;
+    size_t int4_groupwise_problem_shape_size
+        = sizeof(INT4GroupwiseParams::ProblemShapeInt::UnderlyingProblemShape) * num_experts;
     size_t int4_groupwise_sf_a_size = sizeof(INT4GroupwiseParams::SFA*) * num_experts;
     size_t int4_groupwise_stride_sf_a_size = sizeof(INT4GroupwiseParams::StrideSFA) * num_experts;
 
@@ -87,7 +88,8 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(
     fp4_block_scaling_factors_stride_A = reinterpret_cast<LayoutScalingFactorsA*>(pointers[12]);
     fp4_block_scaling_factors_stride_B = reinterpret_cast<LayoutScalingFactorsB*>(pointers[13]);
 
-    int4_groupwise_params.shape.problem_shapes = reinterpret_cast<INT4GroupwiseParams::ProblemShapeInt::UnderlyingProblemShape*>(pointers[14]);
+    int4_groupwise_params.shape.problem_shapes
+        = reinterpret_cast<INT4GroupwiseParams::ProblemShapeInt::UnderlyingProblemShape*>(pointers[14]);
     int4_groupwise_params.shape.host_problem_shapes = nullptr;
     int4_groupwise_params.ptr_s_a = reinterpret_cast<INT4GroupwiseParams::SFA const**>(pointers[15]);
     int4_groupwise_params.stride_s_a = reinterpret_cast<INT4GroupwiseParams::StrideSFA*>(pointers[16]);
@@ -155,4 +157,4 @@ std::string TmaWarpSpecializedGroupedGemmInput::toString() const
 
     return ss.str();
 }
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::cutlass_kernels

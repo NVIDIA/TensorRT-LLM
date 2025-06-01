@@ -131,21 +131,27 @@ set(GEMM_SWIGLU_SM90_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
 add_library(gemm_swiglu_sm90_src STATIC ${GEMM_SWIGLU_SM90_SRC_CU})
 
-if (ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
-file(GLOB LOW_LATENCY_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/low_latency_gemm/*.cu")
-add_library(low_latency_gemm_src STATIC ${LOW_LATENCY_GEMM_SRC_CU})
-  target_include_directories(
-    low_latency_gemm_src
-    PRIVATE ${3RDPARTY_DIR}/cutlass/examples)
+if(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
+  file(GLOB LOW_LATENCY_GEMM_SRC_CU
+       "${CMAKE_CURRENT_SOURCE_DIR}/low_latency_gemm/*.cu")
+  add_library(low_latency_gemm_src STATIC ${LOW_LATENCY_GEMM_SRC_CU})
+  target_include_directories(low_latency_gemm_src
+                             PRIVATE ${3RDPARTY_DIR}/cutlass/examples)
 endif()
 
-if (ENABLE_OPENED_CUTLASS_FP4_GEMM)
+if(ENABLE_OPENED_CUTLASS_FP4_GEMM)
   file(GLOB FP4_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/fp4_gemm/*.cu")
   add_library(fp4_gemm_src STATIC ${FP4_SRC_CU} ${FP4_CU_INSTANTIATIONS})
 endif()
 
-file(GLOB MOE_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/moe_gemm/*.cu")
-add_library(moe_gemm_src STATIC ${MOE_GEMM_SRC_CU})
+if(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+  file(GLOB MOE_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/moe_gemm/*.cu")
+  add_library(moe_gemm_src STATIC ${MOE_GEMM_SRC_CU} ${GROUPED_SRC_CPP}
+                                  ${GROUPED_CU_INSTANTIATIONS})
+  target_include_directories(
+    moe_gemm_src
+    PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
+endif()
 
 function(process_target target_name enable_hopper enable_blackwell)
   set_property(TARGET ${target_name} PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -201,7 +207,6 @@ endforeach()
 foreach(target_name low_latency_gemm_src moe_gemm_src)
   process_target(${target_name} true true) # Name, Hopper, Blackwell
 endforeach()
-
 
 # foreach(target_name moe_gemm_src) process_target(${target_name} true true) #
 # Name, Hopper, Blackwell endforeach()

@@ -60,7 +60,7 @@
 #include <math.h>
 #include <sstream>
 
-namespace tensorrt_llm
+namespace tensorrt_llm::kernels::cutlass_kernels
 {
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
@@ -171,7 +171,8 @@ template <typename ClusterTileShape, typename ClusterShape, typename DataType>
 constexpr bool are_tile_shapes_supported_sm120()
 {
     using namespace cute;
-    if constexpr (cute::size<0>(ClusterShape{}) != 1 || cute::size<1>(ClusterShape{}) != 1 || cute::size<2>(ClusterShape{}) != 1)
+    if constexpr (cute::size<0>(ClusterShape{}) != 1 || cute::size<1>(ClusterShape{}) != 1
+        || cute::size<2>(ClusterShape{}) != 1)
     {
         return false;
     }
@@ -181,10 +182,8 @@ constexpr bool are_tile_shapes_supported_sm120()
     constexpr auto TileN = size<1>(CtaShape{});
     constexpr auto TileK = size<2>(CtaShape{});
 
-    return (TileM == 128 && TileN == 128 && TileK == 128)
-        || (TileM == 128 && TileN == 128 && TileK == 256)
-        || (TileM == 128 && TileN == 256 && TileK == 128)
-        || (TileM == 256 && TileN == 128 && TileK == 128);
+    return (TileM == 128 && TileN == 128 && TileK == 128) || (TileM == 128 && TileN == 128 && TileK == 256)
+        || (TileM == 128 && TileN == 256 && TileK == 128) || (TileM == 256 && TileN == 128 && TileK == 128);
 }
 
 /*
@@ -357,10 +356,14 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
         {
             TLLM_THROW("Unsupported SM100 configuration requested");
         }
-    } else if (gemm_config.sm_version == 120) {
+    }
+    else if (gemm_config.sm_version == 120)
+    {
         TLLM_LOG_TRACE("At %s, SM120 config=%d", __PRETTY_FUNCTION__, (int) gemm_config.tile_config_sm120);
-        if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType, EpilogueTag, FUSION>()){
-            switch (gemm_config.tile_config_sm120){
+        if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType, EpilogueTag, FUSION>())
+        {
+            switch (gemm_config.tile_config_sm120)
+            {
                 SHAPE_CASE(120, 128, 128, 64)
                 SHAPE_CASE(120, 128, 128, 128)
                 SHAPE_CASE(120, 128, 256, 64)
@@ -384,4 +387,4 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecialized(
     return count;
 }
 
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::cutlass_kernels

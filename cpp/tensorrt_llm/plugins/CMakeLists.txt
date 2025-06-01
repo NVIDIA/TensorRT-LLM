@@ -116,7 +116,8 @@ target_include_directories(
   PRIVATE ${TARGET_DIR})
 
 if(ENABLE_OPENED_CUTLASS_FP4_GEMM)
-  target_compile_definitions(${PLUGIN_SHARED_TARGET} PRIVATE ENABLE_OPENED_CUTLASS_FP4_GEMM)
+  target_compile_definitions(${PLUGIN_SHARED_TARGET}
+                             PRIVATE ENABLE_OPENED_CUTLASS_FP4_GEMM)
 endif()
 
 if(ENABLE_MULTI_DEVICE)

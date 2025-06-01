@@ -16,7 +16,7 @@
  */
 #if defined(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
 #include "tensorrt_llm/kernels/cutlass_kernels/include/low_latency_gemm.h"
-#else 
+#else
 #include "low_latency_gemm.h"
 #endif
 #include "tensorrt_llm/runtime/torchUtils.h"
