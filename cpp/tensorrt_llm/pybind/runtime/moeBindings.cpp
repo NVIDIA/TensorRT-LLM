@@ -22,12 +22,30 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
+#include <vector>
 
 namespace py = pybind11;
 namespace tr = tensorrt_llm::runtime;
+namespace tk = tensorrt_llm::kernels;
 
 namespace tensorrt_llm::pybind::runtime
 {
+
+void pyDoReplication(tk::MoeLoadBalanceMetaInfo const& metaInfo, std::vector<float>& expertLoadFactor,
+    tr::MoePlacementCpuInfo* cpuPlacement)
+{
+    TLLM_CHECK_WITH_INFO(
+        metaInfo.expertCount == expertLoadFactor.size(), "expert_count and expert_load_factor size mismatch");
+    tr::doReplication(metaInfo, expertLoadFactor.data(), cpuPlacement);
+};
+
+void pyDoPlacement(tk::MoeLoadBalanceMetaInfo const& metaInfo, std::vector<float>& expertLoadFactor,
+    tr::MoePlacementCpuInfo* cpuPlacement)
+{
+    TLLM_CHECK_WITH_INFO(
+        metaInfo.expertCount == expertLoadFactor.size(), "expert_count and expert_load_factor size mismatch");
+    tr::doPlacement(metaInfo, expertLoadFactor.data(), cpuPlacement);
+};
 
 void initMoeBindings(pybind11::module_& m)
 {
@@ -45,6 +63,22 @@ void initMoeBindings(pybind11::module_& m)
                     + " height=" + std::to_string(self.mHeight) + " width=" + std::to_string(self.mWidth)
                     + " pitch=" + std::to_string(self.mPitch) + ">";
             });
+
+    // Bind MoeLoadBalanceMetaInfo struct
+    py::class_<tk::MoeLoadBalanceMetaInfo>(m, "MoeLoadBalanceMetaInfo")
+        .def(py::init<int, int, int, int, int>(), py::arg("expert_count"), py::arg("top_k"), py::arg("ep_rank"),
+            py::arg("ep_size"), py::arg("slot_count_per_rank"))
+        .def_readwrite("expert_count", &tk::MoeLoadBalanceMetaInfo::expertCount)
+        .def_readwrite("top_k", &tk::MoeLoadBalanceMetaInfo::topK)
+        .def_readwrite("ep_rank", &tk::MoeLoadBalanceMetaInfo::epRank)
+        .def_readwrite("ep_size", &tk::MoeLoadBalanceMetaInfo::epSize)
+        .def_readwrite("slot_count_per_rank", &tk::MoeLoadBalanceMetaInfo::slotCountPerRank);
+
+    // Bind MoePlacementCpuInfo struct
+    py::class_<tr::MoePlacementCpuInfo>(m, "MoePlacementCpuInfo")
+        .def(py::init<>())
+        .def_readwrite("expert_replica_count", &tr::MoePlacementCpuInfo::expertReplicaCount)
+        .def_readwrite("rank_expert_ids", &tr::MoePlacementCpuInfo::rankExpertIds);
 
     // Bind SingleLayerMoeLoadBalancer class
     py::class_<tr::SingleLayerMoeLoadBalancer, std::shared_ptr<tr::SingleLayerMoeLoadBalancer>>(
@@ -74,6 +108,14 @@ void initMoeBindings(pybind11::module_& m)
             py::arg("enable_update_weights"), "Start a new iteration with the given ID and settings")
         .def("end_iter", &tr::MoeLoadBalancer::endIter, py::arg("iter_id"), "End the iteration with the given ID")
         .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources");
+
+    // Bind do_replication function for testing
+    m.def("do_replication", &pyDoReplication, py::arg("meta_info"), py::arg("expert_load_factor"),
+        py::arg("cpu_placement"), "Do replication");
+
+    // Bind do_placement function for testing
+    m.def("do_placement", &pyDoPlacement, py::arg("meta_info"), py::arg("expert_load_factor"), py::arg("cpu_placement"),
+        "Do placement");
 }
 
 } // namespace tensorrt_llm::pybind::runtime

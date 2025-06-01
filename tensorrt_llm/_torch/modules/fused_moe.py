@@ -19,6 +19,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
+from ..expert_statistic import ExpertStatistic
 from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                      reswizzle_sf, swizzle_sf, unswizzle_sf)
@@ -936,10 +937,11 @@ class FusedMoE(nn.Module):
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
+        self.layer_idx = layer_idx
         moe_load_balancer_config = model_config.moe_load_balancer
         if moe_load_balancer_config is None:
             assert moe_load_balancer is None
-            # A dummy MoeLoadBalancerConfig to generate default initial_global_assignments and initial_local_expert_ids
+            # A dummy MoeLoadBalancerConfig to generate default initial_global_assignments
             moe_load_balancer_config = MoeLoadBalancerConfig()
             moe_load_balancer_config.setup(num_experts=num_experts,
                                            ep_rank=self.ep_rank,
@@ -1415,6 +1417,11 @@ class FusedMoE(nn.Module):
             # so we need to offset the round robin position by ep_rank
             token_selected_slots = self.balancer_layer.route(
                 token_selected_experts, offset_by_ep_rank=self.use_dp)
+
+        # If load balancer is disabled, the statistics are collected from expert IDs.
+        # If load balancer is enabled, the statistics are collected from expert slot IDs.
+        ExpertStatistic.set_layer(self.layer_idx)
+        ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
 
         assert token_selected_slots.shape[
             1] == self.routing_method.experts_per_token
