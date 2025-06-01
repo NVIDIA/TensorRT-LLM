@@ -43,7 +43,8 @@ set(SRCS
     ipcNvlsMemory.cpp
     mcastDeviceMemory.cpp
     memoryCounters.cpp
-    moeLoadBalancer.cpp
+    moeLoadBalancer/moeLoadBalancer.cpp
+    moeLoadBalancer/topologyDetector.cpp
     ncclCommunicator.cpp
     promptTuningParams.cpp
     runtimeKernels.cu
@@ -79,4 +80,15 @@ target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 
 if(ENABLE_MULTI_DEVICE)
   target_link_libraries(runtime_src PUBLIC ${NCCL_LIB})
+endif()
+
+if(NOT WIN32)
+  find_path(NUMA_INCLUDE_DIR numa.h)
+  find_library(NUMA_LIBRARY numa)
+  if(NUMA_INCLUDE_DIR AND NUMA_LIBRARY)
+    target_include_directories(runtime_src PRIVATE ${NUMA_INCLUDE_DIR})
+    target_link_libraries(runtime_src PUBLIC ${NUMA_LIBRARY})
+  else()
+    message(WARNING "NUMA library not found, please install libnuma-dev")
+  endif()
 endif()
