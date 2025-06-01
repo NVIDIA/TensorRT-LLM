@@ -93,10 +93,10 @@ struct WindowSizeMetadata
     std::string toString()
     {
         return tensorrt_llm::common::fmtstr(
-            "WindowSizeMetadata{ .absolutePoolsOffset=%d, .numPools=%d, .maxTokenNum=%d, .maxBlocksPerSeq=%d, "
-            ".maxNumBlocks=%d, .temporaryAttentionWindow=%d, .allottedPrimaryBlocks=%d, .allottedSecondaryBlocks=%d }",
-            absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq, maxNumBlocks, temporaryAttentionWindow,
-            allottedPrimaryBlocks, allottedSecondaryBlocks);
+            "WindowSizeMetadata{ .allottedPrimaryBlocks=%d, .allottedSecondaryBlocks=%d, .absolutePoolsOffset=%d, "
+            ".numPools=%d, .maxTokenNum=%d, .maxBlocksPerSeq=%d, .maxNumBlocks=%d, .temporaryAttentionWindow=%d }",
+            allottedPrimaryBlocks, allottedSecondaryBlocks, absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq,
+            maxNumBlocks, temporaryAttentionWindow);
     }
 };
 
