@@ -343,9 +343,7 @@ class Deepseekv3MoE(nn.Module):
                  aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig(),
-                 override_quant_config: Optional[QuantConfig] = None,
-                 moe_load_balancer: Optional[MoeLoadBalancer] = None,
-                 layer_idx: Optional[int] = None):
+                 override_quant_config: Optional[QuantConfig] = None):
         from ..distributed import AllReduce
 
         super().__init__()
@@ -378,9 +376,7 @@ class Deepseekv3MoE(nn.Module):
             model_config=model_config,
             override_quant_config=override_quant_config,
             aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
-            enable_alltoall=self.enable_alltoall,
-            moe_load_balancer=moe_load_balancer,
-            layer_idx=layer_idx)
+            enable_alltoall=self.enable_alltoall)
 
         self.mapping = model_config.mapping
 
@@ -542,11 +538,9 @@ class Deepseekv3MoE(nn.Module):
 
 class DeepseekV3DecoderLayer(DecoderLayer):
 
-    def __init__(self,
-                 model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int,
-                 aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-                 moe_load_balancer: Optional[MoeLoadBalancer] = None):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig],
+                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
+                                                       torch.cuda.Stream]):
         super().__init__()
         self.model_config = model_config
         config = model_config.pretrained_config
@@ -597,9 +591,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 dtype=config.torch_dtype,
                 model_config=model_config,
                 override_quant_config=quant_config,
-                aux_stream_dict=aux_stream_dict,
-                moe_load_balancer=moe_load_balancer,
-                layer_idx=layer_idx)
+                aux_stream_dict=aux_stream_dict)
         else:
             block_size = 1
             if quant_config and quant_config.group_size is not None:
@@ -865,13 +857,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
 class DeepseekV3MTP(DeepseekV3DecoderLayer):
 
-    def __init__(self,
-                 model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int,
-                 aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-                 moe_load_balancer: Optional[MoeLoadBalancer] = None):
-        super().__init__(model_config, layer_idx, aux_stream_dict,
-                         moe_load_balancer)
+    def __init__(self, model_config: ModelConfig[PretrainedConfig],
+                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
+                                                       torch.cuda.Stream]):
+        super().__init__(model_config, layer_idx, aux_stream_dict)
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -992,23 +981,9 @@ class DeepseekV3Model(DecoderModel):
             dtype=config.torch_dtype,
         )
 
-        self.moe_load_balancer = None
-        if model_config.moe_load_balancer is not None:
-            num_experts = config.n_routed_experts
-            ep_rank = model_config.mapping.moe_ep_rank
-            ep_size = model_config.mapping.moe_ep_size
-            model_config.moe_load_balancer.setup(num_experts=num_experts,
-                                                 ep_rank=ep_rank,
-                                                 ep_size=ep_size)
-            self.moe_load_balancer = MoeLoadBalancer(
-                ep_rank=ep_rank,
-                ep_size=ep_size,
-                layer_updates_per_iter=model_config.moe_load_balancer.
-                layer_updates_per_iter)
-
         self.layers = nn.ModuleList([
             DeepseekV3DecoderLayer(model_config, layer_idx,
-                                   self.aux_stream_dict, self.moe_load_balancer)
+                                   self.aux_stream_dict)
             for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
@@ -1054,7 +1029,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
-        self.moe_load_balancer = self.model.moe_load_balancer
         self.model_nextn = 0
         if model_config.spec_config is not None:
             model_nextn = model_config.spec_config.num_nextn_predict_layers
@@ -1063,8 +1037,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
             if ckpt_nextn == 1:
                 mtp_layer = DeepseekV3MTP(model_config, self.num_hidden_layers,
-                                          self.model.aux_stream_dict,
-                                          self.moe_load_balancer)
+                                          self.model.aux_stream_dict)
                 self.model.layers.append(mtp_layer)
                 self.epilogue.append(mtp_layer)
                 self.mtp_worker = MTPEagleWorker(model_config.spec_config)
@@ -1074,8 +1047,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 mtp_layers = nn.ModuleList([
                     DeepseekV3MTP(model_config,
                                   layer_idx + self.num_hidden_layers,
-                                  self.model.aux_stream_dict,
-                                  self.moe_load_balancer)
+                                  self.model.aux_stream_dict)
                     for layer_idx in range(model_nextn)
                 ])
                 self.model.layers.extend(mtp_layers)
@@ -1099,9 +1071,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                     self.model_config.quant_config.exclude_modules.extend(
                         extend_exclude_modules)
             self.epilogue.append(self.mtp_worker)
-
-        if self.moe_load_balancer is not None:
-            self.moe_load_balancer.finalize_model()
 
     def forward(
         self,
