@@ -502,7 +502,7 @@ struct Producer
 #endif
         if (threadIdx.x == 0)
         {
-            smem.qkScaleLog2e = args.qScale * args.kvCacheScale[0] * (sqrtf(192.F / 576.F) * log2e);
+            smem.qkScaleLog2e = args.qScale * args.kvCacheScale[0] * log2e;
         }
 
         if (threadIdx.x < headGrpSize)
