@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -328,3 +328,30 @@ def _register_fake():
         return torch.empty_like(input,
                                 dtype=torch.float8_e4m3fn), input.new_empty(
                                     sz, dtype=torch.float)
+
+    @torch.library.register_fake("trtllm::causal_conv1d_fwd")
+    def _(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias_: Optional[torch.Tensor],
+        conv_states: Optional[torch.Tensor],
+        query_start_loc: Optional[torch.Tensor],
+        cache_indices: Optional[torch.Tensor],
+        has_initial_state: Optional[torch.Tensor],
+        silu_activation: bool,
+        pad_slot_id: int,
+    ) -> None:
+        pass
+
+    @torch.library.register_fake("trtllm::causal_conv1d_update")
+    def _(
+        x: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias_: Optional[torch.Tensor],
+        silu_activation: bool,
+        cache_seqlens_: Optional[torch.Tensor],
+        conv_state_indices_: Optional[torch.Tensor],
+        pad_slot_id: int,
+    ) -> None:
+        pass
