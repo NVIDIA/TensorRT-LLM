@@ -18,10 +18,12 @@ class SimpleConfig:
     # 1. Sharded checkpoint (multiple files) in the safetensors format
     # 2. Single, unsharded checkpoint in the safetensors format
     # 3. Single, unsharded checkpoint in the pytorch format (.pt/.pth) file ending.
-    # If no `model` argument is provided, the checkpoint directory is used to infer the model
-    # architecture.
-    model: Optional[str] = None
-    model_factory: Literal["AutoModelForCausalLM"] = "AutoModelForCausalLM"
+    model: str
+    # same as model. None defaults to model. Only used if customize_tokenizer is True
+    tokenizer: Optional[str] = None
+    model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = (
+        "AutoModelForCausalLM"
+    )
     skip_loading_weights: bool = False  # only load the architecture, not the weights
     customize_tokenizer: bool = False  # True: tokenizer from the model factory, False: from LLM api
 
@@ -54,6 +56,8 @@ class SimpleConfig:
     max_seq_len: int = 512  # max sequence length for inference/cache
     max_batch_size: int = 8  # max dimension for statically allocated kv cache
     page_size: int = 64  # page size for attention
+    simple_shard_only: bool = False  # if True, force simple sharding(all_gather) in TP;
+    # otherwise auto-detect and use column+row (all_reduce) sharding
 
     ### SOME SIMPLE PROMPTING CONFIG ###############################################################
     batch_size: int = 2  # example input shape
@@ -76,13 +80,14 @@ class SimpleConfig:
     visualize: bool = False
 
     ### BENCHMARKING CONFIG ########################################################################
-    free_mem_ratio: float = 0.8  # specifies the fraction of available memory to occupy for cache
+    free_mem_ratio: float = 0.0  # specifies the fraction of available memory to occupy for cache
     benchmark: bool = False  # If true, set ISO to 2048 random int and OSL to 128
     benchmark_num: int = 10  # By default run 10 times and get average
     benchmark_isl: int = 2048  # input seq length for benchmarking
     benchmark_osl: int = 128  # output seq length for benchmarking
     benchmark_bs: int = 1  # batch size for benchmarking
     benchmark_results_path: Optional[str] = "./benchmark_results.json"
+    benchmark_store_results: bool = False  # if True, store benchmark res in benchmark_results_path
 
     ### POST INITIALIZATION ########################################################################
     def __post_init__(self):

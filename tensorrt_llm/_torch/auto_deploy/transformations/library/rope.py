@@ -53,7 +53,13 @@ import torch
 from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
-from ...utils.node_utils import bfs, extract_output_tuple, identify_regions_between_residuals, is_op
+from ...utils.node_utils import (
+    bfs,
+    extract_op_args,
+    extract_output_tuple,
+    identify_regions_between_residuals,
+    is_op,
+)
 from .._graph import canonicalize_graph
 
 
@@ -68,10 +74,10 @@ def match_explicit_rope(gm: GraphModule) -> GraphModule:
     by a call to `rope::torch_apply_rope_with_qk_interleaving` or
     `rope::torch_apply_rope_with_explicit_cos_sin` respectively.
     """
-    ad_logger.info("Match explicit(HF) style RoPE")
     graph = gm.graph
     boundary_nodes: List[torch.fx.Node] = identify_regions_between_residuals(gm)
 
+    num_explicit_rope_patterns = 0
     for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         matches = []  # list of (match_info, is_ds)
         node = start_boundary
@@ -112,8 +118,10 @@ def match_explicit_rope(gm: GraphModule) -> GraphModule:
             _process_input_interleave_rope(graph, q_match, k_match)
         else:
             _process_explicit_rope(graph, q_match, k_match, start_boundary)
-
-    gm = canonicalize_graph(gm)
+        num_explicit_rope_patterns += 1
+    if num_explicit_rope_patterns:
+        gm = canonicalize_graph(gm)
+    ad_logger.info(f"Found and matched {num_explicit_rope_patterns} explicit RoPE patterns")
     return gm
 
 
@@ -126,10 +134,10 @@ def match_complex_rope(gm: GraphModule) -> GraphModule:
     If exactly two such branches (query and key) are detected within each region, they're replaced
     by a call to `torch.ops.rope.torch_apply_rope_with_complex_freqs`.
     """
-    ad_logger.info("Match Complex style RoPE")
     graph = gm.graph
     boundary_nodes: List[torch.fx.Node] = identify_regions_between_residuals(gm)
 
+    num_complex_rope_patterns = 0
     for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         matches = []
         node = start_boundary
@@ -154,17 +162,12 @@ def match_complex_rope(gm: GraphModule) -> GraphModule:
         # since node naming conventions don't reliably indicate q/k branches.
         q_match, k_match = matches
         _process_complex_rope(graph, q_match, k_match)
+        num_complex_rope_patterns += 1
 
-    gm = canonicalize_graph(gm)
+    if num_complex_rope_patterns:
+        gm = canonicalize_graph(gm)
+    ad_logger.info(f"Found and matched {num_complex_rope_patterns} complex RoPE patterns")
     return gm
-
-
-def _get_default_unsqueeze_dim(op):
-    schema = next(iter(op._schemas.values()))
-    for a in schema.arguments:
-        if a.name == "unsqueeze_dim" and a.has_default_value:
-            return a.default_value
-    raise RuntimeError(f"No default unsqueeze_dim on {op}")
 
 
 def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphModule:
@@ -189,18 +192,23 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
     }
 
     need_transpose = False
-    need_canonicalize_graph = False
+    num_rope_layout_matches = 0
     for node in graph.nodes:
         if not is_op(node, rope_ops):
             continue
 
-        rope_op = next(op for op in rope_ops if is_op(node, op))
         if is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
-            q_node, k_node, freqs_node, *rest = node.args
-            unsq = rest[0] if rest else _get_default_unsqueeze_dim(rope_op)
+            q_node, k_node, freqs_node, unsq = extract_op_args(
+                node,
+                "xq",  # argument name in schema
+                "xk",
+                "freqs_cis",
+                "unsqueeze_dim",
+            )
         else:
-            q_node, k_node, cos_node, sin_node, *rest = node.args
-            unsq = rest[0] if rest else _get_default_unsqueeze_dim(rope_op)
+            q_node, k_node, cos_node, sin_node, unsq = extract_op_args(
+                node, "q", "k", "cos", "sin", "unsqueeze_dim"
+            )
 
         if unsq == 2:
             current_layout = "bsnd"
@@ -218,7 +226,7 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         if not need_transpose:
             continue
 
-        need_canonicalize_graph = True
+        num_rope_layout_matches += 1
         # retrieve q and k output node from node
         q_rope_old, k_rope_old = extract_output_tuple(node, 2)
         if q_rope_old is None or k_rope_old is None:
@@ -273,8 +281,9 @@ def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> GraphMo
         q_rope_new.args = (q_rope_old, 1, 2)
         k_rope_new.args = (k_rope_old, 1, 2)
 
-    if need_canonicalize_graph:
+    if num_rope_layout_matches:
         gm = canonicalize_graph(gm)
+    ad_logger.info(f"Found {num_rope_layout_matches} RoPE layout matches")
     return gm
 
 
@@ -285,18 +294,22 @@ def optimize_rope(gm: GraphModule) -> GraphModule:
     Precomputes positional IDs and the fused cosine-sine cache as explicit nodes,
     and reuses those nodes when possible.
     """
-    ad_logger.info("RoPE optimization")
     graph = gm.graph
     rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)
     rope_position_ids_cache: Dict[str, Node] = {}
 
+    num_rope_optimizations = 0
     for node in list(graph.nodes):
         if is_op(node, torch.ops.rope.torch_apply_rope_with_explicit_cos_sin):
             _optimize_explicit(graph, node, rope_flash_cache, rope_position_ids_cache)
         elif is_op(node, torch.ops.rope.torch_apply_rope_with_complex_freqs):
             _optimize_complex(graph, node, rope_flash_cache, rope_position_ids_cache)
-
-    gm = canonicalize_graph(gm)
+        else:
+            continue
+        num_rope_optimizations += 1
+    if num_rope_optimizations:
+        gm = canonicalize_graph(gm)
+    ad_logger.info(f"Found {num_rope_optimizations} RoPE optimizations")
     return gm
 
 
@@ -397,7 +410,13 @@ def _optimize_explicit(
 def _optimize_complex(
     graph: GraphModule, node: Node, cache: Dict[Any, Node], pos_cache: Dict[str, Node]
 ) -> None:
-    q_node, k_node, inv_freq_node = node.args
+    # q_node, k_node, inv_freq_node = node.args
+    q_node, k_node, inv_freq_node = extract_op_args(
+        node,
+        "xq",  # argument name in schema
+        "xk",
+        "freqs_cis",
+    )
 
     # Sanity check on head_dim
     if not _validate_rope_inputs(q_node, k_node):

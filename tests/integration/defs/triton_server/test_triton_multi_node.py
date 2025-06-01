@@ -10,6 +10,7 @@ from .common import *
 @pytest.mark.skip_less_device_memory(80000)
 def test_gpt175b_dummyWeights_multi_node_engine_config(
     tensorrt_llm_gpt_example_root,
+    tensorrt_llm_example_root,
     gpt_tokenizer_model_root,
 ):
     ACCUMULATE_TOKEN = "False"
@@ -36,7 +37,8 @@ def test_gpt175b_dummyWeights_multi_node_engine_config(
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build Engine
     ENGINE_PATH = prepare_gpt_multi_node_engine("ifb",
-                                                tensorrt_llm_gpt_example_root)
+                                                tensorrt_llm_gpt_example_root,
+                                                tensorrt_llm_example_root)
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
     prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)

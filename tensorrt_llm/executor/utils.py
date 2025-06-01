@@ -5,6 +5,8 @@ from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from typing import Any, Callable, List, NamedTuple, Optional
 
+from strenum import StrEnum
+
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.bindings.executor import Response
 from tensorrt_llm.llmapi.utils import print_colored_debug
@@ -14,13 +16,24 @@ from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.utils import print_colored_debug
 
+
+class LlmLauncherEnvs(StrEnum):
+    # Spawn a process for the LLM-API Proxy
+    TLLM_SPAWN_PROXY_PROCESS = "TLLM_SPAWN_PROXY_PROCESS"
+    TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR = "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
+    TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = "TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"
+
+    # Whether to use periodical responses handler in await_responses
+    TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT = "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT"
+
+
 PERIODICAL_RESP_IN_AWAIT = os.getenv(
-    "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT") == "1"
+    LlmLauncherEnvs.TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT) == "1"
 
 
 def get_spawn_proxy_process_ipc_addr_env() -> str | None:
     ''' Get the IPC address for the spawn proxy process dynamically. '''
-    return os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR")
+    return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR)
 
 
 def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes | None:
@@ -31,7 +44,7 @@ def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes | None:
 
 def get_spawn_proxy_process_env() -> bool:
     ''' Get the environment variable for the spawn proxy process dynamically. '''
-    return os.getenv("TLLM_SPAWN_PROXY_PROCESS") == "1"
+    return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS) == "1"
 
 
 if PERIODICAL_RESP_IN_AWAIT:
@@ -44,7 +57,7 @@ def create_mpi_comm_session(
     ) == 0, f"create_mpi_comm_session must be called by rank 0, but it was called by rank {mpi_rank()}"
     if get_spawn_proxy_process_env():
         assert get_spawn_proxy_process_ipc_addr_env(
-        ), "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set."
+        ), f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR} is not set."
         print_colored_debug(
             f"Using RemoteMpiPoolSessionClient to bind to external MPI processes at {get_spawn_proxy_process_ipc_addr_env()}\n",
             "yellow")

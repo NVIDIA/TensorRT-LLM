@@ -14,7 +14,7 @@
 # limitations under the License.
 import pytest
 
-from tensorrt_llm.llmapi import LLM
+from tensorrt_llm.llmapi import LLM, EagleDecodingConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -289,4 +289,51 @@ class TestQwen2_5_7BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestEagleVicuna_7B_v1_3(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "lmsys/vicuna-7b-v1.3"
+    MODEL_PATH = f"{llm_models_root()}/vicuna-7b-v1.3"
+
+    speculative_config = EagleDecodingConfig(
+        max_draft_len=63,
+        speculative_model=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
+        num_eagle_layers=4,
+        max_non_leaves_per_layer=10,
+                            eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
+                                            [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
+                                            [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
+                                            [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], \
+                                            [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], \
+                                            [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
+    )
+
+    def test_auto_dtype(self):
+        with LLM(
+                self.MODEL_PATH,
+                max_batch_size=8,  # Spec-dec use case less than bs=8
+                speculative_config=self.speculative_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestEagle2Vicuna_7B_v1_3(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "lmsys/vicuna-7b-v1.3"
+    MODEL_PATH = f"{llm_models_root()}/vicuna-7b-v1.3"
+
+    speculative_config = EagleDecodingConfig(
+        max_draft_len=63,
+        speculative_model=f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3",
+        num_eagle_layers=4,
+        max_non_leaves_per_layer=10,
+        use_dynamic_tree=True,
+        dynamic_tree_max_topK=10)
+
+    def test_auto_dtype(self):
+        with LLM(
+                self.MODEL_PATH,
+                max_batch_size=8,  # Spec-dec use case less than bs=8
+                speculative_config=self.speculative_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
