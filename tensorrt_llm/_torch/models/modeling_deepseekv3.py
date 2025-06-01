@@ -343,7 +343,8 @@ class Deepseekv3MoE(nn.Module):
                  aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig(),
-                 override_quant_config: Optional[QuantConfig] = None):
+                 override_quant_config: Optional[QuantConfig] = None,
+                 layer_idx: Optional[int] = None):
         from ..distributed import AllReduce
 
         super().__init__()
@@ -376,7 +377,8 @@ class Deepseekv3MoE(nn.Module):
             model_config=model_config,
             override_quant_config=override_quant_config,
             aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
-            enable_alltoall=self.enable_alltoall)
+            enable_alltoall=self.enable_alltoall,
+            layer_idx=layer_idx)
 
         self.mapping = model_config.mapping
 
@@ -589,7 +591,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 dtype=config.torch_dtype,
                 model_config=model_config,
                 override_quant_config=quant_config,
-                aux_stream_dict=aux_stream_dict)
+                aux_stream_dict=aux_stream_dict,
+                layer_idx=layer_idx)
         else:
             block_size = 1
             if quant_config and quant_config.group_size is not None:
