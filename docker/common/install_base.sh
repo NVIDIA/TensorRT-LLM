@@ -53,6 +53,8 @@ init_ubuntu() {
     llvm \
     libclang-rt-dev \
     libffi-dev \
+    libnuma1 \
+    libnuma-dev \
     python3-dev \
     python3-pip \
     python-is-python3 \
@@ -88,6 +90,7 @@ install_python_rockylinux() {
     llvm-toolset \
     lld \
     libffi-devel \
+    numactl \
     zlib-devel \
     xz-devel \
     sqlite-devel \
