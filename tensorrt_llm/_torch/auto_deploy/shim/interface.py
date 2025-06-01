@@ -45,11 +45,11 @@ class CachedSequenceInterface:
     def initialize_caches(self) -> None:
         """Initialize caches using the cache initializers."""
         assert not self._caches, "Caches already initialized."
-        ad_logger.info("Setting up caches + moving info args to device")
         self.info.to(self.device)
         self._caches = {
             name: get_cache(self.info) for name, get_cache in self._cache_initializers.items()
         }
+        ad_logger.info(f"Initialized {len(self._caches)} caches for cached attention")
 
     def current_cache_size_bytes(self) -> int:
         """Calculate and return the total size of all caches in bytes."""
@@ -104,6 +104,9 @@ class AutoDeployConfig(PyTorchConfig):
 
     # specifies the fraction of available memory to occupy for cache
     free_mem_ratio: float = 0.8
+
+    simple_shard_only: bool = False  # if True, force simple sharding(all_gather) in TP;
+    # otherwise auto-detect and use column+row (all_reduce) sharding
 
     def __post_init__(self):
         # we don't want to loose the default values for model_kwargs unless explicitly set by the

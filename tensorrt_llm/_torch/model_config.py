@@ -18,7 +18,9 @@ TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 @dataclass
 class MoeLoadBalancerConfig:
     num_slots: Optional[int] = None
-    initial_global_assignments: Optional[Dict[int, List[int]]] = None
+    initial_global_assignments: Optional[Dict[int,
+                                              List[int]]] = field(default=None,
+                                                                  repr=False)
     layer_updates_per_iter: int = 0
 
     num_experts: Optional[int] = field(default=None, init=False)
@@ -85,6 +87,14 @@ class ModelConfig(Generic[TConfig]):
                                               "architectures"):
             self.is_generation = self.is_generation_model(
                 self.pretrained_config.architectures)
+
+    @property
+    def fuse_pos_embd(self):
+        if self.attn_backend == 'TRTLLM':
+            return True
+        elif self.attn_backend == 'FLASHINFER':
+            return False
+        return False
 
     @property
     def enable_flash_mla(self):

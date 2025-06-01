@@ -25,6 +25,7 @@ from typing import Any, Callable, Optional, Union
 
 import numpy as np
 import pandas as pd
+from benchmark_utils import download_and_cache_file
 from datasets import load_dataset
 from transformers import PreTrainedTokenizerBase
 
@@ -242,14 +243,23 @@ class ShareGPTDataset(BenchmarkDataset):
     Implements the ShareGPT dataset.  Loads data from a JSON file and generates
     sample requests based on conversation turns.
     """
+    URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self,
+                 download_timeout: int,
+                 download_path: Optional[str] = None,
+                 **kwargs) -> None:
         super().__init__(**kwargs)
-        self.load_data()
+        self.load_data(download_timeout, download_path)
 
-    def load_data(self) -> None:
+    def load_data(self,
+                  download_timeout: int,
+                  download_path: Optional[str] = None) -> None:
         if self.dataset_path is None:
-            raise ValueError("dataset_path must be provided for loading data.")
+            logger.warning("dataset_path is not provided")
+            self.dataset_path = download_and_cache_file(
+                ShareGPTDataset.URL, download_path,
+                ShareGPTDataset.URL.split("/")[-1], download_timeout)
 
         with open(self.dataset_path, encoding="utf-8") as f:
             self.data = json.load(f)

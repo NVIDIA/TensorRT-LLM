@@ -239,6 +239,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     num_eagle_layers: Optional[int] = None
     max_non_leaves_per_layer: Optional[int] = None
     pytorch_eagle_weights_path: Optional[str] = None
+    eagle3_one_model: Optional[bool] = True
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1204,8 +1205,10 @@ class BaseLlmArgs(BaseModel):
                     from tensorrt_llm._torch.speculative import Eagle3Config
                     self.speculative_config = Eagle3Config(
                         max_draft_tokens=self.speculative_config.max_draft_len,
-                        eagle_weights_path=self.speculative_config.
-                        pytorch_eagle_weights_path)
+                        draft_model_path=self.speculative_config.
+                        pytorch_eagle_weights_path,
+                        eagle3_one_model=self.speculative_config.
+                        eagle3_one_model)
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
                 assert self.backend == 'pytorch'
@@ -1494,10 +1497,10 @@ class TorchLlmArgs(BaseLlmArgs):
         "If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used."
     )
 
-    moe_load_balancer: Optional[Union[object, dict, str]] = Field(
+    moe_load_balancer: Optional[Union[object, str]] = Field(
         default=None,
         description="Configuration for MoE load balancing.",
-        json_schema_extra={"type": f"Union[MoeLoadBalancerConfig, dict, str]"})
+        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.")
@@ -1573,6 +1576,12 @@ class TorchLlmArgs(BaseLlmArgs):
         "How to load the model weights. By default, detect the weight type from the model checkpoint."
     )
 
+    enable_min_latency: bool = Field(
+        default=False,
+        description=
+        "If true, enable min-latency mode. Currently only used for Llama4.",
+    )
+
     @field_validator('load_format', mode='before')
     @classmethod
     def convert_load_format(cls, v):
@@ -1607,20 +1616,19 @@ class TorchLlmArgs(BaseLlmArgs):
         self.model_format = _ModelFormatKind.HF
 
         if isinstance(self.moe_load_balancer, str):
-            assert os.path.exists(self.moe_load_balancer)
-            if self.moe_load_balancer.endswith(".json"):
-                with open(self.moe_load_balancer) as f:
-                    self.moe_load_balancer = json.load(f)
-            elif self.moe_load_balancer.endswith((".yaml", ".yml")):
-                with open(self.moe_load_balancer) as f:
-                    self.moe_load_balancer = yaml.safe_load(f)
-            else:
-                raise ValueError(
-                    f"Unsupported moe load balancer config file: {self.moe_load_balancer}"
+            if not os.path.exists(self.moe_load_balancer):
+                raise FileNotFoundError(
+                    f"MoE load balancer config file not found: {self.moe_load_balancer}"
                 )
-        if isinstance(self.moe_load_balancer, dict):
-            self.moe_load_balancer = MoeLoadBalancerConfig(
-                **self.moe_load_balancer)
+            try:
+                with open(self.moe_load_balancer) as f:
+                    moe_load_balancer_config = yaml.safe_load(f)
+                self.moe_load_balancer = MoeLoadBalancerConfig(
+                    **moe_load_balancer_config)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load MoE load balancer config file: {self.moe_load_balancer}"
+                ) from e
 
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
@@ -1658,7 +1666,8 @@ class TorchLlmArgs(BaseLlmArgs):
             torch_compile_enable_userbuffers,
             autotuner_enabled=self.autotuner_enabled,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
-            load_format=self.load_format)
+            load_format=self.load_format,
+            enable_min_latency=self.enable_min_latency)
 
     @field_validator('cuda_graph_max_batch_size')
     @classmethod
