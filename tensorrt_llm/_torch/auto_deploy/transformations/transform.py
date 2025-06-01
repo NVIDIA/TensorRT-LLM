@@ -20,7 +20,6 @@ from .library import (
     ep_shard,
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
-    fuse_moe,
     insert_cached_attention,
     match_attention_layout,
     match_causal_attn_mask,
@@ -139,7 +138,7 @@ class InferenceOptimizer:
         egm = optimize_rope(egm)
 
         # run TP sharding across ranks
-        egm = column_row_shard(egm, local_rank, world_size)
+        egm = column_row_shard(egm, local_rank, world_size, self.ad_config.simple_shard_only)
 
         # run EP sharding across ranks
         egm = ep_shard(egm, local_rank, world_size)
@@ -168,10 +167,11 @@ class InferenceOptimizer:
         ############################################################################################
 
         # run MoE fusion
-        egm = fuse_moe(egm)
+        # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+        # egm = fuse_moe(egm)
 
         # run GEMM fusion
-        # TODO: this is causing OOMs, so we're disabling it for now
+        # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
         # egm = fuse_gemms(egm)
 
         # check if we can fuse allreduce, residual and rmsnorm

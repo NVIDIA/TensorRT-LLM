@@ -18,9 +18,9 @@ class SimpleConfig:
     # 1. Sharded checkpoint (multiple files) in the safetensors format
     # 2. Single, unsharded checkpoint in the safetensors format
     # 3. Single, unsharded checkpoint in the pytorch format (.pt/.pth) file ending.
-    # If no `model` argument is provided, the checkpoint directory is used to infer the model
-    # architecture.
-    model: Optional[str] = None
+    model: str
+    # same as model. None defaults to model. Only used if customize_tokenizer is True
+    tokenizer: Optional[str] = None
     model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = (
         "AutoModelForCausalLM"
     )
@@ -37,9 +37,6 @@ class SimpleConfig:
     # Note that that if the kwarg does not exist in the model config class, it will be ignored.
     # An example model config class can be found [here](https://github.com/huggingface/transformers/blob/c409cd81777fb27aadc043ed3d8339dbc020fb3b/src/transformers/models/llama/configuration_llama.py#L26).
     model_kwargs: Dict = field(default_factory=dict)
-
-    # TODO: temp fix for dashboard to modify the number of hidden layers
-    num_hidden_layers: int = -1
 
     ### TOKENIZER EXTRA KWARGS #####################################################################
     # Extra kwargs for the tokenizer class to customize the tokenizer. Same as model_kwargs.
@@ -59,6 +56,8 @@ class SimpleConfig:
     max_seq_len: int = 512  # max sequence length for inference/cache
     max_batch_size: int = 8  # max dimension for statically allocated kv cache
     page_size: int = 64  # page size for attention
+    simple_shard_only: bool = False  # if True, force simple sharding(all_gather) in TP;
+    # otherwise auto-detect and use column+row (all_reduce) sharding
 
     ### SOME SIMPLE PROMPTING CONFIG ###############################################################
     batch_size: int = 2  # example input shape
@@ -88,6 +87,7 @@ class SimpleConfig:
     benchmark_osl: int = 128  # output seq length for benchmarking
     benchmark_bs: int = 1  # batch size for benchmarking
     benchmark_results_path: Optional[str] = "./benchmark_results.json"
+    benchmark_store_results: bool = False  # if True, store benchmark res in benchmark_results_path
 
     ### POST INITIALIZATION ########################################################################
     def __post_init__(self):
@@ -134,6 +134,3 @@ class SimpleConfig:
         # replicate prompts to get to batch_size
         prompts = self.prompt * (self.batch_size // len(self.prompt) + 1)
         self.prompt = prompts[: self.batch_size]
-
-        if self.num_hidden_layers != -1:
-            self.model_kwargs["num_hidden_layers"] = self.num_hidden_layers
