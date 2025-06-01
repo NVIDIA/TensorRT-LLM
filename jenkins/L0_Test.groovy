@@ -1230,11 +1230,21 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         if (perfMode) {
+            basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
+            basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
             stage("Check perf result") {
                 sh """
                     python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
                     ${stageName}/perf_script_test_results.csv \
-                    ${llmSrc}/tests/integration/defs/perf/base_perf.csv
+                    ${basePerfPath}
+                """
+            }
+            stage("Create perf report") {
+                sh """
+                    python3 ${llmSrc}/tests/integration/defs/perf/create_perf_comparison_report.py \
+                    --output_path ${stageName}/report.pdf \
+                    --files ${stageName}/perf_script_test_results.csv \
+                    ${basePerfPath}
                 """
             }
         }
@@ -1572,8 +1582,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "H100_PCIe-TensorRT-[Post-Merge]-2": ["h100-cr", "l0_h100", 2, 2],
         "B200_PCIe-Triton-Python-[Post-Merge]-1": ["b100-ts2", "l0_b200", 1, 1],
         "DGX_H100-4_GPUs-TensorRT-[Post-Merge]-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "A100_80GB_PCIE-TensorRT-Perf-1": ["a100-80gb-pcie", "l0_perf", 1, 1],
+        // "A100_80GB_PCIE-TensorRT-Perf-1": ["a100-80gb-pcie", "l0_perf", 1, 1],
         "H100_PCIe-TensorRT-Perf-1": ["h100-cr", "l0_perf", 1, 1],
+        "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-8_GPUs-PyTorch-[Post-Merge]-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 2, 4],
         "DGX_H200-4_GPUs-PyTorch-[Post-Merge]-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 2, 4],
