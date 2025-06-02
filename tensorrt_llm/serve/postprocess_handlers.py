@@ -139,7 +139,9 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
         if finish_reason_sent[i]:
             continue
 
-        delta_text = output.text_diff
+        delta_text, args.last_text_len = output.text_diff_safe(args.last_text_len)
+        if delta_text == '' and not output.finish_reason and not output.stop_reason:
+            continue
 
         in_reasoning, delta_text, reasoning_delta_text = apply_reasoning_parser(
             args, i, delta_text, True)
@@ -162,8 +164,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
                                                     delta=delta_message,
                                                     finish_reason=None)
         if args.return_logprobs:
-            logprobs = output.logprobs_diff
-            token_ids = output.token_ids_diff
+            logprobs, args.last_logprobs_len = output.logprobs_diff_safe(args.last_logprobs_len)
+            token_ids, args.last_token_ids_len = output.token_ids_diff_safe(args.last_token_ids_len)
             choice.logprobs = create_logprobs(token_ids, args.tokenizer, logprobs)
         if output.finish_reason is not None:
             choice.finish_reason = output.finish_reason
@@ -282,9 +284,11 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase, args:
         include_continuous_usage = False
 
     for output in rsp.outputs:
-        delta_text = output.text_diff
+        delta_text, args.last_text_len = output.text_diff_safe(args.last_text_len)
         if args.echo and args.first_iteration:
             delta_text = args.prompt + delta_text
+        if delta_text == '' and not output.finish_reason and not output.stop_reason:
+            continue
         choice = CompletionResponseStreamChoice(
             index=args.prompt_idx * args.num_choices + output.index,
             text=delta_text,
