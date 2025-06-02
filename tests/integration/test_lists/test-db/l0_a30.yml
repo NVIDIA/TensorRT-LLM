@@ -64,6 +64,8 @@ l0_a30:
       backend: triton
   tests:
   - triton_server/test_triton.py::test_opt[opt]
+  - triton_server/test_triton_llm.py::test_llmapi_backend[1-0-disableDecoupleMode-tensorrt_llm]
+  - triton_server/test_triton_llm.py::test_llmapi_backend[1-0-enableDecoupleMode-tensorrt_llm]
 - condition:
     ranges:
       system_gpu_count:
