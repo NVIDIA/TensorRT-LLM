@@ -61,6 +61,20 @@ l0_a30:
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
+      backend: triton
+  tests:
+  - triton_server/test_triton.py::test_opt[opt]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a30*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
