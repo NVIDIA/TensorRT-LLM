@@ -8,7 +8,7 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
 import zmq
 import zmq.asyncio
 
-import tensorrt_llm.serialization as serialization
+from tensorrt_llm import serialization
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm

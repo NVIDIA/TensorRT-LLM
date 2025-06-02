@@ -9,7 +9,7 @@ import torch
 import zmq
 import zmq.asyncio
 
-import tensorrt_llm.serialization as serialization
+from tensorrt_llm import serialization
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_rank, nvtx_range_debug
