@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@yanchaol-ubuntu-mirror']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1003,6 +1003,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         if (env.alternativeTrtSBSA) {
                             parameters += [
                                 "alternativeTRT": env.alternativeTrtSBSA,
+                            ]
+                        }
+
+                        if (env.testPhase2StageName) {
+                            parameters += [
+                                'testPhase2StageName': env.testPhase2StageName,
                             ]
                         }
 
