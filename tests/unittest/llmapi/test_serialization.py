@@ -3,7 +3,7 @@ import tempfile
 
 import torch
 
-import tensorrt_llm.serialization as serialization
+from tensorrt_llm import serialization
 from tensorrt_llm.auto_parallel.config import AutoParallelConfig
 from tensorrt_llm.auto_parallel.parallelization import ParallelConfig
 from tensorrt_llm.auto_parallel.simplifier import GraphConfig, StageType
