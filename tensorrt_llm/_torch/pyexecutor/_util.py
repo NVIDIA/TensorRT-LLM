@@ -427,7 +427,8 @@ def create_py_executor_instance(
         max_num_sequences,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,
-        two_step_lookahead=mapping.has_pp())
+        two_step_lookahead=mapping.has_pp()
+        or not pytorch_backend_config.disable_overlap_scheduler)
     mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
                                            executor_config.max_num_tokens,
                                            ctx_chunk_config)
