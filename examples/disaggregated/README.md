@@ -100,5 +100,5 @@ curl http://localhost:8000/v1/completions     -H "Content-Type: application/json
 ```
 Or using the provided client parsing the prompts from a file and sending request to the disaggregated server specified in the `disagg_config.yaml` file at the `chat` endpoint:
 ```
-python3 ./clients/disagg_client.py -c disagg_config.yaml -p ./clients/prompts.json --e chat
+python3 ./clients/disagg_client.py -c disagg_config.yaml -p ./clients/prompts.json -e chat
 ```
