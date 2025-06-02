@@ -1488,8 +1488,7 @@ class PyExecutor:
                 request_ids=[0],
                 is_gen=not self.has_context_request,
                 prepare_resource=not self.has_context_request,
-                max_num_draft_tokens=0
-                if self.has_context_request else self.max_draft_tokens,
+                max_num_draft_tokens=self.max_draft_tokens,
             )[0]
             llm_request.is_attention_dp_dummy = True
             self.active_requests.append(llm_request)
@@ -1525,7 +1524,8 @@ class PyExecutor:
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
-                req.py_draft_tokens = req.context_phase_params.draft_tokens
+                ctx_draft_tokens = req.context_phase_params.draft_tokens
+                req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.sampling_config.beam_width
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
@@ -1583,14 +1583,20 @@ class PyExecutor:
         @nvtx_range(
             f"[Executor] _forward_step: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
         )
-        def forward(scheduled_requests, resource_manager, new_tensors_device):
-            return self.model_engine.forward(scheduled_requests,
-                                             resource_manager,
-                                             new_tensors_device)
+        def forward(scheduled_requests, resource_manager, new_tensors_device,
+                    gather_context_logits):
+            return self.model_engine.forward(
+                scheduled_requests,
+                resource_manager,
+                new_tensors_device,
+                gather_context_logits=gather_context_logits)
 
         try:
+            gather_context_logits = any(
+                a.py_return_context_logits
+                for a in scheduled_requests.context_requests)
             outputs = forward(scheduled_requests, self.resource_manager,
-                              new_tensors_device)
+                              new_tensors_device, gather_context_logits)
             return outputs
         except Exception as e:
             traceback.print_exc()

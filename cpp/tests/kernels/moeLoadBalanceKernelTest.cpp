@@ -528,7 +528,7 @@ TEST_P(MoeLoadBalanceRouteKernelTest, TestBasicRouting)
     generateRandomExpertSelection();
 
     moeComputeRouteDevice(mMetaInfo, mPlacementInfo, mDeviceTokenSelectedExperts, mDeviceTokenRoutedRankIds,
-        param.maxTokenCountPerRank, mStream);
+        param.maxTokenCountPerRank, false, mStream);
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
 
     computeExpectedRouting();
@@ -556,7 +556,7 @@ TEST_P(MoeLoadBalanceRouteKernelTest, TestInvalidExpertIds)
         cudaSuccess);
 
     moeComputeRouteDevice(mMetaInfo, mPlacementInfo, mDeviceTokenSelectedExperts, mDeviceTokenRoutedRankIds,
-        param.maxTokenCountPerRank, mStream);
+        param.maxTokenCountPerRank, false, mStream);
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
 
     ASSERT_EQ(cudaMemcpy(mHostTokenRoutedRankIds.data(), mDeviceTokenRoutedRankIds, mTotalTokens * sizeof(int),
@@ -575,7 +575,7 @@ TEST_P(MoeLoadBalanceRouteKernelTest, TestInvalidExpertIds)
         cudaSuccess);
 
     moeComputeRouteDevice(mMetaInfo, mPlacementInfo, mDeviceTokenSelectedExperts, mDeviceTokenRoutedRankIds,
-        param.maxTokenCountPerRank, mStream);
+        param.maxTokenCountPerRank, false, mStream);
     ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
 
     ASSERT_EQ(cudaMemcpy(mHostTokenRoutedRankIds.data(), mDeviceTokenRoutedRankIds, mTotalTokens * sizeof(int),

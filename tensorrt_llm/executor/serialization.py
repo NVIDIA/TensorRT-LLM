@@ -50,7 +50,12 @@ BASE_ZMQ_CLASSES = {
     ### ending import of torch models classes
     "tensorrt_llm._torch.pyexecutor.llm_request":
     ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
+    "tensorrt_llm._torch.speculative.mtp": ["MTPConfig"],
+    "tensorrt_llm._torch.speculative.interface": ["SpeculativeDecodingMode"],
+    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm.auto_parallel.config": ["AutoParallelConfig", "CostModel"],
+    "tensorrt_llm.auto_parallel.cluster_info":
+    ["ClusterInfo", "MathThroughput"],
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm.bindings.executor": [
         "BatchingType", "CapacitySchedulerPolicy", "ContextPhaseParams",
@@ -81,7 +86,7 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm.llmapi.llm_args": [
         "_ModelFormatKind", "_ParallelConfig", "CalibConfig",
         "CapacitySchedulerPolicy", "KvCacheConfig", "LookaheadDecodingConfig",
-        "TrtLlmArgs", "SchedulerConfig", "LoadFormat"
+        "TrtLlmArgs", "SchedulerConfig", "LoadFormat", "DynamicBatchConfig"
     ],
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.llm_utils":

@@ -314,7 +314,7 @@ def main(args):
                 theta=pretrain_config.rotary_base,
             )
 
-        if batch_size == 0:
+        if batch_size == 0 or len(batch_input_ids) == 0:
             return [], [], [], {}
         input_lengths = [x.size(0) for x in batch_input_ids]
 

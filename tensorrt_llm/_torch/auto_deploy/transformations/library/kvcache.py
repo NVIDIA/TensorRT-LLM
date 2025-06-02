@@ -37,10 +37,13 @@ def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> GraphM
     assert len(output_nodes) == 1, "Expected exactly one output node!"
     assert len(output_nodes[0].all_input_nodes) == 1, "Expected to only return final tensor output!"
 
+    ad_logger.info(f"Found {len(input_nodes)} input nodes and {len(output_nodes)} output nodes")
+
     # Activate and add extra argument nodes
     new_args = cm.info.switch_to_cached_attn_inputs()
     for name in new_args:
         input_nodes.append(add_graph_input(egm, name))
+    ad_logger.info(f"Added {len(new_args)} new input nodes for cached attention metadata")
 
     egm = canonicalize_graph(egm)
 
@@ -71,7 +74,6 @@ def insert_cached_attention(
     if cm.info.is_paged:
         assert attn_descriptor.is_paged(), "Paged sequence info requires paged attention op."
 
-    ad_logger.info(f"Replacing attn op {source_op} with backend {attn_descriptor.__name__}")
     ad_logger.debug(f"Before inserting {attn_descriptor=} with cache: {egm}")
 
     # retrieve input nodes
@@ -95,6 +97,7 @@ def insert_cached_attention(
     buffer_in_lookup: Dict[str, Node] = {}
 
     # replace fused attention node with attention node that has kv cache
+    num_cached_attn_replacements = 0
     for idx, attn_node in enumerate(source_attn_nodes):
         # pick out GEMMs
         qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
@@ -126,8 +129,13 @@ def insert_cached_attention(
             )
         attn_node.replace_all_uses_with(cached_attn_node)
         graph.erase_node(attn_node)
+        num_cached_attn_replacements += 1
 
     egm = canonicalize_graph(egm)
+    ad_logger.info(
+        f"Replaced {num_cached_attn_replacements} {source_op} ops "
+        f"with {attn_descriptor.get_cached_attention_op()}"
+    )
     ad_logger.debug(f"After inserting {attn_descriptor=} with cache: {egm}")
 
     return egm

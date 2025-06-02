@@ -81,9 +81,10 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
 // @param tokenSelectedExperts: the selected experts of all tokenCount tokens, has shape of [tokenCount * topK]
 // @param tokenRoutedRankIds: output the routed slotIds of all tokenCount tokens, has shape of [tokenCount * topK]
 // @param tokenCount: the token count to compute the route
+// @param offsetByEpRank: whether to offset the round robin position by epRank
 // @param stream: the CUDA stream to be used
 void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo placementInfo,
-    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, cudaStream_t stream);
+    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank, cudaStream_t stream);
 
 // @brief wait for the signal from gpu to cpu on host
 //

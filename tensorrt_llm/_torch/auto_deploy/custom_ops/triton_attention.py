@@ -39,6 +39,7 @@ def _generate_mha(
     v_cache: torch.Tensor,
     cache_locs: torch.Tensor,
     input_pos: torch.Tensor,
+    scale: float,
     out: torch.Tensor,
 ):
     b, (n_heads, q_d_head) = q.shape[0], q.shape[-2:]
@@ -88,6 +89,7 @@ def _generate_mha(
         stage1_output_values,
         stage1_output_logsumexp,
         num_blocks,
+        scale,
         max_seq_len,
         n_heads,
         n_kv_heads,
@@ -118,6 +120,7 @@ def _flattened_context_mha(
     v_cache: torch.Tensor,
     seq_len: torch.Tensor,
     seq_start: torch.Tensor,
+    scale: float,
     out: torch.Tensor,
 ) -> None:
     # NOTE: s_total == sum(seq_len)
@@ -145,7 +148,6 @@ def _flattened_context_mha(
     )
 
     # TODO: use input_pos to get the correct cache locations
-    softmax_scale = 1.0 / math.sqrt(q_d_head)
     grid = (BATCH_SIZE, n_heads, (max(seq_len) + SEQ_BLOCK - 1) // SEQ_BLOCK)
     context_attention_kv_flattened[grid](
         q,
@@ -156,7 +158,7 @@ def _flattened_context_mha(
         input_pos,
         cache_loc,
         out,
-        softmax_scale,
+        scale,
         n_heads,
         n_kv_heads,
         q_d_head,
@@ -184,7 +186,7 @@ def flattened_mha_with_cache(
     # BUFFERS
     # <none>
     # CONSTANTS
-    scale: Optional[float],  # TODO: build support for softmax scale
+    scale: Optional[float],
 ) -> torch.Tensor:
     """Flattened MHA with cache that takes q, k, v in BSND layout.
 
@@ -216,11 +218,12 @@ def flattened_mha_with_cache(
     k = k.contiguous().view(*bs_view, num_kv_heads, qk_head_dim)
     v = v.contiguous().view(*bs_view, num_kv_heads, v_head_dim)
 
+    scale = 1.0 / math.sqrt(qk_head_dim) if scale is None else scale
     # run attention
     y = q.new_empty(*bs_view, num_heads, v_head_dim).contiguous()
     if s == 1:
         # generate-only phase
-        _generate_mha(q, k, v, k_cache, v_cache, cache_loc, input_pos, y)
+        _generate_mha(q, k, v, k_cache, v_cache, cache_loc, input_pos, scale, y)
     else:
         # mixed context + generate phase
         _flattened_context_mha(
@@ -233,6 +236,7 @@ def flattened_mha_with_cache(
             v_cache,
             seq_len,
             seq_start,
+            scale,
             y,
         )
 
@@ -362,9 +366,6 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         # retrieve head_dim from k_fake
-        k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
-        head_dim = k_fake.shape[3]
-
         attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
         )
@@ -382,14 +383,9 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
 
         # do a sanity check on the scale if it is not None, we only support the default scale
         # of 1/sqrt(head_dim) and so we should do an approximate check for that one
-        if scale is not None:
-            expected_scale = 1.0 / math.sqrt(head_dim)
-
-            if not math.isclose(scale, expected_scale, rel_tol=1e-3, abs_tol=1e-3):
-                ad_logger.warning(
-                    f"Only default scale is supported for TritonWithFlattenedInputs, "
-                    f"got {scale=} instead of {expected_scale=}"
-                )
+        if not isinstance(scale, float):
+            ad_logger.warning("Provided scale is not a float, Using default scale instead.")
+            scale = None
 
         return [
             scale,  # softmax scale

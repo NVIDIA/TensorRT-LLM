@@ -83,7 +83,7 @@ def collect_and_clean_myelin_time(log: str):
 
 class PerfMetricType(str, Enum):
     """
-    An string-enum type to define what kind of perf metric it is. While it is not used by TURTLE, it is used by QA to
+    An string-enum type to define what kind of perf metric it is. It is used by QA to
     set up special threshold criteria for each type of metrics (like >50MB for engine size increase, etc.).
     """
     INFERENCE_TIME = "INFERENCE_TIME"
@@ -352,13 +352,12 @@ class AbstractPerfScriptTestClass(abc.ABC):
         """
         Get the absolute threshold used to flag a perf regression compared to perf baseline.
         Perf comparison will only fail if it exceeds both relative and absolute thresholds.
-        Note: This is not honored by TURTLE for now, but we can add the support later.
         """
         return 0.0
 
     def get_metric_type(self) -> PerfMetricType:
         """
-        Get the type of perf metric. This does not affect TURTLE for now, but QA uses this field to set up special
+        Get the type of perf metric. QA uses this field to set up special
         threshold criteria depending on the metric type.
         """
         return PerfMetricType.INFERENCE_TIME
@@ -409,6 +408,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
         self._gpu_clock_lock = gpu_clock_lock
         tmpDir = temp_wd(self.get_working_dir())
 
+        is_prepare_dataset_cmd = 'prepare_dataset' in commands.get_cmd_str(
+            cmd_idx)
+
         # Start the timer.
         self._start_timestamp = datetime.utcnow()
         try:
@@ -422,16 +424,17 @@ class AbstractPerfScriptTestClass(abc.ABC):
                                 buf), self._gpu_clock_lock, tmpDir:
                             output = commands.run_cmd(cmd_idx, venv)
                             # Print the output log to buf.
+                            # if not is_prepare_dataset_cmd:
                             print(collect_and_clean_myelin_time(output))
                     else:
                         with contextlib.redirect_stdout(buf), tmpDir:
                             output = commands.run_cmd(cmd_idx, venv)
                             # Print the output log to buf.
+                            # if not is_prepare_dataset_cmd:
                             print(collect_and_clean_myelin_time(output))
 
                     # Print the output log to stdout and cache it.
-                    # skip the output log for prepare dataset command
-                    if 'prepare_dataset' not in commands.get_cmd_str(cmd_idx):
+                    if not is_prepare_dataset_cmd:
                         print(buf.getvalue())
                     outputs[cmd_idx] = buf.getvalue()
             else:
@@ -464,10 +467,11 @@ class AbstractPerfScriptTestClass(abc.ABC):
         # Only save perf result if the result is valid.
         if self._result_state == "valid":
             # Parse the perf result from the test outputs.
-            if self._config.runtime == 'bench' and cmd_idx == 0:
+            if is_prepare_dataset_cmd:
                 print_info(
                     f"skip writing perf result when calling generating dataset in trtllm-bench"
                 )
+                outputs.pop(cmd_idx)
             else:
                 self._perf_result = self.get_perf_result(outputs)
 
@@ -532,8 +536,6 @@ class AbstractPerfScriptTestClass(abc.ABC):
             "original_test_name":
             original_test_name
             if original_test_name is not None else full_test_name,
-            "raw_result":
-            raw_result,
             "perf_metric":
             self._perf_result,
             "total_time__sec":
@@ -562,8 +564,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
         if "csv" in session_data_writer._output_formats:
             csv_name = "perf_script_test_results.csv"
             cvs_result_dict = {**test_description_dict, **test_result_dict}
-            cvs_result_dict["raw_result"] = cvs_result_dict[
-                "raw_result"].replace("\n", "\\n")
+            if "raw_result" in cvs_result_dict:
+                cvs_result_dict["raw_result"] = cvs_result_dict[
+                    "raw_result"].replace("\n", "\\n")
             write_csv(output_dir,
                       csv_name, [cvs_result_dict],
                       list(cvs_result_dict.keys()),

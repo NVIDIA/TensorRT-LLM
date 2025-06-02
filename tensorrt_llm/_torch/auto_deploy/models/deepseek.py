@@ -171,8 +171,8 @@ CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
 }
 
 
-def get_model_from_config_patched(model_config, trust_remote_code):
-    model = _from_config_original(model_config, trust_remote_code=trust_remote_code)
+def get_model_from_config_patched(config, **kwargs):
+    model = _from_config_original(config, **kwargs)
     # Patch modules
     for _, module in model.named_modules():
         if type(module).__name__ in CUSTOM_MODULE_PATCHES.keys():

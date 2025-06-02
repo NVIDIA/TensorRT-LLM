@@ -137,9 +137,9 @@ def _patch_phi3_emb_with_decorator_forward(self, x, position_ids):
     return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-def get_model_from_config_patched(model_config, trust_remote_code):
-    model = _from_config_original(model_config, trust_remote_code=trust_remote_code)
-    if re.search(r"Phi-4-mini-instruct", model_config._name_or_path):
+def get_model_from_config_patched(config, **kwargs):
+    model = _from_config_original(config, **kwargs)
+    if re.search(r"Phi-4-mini-instruct", getattr(config, "_name_or_path", "")):
         for _, module in model.named_modules():
             name = type(module).__name__
             if name == "Phi3RotaryEmbedding":
@@ -147,7 +147,7 @@ def get_model_from_config_patched(model_config, trust_remote_code):
                     _patch_phi4_long_rope_update, module
                 )
         return model
-    if re.search(r"Phi-4-mini-reasoning", model_config._name_or_path):
+    if re.search(r"Phi-4-mini-reasoning", getattr(config, "_name_or_path", "")):
         for _, module in model.named_modules():
             name = type(module).__name__
             if name == "Phi3RotaryEmbedding":
@@ -160,7 +160,7 @@ def get_model_from_config_patched(model_config, trust_remote_code):
         r"Phi-(?:3|3\.5)-"
         r"(?:mini|medium)"
     )
-    if not re.search(pattern, model_config._name_or_path):
+    if not re.search(pattern, getattr(config, "_name_or_path", "")):
         return model
     for _, module in model.named_modules():
         name = type(module).__name__

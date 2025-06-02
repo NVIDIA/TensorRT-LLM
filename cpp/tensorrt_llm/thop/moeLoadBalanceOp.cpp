@@ -83,7 +83,8 @@ void moeLoadBalanceStatistic(torch::Tensor gatheredRawExpertIds, torch::Tensor e
         static_cast<bool>(isFirstStage), static_cast<bool>(isLastStage), gatheredRawExpertIds.data_ptr<int>(), stream);
 }
 
-torch::Tensor moeLoadBalanceRouting(torch::Tensor tokenSelectedExperts, int64_t singleLayerLoadBalancerPtr)
+torch::Tensor moeLoadBalanceRouting(
+    torch::Tensor tokenSelectedExperts, bool offsetByEpRank, int64_t singleLayerLoadBalancerPtr)
 {
     CHECK_INPUT(tokenSelectedExperts, torch::kInt32);
     TORCH_CHECK(tokenSelectedExperts.dim() == 2, "tokenSelectedExperts must be a 2D tensor");
@@ -103,7 +104,7 @@ torch::Tensor moeLoadBalanceRouting(torch::Tensor tokenSelectedExperts, int64_t 
     auto tokenRoutedSlotIds = torch::empty_like(tokenSelectedExperts);
 
     tensorrt_llm::kernels::moeComputeRouteDevice(metaInfo, loadBalancer->getPlacementCpuInfo()->placementInfoForGPU,
-        tokenSelectedExperts.data_ptr<int>(), tokenRoutedSlotIds.data_ptr<int>(), tokenCount, stream);
+        tokenSelectedExperts.data_ptr<int>(), tokenRoutedSlotIds.data_ptr<int>(), tokenCount, offsetByEpRank, stream);
 
     return tokenRoutedSlotIds;
 }
@@ -144,7 +145,9 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("moe_load_balance_routing(Tensor token_selected_experts, int single_layer_load_balancer_ptr) -> Tensor");
+    m.def(
+        "moe_load_balance_routing(Tensor token_selected_experts, bool offset_by_ep_rank, "
+        "int single_layer_load_balancer_ptr) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

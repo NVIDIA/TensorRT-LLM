@@ -247,7 +247,7 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
 
 template <int MAX_EXPERT_COUNT = 1024, int THREAD_COUNT = 256, int ITEM_PER_THREAD = 4>
 __global__ void moeComputeRouteKernel(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo placementInfo,
-    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount)
+    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank)
 {
     using BlockSort = cub::BlockRadixSort<int, THREAD_COUNT, 1>;
     extern __shared__ int sharedGlobalSlotIdsInfo[];
@@ -338,6 +338,10 @@ __global__ void moeComputeRouteKernel(MoeLoadBalanceMetaInfo metaInfo, MoePlacem
                 int replicaCount = sharedExpertReplicaCount[expertId];
                 int replicaStartOffset = sharedExpertReplicaStartOffset[expertId];
                 int key = blockIdx.x + idxInBlock; // using local round robin here, do we need global round robin?
+                if (offsetByEpRank)
+                {
+                    key += metaInfo.epRank;
+                }
                 int replicaId = key % replicaCount;
                 targetGlobalSlotId = sharedGlobalSlotIdsInfo[replicaStartOffset + replicaId];
                 atomicAdd_block(&sharedExpertTokenCount[expertId], 1);
@@ -352,14 +356,14 @@ __global__ void moeComputeRouteKernel(MoeLoadBalanceMetaInfo metaInfo, MoePlacem
 }
 
 void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo placementInfo,
-    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, cudaStream_t stream)
+    int* const tokenSelectedExperts, int* tokenRoutedSlotIds, int tokenCount, bool offsetByEpRank, cudaStream_t stream)
 {
     constexpr int kThreadCount = 256;
     constexpr int kEltPerThread = 4;
     int blockCount = (tokenCount * metaInfo.topK + kThreadCount * kEltPerThread - 1) / (kThreadCount * kEltPerThread);
     int dynamicShmSize = sizeof(int) * metaInfo.epSize * metaInfo.slotCountPerRank;
     moeComputeRouteKernel<1024, kThreadCount, kEltPerThread><<<blockCount, kThreadCount, dynamicShmSize, stream>>>(
-        metaInfo, placementInfo, tokenSelectedExperts, tokenRoutedSlotIds, tokenCount);
+        metaInfo, placementInfo, tokenSelectedExperts, tokenRoutedSlotIds, tokenCount, offsetByEpRank);
 }
 
 void moeWaitSignalForCpuStageHost(MoeLoadBalanceSingleLayerSignal* signal)
