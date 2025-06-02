@@ -190,7 +190,9 @@ def _simple_shard(
             _insert_sharded_matmul(gm, n, 0, rank, world_size, add_dist=True)
 
 
-def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
+def column_row_shard(
+    gm: GraphModule, rank: int, world_size: int, simple_shard_only: bool = False
+) -> GraphModule:
     """A transformation to apply sharding to the model following tensor parallelism.
 
     The transformation is based on the following steps:
@@ -204,7 +206,6 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
        linear node to the last linear node of an identified sharding region.
     # 5. Shard the GEMM nodes or skip accordingly.
     """
-    ad_logger.info("Sharding graph for TP")
     ad_logger.debug("Before sharding graph: " + str(gm))
 
     if world_size < 2:
@@ -256,6 +257,7 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
     #           col_split (dim 1) 2nd group + all_reduce output of 2nd group
     # 3. Linear nodes that are not in two groups or we cannot account for all nodes:
     #       --> row_split (dim 0 of weight) + all_gather (dim -1 of output) output
+    num_shards = 0
     for n_start, n_end in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         # we iterate through all nodes between the two boundary nodes and store linear nodes
         # sorted by their input activation node. We also store remaining nodes.
@@ -278,6 +280,13 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
 
         # nothing to shard
         if len(nodes_linear) == 0:
+            continue
+
+        num_shards += 1
+
+        if simple_shard_only:
+            ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
+            _simple_shard(gm, nodes_linear, rank, world_size)
             continue
 
         # simple shard when we have != 2 groups of linear nodes
@@ -323,8 +332,10 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
                 _insert_sharded_matmul(gm, n, i, rank, world_size, add_dist=i > 0)
 
     # canonicalize and return
-    gm = canonicalize_graph(gm)
+    if num_shards:
+        gm = canonicalize_graph(gm)
     ad_logger.debug("After sharding: " + str(gm))
+    ad_logger.info(f"Found {num_shards} TP shards")
     return gm
 
 
@@ -337,7 +348,6 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
 
     We'll also assume that the inputs to BMM are broadcasted across the devices already.
     """
-    ad_logger.info("Sharding graph for BMM")
     ad_logger.debug("Before sharding graph: " + str(gm))
 
     if world_size < 2:
@@ -345,6 +355,8 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
         return gm
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
+
+    num_bmm_shards = 0
 
     def handle_tensor(
         bmm_node: Node, tensor_node: Node, arg_idx: int, start_idx: int, end_idx: int
@@ -445,7 +457,11 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
             node.replace_all_uses_with(gather_node)
             gather_node.replace_input_with(gather_node, node)
 
+        num_bmm_shards += 1
+
     # Canonicalize and return
-    gm = canonicalize_graph(gm)
+    if num_bmm_shards:
+        gm = canonicalize_graph(gm)
     ad_logger.debug("After sharding BMM: " + str(gm))
+    ad_logger.info(f"Found {num_bmm_shards} BMM shards")
     return gm

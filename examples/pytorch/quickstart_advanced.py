@@ -171,6 +171,8 @@ def setup_llm(args):
               max_batch_size=args.max_batch_size,
               max_num_tokens=args.max_num_tokens,
               enable_attention_dp=args.enable_attention_dp,
+              tensor_parallel_size=args.tp_size,
+              pipeline_parallel_size=args.pp_size,
               moe_expert_parallel_size=args.moe_ep_size,
               moe_tensor_parallel_size=args.moe_tp_size,
               moe_cluster_parallel_size=args.moe_cluster_size,

@@ -15,8 +15,8 @@ import torch
 import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
-from .._utils import (KVCacheEventSerializer, global_mpi_rank, mpi_comm,
-                      mpi_rank, nvtx_range_debug)
+from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
+                      mpi_comm, mpi_rank, nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import PybindMirror
@@ -82,6 +82,9 @@ class GenerationExecutorWorker(GenerationExecutor):
         self._executor_config = executor_config
         self._is_pytorch_backend = getattr(self._executor_config, "backend",
                                            None) == "pytorch"
+
+        if global_mpi_size() > 1:
+            logger.set_rank(self.global_rank)
 
         if isinstance(engine, list):
             engine = engine[self.rank]
