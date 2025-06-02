@@ -5,7 +5,7 @@ Tests for basic graph sharding.
 import pytest
 import torch
 from _graph_test_helpers import run_test
-from _model_test_utils import MLP, BMMModel
+from _model_test_utils import MLP, BMMDynamicModel, BMMModel
 from _torch_test_utils import fp4_compatible, fp8_compatible
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.quant import QUANT_OPS
@@ -74,28 +74,52 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
 
 
 @pytest.mark.parametrize(
-    "quant_config,atol,rtol,num_p_og",
+    "quant_config,atol,rtol,num_p_og,model_class",
     [
         pytest.param(
             {"quant_algo": "FP8"},
             5e-1,
             5e-1,
             lambda num_p_og: num_p_og,
+            BMMModel,
+            marks=pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support"),
+        ),
+        pytest.param(
+            {"quant_algo": "FP8"},
+            5e-1,
+            5e-1,
+            lambda num_p_og: num_p_og,
+            BMMDynamicModel,
             marks=pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support"),
         ),
     ],
 )
-def test_bmm_quantization(quant_config, atol, rtol, num_p_og):
+def test_bmm_quantization(quant_config, atol, rtol, num_p_og, model_class):
     batch_size, seq_len, hidden_dim, num_experts = 2, 2, 16, 1
-    model = BMMModel(hidden_dim, batch_size, num_experts).to(torch.float16).to("cuda")
+
+    # Create model based on class
+    if model_class == BMMModel:
+        model = model_class(hidden_dim, batch_size, num_experts).to(torch.float16).to("cuda")
+    else:  # BMMDynamicModel
+        model = model_class(hidden_dim, batch_size).to(torch.float16).to("cuda")
+
     x = torch.randn(batch_size, seq_len, hidden_dim, dtype=torch.float16).to("cuda")
 
-    # register fp8 scales
+    # Register fp8 scales based on model type
     if quant_config["quant_algo"] == "FP8":
-        model.experts[0].register_buffer("weight1_input_scale", fp8_scale(x))
-        model.experts[0].register_buffer(
-            "weight1_weight_scale", fp8_scale(model.experts[0].weight1)
-        )
+        if model_class == BMMModel:
+            # Parameter case - register scales in the expert module
+            model.experts[0].register_buffer("weight1_input_scale", fp8_scale(x))
+            model.experts[0].register_buffer(
+                "weight1_weight_scale", fp8_scale(model.experts[0].weight1)
+            )
+        else:  # BMMDynamicModel
+            # Dynamic case - register scales in the root model
+            dummy_weight_shape = (batch_size, hidden_dim, hidden_dim)
+            dummy_weight = torch.randn(dummy_weight_shape, dtype=torch.float16, device="cuda")
+
+            model.register_buffer("bmm_dynamic_input_scale", fp8_scale(x))
+            model.register_buffer("bmm_dynamic_weight_scale", fp8_scale(dummy_weight))
 
     gm_transformed = run_test(
         model,

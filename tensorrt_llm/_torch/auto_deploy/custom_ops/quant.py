@@ -241,6 +241,12 @@ def fp8_bmm(
     input = input.contiguous()
     input_fp8 = _to_fp8(input, input_scale)
 
+    # for none fp8 case, we need to convert to fp8
+    if weight_fp8.dtype in [torch.float16, torch.bfloat16]:
+        weight_fp8 = _to_fp8(weight_fp8, weight_scale)
+    else:
+        assert weight_fp8.dtype == torch.float8_e4m3fn
+
     # Ensure weight is in the correct memory layout
     # For cuBLASLt, we need one matrix in row-major and one in column-major format
     # Since PyTorch uses row-major by default, we'll transpose the weight to get a different layout

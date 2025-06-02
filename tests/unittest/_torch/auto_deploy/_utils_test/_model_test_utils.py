@@ -234,6 +234,34 @@ class BMMModel(nn.Module):
         return torch.cat([expert(x) for expert in self.experts], dim=1)
 
 
+class BMMDynamicModel(nn.Module):
+    """BMM model with dynamic tensor weights for testing."""
+
+    def __init__(self, hidden_dim, batch_size):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.batch_size = batch_size
+        # Create a linear layer to generate dynamic weights
+        self.weight_generator = nn.Linear(hidden_dim, hidden_dim * hidden_dim)
+
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, hidden_dim]
+        batch_size, seq_len, hidden_dim = x.shape
+
+        # Generate dynamic weights from input
+        # Take mean across sequence dimension to get [batch_size, hidden_dim]
+        weight_input = x.mean(dim=1)  # [batch_size, hidden_dim]
+
+        # Generate weights: [batch_size, hidden_dim * hidden_dim]
+        weight_flat = self.weight_generator(weight_input)
+
+        # Reshape to BMM weight format: [batch_size, hidden_dim, hidden_dim]
+        dynamic_weights = weight_flat.view(batch_size, hidden_dim, hidden_dim)
+
+        # Perform BMM with dynamic weights
+        return torch.bmm(x, dynamic_weights)
+
+
 def generate_dynamic_shapes(max_batch_size, max_seq_len):
     dynamic_shapes = (
         {

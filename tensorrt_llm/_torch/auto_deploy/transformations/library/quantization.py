@@ -91,10 +91,12 @@ def _insert_quantized_bmm(
     """Replaces the bmm node with a new quantized bmm node."""
     weight_node = node.args[1]
 
-    # Check if weight is a parameter that we need to quantize
+    # Weight is a parameter
     if weight_node.op == "get_attr":
+        # Handle parameter tensor
         param_name = weight_node.target
         original_weight = gm.get_parameter(param_name)
+        weight_shape = original_weight.shape
 
         # Quantize the weight
         new_param = nn.Parameter(
@@ -106,34 +108,60 @@ def _insert_quantized_bmm(
         submod = gm.get_submodule(modname)
         setattr(submod, attrname, new_param)
 
-        def get_scale_name(scale_name):
-            return attrname + "_" + scale_name
-
-        # Register scales directly in the parent module as torch.bmm is not a module
-        for scale_name, scale in quantization_impl.default_scales(original_weight.shape).items():
-            submod.register_buffer(get_scale_name(scale_name), scale)
-
         # Register load state dict hook
         gm._register_load_state_dict_pre_hook(
             partial(quantization_impl.load_hook, weight_name=param_name)
         )
 
-        # Change node target to quantized bmm op
-        node.target = quantization_impl.target_op()
+        # Setup scale names and target module for parameter case
+        def get_scale_name(scale_name):
+            return attrname + "_" + scale_name
 
-        # Insert scale nodes with proper fully qualified names
-        with gm.graph.inserting_before(node):
-            scales = {}
-            for scale_name in quantization_impl.scale_names():
-                scales[scale_name] = gm.graph.create_node(
-                    "get_attr", f"{modname}.{get_scale_name(scale_name)}"
-                )
+        scale_target_module = submod
+        scale_name_prefix = f"{modname}."
 
-        # Update node arguments and kwargs
-        node.kwargs = {**node.kwargs, **scales}
+    # Weight is a dynamic tensor
+    elif hasattr(weight_node, "meta") and "val" in weight_node.meta:
+        weight_shape = weight_node.meta["val"].shape
+
+        # Create a unique identifier for this dynamic weight node
+        node_id = f"bmm_dynamic_{id(node)}"
+
+        # Setup scale names and target module for dynamic case
+        def get_scale_name(scale_name):
+            return f"{node_id}_{scale_name}"
+
+        scale_target_module = gm  # Register in root module
+        scale_name_prefix = ""
+
+        ad_logger.info(f"Quantized BMM with dynamic weight tensor for node {node}")
     else:
-        # If weight is not a parameter, we might need different handling
-        ad_logger.warning(f"BMM weight is not a parameter, skipping quantization for node {node}")
+        # If we can't determine the shape, skip quantization
+        ad_logger.warning(
+            f"BMM weight is dynamic tensor without shape metadata, skipping quantization for node {node}"
+        )
+        return
+
+    # Common logic for both parameter and dynamic tensor cases
+    # Register scales in the target module
+    for scale_name, scale in quantization_impl.default_scales(weight_shape).items():
+        scale_buffer_name = get_scale_name(scale_name)
+        scale_target_module.register_buffer(scale_buffer_name, scale)
+
+    # Change node target to quantized bmm op
+    node.target = quantization_impl.target_op()
+
+    # Insert scale nodes
+    with gm.graph.inserting_before(node):
+        scales = {}
+        for scale_name in quantization_impl.scale_names():
+            scale_buffer_name = get_scale_name(scale_name)
+            scales[scale_name] = gm.graph.create_node(
+                "get_attr", f"{scale_name_prefix}{scale_buffer_name}"
+            )
+
+    # Update node arguments and kwargs
+    node.kwargs = {**node.kwargs, **scales}
 
 
 def quantize(gm: GraphModule, quant_config: Dict[str, Any]):
