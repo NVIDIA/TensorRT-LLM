@@ -88,6 +88,7 @@ LLM_DOCSTRING = LLMARGS_EXPLICIT_DOCSTRING + """
     Attributes:
         tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
         workspace (pathlib.Path): The directory to store intermediate files.
+        llm_id (str): The unique ID of the LLM instance.
 """
 
 

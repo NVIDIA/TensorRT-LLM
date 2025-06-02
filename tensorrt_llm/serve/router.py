@@ -533,7 +533,7 @@ def block_key_hasher(token_ids: list[int],
 class KvCacheAwareRouter(Router):
 
     def __init__(self,
-                 server_role: ServerRole,
+                 server_role: ServerRole = None,
                  servers: list[str] = None,
                  metadata_server: JsonDictionary = None,
                  use_tokens: bool = False,
