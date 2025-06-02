@@ -34,6 +34,25 @@ class BenchmarkSpecification(BaseModel):
         default=None, description="The world to use for benchmarking.")
 
 
+    @model_validator(mode="after")
+    def validate_heuristic_constraints(self):
+        build_options = [
+            self.dataset_path, self.constraints.max_input_len, self.constraints.target_input_len
+        ]
+        if all(opt is None for opt in build_options):
+            raise ValueError(
+                "No engine build option is selected, please provide at least one option."
+            )
+        elif sum([bool(opt) for opt in build_options]) > 1:
+            raise ValueError(
+                "Multiple engine build options detected, please choose only one engine build option."
+            )
+
+        if not self.dataset_path and not self.max_input_len:
+            raise ValueError("Unspecified max_input_len for engine build.")
+        return self
+
+
 
 class BenchmarkEnvironment(BaseModel):
     model: str = Field(default="",
@@ -69,8 +88,6 @@ class ScenarioSpecification(BaseModel):
         default=None, description="The number of concurrent requests to benchmarking.")
     eos_id: Optional[int] = Field(
         default=-1, description="The end-of-sequence token to use for benchmarking.")
-    pad_id: Optional[int] = Field(
-        default=None, description="The padding token to use for benchmarking.")
     extra_llm_api_options: Optional[Dict[str, Any]] = Field(
         default_factory=dict,
         description="A dictionary of extra LLM API options to use for benchmarking.")
@@ -78,6 +95,13 @@ class ScenarioSpecification(BaseModel):
         default=.9,
         description=
         "The percentage of memory to use for KV Cache after model load.")
+    max_batch_size: Optional[int] = Field(
+        default=None, description="The maximum batch size to use for tuning.")
+    max_num_tokens: Optional[int] = Field(
+        default=None,
+        description="The maximum number of tokens to use for tuning.")
+    pad_id: Optional[int] = Field(
+        default=-1, description="The padding token to use for benchmarking.")
 
     class Config:
         extra = "ignore"
@@ -120,35 +144,12 @@ class TuningConstraints(BaseModel):
     max_output_len: Optional[int] = Field(
         default=None,
         description="The maximum output length to use for tuning.")
-    max_batch_size: Optional[int] = Field(
-        default=None, description="The maximum batch size to use for tuning.")
-    max_num_tokens: Optional[int] = Field(
-        default=None,
-        description="The maximum number of tokens to use for tuning.")
     max_seq_len: Optional[int] = Field(
         default=None,
         description="The maximum sequence length to use for tuning.")
 
     class Config:
         extra = "ignore"
-
-    @model_validator(mode="after")
-    def validate_tuning_setup(self):
-        build_options = [
-            self.dataset_path, self.max_input_len, self.target_input_len
-        ]
-        if all(opt is None for opt in build_options):
-            raise ValueError(
-                "No engine build option is selected, please provide at least one option."
-            )
-        elif sum([bool(opt) for opt in build_options]) > 1:
-            raise ValueError(
-                "Multiple engine build options detected, please choose only one engine build option."
-            )
-
-        if not self.dataset_path and not self.max_input_len:
-            raise ValueError("Unspecified max_input_len for engine build.")
-        return self
 
     @model_validator(mode="after")
     def validate_max_input_len(self):
