@@ -141,10 +141,11 @@ public:
     ///
     /// \param model The name of the model to provide metrics for.
     /// \param version The version of the model to provide metrics for.
-    /// \param is_v1_model Whether the model type is v1 or an inflight
+    /// \param is_static_batch Whether the model type is static batch or an inflight
     /// batching model.
     /// \return a TRITONSERVER_Error indicating success or failure.
-    TRITONSERVER_Error* InitializeReporter(std::string const& model, const uint64_t version, bool const is_v1_model);
+    TRITONSERVER_Error* InitializeReporter(
+        std::string const& model, const uint64_t version, bool const is_static_batch);
 
     /// Updates the vector of TritonMetricGroup objects with a
     /// JSON-formatted statistics string.
@@ -166,8 +167,8 @@ public:
     static const std::vector<std::string> dis_serving_keys_;
     static const std::vector<std::string> dis_serving_labels_;
 
-    static const std::vector<std::string> v1_specific_keys_;
-    static const std::vector<std::string> v1_specific_labels_;
+    static const std::vector<std::string> static_batch_specific_keys_;
+    static const std::vector<std::string> static_batch_specific_labels_;
 
     static const std::vector<std::string> IFB_specific_keys_;
     static const std::vector<std::string> IFB_specific_labels_;

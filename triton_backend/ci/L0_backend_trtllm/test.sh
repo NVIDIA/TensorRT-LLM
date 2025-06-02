@@ -221,10 +221,11 @@ for NUM_GPU in "${NUM_GPUS_TO_TEST[@]}"; do
 
     wait_for_server_terminated ${SERVER_TIMEOUT} ${SERVER_PID[@]}
 
-    # inflight batching OFF (V1)
+    # inflight batching OFF (STATIC BATCH)
     # streaming OFF
-    SERVER_LOG="./${NUM_GPU}gpu_v1_no_streaming_server.log"
-    replace_config_tags 'INVALID' 'V1' "${MODEL_DIR}/tensorrt_llm/config.pbtxt"
+    SERVER_LOG="./${NUM_GPU}gpu_static_batch_no_streaming_server.log"
+    replace_config_tags 'INVALID' 'inflight_fused_batching' "${MODEL_DIR}/tensorrt_llm/config.pbtxt"
+    replace_config_tags '${batch_scheduler_policy}' 'static_batch' "${MODEL_DIR}/ensemble/config.pbtxt"
 
     run_server "${SERVER_ARGS}"
     wait_for_server_ready ${SERVER_TIMEOUT} ${SERVER_PID[@]}
@@ -244,7 +245,7 @@ for NUM_GPU in "${NUM_GPUS_TO_TEST[@]}"; do
 
     if [ $? -ne 0 ]; then
         cat $SERVER_LOG
-        echo -e "\n***\n*** Error executing v1 benchmark_core_model test with ${NUM_GPU}GPU(s): line ${LINENO}\n***"
+        echo -e "\n***\n*** Error executing static batch benchmark_core_model test with ${NUM_GPU}GPU(s): line ${LINENO}\n***"
         kill_server
         wait_for_server_terminated ${SERVER_TIMEOUT} ${SERVER_PID[@]}
         RET=1
@@ -258,7 +259,7 @@ for NUM_GPU in "${NUM_GPUS_TO_TEST[@]}"; do
 
     if [ $? -ne 0 ]; then
         cat $SERVER_LOG
-        echo -e "\n***\n*** Error executing v1 end-to-end test with ${NUM_GPU}GPU(s): line ${LINENO}\n***"
+        echo -e "\n***\n*** Error executing static batch end-to-end test with ${NUM_GPU}GPU(s): line ${LINENO}\n***"
         kill_server
         wait_for_server_terminated ${SERVER_TIMEOUT} ${SERVER_PID[@]}
         RET=1
@@ -267,7 +268,7 @@ for NUM_GPU in "${NUM_GPUS_TO_TEST[@]}"; do
 
     # Make sure the metrics is retrieved after the server has updated the metrics internally
     sleep ${SLEEP_DURATION}
-    curl localhost:8002/metrics -o ${NUM_GPU}gpu_v1_no_stream_metrics.out
+    curl localhost:8002/metrics -o ${NUM_GPU}gpu_static_batch_no_stream_metrics.out
 
     kill_server
     wait_for_server_terminated ${SERVER_TIMEOUT} ${SERVER_PID[@]}
@@ -275,7 +276,7 @@ for NUM_GPU in "${NUM_GPUS_TO_TEST[@]}"; do
     # inflight batching ON
     # streaming OFF
     SERVER_LOG="./${NUM_GPU}gpu_IFB_no_streaming_server.log"
-    replace_config_tags 'V1' 'inflight_fused_batching' "${MODEL_DIR}/tensorrt_llm/config.pbtxt"
+    replace_config_tags 'static_batch' 'max_utilization' "${MODEL_DIR}/tensorrt_llm/config.pbtxt"
 
     run_server "${SERVER_ARGS}"
     wait_for_server_ready ${SERVER_TIMEOUT} ${SERVER_PID[@]}

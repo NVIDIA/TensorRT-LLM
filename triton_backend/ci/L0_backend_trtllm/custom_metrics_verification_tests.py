@@ -53,9 +53,11 @@ metric_to_stat_dict = {
     "inflight_batcher_specific_metric=generation_requests":
     "Generation Requests",
     "inflight_batcher_specific_metric=paused_requests": "Paused Requests",
-    "v1_specific_metric=total_context_tokens": "Total Context Tokens",
-    "v1_specific_metric=total_generation_tokens": "Total Generation Tokens",
-    "v1_specific_metric=empty_generation_slots": "Empty Generation Slots",
+    "static_batch_specific_metric=total_context_tokens": "Total Context Tokens",
+    "static_batch_specific_metric=total_generation_tokens":
+    "Total Generation Tokens",
+    "static_batch_specific_metric=empty_generation_slots":
+    "Empty Generation Slots",
     "general_type=iteration_counter": "Iteration Counter",
     "general_type=timestamp": "Timestamp",
     "disaggregated_serving_type=kv_cache_transfer_ms": "KV cache transfer time",
@@ -82,7 +84,7 @@ class CustomMetricsTest(unittest.TestCase):
 
                     return json.loads(json_string)
 
-    def _parse_triton_metrics(self, filename, is_v1):
+    def _parse_triton_metrics(self, filename, is_static_batch):
         curl_counts = {}
         with open(filename) as metrics_file:
             for line in metrics_file:
@@ -92,11 +94,11 @@ class CustomMetricsTest(unittest.TestCase):
                     metric_key = metric_output[0]
                     metric_value = metric_output[1]
                     key = self._convert_metric_key_to_stats_key(
-                        metric_key, is_v1)
+                        metric_key, is_static_batch)
                     curl_counts[key] = metric_value
         return curl_counts
 
-    def _convert_metric_key_to_stats_key(self, metric_output, is_v1):
+    def _convert_metric_key_to_stats_key(self, metric_output, is_static_batch):
         # Converts:
         # '{model="tensorrt_llm",request_type="context",version="1"}'
         # to:
@@ -107,15 +109,15 @@ class CustomMetricsTest(unittest.TestCase):
             if not i.startswith('model') and not i.startswith('version')
         ][0]
         self.assertIn(key, metric_to_stat_dict)
-        if (is_v1):
+        if (is_static_batch):
             self.assertNotIn("inflight_batcher_specific_metric", key)
         else:
-            self.assertNotIn("v1_specific_metric", key)
+            self.assertNotIn("static_batch_specific_metric", key)
         return metric_to_stat_dict[key]
 
-    def _base_test(self, stats_file, metrics_file, is_v1):
+    def _base_test(self, stats_file, metrics_file, is_static_batch):
         stats = self._parse_log_file(stats_file)
-        metrics = self._parse_triton_metrics(metrics_file, is_v1)
+        metrics = self._parse_triton_metrics(metrics_file, is_static_batch)
         self.assertEqual(len(stats.keys()), len(metrics.keys()))
         self.assertEqual(list(stats.keys()).sort(), list(metrics.keys()).sort())
         for metric_key in stats.keys():
@@ -140,9 +142,9 @@ class CustomMetricsTest(unittest.TestCase):
                     timedelta(seconds=-1) <= difference, difference
                     <= timedelta(seconds=1))
 
-    def test_1_gpu_v1(self):
-        self._base_test("1gpu_v1_no_streaming_server.log",
-                        "1gpu_v1_no_stream_metrics.out", True)
+    def test_1_gpu_static_batch(self):
+        self._base_test("1gpu_static_batch_no_streaming_server.log",
+                        "1gpu_static_batch_no_stream_metrics.out", True)
 
     def test_1_gpu_IFB_no_stream(self):
         self._base_test("1gpu_IFB_no_streaming_server.log",
@@ -154,9 +156,9 @@ class CustomMetricsTest(unittest.TestCase):
 
     if AVAILABLE_GPUS >= 2:
 
-        def test_2_gpu_v1(self):
-            self._base_test("2gpu_v1_no_streaming_server.log",
-                            "2gpu_v1_no_stream_metrics.out", True)
+        def test_2_gpu_static_batch(self):
+            self._base_test("2gpu_static_batch_no_streaming_server.log",
+                            "2gpu_static_batch_no_stream_metrics.out", True)
 
         def test_2_gpu_IFB_no_stream(self):
             self._base_test("2gpu_IFB_no_streaming_server.log",
@@ -168,9 +170,9 @@ class CustomMetricsTest(unittest.TestCase):
 
     if AVAILABLE_GPUS >= 4:
 
-        def test_4_gpu_v1(self):
-            self._base_test("4gpu_v1_no_streaming_server.log",
-                            "4gpu_v1_no_stream_metrics.out", True)
+        def test_4_gpu_static_batch(self):
+            self._base_test("4gpu_static_batch_no_streaming_server.log",
+                            "4gpu_static_batch_no_stream_metrics.out", True)
 
         def test_4_gpu_IFB_no_stream(self):
             self._base_test("4gpu_IFB_no_streaming_server.log",

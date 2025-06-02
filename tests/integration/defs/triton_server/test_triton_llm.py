@@ -1331,9 +1331,6 @@ def test_whisper_large_v3_ifb(
     whisper_large_model_root,
     llm_backend_venv,
 ):
-    if BATCH_SCHEDULER_POLICY == "static_batch" and FEATURE_NAME == "test_embedding_bias":
-        pytest.skip(
-            "Skipping. static batch doesn't support embedding_bias tensor yet.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")
@@ -1472,9 +1469,6 @@ def test_gpt_gather_logits_ifb(
     gpt_tokenizer_model_root,
     llm_backend_venv,
 ):
-    if BATCH_SCHEDULER_POLICY == "static_batch" and FEATURE_NAME == "test_embedding_bias":
-        pytest.skip(
-            "Skipping. static batch doesn't support embedding_bias tensor yet.")
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build engine
     ENGINE_PATH = prepare_gpt_gather_logits_engine(
@@ -1597,9 +1591,6 @@ def test_gpt_350m_speculative_decoding(
     llm_backend_dataset_root,
     llm_backend_venv,
 ):
-    if BATCH_SCHEDULER_POLICY == "static_batch" and FEATURE_NAME == "test_embedding_bias":
-        pytest.skip(
-            "Skipping. static batch doesn't support embedding_bias tensor yet.")
 
     if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
         pytest.skip("Skipping.")

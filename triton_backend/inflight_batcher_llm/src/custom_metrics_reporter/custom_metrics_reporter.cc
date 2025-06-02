@@ -51,9 +51,9 @@ const std::vector<std::string> CustomMetricsReporter::kv_cache_labels_{
 const std::vector<std::string> CustomMetricsReporter::dis_serving_keys_{"KV cache transfer time", "Request count"};
 const std::vector<std::string> CustomMetricsReporter::dis_serving_labels_{"kv_cache_transfer_ms", "request_count"};
 
-const std::vector<std::string> CustomMetricsReporter::v1_specific_keys_{
+const std::vector<std::string> CustomMetricsReporter::static_batch_specific_keys_{
     "Total Context Tokens", "Total Generation Tokens", "Empty Generation Slots"};
-const std::vector<std::string> CustomMetricsReporter::v1_specific_labels_{
+const std::vector<std::string> CustomMetricsReporter::static_batch_specific_labels_{
     "total_context_tokens", "total_generation_tokens", "empty_generation_slots"};
 
 const std::vector<std::string> CustomMetricsReporter::IFB_specific_keys_{
@@ -162,7 +162,7 @@ std::vector<std::string> const& TritonMetricGroup::JsonKeys() const
 }
 
 TRITONSERVER_Error* CustomMetricsReporter::InitializeReporter(
-    std::string const& model_name, const uint64_t version, bool const is_v1_model)
+    std::string const& model_name, const uint64_t version, bool const is_static_batch)
 {
     /* REQUEST METRIC GROUP */
     request_metric_family_ = std::make_unique<TritonMetricGroup>(
@@ -193,16 +193,17 @@ TRITONSERVER_Error* CustomMetricsReporter::InitializeReporter(
     RETURN_IF_ERROR(dis_serving_metric_family_->CreateGroup(model_name, version, TRITONSERVER_METRIC_KIND_COUNTER));
     metric_groups_.push_back(std::move(dis_serving_metric_family_));
 
-    /* MODEL-TYPE METRIC GROUP (V1 / IFB) */
-    std::string model = (is_v1_model) ? "v1" : "inflight_batcher";
+    /* MODEL-TYPE METRIC GROUP (STATIC BATCH / IFB) */
+    std::string model = (is_static_batch) ? "static_batch" : "inflight_batcher";
     std::string model_metric_family_label = "nv_trt_llm_" + model + "_metrics";
     std::string model_metric_family_description = "TRT LLM " + model + "-specific metrics";
     std::string model_metric_family_category = model + "_specific_metric";
 
-    if (is_v1_model)
+    if (is_static_batch)
     {
-        model_type_metric_family_ = std::make_unique<TritonMetricGroup>(model_metric_family_label,
-            model_metric_family_description, model_metric_family_category, v1_specific_keys_, v1_specific_labels_);
+        model_type_metric_family_
+            = std::make_unique<TritonMetricGroup>(model_metric_family_label, model_metric_family_description,
+                model_metric_family_category, static_batch_specific_keys_, static_batch_specific_labels_);
     }
     else
     {
