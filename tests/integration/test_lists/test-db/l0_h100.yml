@@ -24,7 +24,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=FLASHINFER-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=FLASHINFER-torch_compile=True]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[attn_backend=TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[attn_backend=TRTLLM] TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[attn_backend=FLASHINFER]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=True]
@@ -95,7 +95,7 @@ l0_h100:
   - cpp/test_unit_tests.py::test_unit_tests[common-90]
   - cpp/test_unit_tests.py::test_unit_tests[executor-90]
   - cpp/test_unit_tests.py::test_unit_tests[kernels-90]
-  - cpp/test_unit_tests.py::test_unit_tests[layers-90]
+  - cpp/test_unit_tests.py::test_unit_tests[layers-90] TIMEOUT (90)
   - cpp/test_unit_tests.py::test_unit_tests[runtime-90]
   - cpp/test_unit_tests.py::test_unit_tests[thop-90]
   - cpp/test_unit_tests.py::test_unit_tests[utils-90]
@@ -244,7 +244,7 @@ l0_h100:
   - examples/test_multimodal.py::test_llm_multimodal_general[Mistral-Small-3.1-24B-Instruct-2503-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] # 10 mins
   - examples/test_enc_dec.py::test_llm_enc_dec_mmlu[flan-t5-small-float32-tp:1-pp:1-nb:1-enable_fp8] # 7 mins
-  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8] # 13 mins
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8] # 13 mins TIMEOUT (90)
   - examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] # 18mins
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] # 8 mins
   - unittest/trt/attention/test_bert_attention.py # 12 mins

@@ -25,7 +25,7 @@ l0_gb203:
   - examples/test_llama.py::test_llm_llama_v3_1_1node_single_gpu[llama-3.2-1b-disable_fp8]
   - examples/test_llama.py::test_llm_llama_wo_1gpu_summary[llama-7b-int4-nb:1]
   - examples/test_llama.py::test_llm_llama_wo_1gpu_summary[llama-7b-int8-nb:1]
-  - examples/test_llama.py::test_llm_llama_1gpu[llama-3.1-8b-instruct-hf-fp8-enable_fp8-float16-summarization-nb:1]
+  - examples/test_llama.py::test_llm_llama_1gpu[llama-3.1-8b-instruct-hf-fp8-enable_fp8-float16-summarization-nb:1] TIMEOUT (90)
   # - examples/test_qwen.py::test_llm_qwen1_5_7b_single_gpu_lora[qwen1.5_7b_chat-Qwen1.5-7B-Chat-750Mb-lora] # https://nvbugs/5234573
   # - examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2.5_1.5b_instruct-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha_fp32_acc] # https://nvbugs/5234573
   - llmapi/test_llm_examples.py::test_llmapi_quickstart

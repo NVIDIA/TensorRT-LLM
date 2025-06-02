@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@yanchaol-ubuntu-mirror']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1133,13 +1133,14 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C; fi'
 
         def extraInternalEnv = ""
-        // Move back to 3600 once TRTLLM-4000 gets resolved
-        def pytestTestTimeout = "7200"
+
+        // The default pytest timeout is 1800 seconds. Per-test timeout can be specified in the test-db.
+        def pytestTestTimeout = "1800"
 
         // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
         extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
-        // CPP test execution is timing out easily, so we always override the timeout to 7200
-        extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=7200"
+        // CPP test execution is timing out easily, so we override the timeout to the pytest timeout.
+        extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
 
         def testDBList = renderTestDB(testList, llmSrc, stageName)
         testList = "${testList}_${splitId}"
