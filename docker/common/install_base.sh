@@ -91,6 +91,7 @@ install_python_rockylinux() {
     lld \
     libffi-devel \
     numactl \
+    numactl-devel \
     zlib-devel \
     xz-devel \
     sqlite-devel \
