@@ -3,7 +3,7 @@ import concurrent.futures
 import os
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
-from typing import Any, Callable, List, NamedTuple, Optional
+from typing import Any, Callable, List, NamedTuple
 
 from strenum import StrEnum
 
@@ -61,9 +61,8 @@ def create_mpi_comm_session(
         print_colored_debug(
             f"Using RemoteMpiPoolSessionClient to bind to external MPI processes at {get_spawn_proxy_process_ipc_addr_env()}\n",
             "yellow")
-        hmac_key = get_spawn_proxy_process_ipc_hmac_key_env()
         return RemoteMpiCommSessionClient(
-            addr=get_spawn_proxy_process_ipc_addr_env(), hmac_key=hmac_key)
+            get_spawn_proxy_process_ipc_addr_env())
     else:
         print_colored_debug(
             f"Using MpiCommSession to bind to external MPI processes\n",
@@ -144,12 +143,12 @@ class IntraProcessQueue:
 
 
 class WorkerCommIpcAddrs(NamedTuple):
-    ''' IPC addresses (str) and HMAC keys (bytes) for communication with the worker processes. '''
-    request_queue_addr: tuple[str, Optional[bytes]]
-    request_error_queue_addr: tuple[str, Optional[bytes]]
-    result_queue_addr: tuple[str, Optional[bytes]]
-    stats_queue_addr: tuple[str, Optional[bytes]]
-    kv_cache_events_queue_addr: tuple[str, Optional[bytes]]
+    ''' IPC addresses for communication with the worker processes. '''
+    request_queue_addr: str
+    request_error_queue_addr: str
+    result_queue_addr: str
+    stats_queue_addr: str
+    kv_cache_events_queue_addr: str
 
 
 def is_llm_response(instance):
