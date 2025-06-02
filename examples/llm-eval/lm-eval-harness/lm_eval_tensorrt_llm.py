@@ -174,7 +174,7 @@ class TRTLLMEvalBase(TemplateLM):
                                tokenizer=self.tokenizer,
                                kv_cache_config=trt_kv_cache_config,
                                **kwargs)
-            self.max_length = self.llm.max_seq_len - 1
+            # self.max_length = self.llm.max_seq_len - 1
             logger.info("Loaded TRT-LLM engine")
 
     @property
