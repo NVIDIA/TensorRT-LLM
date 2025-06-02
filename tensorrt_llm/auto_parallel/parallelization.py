@@ -11,7 +11,7 @@ import tensorrt as trt
 import torch
 from filelock import FileLock
 
-import tensorrt_llm.serialization as serialization
+from tensorrt_llm import serialization
 from tensorrt_llm._utils import (str_dtype_to_trt, trt_dtype_to_np,
                                  trt_dtype_to_torch)
 from tensorrt_llm.functional import AllReduceParams, create_allreduce_plugin
@@ -39,6 +39,13 @@ from .utils import (get_updated_plugin, to_base_class_layer, to_subclass_layer,
 
 default_int_dtype = trt.int64
 
+# These dataclasses are used in ParallelConfig serialization. If there are other classes need to be serialized, please add to this list.
+BASE_AUTOPP_CLASSES = {
+    "tensorrt_llm.auto_parallel.parallelization": ["ParallelConfig"],
+    "tensorrt_llm.auto_parallel.config": ["AutoParallelConfig", "CostModel"],
+    "tensorrt_llm.auto_parallel.simplifier": ["GraphConfig", "StageType"]
+}
+
 
 @dataclass
 class ParallelConfig:
@@ -60,8 +67,8 @@ class ParallelConfig:
     @staticmethod
     def from_file(filename) -> "ParallelConfig":
         with open(filename, "rb") as file:
-            return serialization.load(
-                file, approved_imports=serialization.BASE_PARALLEL_CLASSES)
+            return serialization.load(file,
+                                      approved_imports=BASE_AUTOPP_CLASSES)
 
     def print_graph_strategy(self, file=None):
         for index, (node_name,
