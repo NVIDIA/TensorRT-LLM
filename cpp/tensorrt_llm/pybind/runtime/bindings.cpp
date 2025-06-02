@@ -337,7 +337,11 @@ void initBindings(pybind11::module_& m)
         .def("setup_lookahead", &tr::decoder::DecoderState::setupLookahead, py::arg("lookahead_decoding_buffers"))
         .def_property_readonly("joint_decoding_input", &tr::decoder::DecoderState::getJointDecodingInput)
         .def_property_readonly("joint_decoding_output", &tr::decoder::DecoderState::getJointDecodingOutput)
-        .def_property_readonly("sequence_lengths", &tr::decoder::DecoderState::getSequenceLengths)
+        .def_property_readonly(
+            "sequence_lengths", py::overload_cast<>(&tr::decoder::DecoderState::getSequenceLengths, py::const_))
+        .def("get_sequence_lengths",
+            py::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getSequenceLengths, py::const_),
+            py::arg("batch_idx"))
         .def_property_readonly("all_new_tokens", &tr::decoder::DecoderState::getAllNewTokens)
         .def_property_readonly("finished_sum", &tr::decoder::DecoderState::getFinishedSum)
         .def_property_readonly("finish_reasons", &tr::decoder::DecoderState::getFinishReasons)
