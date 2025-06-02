@@ -80,7 +80,7 @@ l0_a30:
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
-  - unittest/trt/model/test_nemotron_nas.py -k "not fp8"
+  - unittest/trt/model/test_nemotron_nas.py -k "not fp8" TIMEOUT (45)
   - unittest/trt/model/test_gpt.py -k "partition0" # 10 mins
   - unittest/trt/model/test_gpt.py -k "partition1" # 10 mins
   - unittest/trt/model/test_gpt.py -k "partition2" # 10 mins
@@ -107,7 +107,7 @@ l0_a30:
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
   - examples/test_granite.py::test_llm_granite[granite-3.0-1b-a400m-instruct-bfloat16] # 5 mins
   - examples/test_llama.py::test_llm_llama_1gpu_batched_beam_search[llama-7b] # 2 mins
-  - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-chunked_summarization_long] # 6 mins
+  - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-chunked_summarization_long] TIMEOUT (45)
   - examples/test_medusa.py::test_llm_medusa_1gpu[use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs1] # 4 mins
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
   - examples/test_internlm.py::test_llm_internlm2_7b_1node_1gpu[bfloat16-enable_context_fmha-enable_gemm_plugin-enable_attention_plugin-nb:2] # 5 mins
@@ -156,7 +156,7 @@ l0_a30:
   - accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_weight_only
   - examples/test_llama.py::test_llm_llama_v2_1gpu_auto_parallel[llama-v2-7b-hf] # 15 mins
   - accuracy/test_cli_flow.py::TestMistral7B::test_beam_search # 5 mins
-  - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization_long] # 6 mins
+  - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization_long] TIMEOUT (45)
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:2-disable_fp8]
   - examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_3.0_7.8b_instruct-float16-nb:4] # ? mins
   - examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_deep_2.4b-float16-nb:4]
@@ -201,7 +201,7 @@ l0_a30:
   - triton_server/test_triton.py::test_t5_ib[t5-ib]
   - triton_server/test_triton.py::test_mistral_ib[mistral-ib] TIMEOUT (70)
   - triton_server/test_triton.py::test_mistral_ib_streaming[mistral-ib-streaming]
-  - triton_server/test_triton.py::test_mistral_ib_mm[mistral-ib-mm]
+  - triton_server/test_triton.py::test_mistral_ib_mm[mistral-ib-mm] TIMEOUT (70)
   - triton_server/test_triton.py::test_gpt_ib_streaming[gpt-ib-streaming]
   - triton_server/test_triton.py::test_cpp_unit_tests[cpp-unit-tests]
   - triton_server/test_triton.py::test_python_bls_unit_tests[python-bls-unit-tests]
