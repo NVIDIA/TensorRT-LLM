@@ -1006,6 +1006,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             ]
                         }
 
+                        if (env.testPhase2StageName) {
+                            parameters += [
+                                'testPhase2StageName': env.testPhase2StageName,
+                            ]
+                        }
+
                         echo "trigger SBSA test job, params: ${parameters}"
 
                         def status = triggerJob(
