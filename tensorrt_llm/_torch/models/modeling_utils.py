@@ -20,7 +20,7 @@ from ..distributed.communicator import pp_recv, pp_send
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import FusedMoE, VanillaMoE
+from ..modules.fused_moe import MoE, VanillaMoE
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
@@ -419,7 +419,7 @@ class DecoderModelForCausalLM(nn.Module,
         quant_config_dict = self.model_config.quant_config_dict
         if quant_config_dict is not None:
             for name, module in self.named_modules():
-                if isinstance(module, (FusedMoE, VanillaMoE)):
+                if isinstance(module, (MoE, VanillaMoE)):
                     for n, q in quant_config_dict.items():
                         # all linear layers inside FusedMoE share the same quant config
                         if name in n:
