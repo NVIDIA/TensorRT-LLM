@@ -374,6 +374,13 @@ def smooth_quant_layer_norm(input: Tensor,
             'LayernormQuantization', '1', TRT_LLM_PLUGIN_NAMESPACE)
         assert plg_creator is not None
 
+        output_type = trt.PluginField("out_type_id",
+                                      np.array([int(trt.int8)], np.int32),
+                                      trt.PluginFieldType.INT32)
+        quant_mode = trt.PluginField(
+            "quant_mode",
+            np.array([int(QuantMode.use_smooth_quant(per_token=True))],
+                     np.int32), trt.PluginFieldType.INT32)
         eps = trt.PluginField("eps", np.array(eps, dtype=np.float32),
                               trt.PluginFieldType.FLOAT32)
         use_diff_of_squares = trt.PluginField(
@@ -389,8 +396,10 @@ def smooth_quant_layer_norm(input: Tensor,
         pf_type = trt.PluginField(
             "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
             trt.PluginFieldType.INT32)
-        pfc = trt.PluginFieldCollection(
-            [eps, use_diff_of_squares, dyn_act_scaling, pf_type])
+        pfc = trt.PluginFieldCollection([
+            eps, use_diff_of_squares, dyn_act_scaling, pf_type, output_type,
+            quant_mode
+        ])
         layernorm_plug = plg_creator.create_plugin("layernorm_quantized", pfc)
         normalized_shape = [normalized_shape] if isinstance(
             normalized_shape, int) else normalized_shape
