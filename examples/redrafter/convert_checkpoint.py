@@ -22,13 +22,12 @@ from argparse import Namespace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Optional
+from tensorrt_llm.models import PretrainedConfig
 
 import safetensors
 import torch
 from transformers.models.auto import AutoModel
 from transformers.models.auto.configuration_auto import AutoConfig
-from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 import tensorrt_llm.models.modeling_utils
 from tensorrt_llm._utils import str_dtype_to_torch
@@ -37,11 +36,13 @@ from tensorrt_llm.models.llama.convert import (dup_kv_weight,
                                                get_tllm_linear_weight,
                                                get_weight, get_weight_and_bias,
                                                split)
-from tensorrt_llm.models.medusa.weight import convert_hf_llama
 
 BASE_MODEL_TLLM_WEIGHT_PREFIX = "base_model."
 DRAFTER_TLLM_WEIGHT_PREFIX = "drafter."
 
+# Add new models here as needed
+REDRAFTER_MAP = {"QWenForCausalLM": "ReDrafterForQWenLM",
+                 "LLaMAForCausalLM": "ReDrafterForLLaMALM"}
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -129,123 +130,6 @@ def parse_arguments():
     )
 
     return parser.parse_args()
-
-
-def hf_llama_model(
-    hf_model: LlamaForCausalLM,
-    mapping: Mapping,
-    dtype: torch.dtype = torch.float32,
-    use_parallel_embedding: bool = False,
-    sharding_dim: int = 0,
-    additional_tllm_prefix: str = "",
-) -> Dict[str, torch.Tensor]:
-    weights = {}
-    model_params = dict(hf_model.named_parameters())
-    num_attention_heads = hf_model.config.num_attention_heads
-    hidden_size = hf_model.config.hidden_size
-    head_size = hidden_size // num_attention_heads
-    num_key_value_heads = hf_model.config.num_key_value_heads
-
-    for layer_idx in range(hf_model.config.num_hidden_layers):
-        hf_prefix = f"model.layers.{layer_idx}."
-        tllm_prefix = f"{additional_tllm_prefix}transformer.layers.{layer_idx}."
-
-        # load qkv
-        q_weight = get_weight(model_params, hf_prefix + "self_attn.q_proj",
-                              dtype)
-        k_weight = get_weight(model_params, hf_prefix + "self_attn.k_proj",
-                              dtype)
-        v_weight = get_weight(model_params, hf_prefix + "self_attn.v_proj",
-                              dtype)
-
-        if num_key_value_heads < mapping.tp_size:
-            # duplicate the KV heads up to mapping.tp_size
-            k_weight = dup_kv_weight(k_weight, num_key_value_heads,
-                                     mapping.tp_size)
-            v_weight = dup_kv_weight(v_weight, num_key_value_heads,
-                                     mapping.tp_size)
-        assert (k_weight.shape[0] % (mapping.tp_size * head_size)) == 0
-        assert (v_weight.shape[0] % (mapping.tp_size * head_size)) == 0
-
-        wq = split(q_weight, mapping.tp_size, mapping.tp_rank)
-        wk = split(k_weight, mapping.tp_size, mapping.tp_rank)
-        wv = split(v_weight, mapping.tp_size, mapping.tp_rank)
-
-        split_qkv = torch.concat((wq, wk, wv))
-
-        weights.update(
-            get_tllm_linear_weight(split_qkv, tllm_prefix + "attention.qkv."))
-
-        # load dense
-        attn_dense_weight = get_weight(model_params,
-                                       hf_prefix + "self_attn.o_proj", dtype)
-        split_attn_dense_weight = split(attn_dense_weight,
-                                        mapping.tp_size,
-                                        mapping.tp_rank,
-                                        dim=1)
-        weights.update(
-            get_tllm_linear_weight(split_attn_dense_weight,
-                                   tllm_prefix + "attention.dense."))
-
-        # load mlp (merge gate + fc = gate_fc, and then proj)
-        mlp_up_weight = get_weight(model_params, hf_prefix + "mlp.up_proj",
-                                   dtype)
-        mlp_up_weight = split(mlp_up_weight,
-                              mapping.tp_size,
-                              mapping.tp_rank,
-                              dim=0)
-
-        mlp_gate_weight = get_weight(model_params, hf_prefix + "mlp.gate_proj",
-                                     dtype)
-        mlp_gate_weight = split(mlp_gate_weight,
-                                mapping.tp_size,
-                                mapping.tp_rank,
-                                dim=0)
-
-        mlp_gate_fc_weight = torch.concat((mlp_up_weight, mlp_gate_weight))
-
-        weights.update(
-            get_tllm_linear_weight(mlp_gate_fc_weight,
-                                   tllm_prefix + "mlp.gate_fc."))
-
-        mlp_proj_weight = get_weight(model_params, hf_prefix + "mlp.down_proj",
-                                     dtype)
-        split_mlp_proj_weight = split(mlp_proj_weight,
-                                      mapping.tp_size,
-                                      mapping.tp_rank,
-                                      dim=1)
-        weights.update(
-            get_tllm_linear_weight(split_mlp_proj_weight,
-                                   tllm_prefix + "mlp.proj."))
-
-        # Layer norms do not use tensor parallelism
-        input_ln_weight = get_weight(model_params,
-                                     hf_prefix + "input_layernorm", dtype)
-        weights[tllm_prefix + "input_layernorm.weight"] = input_ln_weight
-
-        post_ln_weight = get_weight(model_params,
-                                    hf_prefix + "post_attention_layernorm",
-                                    dtype)
-        weights[tllm_prefix + "post_layernorm.weight"] = post_ln_weight
-
-    embed_tokens = get_weight(model_params, "model.embed_tokens", dtype)
-
-    weights[f"{additional_tllm_prefix}lm_head.weight"] = split(
-        embed_tokens.clone(), mapping.tp_size, mapping.tp_rank, dim=0)
-
-    if use_parallel_embedding:
-        embed_tokens = split(embed_tokens,
-                             mapping.tp_size,
-                             mapping.tp_rank,
-                             dim=sharding_dim)
-
-    weights[
-        f"{additional_tllm_prefix}transformer.vocab_embedding.weight"] = embed_tokens
-
-    ln_f_w = get_weight(model_params, "model.norm", dtype)
-    weights[f"{additional_tllm_prefix}transformer.ln_f.weight"] = ln_f_w
-
-    return weights
 
 
 def hf_drafter(
@@ -358,34 +242,6 @@ def hf_drafter(
 
     return weights
 
-
-def hf_llama_config(
-    hf_config: LlamaConfig,
-    dtype: str = "float32",
-    logits_dtype: str = "float32",
-    mapping: Mapping = Mapping(1),
-) -> tensorrt_llm.models.modeling_utils.PretrainedConfig:
-    return tensorrt_llm.models.modeling_utils.PretrainedConfig(
-        architecture="LlamaForCausalLM",
-        dtype=dtype,
-        logits_dtype=logits_dtype,
-        vocab_size=hf_config.vocab_size,
-        max_position_embeddings=hf_config.max_position_embeddings,
-        hidden_size=hf_config.hidden_size,
-        num_hidden_layers=hf_config.num_hidden_layers,
-        num_attention_heads=hf_config.num_attention_heads,
-        num_key_value_heads=hf_config.num_key_value_heads,
-        hidden_act=hf_config.hidden_act,
-        intermediate_size=hf_config.intermediate_size,
-        norm_epsilon=hf_config.rms_norm_eps,
-        position_embedding_type="rope_gpt_neox",
-        mapping=mapping,
-        quantization=tensorrt_llm.models.modeling_utils.QuantConfig(),
-        rotary_base=getattr(hf_config, "rope_theta", 500000.0),
-        rotary_scaling=getattr(hf_config, "rotary_scaling", None),
-    )
-
-
 def hf_redrafter_config(
     tllm_base_model_config: tensorrt_llm.models.modeling_utils.PretrainedConfig,
     drafter_config: Namespace,  # DrafterConfig
@@ -396,7 +252,7 @@ def hf_redrafter_config(
     tllm_config = copy.deepcopy(tllm_base_model_config)
 
     tllm_config.base_model_architecture = tllm_config.architecture
-    tllm_config.architecture = "ReDrafterForCausalLM"
+    tllm_config.architecture = REDRAFTER_MAP[tllm_config.architecture]
     setattr(tllm_config, "redrafter_num_layers",
             drafter_config.num_draft_layers)
     setattr(tllm_config, "redrafter_hidden_size", drafter_config.hidden_size)
@@ -411,41 +267,63 @@ def hf_redrafter_config(
             redrafter_draft_len_per_beam)
     setattr(tllm_config, "redrafter_greedy_search", redrafter_greedy_search)
 
+    # Exclude the redrafter weights from any quantisation
+    if hasattr(tllm_config, "quantization") and tllm_config.quantization is not None:
+        # If quantization is an object/namespace, handle it accordingly
+        if hasattr(tllm_config.quantization, "exclude_modules"):
+            redrafter_exclude_modules = ['drafter', 'drafter.layers', 'drafter.lm_head']
+            num_redrafter_layers = tllm_config.redrafter_num_layers
+            if tllm_config.redrafter_is_rnn:
+                redrafter_exclude_modules += ['drafter.rnn_u', 'drafter.rnn_w']
+            for lyrnum in range(num_redrafter_layers):
+                redrafter_exclude_modules += [f'drafter.layers.{lyrnum}', f'drafter.layers.{lyrnum}.linear']
+            tllm_config.quantization.exclude_modules += redrafter_exclude_modules
+
+    # Align type to drafter type for gemm plugin
+    if tllm_config.dtype == 'bfloat16':
+        tllm_config.dtype = 'float16'
+
     return tllm_config
 
 
 def convert_and_save(
     rank: int,
     tp_size: int,
-    hf_base_model: LlamaForCausalLM,
+    hf_base_model_dir: str,
     hf_drafter_model: Optional[AutoModel],
     dtype: str,
     use_parallel_embedding: bool,
     embedding_sharding_dim: int,
     output_dir: str,
 ) -> None:
+
     mapping = Mapping(
         world_size=tp_size,
         rank=rank,
         tp_size=tp_size,
     )
-    weights = convert_hf_llama(
-        hf_base_model,
-        mapping,
-        rank,
-        dtype=dtype,
-        use_parallel_embedding=use_parallel_embedding,
-        sharding_dim=embedding_sharding_dim,
-        # use_weight_only=args.use_weight_only,
-        # plugin_weight_only_quant_type=plugin_weight_only_quant_type,
-        # use_smooth_quant=args.smoothquant,
-        # per_channel=args.per_channel,
-        # per_token=args.per_token,
-        # int8_kv_cache=args.int8_kv_cache,
-        # act_range=convert_args['act_range'],
-        # qkv_para=convert_args['llama_qkv_para'],
-        # smoother=convert_args['llama_smoother']
-    )
+
+    # Load model configuration
+    config_path = os.path.join(hf_base_model_dir, 'config.json')
+    stade_dict_path = os.path.join(hf_base_model_dir, f'rank{rank}.safetensors')
+
+    model_config = PretrainedConfig.from_json_file(config_path)
+    model_config = copy.deepcopy(model_config)
+
+    # Prepare rank-specific configuration
+    rank_config = copy.deepcopy(model_config)
+    rank_config.set_rank(rank)
+
+    # Load and prepare weights
+    weights_safe = safetensors.safe_open(stade_dict_path, framework="pt")
+    weights = {k: weights_safe.get_tensor(k) for k in weights_safe.keys()}
+
+    # Convert bfloat16 tensors to float16
+    # TODO: Support ReDrafter for bfloat16.
+    weights = {
+        k: v.to(torch.float16) if v.dtype == torch.bfloat16 else v
+        for k, v in weights.items()
+    }
 
     if hf_drafter_model is not None:
         drafter_weights = hf_drafter(
@@ -464,7 +342,7 @@ def convert_and_save(
 def multi_worker_convert_and_save(
     workers: int,
     tp_size: int,
-    hf_base_model: LlamaForCausalLM,
+    hf_base_model_dir: str,
     hf_drafter_model: Optional[AutoModel],
     dtype: str,
     use_parallel_embedding: bool,
@@ -477,7 +355,7 @@ def multi_worker_convert_and_save(
                 convert_and_save,
                 rank,
                 tp_size,
-                hf_base_model,
+                hf_base_model_dir,
                 hf_drafter_model,
                 dtype,
                 use_parallel_embedding,
@@ -503,12 +381,11 @@ def create_and_save_config(args):
         tp_size=args.tp_size,
         pp_size=1,
     )
-    base_model_hf_config = AutoConfig.from_pretrained(args.model_dir)
-    tllm_model_config = hf_llama_config(
-        base_model_hf_config,
-        dtype=args.dtype,
-        mapping=mapping,
-    )
+
+    hf_base_model_dir = args.model_dir
+    config_path = os.path.join(hf_base_model_dir, 'config.json')
+    model_config = PretrainedConfig.from_json_file(config_path)
+    tllm_model_config = copy.deepcopy(model_config)
 
     if args.drafter_model_dir:
         # TODO: When ReDrafter is added to Transformers
@@ -528,16 +405,14 @@ def create_and_save_config(args):
     return drafter_hf_config
 
 
+
 def main():
     args = parse_arguments()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-    drafter_hf_config = create_and_save_config(args)
 
-    hf_base_model = LlamaForCausalLM.from_pretrained(
-        args.model_dir,
-        torch_dtype="auto",
-    )
+    drafter_hf_config = create_and_save_config(args)
+    hf_base_model_dir = args.model_dir
 
     hf_drafter_model: Optional[AutoModel] = None
     if args.drafter_model_dir:
@@ -567,14 +442,13 @@ def main():
     multi_worker_convert_and_save(
         args.workers,
         args.tp_size,
-        hf_base_model,
+        hf_base_model_dir,
         hf_drafter_model,
         args.dtype,
         args.use_parallel_embedding,
         args.embedding_sharding_dim,
         args.output_dir,
     )
-
 
 if __name__ == "__main__":
     main()

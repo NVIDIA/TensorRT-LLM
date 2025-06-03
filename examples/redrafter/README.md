@@ -45,7 +45,13 @@ We use `convert_checkpoint.py` script to convert the model for ReDrafter decodin
 You can specify the 3 hyperparameters (described above) during this conversion. The resulting config.json file can be modified to alter these hyperparameters before the engine building process.
 
 ```bash
+# Convert or quantise the base model
 python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3 \
+                              --output_dir ./vicuna-7b-v1.3-ckpt \
+                              --dtype float16
+
+# Convert the draft model and attach base model
+python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3-ckpt \
                              --drafter_model_dir ./vicuna-7b-drafter \
                              --output_dir ./tllm_checkkpoint_1gpu_redrafter \
                              --dtype float16 \
