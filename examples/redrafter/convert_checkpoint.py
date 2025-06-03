@@ -42,7 +42,7 @@ DRAFTER_TLLM_WEIGHT_PREFIX = "drafter."
 
 # Add new models here as needed
 REDRAFTER_MAP = {"QWenForCausalLM": "ReDrafterForQWenLM",
-                 "LLaMAForCausalLM": "ReDrafterForLLaMALM",}
+                 "LLaMAForCausalLM": "ReDrafterForLLaMALM"}
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -318,7 +318,8 @@ def convert_and_save(
     weights_safe = safetensors.safe_open(stade_dict_path, framework="pt")
     weights = {k: weights_safe.get_tensor(k) for k in weights_safe.keys()}
 
-    # Convert bfloat16 tensors if needed
+    # Convert bfloat16 tensors to float16
+    # TODO: Support ReDrafter for bfloat16.
     weights = {
         k: v.to(torch.float16) if v.dtype == torch.bfloat16 else v
         for k, v in weights.items()
