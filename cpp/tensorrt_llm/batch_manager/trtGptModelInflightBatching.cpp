@@ -269,10 +269,10 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
                 "Must set crossKvCacheFraction for encoder-decoder model");
             auto const crossKvCacheFraction = optionalParams.kvCacheConfig.crossKvCacheFraction.value();
             mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kSELF,
-                freePrimaryMemBytes / (1.0f - crossKvCacheFraction),
-                freeSecondaryMemBytes / (1.0f - crossKvCacheFraction), cacheTransPreAllocaSize);
+                freePrimaryMemBytes * (1.0f - crossKvCacheFraction),
+                freeSecondaryMemBytes * (1.0f - crossKvCacheFraction), cacheTransPreAllocaSize);
             mCrossKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kCROSS,
-                freePrimaryMemBytes / crossKvCacheFraction, freeSecondaryMemBytes / crossKvCacheFraction,
+                freePrimaryMemBytes * crossKvCacheFraction, freeSecondaryMemBytes * crossKvCacheFraction,
                 cacheTransPreAllocaSize);
             TLLM_LOG_INFO("This is an Encoder-Decoder model, set %0.1f cross KV cache fraction based on the config.",
                 crossKvCacheFraction);
