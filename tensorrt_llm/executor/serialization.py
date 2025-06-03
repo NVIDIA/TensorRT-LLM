@@ -66,6 +66,7 @@ BASE_ZMQ_CLASSES = {
         "SchedulerConfig", "DynamicBatchConfig"
     ],
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig"],
+    "tensorrt_llm._torch.model_config": ["MoeLoadBalancerConfig"],
     "tensorrt_llm.builder": ["BuildConfig"],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
     "tensorrt_llm.executor.postproc_worker": [
@@ -138,6 +139,7 @@ class Unpickler(pickle.Unpickler):
             # is being used as part of a routine scenario, then it should be added
             # to the appropriate base classes above.
             raise ValueError(f"Import {module} | {name} is not allowed")
+        print(f"Import {module} | {name} here")
         return super().find_class(module, name)
 
 
