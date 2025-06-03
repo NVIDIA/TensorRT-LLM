@@ -24,23 +24,23 @@ from packaging import version
 from .trt_test_alternative import check_call, check_output, exists, is_windows
 
 
-def venv_check_call(venv, cmd, env=None):
+def venv_check_call(venv, cmd, env=None, **kwargs):
 
     def _war_check_call(*args, **kwargs):
         kwargs["cwd"] = venv.get_working_directory()
         return check_call(*args, **kwargs)
 
-    venv.run_cmd(cmd, caller=_war_check_call, env=env)
+    venv.run_cmd(cmd, caller=_war_check_call, env=env, **kwargs)
 
 
-def venv_check_output(venv, cmd):
+def venv_check_output(venv, cmd, env=None, **kwargs):
 
     def _war_check_output(*args, **kwargs):
         kwargs["cwd"] = venv.get_working_directory()
         output = check_output(*args, **kwargs)
         return output
 
-    return venv.run_cmd(cmd, caller=_war_check_output)
+    return venv.run_cmd(cmd, caller=_war_check_output, env=env, **kwargs)
 
 
 def venv_mpi_check_call(venv, mpi_cmd, python_cmd):
@@ -548,24 +548,6 @@ def generate_summary_cmd(example_root, *args, **kwargs):
         summary_cmd.append(f"--{arg}")
 
     return summary_cmd
-
-
-def generate_mmlu_cmd(example_root, *args, **kwargs):
-    "generate mmlu command"
-    mmlu_script = f"{example_root}/../../../mmlu_llmapi.py" if "core" in example_root else f"{example_root}/../mmlu_llmapi.py"
-    mmlu_cmd = [mmlu_script, "--check_accuracy"]
-
-    for key, value in kwargs.items():
-        if isinstance(value, bool):
-            if value:
-                mmlu_cmd.append(f"--{key}")
-        else:
-            mmlu_cmd.extend([f"--{key}", f"{value}"])
-
-    for arg in args:
-        mmlu_cmd.append(f"--{arg}")
-
-    return mmlu_cmd
 
 
 def generate_deterministic_cmd(example_root, *args, **kwargs):

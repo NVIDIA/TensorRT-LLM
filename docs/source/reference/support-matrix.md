@@ -4,75 +4,105 @@
 
 TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA GPUs. The following sections provide a list of supported GPU architectures as well as important features implemented in TensorRT-LLM.
 
-## Models
+## Models (PyTorch Backend)
+
+| Architecture | Model | HuggingFace Example | Modality |
+|--------------|-------|---------------------|----------|
+| `BertForSequenceClassification` | BERT-based | `textattack/bert-base-uncased-yelp-polarity` | L |
+| `DeciLMForCausalLM` | Nemotron | `nvidia/Llama-3_1-Nemotron-51B-Instruct` | L |
+| `DeepseekV3ForCausalLM` | DeepSeek-V3 | `deepseek-ai/DeepSeek-V3 `| L |
+| `LlavaLlamaModel` | VILA | `Efficient-Large-Model/NVILA-8B` | L + V |
+| `LlavaNextForConditionalGeneration` | LLaVA-NeXT | `llava-hf/llava-v1.6-mistral-7b-hf` | L + V |
+| `LlamaForCausalLM` | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B` | L |
+| `Llama4ForConditionalGeneration` | Llama 4 | `meta-llama/Llama-4-Scout-17B-16E-Instruct` | L |
+| `MistralForCausalLM` | Mistral | `mistralai/Mistral-7B-v0.1` | L |
+| `MixtralForCausalLM` | Mixtral | `mistralai/Mixtral-8x7B-v0.1` | L |
+| `MllamaForConditionalGeneration` | Llama 3.2 | `meta-llama/Llama-3.2-11B-Vision` | L |
+| `NemotronForCausalLM` | Nemotron-3, Nemotron-4, Minitron | `nvidia/Minitron-8B-Base` | L |
+| `NemotronNASForCausalLM` | NemotronNAS | `nvidia/Llama-3_3-Nemotron-Super-49B-v1` | L |
+| `Qwen2ForCausalLM` | QwQ, Qwen2 | `Qwen/Qwen2-7B-Instruct` | L |
+| `Qwen2ForProcessRewardModel` | Qwen2-based | `Qwen/Qwen2.5-Math-PRM-7B` | L |
+| `Qwen2ForRewardModel` | Qwen2-based | `Qwen/Qwen2.5-Math-RM-72B` | L |
+| `Qwen2VLForConditionalGeneration` | Qwen2-VL | `Qwen/Qwen2-VL-7B-Instruct` | L + V |
+| `Qwen2_5_VLForConditionalGeneration` | Qwen2.5-VL | `Qwen/Qwen2.5-VL-7B-Instruct` | L + V |
+
+Note:
+- L: Language only
+- L + V: Language and Vision multimodal support
+- Llama 3.2 accepts vision input, but our support currently limited to text only.
+
+## Models (TensorRT Backend)
 
 ### LLM Models
 
-- [Arctic](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/arctic)
-- [Baichuan/Baichuan2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/baichuan)
-- [BART](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
-- [BERT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert)
-- [BLOOM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bloom)
-- [ByT5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
-- [GLM/ChatGLM/ChatGLM2/ChatGLM3/GLM-4](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/chatglm)
-- [Code LLaMA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
-- [DBRX](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/dbrx)
-- [Exaone](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/exaone)
-- [FairSeq NMT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
-- [Falcon](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/falcon)
-- [Flan-T5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec) [^encdec]
-- [Gemma/Gemma2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gemma)
-- [GPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
-- [GPT-J](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptj)
-- [GPT-Nemo](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
-- [GPT-NeoX](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptneox)
-- [Granite-3.0](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/granite)
-- [Grok-1](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/grok)
-- [InternLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm)
-- [InternLM2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm2)
-- [LLaMA/LLaMA 2/LLaMA 3/LLaMA 3.1](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
-- [Mamba](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mamba)
-- [mBART](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
-- [Minitron](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/nemotron)
-- [Mistral](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
-- [Mistral NeMo](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
-- [Mixtral](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mixtral)
-- [MPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt)
-- [Nemotron](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/nemotron)
-- [mT5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
-- [OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/opt)
-- [Phi-1.5/Phi-2/Phi-3](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/phi)
-- [Qwen/Qwen1.5/Qwen2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen)
-- [Qwen-VL](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwenvl)
-- [RecurrentGemma](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/recurrentgemma)
-- [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt) [^replitcode]
-- [RoBERTa](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert)
-- [SantaCoder](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
-- [Skywork](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/skywork)
-- [Smaug](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/smaug)
-- [StarCoder](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
-- [T5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
-- [Whisper](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/whisper)
+- [Arctic](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/arctic)
+- [Baichuan/Baichuan2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/baichuan)
+- [BART](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/enc_dec)
+- [BERT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/bert)
+- [BLOOM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/bloom)
+- [ByT5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/enc_dec)
+- [ChatGLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/chatglm-6b)
+- [ChatGLM2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/chatglm2-6b)
+- [ChatGLM3](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/chatglm3-6b-32k)
+- [Code LLaMA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama)
+- [DBRX](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/dbrx)
+- [Exaone](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/exaone)
+- [FairSeq NMT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/enc_dec)
+- [Falcon](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/falcon)
+- [Flan-T5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/enc_dec) [^encdec]
+- [Gemma/Gemma2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gemma)
+- [GLM-4](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/glm-4-9b)
+- [GPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt)
+- [GPT-J](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/gptj)
+- [GPT-Nemo](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt)
+- [GPT-NeoX](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/gptneox)
+- [Granite-3.0](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/granite)
+- [Grok-1](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/grok)
+- [InternLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples//models/contrib/internlm)
+- [InternLM2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/internlm2)
+- [LLaMA/LLaMA 2/LLaMA 3/LLaMA 3.1](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama)
+- [Mamba](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/mamba)
+- [mBART](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/enc_dec)
+- [Minitron](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/nemotron)
+- [Mistral](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama)
+- [Mistral NeMo](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama)
+- [Mixtral](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/mixtral)
+- [MPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/mpt)
+- [Nemotron](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/nemotron)
+- [mT5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/enc_dec)
+- [OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/opt)
+- [Phi-1.5/Phi-2/Phi-3](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/phi)
+- [Qwen/Qwen1.5/Qwen2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/qwen)
+- [Qwen-VL](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/qwenvl)
+- [RecurrentGemma](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/recurrentgemma)
+- [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/mpt) [^replitcode]
+- [RoBERTa](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/bert)
+- [SantaCoder](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt)
+- [Skywork](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/skywork)
+- [Smaug](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/smaug)
+- [StarCoder](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt)
+- [T5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/enc_dec)
+- [Whisper](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/whisper)
 
 
 ### Multi-Modal Models [^multimod]
 
-- [BLIP2 w/ OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [BLIP2 w/ T5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [CogVLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal) [^bf16only]
-- [Deplot](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [Fuyu](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [Kosmos](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [LLaVA-v1.5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [LLaVa-Next](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [LLaVa-OneVision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [Nougat](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [Phi-3-vision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [Video NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [VILA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [MLLaMA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
-- [LLama 3.2 VLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+- [BLIP2 w/ OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [BLIP2 w/ T5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [CogVLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal) [^bf16only]
+- [Deplot](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [Fuyu](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [Kosmos](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [LLaVA-v1.5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [LLaVa-Next](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [LLaVa-OneVision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [Nougat](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [Phi-3-vision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [Video NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [VILA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [MLLaMA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
+- [LLama 3.2 VLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/multimodal)
 
 
 (support-matrix-hardware)=
@@ -112,9 +142,9 @@ The following table shows the supported software for TensorRT-LLM.
 * -
   - Software Compatibility
 * - Container
-  - [25.03](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
+  - [25.04](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
 * - TensorRT
-  - [10.9](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
+  - [10.10](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
 * - Precision
   -
     - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4

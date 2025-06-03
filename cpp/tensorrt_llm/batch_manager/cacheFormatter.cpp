@@ -19,16 +19,17 @@
 
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheConcatenate.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -136,78 +137,34 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
         }
 
         auto cacheBlockSize = inputKvCacheBlocks.front()->getSize();
-        auto dataType = inputKvCacheBlocks.front()->getDataType();
-        size_t const sendBufferSize = common::getEnvMemSizeForKVCacheTransferBuffer();
-        size_t const sendBufferEleSize = sendBufferSize / common::getDTypeSize(dataType);
 
-        bool const onlyUseAsyncBuffer = sendBufferEleSize == 0;
-        runtime::ITensor::SharedPtr preAllocSendBuffer;
-        auto const maxConcurrenceNum = static_cast<int>(common::getEnvKVCacheSendMaxConcurrenceNum());
-        if (!onlyUseAsyncBuffer && (mConcurrenceSendResource.mConcurrence >= maxConcurrenceNum))
-        {
-            std::unique_lock lk(mConcurrenceSendResource.mSendbuffersMutex);
-            mConcurrenceSendResource.mSendbuffersCV.wait(
-                lk, [this, maxConcurrenceNum]() { return mConcurrenceSendResource.mConcurrence < maxConcurrenceNum; });
-        }
-        if (!onlyUseAsyncBuffer)
-        {
-            int bufferId = mConcurrenceSendResource.mConcurrence++;
-
-            if (!onlyUseAsyncBuffer
-                && mConcurrenceSendResource.mSendbuffers.find(bufferId) == mConcurrenceSendResource.mSendbuffers.end())
-            {
-                if (common::getEnvKVCacheTransferUseAsyncBuffer())
-                {
-                    mConcurrenceSendResource.mSendbuffers[bufferId] = bufferManager.gpu(
-                        runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
-                }
-                else
-                {
-                    mConcurrenceSendResource.mSendbuffers[bufferId] = bufferManager.gpuSync(
-                        runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
-                }
-            }
-            preAllocSendBuffer = mConcurrenceSendResource.mSendbuffers[bufferId];
-        };
+        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
 
         auto targetNum = connections.size();
         TLLM_CHECK((cacheBlockSize * blockNum) % targetNum == 0);
         auto const targetBufferSize = (cacheBlockSize * blockNum) / targetNum;
-        std::vector<runtime::ITensor::SharedPtr> outputSplitCaches;
 
-        size_t bufferCoverTargetNum = sendBufferEleSize / targetBufferSize;
-
-        runtime::ITensor::SharedPtr SendBufferTemp;
-        if (bufferCoverTargetNum < targetNum)
+        auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
+            cacheBufferId, targetNum, targetBufferSize, bufferManager);
+        auto& outputSplitCaches = std::get<0>(result);
+        auto& bufferCoverTargetNum = std::get<1>(result);
+        auto& onlyUseDynamicBuffer = std::get<2>(result);
+        auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+        if (agentConnnecion != nullptr)
         {
-            SendBufferTemp
-                = bufferManager.gpu(runtime::ITensor::makeShape(
-                                        {static_cast<int64_t>(targetBufferSize * (targetNum - bufferCoverTargetNum))}),
-                    dataType);
-        }
-
-        for (size_t i = 0; i < targetNum; i++)
-        {
-            if (i < bufferCoverTargetNum)
-            {
-                auto slice = runtime::ITensor::slice(preAllocSendBuffer, i * targetBufferSize, targetBufferSize);
-                outputSplitCaches.push_back(std::move(slice));
-            }
-            else
-            {
-                auto slice = runtime::ITensor::slice(
-                    SendBufferTemp, (i - bufferCoverTargetNum) * targetBufferSize, targetBufferSize);
-                outputSplitCaches.push_back(std::move(slice));
-            }
+            TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need all buffer pre-allocated");
+            TLLM_CHECK(onlyUseDynamicBuffer == false);
         }
 
         tensorrt_llm::executor::kv_cache::splitKVCacheDispatch(
             inputKvCacheBlocks, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
 
         bufferManager.getStream().synchronize();
-        if (onlyUseAsyncBuffer)
+
+        auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
+        if (preAllocSendBuffer != nullptr)
         {
-            bufferCoverTargetNum = targetNum;
+            TLLM_CHECK(preAllocSendBuffer->getDataType() == inputKvCacheBlocks.front()->getDataType());
         }
         auto sendBufferFun = [&](int deviceId, size_t processIdx)
         {
@@ -239,11 +196,16 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
                 // send multiple times
                 size = targetBufferSize;
                 size_t remainSendSize = targetBufferSize;
+
                 while (remainSendSize > 0)
                 {
+                    TLLM_CHECK(preAllocSendBuffer != nullptr);
+                    auto sendBufferEleSize = preAllocSendBuffer->getSize();
+
                     auto sendSize = std::min(remainSendSize, sendBufferEleSize);
                     auto copySlice = runtime::ITensor::slice(
                         outputSplitCaches[processIdx], targetBufferSize - remainSendSize, sendSize);
+
                     auto copyTargetSlice = runtime::ITensor::slice(preAllocSendBuffer, 0, sendSize);
                     bufferManager.copy(*copySlice, *copyTargetSlice);
                     bufferManager.getStream().synchronize();
@@ -300,10 +262,8 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
         {
             sendBufferFun(deviceId, 0);
         }
-        if (!onlyUseAsyncBuffer && (mConcurrenceSendResource.mConcurrence--) >= maxConcurrenceNum)
-        {
-            mConcurrenceSendResource.mSendbuffersCV.notify_one();
-        }
+
+        mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
     }
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
@@ -433,21 +393,18 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                     >= selfConfig.getParallelConfig().mTensorParallelism);
 
             runtime::ITensor::SharedPtr recvBufferTemp;
-            runtime::ITensor::SharedPtr preAllocRecvBufferTemp;
             std::vector<runtime::ITensor::SharedPtr> recvSplitCaches;
 
             auto cacheBlockSize = outputBuffers.front()->getSize();
 
             auto dataType = outputBuffers.front()->getDataType();
-            auto const recvBufferSize = common::getEnvMemSizeForKVCacheTransferBuffer();
-            auto const recvBufferEleSize = recvBufferSize / common::getDTypeSize(dataType);
             auto targetNum = connections.size();
             TLLM_CHECK((cacheBlockSize * blockNum) % targetNum == 0);
             auto targetBufferSize = (cacheBlockSize * blockNum) / targetNum;
 
-            size_t bufferCoverTargetNum = recvBufferEleSize / targetBufferSize;
-            size_t remainNoCoverTargetNum = targetNum > bufferCoverTargetNum ? targetNum - bufferCoverTargetNum : 0;
-            bool const onlyUseAsyncBuffer = recvBufferEleSize == 0;
+            size_t remainNoCoverTargetNum = 0;
+            size_t bufferCoverTargetNum = 0;
+            std::optional<int> cacheBufferId = std::nullopt;
             {
                 NVTX3_SCOPED_RANGE(formatInputAllocBuffer);
 
@@ -471,67 +428,41 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                 }
                 else
                 {
-                    if (!onlyUseAsyncBuffer)
+                    auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+                    if (agentConnnecion != nullptr)
                     {
-                        std::string processString = "default";
-
-                        if (common::getEnvRequestKVCacheConcurrent())
-                        {
-                            processString = llmRequest.getDataTransceiverState().getCommState()->toString();
-                        }
-
-                        {
-                            std::scoped_lock<std::mutex> lock(mProcessToRecvBufferMutex);
-                            if (mProcessToRecvBuffer.find(processString) == mProcessToRecvBuffer.end())
-                            {
-
-                                if (common::getEnvKVCacheTransferUseAsyncBuffer())
-                                {
-                                    mProcessToRecvBuffer[processString] = bufferManager.gpu(
-                                        runtime::ITensor::makeShape({static_cast<int64_t>(recvBufferEleSize)}),
-                                        dataType);
-                                }
-                                else
-                                {
-                                    mProcessToRecvBuffer[processString] = bufferManager.gpuSync(
-                                        runtime::ITensor::makeShape({static_cast<int64_t>(recvBufferEleSize)}),
-                                        dataType);
-                                }
-                            }
-                            preAllocRecvBufferTemp = mProcessToRecvBuffer[processString];
-                        }
+                        cacheBufferId = agentConnnecion->getCacheBufferId();
+                        TLLM_CHECK(cacheBufferId.has_value());
                     }
-
-                    if (bufferCoverTargetNum < targetNum)
+                    else
                     {
-                        recvBufferTemp
-                            = bufferManager.gpu(runtime::ITensor::makeShape(
-                                                    {static_cast<int64_t>(remainNoCoverTargetNum * targetBufferSize)}),
-                                dataType);
+                        cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
                     }
-                    for (size_t i = 0; i < targetNum; i++)
-                    {
-                        if (i < remainNoCoverTargetNum)
-                        {
-                            recvSplitCaches.push_back(
-                                runtime::ITensor::slice(recvBufferTemp, i * targetBufferSize, targetBufferSize));
-                        }
-                        else
-                        {
+                    TLLM_CHECK(cacheBufferId.has_value());
+                    auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
+                        = mCacheTransBufferManager->getOrAllocateRecvBuffers(
+                            cacheBufferId, targetNum, targetBufferSize, bufferManager);
+                    bufferCoverTargetNum = bufferCoverTargetNumtmp;
+                    remainNoCoverTargetNum = targetNum > bufferCoverTargetNum ? targetNum - bufferCoverTargetNum : 0;
 
-                            recvSplitCaches.push_back(runtime::ITensor::slice(preAllocRecvBufferTemp,
-                                (i - remainNoCoverTargetNum) * targetBufferSize, targetBufferSize));
-                        }
+                    if (agentConnnecion != nullptr)
+                    {
+                        TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need buffer pre-allocated");
+                        TLLM_CHECK(onlyUseDynamicBuffer == false);
                     }
+                    recvSplitCaches = std::move(recvSplitCachestmp);
                 }
 
                 // sync to alloc buffer
                 bufferManager.getStream().synchronize();
             }
-            if (onlyUseAsyncBuffer)
+
+            runtime::ITensor::SharedPtr preAllocRecvBuffer = nullptr;
+            if (cacheBufferId.has_value())
             {
-                remainNoCoverTargetNum = 0;
-                bufferCoverTargetNum = targetNum;
+                preAllocRecvBuffer = mCacheTransBufferManager->getRecvBuffer(cacheBufferId);
+                TLLM_CHECK(preAllocRecvBuffer != nullptr);
+                TLLM_CHECK(preAllocRecvBuffer->getDataType() == dataType);
             }
 
             auto recvBufferFun = [&](int deviceId, size_t processIdx)
@@ -576,8 +507,10 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                         size_t remainRecvSize = targetBufferSize;
                         while (remainRecvSize > 0)
                         {
+                            TLLM_CHECK(preAllocRecvBuffer != nullptr);
+                            auto recvBufferEleSize = preAllocRecvBuffer->getSize();
                             auto recvSize = std::min(remainRecvSize, recvBufferEleSize);
-                            auto recvSlice = runtime::ITensor::slice(preAllocRecvBufferTemp, 0, recvSize);
+                            auto recvSlice = runtime::ITensor::slice(preAllocRecvBuffer, 0, recvSize);
                             auto copySlice = runtime::ITensor::slice(
                                 recvSplitCaches[processIdx], targetBufferSize - remainRecvSize, recvSize);
                             llmRequest.updateKvCacheSize((*recvSlice).getSizeInBytes());
@@ -651,6 +584,10 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                         recvSplitCaches, outputBuffers, destConfig, selfConfig, selfIdx, bufferManager);
                 }
                 bufferManager.getStream().synchronize();
+                if (cacheBufferId.has_value())
+                {
+                    mCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
+                }
             }
         }
     }
@@ -662,6 +599,11 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
 
 [[nodiscard]] bool CacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const
 {
+    if (selfConfig.getDataType() != destConfig.getDataType())
+    {
+        return false;
+    }
+
     std::unordered_set<SizeType32> setVecSelf{
         selfConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), selfConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
 
@@ -681,6 +623,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
     {
         return false;
     }
+
     std::unordered_set<int> setVecDest{
         destConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), destConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
 

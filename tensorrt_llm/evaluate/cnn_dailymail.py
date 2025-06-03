@@ -70,14 +70,42 @@ class CnnDailymail(Evaluator):
         return rouge1
 
     @click.command("cnn_dailymail")
-    @click.option("--dataset_path", type=str, default="ccdv/cnn_dailymail")
-    @click.option("--num_samples", type=int, default=None)
-    @click.option("--random_seed", type=int, default=0)
-    @click.option("--rouge_path", type=str, default="rouge")
-    @click.option("--apply_chat_template", is_flag=True, default=False)
-    @click.option("--system_prompt", type=Optional[str], default=None)
-    @click.option("--max_input_length", type=int, default=924)
-    @click.option("--max_output_length", type=int, default=100)
+    @click.option("--dataset_path",
+                  type=str,
+                  default="ccdv/cnn_dailymail",
+                  help="The path to CNN Dailymail dataset. "
+                  "If unspecified, the dataset is downloaded from HF hub.")
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to run the evaluation; None means full dataset."
+    )
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option("--rouge_path",
+                  type=str,
+                  default="rouge",
+                  help="The path to rouge repository."
+                  "If unspecified, the repository is downloaded from HF hub.")
+    @click.option("--apply_chat_template",
+                  is_flag=True,
+                  default=False,
+                  help="Whether to apply chat template.")
+    @click.option("--system_prompt",
+                  type=Optional[str],
+                  default=None,
+                  help="System prompt.")
+    @click.option("--max_input_length",
+                  type=int,
+                  default=924,
+                  help="Maximum prompt length.")
+    @click.option("--max_output_length",
+                  type=int,
+                  default=100,
+                  help="Maximum generation length.")
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: str, num_samples: int, random_seed: int,

@@ -11,7 +11,7 @@ methods:
         annotation: int
         default: inspect._empty
       stream_ptr:
-        annotation: int
+        annotation: Optional[int]
         default: inspect._empty
       token_ids:
         annotation: List[List[int]]

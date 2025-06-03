@@ -54,6 +54,7 @@ bool getEnvEnablePDL();
 bool getEnvUseUCXKvCache();
 
 bool getEnvUseMPIKvCache();
+bool getEnvUseNixlKvCache();
 
 std::string getEnvUCXInterface();
 
@@ -87,10 +88,18 @@ bool getEnvForceDeterministicAllReduce();
 // This only works when force deterministic is enabled.
 size_t getEnvAllReduceWorkspaceSize();
 
+size_t getEnvKVCacheRecvBufferCount();
+
 bool getEnvKVCacheTransferUseAsyncBuffer();
+
+bool getEnvKVCacheTransferUseSyncBuffer();
 
 size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
+
+uint16_t getEnvNixlPort();
+
+bool getEnvDisaggBenchmarkGenOnly();
 
 } // namespace tensorrt_llm::common

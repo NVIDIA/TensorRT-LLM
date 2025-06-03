@@ -1147,7 +1147,7 @@ def gemm_swiglu(input: Tensor,
 
     p_dtype = default_net().plugin_config.gemm_swiglu_plugin
     if p_dtype == "fp8":
-        assert bias == None, "fp8 gemm_swiglu does not support bias yet"
+        assert bias is None, "fp8 gemm_swiglu does not support bias yet"
 
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
@@ -2790,7 +2790,7 @@ def embedding(input: Tensor,
     # Distribute embedding lookup table across multiple GPU
     if tp_size > 1 and tp_group is not None:
         if sharding_dim == 0:  # TP on vocab_size dimension
-            if tp_rank == None:
+            if tp_rank is None:
                 raise ValueError(
                     "Rank cannot be none for tensor parallelism on vocab dim")
 
@@ -3879,6 +3879,7 @@ class AllReduceStrategy(IntEnum):
     AUTO = 3
     ONESHOT = 4
     TWOSHOT = 5
+    LOWPRECISION = 6
 
 
 class AllReduceFusionOp(IntEnum):
@@ -4351,7 +4352,7 @@ def gemm_allreduce(a: Tensor,
         assert a.dtype == trt.fp8
         assert b.dtype == trt.fp8
 
-    if output_dtype == None:
+    if output_dtype is None:
         output_dtype = str_dtype_to_trt(
             default_net().plugin_config.gemm_allreduce_plugin)
     assert output_dtype in [trt.float16, trt.bfloat16]
@@ -4449,7 +4450,10 @@ def bert_attention(tensor: Tensor,
                    sage_attn: bool = False,
                    sage_attn_q_block_size: int = 0,
                    sage_attn_k_block_size: int = 0,
-                   sage_attn_v_block_size: int = 0) -> Tuple[Tensor]:
+                   sage_attn_v_block_size: int = 0,
+                   cp_group: list[int] = None,
+                   cp_size: int = 1,
+                   cp_rank: int = 0) -> Tuple[Tensor]:
     '''
     Add an operation that performs the multi-head attention in BERT.
 
@@ -4516,6 +4520,15 @@ def bert_attention(tensor: Tensor,
         sage_attn_v_quant_size: int = 0
             dynamic quant block size along sequence dimension of v tensor. Each quant block will share one scale.
 
+        cp_group: list[int] = None
+            The communication group for context parallel
+
+        cp_size: int = 1
+            The communication size for context parallel
+
+        cp_rank: int = 0
+            The communication rank for context parallel
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -4570,10 +4583,31 @@ def bert_attention(tensor: Tensor,
         np.array(sage_attn_v_block_size, dtype=np.int32),
         trt.PluginFieldType.INT32)
 
+    if cp_size > 1:
+        # transpose q,k,v inside qkv to make kv contiguous, which is required by ring attention
+        # (b, s, 3d)
+        query, key, value = chunk(tensor, 3, dim=-1)
+        bs = shape(query, 0)
+        seq_len = shape(query, 1)
+        # (b, s, d) -> (b, s, 2d) -> (2b, s, d)
+        kv = concat([key, value],
+                    dim=-1).view(concat((2 * bs, seq_len, query.shape[-1])))
+        tensor = concat((query, kv),
+                        dim=0).view(concat((bs, seq_len, query.shape[-1] * 3)))
+
+    cp_size = trt.PluginField("cp_size", np.array(cp_size, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_rank = trt.PluginField("cp_rank", np.array(cp_rank, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_group = cp_group or [0]
+    cp_group = np.array(cp_group, dtype=np.int32)
+    cp_group = trt.PluginField("cp_group", cp_group, trt.PluginFieldType.INT32)
+
     pfc = trt.PluginFieldCollection([
         nheads, head_size, q_scaling, context_fmha_type, pf_type,
         do_relative_attention, max_distance, remove_padding, sage_attn,
-        sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size
+        sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size,
+        cp_size, cp_rank, cp_group
     ])
 
     attn_plug = attn_plg_creator.create_plugin("padding_attn", pfc)
@@ -4772,6 +4806,7 @@ class RopeEmbeddingUtils:
             beta_slow: int = 1,
             mscale: float = 1.0,
             mscale_all_dim: float = 1.0,
+            duplicate_data: bool = True,
             dtype=np.float32):
 
         # Copy from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/modeling_deepseek.py
@@ -4829,23 +4864,25 @@ class RopeEmbeddingUtils:
         inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high,
                                                     dim // 2).astype(dtype)
         inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
-        t = np.arange(num_pos, dtype=dtype)
-
-        freqs = np.outer(t, inv_freq)
+        sinusoid_inp = np.expand_dims(np.einsum("i , j -> i j",
+                                                np.arange(num_pos, dtype=dtype),
+                                                inv_freq,
+                                                dtype=dtype),
+                                      axis=-1)
 
         _mscale = float(
             yarn_get_mscale(scaling_factor, mscale) /
             yarn_get_mscale(scaling_factor, mscale_all_dim))
 
-        emb = np.concatenate((freqs, freqs), axis=-1)
+        if duplicate_data:
+            emb = np.concatenate((sinusoid_inp, sinusoid_inp), axis=-2)
+        else:
+            emb = sinusoid_inp
 
         concat = np.concatenate((np.cos(emb) * _mscale, np.sin(emb) * _mscale),
                                 axis=-1)
 
-        concat = concat.reshape((num_pos, 2, dim))
-        concat = np.transpose(concat, (0, 2, 1))
-
-        return concat.reshape((1, -1)).astype(dtype)
+        return inv_freq, concat.reshape((1, -1)).astype(dtype)
 
     @staticmethod
     def rotate_every_two(tensor: Tensor) -> Tensor:

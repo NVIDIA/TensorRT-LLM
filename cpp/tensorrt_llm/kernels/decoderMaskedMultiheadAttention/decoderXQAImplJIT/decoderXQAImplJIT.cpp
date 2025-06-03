@@ -251,7 +251,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         // The rotary_embedding_inv_freq_cache for QKVPreprocessing.
         // Use the xqaParams.rotary_embedding_inv_freq_cache input when the buildDecoderInfoKernel is skipped.
         float const* rotary_inv_freq_buf = xqaParams.rotary_embedding_inv_freq_cache;
-        if (decoder_params.isBuildDecoderInfoKernelNeeded())
+        if (decoder_params.isBuildDecoderInfoKernelNeeded() || xqaParams.multi_query_tokens)
         {
             rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
             invokeBuildDecoderInfo(decoder_params, stream);
@@ -314,11 +314,10 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     auto const makeSpecDecParams = [&]() -> SpecDecParams
     {
         auto const qSeqLen = static_cast<uint32_t>(xqaParams.generation_input_length);
-        TLLM_CHECK_WITH_INFO(xqaParams.spec_decoding_is_generation_length_variable
-                || qSeqLen == xqaParams.spec_decoding_max_generation_length,
-            "qSeqLen must be equal to spec_decoding_max_generation_length when "
-            "spec_decoding_is_generation_length_variable is false.");
-        return {.qSeqLen = qSeqLen,
+        uint32_t maxQSeqLen = xqaParams.spec_decoding_is_generation_length_variable
+            ? xqaParams.spec_decoding_max_generation_length
+            : qSeqLen;
+        return {.qSeqLen = maxQSeqLen,
             .qCuSeqLens = reinterpret_cast<uint32_t const*>(launchParams.cu_seq_lens),
             .mask = reinterpret_cast<SpecDecParams::MaskType const*>(xqaParams.spec_decoding_packed_mask)};
     };

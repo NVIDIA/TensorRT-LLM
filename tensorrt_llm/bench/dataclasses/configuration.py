@@ -55,6 +55,8 @@ class RuntimeConfig(BaseModel):
             self.world_config.gpus_per_node,
             "moe_expert_parallel_size":
             self.world_config.ep_size,
+            "moe_cluster_parallel_size":
+            self.world_config.cluster_size,
             "trust_remote_code":
             True,
             "kv_cache_config":
@@ -79,8 +81,7 @@ class RuntimeConfig(BaseModel):
         }
 
         if self.backend in backend_config_map:
-            llm_args["pytorch_backend_config"] = backend_config_map[
-                self.backend]()
+            llm_args.update(backend_config_map[self.backend]())
 
         return update_llm_args_with_extra_options(llm_args,
                                                   self.extra_llm_api_options)
@@ -107,7 +108,7 @@ class PerformanceOptions:
         return config
 
     def get_pytorch_perf_config(self) -> PyTorchConfig:
-        return PyTorchConfig(**self.pytorch_config)
+        return self.pytorch_config
 
     def get_autodeploy_perf_config(self) -> AutoDeployConfig:
         ad_config = AutoDeployConfig(**self.pytorch_config)
@@ -154,6 +155,7 @@ class ExecutorWorldConfig(BaseModel):
     gpus_per_node: Optional[int] = None
     leader_mode: bool = False
     ep_size: Optional[int] = None
+    cluster_size: Optional[int] = None
 
     @model_validator(mode="after")
     def validate_world_size(self) -> ExecutorWorldConfig:

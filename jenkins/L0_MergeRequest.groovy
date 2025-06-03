@@ -15,18 +15,23 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 }
 LLM_ROOT = "llm"
 
+// LLM repository configuration
+withCredentials([string(credentialsId: 'default-scan-repo', variable: 'DEFAULT_SCAN_REPO')]) {
+    SCAN_REPO = "${DEFAULT_SCAN_REPO}"
+}
+SCAN_COMMIT = "main"
+SCAN_ROOT = "scan"
+
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
 // Container configuration
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-x86_64-ubuntu24.04-trt10.9.0.34-skip-devel-202504101610-3421"
-LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-aarch64-ubuntu24.04-trt10.9.0.34-skip-devel-202504101610-3421"
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py310-trt10.9.0.34-skip-devel-202504101610-3421"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py312-trt10.9.0.34-skip-devel-202504101610-3421"
-
-LLM_ROCKYLINUX8_DOCKER_IMAGE = LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE
+LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505211401-4539"
+LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-aarch64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505211401-4539"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310-trt10.10.0.31-skip-tritondevel-202505211401-4539"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312-trt10.10.0.31-skip-tritondevel-202505211401-4539"
 
 // TODO: Move common variables to an unified location
 BUILD_CORES_REQUEST = "8"
@@ -79,6 +84,8 @@ def TEST_STAGE_LIST = "stage_list"
 @Field
 def GPU_TYPE_LIST = "gpu_type"
 @Field
+def TEST_BACKEND = "test_backend"
+@Field
 def IS_POST_MERGE = "post_merge"
 @Field
 def ADD_MULTI_GPU_TEST = "add_multi_gpu_test"
@@ -95,6 +102,8 @@ def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
 def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 @Field
+def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
+@Field
 def DEBUG_MODE = "debug"
 
 def testFilter = [
@@ -102,6 +111,7 @@ def testFilter = [
     (ENABLE_SKIP_TEST): gitlabParamsFromBot.get((ENABLE_SKIP_TEST), false),
     (TEST_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((TEST_STAGE_LIST), null)?.tokenize(',')),
     (GPU_TYPE_LIST): trimForStageList(gitlabParamsFromBot.get((GPU_TYPE_LIST), null)?.tokenize(',')),
+    (TEST_BACKEND): trimForStageList(gitlabParamsFromBot.get((TEST_BACKEND), null)?.tokenize(',')),
     (IS_POST_MERGE): (env.JOB_NAME ==~ /.*PostMerge.*/) || gitlabParamsFromBot.get((IS_POST_MERGE), false),
     (ADD_MULTI_GPU_TEST): gitlabParamsFromBot.get((ADD_MULTI_GPU_TEST), false),
     (ONLY_MULTI_GPU_TEST): gitlabParamsFromBot.get((ONLY_MULTI_GPU_TEST), false) || gitlabParamsFromBot.get((ENABLE_MULTI_GPU_TEST), false),
@@ -110,6 +120,7 @@ def testFilter = [
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_PYTORCH_FILE_CHANGED): false,
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
+    (AUTO_TRIGGER_TAG_LIST): [],
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -118,9 +129,12 @@ String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
 def GITHUB_PR_API_URL = "github_pr_api_url"
 @Field
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+@Field
+def ACTION_INFO = "action_info"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -128,7 +142,8 @@ boolean enableUpdateGitlabStatus =
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
     testFilter[GPU_TYPE_LIST] == null &&
-    testFilter[TEST_STAGE_LIST] == null
+    testFilter[TEST_STAGE_LIST] == null &&
+    testFilter[TEST_BACKEND] == null
 
 String getShortenedJobName(String path)
 {
@@ -312,6 +327,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
     })
 }
 
@@ -343,8 +359,33 @@ def launchReleaseCheck(pipeline)
                 sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
             }
         }
-        // Step 3: do some check in container
+        // Step 3: Run license check
         sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
+
+        // Step 4: Run guardwords scan
+        def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+        if (env.alternativeTRT || isOfficialPostMergeJob) {
+            trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
+            try {
+                ignoreList = [
+                    "*/.git/*",
+                    "*/3rdparty/*",
+                    "*/examples/scaffolding/contrib/mcp/weather/weather.py",
+                    "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz"
+                ]
+                sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')}) 2>&1 | tee scan.log"
+                def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
+                if (lastLine.toLowerCase().contains("error")) {
+                    error "Guardwords Scan Failed."
+                }
+            } catch (Exception e) {
+                throw e
+            } finally {
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/guardwords-scan-results/")
+                echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
+            }
+        }
     }
 
     def image = "urm.nvidia.com/docker/golang:1.22"
@@ -439,6 +480,12 @@ def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
 }
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set changed file list to empty list.")
+        return []
+    }
+
     def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
 
     if (globalVars[CACHED_CHANGED_FILE_LIST] != null) {
@@ -458,6 +505,34 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
         globalVars[CACHED_CHANGED_FILE_LIST] = []
         return globalVars[CACHED_CHANGED_FILE_LIST]
     }
+}
+
+def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
+    def autoTriggerTagList = []
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set auto trigger tags to empty list.")
+        return autoTriggerTagList
+    }
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+    if (!changedFileList || changedFileList.isEmpty()) {
+        return autoTriggerTagList
+    }
+    def specialFileToTagMap = [
+        "tensorrt_llm/_torch/models/modeling_deepseekv3.py": ["-DeepSeek-"],
+    ]
+    for (file in changedFileList) {
+        for (String key : specialFileToTagMap.keySet()) {
+            if (file.startsWith(key)) {
+                autoTriggerTagList += specialFileToTagMap[key]
+            }
+        }
+    }
+    autoTriggerTagList = autoTriggerTagList.unique()
+    if (!autoTriggerTagList.isEmpty()) {
+        pipeline.echo("Auto trigger tags detected: ${autoTriggerTagList.join(', ')}")
+    }
+    return autoTriggerTagList
 }
 
 def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
@@ -517,13 +592,17 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
+        "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
-        "tensorrt_llm/_torch/models/modeling_deepseekv3.py",
+        "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
+        "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
+        "tests/unittest/llmapi/test_llm_multi_gpu.py",
+        "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
         "jenkins/L0_Test.groovy",
     ]
 
@@ -564,10 +643,18 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
     }
     def pytorchOnlyList = [
         "tensorrt_llm/_torch/",
+        "tensorrt_llm/scaffolding/",
         "tests/unittest/_torch/",
+        "tests/unittest/scaffolding/",
+        "tests/unittest/llmapi/test_llm_pytorch.py",
+        "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
         "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
         "tests/integration/defs/disaggregated/",
+        "examples/auto_deploy",
+        "examples/disaggregated",
         "examples/pytorch/",
+        "examples/scaffolding/",
+        "docs/"
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
@@ -630,6 +717,45 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
+        stage("Rerun report") {
+            sh "rm -rf rerun && mkdir -p rerun"
+            sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
+            sh "find rerun -type f"
+            def rerunFileCount = sh(returnStdout: true, script: 'find rerun -type f | wc -l').replaceAll("\\s","").toInteger()
+            if (rerunFileCount == 0) {
+                echo "Rerun report is skipped because there is no rerun test data file."
+                return
+            }
+            def xmlFiles = findFiles(glob: 'rerun/**/*.xml')
+            def xmlFileList = xmlFiles.collect { it.path }
+            def inputfiles = xmlFileList.join(',')
+            echo "inputfiles: ${inputfiles}"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
+            sh """
+                python3 llm/tests/integration/defs/test_rerun.py \
+                generate_rerun_report \
+                --output-file=rerun/rerun_report.xml \
+                --input-files=${inputfiles}
+            """
+            trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
+            echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+            def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+            if (env.alternativeTRT || isOfficialPostMergeJob) {
+                catchError(
+                    buildResult: 'FAILURE',
+                    stageResult: 'FAILURE') {
+                    error "Some failed tests were reruned, please check the rerun report."
+                }
+            } else {
+                catchError(
+                    buildResult: 'SUCCESS',
+                    stageResult: 'UNSTABLE') {
+                    error "Some failed tests were reruned, please check the rerun report."
+                }
+            }
+        } // Rerun report stage
         try {
             stage("Test coverage") {
                 sh "ls"
@@ -715,7 +841,7 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
     return status
 }
 
-def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
+def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
         "Release Check": {
@@ -727,10 +853,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
             script {
                 stage("Build") {
                     def parameters = getCommonParameters()
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
                         'enableFailFast': enableFailFast,
                         'dockerImage': LLM_DOCKER_IMAGE,
-                        'wheelDockerImage': LLM_ROCKYLINUX8_DOCKER_IMAGE,
+                        'wheelDockerImagePy310': LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
+                        'wheelDockerImagePy312': LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+                        'globalVars': globalVarsJson,
                     ]
 
                     if (env.alternativeTRT) {
@@ -764,10 +893,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
                         parameters = getCommonParameters()
 
                         String testFilterJson = writeJSON returnText: true, json: testFilter
+                        String globalVarsJson = writeJSON returnText: true, json: globalVars
                         parameters += [
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
                             'dockerImage': LLM_DOCKER_IMAGE,
+                            'wheelDockerImagePy310': LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
+                            'wheelDockerImagePy312': LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+                            'globalVars': globalVarsJson,
                         ]
 
                         if (env.alternativeTRT) {
@@ -820,9 +953,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
                 def stageName = "Build"
                 stage(stageName) {
                     def parameters = getCommonParameters()
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
                         'enableFailFast': enableFailFast,
                         "dockerImage": LLM_SBSA_DOCKER_IMAGE,
+                        'globalVars': globalVarsJson,
                     ]
 
                     if (env.alternativeTrtSBSA) {
@@ -857,15 +992,23 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
                         def parameters = getCommonParameters()
 
                         String testFilterJson = writeJSON returnText: true, json: testFilter
+                        String globalVarsJson = writeJSON returnText: true, json: globalVars
                         parameters += [
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
                             "dockerImage": LLM_SBSA_DOCKER_IMAGE,
+                            'globalVars': globalVarsJson,
                         ]
 
                         if (env.alternativeTrtSBSA) {
                             parameters += [
                                 "alternativeTRT": env.alternativeTrtSBSA,
+                            ]
+                        }
+
+                        if (env.testPhase2StageName) {
+                            parameters += [
+                                'testPhase2StageName': env.testPhase2StageName,
                             ]
                         }
 
@@ -898,6 +1041,43 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
             }
         },
     ]
+    def dockerBuildJob = [
+        "Build-Docker-Images": {
+            script {
+                stage("[Build-Docker-Images] Remote Run") {
+                    def parameters = getCommonParameters()
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
+                    def branch = env.gitlabBranch ? env.gitlabBranch : "main"
+                    if (globalVars[GITHUB_PR_API_URL]) {
+                        branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                    }
+
+                    parameters += [
+                        'enableFailFast': enableFailFast,
+                        'branch': branch,
+                        'action': "push",
+                        'globalVars': globalVarsJson,
+                    ]
+
+                    echo "trigger BuildDockerImages job, params: ${parameters}"
+
+                    def status = triggerJob("/LLM/helpers/BuildDockerImages", parameters)
+                    if (status != "SUCCESS") {
+                        error "Downstream job did not succeed"
+                    }
+                }
+            }
+        }
+    ]
+    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+        stages += dockerBuildJob
+    }
+    if (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") || testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images")) {
+        stages += dockerBuildJob
+        testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
+        testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
+        echo "Will run Build-Docker-Images job"
+    }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
@@ -955,6 +1135,8 @@ pipeline {
             {
                 script {
                     setupPipelineEnvironment(this, testFilter, globalVars)
+                    println globalVars
+                    globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                     echo "enableFailFast is: ${enableFailFast}"
                     echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
                     println testFilter
@@ -972,7 +1154,10 @@ pipeline {
                             }
                         }
                     } else {
-                        launchStages(this, reuseBuild, testFilter, enableFailFast)
+                        // globalVars[CACHED_CHANGED_FILE_LIST] is only used in setupPipelineEnvironment
+                        // Reset it to null to workaround the "Argument list too long" error
+                        globalVars[CACHED_CHANGED_FILE_LIST] = null
+                        launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
             }

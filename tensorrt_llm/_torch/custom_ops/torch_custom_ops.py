@@ -1,11 +1,14 @@
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
+from ..attention_backend.interface import AttentionInputType
 from ..autotuner import AutoTuner, TunableRunner, TuningConfig
-from ..utils import (get_last_power_of_2_num_tokens_buckets,
+from ..utils import (compute_swizzled_sf_shape,
+                     get_last_power_of_2_num_tokens_buckets,
+                     get_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2, next_positive_power_of_2)
 
 
@@ -29,7 +32,10 @@ class MoERunner(TunableRunner):
         tp_rank: int,
         ep_size: int,
         ep_rank: int,
+        cluster_size: int,
+        cluster_rank: int,
         use_fp8_block_scaling: bool,
+        use_w4a8_group_scaling: bool,
     ):
         self.x_dtype = x_dtype
         self.weight_dtype = weight_dtype
@@ -39,15 +45,19 @@ class MoERunner(TunableRunner):
         self.tp_rank = tp_rank
         self.ep_size = ep_size
         self.ep_rank = ep_rank
+        self.cluster_size = cluster_size
+        self.cluster_rank = cluster_rank
         self.use_fp8_block_scaling = use_fp8_block_scaling
+        self.use_w4a8_group_scaling = use_w4a8_group_scaling
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
-                        use_fp8_block_scaling)
+                        use_fp8_block_scaling, use_w4a8_group_scaling)
 
         if instance_key not in MoERunner._runner_dict:
             MoERunner._runner_dict[
                 instance_key] = torch.classes.trtllm.FusedMoeRunner(
-                    x_dtype, weight_dtype, output_dtype, use_fp8_block_scaling)
+                    x_dtype, weight_dtype, output_dtype, use_fp8_block_scaling,
+                    use_w4a8_group_scaling)
         self._fused_moe_runner = MoERunner._runner_dict[instance_key]
         self._is_nvfp4 = weight_dtype == torch.int64
 
@@ -55,7 +65,7 @@ class MoERunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
     ) -> List[int]:
-        x, fc2_expert_weights, min_latency_mode_tensor = inputs
+        x, _, _, min_latency_mode_tensor = inputs
         min_latency_mode = min_latency_mode_tensor.size(0) == 1
         m = x.shape[0]
 
@@ -79,17 +89,20 @@ class MoERunner(TunableRunner):
         tactic: int = -1,
         do_preparation: bool = False,
     ):
-        x, fc2_expert_weights, min_latency_mode_tensor = inputs
+        x, fc1_expert_weights, fc2_expert_weights, min_latency_mode_tensor = inputs
         min_latency_mode = min_latency_mode_tensor.size(0) == 1
         # determine if we should use min latency mode according to the profiled seq len
         self._fused_moe_runner.run_gemm_profile(
             x,
+            fc1_expert_weights,
             fc2_expert_weights,
             self.top_k,
             self.tp_size,
             self.tp_rank,
             self.ep_size,
             self.ep_rank,
+            self.cluster_size,
+            self.cluster_rank,
             min_latency_mode,
             gemm_idx,
             tactic,
@@ -111,19 +124,27 @@ def fused_moe(
     tp_rank: int = 0,
     ep_size: int = 1,
     ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
     use_fp8_block_scaling: bool = False,
+    use_w4a8_group_scaling: bool = False,
     min_latency_mode: bool = False,
+    tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
 
+    tune_num_tokens_list = []
+    tune_num_tokens = next_positive_power_of_2(tune_max_num_tokens)
+    while tune_num_tokens > 0:
+        tune_num_tokens_list.append(tune_num_tokens)
+        tune_num_tokens //= 2
     # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
     tuning_config = TuningConfig(dynamic_tensors=(
         # input, dim 0, all valid buckets, map a seq_len to power of 2 bucket index
-        (0, 0, ((16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4,
-                 2, 1), next_positive_power_of_2)),
+        (0, 0, (tuple(tune_num_tokens_list), next_positive_power_of_2)),
         # min_latency_tensor, dim 0, (0 for False, 1 for True), map to it self
-        (2, 0, ((0, ), lambda x: x)),
+        (3, 0, ((0, ), lambda x: x)),
     ))
 
     # TODO: set min_latency_mode always to False due to the error in the moe_kernels
@@ -139,14 +160,17 @@ def fused_moe(
         tp_rank=tp_rank,
         ep_size=ep_size,
         ep_rank=ep_rank,
+        cluster_size=cluster_size,
+        cluster_rank=cluster_rank,
         use_fp8_block_scaling=use_fp8_block_scaling,
+        use_w4a8_group_scaling=use_w4a8_group_scaling,
     )
 
     _, gemm_tactic_1 = tuner.choose_one(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
         tuning_config,
-        [input, fc2_expert_weights, min_latency_tensor],
+        [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
         gemm_idx=1,
     )
 
@@ -154,7 +178,7 @@ def fused_moe(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
         tuning_config,
-        [input, fc2_expert_weights, min_latency_tensor],
+        [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
         gemm_idx=2,
     )
 
@@ -171,6 +195,8 @@ def fused_moe(
         tp_rank,
         ep_size,
         ep_rank,
+        cluster_size,
+        cluster_rank,
         min_latency_mode,
         [gemm_tactic_1, gemm_tactic_2],
     )
@@ -192,7 +218,10 @@ def _(
     tp_rank: int = 0,
     ep_size: int = 1,
     ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
     use_fp8_block_scaling: bool = False,
+    use_w4a8_group_scaling: bool = False,
     min_latency_mode: bool = False,
 ):
     seq_len = input.shape[0]
@@ -254,6 +283,24 @@ class NVFP4GemmRunner(TunableRunner):
             tactic,
         )
 
+    def find_nearest_profile(
+            self, shapes: Tuple[torch.Size],
+            dynamic_tensors: Tuple[Tuple[int, int, Tuple[Union[Tuple[int],
+                                                               Callable],
+                                                         Callable]]],
+            constraints: Tuple[Tuple[int, int, Callable]]) -> Tuple:
+        """Generate a unique profile to reduce host overhead during inference.
+        """
+        _, _, (_, shape_round_rule) = dynamic_tensors[0]
+        m, n, k = shape_round_rule(shapes[0][0]), shapes[1][0], shapes[1][1] * 2
+
+        return (m, n, k)
+
+    def get_cache_key_specifc(self, profile: Tuple) -> Tuple:
+        """Generate a unique cache key for the given profile.
+        """
+        return (self.sf_use_ue8m0, self.output_dtype), profile
+
 
 def fp4_scale_dims(input_shapes: List[torch.Tensor], sf_vec_size: int = 16):
     """Calculate the dimensions of the fp4 scale tensor.
@@ -280,8 +327,11 @@ def nvfp4_gemm(
     tuner = AutoTuner.get()
 
     tuning_config = TuningConfig(
-        dynamic_tensors=((0, 0, (get_last_power_of_2_num_tokens_buckets,
-                                 last_positive_power_of_2)), ),
+        dynamic_tensors=((0, 0, (
+            lambda x: get_power_of_2_num_tokens_buckets(8192)
+            if not to_userbuffers else get_last_power_of_2_num_tokens_buckets(
+                x), lambda x: next_positive_power_of_2(x)
+            if not to_userbuffers else last_positive_power_of_2(x))), ),
         constraints=((2, 0, fp4_scale_dims), ),
     )
 
@@ -314,3 +364,208 @@ def _(
 ) -> torch.Tensor:
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
+
+
+@torch.library.custom_op("trtllm::attention", mutates_args=())
+def attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+    workspace: Optional[torch.Tensor],
+    sequence_length: torch.Tensor,
+    host_past_key_value_lengths: torch.Tensor,
+    context_lengths: torch.Tensor,
+    host_context_lengths: torch.Tensor,
+    host_request_types: torch.Tensor,
+    kv_cache_block_offsets: Optional[torch.Tensor],
+    host_kv_cache_block_offsets: Optional[torch.Tensor],
+    host_kv_cache_pool_pointers: Optional[torch.Tensor],
+    host_kv_cache_pool_mapping: Optional[torch.Tensor],
+    cache_indirection: Optional[torch.Tensor],
+    kv_scale_orig_quant: Optional[torch.Tensor],
+    kv_scale_quant_orig: Optional[torch.Tensor],
+    out_scale: Optional[torch.Tensor],
+    rotary_inv_freq: Optional[torch.Tensor],
+    rotary_cos_sin: Optional[torch.Tensor],
+    latent_cache: Optional[torch.Tensor],
+    q_pe: Optional[torch.Tensor],
+    block_ids_per_seq: Optional[torch.Tensor],
+    is_fused_qkv: bool,
+    update_kv_cache: bool,
+    predicted_tokens_per_seq: int,
+    layer_idx: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    tokens_per_block: Optional[int],
+    max_num_requests: int,
+    max_context_length: int,
+    attention_window_size: int,
+    sink_token_length: int,
+    beam_width: int,
+    mask_type: int,
+    quant_mode: int,
+    q_scaling: float,
+    position_embedding_type: int,
+    rotary_embedding_dim: int,
+    rotary_embedding_base: float,
+    rotary_embedding_scale_type: int,
+    rotary_embedding_scale: float,
+    rotary_embedding_short_m_scale: float,
+    rotary_embedding_long_m_scale: float,
+    rotary_embedding_max_positions: int,
+    rotary_embedding_original_max_positions: int,
+    use_paged_context_fmha: bool,
+    attention_input_type: Optional[int],
+    is_mla_enable: bool,
+    q_lora_rank: Optional[int],
+    kv_lora_rank: Optional[int],
+    qk_nope_head_dim: Optional[int],
+    qk_rope_head_dim: Optional[int],
+    v_head_dim: Optional[int],
+    mrope_rotary_cos_sin: Optional[torch.Tensor],
+    mrope_position_deltas: Optional[torch.Tensor],
+    mla_context_paged_kv: Optional[torch.Tensor],
+    mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
+    attention_chunk_size: Optional[int],
+) -> List[torch.Tensor]:
+    num_tokens = q.size(0)
+    attention_input_type = (AttentionInputType(attention_input_type)
+                            if attention_input_type is not None else
+                            AttentionInputType.mixed)
+    is_gen_only = attention_input_type == AttentionInputType.generation_only
+    v_head_size = head_size if not is_mla_enable else kv_lora_rank if is_gen_only else v_head_dim
+    if out_dtype is None:
+        out_dtype = q.dtype
+
+    if out_dtype == torch.uint8:
+        num_nvfp4_elements_per_container = 2
+        scaling_vector_size = 16
+        size_per_token = num_heads * v_head_size
+        output_act = q.new_empty(
+            (num_tokens, size_per_token // num_nvfp4_elements_per_container),
+            dtype=torch.uint8)
+        # Create a sf (scaling factors) tensor for NVFP4 (use INT8 as the container dtype).
+        output_sf = q.new_empty(compute_swizzled_sf_shape(
+            num_tokens, size_per_token // scaling_vector_size),
+                                dtype=torch.uint8)
+    else:
+        output_act = q.new_empty((num_tokens, num_heads * v_head_size),
+                                 dtype=out_dtype)
+        # NOTE(tizheng): Does this introduce overhead?
+        output_sf = torch.empty(())  # Create a placeholder, which is not used.
+
+    torch.ops.trtllm.attention_inplace(
+        q, k, v, output_act, output_sf, out_dtype, workspace, sequence_length,
+        host_past_key_value_lengths, context_lengths, host_context_lengths,
+        host_request_types, kv_cache_block_offsets, host_kv_cache_block_offsets,
+        host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
+        cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
+        rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq,
+        is_fused_qkv, update_kv_cache, predicted_tokens_per_seq, layer_idx,
+        num_heads, num_kv_heads, head_size, tokens_per_block, max_num_requests,
+        max_context_length, attention_window_size, sink_token_length,
+        beam_width, mask_type, quant_mode, q_scaling, position_embedding_type,
+        rotary_embedding_dim, rotary_embedding_base,
+        rotary_embedding_scale_type, rotary_embedding_scale,
+        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
+        rotary_embedding_max_positions, rotary_embedding_original_max_positions,
+        use_paged_context_fmha, attention_input_type, is_mla_enable,
+        q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
+        v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
+        mla_context_paged_kv, mla_context_kv_cache_block_offsets,
+        attention_chunk_size)
+    return output_act, output_sf
+
+
+@attention.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+    workspace: Optional[torch.Tensor],
+    sequence_length: torch.Tensor,
+    host_past_key_value_lengths: torch.Tensor,
+    context_lengths: torch.Tensor,
+    host_context_lengths: torch.Tensor,
+    host_request_types: torch.Tensor,
+    kv_cache_block_offsets: Optional[torch.Tensor],
+    host_kv_cache_block_offsets: Optional[torch.Tensor],
+    host_kv_cache_pool_pointers: Optional[torch.Tensor],
+    host_kv_cache_pool_mapping: Optional[torch.Tensor],
+    cache_indirection: Optional[torch.Tensor],
+    kv_scale_orig_quant: Optional[torch.Tensor],
+    kv_scale_quant_orig: Optional[torch.Tensor],
+    out_scale: Optional[torch.Tensor],
+    rotary_inv_freq: Optional[torch.Tensor],
+    rotary_cos_sin: Optional[torch.Tensor],
+    latent_cache: Optional[torch.Tensor],
+    q_pe: Optional[torch.Tensor],
+    block_ids_per_seq: Optional[torch.Tensor],
+    is_fused_qkv: bool,
+    update_kv_cache: bool,
+    predicted_tokens_per_seq: int,
+    layer_idx: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    tokens_per_block: Optional[int],
+    max_num_requests: int,
+    max_context_length: int,
+    attention_window_size: int,
+    sink_token_length: int,
+    beam_width: int,
+    mask_type: int,
+    quant_mode: int,
+    q_scaling: float,
+    position_embedding_type: int,
+    rotary_embedding_dim: int,
+    rotary_embedding_base: float,
+    rotary_embedding_scale_type: int,
+    rotary_embedding_scale: float,
+    rotary_embedding_short_m_scale: float,
+    rotary_embedding_long_m_scale: float,
+    rotary_embedding_max_positions: int,
+    rotary_embedding_original_max_positions: int,
+    use_paged_context_fmha: bool,
+    attention_input_type: Optional[int],
+    is_mla_enable: bool,
+    q_lora_rank: Optional[int],
+    kv_lora_rank: Optional[int],
+    qk_nope_head_dim: Optional[int],
+    qk_rope_head_dim: Optional[int],
+    v_head_dim: Optional[int],
+    mrope_rotary_cos_sin: Optional[torch.Tensor],
+    mrope_position_deltas: Optional[torch.Tensor],
+    mla_context_paged_kv: Optional[torch.Tensor],
+    mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
+    attention_chunk_size: Optional[int],
+) -> List[torch.Tensor]:
+    num_tokens = q.size(0)
+    attention_input_type = (AttentionInputType(attention_input_type)
+                            if attention_input_type is not None else
+                            AttentionInputType.mixed)
+    if out_dtype is None:
+        out_dtype = q.dtype
+    is_gen_only = attention_input_type == AttentionInputType.generation_only
+    v_head_size = head_size if not is_mla_enable else kv_lora_rank if is_gen_only else v_head_dim
+
+    if out_dtype == torch.uint8:
+        num_nvfp4_elements_per_container = 2
+        scaling_vector_size = 16
+        size_per_token = num_heads * v_head_size
+        output_act = q.new_empty(
+            (num_tokens, size_per_token // num_nvfp4_elements_per_container),
+            dtype=torch.uint8)
+        # Create a sf (scaling factors) tensor for NVFP4 (use INT8 as the container dtype).
+        output_sf = q.new_empty(compute_swizzled_sf_shape(
+            num_tokens, size_per_token // scaling_vector_size),
+                                dtype=torch.uint8)
+    else:
+        output_act = q.new_empty((num_tokens, num_heads * v_head_size),
+                                 dtype=out_dtype)
+        output_sf = torch.empty(())  # Create a placeholder, which is not used.
+
+    return output_act, output_sf

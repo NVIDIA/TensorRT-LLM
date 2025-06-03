@@ -15,7 +15,6 @@
 # -*- coding: utf-8 -*-
 
 import datetime
-import json
 import os
 import re
 import shutil
@@ -23,6 +22,7 @@ import subprocess as sp
 import tempfile
 import time
 import urllib.request
+import warnings
 from functools import wraps
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -30,6 +30,7 @@ from typing import Iterable, Sequence
 import defs.ci_profiler
 import psutil
 import pytest
+import torch
 import tqdm
 import yaml
 from _pytest.mark import ParameterSet
@@ -54,9 +55,6 @@ except ImportError:
 DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
 GITLAB_API_USER = os.environ.get("GITLAB_API_USER")
 GITLAB_API_TOKEN = os.environ.get("GITLAB_API_TOKEN")
-EVALTOOL_REPO_URL = os.environ.get("EVALTOOL_REPO_URL")
-LLM_GATE_WAY_CLIENT_ID = os.environ.get("LLM_GATE_WAY_CLIENT_ID")
-LLM_GATE_WAY_TOKEN = os.environ.get("LLM_GATE_WAY_TOKEN")
 
 
 def print_storage_usage(path, tag, capfd):
@@ -179,6 +177,13 @@ def get_llm_root(trt_config=None, gitlab_token=None):
 @pytest.fixture(scope="session")
 def llm_root():
     return get_llm_root()
+
+
+@pytest.fixture(scope="session")
+def llm_backend_root():
+    llm_root_directory = get_llm_root()
+    llm_backend_repo_root = os.path.join(llm_root_directory, "triton_backend")
+    return llm_backend_repo_root
 
 
 @pytest.fixture(scope="session")
@@ -705,8 +710,16 @@ def llm_venv(llm_root, custom_user_workspace):
         workspace_dir = "llm-test-workspace"
     workspace_dir = os.path.join(workspace_dir, subdir)
     from defs.local_venv import PythonVenvRunnerImpl
-    return PythonVenvRunnerImpl("", "", "python3",
+    venv = PythonVenvRunnerImpl("", "", "python3",
                                 os.path.join(os.getcwd(), workspace_dir))
+    yield venv
+    # Remove the workspace directory
+    if os.path.exists(workspace_dir):
+        print(f"Cleaning up workspace: {workspace_dir}")
+        try:
+            shutil.rmtree(workspace_dir)
+        except Exception as e:
+            print(f"Failed to clean up workspace: {e}")
 
 
 @pytest.fixture(scope="session")
@@ -797,6 +810,8 @@ def multimodal_model_root(request, llm_venv):
         tllm_model_name = tllm_model_name + ".nemo"
     elif 'Llama-3.2' in tllm_model_name:
         models_root = os.path.join(llm_models_root(), 'llama-3.2-models')
+    elif 'Mistral-Small' in tllm_model_name:
+        models_root = llm_models_root()
 
     multimodal_model_root = os.path.join(models_root, tllm_model_name)
 
@@ -1668,79 +1683,6 @@ def llm_aya_23_35b_model_root(llm_venv):
     return model_root
 
 
-def evaltool_mmlu_post_process(results_path, baseline, threshold):
-    # Note: In the older version of the lm-harness result file,
-    # there are 57 values.
-    # The latest version of lm-harness includes
-    # 4 additional categories and 1 whole dataset in the result file.
-    # We need to exclude these new categories and
-    # the whole dataset when calculating the average.
-
-    with open(results_path) as f:
-        result = json.load(f)
-        acc_acc = 0.0
-        tasks_to_ignore = [
-            "mmlu_str", "mmlu_str_stem", "mmlu_str_other",
-            "mmlu_str_social_sciences", "mmlu_str_humanities"
-        ]
-        total_task = len(result['results']) - len(tasks_to_ignore)
-        assert total_task == 57
-        for sub_task in result['results']:
-            if sub_task in tasks_to_ignore:
-                continue
-            acc_acc += float(result['results'][sub_task]['exact_match,none'])
-        avg_acc = acc_acc / total_task
-        print("MMLU avg accuracy:", avg_acc)
-        assert abs(avg_acc - baseline) <= threshold
-
-
-def evaltool_wikilingua_post_process(results_path, baseline, threshold):
-    with open(results_path) as f:
-        result = json.load(f)
-        rouge_l = result['results']['wikilingua_english']['rougeL,none']
-        print("Wikilingua_english rouge_L:", rouge_l)
-        assert abs(rouge_l - baseline) <= threshold
-
-
-def evaltool_humaneval_post_process(results_path, baseline, threshold):
-    with open(results_path) as f:
-        result = json.load(f)
-        print(result)
-        acc = result[0]['humaneval']['pass@1']
-        assert abs(acc - baseline) <= threshold
-
-
-def evaltool_mtbench_post_process(results_path, baseline, threshold):
-    with open(results_path) as f:
-        get_result = False
-        for total_score in f:
-            if total_score.startswith('total'):
-                get_result = True
-                total_score = float(total_score.split(',')[1].strip())
-                assert abs(total_score - baseline) <= threshold
-        assert get_result
-
-
-@pytest.fixture(scope="module")
-def evaltool_root(llm_venv):
-    if GITLAB_API_USER is None or GITLAB_API_TOKEN is None or EVALTOOL_REPO_URL is None:
-        pytest.skip(
-            "Need to set GITLAB_API_USER, GITLAB_API_TOKEN, and EVALTOOL_REPO_URL env vars to run evaltool tests."
-        )
-    workspace = llm_venv.get_working_directory()
-    clone_dir = os.path.join(workspace, "eval-tool")
-    repo_url = f"https://{GITLAB_API_USER}:{GITLAB_API_TOKEN}@{EVALTOOL_REPO_URL}"
-    branch_name = "dev/0.9"
-
-    from evaltool.constants import EVALTOOL_SETUP_SCRIPT
-    evaltool_setup_cmd = [
-        EVALTOOL_SETUP_SCRIPT, "-b", branch_name, "-d", clone_dir, "-r",
-        repo_url
-    ]
-    call(" ".join(evaltool_setup_cmd), shell=True)
-    return clone_dir
-
-
 @pytest.fixture(scope="function")
 def engine_dir(llm_venv, capfd):
     "Get engine dir"
@@ -1834,6 +1776,8 @@ def star_attention_input_root(llm_root):
 def parametrize_with_ids(argnames: str | Sequence[str],
                          argvalues: Iterable[ParameterSet | Sequence[object]
                                              | object], **kwargs):
+    """An alternative to pytest.mark.parametrize with automatically generated test ids.
+    """
     if isinstance(argnames, str):
         argname_list = [n.strip() for n in argnames.split(",")]
     else:
@@ -1848,15 +1792,10 @@ def parametrize_with_ids(argnames: str | Sequence[str],
             case_argvalues = (case_argvalues, )
         assert len(case_argvalues) == len(argname_list)
 
-        case_id = []
-        for name, value in zip(argname_list, case_argvalues):
-            if value is None:
-                pass
-            elif isinstance(value, bool):
-                if value:
-                    case_id.append(name)
-            else:
-                case_id.append(f"{name}={value}")
+        case_id = [
+            f"{name}={value}"
+            for name, value in zip(argname_list, case_argvalues)
+        ]
         case_ids.append("-".join(case_id))
 
     return pytest.mark.parametrize(argnames, argvalues, ids=case_ids, **kwargs)
@@ -1888,19 +1827,8 @@ def skip_by_device_memory(request):
 
 def get_sm_version():
     "get compute capability"
-    with tempfile.TemporaryDirectory() as temp_dirname:
-        suffix = ".exe" if is_windows() else ""
-        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
-        cmd = " ".join([
-            "nvidia-smi" + suffix, "--query-gpu=compute_cap",
-            "--format=csv,noheader"
-        ])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
-
-    compute_cap = output.strip().split("\n")[0]
-    sm_major, sm_minor = list(map(int, compute_cap.split(".")))
-
-    return sm_major * 10 + sm_minor
+    prop = torch.cuda.get_device_properties(0)
+    return prop.major * 10 + prop.minor
 
 
 skip_pre_ada = pytest.mark.skipif(
@@ -1916,11 +1844,17 @@ skip_pre_blackwell = pytest.mark.skipif(
     reason="This test is not supported in pre-Blackwell architecture")
 
 skip_post_blackwell = pytest.mark.skipif(
-    get_sm_version() >= 100 and get_sm_version() < 120,
+    get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
 
 skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
                                   reason="NVLS is not supported")
+skip_no_hopper = pytest.mark.skipif(
+    get_sm_version() != 90,
+    reason="This test is only  supported in Hopper architecture")
+
+skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
+                                   reason="This test is for Blackwell SM120")
 
 
 def skip_fp8_pre_ada(use_fp8):
@@ -1976,22 +1910,6 @@ def get_device_memory():
         memory = int(output.strip().split()[0])
 
     return memory
-
-
-#
-# When test parameters have an empty id, older versions of pytest ignored that parameter when generating the
-# test node's ID completely. This however was actually a bug, and not expected behavior that got fixed in newer
-# versions of pytest:https://github.com/pytest-dev/pytest/pull/6607. TRT test defs however rely on this behavior
-# for quite a few test names. This is a hacky WAR that restores the old behavior back so that the
-# test names do not change. Note: This might break in a future pytest version.
-#
-# TODO: Remove this hack once the test names are fixed.
-#
-
-from _pytest.python import CallSpec2
-
-CallSpec2.id = property(
-    lambda self: "-".join(map(str, filter(None, self._idlist))))
 
 
 def pytest_addoption(parser):
@@ -2069,9 +1987,28 @@ def pytest_generate_tests(metafunc: pytest.Metafunc):
         lines = preprocess_test_list_lines(testlist_path, lines)
 
     uts = []
+    ids = []
     for line in lines:
         if line.startswith("unittest/"):
-            uts.append(line.strip())
+            if " TIMEOUT " in line:
+                # Process for marker TIMEOUT
+                case_part, timeout_part = line.split(" TIMEOUT ", 1)
+                case = case_part.strip()
+                timeout_str = timeout_part.strip()
+                timeout_num_match = re.search(r'\(?(\d+)\)?', timeout_str)
+                if timeout_num_match:
+                    timeout_min = int(timeout_num_match.group(1))
+                    timeout_sec = timeout_min * 60
+                else:
+                    raise ValueError(
+                        f"Invalid TIMEOUT format: {timeout_str} in line: {line}"
+                    )
+                mark = pytest.mark.timeout(int(timeout_sec))
+                uts.append(pytest.param(case, marks=mark))
+                # Change back id to include timeout information
+                ids.append(f"{case} TIMEOUT {timeout_str}")
+            else:
+                uts.append(line.strip())
     metafunc.parametrize("case", uts, ids=lambda x: x)
 
 
@@ -2184,7 +2121,7 @@ def all_pytest_items():
 
 
 @pytest.fixture(scope="session")
-def turtle_root():
+def test_root():
     return os.path.dirname(os.path.dirname(__file__))
 
 
@@ -2260,8 +2197,10 @@ def skip_by_host_memory(request):
 
 IS_UNDER_CI_ENV = 'JENKINS_HOME' in os.environ
 
+gpu_warning_threshold = 1024 * 1024 * 1024
 
-def collect_status():
+
+def collect_status(item: pytest.Item):
     if not IS_UNDER_CI_ENV:
         return
 
@@ -2274,6 +2213,22 @@ def collect_status():
         for idx in range(pynvml.nvmlDeviceGetCount())
     }
 
+    deadline = time.perf_counter() + 60  # 1 min
+    observed_used = 0
+    global gpu_warning_threshold
+
+    while time.perf_counter() < deadline:
+        observed_used = max(
+            pynvml.nvmlDeviceGetMemoryInfo(device).used
+            for device in handles.values())
+        if observed_used <= gpu_warning_threshold:
+            break
+        time.sleep(1)
+    else:
+        gpu_warning_threshold = max(observed_used, gpu_warning_threshold)
+        warnings.warn(
+            f"Test {item.name} does not free up GPU memory correctly!")
+
     gpu_memory = {}
     for idx, device in handles.items():
         total_used = pynvml.nvmlDeviceGetMemoryInfo(device).used // 1024 // 1024
@@ -2282,13 +2237,12 @@ def collect_status():
         process = {}
 
         for entry in detail:
-            host_memory_in_mbs = -1
             try:
-                host_memory_in_mbs = psutil.Process(
-                    entry.pid).memory_full_info().uss // 1024 // 1024
+                p = psutil.Process(entry.pid)
+                host_memory_in_mbs = p.memory_full_info().uss // 1024 // 1024
                 process[entry.pid] = (entry.usedGpuMemory // 1024 // 1024,
-                                      host_memory_in_mbs)
-            except:
+                                      host_memory_in_mbs, p.cmdline())
+            except Exception:
                 pass
 
         gpu_memory[idx] = {
@@ -2303,7 +2257,7 @@ def collect_status():
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(item, nextitem):
     ret = yield
-    collect_status()
+    collect_status(item)
     return ret
 
 
@@ -2323,3 +2277,12 @@ def disaggregated_test_root(llm_root, llm_venv):
                                       "tests/integration/defs/disaggregated")
 
     return disaggregated_root
+
+
+@pytest.fixture(scope="function")
+def tritonserver_test_root(llm_root):
+    "Get tritonserver test root"
+    tritonserver_root = os.path.join(llm_root,
+                                     "tests/integration/defs/triton_server")
+
+    return tritonserver_root

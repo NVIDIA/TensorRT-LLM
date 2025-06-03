@@ -11,6 +11,20 @@ l0_a100:
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
+      backend: "pytorch"
+  tests:
+    - unittest/llmapi/test_llm_pytorch.py
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
       backend: tensorrt
   tests:
   - unittest/trt/attention/test_sage_attention.py unittest/llmapi/test_llm_download.py unittest/llmapi/test_llm_kv_cache_events.py unittest/llmapi/test_mpi_session.py unittest/trt/model/redrafter unittest/trt/model/test_phi.py unittest/trt/model/test_unet.py unittest/trt/python_plugin unittest/tools unittest/utils unittest/others
@@ -56,3 +70,30 @@ l0_a100:
   - unittest/llmapi/test_llm_models.py -m "part0"
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: triton
+  tests:
+  - triton_server/test_triton.py::test_gpt_disaggregated_serving_bls[gpt-disaggregated-serving-bls]
+  - triton_server/test_triton.py::test_llava[llava]
+  - triton_server/test_triton.py::test_gpt_ib[gpt-ib]
+  - triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]
+  - triton_server/test_triton.py::test_gpt_2b_ib_lora[gpt-2b-ib-lora]
+  - triton_server/test_triton.py::test_gpt_ib_lad[gpt-ib-lad]
+  - triton_server/test_triton.py::test_gpt_speculative_decoding[gpt-speculative-decoding]
+  - triton_server/test_triton.py::test_gpt_ib_speculative_decoding_bls[gpt-ib-speculative-decoding-bls]
+  - triton_server/test_triton.py::test_gpt_gather_logits[gpt-gather-logits]
+  - triton_server/test_triton.py::test_medusa[medusa]
+  - triton_server/test_triton.py::test_mllama[mllama]
+  - triton_server/test_triton.py::test_eagle[eagle]
+  - triton_server/test_triton.py::test_llava_onevision[llava_onevision]
+  - triton_server/test_triton.py::test_qwen2_vl[qwen2_vl]

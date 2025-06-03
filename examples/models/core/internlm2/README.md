@@ -6,7 +6,7 @@ This document shows how to build and run InternLM2 7B / 20B models in TensorRT-L
 
 The TensorRT-LLM InternLM2 implementation is based on the LLaMA model. The implementation can
 be found in [model.py](../../../../tensorrt_llm/models/llama/model.py).
-The TensorRT-LLM InternLM2 example code lies in [`examples/internlm2`](./):
+The TensorRT-LLM InternLM2 example code lies in [`examples/models/core/internlm2`](./):
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) converts the Huggingface Model of InternLM2 into TensorRT-LLM checkpoint.
 

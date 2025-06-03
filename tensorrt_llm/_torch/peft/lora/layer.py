@@ -92,10 +92,14 @@ class LoraLayer(torch.nn.Module):
         self.output_hidden_sizes = output_hidden_sizes
         assert len(lora_module_types) == len(output_hidden_sizes)
 
-    def forward(self, x, lora_params: Dict,
-                layer_idx: int) -> Optional[torch.Tensor]:
-        if bool(lora_params):
+    def forward(
+        self,
+        x,
+        lora_params: Dict,
+        layer_idx: int,
+    ) -> Optional[torch.Tensor]:
 
+        if bool(lora_params):
             lora_ranks = []
             lora_weight_pointers = []
             active_lora_module_ids = []
@@ -126,7 +130,7 @@ class LoraLayer(torch.nn.Module):
                     True,  # transB
                     max([r.max() for r in lora_ranks]),
                     0,
-                    lora_params["remove_input_padding"],
+                    True,  # TODO smor- should be lora_params["remove_input_padding"], support in loraOp as well
                 )
                 if isinstance(lora_outputs, torch.Tensor):
                     return lora_outputs
@@ -147,7 +151,6 @@ class LoraLayer(torch.nn.Module):
                                 ],
                                             dtype=x.dtype,
                                             device=x.device))
-
                     lora_output = torch.cat(lora_output, dim=-1)
                     return lora_output
 

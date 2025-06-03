@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/types.h"
 #include <cstdint>
 #include <limits>
@@ -58,7 +59,8 @@ std::mutex CacheTransceiver::mDllMutex;
 
 std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransceiver(
     kv_cache_manager::BaseKVCacheManager* cacheManager, runtime::ModelConfig const& modelConfig,
-    runtime::WorldConfig const& worldConfig, executor::kv_cache::CacheState::AttentionType attentionType)
+    runtime::WorldConfig const& worldConfig, executor::kv_cache::CacheState::AttentionType attentionType,
+    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig)
 {
 
     std::optional<CacheTransceiver::CommType> commType;
@@ -67,27 +69,35 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
         commType = CacheTransceiver::CommType::UCX;
         TLLM_LOG_INFO("Enable UCX KV cache transport.");
     }
+    else if (common::getEnvUseNixlKvCache())
+    {
+        commType = CacheTransceiver::CommType::NIXL;
+        TLLM_LOG_INFO("Enable NIXL KV cache transport.");
+    }
     else if (common::getEnvUseMPIKvCache())
     {
         commType = CacheTransceiver::CommType::MPI;
         TLLM_LOG_INFO("Enable MPI KV cache transport.");
     }
+
     if (commType)
     {
         executor::kv_cache::CacheState::ModelConfig cacheStateCfg{
             modelConfig.getNumKvHeadsPerLayer(), modelConfig.getSizePerHead(), modelConfig.getTokensPerBlock()};
 
-        return std::make_unique<CacheTransceiver>(
-            cacheManager, commType.value(), cacheStateCfg, worldConfig, modelConfig.getKvDataType(), attentionType);
+        return std::make_unique<CacheTransceiver>(cacheManager, commType.value(), cacheStateCfg, worldConfig,
+            modelConfig.getKvDataType(), attentionType, cacheTransceiverConfig);
     }
     return nullptr;
 }
 
 CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, CommType commType,
     executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
-    nvinfer1::DataType dataType, executor::kv_cache::CacheState::AttentionType attentionType)
+    nvinfer1::DataType dataType, executor::kv_cache::CacheState::AttentionType attentionType,
+    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig)
     : mCommType{commType}
     , mMpiGroupComm(std::addressof(tensorrt_llm::mpi::MpiComm::session()))
+    , mCacheTransceiverConfig{cacheTransceiverConfig}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
     if (worldConfig.isPipelineParallel())
@@ -128,8 +138,15 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         }
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
-    if (mCommType == CommType::MPI || mCommType == CommType::UCX)
+    if (mCommType == CommType::MPI || mCommType == CommType::UCX || mCommType == CommType::NIXL)
     {
+        std::optional<size_t> maxNumTokens = std::nullopt;
+        if (mCacheTransceiverConfig.has_value())
+        {
+            maxNumTokens = mCacheTransceiverConfig.value().getMaxNumTokens();
+        }
+        mCacheTransBufferManager
+            = std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens);
         if (mCommType == CommType::UCX)
         {
             std::lock_guard<std::mutex> lock(mDllMutex);
@@ -148,6 +165,12 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             mManager = makeUcxConnectionManager();
             TLLM_LOG_INFO("UCX Connection Manager created");
         }
+        else if (mCommType == CommType::NIXL)
+        {
+            mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
+                mCacheTransBufferManager.get());
+            TLLM_LOG_INFO("NIXL Connection Manager created");
+        }
         else
         {
             mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
@@ -156,10 +179,12 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         }
 
         using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
-        auto makeFormatter = [cacheManager, isMLA]() -> std::unique_ptr<IOFormatter>
+        auto makeFormatter = [cacheManager, isMLA, this]() -> std::unique_ptr<IOFormatter>
         {
-            return isMLA ? std::unique_ptr<IOFormatter>(std::make_unique<MLACacheFormatter>(cacheManager))
-                         : std::unique_ptr<IOFormatter>(std::make_unique<CacheFormatter>(cacheManager));
+            return isMLA ? std::unique_ptr<IOFormatter>(
+                       std::make_unique<MLACacheFormatter>(cacheManager, this->mCacheTransBufferManager.get()))
+                         : std::unique_ptr<IOFormatter>(
+                             std::make_unique<CacheFormatter>(cacheManager, this->mCacheTransBufferManager.get()));
         };
 
         mDataResponder = std::make_unique<DataResponder>(

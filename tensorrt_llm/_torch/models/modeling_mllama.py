@@ -31,10 +31,11 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
-from ..modules.logits_procesor import LogitsProcessor
+from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from .modeling_llama import LlamaAttention
-from .modeling_utils import duplicate_kv_weight, register_auto_model
+from .modeling_utils import (duplicate_kv_weight, filter_weights,
+                             register_auto_model)
 
 
 class MllamaDecoderLayer(DecoderLayer):
@@ -159,7 +160,7 @@ class MllamaTextModel(nn.Module):
 
         residual = None
         for _, decoder_layer in enumerate(self.layers):
-            if decoder_layer == None:
+            if decoder_layer is None:
                 assert skip_cross_attention == True, 'Cross-attention is not supported yet'
             elif isinstance(decoder_layer, MllamaDecoderLayer):
                 hidden_states, residual = decoder_layer(
@@ -334,14 +335,6 @@ class MllamaForConditionalGeneration(nn.Module):
         text_config = self.config.pretrained_config.text_config
         text_head_dim = text_config.hidden_size // text_config.num_attention_heads
         vision_head_dim = vision_config.hidden_size // vision_config.attention_heads
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
 
         params_map = {
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],

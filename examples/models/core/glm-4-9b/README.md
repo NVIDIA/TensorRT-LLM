@@ -27,7 +27,7 @@ This document explains how to build the [glm-4-9b](https://huggingface.co/THUDM/
 ## Overview
 
 The TensorRT-LLM ChatGLM implementation can be found in [`tensorrt_llm/models/chatglm/model.py`](../../../../tensorrt_llm/models/chatglm/model.py).
-The TensorRT-LLM ChatGLM example code is located in [`examples/glm-4-9b`](./). There is one main file:
+The TensorRT-LLM ChatGLM example code is located in [`examples/models/core/glm-4-9b`](./). There is one main file:
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
 

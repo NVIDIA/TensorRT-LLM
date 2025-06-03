@@ -51,42 +51,41 @@ def server(model_name: str, backend: str, num_postprocess_workers: int):
 
     args = ["--backend", f"{backend}"]
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
-    with RemoteOpenAIServer(model_path, args) as remote_server:
-        yield remote_server
-
-
-@pytest.fixture(scope="module")
-def async_client(server: RemoteOpenAIServer):
-    return server.get_async_client()
+    args.extend(["--kv_cache_free_gpu_memory_fraction", "0.5"])
+    remote_server = RemoteOpenAIServer(model_path, args)
+    return remote_server
 
 
 def create_trtoai_worker(model_name, async_client):
     return TRTOpenaiWorker(
         async_client=async_client,
         model=model_name,
-        max_tokens=5,
     )
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_trtoai_worker_generation(default_prompt, model_name,
-                                        async_client):
-    worker = create_trtoai_worker(model_name, async_client)
+def test_trtoai_worker_generation(default_prompt, model_name, server):
+    worker = create_trtoai_worker(model_name, server.get_async_client())
     task = GenerationTask.create_from_prompt(default_prompt)
-    status = await worker.run_task(task)
-    assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTOpenaiWorker"
+    status = asyncio.run(worker.run_task(task))
+    try:
+        assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTOpenaiWorker"
+    except AssertionError as e:
+        worker.shutdown()
+        server.__exit__(None, None, None)
+        raise e
 
 
 def create_trtllm_worker(model_path):
-    return TRTLLMWorker.init_with_new_llm(str(model_path),
-                                          backend="pytorch",
-                                          max_batch_size=1,
-                                          max_num_tokens=5,
-                                          temperature=0.9)
+    return TRTLLMWorker.init_with_new_llm(str(model_path), backend="pytorch")
 
 
 def test_trtllm_worker_generation(default_prompt, deepseek_distill_7b_path):
     worker = create_trtllm_worker(deepseek_distill_7b_path)
     task = GenerationTask.create_from_prompt(default_prompt)
     status = asyncio.run(worker.run_task(task))
-    assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTLLMWorker"
+    try:
+        assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTLLMWorker"
+    except AssertionError as e:
+        worker.shutdown()
+        raise e

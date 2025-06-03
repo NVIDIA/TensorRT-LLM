@@ -31,6 +31,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -43,6 +44,7 @@
 #include <cstdlib>
 #include <memory>
 #include <random>
+#include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheConcatenate.h>
 
@@ -344,9 +346,9 @@ protected:
                 int64_t bufferSize = buffer.size();
                 TLLM_LOG_DEBUG(
                     tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d", bufferSize, genRank);
-                tensorrt_llm::mpi::MpiComm::world().send(
+                tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                     &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
-                tensorrt_llm::mpi::MpiComm::world().send(
+                tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                     buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
                 TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
                 mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(commState);
@@ -354,11 +356,12 @@ protected:
             else
             {
                 int64_t bufferSize;
-                tensorrt_llm::mpi::MpiComm::world().recv(&bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
+                tensorrt_llm::mpi::MpiComm::world().recvRawTag(
+                    &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
                 TLLM_LOG_DEBUG(
                     tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
                 std::vector<char> recvBuffer(bufferSize);
-                tensorrt_llm::mpi::MpiComm::world().recv(
+                tensorrt_llm::mpi::MpiComm::world().recvRawTag(
                     recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
                 TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
                 std::istringstream iStream(std::string(recvBuffer.begin(), recvBuffer.end()));
@@ -381,15 +384,19 @@ protected:
 
     void setUpCacheTransceiver()
     {
+        int maxNumTokens = 1024;
+        mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
         if (isSender)
         {
-            mResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                mConnectionManager.get(), *mCacheState, mlocalRank, std::make_unique<CacheFormatter>(mManager.get())));
+            mResponder = std::make_unique<DataResponder>(
+                std::make_unique<DataSenderImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
+                    std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
         }
         else
         {
-            mRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                mConnectionManager.get(), *mCacheState, mlocalRank, std::make_unique<CacheFormatter>(mManager.get())));
+            mRequester = std::make_unique<DataRequester>(
+                std::make_unique<DataReceiverImpl>(mConnectionManager.get(), *mCacheState, mlocalRank,
+                    std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get())));
         }
     }
 
@@ -443,6 +450,7 @@ protected:
     LlmRequest::RequestIdType mRequestId{0};
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
+    std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
     std::unique_ptr<DataResponder> mResponder;
     std::unique_ptr<DataRequester> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
@@ -677,10 +685,14 @@ protected:
         {
             return;
         }
-        else if (tensorrt_llm::common::getEnvUseMPIKvCache() || tensorrt_llm::common::getEnvUseUCXKvCache())
+        else if (tensorrt_llm::common::getEnvUseMPIKvCache() || tensorrt_llm::common::getEnvUseUCXKvCache()
+            || tensorrt_llm::common::getEnvUseNixlKvCache())
         {
+            int maxNumTokens = 2048;
+            mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
             bool isUcx = tensorrt_llm::common::getEnvUseUCXKvCache();
-            TLLM_LOG_INFO("Enable %s KV cache transport.", isUcx ? "UCX" : "MPI");
+            bool isNixl = tensorrt_llm::common::getEnvUseNixlKvCache();
+            TLLM_LOG_INFO("Enable %s KV cache transport.", isUcx ? "UCX" : isNixl ? "NIXL" : "MPI");
 
             if (isUcx)
             {
@@ -700,6 +712,15 @@ protected:
                 *(void**) (&makeUcxConnectionManager) = load_sym(WrapperLibHandle, "makeUcxConnectionManager");
                 mConnectionManager = makeUcxConnectionManager();
             }
+            else if (isNixl)
+            {
+                constexpr auto port = 22345;
+
+                setenv("TRTLLM_NIXL_PORT", std::to_string(port).c_str(), 1);
+
+                mConnectionManager
+                    = std::make_unique<texec::kv_cache::AgentConnectionManager>(mCacheTransBufferManager.get());
+            }
             else
             {
                 mConnectionManager = std::make_unique<texec::kv_cache::MpiConnectionManager>(mComm);
@@ -707,8 +728,10 @@ protected:
 
             auto makeFormatter = [this]()
             {
-                return mIsMLA ? std::unique_ptr<IOFormatter>(std::make_unique<MLACacheFormatter>(mManager.get()))
-                              : std::unique_ptr<IOFormatter>(std::make_unique<CacheFormatter>(mManager.get()));
+                return mIsMLA ? std::unique_ptr<IOFormatter>(
+                           std::make_unique<MLACacheFormatter>(mManager.get(), mCacheTransBufferManager.get()))
+                              : std::unique_ptr<IOFormatter>(
+                                  std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get()));
             };
 
             if (mIsContext)
@@ -725,7 +748,7 @@ protected:
             std::vector<int> contextRankVec(mContextRankSize);
             std::iota(contextRankVec.begin(), contextRankVec.end(), 0);
 
-            if (isUcx)
+            if (isUcx || isNixl)
             {
                 auto commState = mConnectionManager->getCommState();
                 namespace su = tensorrt_llm::executor::serialize_utils;
@@ -742,9 +765,9 @@ protected:
                         int64_t bufferSize = buffer.size();
                         TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d",
                             bufferSize, genRank);
-                        tensorrt_llm::mpi::MpiComm::world().send(
+                        tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                             &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
-                        tensorrt_llm::mpi::MpiComm::world().send(
+                        tensorrt_llm::mpi::MpiComm::world().sendRawTag(
                             buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
                         TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
                     }
@@ -753,12 +776,12 @@ protected:
                 if (mIsGeneration)
                 {
                     int64_t bufferSize;
-                    tensorrt_llm::mpi::MpiComm::world().recv(
+                    tensorrt_llm::mpi::MpiComm::world().recvRawTag(
                         &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
                     TLLM_LOG_DEBUG(
                         tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
                     std::vector<char> recvBuffer(bufferSize);
-                    tensorrt_llm::mpi::MpiComm::world().recv(
+                    tensorrt_llm::mpi::MpiComm::world().recvRawTag(
                         recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
                     TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
                     std::istringstream iStream(std::string(recvBuffer.begin(), recvBuffer.end()));
@@ -1042,6 +1065,7 @@ protected:
     bool mIsMLA{false};
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
+    std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;
     std::unique_ptr<DataResponder> mResponder;
     std::unique_ptr<DataRequester> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
@@ -1179,7 +1203,8 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
         int requestId = 0;
         for (auto len : {30, 10, 60, 30, 60, 10})
         {
-            requests.emplace_back(makeLlmRequestWithDP(len, requestId++, requestId % contextTp));
+            requests.emplace_back(makeLlmRequestWithDP(len, requestId, requestId % contextTp));
+            requestId++;
         }
         std::vector<std::future<void>> contextFutures;
         std::vector<std::future<void>> generationFutures;
@@ -1192,7 +1217,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
             {
                 for (int i = 0; i < requests.size(); i++)
                 {
-                    if (i % mTpSize == mTpRank)
+                    if ((i) % mTpSize == mTpRank)
                     {
                         // round robin
                         contextRequests.push_back(requests[i]);
@@ -1215,7 +1240,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
             {
                 for (int i = 0; i < requests.size(); i++)
                 {
-                    if (i % mTpSize == mTpRank)
+                    if ((i) % mTpSize == mTpRank)
                     {
                         generationRequests.push_back(requests[i]);
                     }

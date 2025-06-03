@@ -3,11 +3,13 @@ from ..executor import CompletionOutput, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
-from .llm_args import (BatchingType, CalibConfig, CapacitySchedulerPolicy,
-                       ContextChunkingPolicy, DynamicBatchConfig,
-                       EagleDecodingConfig, ExtendedRuntimePerfKnobConfig,
-                       KvCacheConfig, LookaheadDecodingConfig,
-                       MedusaDecodingConfig, MTPDecodingConfig, SchedulerConfig)
+from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
+                       CapacitySchedulerPolicy, ContextChunkingPolicy,
+                       DynamicBatchConfig, EagleDecodingConfig,
+                       ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
+                       LookaheadDecodingConfig, MedusaDecodingConfig,
+                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
+                       TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mpi_session import MpiCommSession
@@ -38,4 +40,9 @@ __all__ = [
     'BatchingType',
     'ContextChunkingPolicy',
     'DynamicBatchConfig',
+    'CacheTransceiverConfig',
+    'NGramDecodingConfig',
+    'LlmArgs',
+    'TorchLlmArgs',
+    'TrtLlmArgs',
 ]

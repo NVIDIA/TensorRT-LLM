@@ -82,6 +82,7 @@ class GenerateRequestOptions;
 class LogitsPostProcessor;
 class MakeDecodingBatchInputOutput;
 class CreateNewDecoderRequests;
+class UpdateDecoderBuffers;
 
 namespace utils
 {
@@ -137,6 +138,12 @@ public:
     ~TrtGptModelInflightBatching() override;
 
     void terminateRequest(LlmRequestPtr const& llmRequest, bool pause = false) override;
+
+    /// @brief Terminate request in the next forwardSync call that includes the request.
+    /// @details This function does not terminate requests immediately. It will add the requests to the
+    ///          mReqIdsToTerminate set. The requests will be terminated in the next forwardSync call that
+    ///          includes the request in the batch.
+    void terminateRequestSync(LlmRequestPtr const& llmRequest, executor::FinishReason finishReason) override;
 
     /// @brief Function that waits for the decoding of requests in flight.
     ///        When the requests have finished or using speculative decoding, the state of requests
@@ -257,7 +264,7 @@ private:
     void createDecoder(std::optional<executor::DecodingMode> const& decodingModeOpt);
     void createBuffers(executor::DecodingConfig const& decodingConfig,
         std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs);
-    std::shared_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig,
+    std::unique_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, KvCacheType kvCacheType = KvCacheType::kSELF);
     void createRnnStateManager();
     void createCustomAllReduceWorkspace();
@@ -290,12 +297,11 @@ private:
         RequestVector const& contextRequests, RequestVector const& generationRequests, SizeType32 bufferId);
 
     void setupDecoderStep(
-        RequestVector const& contextRequests, RuntimeBuffers const& buffers, DecoderInputBuffers const& inputBuffers);
+        RequestVector const& contextRequests, RuntimeBuffers const& buffers, DecoderInputBuffers& inputBuffers);
     runtime::CudaEvent decoderStepAsync(ScheduledRequests const& scheduledRequests);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> decoderSync(
         ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent);
 
-    runtime::CudaEvent updateDecoderBuffers(bool returnLogProbs, runtime::CudaEvent decoderFinishEvent);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> communicateDecoderBuffers(bool returnLogProbs);
     void updateRequests(ScheduledRequests const& scheduledRequests);
 
@@ -439,9 +445,11 @@ private:
     /******************** Components ********************/
     std::shared_ptr<nvinfer1::ILogger> mLogger;
     // Runner for the TRT engine. The engine produces logits.
-    std::shared_ptr<runtime::TllmRuntime> mRuntime;
+    std::unique_ptr<runtime::TllmRuntime> mRuntime;
     // Decoder that generates new tokens from the logits.
-    std::shared_ptr<runtime::GptDecoderBatched> mDecoder;
+    std::unique_ptr<runtime::GptDecoderBatched> mDecoder;
+    // Decoder state for all requests
+    std::unique_ptr<runtime::decoder::DecoderState> mDecoderState;
     // Synchronization handles for decoder
     std::vector<std::optional<runtime::CudaEvent>> mDecoderFinishedEvents;
 
@@ -452,7 +460,7 @@ private:
     // KV cache manager for cross attention in enc-dec models (optional)
     std::shared_ptr<BaseKVCacheManager> mCrossKvCacheManager = nullptr;
     // RNN state manager for recurrent layers (optional)
-    std::shared_ptr<RnnStateManager> mRnnStateManager;
+    std::unique_ptr<RnnStateManager> mRnnStateManager;
     // PEFT cache manager for LoRA tasks (optional)
     std::shared_ptr<BasePeftCacheManager> mPeftCacheManager;
     // BufferManager using a separate stream for async copy operations.
@@ -534,6 +542,8 @@ private:
     std::vector<ScheduledRequests> mMicroBatchScheduledRequests;
     // Set of in-flight requests of *all* micro batches
     ReqIdsSet mInflightReqIds;
+    // Requests that should be terminated (requested from outside the model)
+    std::unordered_map<RequestIdType, executor::FinishReason> mReqIdsToTerminate;
     // Requests that the scheduler selected to be paused
     ReqIdsSet mReqIdsToPause;
     // Stats collected in last iteration
@@ -570,10 +580,10 @@ private:
     std::unique_ptr<tensorrt_llm::batch_manager::AllocateKvCache const> mAllocateKvCache;
     std::unique_ptr<tensorrt_llm::batch_manager::HandleContextLogits const> mHandleContextLogits;
     std::unique_ptr<tensorrt_llm::batch_manager::HandleGenerationLogits const> mHandleGenerationLogits;
-    std::unique_ptr<tensorrt_llm::batch_manager::GenerateRequestOptions const> mGenerateRequestOptions;
     std::unique_ptr<tensorrt_llm::batch_manager::LogitsPostProcessor const> mLogitsPostProcessor;
     std::unique_ptr<tensorrt_llm::batch_manager::MakeDecodingBatchInputOutput const> mMakeDecodingBatchInputOutput;
     std::unique_ptr<tensorrt_llm::batch_manager::CreateNewDecoderRequests const> mCreateNewDecoderRequests;
+    std::unique_ptr<tensorrt_llm::batch_manager::UpdateDecoderBuffers const> mUpdateDecoderBuffers;
 };
 
 } // namespace tensorrt_llm::batch_manager

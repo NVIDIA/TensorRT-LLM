@@ -2,9 +2,8 @@ import argparse
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
-                                 MTPDecodingConfig)
+                                 MTPDecodingConfig, NGramDecodingConfig)
 
 example_prompts = [
     "Hello, my name is",
@@ -55,20 +54,24 @@ def add_llm_args(parser):
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
+    parser.add_argument('--enable_trtllm_sampler',
+                        default=False,
+                        action='store_true')
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--moe_ep_size', type=int, default=-1)
     parser.add_argument('--moe_tp_size', type=int, default=-1)
+    parser.add_argument('--moe_cluster_size', type=int, default=-1)
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
-    parser.add_argument('--kv_cache_enable_block_reuse',
-                        default=True,
-                        action='store_false')
+    parser.add_argument('--disable_kv_cache_reuse',
+                        default=False,
+                        action='store_true')
     parser.add_argument("--kv_cache_fraction", type=float, default=None)
 
     # Runtime
-    parser.add_argument('--enable_overlap_scheduler',
+    parser.add_argument('--disable_overlap_scheduler',
                         default=False,
                         action='store_true')
     parser.add_argument('--enable_chunked_prefill',
@@ -79,6 +82,14 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true',
                         help='Print iteration logs during execution')
+    parser.add_argument('--use_torch_compile',
+                        default=False,
+                        action='store_true',
+                        help='Use torch.compile to optimize the model')
+    parser.add_argument('--use_piecewise_cuda_graph',
+                        default=False,
+                        action='store_true',
+                        help='Use piecewise CUDA graph to optimize the model')
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
@@ -91,6 +102,14 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_algo', type=str, default=None)
     parser.add_argument('--spec_decode_nextn', type=int, default=1)
     parser.add_argument('--eagle_model_dir', type=str, default=None)
+    parser.add_argument('--max_matching_ngram_size', type=int, default=5)
+
+    # Relaxed acceptance
+    parser.add_argument('--use_relaxed_acceptance_for_thinking',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--relaxed_topk', type=int, default=1)
+    parser.add_argument('--relaxed_delta', type=float, default=0.)
 
     return parser
 
@@ -104,17 +123,8 @@ def parse_arguments():
 
 
 def setup_llm(args):
-    pytorch_config = PyTorchConfig(
-        enable_overlap_scheduler=args.enable_overlap_scheduler,
-        kv_cache_dtype=args.kv_cache_dtype,
-        attn_backend=args.attention_backend,
-        use_cuda_graph=args.use_cuda_graph,
-        load_format=args.load_format,
-        print_iter_log=args.print_iter_log,
-        moe_backend=args.moe_backend)
-
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=args.kv_cache_enable_block_reuse,
+        enable_block_reuse=not args.disable_kv_cache_reuse,
         free_gpu_memory_fraction=args.kv_cache_fraction,
     )
 
@@ -123,25 +133,49 @@ def setup_llm(args):
 
     if spec_decode_algo == 'MTP':
         spec_config = MTPDecodingConfig(
-            num_nextn_predict_layers=args.spec_decode_nextn)
+            num_nextn_predict_layers=args.spec_decode_nextn,
+            use_relaxed_acceptance_for_thinking=args.
+            use_relaxed_acceptance_for_thinking,
+            relaxed_topk=args.relaxed_topk,
+            relaxed_delta=args.relaxed_delta)
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_nextn,
             pytorch_eagle_weights_path=args.eagle_model_dir)
+    elif spec_decode_algo == "NGRAM":
+        spec_config = NGramDecodingConfig(
+            prompt_lookup_num_tokens=args.spec_decode_nextn,
+            max_matching_ngram_size=args.max_matching_ngram_size,
+            is_keep_all=True,
+            is_use_oldest=True,
+            is_public_pool=True,
+        )
     else:
         spec_config = None
 
     llm = LLM(model=args.model_dir,
+              backend='pytorch',
+              disable_overlap_scheduler=args.disable_overlap_scheduler,
+              kv_cache_dtype=args.kv_cache_dtype,
+              kv_cache_config=kv_cache_config,
+              attn_backend=args.attention_backend,
+              use_cuda_graph=args.use_cuda_graph,
+              load_format=args.load_format,
+              print_iter_log=args.print_iter_log,
+              enable_iter_perf_stats=args.print_iter_log,
+              torch_compile_enabled=args.use_torch_compile,
+              torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph,
+              moe_backend=args.moe_backend,
+              enable_trtllm_sampler=args.enable_trtllm_sampler,
               max_seq_len=args.max_seq_len,
               max_batch_size=args.max_batch_size,
               max_num_tokens=args.max_num_tokens,
-              pytorch_backend_config=pytorch_config,
-              kv_cache_config=kv_cache_config,
+              enable_attention_dp=args.enable_attention_dp,
               tensor_parallel_size=args.tp_size,
               pipeline_parallel_size=args.pp_size,
-              enable_attention_dp=args.enable_attention_dp,
               moe_expert_parallel_size=args.moe_ep_size,
               moe_tensor_parallel_size=args.moe_tp_size,
+              moe_cluster_parallel_size=args.moe_cluster_size,
               enable_chunked_prefill=args.enable_chunked_prefill,
               speculative_config=spec_config)
 

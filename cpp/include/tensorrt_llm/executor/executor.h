@@ -88,10 +88,8 @@ public:
     [[nodiscard]] std::optional<SizeType32> getTopPResetIds() const;
     [[nodiscard]] std::optional<FloatType> getTopPDecay() const;
     [[nodiscard]] std::optional<RandomSeedType> getSeed() const;
-    [[nodiscard]] std::optional<RandomSeedType> getRandomSeed() const;
     [[nodiscard]] std::optional<FloatType> getTemperature() const;
     [[nodiscard]] std::optional<SizeType32> getMinTokens() const;
-    [[nodiscard]] std::optional<SizeType32> getMinLength() const;
     [[nodiscard]] std::optional<FloatType> getBeamSearchDiversityRate() const;
     [[nodiscard]] std::optional<FloatType> getRepetitionPenalty() const;
     [[nodiscard]] std::optional<FloatType> getPresencePenalty() const;
@@ -110,10 +108,8 @@ public:
     void setTopPResetIds(std::optional<TokenIdType> const& topPResetIds);
     void setTopPDecay(std::optional<FloatType> const& topPDecay);
     void setSeed(std::optional<RandomSeedType> const& seed);
-    void setRandomSeed(std::optional<RandomSeedType> const& randomSeed);
     void setTemperature(std::optional<FloatType> const& temperature);
     void setMinTokens(std::optional<SizeType32> const& minTokens);
-    void setMinLength(std::optional<SizeType32> const& minLength);
     void setBeamSearchDiversityRate(std::optional<FloatType> const& beamSearchDiversityRate);
     void setRepetitionPenalty(std::optional<FloatType> const& repetitionPenalty);
     void setPresencePenalty(std::optional<FloatType> const& presencePenalty);
@@ -143,8 +139,8 @@ private:
     static std::optional<SizeType32> const& checkNumReturnSequences(
         std::optional<SizeType32> const& numReturnSequences, SizeType32 beamWidth);
     static std::optional<FloatType> const& checkMinP(std::optional<FloatType> const& minP);
-    static std::optional<std::vector<SizeType32>> const& checkBeamWidthArray(
-        std::optional<std::vector<SizeType32>> const& beamWidthArray, std::optional<SizeType32> const beamWidth);
+    static std::pair<std::optional<std::vector<SizeType32>> const&, SizeType32 const> const checkBeamWidthArray(
+        std::optional<std::vector<SizeType32>> const& beamWidthArray, SizeType32 const beamWidth);
     void updateNumReturnBeams();
 
     friend class Serialization;
@@ -205,6 +201,8 @@ class AdditionalModelOutput
 {
 public:
     explicit AdditionalModelOutput(std::string name, bool gatherContext = false);
+
+    bool operator==(AdditionalModelOutput const& other) const;
 
     std::string name;
     bool gatherContext{false};
@@ -485,6 +483,9 @@ public:
         /// @brief The generated text is amenable to the user-specified extended Backus-Naur form (EBNF) grammar.
         /// EBNF grammar is widely-used to express context-free grammars.
         kEBNF_GRAMMAR = 3,
+
+        /// @brief The generated text is amenable to the XGrammar structural tag.
+        kSTRUCTURAL_TAG = 4,
     };
 
     explicit GuidedDecodingParams(GuideType guideType, std::optional<std::string> guide = std::nullopt);
@@ -559,11 +560,15 @@ public:
 
     explicit KvCacheRetentionConfig(std::vector<TokenRangeRetentionConfig> const& tokenRangeRetentionPriorities,
         RetentionPriority decodeRetentionPriority = kDefaultRetentionPriority,
-        std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt);
+        std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt,
+        KvCacheTransferMode transferMode = KvCacheTransferMode::DRAM,
+        std::optional<std::string> directory = std::nullopt);
 
     [[nodiscard]] std::vector<TokenRangeRetentionConfig> getTokenRangeRetentionConfigs() const;
     [[nodiscard]] RetentionPriority getDecodeRetentionPriority() const;
     [[nodiscard]] std::optional<std::chrono::milliseconds> getDecodeDurationMs() const;
+    [[nodiscard]] KvCacheTransferMode getTransferMode() const;
+    [[nodiscard]] std::optional<std::string> getDirectory() const;
 
     /// @brief Convert the token range data into an entry per kv block. Returns a tuple of vectors corresponding to the
     /// priorities and durations for each block.
@@ -574,7 +579,8 @@ public:
     {
         return mTokenRangeRetentionConfigs == other.mTokenRangeRetentionConfigs
             && mDecodeRetentionPriority == other.mDecodeRetentionPriority
-            && mDecodeDurationMs == other.mDecodeDurationMs;
+            && mDecodeDurationMs == other.mDecodeDurationMs && mTransferMode == other.mTransferMode
+            && mDirectory == other.mDirectory;
     }
 
 private:
@@ -586,6 +592,10 @@ private:
     RetentionPriority mDecodeRetentionPriority;
     /// @brief The duration in ms that decode blocks should remain at their assigned priority level.
     std::optional<std::chrono::milliseconds> mDecodeDurationMs;
+    /// @brief The transfer mode for the block.
+    KvCacheTransferMode mTransferMode;
+    /// @brief Name of the directory if transfer mode is GDS or POSIX_DEBUG_FALLBACK.
+    std::optional<std::string> mDirectory;
 };
 
 /// @brief A class that holds information about the request
@@ -609,6 +619,8 @@ public:
     /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
     /// @param externalDraftTokensConfig The speculative decoding with external draft tokens configuration
     /// @param pTuningConfig The prompt tuning configuration
+    /// @param multimodalEmbedding The multimodal embedding tensor. Expected shape is [num_multimodal_tokens,
+    /// hidden_dim]
     /// @param mRopeConfig The mrope configuration
     /// @param loraConfig The LoRA configuration
     /// @param lookaheadConfig The lookahead speculative decoding configuration
@@ -633,9 +645,9 @@ public:
     /// @param skipCrossAttnBlocks Skip the cross attention transformer blocks or not.
     /// @param guidedDecodingParams The guided decoding parameters.
     /// @param languageAdapterUid Task Uid for language adapter.
-    /// @param allottedTimeMs The allotted time in milliseconds after which the request is finished with a timedOut
-    /// finish reason. The request always will exceed this time slightly, but at most with 1 forward pass. A request can
-    /// be timed-out before ever being scheduled.
+    /// @param allottedTimeMs The allotted time in milliseconds after which the request is cancelled with a timedOut
+    /// finish reason. The request may exceed this time slightly, but at most by 1 forward pass (in pipeline parallelism
+    /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
     // 34 parameters
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
@@ -646,7 +658,8 @@ public:
         std::optional<Tensor> embeddingBias = std::nullopt,
         std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig = std::nullopt,
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
-        std::optional<MropeConfig> mRopeConfig = std::nullopt, std::optional<LoraConfig> loraConfig = std::nullopt,
+        std::optional<Tensor> multimodalEmbedding = std::nullopt, std::optional<MropeConfig> mRopeConfig = std::nullopt,
+        std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
         std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         std::optional<std::string> logitsPostProcessorName = std::nullopt,
@@ -676,7 +689,6 @@ public:
 
     [[nodiscard]] VecTokens getInputTokenIds() const;
     [[nodiscard]] SizeType32 getMaxTokens() const;
-    [[nodiscard]] SizeType32 getMaxNewTokens() const;
     [[nodiscard]] bool getStreaming() const;
     [[nodiscard]] SamplingConfig getSamplingConfig() const;
     [[nodiscard]] OutputConfig getOutputConfig() const;
@@ -688,6 +700,7 @@ public:
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
     [[nodiscard]] std::optional<ExternalDraftTokensConfig> getExternalDraftTokensConfig() const;
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
+    [[nodiscard]] std::optional<Tensor> getMultimodalEmbedding() const;
     [[nodiscard]] std::optional<MropeConfig> getMropeConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
     [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadConfig() const;
@@ -703,7 +716,6 @@ public:
     [[nodiscard]] std::optional<SizeType32> getEncoderOutputLength() const;
     [[nodiscard]] std::optional<Tensor> getCrossAttentionMask() const;
     [[nodiscard]] RequestType getRequestType() const;
-    [[nodiscard]] SizeType32 getNumReturnSequences() const;
     [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const;
     [[nodiscard]] std::optional<Tensor> getSkipCrossAttnBlocks() const;
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
@@ -722,6 +734,7 @@ public:
     void setEmbeddingBias(Tensor const& embeddingBias);
     void setExternalDraftTokensConfig(ExternalDraftTokensConfig const& externalDraftTokensConfig);
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
+    void setMultimodalEmbedding(Tensor const& multimodalEmbedding);
     void setMropeConfig(MropeConfig const& mRopeConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
     void setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig);
@@ -737,7 +750,6 @@ public:
     void setEncoderInputFeatures(Tensor encoderInputFeatures);
     void setEncoderOutputLength(SizeType32 encoderOutputLength);
     void setCrossAttentionMask(Tensor crossAttentionMask);
-    void setNumReturnSequences(SizeType32 numReturnSequences);
     void setEagleConfig(std::optional<EagleConfig> const& eagleConfig);
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks);
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
@@ -799,8 +811,8 @@ struct Result
     /// @brief The context logits. Size [promptLen, vocabSizePadded]
     std::optional<Tensor> contextLogits;
 
-    /// @brief The generation logits. Size [beamSize, maxNewTokens, vocabSizePadded] (non-streaming)
-    /// or [maxNewTokens, beamSize, vocabSizePadded] (streaming and allGeneratedTokens)
+    /// @brief The generation logits. Size [beamSize, maxTokens, vocabSizePadded] (non-streaming)
+    /// or [maxTokens, beamSize, vocabSizePadded] (streaming and allGeneratedTokens)
     /// or [1, beamSize, vocabSizePadded] (streaming and non-allGeneratedTokens)
     std::optional<Tensor> generationLogits;
 
@@ -1380,6 +1392,23 @@ private:
     bool mReplicate;
 };
 
+class CacheTransceiverConfig
+{
+public:
+    explicit CacheTransceiverConfig(std::optional<size_t> maxNumTokens = std::nullopt);
+
+    bool operator==(CacheTransceiverConfig const& other) const;
+
+    [[nodiscard]] std::optional<size_t> getMaxNumTokens() const;
+    void setMaxNumTokens(size_t maxNumTokens);
+
+private:
+    /// @brief The maximum number of tokens that the CacheTransceiver's pre-allocated buffer can hold. If the number of
+    /// kvCache tokens to be transferred for a single request is greater than this value, the performance of the cache
+    /// transfer may be degraded.
+    std::optional<size_t> mMaxNumTokens;
+};
+
 /// @brief Configuration class for the model executor
 class ExecutorConfig
 {
@@ -1408,8 +1437,8 @@ public:
         std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
-        bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false,
-        bool promptTableOffloading = false);
+        std::optional<CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
+        bool gatherGenerationLogits = false, bool promptTableOffloading = false, bool enableTrtOverlap = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1441,8 +1470,9 @@ public:
     [[nodiscard]] std::optional<GuidedDecodingConfig> getGuidedDecodingConfig() const;
     [[nodiscard]] std::optional<std::vector<AdditionalModelOutput>> getAdditionalModelOutputs() const;
     [[nodiscard]] bool getGatherGenerationLogits() const;
-    [[nodiscard]] bool getUseVariableBeamWidthSearch() const;
     [[nodiscard]] bool getPromptTableOffloading() const;
+    [[nodiscard]] std::optional<CacheTransceiverConfig> getCacheTransceiverConfig() const;
+    [[nodiscard]] bool getEnableTrtOverlap() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1469,8 +1499,9 @@ public:
     void setGuidedDecodingConfig(GuidedDecodingConfig const& guidedDecodingConfig);
     void setAdditionalModelOutputs(std::vector<AdditionalModelOutput> const& additionalModelOutputs);
     void setGatherGenerationLogits(bool gatherGenerationLogits);
-    void setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch);
     void setPromptTableOffloading(bool promptTableOffloading);
+    void setCacheTransceiverConfig(CacheTransceiverConfig const& cacheTransceiverConfig);
+    void setEnableTrtOverlap(bool enableTrtOverlap);
 
 private:
     friend class Serialization;
@@ -1484,7 +1515,7 @@ private:
     /// @brief The KV cache configuration.
     KvCacheConfig mKvCacheConfig;
 
-    /// @brief The KV cache configuration.
+    /// @brief Controls whether context is allowed to be chunked.
     bool mEnableChunkedContext;
 
     /// @brief Controls if log probabilities should be normalized or not.
@@ -1546,14 +1577,17 @@ private:
     /// @brief The additional outputs to gather from the model.
     std::optional<std::vector<AdditionalModelOutput>> mAdditionalModelOutputs;
 
+    /// @brief The cache transceiver configuration
+    std::optional<CacheTransceiverConfig> mCacheTransceiverConfig;
+
     /// @brief Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
     bool mGatherGenerationLogits{false};
 
-    /// @brief Controls if Variable-Beam-Width-Search is enabled.
-    bool mUseVariableBeamWidthSearch{false};
-
     /// @brief Controls if prompt table offloading is enabled.
     bool mPromptTableOffloading{false};
+
+    /// @brief Controls whether preparation and TRT engine execution should be overlapped.
+    bool mEnableTrtOverlap{false};
 };
 
 struct KVCacheCreatedData

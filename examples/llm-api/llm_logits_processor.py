@@ -15,6 +15,7 @@ from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
 # This simple callback will output a specific token at each step irrespective of prompt.
 # Refer to ../bindings/executor/example_logits_processor.py for a more
 # sophisticated callback that generates JSON structured output.
+# Please also refer to sampling_params.py for adding subclass to the approved class list for deserialization
 class MyLogitsProcessor(LogitsProcessor):
 
     def __init__(self, allowed_token_id: int):
@@ -26,7 +27,9 @@ class MyLogitsProcessor(LogitsProcessor):
         mask = torch.full_like(logits, fill_value=float("-inf"), device="cpu")
         mask[:, :, self.allowed_token_id] = 0
 
-        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+        stream = None if stream_ptr is None else torch.cuda.ExternalStream(
+            stream_ptr)
+        with torch.cuda.stream(stream):
             mask = mask.to(logits.device, non_blocking=True)
             logits += mask
 
@@ -66,7 +69,8 @@ class MyBatchedLogitsProcessor(BatchedLogitsProcessor):
 
 def main():
 
-    # Batched logits processor should be specified when initializing LLM.
+    # Batched logits processor (only supported in TensorRT backend)
+    # should be specified when initializing LLM.
     llm = LLM(
         model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         batched_logits_processor=MyBatchedLogitsProcessor(allowed_token_id=42))

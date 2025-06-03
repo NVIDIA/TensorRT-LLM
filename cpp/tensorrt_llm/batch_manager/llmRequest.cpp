@@ -16,10 +16,28 @@
  */
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/kernels/beamSearchKernels.h"
 
 namespace tensorrt_llm::batch_manager
 {
+
+template <typename TTensor, typename TStream>
+runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool const forNextIteration)
+{
+    runtime::SizeType32 beamWidth = mSamplingConfig.beamWidth; // For non-Variable-Beam-Width-Search
+    auto const& beamWidthArray = mSamplingConfig.beamWidthArray;
+    if (beamWidthArray.has_value())
+    {
+        auto const iter = mDecodingIter + (forNextIteration ? 1 : 0);
+        // Clamped `decodingIter` into [0,kMaxBeamWidthArrayLength-1] as index
+        int const index
+            = std::max(std::min(iter, static_cast<int>(tensorrt_llm::kernels::kMaxBeamWidthArrayLength)) - 1, 0);
+        beamWidth = beamWidthArray.value()[0][index];
+    }
+    return beamWidth;
+}
+
+template class GenericLlmRequest<runtime::ITensor::SharedPtr>;
 
 /// Note that there is some dependency on the order of operations in this method. Modify with care!
 std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits, int32_t mpiWorldRank)

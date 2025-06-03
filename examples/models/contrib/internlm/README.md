@@ -59,7 +59,7 @@ Here're some examples:
 # Build a single-GPU float16 engine from HF weights.
 # gpt_attention_plugin is necessary in InternLM.
 # Try use_gemm_plugin to prevent accuracy issue.
-cd examples/llama
+cd examples/models/core/llama
 
 # Convert the InternLM 7B model using a single GPU and FP16.
 python convert_checkpoint.py --model_dir ./internlm-chat-7b/ \
@@ -117,7 +117,7 @@ and then export the scaling factors needed for INT8 KV cache inference.
 Example:
 
 ```bash
-cd examples/llama
+cd examples/models/core/llama
 
 # For 7B models
 python convert_checkpoint.py --model_dir ./internlm-chat-7b  \
@@ -135,7 +135,7 @@ trtllm-build --checkpoint_dir ./internlm-chat-7b/smooth_internlm/int8_kv_cache/ 
 
 
 ```bash
-cd examples/llama
+cd examples/models/core/llama
 
 # For 20B models
 python convert_checkpoint.py --model_dir ./internlm-chat-20b  \
@@ -182,7 +182,7 @@ Unlike the FP16 build where the HF weights are processed and loaded into the Ten
 
 Example:
 ```bash
-cd examples/llama
+cd examples/models/core/llama
 
 # For 7B models
 python convert_checkpoint.py --model_dir ./internlm-chat-7b  --output_dir ./internlm-chat-7b/smooth_internlm/sq0.5/ --dtype float16 --smoothquant 0.5
@@ -192,7 +192,7 @@ trtllm-build --checkpoint_dir ./internlm-chat-7b/smooth_internlm/sq0.5/ \
              --gemm_plugin float16
 
 # For 20B models
-cd examples/llama
+cd examples/models/core/llama
 
 python convert_checkpoint.py --model_dir ./internlm-chat-20b  --output_dir ./internlm-chat-20b/smooth_internlm/sq0.5/ --dtype float16 --smoothquant 0.5
 trtllm-build --checkpoint_dir ./internlm-chat-20b/smooth_internlm/sq0.5/ \
@@ -211,7 +211,7 @@ Examples of build invocations:
 
 ```bash
 # Build model for SmoothQuant in the _per_token_ + _per_channel_ mode
-cd examples/llama
+cd examples/models/core/llama
 
 # 7B model
 python convert_checkpoint.py --model_dir ./internlm-chat-7b  --output_dir ./internlm-chat-7b/smooth_internlm/sq0.5/ --dtype float16 --smoothquant 0.5 --per_channel --per_token

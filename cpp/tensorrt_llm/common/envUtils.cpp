@@ -18,6 +18,7 @@
 #include "envUtils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/stringUtils.h"
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
@@ -98,11 +99,7 @@ size_t parseMemorySize(std::string const& input)
         throw std::invalid_argument("Invalid number format in memory size: " + input);
     }
 
-    for (char& c : unitPart)
-    {
-        c = std::tolower(c);
-    }
-
+    toLower(unitPart);
     size_t multiplier = 1;
     if (unitPart == "b")
     {
@@ -264,6 +261,12 @@ bool getEnvUseMPIKvCache()
     return useMPIKVCache;
 }
 
+bool getEnvUseNixlKvCache()
+{
+    static bool const useNixlKvCache = getBoolEnv("TRTLLM_USE_NIXL_KVCACHE");
+    return useNixlKvCache;
+}
+
 std::string getEnvUCXInterface()
 {
     static std::once_flag flag;
@@ -362,11 +365,23 @@ bool getEnvKVCacheTransferUseAsyncBuffer()
     return useAsyncBuffer;
 }
 
+bool getEnvKVCacheTransferUseSyncBuffer()
+{
+    static bool const useSyncBuffer = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_USE_SYNC_BUFFER");
+    return useSyncBuffer;
+}
+
 size_t getEnvKVCacheSendMaxConcurrenceNum()
 {
 
-    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(4);
+    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(2);
     return maxConcurrenceNum;
+}
+
+size_t getEnvKVCacheRecvBufferCount()
+{
+    static size_t const recvBufferCount = getUInt64Env("TRTLLM_KVCACHE_RECV_BUFFER_COUNT").value_or(2);
+    return recvBufferCount;
 }
 
 size_t getEnvMemSizeForKVCacheTransferBuffer()
@@ -382,9 +397,24 @@ size_t getEnvMemSizeForKVCacheTransferBuffer()
             {
                 memSizeForKVCacheTransferBuffer = parseMemorySize(memSizeForKVCacheTransferBufferEnv);
             }
+            else
+            {
+                memSizeForKVCacheTransferBuffer = parseMemorySize("512MB");
+            }
         });
 
     return memSizeForKVCacheTransferBuffer;
+}
+
+uint16_t getEnvNixlPort()
+{
+    static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
+    return nixlPort;
+}
+
+bool getEnvDisaggBenchmarkGenOnly()
+{
+    return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY");
 }
 
 } // namespace tensorrt_llm::common

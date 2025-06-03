@@ -461,6 +461,7 @@ class KVCacheBlockPool
 {
 public:
     SizeType32 numLayers;
+    SizeType32 kvFactor;
     SizeType32 numKvHeads;
     SizeType32 sizePerHead;
     SizeType32 tokensPerBlock;
@@ -474,10 +475,11 @@ public:
     // FP4 KV caches have extra pools that contain second level scales for dequantization.
     bool containsBlockScales;
 
-    KVCacheBlockPool(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        SizeType32 quantSize, runtime::ITensor::SharedPtr primaryPtr = nullptr,
+    KVCacheBlockPool(SizeType32 numLayers, SizeType32 kvFactor, SizeType32 numKvHeads, SizeType32 sizePerHead,
+        SizeType32 tokensPerBlock, SizeType32 quantSize, runtime::ITensor::SharedPtr primaryPtr = nullptr,
         runtime::ITensor::SharedPtr secondaryPtr = nullptr, bool containsBlockScales = false)
         : numLayers(numLayers)
+        , kvFactor(kvFactor)
         , numKvHeads(numKvHeads)
         , sizePerHead(sizePerHead)
         , tokensPerBlock(tokensPerBlock)
@@ -757,6 +759,10 @@ private:
     //! \return Number of matched tokens from loaded blocks.
     SizeType32 loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
         GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions);
+
+    //! \brief Free block and all it's descendants. This makes block a claimed leaf block.
+    void freeChildren(BlockPtr const& block, executor::RetentionPriority priority,
+        std::optional<std::chrono::milliseconds> durationMs);
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
     [[nodiscard]] BlockPtr getFreeBlock(
@@ -1308,7 +1314,7 @@ public:
     [[nodiscard]] static std::tuple<SizeType32, SizeType32> calculateMaxNumBlocks(KvCacheConfig const& config,
         nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         tensorrt_llm::runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager,
-        SizeType32 kvFactor = 2);
+        SizeType32 kvFactor = 2, size_t extraCostMemory = 0);
 
     /// @brief Calculates the maximum batch size that can fit the kv-cache, given that all sequences in the batch have
     /// the provided input and output length.

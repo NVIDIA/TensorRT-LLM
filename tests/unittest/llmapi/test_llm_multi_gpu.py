@@ -3,11 +3,12 @@ import json
 import os
 import subprocess  # nosec B404
 import tempfile
+from typing import Optional
 
 import pytest
 from parameterized import parameterized
 
-from tensorrt_llm.executor import ExecutorBindingsProxy
+from tensorrt_llm.executor import GenerationExecutorProxy
 from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.mapping import Mapping
@@ -18,11 +19,12 @@ from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 from .test_llm import (
     DummyError, DummyExecutorWorker3, _test_llm_capture_request_error,
     _test_llm_generate_async, check_llm_return_context_logits,
-    check_llm_return_generation_logits, default_model_name, get_model_path,
-    llama_7b_multi_lora_test_harness, llama_model_path,
-    llama_v2_7b_prompt_adapter_test_harness, llama_v2_13b_lora_test_harness,
-    llm_check_output, llm_get_stats_async_test_harness,
-    llm_get_stats_test_harness, llm_test_harness, mixtral_model_name, prompts,
+    check_llm_return_generation_logits, llm_return_logprobs_test_harness,
+    default_model_name, get_model_path, llama_7b_multi_lora_test_harness,
+    llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
+    llama_v2_13b_lora_test_harness, llm_check_output,
+    llm_get_stats_async_test_harness, llm_get_stats_test_harness,
+    llm_test_harness, mixtral_model_name, prompts, test_llm_api_eagle,
     tinyllama_guided_decoding_test_harness,
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
     run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
@@ -71,6 +73,7 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
     return tmpdir
 
 
+@pytest.mark.skip(reason="https://nvbugs/5266240")
 @pytest.mark.gpu2
 @pytest.mark.part0
 def test_llm_loading_from_ckpt_for_tp2(
@@ -112,6 +115,23 @@ def test_llm_return_context_logits_tp2():
 @skip_single_gpu
 def test_llm_return_generation_logits_tp2():
     check_llm_return_generation_logits(tp_size=2)
+
+
+@skip_single_gpu
+@pytest.mark.parametrize(
+    "prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
+    [
+        (2, 2, False, True),
+    ])
+def test_llm_return_logprobs_tp2(prompt_logprobs: Optional[int],
+                                 logprobs: Optional[int],
+                                 return_context_logits: bool,
+                                 return_generation_logits: bool):
+    llm_return_logprobs_test_harness(prompt_logprobs,
+                                     logprobs,
+                                     return_context_logits,
+                                     return_generation_logits,
+                                     tp_size=2)
 
 
 @pytest.mark.parametrize("use_auto_parallel", [True, False],
@@ -227,23 +247,18 @@ def test_llm_end2end_tp2(llm_additional_options):
 
 @pytest.mark.gpu4
 @pytest.mark.part0
-def test_tinyllama_logits_processor_tp2pp2():
-    tinyllama_logits_processor_test_harness(tensor_parallel_size=2,
-                                            pipeline_parallel_size=2)
-
-
-@pytest.mark.gpu4
-@pytest.mark.part0
-@pytest.mark.parametrize("backend", ['tensorrt', 'pytorch'])
-def test_tinyllama_guided_decoding_tp2pp2(backend: str):
-    llm_kwargs = {}
-    if backend == 'pytorch':
-        llm_kwargs['backend'] = 'pytorch'
+def test_tinyllama_guided_decoding_tp2pp2():
+    pytest.skip(reason="https://nvbugs/5244006")
     tinyllama_guided_decoding_test_harness(
         tensor_parallel_size=2,
         pipeline_parallel_size=2,
-        kv_cache_config=global_kv_cache_config,
-        **llm_kwargs)
+        kv_cache_config=global_kv_cache_config)
+
+
+@pytest.mark.gpu4
+def test_tinyllama_logits_processor_tp2pp2():
+    tinyllama_logits_processor_test_harness(tensor_parallel_size=2,
+                                            pipeline_parallel_size=2)
 
 
 @pytest.mark.gpu2
@@ -269,6 +284,13 @@ def test_llama_v2_7b_prompt_adapter_tp2():
         tensor_parallel_size=2, kv_cache_config=global_kv_cache_config_no_reuse)
 
 
+@pytest.mark.gpu2
+@pytest.mark.part0
+def test_llm_api_eagle_tp2():
+    test_llm_api_eagle(tensor_parallel_size=2,
+                       kv_cache_config=global_kv_cache_config)
+
+
 def run_command(command: str):
     try:
         result = subprocess.run(command,
@@ -290,7 +312,6 @@ def run_command(command: str):
 
 @skip_single_gpu
 def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
-    # TODO[chunweiy]: reactivate this later
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
     os.path.join(os.path.dirname(__file__), "launch.py")
@@ -301,8 +322,8 @@ def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
 
 
 @skip_single_gpu
-def test_llm_multi_node_pytorch():
-    nworkers = 2
+@pytest.mark.parametrize("nworkers", [1, 2])
+def test_llm_multi_node_pytorch(nworkers: int):
     test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
     os.path.join(os.path.dirname(__file__), "launch.py")
     command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-llmapi-launch python3 {test_case_file} --model_dir {llama_model_path} --tp_size {nworkers} --use_pytorch"
@@ -313,6 +334,7 @@ def test_llm_multi_node_pytorch():
 
 @skip_single_gpu
 def test_llm_multi_node_with_postproc():
+    pytest.skip(reason="https://nvbugs/5302891")
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__),
                                   "run_llm_with_postproc.py")
@@ -328,7 +350,7 @@ def test_executor_results_cleanup():
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kv_cache_config,
               tensor_parallel_size=2)
-    sampling_params = SamplingParams(max_new_tokens=6)
+    sampling_params = SamplingParams(max_tokens=6)
     for i in range(20):
         llm.generate(prompts, sampling_params=sampling_params)
 
@@ -360,7 +382,7 @@ class DummyExecutorMeta(type):
         return new_cls
 
 
-class DummyExecutorProxy2(ExecutorBindingsProxy):
+class DummyExecutorProxy2(GenerationExecutorProxy):
     ''' This is for testing the error occur in the thread in the Proxy. '''
 
     def __init__(
@@ -407,7 +429,7 @@ def _test_executor_handle_background_error_in_dispatch_result_thread():
     asyncio.run(task())
 
 
-class DummyExecutorProxy3(ExecutorBindingsProxy):
+class DummyExecutorProxy3(GenerationExecutorProxy):
     ''' This is for testing the error occur in a Worker process in the Proxy. '''
 
     def __init__(

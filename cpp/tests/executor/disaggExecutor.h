@@ -358,13 +358,13 @@ public:
                             {
                                 continue;
                             }
-                            mWorldComm.send(&terminationMessage, 1, tensorrt_llm::mpi::MpiType::kUINT64, leaderRank,
-                                kM_CONTROLLER_ID_TAG);
+                            mWorldComm.sendRawTag(&terminationMessage, 1, tensorrt_llm::mpi::MpiType::kUINT64,
+                                leaderRank, kM_CONTROLLER_ID_TAG);
                             isSend[leaderRank] = true;
                         }
                     }
 
-                    mWorldComm.send(&terminationMessage, 1, tensorrt_llm::mpi::MpiType::kUINT64, mControllerRank,
+                    mWorldComm.sendRawTag(&terminationMessage, 1, tensorrt_llm::mpi::MpiType::kUINT64, mControllerRank,
                         kM_INSTANCE_ID_TAG);
                 });
             // end recv thread;
@@ -557,9 +557,10 @@ private:
                 auto packed = RequestWithId::serializeReqWithIds(reqWithIds.requests);
                 int contextRank = selectContextLeaderRank();
 
-                mWorldComm.send(&message.id, 1, tensorrt_llm::mpi::MpiType::kUINT64, contextRank, kM_CONTROLLER_ID_TAG);
+                mWorldComm.sendRawTag(
+                    &message.id, 1, tensorrt_llm::mpi::MpiType::kUINT64, contextRank, kM_CONTROLLER_ID_TAG);
 
-                mWorldComm.send(packed.data(), packed.size(), tensorrt_llm::mpi::MpiType::kCHAR, contextRank,
+                mWorldComm.sendRawTag(packed.data(), packed.size(), tensorrt_llm::mpi::MpiType::kCHAR, contextRank,
                     kM_CONTROLLER_DATA_TAG);
             }
             else if (message.id == MessageID::PENDING_GENERATION_REQUEST
@@ -570,10 +571,10 @@ private:
                 auto packed = RequestWithId::serializeReqWithIds(reqWithIds.requests);
                 int generationRank = selectGenerationLeaderRank();
 
-                mWorldComm.send(
+                mWorldComm.sendRawTag(
                     &message.id, 1, tensorrt_llm::mpi::MpiType::kUINT64, generationRank, kM_CONTROLLER_ID_TAG);
 
-                mWorldComm.send(packed.data(), packed.size(), tensorrt_llm::mpi::MpiType::kCHAR, generationRank,
+                mWorldComm.sendRawTag(packed.data(), packed.size(), tensorrt_llm::mpi::MpiType::kCHAR, generationRank,
                     kM_CONTROLLER_DATA_TAG);
             }
             else
@@ -600,7 +601,7 @@ private:
             MPI_Message msg = nullptr;
             MPI_Status status;
 
-            mWorldComm.mprobe(MPI_ANY_SOURCE, kM_INSTANCE_ID_TAG, &msg, &status);
+            mWorldComm.mprobeRawTag(MPI_ANY_SOURCE, kM_INSTANCE_ID_TAG, &msg, &status);
 
             auto sourceRank{status.MPI_SOURCE};
             int32_t count = 0;
@@ -617,7 +618,7 @@ private:
             }
             if (messageId == MessageID::CONTEXT_RESPONSE)
             {
-                mWorldComm.mprobe(sourceRank, kM_INSTANCE_DATA_TAG, &msg, &status);
+                mWorldComm.mprobeRawTag(sourceRank, kM_INSTANCE_DATA_TAG, &msg, &status);
                 MPICHECK(MPI_Get_count(&status, MPI_CHAR, &count));
                 std::vector<char> buffer(count);
                 MPICHECK(MPI_Mrecv(buffer.data(), count, MPI_CHAR, &msg, &status));
@@ -640,7 +641,7 @@ private:
             else if (messageId == MessageID::GENERATION_RESPONSE)
             {
 
-                mWorldComm.mprobe(sourceRank, kM_INSTANCE_DATA_TAG, &msg, &status);
+                mWorldComm.mprobeRawTag(sourceRank, kM_INSTANCE_DATA_TAG, &msg, &status);
                 MPICHECK(MPI_Get_count(&status, MPI_CHAR, &count));
                 std::vector<char> buffer(count);
                 MPICHECK(MPI_Mrecv(buffer.data(), count, MPI_CHAR, &msg, &status));
@@ -674,9 +675,9 @@ private:
                 auto& responseWithIds = std::get<ResponsesData>(message.data);
                 auto packed = serializeResponseWithIds(responseWithIds.response);
 
-                mWorldComm.send(
+                mWorldComm.sendRawTag(
                     &message.id, 1, tensorrt_llm::mpi::MpiType::kUINT64, mControllerRank, kM_INSTANCE_ID_TAG);
-                mWorldComm.send(packed.data(), packed.size(), tensorrt_llm::mpi::MpiType::kCHAR, mControllerRank,
+                mWorldComm.sendRawTag(packed.data(), packed.size(), tensorrt_llm::mpi::MpiType::kCHAR, mControllerRank,
                     kM_INSTANCE_DATA_TAG);
             }
             else if (message.id == MessageID::TERMINATION)
@@ -711,7 +712,7 @@ private:
             MPI_Message msg;
             MPI_Status status;
             auto sourceRank{mControllerRank};
-            mWorldComm.mprobe(sourceRank, kM_CONTROLLER_ID_TAG, &msg, &status);
+            mWorldComm.mprobeRawTag(sourceRank, kM_CONTROLLER_ID_TAG, &msg, &status);
 
             int32_t count;
             MPICHECK(MPI_Get_count(&status, MPI_UINT64_T, &count));
@@ -732,7 +733,7 @@ private:
             if (messageId == MessageID::PENDING_CONTEXT_REQUEST || messageId == MessageID::PENDING_GENERATION_REQUEST
                 || messageId == MessageID::PENDING_FULL_REQUEST)
             {
-                mWorldComm.mprobe(sourceRank, kM_CONTROLLER_DATA_TAG, &msg, &status);
+                mWorldComm.mprobeRawTag(sourceRank, kM_CONTROLLER_DATA_TAG, &msg, &status);
                 MPICHECK(MPI_Get_count(&status, MPI_CHAR, &count));
                 std::vector<char> buffer(count);
                 MPICHECK(MPI_Mrecv(buffer.data(), count, MPI_CHAR, &msg, &status));

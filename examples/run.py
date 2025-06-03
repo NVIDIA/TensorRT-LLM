@@ -319,7 +319,7 @@ def main(args):
     if is_enc_dec:
         logger.warning(
             "This path is an encoder-decoder model. Using different handling.")
-        assert not args.use_py_session, "Encoder-decoder models don't have a unified python runtime, please use its own examples/enc_dec/run.py instead."
+        assert not args.use_py_session, "Encoder-decoder models don't have a unified python runtime, please use its own examples/models/core/enc_dec/run.py instead."
 
     model_name, model_version = read_model_name(
         args.engine_dir if not is_enc_dec else os.path.
@@ -454,7 +454,8 @@ def main(args):
             lora_ckpt_source=args.lora_ckpt_source,
             gpu_weights_percent=args.gpu_weights_percent,
             max_output_len=args.max_output_len,
-            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
+            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc,
+        )
         if args.medusa_choices is not None:
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"

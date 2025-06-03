@@ -89,6 +89,7 @@ CUDADriverWrapper::CUDADriverWrapper()
     *reinterpret_cast<void**>(&_cuTensorMapEncodeTiled) = load_sym(handle, "cuTensorMapEncodeTiled");
     *reinterpret_cast<void**>(&_cuMemcpyDtoH) = load_sym(handle, "cuMemcpyDtoH_v2");
     *reinterpret_cast<void**>(&_cuDeviceGetAttribute) = load_sym(handle, "cuDeviceGetAttribute");
+    *reinterpret_cast<void**>(&_cuOccupancyMaxActiveClusters) = load_sym(handle, "cuOccupancyMaxActiveClusters");
 }
 
 CUDADriverWrapper::~CUDADriverWrapper()
@@ -245,6 +246,12 @@ CUresult CUDADriverWrapper::cuMemcpyDtoH(void* dstHost, CUdeviceptr srcDevice, s
 CUresult CUDADriverWrapper::cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevice dev) const
 {
     return (*_cuDeviceGetAttribute)(pi, attrib, dev);
+}
+
+CUresult CUDADriverWrapper::cuOccupancyMaxActiveClusters(
+    int* maxActiveClusters, CUfunction f, CUlaunchConfig const* config) const
+{
+    return (*_cuOccupancyMaxActiveClusters)(maxActiveClusters, f, config);
 }
 
 } // namespace tensorrt_llm::common

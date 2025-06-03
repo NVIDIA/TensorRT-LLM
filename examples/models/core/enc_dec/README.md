@@ -18,16 +18,16 @@ This document shows how to build and run an Encoder-Decoder (Enc-Dec) model in T
       - [Run Python runtime](#run-python-runtime)
     - [Benchmark](#benchmark)
       - [Benchmark C++ runtime](#benchmark-c-runtime)
-      - [Benchmark Python runtime](#benchmark-python-runtime)
     - [Run BART with LoRA](#run-bart-with-lora)
     - [Reminders](#reminders)
     - [Attention Scaling Factors](#attention-scaling-factors)
     - [Run FairSeq NMT (Neural Machine Translation) models](#run-fairseq-nmt-neural-machine-translation-models)
     - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
+      - [Get quantized checkpoint with ModelOpt](#get-quantized-checkpoint-with-modelopt)
 
 ## Overview
 
-The TensorRT-LLM Enc-Dec implementation can be found in [tensorrt_llm/models/enc_dec/model.py](../../../../tensorrt_llm/models/enc_dec/model.py). The TensorRT-LLM Enc-Dec example code is located in [`examples/enc_dec`](./):
+The TensorRT-LLM Enc-Dec implementation can be found in [tensorrt_llm/models/enc_dec/model.py](../../../../tensorrt_llm/models/enc_dec/model.py). The TensorRT-LLM Enc-Dec example code is located in [`examples/models/core/enc_dec`](./):
 
  * `trtllm-build` to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Enc-Dec model,
  * [`run.py`](./run.py) to run the inference on an example input text.
@@ -35,7 +35,7 @@ The TensorRT-LLM Enc-Dec implementation can be found in [tensorrt_llm/models/enc
    * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert weights from HuggingFace or FairSeq format to TRT-LLM format, and split weights for multi-GPU inference,
 ## Usage
 
-The TensorRT-LLM Enc-Dec example code locates at [examples/enc_dec](./). It takes HuggingFace or FairSeq model name as input, and builds the corresponding TensorRT engines. On each GPU, there will be two TensorRT engines, one for Encoder and one for Decoder.
+The TensorRT-LLM Enc-Dec example code locates at [examples/models/core/enc_dec](./). It takes HuggingFace or FairSeq model name as input, and builds the corresponding TensorRT engines. On each GPU, there will be two TensorRT engines, one for Encoder and one for Decoder.
 
 ## Encoder-Decoder Model Support
 
@@ -225,7 +225,7 @@ For pure C++ runtime, there is no example given yet. Please check the [`Executor
 
 #### Run Python runtime
 
-For pure Python runtime, you can still use the encoder-decoder specific script under `examples/enc_dec/`.
+For pure Python runtime, you can still use the encoder-decoder specific script under `examples/models/core/enc_dec/`.
 
 ```bash
 # Inferencing w/ single GPU greedy search, compare results with HuggingFace FP32
@@ -241,31 +241,6 @@ mpirun --allow-run-as-root -np ${WORLD_SIZE} python3 run.py --engine_dir tmp/trt
 
 The tutorial for encoder-decoder C++ runtime benchmark can be found in [`benchmarks/cpp`](../../benchmarks/cpp/README.md#2-launch-c-benchmarking-inflightv1-batching)
 
-#### Benchmark Python runtime
-
-The benchmark implementation and entrypoint can be found in [`benchmarks/python/benchmark.py`](../../benchmarks/python/benchmark.py). Specifically, [`benchmarks/python/enc_dec_benchmark.py`](../../benchmarks/python/enc_dec_benchmark.py) is the benchmark script for Encoder-Decoder models.
-
-In `benchmarks/python/`:
-
-```bash
-# Example 1: Single-GPU benchmark
-python benchmark.py \
-    -m enc-dec \
-    --batch_size "1;8" \
-    --input_output_len "60,20;128,20" \
-    --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} \
-    --dtype float32 \
-    --csv # optional
-
-# Example 2: Multi-GPU benchmark
-mpirun --allow-run-as-root -np 4 python benchmark.py \
-    -m enc-dec \
-    --batch_size "1;8" \
-    --input_output_len "60,20;128,20" \
-    --engine_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION} \
-    --dtype float32 \
-    --csv # optional
-```
 
 ### Run BART with LoRA
 

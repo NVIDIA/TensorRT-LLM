@@ -9,8 +9,6 @@ import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 
-from .pipeline_interface import PipelineInterface
-
 is_torch_compiling_flag = False
 
 aux_stream_name_list = ['Attention', 'MoeShared', 'MoeChunkingOverlap']
@@ -85,8 +83,6 @@ def make_weak_ref(x):
         return {k: make_weak_ref(v) for k, v in x.items()}
     elif isinstance(x, (int, float, bool)):
         return x
-    elif isinstance(x, PipelineInterface):
-        return tuple(make_weak_ref(tensor) for tensor in x)
     else:
         raise TypeError(f"Invalid type {type(x)} to make weak ref")
 
@@ -96,12 +92,22 @@ class Fp4QuantizedTensor:
     fp4_tensor: torch.Tensor
     scaling_factor: torch.Tensor
 
+    @property
+    def shape(self):
+        return self.fp4_tensor.shape
+
 
 _disable_fp4_allgather = os.getenv("TLLM_DISABLE_FP4_ALLGATHER", "0") == "1"
 
 
 def disable_fp4_allgather():
     return _disable_fp4_allgather
+
+
+def compute_swizzled_sf_shape(row: int, col: int):
+    padded_row = (row + 128 - 1) // 128 * 128
+    padded_col = (col + 4 - 1) // 4 * 4
+    return padded_row, padded_col
 
 
 def swizzle_sf(sf: torch.Tensor,
@@ -197,7 +203,7 @@ def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
         num_token_buckets.append(m)
         m //= 2
 
-    return num_token_buckets
+    return tuple(num_token_buckets)
 
 
 def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
@@ -208,3 +214,16 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
         num_token_buckets.append(m)
         m //= 2
     return num_token_buckets
+
+
+_enable_piecewise_cuda_graph = True
+
+
+def set_piecewise_cuda_graph_flag(enable: bool):
+    global _enable_piecewise_cuda_graph
+    _enable_piecewise_cuda_graph = enable
+
+
+def get_piecewise_cuda_graph_flag() -> bool:
+    global _enable_piecewise_cuda_graph
+    return _enable_piecewise_cuda_graph

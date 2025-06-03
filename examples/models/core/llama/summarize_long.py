@@ -397,12 +397,11 @@ def main(args):
                 beam_idx].compute()
             for key in computed_metrics_tensorrt_llm.keys():
                 logger.info(
-                    f'  {key} : {computed_metrics_tensorrt_llm[key].mid[2]*100}'
-                )
+                    f'  {key} : {computed_metrics_tensorrt_llm[key]*100}')
 
             if args.check_accuracy and beam_idx == 0:
-                assert computed_metrics_tensorrt_llm['rouge1'].mid[
-                    2] * 100 > args.tensorrt_llm_rouge1_threshold
+                assert computed_metrics_tensorrt_llm[
+                    'rouge1'] * 100 > args.tensorrt_llm_rouge1_threshold
 
 
 if __name__ == '__main__':

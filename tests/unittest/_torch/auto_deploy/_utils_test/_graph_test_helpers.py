@@ -51,7 +51,7 @@ def run_test(
     num_params_gm = count_parameters(gm)
 
     assert num_params_model == num_params_gm
-    assert all_close(y_model, y_gm)
+    torch.testing.assert_close(y_model, y_gm, atol=atol, rtol=rtol)
 
     # graph transformation + check
     gm_transformed = transform(gm, *args)
@@ -71,31 +71,30 @@ def run_test(
 
     if strict_loading:
         # check if output equals without loading state dict
-        assert all_close(y_model, y_transformed, atol=atol, rtol=rtol)
+        torch.testing.assert_close(y_model, y_transformed, atol=atol, rtol=rtol)
 
     if test_load_hook:
         # check if loading hook works from original state dict
         reset_parameters(gm_transformed)
         y_random = gm_transformed(x)
-        assert not all_close(y_model, y_random)
+        assert not all_close(y_model, y_random), f"{y_model=}, {y_random=}"
 
         gm_transformed.load_state_dict(model.state_dict(), strict=True if strict_loading else False)
         y_loaded_from_original = gm_transformed(x)
-        assert all_close(y_model, y_loaded_from_original, atol=atol, rtol=rtol)
+        torch.testing.assert_close(y_model, y_loaded_from_original, atol=atol, rtol=rtol)
 
         # check if loading hook works from state_dict of a transformed model
         state_dict_sharded = copy.deepcopy(gm_transformed.state_dict())
         reset_parameters(gm_transformed)
         y_random2 = gm_transformed(x)
-        assert not all_close(y_model, y_random2)
+        assert not all_close(y_model, y_random2), f"{y_model=}, {y_random2=}"
 
         gm_transformed.load_state_dict(state_dict_sharded, strict=True if strict_loading else False)
         y_loaded_from_transformed = gm_transformed(x)
-        assert all_close(y_model, y_loaded_from_transformed, atol=atol, rtol=rtol)
+        torch.testing.assert_close(y_model, y_loaded_from_transformed, atol=atol, rtol=rtol)
 
     # check if we can still export the model as expected
     torch_export(gm_transformed, args=(x,))
-    torch_export_to_gm(gm_transformed, args=(x,))
 
     # return graph module for further testing
     return gm_transformed

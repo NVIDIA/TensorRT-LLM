@@ -27,7 +27,3 @@ properties:
   finished:
     annotation: bool
     default: inspect._empty
-  # TODO [TRTLLM-876]
-  # prompt_logprobs:
-  #   annotation: Optional[PromptLogprobs]
-  #   default: inspect._empty

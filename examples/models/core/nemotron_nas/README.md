@@ -43,7 +43,7 @@ Due the non-uniform architecture of the model, the different pipeline parallelis
 
 ## Usage
 
-The TensorRT-LLM example code is located at [examples/nemotron_nas](./).
+The TensorRT-LLM example code is located at [examples/models/core/nemotron_nas](./).
 The `convert_checkpoint.py` script accepts Hugging Face weights as input, and builds the corresponding TensorRT engines.
 The number of TensorRT engines depends on the number of GPUs used to run inference.
 

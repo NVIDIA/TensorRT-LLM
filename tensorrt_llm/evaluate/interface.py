@@ -14,7 +14,7 @@
 # limitations under the License.
 import random
 from abc import ABC, abstractmethod
-from typing import Iterable, List, Optional, Union
+from typing import Any, Iterable, List, Optional
 
 import numpy as np
 import torch
@@ -22,8 +22,7 @@ from tqdm import tqdm
 
 import tensorrt_llm.profiler as profiler
 
-from .._torch import LLM as PyTorchLLM
-from ..llmapi import LLM, RequestOutput
+from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
 
@@ -49,8 +48,7 @@ class Evaluator(ABC):
                       *auxiliaries) -> float:
         raise NotImplementedError()
 
-    def do_apply_chat_template(self, llm: Union[LLM, PyTorchLLM],
-                               prompt: str) -> str:
+    def do_apply_chat_template(self, llm: Any, prompt: str) -> str:
         messages = [{"role": "user", "content": prompt}]
         if self.system_prompt is not None:
             messages = [{
@@ -62,7 +60,7 @@ class Evaluator(ABC):
                                                  add_generation_prompt=True)
 
     def evaluate(self,
-                 llm: Union[LLM, PyTorchLLM],
+                 llm: Any,
                  sampling_params: Optional[SamplingParams] = None) -> float:
         profiler.start("trtllm exec")
         outputs, references, auxiliaries = [], [], []
@@ -74,17 +72,17 @@ class Evaluator(ABC):
             outputs.append(output)
             references.append(reference)
             auxiliaries.append(aux)
+        results = []
         for output in tqdm(outputs, desc="Fetching responses"):
-            output.result()
+            results.append(output.result())
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
         profiler.reset("trtllm exec")
 
-        score = self.compute_score(outputs, references, *zip(*auxiliaries))
+        score = self.compute_score(results, references, *zip(*auxiliaries))
         return score
 
     @staticmethod
-    @abstractmethod
     def command(ctx, *args, **kwargs) -> None:
         raise NotImplementedError()

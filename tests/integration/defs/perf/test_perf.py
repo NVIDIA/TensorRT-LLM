@@ -27,7 +27,7 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
 from ..conftest import get_llm_root, llm_models_root, trt_environment
-from .model_yaml_config import get_model_yaml_config
+from .pytorch_model_config import get_model_yaml_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfMetricType, PerfScriptTestCmds, generate_test_nodes)
 
@@ -44,15 +44,29 @@ MODEL_PATH_DICT = {
     "llama_v2_70b": "llama-models-v2/llama-v2-70b-hf",  # not safetensors repo
     "llama_v3.1_8b": "llama-3.1-model/Meta-Llama-3.1-8B",
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
+    "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
+    "llama_v3.1_8b_instruct_fp4":
+    "modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4",
     "llama_v3.1_70b": "llama-3.1-model/Meta-Llama-3.1-70B",
+    "llama_v3.1_70b_instruct_fp8": "llama-3.1-model/Llama-3.1-70B-Instruct-FP8",
+    "llama_v3.3_70b_instruct_fp8":
+    "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
+    "llama_v3.1_405b_instruct_fp4":
+    "modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4",
     "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
-    "llama_v3.2_11b": "llama-3.2-models/Llama-3.2-11B-Vision",
+    "llama_v3.2_1b": "llama-3.2-models/Llama-3.2-1B",
+    "llama_v3.1_nemotron_nano_8b": "Llama-3.1-Nemotron-Nano-8B-v1",
+    "llama_v3.3_nemotron_super_49b":
+    "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
+    "llama_v3.1_nemotron_ultra_253b":
+    "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1",
     # "llama_30b": "llama-models/llama-30b-hf",
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
+    "mixtral_8x7b_v0.1_instruct_fp8": "Mixtral-8x7B-Instruct-v0.1-fp8",
     "mixtral_8x22b_v0.1": "Mixtral-8x22B-v0.1",
     "mistral_7b_v0.1": "mistral-7b-v0.1",
-    "deepseek_r1": "DeepSeek-R1/DeepSeek-R1",
+    "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "deepseek_v3_lite_nvfp4": "DeepSeek-V3-Lite/nvfp4_moe_only",
@@ -76,6 +90,7 @@ MODEL_PATH_DICT = {
     "gpt_350m_moe": "gpt2-medium",
     "phi_3_mini_4k_instruct": "Phi-3/Phi-3-mini-4k-instruct",
     "phi_3_mini_128k_instruct": "Phi-3/Phi-3-mini-128k-instruct",
+    "phi_4_mini_instruct": "Phi-4-mini-instruct",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
@@ -90,10 +105,16 @@ HF_MODEL_PATH = {
     "llama_v3_70b_hf": "meta-llama/Meta-Llama-3-70B",
     "llama_v3.1_70b_hf": "meta-llama/Llama-3.1-70B",
     "llama_v3.1_405b_hf": "meta-llama/Llama-3.1-405B",
+    "llama_v3.1_nemotron_nano_8b_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+    "llama_v3.3_nemotron_super_49b_hf":
+    "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+    "llama_v3.1_nemotron_ultra_253b_hf":
+    "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
     "mixtral_8x7b_v0.1_hf": "mistralai/Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct_hf": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistral_7b_v0.1_hf": "mistralai/Mistral-7B-v0.1",
     "flan_t5_base_hf": "google/flan-t5-small",
+    "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
 }
 LORA_MODEL_PATH = {
     "llama_v2_13b": "llama-models-v2/chinese-llama-2-lora-13b",
@@ -101,6 +122,10 @@ LORA_MODEL_PATH = {
 }
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
+
+TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    "llama_v3.3_nemotron_super_49b"
+}
 
 
 def cpu_socket_count_gt_1():
@@ -176,7 +201,7 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.INFERENCE_TIME:
     re.compile(r"Total Latency \(ms\):\s+([\d\.]+)"),
     PerfMetricType.TOKEN_THROUGHPUT:
-    re.compile(r"GPU Output Throughput \(tokens\/sec\/gpu\):\s+([\d\.]+)"),
+    re.compile(r"GPU Output Throughput \(tps\/gpu\):\s+([\d\.]+)"),
     PerfMetricType.SEQ_THROUGHPUT:
     re.compile(r"Request Throughput \(req\/sec\):\s+([\d\.]+)"),
     PerfMetricType.FIRST_TOKEN_TIME:
@@ -249,7 +274,7 @@ class PerfTestMetric(NamedTuple):
     """
     Configurations of a test metric.
     """
-    # The original test name used to run the TURTLE test.
+    # The original test name used to run the oraginal perf test.
     original_test_name: str
     # The name for this particular metric.
     metric_name: str
@@ -358,9 +383,9 @@ class PerfTestConfig:
         # First, add the model name.
         entries = [self.model_name]
 
-        if self.runtime == "cpp":  # gptSessionBenchmark or berBenchmark runtime
+        if self.runtime == "cpp":  # bertBenchmark runtime
             entries.append(f"cpp")
-        elif self.runtime == "cppmanager":  # gptMananberBenchmark runtime
+        elif self.runtime == "cppmanager":  # gptManagerBenchmark runtime
             entries.append(f"cppmanager")
             if self.api == "exe":  # executor
                 entries.append(f"exe")
@@ -473,11 +498,9 @@ class PerfTestConfig:
         labels = test_param_labels.split("-")
 
         self.model_name = labels.pop(0)
-        self.runtime = "python" if labels[0] not in [
-            "cpp",
-            "cppmanager",
-            "bench",
-        ] else labels.pop(0)
+        assert labels[0] in ["cpp", "cppmanager", "bench"], \
+            f"Invalid runtime {labels[0]}!"
+        self.runtime = labels.pop(0)
         self.api = labels.pop(0) if labels[0] == "exe" else ""
         self.backend = labels.pop(0) if labels[0] == "pytorch" else ""
         self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
@@ -584,7 +607,7 @@ class PerfTestConfig:
             assert self.model_name in allowed_models, f"model_name {self.model_name} is not in allowed_models!"
 
         # Validate runtime type.
-        VALID_RUNTIMES = ["cpp", "cppmanager", "python", "bench"]
+        VALID_RUNTIMES = ["cpp", "cppmanager", "bench"]
         assert self.runtime in VALID_RUNTIMES, f"Invalid runtime {self.runtime}!"
 
         # Validate plugin mode.
@@ -594,14 +617,14 @@ class PerfTestConfig:
         assert self.mode in VALID_MODES, f"Invalid mode {self.mode}!"
 
         # Validate dtype.
-        VALID_DTYPES = ["float32", "float16", "bfloat16"]
+        VALID_DTYPES = ["float32", "float16", "bfloat16", "float8", "float4"]
         assert self.data_type in VALID_DTYPES, f"Invalid data_type {self.data_type}!"
 
         # Validate quantization mode.
         if self.model_name in MODEL_PATH_DICT.keys():
             VALID_QUANTS = [
-                "", "nvfp4", "fp8", "int8_sq", "int4_awq", "w4a8_awq",
-                "w4a16_awq", "int8_wo", "int4_wo", "full_prec"
+                "", "nvfp4", "fp8", "int8", "int4_awq", "w4a8_awq", "w4a16_awq",
+                "int4_wo", "full_prec"
             ]
         else:
             VALID_QUANTS = [
@@ -617,6 +640,8 @@ class PerfTestConfig:
                 "int4_weight_only_gptq",
             ]
         assert self.quantization in VALID_QUANTS, f"Invalid quantization {self.quantization}!"
+        if self.backend == "pytorch":
+            assert self.quantization == "", f"Not support passing quantization {self.quantization} for pytorch backend!"
         assert self.num_beams >= 1, f"Invalid num_beams: {self.num_beams}!"
         assert self.num_loras >= 0, f"Invalid num_loras: {self.num_loras}!"
         assert self.num_reqs >= 1, f"Invalid num_reqs: {self.num_reqs}!"
@@ -734,7 +759,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     """
 
     def __init__(self, full_test_name: str):
-        # full_test_name is the full test name appearing in TURTLE output.
+        # full_test_name is the full test name appearing in test output.
         self._full_test_name = full_test_name
         # test_domain_name is the part before "::".
         self._test_domain_name = "::".join(full_test_name.split("::")[:-1])
@@ -756,17 +781,18 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def set_runtime_configs(self, llm_root, working_dir,
                             perf_cache_fpath) -> None:
         if self._config.runtime == "cpp":
-            cpp_benchmark_name = "bertBenchmark" if self._config.is_bert_like(
-            ) else "gptSessionBenchmark"
-            benchmark_script = get_cpp_benchmark(cpp_benchmark_name, llm_root)
+            if not self._config.is_bert_like():
+                raise ValueError(
+                    f"Invalid config: '{self._config.runtime}' is only supported for bert-like models!"
+                )
+            benchmark_script = get_cpp_benchmark("bertBenchmark", llm_root)
         elif self._config.runtime == "cppmanager":
             benchmark_script = get_cpp_benchmark("gptManagerBenchmark",
                                                  llm_root)
         elif self._config.runtime == "bench":
             benchmark_script = "trtllm-bench"
         else:
-            benchmark_script = os.path.join(llm_root, "benchmarks", "python",
-                                            "benchmark.py")
+            raise RuntimeError(f"Invalid runtime {self._config.runtime}.")
         allowed_configs = import_allowed_perf_config()
         allowed_models = allowed_configs.get_allowed_models()
         if self._config.runtime == "bench":
@@ -795,8 +821,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if self._config.quantization != "":
             command, checkpoint_dir = quantize_data(
                 llm_venv=None,
-                example_root=os.path.join(get_llm_root(), "examples",
-                                          example_name),
+                example_root=os.path.join(get_llm_root(), "examples", "models",
+                                          "core", example_name),
                 model_dir=model_dir,
                 calib_dataset=os.path.join(llm_models_root(), "datasets",
                                            "cnn_dailymail"),
@@ -808,8 +834,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         else:
             command, checkpoint_dir = convert_weights(
                 llm_venv=None,
-                example_root=os.path.join(get_llm_root(), "examples",
-                                          example_name),
+                example_root=os.path.join(get_llm_root(), "examples", "models",
+                                          "core", example_name),
                 cmodel_dir=engine_dir,
                 model=self._config.model_name,
                 model_path=model_dir,
@@ -914,6 +940,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if self._config.quantization:
             build_cmd.append(
                 f"--quantization={self._config.quantization.upper()}")
+        if self._config.model_name in TRUST_REMOTE_CODE_MODELS:
+            build_cmd.append(f"--trust_remote_code=True")
         return build_cmd
 
     def get_benchmark_build_command(self, engine_dir) -> list:
@@ -974,28 +1002,28 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             istdev = 16
             ostdev = 24
             nloras = self._config.num_loras
-            lora_data = os.path.join(engine_dir,
-                                     f"token-norm-dist-lora-{nloras}.json")
-            with open(lora_data, 'w') as file:
-                pass
+            # lora_data = os.path.join(engine_dir,
+            #                          f"token-norm-dist-lora-{nloras}.json")
+            dataset_path = os.path.join(engine_dir, "synthetic_data.json")
             data_cmd += [
-                "python3", prepare_data_script, f"--output={lora_data}",
+                "python3", prepare_data_script, f"--stdout",
                 f"--rand-task-id 0 {nloras-1}", f"--tokenizer={tokenizer_dir}",
                 f"token-norm-dist", f"--num-requests={self._config.num_reqs}",
                 f"--input-mean={input_len}", f"--output-mean={output_len}",
-                f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
+                f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
+                f" > {dataset_path}"
             ]
-            data_cmd += [";"]
-            generate_rand_lora_script = os.path.join(self._llm_root,
-                                                     "benchmarks", "cpp",
-                                                     "utils",
-                                                     "generate_rand_loras.py")
-            checkpoint_dir = os.path.join(engine_dir, "lora_cpp")
-            lora_dir = os.path.join(engine_dir, f"loras")
-            data_cmd += [
-                "python3", generate_rand_lora_script, checkpoint_dir, lora_dir,
-                "16"
-            ]
+            if self._config.runtime == "cppmanager":
+                data_cmd += [";"]
+                generate_rand_lora_script = os.path.join(
+                    self._llm_root, "benchmarks", "cpp", "utils",
+                    "generate_rand_loras.py")
+                checkpoint_dir = os.path.join(engine_dir, "lora_cpp")
+                lora_dir = os.path.join(engine_dir, f"loras")
+                data_cmd += [
+                    "python3", generate_rand_lora_script, checkpoint_dir,
+                    lora_dir, "16"
+                ]
         else:
             istdev = 0
             ostdev = 0
@@ -1384,7 +1412,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         """
         Run through the commands and parse multiple perf metrics from the logs.
         """
-
+        #print info to separate cases
+        print_info(f"Running perf test for case: {self._short_test_name}")
         self._current_cmd_idx = 0
         metrics = self._get_metrics()
         outputs = {}

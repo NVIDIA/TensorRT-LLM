@@ -25,6 +25,7 @@
 using namespace nvinfer1;
 using tensorrt_llm::plugins::SendPluginCreator;
 using tensorrt_llm::plugins::SendPlugin;
+using tensorrt_llm::mpi::MpiTag;
 
 static char const* SEND_PLUGIN_VERSION{"1"};
 static char const* SEND_PLUGIN_NAME{"Send"};
@@ -134,7 +135,7 @@ int SendPlugin::initialize() noexcept
 
     ncclUniqueId id;
     ncclGetUniqueId(&id);
-    COMM_SESSION.sendValue(id, mTgtRank, 0);
+    COMM_SESSION.sendValue(id, mTgtRank, MpiTag::kDefault);
 // Need static connection initialization for accurate KV cache size estimation
 #if defined(_WIN32)
     if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)

@@ -6,7 +6,7 @@ import torch
 
 from ...logger import logger
 
-IS_FLASHINFER_AVAIABLE = False
+IS_FLASHINFER_AVAILABLE = False
 
 
 def get_env_enable_pdl():
@@ -20,14 +20,14 @@ if ENABLE_PDL:
 if platform.system() != "Windows":
     try:
         import flashinfer
-        IS_FLASHINFER_AVAIABLE = True
+        IS_FLASHINFER_AVAILABLE = True
     except ImportError:
         traceback.print_exc()
         print(
             "flashinfer is not installed properly, please try pip install or building from source codes"
         )
 
-if IS_FLASHINFER_AVAIABLE:
+if IS_FLASHINFER_AVAILABLE:
     from flashinfer.activation import silu_and_mul
     from flashinfer.norm import fused_add_rmsnorm, rmsnorm
 
@@ -38,7 +38,7 @@ if IS_FLASHINFER_AVAIABLE:
 
     @flashinfer_silu_and_mul.register_fake
     def _(x: torch.Tensor) -> torch.Tensor:
-        return torch.empty_like(x).chunk(2, dim=-1)[1]
+        return torch.empty_like(x).chunk(2, dim=-1)[1].contiguous()
 
     # Warp this into custom op since flashinfer provides default value for eps with would produce two different graphs depends on the eps value.
     @torch.library.custom_op("trtllm::flashinfer_rmsnorm", mutates_args=())

@@ -9,7 +9,7 @@ methods:
         default: ''
       token_ids:
         annotation: Optional[List[int]]
-        default: null
+        default: []
       finish_reason:
         annotation: Optional[Literal['stop', 'length', 'timeout', 'cancelled']]
         default: null
@@ -19,9 +19,11 @@ methods:
       generation_logits:
         annotation: Optional[torch.Tensor]
         default: null
-      # TODO [TRTLLM-1049]
-      # logprobs:
-      #   annotation: Optional[SampleLogprobs]
-      #   default: null
+      logprobs:
+        annotation: Optional[list[dict[int, tensorrt_llm.executor.result.Logprob]]]
+        default: null
+      prompt_logprobs:
+        annotation: Optional[list[dict[int, tensorrt_llm.executor.result.Logprob]]]
+        default: null
     return_annotation: None
 properties: {}
