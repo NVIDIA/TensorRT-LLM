@@ -8,7 +8,6 @@ from utils.util import force_ampere
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, PyResult
 from tensorrt_llm.bindings.executor import Response, Result
 from tensorrt_llm.executor.result import Logprob
