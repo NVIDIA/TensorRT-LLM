@@ -2306,16 +2306,17 @@ runtime::ITensor::SharedPtr KVCacheManager::getPrimaryPool(SizeType32 layer_idx)
 
 SizeType32 KVCacheManager::getMaxCapacityBatchSize(SizeType32 inputLength, SizeType32 outputLength) const
 {
-    auto max = 0;
+    auto minMaxBatchSizeAllWindows = std::numeric_limits<SizeType32>::max();
     for (auto const [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
     {
         auto const blockRequirementsPerSequence = KVCacheManager::calculateMaxBlockRequirements(
             inputLength, outputLength, mSinkBlockTokenLength, windowSize, mMaxBeamWidth, mTokensPerBlock);
-        auto const maxBatchSize = blockRequirementsPerSequence / metadata.allottedPrimaryBlocks;
-        max = std::max(max, maxBatchSize);
+        auto const maxBatchSizeWindow = metadata.allottedPrimaryBlocks / blockRequirementsPerSequence;
+        // The window with the *smallest* max batch size is the limiting factor
+        // Hence, the std::*min* of all the max batch sizes is chosen
+        minMaxBatchSizeAllWindows = std::min(minMaxBatchSizeAllWindows, maxBatchSizeWindow);
     }
-
-    return max;
+    return minMaxBatchSizeAllWindows;
 }
 
 SizeType32 KVCacheManager::calculateMaxBlockRequirementsPerBeam(
