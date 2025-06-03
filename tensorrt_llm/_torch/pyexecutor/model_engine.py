@@ -166,9 +166,12 @@ def load_weights(
     weights = {}
     weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
     if weight_files:
+        # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
+        # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
         prefetch_size = sum(os.path.getsize(file) for file in weight_files)
-        is_prefetch = prefetch_size < psutil.virtual_memory().available * 0.9
-        if is_prefetch:
+        enable_prefetch = prefetch_size < psutil.virtual_memory(
+        ).available * 0.9
+        if enable_prefetch:
             logger.info(
                 f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
             )
