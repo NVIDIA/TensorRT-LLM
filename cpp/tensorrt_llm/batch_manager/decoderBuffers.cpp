@@ -122,11 +122,6 @@ DecoderBuffers::DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWid
     }
 }
 
-void DecoderBuffers::setLogitsAt(SizeType32 index, TensorPtr value)
-{
-    logits[index] = std::move(value);
-}
-
 void DecoderBuffers::DraftBuffers::create(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep,
     BufferManager const& manager, ModelConfig const& modelConfig)
 {

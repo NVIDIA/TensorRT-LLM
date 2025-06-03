@@ -13,14 +13,14 @@ class HandleGenerationLogits:
         decoder_buffers: DecoderBuffers,
         logits: torch.Tensor,
     ):
+        decoder_buffer_logits = decoder_buffers.logits
         for llm_req in generation_requests:
             beam_width = llm_req.get_beam_width_by_iter()
             seq_slot = llm_req.seq_slot
 
-            # logits_view shape: [beamWidth, vocabSize]
+            # logits_view shape: [beamWidth, 1, vocabSize] - that 1 in the middle is added from unsqueeze in sample_async
             logits_view = logits[logits_index:logits_index + beam_width]
 
-            # TODO: I don't understand why that slicing is done when beam_width <= 1, it seems to work well without it.
             # if beam_width > 1:
             #    decoder_buffer_logits[seq_slot] = logits_view
             #    decoder_buffer_logits[seq_slot].unsqueeze(0)
@@ -28,15 +28,16 @@ class HandleGenerationLogits:
             #    print(f"{seq_slot=}")
             #    decoder_buffer_logits[seq_slot] = logits_view[:logits_view.shape[0], :1, :logits_view.shape[1]]
 
-            # TODO: Seems like setting an element in the logits vector doesn't work, so I (hopefully temporarily) added the set_logits_at method
-            # decoder_buffers.logits[seq_slot] = logits_view
-            decoder_buffers.set_logits_at(seq_slot, logits_view)
+            decoder_buffer_logits[seq_slot] = logits_view
 
             if beam_width > 1:
                 # TODO: Why is this necessary?
-                decoder_buffers.logits[seq_slot].unsqueeze(0)
+                decoder_buffer_logits.unsqueeze(0)
 
             if llm_req.py_return_generation_logits:
                 llm_req.py_result.append_generation_logits(logits_view)
 
             logits_index += beam_width
+
+        # Needs to be done in bulk for the copy to work
+        decoder_buffers.logits = decoder_buffer_logits
