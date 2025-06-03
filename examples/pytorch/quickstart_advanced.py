@@ -10,6 +10,9 @@ example_prompts = [
     "The president of the United States is",
     "The capital of France is",
     "The future of AI is",
+    "000000",
+    "0102030",
+    "99 98 97 96 ",
 ]
 
 
@@ -166,7 +169,7 @@ def setup_llm(args):
             max_matching_ngram_size=args.max_matching_ngram_size,
             is_keep_all=True,
             is_use_oldest=True,
-            is_public_pool=True,
+            is_public_pool=False,
         )
     else:
         spec_config = None
@@ -220,6 +223,11 @@ def main():
         prompt = output.prompt
         generated_text = output.outputs[0].text
         print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+    if args.print_iter_log:
+        stats = llm.get_stats()
+        for stat in stats:
+            print(stat)
 
 
 if __name__ == '__main__':

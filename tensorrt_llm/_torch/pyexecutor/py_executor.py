@@ -268,6 +268,12 @@ class PyExecutor:
                 "Drafting is not supported for selected executor loop. "
                 "Please disable disagg/pipeline parallelism/overlap scheduler.")
 
+        self.is_ngram = hasattr(
+            model_engine, "spec_config"
+        ) and model_engine.spec_config is not None and model_engine.spec_config.spec_dec_mode.is_ngram(
+        )
+        self.enable_ngram_iter_perf_stats = self.is_ngram and self.enable_iter_perf_stats
+
         self.worker_started = False
         self.worker_lock = threading.Lock()
         if start_worker:
@@ -838,11 +844,8 @@ class PyExecutor:
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
-        is_ngram = hasattr(
-            self.model_engine, "spec_config"
-        ) and self.model_engine.spec_config is not None and self.model_engine.spec_config.spec_dec_mode.is_ngram(
-        )
         with self._profiler() as profile_step:
+            sample_state = None
             iter_start_time = time.time()
             iter_stats = None
             while not self.is_shutdown or len(self.active_requests) > 0:
@@ -863,7 +866,7 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
-                if self.draft_model_engine is not None or is_ngram:
+                if self.draft_model_engine is not None or self.is_ngram:
                     self._prepare_draft_requests()
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -901,16 +904,18 @@ class PyExecutor:
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
-                    has_ngram_iter_stats = is_ngram and self.model_engine.spec_config.spec_dec_mode.is_ngram(
-                    ) and iter_stats is not None
-                    if has_ngram_iter_stats:
-                        before = time.time()
-
                     self.resource_manager.prepare_resources(scheduled_batch)
                     if self.draft_model_engine is not None:
                         self._prepare_draft_tokens(scheduled_batch)
 
-                    if has_ngram_iter_stats:
+                    if self.enable_ngram_iter_perf_stats and iter_stats is not None:
+                        before = time.time()
+
+                    if self.is_ngram:
+                        self.sampler.prepare_forward(scheduled_batch,
+                                                     sample_state)
+
+                    if self.enable_ngram_iter_perf_stats and iter_stats is not None:
                         self._insert_ngram_iter_stats(scheduled_batch,
                                                       iter_stats)
                         iter_stats.specdec_stats.iter_latency_ms = (
@@ -1007,6 +1012,9 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
+                if self.is_ngram:
+                    self._prepare_draft_requests()
+
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
                 )
 
@@ -1064,6 +1072,17 @@ class PyExecutor:
 
                     previous_tensors_device = self.previous_batch and self.previous_batch.sample_state.device
 
+                    if self.enable_ngram_iter_perf_stats and iter_stats is not None:
+                        before = time.time()
+
+                    if self.is_ngram and self.previous_batch is not None:
+                        self.sampler.prepare_forward(
+                            scheduled_batch, self.previous_batch.sample_state)
+
+                    if self.enable_ngram_iter_perf_stats and iter_stats is not None:
+                        self._insert_ngram_iter_stats(scheduled_batch,
+                                                      iter_stats)
+
                     batch_outputs = self._forward_step(scheduled_batch,
                                                        previous_tensors_device)
 
@@ -1076,8 +1095,7 @@ class PyExecutor:
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                    has_previous_batch = self.previous_batch is not None
-                    if has_previous_batch:
+                    if self.previous_batch is not None:
                         previous_batch_size = self.previous_batch.sample_state.scheduled_requests.batch_size
                         if previous_batch_size > 0:  # first previous batch size is 0
                             self._process_previous_batch()
