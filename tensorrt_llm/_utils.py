@@ -345,6 +345,25 @@ def is_same_dtype(type_a: Union[str, trt.DataType],
     return type_a == type_b
 
 
+_binding_to_torch_dtype_dict = {
+    DataType.HALF: torch.float16,
+    DataType.FLOAT: torch.float32,
+    DataType.INT64: torch.int64,
+    DataType.INT32: torch.int32,
+    DataType.INT8: torch.int8,
+    DataType.FP8: torch.float8_e4m3fn,
+    DataType.INT8: torch.qint8,
+    DataType.BOOL: torch.bool,
+    DataType.BF16: torch.bfloat16,
+}
+
+
+def binding_dtype_to_torch(dtype):
+    ret = _binding_to_torch_dtype_dict.get(dtype)
+    assert ret is not None, f'Unsupported dtype: {dtype}'
+    return ret
+
+
 _torch_to_trt_dtype_dict = {
     torch.float16: trt.float16,
     torch.float32: trt.float32,
