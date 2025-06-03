@@ -150,7 +150,18 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
             }
 
             // Then by unroll loop 2x for mma
-            return optionsA.mUseUnrollLoop2xForMma;
+            if (optionsA.mUseUnrollLoop2xForMma != optionsB.mUseUnrollLoop2xForMma)
+            {
+                return optionsA.mUseUnrollLoop2xForMma;
+            }
+
+            // Then by splitK sizes
+            if (optionsA.mNumSlicesForSplitK != optionsB.mNumSlicesForSplitK)
+            {
+                return optionsA.mNumSlicesForSplitK > optionsB.mNumSlicesForSplitK;
+            }
+
+            return true;
         });
 
     for (auto const& configIndex : sortedIndices)
