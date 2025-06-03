@@ -104,6 +104,12 @@ def disable_fp4_allgather():
     return _disable_fp4_allgather
 
 
+def compute_swizzled_sf_shape(row: int, col: int):
+    padded_row = (row + 128 - 1) // 128 * 128
+    padded_col = (col + 4 - 1) // 4 * 4
+    return padded_row, padded_col
+
+
 def swizzle_sf(sf: torch.Tensor,
                row: int,
                col: int,
