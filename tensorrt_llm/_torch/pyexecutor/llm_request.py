@@ -102,9 +102,9 @@ class LogitsStorage:
         try:
             last_index = -2 if self._should_exclude_last else -1
             max_position = self._logits_indices[last_index][1]
+            return self._storage[:max_position]
         except IndexError:
             return None
-        return self._storage[:max_position]
 
     def set_exclude_last(self, should_exclude_last: bool) -> None:
         self._should_exclude_last = should_exclude_last
