@@ -1878,10 +1878,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     // Try to match what are being tested on x86 H100_PCIe.
     // The total machine time is scaled proportionally according to the number of each GPU.
-    SBSATestConfigs = [
-        /* "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 2],
-        "GH200-TensorRT-Post-Merge-2": ["gh200", "l0_gh200", 2, 2], */
-    ]
+    SBSATestConfigs = [:]
+    /* SBSATestConfigs = [
+        "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 2],
+        "GH200-TensorRT-Post-Merge-2": ["gh200", "l0_gh200", 2, 2],
+    ] */
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
