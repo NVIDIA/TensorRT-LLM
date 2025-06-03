@@ -41,6 +41,10 @@ class LogitsStorage:
                  seq_length: int,
                  use_device_memory=True,
                  should_exclude_last=False):
+        if should_exclude_last:
+            # Exclude last logits is used when overlap scheduler is used, that generates one extra token,
+            # so we should make sure there's memory for that extra +1.
+            seq_length += 1
         self.seq_length = seq_length
         self.use_device_memory = use_device_memory
         self._should_exclude_last = should_exclude_last
@@ -135,14 +139,14 @@ class PyResult:
                  streaming=False,
                  return_log_probs: bool = False,
                  return_context_logits: bool = False,
-                 return_generation_logits: bool = False):
+                 return_generation_logits: bool = False,
+                 exclude_last_generation_logits: bool = False):
         self._streaming = streaming
         self._context_logits = LogitsStorage(
             prompt_len, use_device_memory) if return_context_logits else None
         self._generation_logits = LogitsStorage(
-            max_new_tokens +
-            1,  # +1 not to crash when using overlapped scheduler
-            use_device_memory) if return_generation_logits else None
+            max_new_tokens, use_device_memory, exclude_last_generation_logits
+        ) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
 
     def append_context_logits(self, context_logits: torch.Tensor):
@@ -156,11 +160,6 @@ class PyResult:
     def append_log_probs(self, log_probs: list[TokenLogprobs]):
         if self._log_probs:
             self._log_probs.append(log_probs)
-
-    def set_generation_logits_exclude_last(self,
-                                           should_exclude_last: bool) -> None:
-        if self._generation_logits:
-            self._generation_logits.set_exclude_last(should_exclude_last)
 
     @property
     def context_logits(self) -> torch.Tensor | None:
@@ -243,6 +242,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_context_logits: bool = False,
             return_generation_logits: bool = False,
             return_logits_device_memory: bool = True,
+            exclude_last_generation_logits: bool = False,
             stop_words_list: list[list[int]] | None = None,
             **kwargs):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
@@ -283,7 +283,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_result = PyResult(self.py_prompt_len, self.py_max_new_tokens,
                                   return_logits_device_memory, self.streaming,
                                   return_log_probs, return_context_logits,
-                                  return_generation_logits)
+                                  return_generation_logits,
+                                  exclude_last_generation_logits)
 
     def create_response(
             self,
@@ -338,6 +339,7 @@ def convert_wordlist(word_list) -> List[List[int]]:
 def executor_request_to_llm_request(
         req_id: int,
         executor_request: ExecutorRequest,
+        exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None) -> LlmRequest:
     executor_sampling_config = executor_request.sampling_config
     sampling_config = SamplingConfig(executor_sampling_config)
@@ -385,6 +387,7 @@ def executor_request_to_llm_request(
         return_context_logits,
         return_generation_logits=executor_request.output_config.
         return_generation_logits,
+        exclude_last_generation_logits=exclude_last_generation_logits,
         draft_tokens=getattr(executor_request, "draft_tokens", None),
         draft_logits=None,
         exclude_input_from_output=executor_request.output_config.
