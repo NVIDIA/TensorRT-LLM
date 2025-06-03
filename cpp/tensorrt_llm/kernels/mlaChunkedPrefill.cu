@@ -11,7 +11,7 @@ template <typename T>
 struct MergeSoftmaxTraits
 {
     static constexpr int kQKNopeSize = 128;
-    static constexpr int kHeadSize = 128;
+    static constexpr int kHeadSize = kQKNopeSize;
 
     static constexpr int kBytesPerElem = sizeof(T);
     static constexpr int kBytesPerLoad = 16;
@@ -167,7 +167,7 @@ __global__ void loadChunkedKVCacheForMLAKernel(T* output_kv_ptr, T* output_k_pe_
 {
     using KT = loadChunkedKVKernelTraits<T>;
     int const batch_idx = static_cast<int>(blockIdx.y);
-    int const head_idx = static_cast<int>(blockIdx.z); // default 0
+    [[maybe_unused]] int const head_idx = static_cast<int>(blockIdx.z); // default 0
 
     size_t const head_dim_vec_idx = (threadIdx.x % KT::kVecPerHead);
     size_t const head_dim_idx = head_dim_vec_idx * KT::kElemPerLoad;
@@ -305,8 +305,8 @@ void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T* 
     dim3 block(KT::kNumThreads);
 
     mergeAttnWithSoftmaxKernel<T><<<grid, block, 0, stream>>>(merged_attn,
-        reinterpret_cast<float2*>(merged_softmax_stats), pre_attn, reinterpret_cast<float2* const>(pre_softmax_stats),
-        curr_attn, reinterpret_cast<float2* const>(curr_softmax_stats), cu_q_seq_len, merge_op, num_heads, head_size);
+        reinterpret_cast<float2*>(merged_softmax_stats), pre_attn, reinterpret_cast<float2*>(pre_softmax_stats),
+        curr_attn, reinterpret_cast<float2*>(curr_softmax_stats), cu_q_seq_len, merge_op, num_heads, head_size);
 }
 
 // load single chunk kv from kv_cache for each request

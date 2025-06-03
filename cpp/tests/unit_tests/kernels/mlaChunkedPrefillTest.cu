@@ -116,9 +116,6 @@ template <typename T>
 void selfAttentionRef(T* output, T* const Q, T* const KV, int batch_size, int num_heads, int64_t* const cu_seq_q_len,
     int64_t* const cu_seq_kv_len, int head_size, bool return_softmax, float* softmax_sum, bool causal_mask)
 {
-    int total_q_len = cu_seq_q_len[batch_size];
-    int total_kv_len = cu_seq_kv_len[batch_size];
-
     for (int b = 0; b < batch_size; b++)
     {
         int curr_q_len = cu_seq_q_len[b + 1] - cu_seq_q_len[b];
@@ -880,7 +877,7 @@ TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillCausalMask)
     // check result
     auto* output_ptr = bufferCast<DataType>(*(this->m_h_output_tensor));
     auto* output_ref_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_accum_ref));
-    for (int i = 0; i < this->h_output_tensor->getSize(); i++)
+    for (int i = 0; i < this->m_h_output_tensor->getSize(); i++)
     {
         if (std::abs(static_cast<float>(output_ptr[i]) - static_cast<float>(output_ref_ptr[i]))
             > getTolerance<DataType>(output_ptr[i]))
