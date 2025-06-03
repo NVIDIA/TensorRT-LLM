@@ -2125,11 +2125,10 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         isCrossAttention ? "Cross KvCacheManager" : "Self KvCacheManager", allottedPrimaryMemBytes,
         allottedSecondaryMemBytes);
 
-    if (config.maxTokens.has_value())
+    if (config.maxTokens.has_value() && windowSizeToLayers.size() > 1)
     {
-        auto const isVSWA = windowSizeToLayers.size() > 1;
-        TLLM_LOG_WARNING(!isVSWA,
-            "Semantically, when using Variable Sliding Window Attention maxTokens is a strange concept, as it limits "
+        TLLM_LOG_WARNING(
+            "Setting maxTokens when using Variable Sliding Window Attention is a strange concept, as it limits "
             "the number of max tokens *per window size* [limiting the sum of all window sizes is even stranger]. "
             "Anticipating the effects of this requires quite a complex calculation, and it probably isn't the "
             "configuration you meant to use.");
@@ -2156,14 +2155,15 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         = [&](SizeType32 windowSize, float windowSizeShare, SizeType32 cacheSizeBytesPerToken)
     {
         TLLM_LOG_DEBUG("windowSizeShare: %f, cacheSizeBytesPerToken: %d", windowSizeShare, cacheSizeBytesPerToken);
-        auto maxTokens = static_cast<SizeType32>(
+        auto maxTokens = static_cast<uint64_t>(
             allottedPrimaryMemBytes * windowSizeShare / static_cast<double>(cacheSizeBytesPerToken));
         if (config.maxTokens.has_value())
         {
-            TLLM_LOG_INFO("Maximum kv-cache token overridden by configuration as '%i'.", config.maxTokens.value());
-            maxTokens = std::min(config.maxTokens.value(), maxTokens);
+            auto const maxTokensFromConfig = static_cast<uint64_t>(config.maxTokens.value());
+            TLLM_LOG_INFO("Maximum kv-cache token overridden by configuration as '%ld'.", maxTokensFromConfig);
+            maxTokens = std::min(maxTokensFromConfig, maxTokens);
         }
-        TLLM_LOG_INFO("Primary maxTokens for windowSize %d: %d", windowSize, maxTokens);
+        TLLM_LOG_INFO("Primary maxTokens for windowSize %d: %ld", windowSize, maxTokens);
         SizeType32 const blocksInPrimaryPool = tc::ceilDiv(maxTokens, tokensPerBlock);
         TLLM_LOG_INFO(
             "Number of blocks in KV cache primary pool for windowSize %d: %d", windowSize, blocksInPrimaryPool);
