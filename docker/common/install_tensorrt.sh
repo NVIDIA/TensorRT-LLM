@@ -2,13 +2,13 @@
 
 set -ex
 
-TRT_VER="10.10.0.31"
+TRT_VER="10.11.0.33"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-04.html#rel-25-04
 CUDA_VER="12.9" # 12.9.0
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.9.0.52-1"
+CUDNN_VER="9.10.1.4-1"
 # NCCL version 2.26.3 used in the NGC PyTorch 25.04 image but not existing in public.
 # Use NCCL version 2.26.5 instead.
 NCCL_VER="2.26.5-1+cuda12.9"
