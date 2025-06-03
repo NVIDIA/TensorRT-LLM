@@ -39,7 +39,7 @@ namespace tensorrt_llm::kernels::llama4_min_latency::llama4_moe
 #define TOPK_VEC_SIZE 4
 static_assert(NUM_EXPERTS == TOPK_VEC_SIZE * WARP_SIZE, "NUM_EXPERTS must be equal to TOPK_VEC_SIZE * WARP_SIZE");
 
-// This is the hand-optimized kernel by Po-Han.
+// This is the hand-optimized kernel.
 // The computation is:
 //   C = silu(AxB_gated * in_scale * sigmoid(logit)) * (AxB_linear * in_scale * sigmoid(logit)) * out_scale_inv
 // The out_scale_inv cannot be fused with in_scale because silu() is non-linear.
@@ -213,10 +213,10 @@ void launch_llama4_moe_fc13_swiglu_fp8_kernel(int num_tokens, int num_experts,
 
     void* args[] = {(void*) &num_tokens, (void*) &A, (void*) &B, (void*) &logits, (void*) &C, (void*) &exp_idx,
         (void*) &in_scales, (void*) &out_scale_inv};
-    launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) llama4_moe_fc13_swiglu_fp8_kernel, args, 8);
+    launch_kernel_pdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) llama4_moe_fc13_swiglu_fp8_kernel, args, 8);
 }
 
-// This is the hand-optimized kernel by Po-Han.
+// This is the hand-optimized kernel.
 __global__ void llama4_moe_fc2_fp8_kernel(int num_tokens,
     __nv_fp8_e4m3 const* __restrict__ A,      // Input tensor A [num_tokens][INTER_SIZE]
     __nv_fp8_e4m3 const* __restrict__ B,      // Input tensor B [num_experts][HIDDEN_SIZE][INTER_SIZE]
@@ -329,7 +329,7 @@ void launch_llama4_moe_fc2_fp8_kernel(int num_tokens, int num_experts,
 
     void* args[]
         = {(void*) &num_tokens, (void*) &A, (void*) &B, (void*) &exp_idx, (void*) &C, (void*) &scaling_factors};
-    launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) llama4_moe_fc2_fp8_kernel, args, 6);
+    launch_kernel_pdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) llama4_moe_fc2_fp8_kernel, args, 6);
 }
 
 void run_moe_llama4_tp8ep1_min_latency(int num_tokens, int num_experts,
