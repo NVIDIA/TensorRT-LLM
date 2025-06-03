@@ -30,7 +30,7 @@ namespace tensorrt_llm::batch_manager
 {
 
 DecoderInputBuffers::DecoderInputBuffers(
-    SizeType32 maxBatchSize, SizeType32 maxDecoderSteps, BufferManager const& manager)
+    SizeType32 maxNumSequences, SizeType32 maxBatchSize, SizeType32 maxDecoderSteps, BufferManager const& manager)
 {
     auto const maxBatchSizeShape = ITensor::makeShape({maxBatchSize});
     auto const nvSizeType = TRTDataType<SizeType32>::value;
@@ -49,7 +49,7 @@ DecoderInputBuffers::DecoderInputBuffers(
         forwardBatchSlots.emplace_back(BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize}), nvSizeType));
     }
 
-    logits.resize(maxBatchSize);
+    logits.resize(maxNumSequences);
 }
 
 DecoderOutputBuffers::DecoderOutputBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxSeqLen,

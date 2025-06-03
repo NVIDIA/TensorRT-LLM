@@ -36,8 +36,8 @@ public:
     using SizeType32 = runtime::SizeType32;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    explicit DecoderInputBuffers(
-        SizeType32 maxBatchSize, SizeType32 maxDecoderSteps, runtime::BufferManager const& manager);
+    explicit DecoderInputBuffers(SizeType32 maxNumSequences, SizeType32 maxBatchSize, SizeType32 maxDecoderSteps,
+        runtime::BufferManager const& manager);
 
     //! Buffers for decoder setup
 
@@ -55,7 +55,7 @@ public:
     //! Batch slots for all decoder steps, [maxDecoderSteps][maxBatchSize]
     std::vector<TensorPtr> forwardBatchSlots;
 
-    //! Logits for all batch slots, [maxBatchSize]
+    //! Logits for all batch slots, [maxNumSequences]
     //! The vector is sparse, only slots in forwardBatchSlots are used.
     std::vector<TensorPtr> logits;
 };
