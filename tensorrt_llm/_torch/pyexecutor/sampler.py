@@ -4,10 +4,10 @@ from dataclasses import dataclass
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.handle_generation_logits import \
-    HandleGenerationLogits
 from tensorrt_llm._torch.pyexecutor.handle_context_logits import \
     HandleContextLogits
+from tensorrt_llm._torch.pyexecutor.handle_generation_logits import \
+    HandleGenerationLogits
 from tensorrt_llm._utils import binding_dtype_to_torch, torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
@@ -584,21 +584,17 @@ class TRTLLMSampler(Sampler):
             self.executor_config.max_seq_len, self.beam_width(requests))
 
         for req in requests:
-            if req.return_generation_logits:
-                if req.py_result.generation_logits_storage is None:
+            if req.py_return_generation_logits:
+                if req.py_result.generation_logits is None:
                     vocab_size_padded = self.model_config.vocab_size_padded(
                         self.world_config.size)
                     logits_dtype = binding_dtype_to_torch(self.logits_datatype)
-                    # Save space for the 1st token which is copied to gen logits storage from handleContextLogits,
+                    # Save space for the 1st generated token logits that are handled by handle_context_logits,
                     # this also initiates the lazy allocation of the logits storage
                     req.py_result.append_generation_logits(
                         torch.zeros((1, req.sampling_config.beam_width,
                                      vocab_size_padded),
                                     dtype=logits_dtype))
-
-                # Update the CPP LlmRequest with the gen logits tensor, as the CPP handleContextLogits copies its last token to it.
-                req.set_generation_logits_host(
-                    req.py_result.generation_logits_storage)
 
         if len(decoder_requests):
             local_batch_size = len(batch_slots)
