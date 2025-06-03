@@ -55,7 +55,7 @@ class HandleContextLogits:
             decoder_buffer_logits[seq_slot] = logits_view.reshape(
                 logits_view.shape[0], 1, logits_view.shape[1])
 
-            # Save the last token logits of context into it's destined slot in generation logits storage
+            # Save the last context token logits in generation logits storage
             if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
                 llm_req.py_result.append_generation_logits(logits_view)
 
