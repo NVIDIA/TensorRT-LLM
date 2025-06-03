@@ -1633,39 +1633,35 @@ void KVCacheManager::startScheduling()
 SizeType32 KVCacheManager::getNeededBlocksOneStep(
     LlmRequest const& req, bool twoStepsLookAhead, SizeType32 windowSize) const
 {
-    SizeType32 numRequiredBlocks{0};
-    SizeType32 numCurrTokens{0};
-    if (mSequences.count(req.mRequestId) > 0)
-    {
-        numCurrTokens = mSequences.at(req.mRequestId).getNumTokens();
-    }
-
-    auto const numDraftTokens = req.getNumDraftTokens();
-    auto const generatedTokens = numCurrTokens - req.getPromptLen();
-    auto const maxTokensToAddToKVCache = req.mMaxNewTokens - generatedTokens + 1;
-    auto const numTokensPerStep = std::min(numDraftTokens + 1, maxTokensToAddToKVCache);
-    auto const numDraftTokensPerStep = std::min(numDraftTokens, maxTokensToAddToKVCache);
-
     if ((req.isContextInitState() && req.isFirstContextChunk()) || req.isDisaggGenerationInitState())
     {
+        auto const maxTokensToAddToKVCache = req.mMaxNewTokens;
+        auto const maxDraftTokensToAdd = std::min(req.getNumDraftTokens(), maxTokensToAddToKVCache);
         // Assumes shared among beam = True
         auto const promptCacheLen
-            = std::min((isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + numDraftTokensPerStep, windowSize)
+            = std::min((isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd, windowSize)
             + mSinkBubbleLength;
         auto const numSharedBlocks = promptCacheLen / getTokensPerBlock();
         auto const numUnSharedTokens = promptCacheLen % getTokensPerBlock();
         auto const numUnSharedBlocks
             = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.beamWidth;
-        numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
+        auto const numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
+        return numRequiredBlocks;
     }
-    else if (req.isGenerationInProgressState())
+
+    if (req.isGenerationInProgressState())
     {
         if (isCrossKv())
         {
             return 0;
         }
 
-        auto const numNextTokens = numCurrTokens + (twoStepsLookAhead ? 2 : 1) * numTokensPerStep;
+        auto const numCurrTokens = mSequences.at(req.mRequestId).getNumTokens();
+        auto const generatedTokens = numCurrTokens - req.getPromptLen();
+        auto const maxTokensToAddToKVCache = req.mMaxNewTokens - generatedTokens;
+        auto const tokensPerStep = req.getNumDraftTokens() + 1;
+        auto const maxTokensToAdd = std::min((twoStepsLookAhead ? 2 : 1) * tokensPerStep, maxTokensToAddToKVCache);
+        auto const numNextTokens = numCurrTokens + maxTokensToAdd;
 
         if (numNextTokens > mBlockManager.getWindowSizeMetadata(windowSize).maxTokenNum)
         {
@@ -1674,9 +1670,11 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
 
         auto const numCurrBlocks = tc::ceilDiv(numCurrTokens, getTokensPerBlock());
         auto const numNextBlocks = tc::ceilDiv(numNextTokens, getTokensPerBlock());
-        numRequiredBlocks = (numNextBlocks - numCurrBlocks) * req.mSamplingConfig.beamWidth;
+        auto const numRequiredBlocks = (numNextBlocks - numCurrBlocks) * req.mSamplingConfig.beamWidth;
+        return numRequiredBlocks;
     }
-    return numRequiredBlocks;
+
+    return 0;
 }
 
 SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize) const
