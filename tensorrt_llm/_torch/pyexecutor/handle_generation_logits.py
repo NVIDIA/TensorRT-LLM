@@ -1,7 +1,6 @@
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm.bindings import ModelConfig
 from tensorrt_llm.bindings.internal.batch_manager import DecoderBuffers
 
 
@@ -12,12 +11,9 @@ class HandleGenerationLogits:
         logits_index: int,
         generation_requests: list[LlmRequest],
         decoder_buffers: DecoderBuffers,
-        model_config: ModelConfig,
         logits: torch.Tensor,
     ):
-        # TODO: Should we check that there's no speculative decoding? can be determined with info from model_config
-        # NOTE: Currently doesn't support speculative decoding, which is supported in handleContextLogits.cpp
-        for i, llm_req in enumerate(generation_requests):
+        for llm_req in generation_requests:
             beam_width = llm_req.get_beam_width_by_iter()
             seq_slot = llm_req.seq_slot
 

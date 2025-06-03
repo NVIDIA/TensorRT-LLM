@@ -584,17 +584,16 @@ class TRTLLMSampler(Sampler):
             self.executor_config.max_seq_len, self.beam_width(requests))
 
         for req in requests:
-            if req.py_return_generation_logits:
-                if req.py_result.generation_logits is None:
-                    vocab_size_padded = self.model_config.vocab_size_padded(
-                        self.world_config.size)
-                    logits_dtype = binding_dtype_to_torch(self.logits_datatype)
-                    # Save space for the 1st generated token logits that are handled by handle_context_logits,
-                    # this also initiates the lazy allocation of the logits storage
-                    req.py_result.append_generation_logits(
-                        torch.zeros((1, req.sampling_config.beam_width,
-                                     vocab_size_padded),
-                                    dtype=logits_dtype))
+            if req.py_return_generation_logits and req.py_result.generation_logits is None:
+                vocab_size_padded = self.model_config.vocab_size_padded(
+                    self.world_config.size)
+                logits_dtype = binding_dtype_to_torch(self.logits_datatype)
+                # Save space for the 1st generated token logits that are handled by handle_context_logits,
+                # this also initiates the lazy allocation of the logits storage
+                req.py_result.append_generation_logits(
+                    torch.zeros(
+                        (1, req.sampling_config.beam_width, vocab_size_padded),
+                        dtype=logits_dtype))
 
         if len(decoder_requests):
             local_batch_size = len(batch_slots)
@@ -628,8 +627,7 @@ class TRTLLMSampler(Sampler):
 
         self.algs.handle_generation_logits(
             logits_index, scheduled_requests.generation_requests,
-            self.store["decoder_buffers"], self.model_config,
-            self.store["buffer_manager"], model_outputs["logits"])
+            self.store["decoder_buffers"], model_outputs["logits"])
 
         decoding_input, self.decoding_output = self.algs.make_decoding_batch_input_output(
             scheduled_requests.context_requests,
