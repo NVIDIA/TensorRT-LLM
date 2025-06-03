@@ -474,7 +474,7 @@ class LLM:
             raise ValueError(
                 f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({build_config.max_seq_len})")
-        
+
         if not self.args.enable_chunked_prefill and self.args.chunked_prefill_size is not None:
             raise ValueError(
                 "chunked_prefill_size is not supported when enable_chunked_prefill is False"

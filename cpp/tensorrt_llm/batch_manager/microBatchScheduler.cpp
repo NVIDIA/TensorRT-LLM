@@ -276,7 +276,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
     {
         allContextRequestsFit = false;
     }
-    
+
     // 2. If not all contexts fit into the batch, the chunk size should be adjusted accordingly.
     if (!allContextRequestsFit)
     {

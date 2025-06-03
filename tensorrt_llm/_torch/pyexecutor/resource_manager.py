@@ -282,7 +282,8 @@ class KVCacheManager(BaseResourceManager):
                         req_beam_width, req)
             else:
                 if req.is_first_context_chunk():
-                    self.impl.add_sequence(req.py_request_id, req.context_chunk_size,
+                    self.impl.add_sequence(req.py_request_id,
+                                           req.context_chunk_size,
                                            req_beam_width, req)
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)

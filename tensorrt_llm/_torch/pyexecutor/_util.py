@@ -415,9 +415,10 @@ def create_py_executor_instance(dist,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,
         num_micro_batches=num_micro_batches)
-    mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
-                                           executor_config.context_chunk_size if executor_config.enable_chunked_context else executor_config.max_seq_len,
-                                           ctx_chunk_config)
+    mb_scheduler = BindMicroBatchScheduler(
+        executor_config.max_batch_size, executor_config.context_chunk_size if
+        executor_config.enable_chunked_context else executor_config.max_seq_len,
+        ctx_chunk_config)
     scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
     config = model_engine.model.model_config.pretrained_config

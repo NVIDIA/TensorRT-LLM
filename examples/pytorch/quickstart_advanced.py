@@ -165,17 +165,14 @@ def main():
 
     if True:
         with open("/workspace/data/prompt_96k_success_0.txt", "r") as f:
-        # with open("/workspace/data/prompt_96k_2k.txt", "r") as f:
+            # with open("/workspace/data/prompt_96k_2k.txt", "r") as f:
             prompts = [f.read()]
 
-    count_words = len(prompts[0].split())
-
-    logger.critical("minwei count_words is ", count_words)
     llm, sampling_params = setup_llm(args)
     outputs = llm.generate(prompts, sampling_params)
 
     for i, output in enumerate(outputs):
-        prompt = output.prompt
+        output.prompt
         generated_text = output.outputs[0].text
         print(f"[{i}] Generated text: {generated_text!r}")
 

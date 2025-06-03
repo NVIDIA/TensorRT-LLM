@@ -1571,7 +1571,9 @@ class PyExecutor:
                                              new_tensors_device)
 
         try:
-            logger.warning(f"[Executor] _forward_step: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs")
+            logger.warning(
+                f"[Executor] _forward_step: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
+            )
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device)
             self._setup_decoder(scheduled_requests, outputs)

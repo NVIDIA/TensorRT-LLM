@@ -165,17 +165,16 @@ def parse_input(tokenizer,
             print('Input file format not supported.')
             raise SystemExit
 
-    batch_input_ids=[]
+    batch_input_ids = []
     # for file in ['prompt_96k_success_0.txt', 'prompt_96k_success_1.txt', 'prompt_96k_success_2.txt']:
     for file in ['/workspace/data/prompt_96k_success_0.txt']:
-    # for file in ['prompt_short.txt']:
+        # for file in ['prompt_short.txt']:
         with open(file, 'r', encoding='utf-8') as txt_file:
             input_text = txt_file.read()
-            input_ids = tokenizer.encode(
-                                        input_text,
-                                        add_special_tokens=add_special_tokens,
-                                        truncation=True,
-                                        max_length=8192)
+            input_ids = tokenizer.encode(input_text,
+                                         add_special_tokens=add_special_tokens,
+                                         truncation=True,
+                                         max_length=8192)
             batch_input_ids.append(input_ids)
             print("length of input_ids: ", len(input_ids))
 

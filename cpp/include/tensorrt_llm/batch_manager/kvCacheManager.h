@@ -91,7 +91,8 @@ struct WindowSizeMetadata
                                          // Only needed when chunked context + sliding window attention are used
                                          // together. And it should only be considered when allocating blocks.
     SizeType32 numNonSinkTokensInWindow; // Number of non-sink tokens in the attention window
-    SizeType32 minNumBlocksAlive;        // Minimum number of blocks alive in the attention window, e.g. context_chunk_size + sliding_window_size
+    SizeType32 minNumBlocksAlive; // Minimum number of blocks alive in the attention window, e.g. context_chunk_size +
+                                  // sliding_window_size
 
     std::string toString()
     {
@@ -446,7 +447,8 @@ private:
     // List of block ids allocated per each window size, for each beam of the sequence.
     //
     // Removed blocks (from the beginning of the cache) are not actually removed from mCacheBlockIds, but instead
-    // the block id is set to 0. We choose such an implementation because kernels expects a linear view of the cache from the beginning.
+    // the block id is set to 0. We choose such an implementation because kernels expects a linear view of the cache
+    // from the beginning.
     std::unordered_map<SizeType32, std::vector<std::vector<KVCacheBlock::IdType>>> mCacheBlockIds;
     // Tensor of block indices allocated per each window size, for each beam of the sequence
     std::unordered_map<SizeType32, runtime::ITensor::SharedPtr> mCacheBlockIndices;
