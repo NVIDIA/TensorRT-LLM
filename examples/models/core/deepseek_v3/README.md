@@ -362,7 +362,7 @@ trtllm-serve \
   --ep_size 8 \
   --pp_size 1 \
   --kv_cache_free_gpu_memory_fraction 0.95 \
-  --extra_llm_api_options ./extra-llm-api-config.yml &> output_gen &
+  --extra_llm_api_options ./gen-extra-llm-api-config.yml &> output_gen &
 ```
 
 Finally, you can launch the disaggregated server which will accept requests from the client and do
@@ -383,7 +383,7 @@ generation_servers:
       - "localhost:8002"
 EOF
 
-trtllm-serve disaggregated -c disagg_config.yaml
+trtllm-serve disaggregated -c disagg-config.yaml
 ```
 
 To query the server, you can start with a `curl` command:
