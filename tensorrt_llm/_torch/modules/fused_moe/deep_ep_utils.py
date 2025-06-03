@@ -1,7 +1,9 @@
+# Adapted from
+# https://github.com/deepseek-ai/DeepEP/blob/aae9fa9a6dd0fec2a723fbb85ec4b22460fab670/README.md
 from typing import List, Optional, Tuple, Union
 
 import torch
-from deep_ep import Buffer, EventOverlap
+from deep_ep import Buffer
 
 from tensorrt_llm._utils import local_mpi_size
 
@@ -46,48 +48,37 @@ def get_hidden_bytes(x: torch.Tensor) -> int:
     return t.size(1) * max(t.element_size(), 2)
 
 
-def dispatch_forward(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+def dispatch_forward(buffer: Buffer, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                      topk_idx: torch.Tensor, topk_weights: torch.Tensor,
-                     num_experts: int, previous_event: Optional[EventOverlap] = None) -> \
-        Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, torch.Tensor, List, Tuple, EventOverlap]:
-    # NOTES: an optional `previous_event` means a CUDA event captured that you want to make it as a dependency
-    # of the dispatch kernel, it may be useful with communication-computation overlap. For more information, please
-    # refer to the docs of `Buffer.dispatch`
-    global _buffer
-
+                     num_experts: int) -> \
+        Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, torch.Tensor, List, Tuple]:
     # Calculate layout before actual dispatch
-    num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, previous_event = \
-        _buffer.get_dispatch_layout(topk_idx, num_experts,
-                                    previous_event=previous_event, async_finish=True,
-                                    allocate_on_comm_stream=previous_event is not None)
+    num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event = \
+        buffer.get_dispatch_layout(topk_idx, num_experts)
+    assert event.event is None
+
     # Do MoE dispatch
     # NOTES: the CPU will wait for GPU's signal to arrive, so this is not compatible with CUDA graph
     # For more advanced usages, please refer to the docs of the `dispatch` function
     recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event = \
-        _buffer.dispatch(x, topk_idx=topk_idx, topk_weights=topk_weights,
-                         num_tokens_per_rank=num_tokens_per_rank, num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-                         is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
-                         previous_event=previous_event, async_finish=True,
-                         allocate_on_comm_stream=True)
+        buffer.dispatch(x, topk_idx=topk_idx, topk_weights=topk_weights,
+                        num_tokens_per_rank=num_tokens_per_rank, num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+                        is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert)
+    assert event.event is None
+
     # For event management, please refer to the docs of the `EventOverlap` class
-    return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event
+    return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle
 
 
-def combine_forward(x: torch.Tensor, handle: Tuple, previous_event: Optional[EventOverlap] = None) -> \
-        Tuple[torch.Tensor, EventOverlap]:
-    global _buffer
-
+def combine_forward(buffer: Buffer, x: torch.Tensor,
+                    handle: Tuple) -> torch.Tensor:
     # Do MoE combine
     # For more advanced usages, please refer to the docs of the `combine` function
-    combined_x, _, event = _buffer.combine(
-        x,
-        handle,
-        async_finish=True,
-        previous_event=previous_event,
-        allocate_on_comm_stream=previous_event is not None)
+    combined_x, _, event = buffer.combine(x, handle)
+    assert event.event is None
 
     # For event management, please refer to the docs of the `EventOverlap` class
-    return combined_x, event
+    return combined_x
 
 
 # You may call this function at the framework initialization
@@ -113,15 +104,15 @@ def low_latency_get_buffer(comm, num_max_dispatch_tokens_per_rank: int,
     return _buffer
 
 
-def low_latency_dispatch(hidden_states: torch.Tensor, topk_idx: torch.Tensor,
+def low_latency_dispatch(buffer: Buffer, hidden_states: torch.Tensor,
+                         topk_idx: torch.Tensor,
                          num_max_dispatch_tokens_per_rank: int,
                          num_experts: int):
-    global _buffer
-
     # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
     recv_hidden_states, recv_expert_count, handle, event, hook = \
-        _buffer.low_latency_dispatch(hidden_states, topk_idx, num_max_dispatch_tokens_per_rank, num_experts,
-                                     use_fp8=False, async_finish=False, return_recv_hook=False)
+        buffer.low_latency_dispatch(hidden_states, topk_idx, num_max_dispatch_tokens_per_rank, num_experts, use_fp8=False)
+    assert event.event is None
+    assert hook is None
 
     # NOTES: the actual tensor will not be received only if you call `hook()`,
     # it is useful for double-batch overlapping, but **without any SM occupation**
@@ -130,14 +121,14 @@ def low_latency_dispatch(hidden_states: torch.Tensor, topk_idx: torch.Tensor,
     return recv_hidden_states, recv_expert_count, handle
 
 
-def low_latency_combine(hidden_states: torch.Tensor, topk_idx: torch.Tensor,
-                        topk_weights: torch.Tensor, handle: Tuple):
-    global _buffer
-
+def low_latency_combine(buffer: Buffer, hidden_states: torch.Tensor,
+                        topk_idx: torch.Tensor, topk_weights: torch.Tensor,
+                        handle: Tuple):
     # Do MoE combine, compatible with CUDA graph (but you may restore some buffer status once you replay)
-    combined_hidden_states, event_overlap, hook = \
-        _buffer.low_latency_combine(hidden_states, topk_idx, topk_weights, handle,
-                                    async_finish=False, return_recv_hook=False)
+    combined_hidden_states, event, hook = \
+        buffer.low_latency_combine(hidden_states, topk_idx, topk_weights, handle)
+    assert event.event is None
+    assert hook is None
 
     # NOTES: the same behavior as described in the dispatch kernel
     return combined_hidden_states

@@ -2,8 +2,7 @@ import os
 from enum import IntEnum
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
-from tensorrt_llm._utils import local_mpi_size, mpi_rank
-from tensorrt_llm.logger import logger
+from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.mapping import Mapping
 
 
@@ -19,20 +18,6 @@ class AlltoallMethodType(IntEnum):
     DeepEPLowLatency = 3
 
 
-def log_once(func):
-    func._logged_args = set()
-
-    def wrapped(*args):
-        result = func(*args)
-        if args not in func._logged_args and mpi_rank() == 0:
-            logger.info(f"{func.__name__} returns {result!r}")
-            func._logged_args.add(args)
-        return result
-
-    return wrapped
-
-
-@log_once
 def select_alltoall_method_type(mapping: Mapping) -> AlltoallMethodType:
     if MnnvlMemory.supports_mnnvl():
         return AlltoallMethodType.MNNVL
