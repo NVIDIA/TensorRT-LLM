@@ -5,7 +5,7 @@ import groovy.transform.Field
 
 // Docker image registry
 IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging"
-NGC_IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-ngc-staging"
+NGC_IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/ngc"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -191,22 +191,25 @@ def buildImage(config, imageKeyToTag)
     def args = config.args ?: ""
     def customTag = config.customTag
     def postTag = config.postTag
-    def dependentTarget = config.dependentTarget
+    def dependent = config.dependent
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
-    def imageName = IMAGE_NAME
-
-    if (target == "ngc-release" and env.triggerByPostMerge) {
-        imageName = NGC_IMAGE_NAME
-        echo "Use NGC image name: ${imageName}"
-    }
+    def makefileStage = config.makefileStage
 
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
 
-    def dependentTargetTag = tag.replace("${arch}-${target}-", "${arch}-${dependentTarget}-")
+    def dependentTag = tag.replace("${arch}-${target}-", "${arch}-${dependent.target}-")
+
+    def imageWithTag = "${IMAGE_NAME}/${makefileStage}:${tag}"
+    def dependentImageWithTag = "${IMAGE_NAME}/${dependent.makefileStage}:${dependentTag}"
+
+    if (target == "ngc-release" and env.triggerByPostMerge) {
+        dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
+        imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
+    }
 
     if (target == "ngc-release") {
-        imageKeyToTag["NGC Devel Image ${config.arch}"] = "${imageName}/devel:${dependentTargetTag}"
-        imageKeyToTag["NGC Release Image ${config.arch}"] = "${imageName}/release:${tag}"
+        imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
+        imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
     }
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
@@ -255,11 +258,12 @@ def buildImage(config, imageKeyToTag)
                     sh """
                     cd ${LLM_ROOT} && make -C docker ${dependentTarget}_${action} \
                     TORCH_INSTALL_TYPE=${torchInstallType} \
-                    IMAGE_NAME=${imageName} IMAGE_TAG=${dependentTargetTag} \
+                    IMAGE_WITH_TAG=${dependentImageWithTag} \
+                    STAGE=${dependent.makefileStage} \
                     BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                     """
                 }
-                args += " DEVEL_IMAGE=${imageName}/${dependentTarget}:${dependentTargetTag}"
+                args += " DEVEL_IMAGE=${dependentImageWithTag}"
             }
         }
 
@@ -280,7 +284,8 @@ def buildImage(config, imageKeyToTag)
                 sh """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_NAME=${imageName} IMAGE_TAG=${tag} \
+                IMAGE_WITH_TAG=${imageWithTag} \
+                STAGE=${makefileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """
             }
@@ -291,7 +296,8 @@ def buildImage(config, imageKeyToTag)
                 sh """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_NAME=${imageName} IMAGE_TAG=${customTag} \
+                IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${customTag} \
+                STAGE=${makefileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """
             }
@@ -322,7 +328,8 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         torchInstallType: "skip",
         arch: "amd64",
         build_wheel: false,
-        dependentTarget: "",
+        dependent: [:],
+        makefileStage: "tritondevel",
     ]
 
     def release_action = params.action
@@ -332,6 +339,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
+            makefileStage: "release",
         ],
         "Build trtllm release (SBSA)": [
             target: "trtllm",
@@ -339,6 +347,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             customTag: LLM_BRANCH_TAG + "-sbsa",
             build_wheel: true,
             arch: "arm64"
+            makefileStage: "release",
         ],
         "Build CI image (x86_64 tritondevel)": [:],
         "Build CI image (SBSA tritondevel)": [
@@ -351,25 +360,31 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         ],
         "Build CI image(RockyLinux8 Python312)": [
             target: "rockylinux8",
-            args: "PYTHON_VERSION=3.12.3 STAGE=tritondevel",
+            args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
         "Build NGC devel and release (x86_64)": [
             target: "ngc-release",
             action: release_action,
-            customTag: "ngc-" + LLM_BRANCH_TAG + "-x86_64",
             args: "DOCKER_BUILD_OPTS='--load --platform linux/amd64'",
             build_wheel: true,
-            dependentTarget: "devel",
+            dependent: [
+                target: "ngc-devel",
+                makefileStage: "devel",
+            ],
+            makefileStage: "release",
         ],
         "Build NGC devel and release(SBSA)": [
             target: "ngc-release",
             action: release_action,
-            customTag: "ngc-" + LLM_BRANCH_TAG + "-sbsa",
             args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
             arch: "arm64",
             build_wheel: true,
-            dependentTarget: "devel",
+            dependent: [
+                target: "ngc-devel",
+                makefileStage: "devel",
+            ],
+            makefileStage: "release",
         ],
     ]
     // Override all fields in build config with default values
