@@ -23,17 +23,17 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         torch.manual_seed(0)
         self.device = 'cuda'
 
-    def _run_w4a16_gemm(self,
-                        m,
-                        n,
-                        k,
-                        group_size,
-                        activation_dtype,
-                        quantized_weight_dtype,
-                        has_pre_quant,
-                        has_zero,
-                        has_bias,
-                        use_w4a8_awq=False):
+    def _run_finegrained_mixed_dtype_gemm(self,
+                                          m,
+                                          n,
+                                          k,
+                                          group_size,
+                                          activation_dtype,
+                                          quantized_weight_dtype,
+                                          has_pre_quant,
+                                          has_zero,
+                                          has_bias,
+                                          use_w4a8_awq=False):
 
         total_groups = (k + group_size - 1) // group_size
         scale_zero_dtype = torch.float16 if use_w4a8_awq else activation_dtype
@@ -109,14 +109,14 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
 
         output = torch.ops.trtllm.w4a16_gemm(
             input=activation.to(activation_type).contiguous()
-            if use_w4a8_awq else activation.contiguous(),  # todo check
+            if use_w4a8_awq else activation.contiguous(),
             weight=cuda_q_weight,
             scales=scale,
             group_size=group_size,
             has_zero_point=has_zero,
             output_dtype=
-            activation_dtype,  # NOTE: output_dtype nneds to match activation dtype for W4A16.
-            #in W4A8 output dtype is float16/bfloat16 where activation dtype is float8_e4m3fn
+            activation_dtype,  # NOTE: output_dtype needs to match activation dtype for W4A16.
+            # where in W4A8 output dtype is float16/bfloat16 where activation dtype is float8_e4m3fn
             alpha=fp8_alpha.item() if use_w4a8_awq else None,
             bias=bias,
             zeros=zero)
@@ -144,16 +144,16 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                            (512, 2048, 1024, 128, True, True, False)])
     def test_matmul_fp16_int4_input(self, m, n, k, group_size, has_pre_quant,
                                     has_zero, has_bias):
-        self._run_w4a16_gemm(m,
-                             n,
-                             k,
-                             group_size,
-                             torch.float16,
-                             torch.quint4x2,
-                             has_pre_quant=has_pre_quant,
-                             has_zero=has_zero,
-                             has_bias=has_bias,
-                             use_w4a8_awq=False)
+        self._run_finegrained_mixed_dtype_gemm(m,
+                                               n,
+                                               k,
+                                               group_size,
+                                               torch.float16,
+                                               torch.quint4x2,
+                                               has_pre_quant=has_pre_quant,
+                                               has_zero=has_zero,
+                                               has_bias=has_bias,
+                                               use_w4a8_awq=False)
 
     @parameterized.expand([(3, 1024, 64, 64, True, False, True),
                            (128, 1024, 256, 64, True, False, True),
@@ -169,16 +169,16 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                            (512, 2048, 1024, 128, True, True, False)])
     def test_matmul_bf16_int4_input(self, m, n, k, group_size, has_pre_quant,
                                     has_zero, has_bias):
-        self._run_w4a16_gemm(m,
-                             n,
-                             k,
-                             group_size,
-                             torch.bfloat16,
-                             torch.quint4x2,
-                             has_pre_quant=has_pre_quant,
-                             has_zero=has_zero,
-                             has_bias=has_bias,
-                             use_w4a8_awq=False)
+        self._run_finegrained_mixed_dtype_gemm(m,
+                                               n,
+                                               k,
+                                               group_size,
+                                               torch.bfloat16,
+                                               torch.quint4x2,
+                                               has_pre_quant=has_pre_quant,
+                                               has_zero=has_zero,
+                                               has_bias=has_bias,
+                                               use_w4a8_awq=False)
 
     @parameterized.expand(
         [(1, 1024, 128, torch.float16, True, True, True, 128, True),
@@ -194,16 +194,17 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
     def test_prequant_matmul_fp8_int4_input(self, m, n, k, dtype, has_pre_quant,
                                             has_zero, has_bias, group_size,
                                             use_w4a8_awq):
-        self._run_w4a16_gemm(m=m,
-                             n=n,
-                             k=k,
-                             activation_dtype=dtype,
-                             quantized_weight_dtype=torch.quint4x2,
-                             has_pre_quant=has_pre_quant,
-                             has_zero=has_zero,
-                             has_bias=has_bias,
-                             group_size=group_size,
-                             use_w4a8_awq=use_w4a8_awq)
+        self._run_finegrained_mixed_dtype_gemm(
+            m=m,
+            n=n,
+            k=k,
+            activation_dtype=dtype,
+            quantized_weight_dtype=torch.quint4x2,
+            has_pre_quant=has_pre_quant,
+            has_zero=has_zero,
+            has_bias=has_bias,
+            group_size=group_size,
+            use_w4a8_awq=use_w4a8_awq)
 
 
 if __name__ == "__main__":

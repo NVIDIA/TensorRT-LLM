@@ -119,7 +119,6 @@ W4A16GemmRunner::W4A16GemmRunner(at::ScalarType activationDtype, at::ScalarType 
         }
         else if (activationDtype == at::ScalarType::Float8_e4m3fn)
         {
-            std::cout << "activationDtype: " << activationDtype << " outputDtype: " << outputDtype << std::endl;
             if (outputDtype == at::ScalarType::BFloat16)
             {
                 mGemmRunner = std::make_shared<
