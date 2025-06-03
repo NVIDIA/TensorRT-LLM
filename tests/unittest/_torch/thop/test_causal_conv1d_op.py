@@ -96,10 +96,9 @@ def test_causal_conv1d(dim, dconv, req_type, dtype, batch_size, max_seq_len,
 
     if paged_cache:
         padded_batch_size = 2 * batch_size
-        cache_indices = torch.randint(0,
-                                      padded_batch_size, (batch_size, ),
-                                      device=device,
-                                      dtype=torch.int32)
+        cache_indices = torch.randperm(padded_batch_size,
+                                       device=device,
+                                       dtype=torch.int32)[:batch_size]
         conv_state_in_out = torch.empty([padded_batch_size, dim, dconv - 1],
                                         dtype=torch_dtype,
                                         device=device)
