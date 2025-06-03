@@ -583,6 +583,20 @@ class TRTLLMSampler(Sampler):
             self.store["cuda_stream"], self.algs.decoder.decoder_stream,
             self.executor_config.max_seq_len, self.beam_width(requests))
 
+        # When overlapped scheduler is enabled and the logits handling is done from the
+        # sample_async method as in this TRTLLMSampler, then when starting to handle a
+        # new prompt, sample_async is called twice before the first call to
+        # update_requests - 1st time as a context request that works on the 1st generated
+        # token, and the 2nd time as a generation request that works on the 2nd generated
+        # token. Since in both times it's the same request object then they share the same
+        # logits storage, which means it contains the gen logits of both the 1st token and
+        # the 2nd token, and since every call to update_requests is about the token that
+        # was handled by the previous call to sample_async, then excluding the last gen
+        # logits from any getter is required.
+        for req in requests:
+            if req.py_return_generation_logits and self.is_trt_overlap:
+                req.py_result.set_generation_logits_exclude_last(True)
+
         if len(decoder_requests):
             local_batch_size = len(batch_slots)
             sampling_config = make_sampling_config(sampling_configs)

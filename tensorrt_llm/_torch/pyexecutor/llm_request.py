@@ -37,9 +37,13 @@ REQUEST_TYPE_MAPPING = {
 
 class LogitsStorage:
 
-    def __init__(self, seq_length: int, use_device_memory=True):
+    def __init__(self,
+                 seq_length: int,
+                 use_device_memory=True,
+                 should_exclude_last=False):
         self.seq_length = seq_length
         self.use_device_memory = use_device_memory
+        self._should_exclude_last = should_exclude_last
         self.position = 0
         self.last_position = 0
 
@@ -47,6 +51,7 @@ class LogitsStorage:
         self._storage: torch.Tensor | None = None
         self.beam_width = -1
         self.vocab_size = -1
+        self._logits_indices = []
 
     def _init(self, logits: torch.Tensor):
         _, self.beam_width, self.vocab_size = logits.shape
@@ -84,12 +89,24 @@ class LogitsStorage:
 
         self._storage[self.position:new_position].copy_(logits,
                                                         non_blocking=True)
+        self._logits_indices.append((self.position, new_position))
         self.last_position, self.position = self.position, new_position
 
-    def get(self, all_logits=False):
-        start = 0 if all_logits else self.last_position
-        return self._storage[start:self.
-                             position] if self._storage is not None else None
+    def get_at(self, index: int) -> torch.Tensor | None:
+        if self._should_exclude_last:
+            index -= 1
+        try:
+            start, end = self._logits_indices[index]
+            return self._storage[start:end]
+        except IndexError:
+            return None
+
+    def get_all(self):
+        max_position = self.position - 1 if self._should_exclude_last else self.position
+        return self._storage[:max_position] if self._storage is not None else None
+
+    def set_exclude_last(self, should_exclude_last: bool) -> None:
+        self._should_exclude_last = should_exclude_last
 
 
 class LogProbStorage:
@@ -145,19 +162,30 @@ class PyResult:
         if self._log_probs:
             self._log_probs.append(log_probs)
 
+    def set_generation_logits_exclude_last(self,
+                                           should_exclude_last: bool) -> None:
+        if self._generation_logits:
+            self._generation_logits.set_exclude_last(should_exclude_last)
+
     @property
     def context_logits(self) -> torch.Tensor | None:
-        return self._context_logits and self._context_logits.get(
-            True)[:, 0]  # remove beam_width axis for context
+        return self._context_logits and self._context_logits.get_all(
+        )[:, 0]  # remove beam_width axis for context
 
     @property
     def generation_logits(self) -> torch.Tensor | None:
         # Internal storage: [seq_length, beam_width, vocab_size]
         # API expect: [beam_width, seq_length, vocab_size]
-        if not self._generation_logits or (
-                storage :=
-                self._generation_logits.get(not self._streaming)) is None:
-            return
+        if not self._generation_logits:
+            return None
+
+        if self._streaming:
+            storage = self._generation_logits.get_at(-1)
+        else:
+            storage = self._generation_logits.get_all()
+
+        if storage is None:
+            return None
         return storage.transpose(0, 1)
 
     @property
