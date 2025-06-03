@@ -475,6 +475,84 @@ Total Latency (ms):             18563.6825
 
 ```
 
+#### Benchmarking with LoRA Adapters in PyTorch workflow
+
+The PyTorch workflow supports benchmarking with LoRA (Low-Rank Adaptation) adapters. This requires preparing a dataset with LoRA metadata and configuring the LoRA settings.
+
+**Preparing LoRA Dataset**
+
+Use `prepare_dataset.py` with LoRA-specific options to generate requests with LoRA metadata:
+
+```shell
+python3 benchmarks/cpp/prepare_dataset.py \
+  --stdout \
+  --rand-task-id 0 1 \
+  --tokenizer /path/to/tokenizer \
+  --lora-dir /path/to/loras \
+  token-norm-dist \
+  --num-requests 100 \
+  --input-mean 128 \
+  --output-mean 128 \
+  --input-stdev 16 \
+  --output-stdev 24 \
+  > synthetic_lora_data.json
+```
+
+Key LoRA options:
+- `--lora-dir`: Parent directory containing LoRA adapter subdirectories named by their task IDs (e.g., `0/`, `1/`, etc.)
+- `--rand-task-id`: Range of LoRA task IDs to randomly assign to requests
+- `--task-id`: Fixed LoRA task ID for all requests (alternative to `--rand-task-id`)
+
+The generated dataset will include LoRA request metadata. Below is an example of a single such request data entry:
+
+```json
+{
+  "task_id": 0,
+  "input_ids": [3452, 88226, 102415, ...],
+  "output_tokens": 152,
+  "lora_request": {
+    "lora_name": "lora_0",
+    "lora_int_id": 0,
+    "lora_path": "/path/to/loras/0"
+  }
+}
+```
+
+**LoRA Configuration**
+
+Create an `extra-llm-api-options.yaml` file with LoRA configuration:
+
+```yaml
+lora_config:
+  lora_dir:
+    - /path/to/loras/0
+    - /path/to/loras/1
+  max_lora_rank: 64
+  lora_target_modules:
+    - attn_q
+    - attn_k
+    - attn_v
+  trtllm_modules_to_hf_modules:
+    attn_q: q_proj
+    attn_k: k_proj
+    attn_v: v_proj
+```
+
+**Running LoRA Benchmark**
+
+```shell
+trtllm-bench --model /path/to/base/model \
+  throughput \
+  --dataset synthetic_lora_data.json \
+  --backend pytorch \
+  --extra_llm_api_options extra-llm-api-options.yaml
+```
+
+```{note}
+The LoRA directory structure should have task-specific subdirectories named by their task IDs (e.g., `loras/0/`, `loras/1/`).
+Each subdirectory should contain the LoRA adapter files for that specific task.
+```
+
 #### Running multi-modal models in the PyTorch Workflow
 
 To benchmark multi-modal models with PyTorch workflow, you can follow the similar approach as above.
@@ -609,6 +687,7 @@ above:
         "quant_algo": "FP8",
         "kv_cache_quant_algo": null
     }
+}
 ```
 
 The checkpoints above are quantized to run with a compute precision of `FP8` and default to no KV cache quantization (full
