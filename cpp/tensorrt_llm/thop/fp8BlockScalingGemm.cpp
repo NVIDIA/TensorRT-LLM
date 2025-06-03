@@ -15,7 +15,8 @@
  */
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
-#include "tensorrt_llm/kernels/trtllmGenKernels/blockscaleGemm/kernelRunner.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/gemm/KernelRunner.h"
+
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/EmptyTensor.h>
@@ -180,9 +181,20 @@ torch::Tensor fp8_block_scale_gemm_blackwell(torch::Tensor const& mat1, torch::T
     */
     float* outScalePtr = nullptr;
 
-    tensorrt_llm::kernels::TrtllmGenBlockScaleGemmRunner runner(Data_type::DATA_TYPE_BF16);
-    runner.run(
-        m, n, k, mat1.data_ptr(), mat1ScalePtr, mat2.data_ptr(), mat2ScalePtr, out.data_ptr(), outScalePtr, stream);
+    // transposeMmaOutput is hardcoded for now
+    tensorrt_llm::kernels::TrtllmGenGemmRunnerOptions options = {.eltType = gemm::trtllm::gen::Dtype::E4m3,
+        .outputType = gemm::trtllm::gen::Dtype::Bfloat16,
+        .deepSeekFp8 = true,
+        .transposeMmaOutput = true};
+
+    tensorrt_llm::kernels::TrtllmGenGemmRunner runner(options);
+
+    int64_t const numBytesWorkspace = runner.getWorkspaceSizeInBytes(m, n, k);
+    at::Tensor workspace
+        = at::detail::empty_cuda({numBytesWorkspace}, at::ScalarType::Char, torch::kCUDA, std::nullopt);
+
+    runner.run(m, n, k, mat1.const_data_ptr(), mat1ScalePtr, mat2.const_data_ptr(), mat2ScalePtr, out.data_ptr(),
+        /* scaleC */ nullptr, outScalePtr, workspace.data_ptr(), stream.stream(), mat1.get_device());
 
     return out;
 }

@@ -102,4 +102,7 @@ uint16_t getEnvNixlPort();
 
 bool getEnvDisaggBenchmarkGenOnly();
 
+// Whether to disable the chunked-attention in the generation phase.
+bool getEnvDisableChunkedAttentionInGenPhase();
+
 } // namespace tensorrt_llm::common
