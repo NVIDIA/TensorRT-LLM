@@ -952,11 +952,11 @@ std::vector<Response> Executor::Impl::awaitResponses(std::optional<std::chrono::
     auto storeResponses = [this]()
     {
         std::vector<Response> responses;
-        for (auto it = mResponses.cbegin(); it != mResponses.cend();)
+        for (auto it = mResponses.begin(); it != mResponses.end();)
         {
             responses.insert(responses.end(), it->second.begin(), it->second.end());
             addTerminatedReqId(it->second, it->first);
-            mResponses.erase(it++);
+            it = mResponses.erase(it);
         }
         return responses;
     };
@@ -1668,7 +1668,7 @@ void Executor::Impl::terminateActiveRequests(RequestList& activeRequests, std::s
         }
 
         // Remove from the requestList
-        activeRequests.erase(it++);
+        it = activeRequests.erase(it);
     }
 }
 
