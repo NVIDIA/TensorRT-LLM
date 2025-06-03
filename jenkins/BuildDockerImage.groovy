@@ -28,7 +28,7 @@ BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
 
 // UPLOAD_PATH = env.uploadPath ?: "sw-tensorrt-artifacts"
-UPLOAD_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/PipelineMonitor/L0_MergeRequest_PR/62"
+UPLOAD_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/2052"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 
@@ -195,7 +195,7 @@ def buildImage(config, imageKeyToTag)
     def dependentTarget = config.dependentTarget
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
 
-    def tmpTag = "3391161-github-pr-4656-83" // TODO: remove this
+    def tmpTag = "8166649-main-108" // TODO: remove this
     // def tmpTag = LLM_DEFAULT_TAG
 
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${tmpTag}"
@@ -203,8 +203,8 @@ def buildImage(config, imageKeyToTag)
     def dependentTargetTag = tag.replace("${arch}-${target}-", "${arch}-${dependentTarget}-")
 
     if (target == "ngc-release") {
-        imageKeyToTag["NGC Devel Image ${config.arch}"] = "${IMAGE_NAME}/${dependentTarget}:${dependentTargetTag}"
-        imageKeyToTag["NGC Release Image ${config.arch}"] = "${IMAGE_NAME}/${target}:${tag}"
+        imageKeyToTag["NGC Devel Image ${config.arch}"] = "${IMAGE_NAME}/devel:${dependentTargetTag}"
+        imageKeyToTag["NGC Release Image ${config.arch}"] = "${IMAGE_NAME}/release:${tag}"
     }
     return // TODO: remove this
 
@@ -407,7 +407,7 @@ def getCommonParameters()
 {
     return [
         'gitlabSourceRepoHttpUrl': LLM_REPO,
-        'gitlabCommit': env.gitlabCommit,
+        'gitlabCommit': '8166649d033109319d7d08cf9541d8996848018f',
         'artifactPath': env.artifactPath,
         'uploadPath': UPLOAD_PATH,
     ]

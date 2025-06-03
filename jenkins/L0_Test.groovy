@@ -2045,9 +2045,9 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                 imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
                 trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
                     sh "env | sort"
-                    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-                        sh "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}"
-                    }
+                    // withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                    //     sh "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}"
+                    // }
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
                     runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name , 1, 1, true, null)
                 })
@@ -2056,9 +2056,10 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
             stage(values.name) {
                 imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
                 trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
-                    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-                        sh "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}"
-                    }
+                    // withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                    //     sh "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}"
+                    // }
+                    sh "env | sort"
                     runLLMBuildFromPackage(pipeline, values.k8sArch, false, "imageTest/")
                 })
             }
