@@ -18,7 +18,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.llmapi.disagg_utils import (ConditionalDisaggConfig,
+                                              MetadataServerConfig,
                                               RouterConfig)
+from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
@@ -42,13 +44,16 @@ class OpenAIDisaggServer:
                  server_start_timeout_secs: int = 180,
                  ctx_router_config: Optional[RouterConfig] = None,
                  gen_router_config: Optional[RouterConfig] = None,
-                 conditional_disagg_config: Optional[ConditionalDisaggConfig] = None):
+                 conditional_disagg_config: Optional[ConditionalDisaggConfig] = None,
+                 metadata_server_cfg: MetadataServerConfig = None):
 
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
-        self.ctx_router = create_router(ctx_router_config, ctx_servers)
-        self.gen_router = create_router(gen_router_config, gen_servers)
+        self.metadata_server = create_metadata_server(metadata_server_cfg)
+        self.ctx_router = create_router(ctx_router_config, ctx_servers, self.metadata_server)
+        self.gen_router = create_router(gen_router_config, gen_servers, self.metadata_server)
         self.conditional_disagg_config = conditional_disagg_config
+
 
         if (len(self.gen_servers) == 0):
             raise ValueError("At least one generation server must be provided")
@@ -71,7 +76,19 @@ class OpenAIDisaggServer:
 
             logging.info("Waiting for context and generation servers to be ready")
             await self.wait_for_servers_ready(server_start_timeout_secs)
+
+            if self.metadata_server:
+                logging.info("Starting server monitoring via metadata service")
+                await self.ctx_router.start_server_monitoring()
+                await self.gen_router.start_server_monitoring()
+
             yield
+
+            if self.metadata_server:
+                logging.info("Stopping server monitoring via metadata service")
+                await self.ctx_router.stop_server_monitoring()
+                await self.gen_router.stop_server_monitoring()
+
             await self.session.close()  # Ensure session cleanup
 
         self.app = FastAPI(lifespan=lifespan)
