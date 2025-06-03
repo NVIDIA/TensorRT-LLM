@@ -113,8 +113,8 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.request_queue = IpcQueue(is_server=True,
                                       name="proxy_request_queue")
-        self.request_error_queue = IpcQueue(is_server=True,
-                                            name="proxy_request_error_queue")
+        self.worker_init_status_queue = IpcQueue(
+            is_server=True, name="worker_init_status_queue")
         # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
         # Use PULL mode when enable_postprocess_parallel as there are
         # multiple senders from multiple processes.
@@ -133,7 +133,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             name="proxy_kv_cache_events_queue")
         return WorkerCommIpcAddrs(
             request_queue_addr=self.request_queue.address,
-            request_error_queue_addr=self.request_error_queue.address,
+            worker_init_status_queue_addr=self.worker_init_status_queue.address,
             result_queue_addr=self.result_queue.address,
             stats_queue_addr=self.mp_stats_queue.address,
             kv_cache_events_queue_addr=self.kv_cache_events_queue.address,
@@ -305,8 +305,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.workers_started = True
 
         while True:
-            if self.request_error_queue.poll(1):
-                ready_signal = self.request_error_queue.get()
+            if self.worker_init_status_queue.poll(1):
+                ready_signal = self.worker_init_status_queue.get()
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
@@ -375,7 +375,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         # close all the sockets
         self.request_queue.close()
-        self.request_error_queue.close()
+        self.worker_init_status_queue.close()
         self.result_queue.close()
         self.mp_stats_queue.close()
         self.kv_cache_events_queue.close()
@@ -408,11 +408,6 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         with nvtx_range_debug("request_queue.put"):
             self.request_queue.put(request)
-
-        with nvtx_range_debug("request_error_queue.get"):
-            error = self.request_error_queue.get()
-        if isinstance(error, Exception):
-            raise error
 
         self._handle_background_error()
 
