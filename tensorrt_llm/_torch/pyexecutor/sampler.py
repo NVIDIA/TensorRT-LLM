@@ -656,9 +656,9 @@ class TRTLLMSampler(Sampler):
         cum_log_probs = torch.empty([0], dtype=torch.float, device='cpu')
         if any(request.py_return_log_probs
                for request in scheduled_requests.all_requests):
-            log_probs = self.algs.decoder.decoder_state.log_probs.to(
-                'cpu', non_blocking=True)
-            cum_log_probs = self.algs.decoder.decoder_state.cum_log_probs.to(
+            log_probs = self.algs.decoder_state.log_probs.to('cpu',
+                                                             non_blocking=True)
+            cum_log_probs = self.algs.decoder_state.cum_log_probs.to(
                 'cpu', non_blocking=True)
 
         device = SampleStateTensors(new_tokens=new_tokens_device_tensor)
