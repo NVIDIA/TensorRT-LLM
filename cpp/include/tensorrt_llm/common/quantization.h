@@ -117,6 +117,11 @@ public:
         return QuantMode(BaseType(1u) << 13);
     }
 
+    static constexpr QuantMode w4a8Mxfp4Fp8() noexcept
+    {
+        return QuantMode(BaseType(1u) << 14);
+    }
+
     constexpr BaseType value() const noexcept
     {
         return mValue;
@@ -192,6 +197,11 @@ public:
         return isSet(nvfp4());
     }
 
+    constexpr bool hasW4a8Mxfp4Fp8() const noexcept
+    {
+        return isSet(w4a8Mxfp4Fp8());
+    }
+
     constexpr bool hasKvCacheQuant() const noexcept
     {
         return hasInt8KvCache() || hasFp8KvCache() || hasFp4KvCache();
@@ -200,7 +210,8 @@ public:
     static constexpr QuantMode fromDescription(bool quantizeWeights = false, bool quantizeActivations = false,
         bool perToken = false, bool perChannel = false, bool perGroup = false, bool useInt4Weights = false,
         bool useInt8KvCache = false, bool useFp8KvCache = false, bool useFp8Qdq = false, bool useFp8RowWise = false,
-        bool useW4a8QServe = false, bool useFp4Quant = false, bool useFp8BlockScales = false)
+        bool useW4a8QServe = false, bool useFp4Quant = false, bool useFp8BlockScales = false,
+        bool useW4a8Mxfp4Fp8 = false)
     {
         QuantMode quantMode{};
         if (quantizeWeights)
@@ -262,6 +273,11 @@ public:
         if (useFp4Quant)
         {
             quantMode += nvfp4();
+        }
+
+        if (useW4a8Mxfp4Fp8)
+        {
+            quantMode += w4a8Mxfp4Fp8();
         }
 
         return quantMode;
@@ -351,6 +367,11 @@ public:
         {
             quantMode = fromDescription(
                 false, false, false, false, false, false, false, false, false, false, false, false, true);
+        }
+        else if (quantAlgo == "W4A8_MXFP4_FP8")
+        {
+            quantMode = fromDescription(
+                false, false, false, false, false, false, false, false, false, false, false, false, false, true);
         }
 
         if (kvCacheQuantAlgo == "INT8")
