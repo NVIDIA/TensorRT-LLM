@@ -48,24 +48,19 @@ class LogitsStorage:
         self.beam_width = -1
         self.vocab_size = -1
 
-    def _lazy_init(self, logits: torch.Tensor):
-        _, beam_width, vocab_size = logits.shape
-        self.allocate_memory(beam_width, vocab_size, logits.dtype)
-
-    def allocate_memory(self, beam_width: int, vocab_size: int, dtype):
-        self.beam_width = beam_width
-        self.vocab_size = vocab_size
+    def _init(self, logits: torch.Tensor):
+        _, self.beam_width, self.vocab_size = logits.shape
 
         if self.use_device_memory:
             self._storage = torch.empty(
                 (self.seq_length, self.beam_width, self.vocab_size),
-                dtype=dtype,
+                dtype=logits.dtype,
                 device='cuda',
                 requires_grad=False)
         else:
             self._storage = torch.empty(
                 (self.seq_length, self.beam_width, self.vocab_size),
-                dtype=dtype,
+                dtype=logits.dtype,
                 device='cpu',
                 pin_memory=True,
                 requires_grad=False)
@@ -76,7 +71,7 @@ class LogitsStorage:
         assert logits.ndim == 3, f"Bad logits shape, expect [num_tokens, beam_width, vocab_size], got {logits.shape}"
 
         if self.beam_width == -1:
-            self._lazy_init(logits)
+            self._init(logits)
 
         assert logits.size(1) == self.beam_width, "Beam width mismatch"
 
@@ -136,7 +131,8 @@ class PyResult:
         self._context_logits = LogitsStorage(
             prompt_len, use_device_memory) if return_context_logits else None
         self._generation_logits = LogitsStorage(
-            max_new_tokens,
+            max_new_tokens +
+            1,  # +1 not to crash when using overlapped scheduler
             use_device_memory) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
 
