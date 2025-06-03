@@ -362,9 +362,10 @@ private:
     /// @brief Based on the KV-cache manager's capacity and configuration, we adjust the maximum supported attention
     /// window.
     ///
-    /// @param numPrimaryBlocks The number of blocks in the kv-cache's primary pool.
-    /// @param numTokensPerBlock The number of tokens per kv-cache block.
-    [[nodiscard]] BlocksPerWindow clampWindowSizesToFitAtLeastOneSequence(BlocksPerWindow const& blocksPerWindow);
+    /// @param blocksPerWindow map of window size to number of blocks.
+    /// @return pair of new blocks per window and new maxAttentionWindowVec
+    [[nodiscard]] std::pair<BlocksPerWindow, std::vector<SizeType32>> clampWindowSizesToFitAtLeastOneSequence(
+        BlocksPerWindow const& blocksPerWindow);
 
     /// @brief Change the speculative decoding mode.
     void changeSpecDecMode(ScheduledRequests const& scheduledRequests);

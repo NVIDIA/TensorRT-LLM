@@ -515,8 +515,8 @@ void TrtGptModelInflightBatching::reshapeKvTensors(OffsetTableDimensions const& 
 
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
 
-BlocksPerWindow TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(
-    BlocksPerWindow const& blocksPerWindow)
+std::pair<BlocksPerWindow, std::vector<SizeType32>>
+TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(BlocksPerWindow const& blocksPerWindow)
 {
     // At this point, we can only validate that the cheapest sequence in terms of kv-cache resources still fits. More
     // validation is needed on a per-request basis, once the prompt / output lengths and the actual beam width are
@@ -553,7 +553,7 @@ BlocksPerWindow TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequ
     }
     if (newMaxAttentionWindowVec == getMaxAttentionWindowVec())
     {
-        return blocksPerWindow;
+        return {blocksPerWindow, newMaxAttentionWindowVec};
     }
     TLLM_LOG_WARNING("maxAttentionWindowVec too large to fit at least one sequence in kvCache. Old: %s, New: %s",
         common::vec2str(getMaxAttentionWindowVec()).c_str(), common::vec2str(newMaxAttentionWindowVec).c_str());
@@ -573,7 +573,7 @@ BlocksPerWindow TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequ
     // TODO: This is problematic, as createBuffers edits the state of trtGptModelInflightBatching, but
     // what if there are different window values for cross+self etc. in encoder+decoder scenario...
     createBuffers(mDecodingConfig, mAdditionalModelOutputs);
-    return newBlocksPerWindow;
+    return {newBlocksPerWindow, newMaxAttentionWindowVec};
 }
 
 std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::createKvCacheManager(
@@ -606,8 +606,14 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
         mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank(), isCrossAttention);
     auto numKvHeadsPerLayer = std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd);
 
+    auto maxAttentionWindowVec = getMaxAttentionWindowVec();
+    if (kvCacheType != KvCacheType::kSELF) // TODO(nhaber): more foolproof way of initing cross-kvcache-manager
+    {
+        maxAttentionWindowVec = std::vector<SizeType32>{mModelConfig.getMaxEncoderLen()};
+    }
+
     auto const numLayers = static_cast<SizeType32>(numKvHeadsPerLayer.size());
-    auto const windowSizeToLayers = KVCacheManager::groupLayersByWindowSize(getMaxAttentionWindowVec(), numLayers);
+    auto const windowSizeToLayers = KVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, numLayers);
     auto blocksPerWindow = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, isCrossAttention, kvDtype, mModelConfig,
         mWorldConfig, windowSizeToLayers, freePrimaryMemBytes, freeSecondaryMemBytes, extraCostMemory, 2);
 
@@ -616,14 +622,7 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     // and user also didn't provide maxAttentionWindow, which leads it to be equal to maxSeqLen
     if (kvCacheType == KvCacheType::kSELF)
     {
-        blocksPerWindow = clampWindowSizesToFitAtLeastOneSequence(blocksPerWindow);
-    }
-
-    auto maxAttentionWindowVec = getMaxAttentionWindowVec();
-
-    if (kvCacheType != KvCacheType::kSELF) // TODO(nhaber): more foolproof way of initing cross-kvcache-manager
-    {
-        maxAttentionWindowVec = std::vector<SizeType32>{mModelConfig.getMaxEncoderLen()};
+        std::tie(blocksPerWindow, maxAttentionWindowVec) = clampWindowSizesToFitAtLeastOneSequence(blocksPerWindow);
     }
 
     kv_cache_manager::TempAttentionWindowInputs tempAttentionWindowInputs;
