@@ -32,6 +32,8 @@ namespace tensorrt_llm::kernels
 
 struct XqaFixedParams
 {
+    // Whether the attention is MLA.
+    bool isMLA;
     // The QKV input data type.
     kernels::Data_type inputDataType;
     // The XQA KV cache data type.

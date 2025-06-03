@@ -343,7 +343,7 @@ inline int computeMultiBlockCount(XQAParams const& xqaParams, int batch_size, in
     int num_kv_heads = xqaParams.num_kv_heads;
     int history_length = xqaParams.max_past_kv_length;
 
-    int32_t const maxNbSubSeq = kXQA_MAX_NUM_SUB_SEQ;
+    int32_t const maxNbSubSeq = getXqaMaxNumSubSeq(xqaParams.isMLA());
 
     multi_block_count = history_length / kMinHistoryTokensPerBlock;
     // avoid using too many blocks for one sequence, otherwise the final reduction may dominate.

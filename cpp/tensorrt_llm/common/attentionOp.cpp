@@ -855,7 +855,8 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         // Scales used for trtllm-gen kernels.
         xqa_workspaces[4] = sizeof(float) * 2;
         xqa_workspaces[5] = sizeof(float);
-        xqa_workspaces[6] = mXqaDispatcher->getWorkspaceSize(max_num_tokens);
+        xqa_workspaces[6] = mXqaDispatcher->getWorkspaceSize(
+            std::min<uint32_t>(mSpecDecodingMaxGenerationLength * max_num_seq, max_num_tokens));
         xqa_workspace_size
             = tc::calculateTotalWorkspaceSize(xqa_workspaces, XQA_NUM_BUFFERS, mXqaDispatcher->getWorkspaceAlignment());
     }
@@ -1164,7 +1165,8 @@ int AttentionOp::mlaGeneration(
             this->template convertMMHAParamsToXQAParams<T, decltype(kv_cache_buffer)>(
                 xqaParams, generation_params, /*forConfigurePlugin=*/false);
             xqaParams.quant_q_buffer_ptr = quant_q_buffer_ptr;
-            xqaParams.q_scaling = 1 / (mQScaling * sqrtf((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
+            xqaParams.q_scaling
+                = 1 / (mQScaling * sqrtf((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
             xqaParams.multi_query_tokens = (params.acc_q_len / batch_beam) > 1;
             if (mEnableXQA && mXqaDispatcher->shouldUse(xqaParams))
             {
@@ -2643,6 +2645,7 @@ int AttentionOp::initialize() noexcept
         TLLM_LOG_DEBUG("Enabling XQA kernels for GPTAttention.");
 
         XqaFixedParams fixedParams{};
+        fixedParams.isMLA = mIsGenerationMLA;
         // TODO: support more combinations.
         // Update Q and O dtype.
         if (mType == nvinfer1::DataType::kHALF)
