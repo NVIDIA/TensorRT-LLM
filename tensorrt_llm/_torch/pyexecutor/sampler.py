@@ -728,7 +728,8 @@ class TRTLLMSampler(Sampler):
                         log_probs.append({
                             new_token.item():
                             Logprob(logprob=state.host.log_probs[seq_slot][beam]
-                                    [begin_log_probs_offset + current_token].item(),
+                                    [begin_log_probs_offset +
+                                     current_token].item(),
                                     rank=1)
                         })
 
