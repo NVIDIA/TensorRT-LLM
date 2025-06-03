@@ -51,10 +51,12 @@ class LlmManager:
             request_start_timestamp = time.perf_counter_ns()
             time_on_first_token = None
             # Schedule the request in the LLM API (asynchronously)
+            print(f"request.lora_request: {request.lora_request}")
             output: RequestOutput = self.llm.generate_async(
                 request.input_ids if self.modality is None else request.prompt,
                 sampling_params=sampling_params,
-                streaming=self.streaming)
+                streaming=self.streaming,
+                lora_request=request.lora_request)
             if self.streaming:
                 async for stream_output in output:
                     if time_on_first_token is None:
