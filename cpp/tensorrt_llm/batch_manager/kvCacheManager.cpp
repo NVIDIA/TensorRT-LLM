@@ -2073,9 +2073,9 @@ std::tuple<uint64_t, uint64_t> BaseKVCacheManager::calculateFreeMemBytes(
     TLLM_CUDA_CHECK(::cudaDeviceSynchronize());
     auto const [freeMem, totalMem] = tc::getDeviceMemoryInfo(config.useUvm);
     auto const finalFreeMem = freeMem + bufferManager.memoryPoolFree();
-    TLLM_CHECK_WITH_INFO(finalFreeMem <= totalMem, "Free memory cannot exceed total memory");
     TLLM_LOG_INFO("Memory usage when calculating max tokens in paged kv cache: total: %0.2f GiB, available: %0.2f GiB",
         totalMem / static_cast<double>(1 << 30), finalFreeMem / static_cast<double>(1 << 30));
+    TLLM_CHECK_WITH_INFO(finalFreeMem <= totalMem, "Free memory cannot exceed total memory");
 
     auto const freePrimaryMemBytes = static_cast<uint64_t>(finalFreeMem * freeMemFraction);
     auto const freeSecondaryMemBytes = config.hostCacheSize.value_or(0);
