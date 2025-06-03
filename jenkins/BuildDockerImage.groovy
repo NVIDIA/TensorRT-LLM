@@ -205,8 +205,8 @@ def buildImage(config, imageKeyToTag)
     def dependentTargetTag = tag.replace("${arch}-${target}-", "${arch}-${dependentTarget}-")
 
     if (target == "ngc-release") {
-        imageKeyToTag["NGC Devel Image ${config.arch}"] = "${imageName}/${dependentTarget}:${dependentTargetTag}"
-        imageKeyToTag["NGC Release Image ${config.arch}"] = "${imageName}/${target}:${tag}"
+        imageKeyToTag["NGC Devel Image ${config.arch}"] = "${imageName}/devel:${dependentTargetTag}"
+        imageKeyToTag["NGC Release Image ${config.arch}"] = "${imageName}/release:${tag}"
     }
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
