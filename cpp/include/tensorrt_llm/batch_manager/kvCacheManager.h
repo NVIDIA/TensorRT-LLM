@@ -414,8 +414,8 @@ public:
     {
         for (auto& beamBlockIds : mCacheBlockIds.at(windowSize))
         {
-            // Do not actually remove from mCacheBlockIds; set to 0 instead.
-            beamBlockIds[mNumBlocksRemoved] = 0;
+            // Do not actually remove from mCacheBlockIds; set to -1 instead.
+            beamBlockIds[mNumBlocksRemoved] = -1;
         }
         ++mNumBlocksRemoved;
     }
