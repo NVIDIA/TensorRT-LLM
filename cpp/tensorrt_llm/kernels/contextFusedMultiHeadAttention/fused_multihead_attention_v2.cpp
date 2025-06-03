@@ -278,7 +278,6 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
     }
 
     auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
-    printf("kernelMeta.mFuncName: %s\n", kernelMeta.mFuncName);
     if (kernelMeta.launcher != nullptr)
     {
         kernelMeta.launcher(params, launch_params, stream);
