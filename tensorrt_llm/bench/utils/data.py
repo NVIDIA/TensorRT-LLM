@@ -7,6 +7,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
+from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs import (INPUT_FORMATTER_MAP, default_image_loader,
                                  default_video_loader)
 
@@ -107,6 +108,7 @@ def create_dataset_from_stream(
     media_paths = []
     all_logits = []
     task_ids = []
+    lora_requests = []
     while (line := stream.readline()) and len(task_ids) < max_requests:
         # We expect the data to come in as a JSON string.
         # For example:
@@ -118,6 +120,11 @@ def create_dataset_from_stream(
         # There once was a man who.", "output_tokens": 1000,
         # "media_paths": ["/path/to/image1.jpg", "/path/to/image2.jpg"]}
         #
+        # For LoRA data, the data should be of the form:
+        # {"prompt": "Generate an infinite response to the following:
+        # There once was a man who.", "output_tokens": 1000,
+        # "lora_request": {"lora_name": "my_lora", "lora_int_id": 1, "lora_path": "/path/to/lora"}}
+        #
         # Each line should be a complete JSON dictionary with no indentation
         # or newline characters.
         data = json.loads(line)
@@ -126,6 +133,16 @@ def create_dataset_from_stream(
         all_logits.append(data.get("input_ids", data.get("logits", None)))
         all_osl.append(data.get("output_tokens"))
         task_ids.append(data.get("task_id"))
+
+        # Parse LoRA request if present
+        lora_data = data.get("lora_request", None)
+        if lora_data:
+            lora_request = LoRARequest(lora_name=lora_data["lora_name"],
+                                       lora_int_id=lora_data["lora_int_id"],
+                                       lora_path=lora_data.get("lora_path", ""))
+            lora_requests.append(lora_request)
+        else:
+            lora_requests.append(None)
 
     if modality is not None:
         # Multimodal data need extra preprocessing
@@ -140,8 +157,8 @@ def create_dataset_from_stream(
 
     all_isl = []
     all_seq_len = []
-    for prompt, logits, osl, task_id in zip(prompts, all_logits, all_osl,
-                                            task_ids):
+    for prompt, logits, osl, task_id, lora_request in zip(
+            prompts, all_logits, all_osl, task_ids, lora_requests):
         if modality is not None:
             # NOTE: we cannot tokenize multi-modal data, handled by preprocessor
             #       so the actual sequence length is unknown until the model is run
@@ -160,6 +177,7 @@ def create_dataset_from_stream(
             prompt=prompt,
             output_tokens=output_limiter(osl),
             input_ids=logits,
+            lora_request=lora_request,
         )
         dataset.append(request)
 
