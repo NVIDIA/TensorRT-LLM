@@ -723,11 +723,12 @@ class TRTLLMSampler(Sampler):
                             state.host.cum_log_probs[seq_slot * beam_width +
                                                      beam].item())
                         begin_log_probs_offset = request.prompt_len if request.sampling_config.beam_width == 1 else 0
+                        current_token = seq_len - request.prompt_len - 1
 
                         log_probs.append({
                             new_token.item():
                             Logprob(logprob=state.host.log_probs[seq_slot][beam]
-                                    [begin_log_probs_offset].item(),
+                                    [begin_log_probs_offset + current_token].item(),
                                     rank=1)
                         })
 

@@ -76,8 +76,6 @@ def test_generate_with_return_logits(enable_trtllm_sampler: bool,
     build_config = BuildConfig()
     build_config.gather_context_logits = gather_context_logits
 
-    pytorch_config = PyTorchConfig(enable_trtllm_sampler=enable_trtllm_sampler)
-
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
                            "TinyLlama-1.1B-Chat-v1.0"),
@@ -87,7 +85,7 @@ def test_generate_with_return_logits(enable_trtllm_sampler: bool,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
-        pytorch_backend_config=pytorch_config,
+        enable_trtllm_sampler=enable_trtllm_sampler,
     )
 
     sampling_params = SamplingParams(
@@ -138,8 +136,6 @@ def test_generate_async_with_return_logits(enable_trtllm_sampler: bool,
     build_config = BuildConfig()
     build_config.gather_context_logits = gather_context_logits
 
-    pytorch_config = PyTorchConfig(enable_trtllm_sampler=enable_trtllm_sampler)
-
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
                            "TinyLlama-1.1B-Chat-v1.0"),
@@ -149,7 +145,7 @@ def test_generate_async_with_return_logits(enable_trtllm_sampler: bool,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
-        pytorch_backend_config=pytorch_config,
+        enable_trtllm_sampler=enable_trtllm_sampler,
     )
     sampling_params = SamplingParams(
         max_tokens=8,
