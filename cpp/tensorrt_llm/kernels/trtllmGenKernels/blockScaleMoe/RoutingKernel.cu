@@ -3001,10 +3001,8 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
         {
             params.mPtrPermutedIdxToTokenIdx[i] = -1;
         }
-        // We need to make sure that the variable mPtrPermutedIdxToTokenIdx is initialized and visible to all threads in
-        // the cluster. Besides the __threadfence(), there is cluster synchronization before the setting of
-        // mPtrPermutedIdxToTokenIdx.
-        __threadfence();
+        // A cluster synchronization is performed prior to setting mPtrPermutedIdxToTokenIdx at the end of the kernel.
+        // Don't need to use __threadfence() here.
     }
 
     if (params.mPtrScores != nullptr)
