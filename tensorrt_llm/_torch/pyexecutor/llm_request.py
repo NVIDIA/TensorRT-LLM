@@ -89,20 +89,14 @@ class LogitsStorage:
         self._storage[position:new_position].copy_(logits, non_blocking=True)
         self._logits_indices.append((position, new_position))
 
-    def get_at(self, index: int) -> torch.Tensor | None:
-        if self._should_exclude_last:
-            index -= 1
+    def get(self, all_logits: bool) -> torch.Tensor | None:
+        """Returns the used logits storage if there are any, otherwise, returns None.
+        When all_logits is True then all set logits are returned, otherwise, only the last logits are returned."""
         try:
-            start, end = self._logits_indices[index]
+            last = -2 if self._should_exclude_last else -1
+            start = 0 if all_logits else self._logits_indices[last][0]
+            end = self._logits_indices[last][1]
             return self._storage[start:end]
-        except IndexError:
-            return None
-
-    def get_all(self):
-        try:
-            last_index = -2 if self._should_exclude_last else -1
-            max_position = self._logits_indices[last_index][1]
-            return self._storage[:max_position]
         except IndexError:
             return None
 
@@ -170,8 +164,8 @@ class PyResult:
 
     @property
     def context_logits(self) -> torch.Tensor | None:
-        if self._context_logits is None or (
-                storage := self._context_logits.get_all()) is None:
+        if self._context_logits is None or (storage := self._context_logits.get(
+                all_logits=True)) is None:
             return None
         return storage[:, 0]  # remove beam_width axis for context
 
@@ -182,11 +176,7 @@ class PyResult:
         if not self._generation_logits:
             return None
 
-        if self._streaming:
-            storage = self._generation_logits.get_at(-1)
-        else:
-            storage = self._generation_logits.get_all()
-
+        storage = self._generation_logits.get(all_logits=not self._streaming)
         if storage is None:
             return None
         return storage.transpose(0, 1)
