@@ -21,26 +21,6 @@ def create_py_executor(executor_config: ExecutorConfig,
                        checkpoint_dir: str = None,
                        engine_dir: str = None,
                        lora_config: LoraConfig = None):
-    logger.warning(f"minwei Executor config: {executor_config}")
-    logger.warning(f"minwei KV cache config: {executor_config.kv_cache_config}")
-    logger.warning(f"minwei Executor config fields:")
-    logger.warning(f"  max_batch_size: {executor_config.max_batch_size}")
-    logger.warning(f"  max_seq_len: {executor_config.max_seq_len}")
-    logger.warning(f"  max_num_tokens: {executor_config.max_num_tokens}")
-    logger.warning(f"  enable_chunked_context: {executor_config.enable_chunked_context}")
-    logger.warning(f"  context_chunk_size: {executor_config.context_chunk_size}")
-    logger.warning(f"  mapping: {executor_config.mapping}")
-    logger.warning(f"  kv_cache_config: {executor_config.kv_cache_config}")
-    logger.warning(f"  pytorch_backend_config: {executor_config.pytorch_backend_config}")
-    logger.warning(f"  speculative_config: {executor_config.speculative_config}")
-
-    logger.warning(f"minwei KV cache config fields:")
-    logger.warning(f"  max_tokens: {executor_config.kv_cache_config.max_tokens}")
-    logger.warning(f"  max_attention_window: {executor_config.kv_cache_config.max_attention_window}")
-    logger.warning(f"  sink_token_length: {executor_config.kv_cache_config.sink_token_length}")
-    logger.warning(f"  free_gpu_memory_fraction: {executor_config.kv_cache_config.free_gpu_memory_fraction}")
-    logger.warning(f"  enable_block_reuse: {executor_config.kv_cache_config.enable_block_reuse}")
-
     if executor_config.pytorch_backend_config is None:
         executor_config.pytorch_backend_config = PyTorchConfig()
 

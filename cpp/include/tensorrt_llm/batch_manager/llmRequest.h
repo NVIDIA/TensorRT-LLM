@@ -1520,7 +1520,6 @@ public:
     /// remaining length.
     void setContextChunkSize(SizeType32 size)
     {
-        TLLM_LOG_WARNING("minwei setContextChunkSize: %d", size);
         TLLM_CHECK_WITH_INFO(
             isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
             "setContextChunkSize is only possible during the context phase or generation init phase.");

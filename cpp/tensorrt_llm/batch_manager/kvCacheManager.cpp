@@ -495,8 +495,6 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             copyOnPartialReuse);
     }
 
-    printf("minwei maxSequenceLength: %d\n", maxSequenceLength.value());
-
     auto const numAllPools = getNumPools();
     mAbsolutePoolToWindowSize.reserve(numAllPools);
     mAbsolutePoolToRelativePoolIndex.reserve(numAllPools);
@@ -509,19 +507,12 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             mAbsolutePoolToWindowSize.push_back(windowSize);
             mAbsolutePoolToRelativePoolIndex.push_back(i);
         }
-        // minwei: set maxTokenNum to be the max of windowSize + sinkBubbleLength + 1024 and maxSequenceLength
-        auto const maxTokenNum = windowSize + sinkBubbleLength;
-        TLLM_LOG_WARNING("minwei maxTokenNum: %d", maxTokenNum);
+        auto const maxTokenNum = windowSize + sinkBubbleLength + chunkContextSize;
         auto const temporaryAttentionWindow = manager.calculateTemporaryAttentionWindow(tempAttentionWindowInputs);
 
         auto const numNonSinkTokensInWindow = windowSize - sinkTokenLength;
 
-        // Consider the temporaryAttentionWindow when allocating blocks.
-        /*
-        auto const maxBlocksPerSeq
-            = tc::ceilDiv(maxTokenNum + temporaryAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
-            */
-        // minwei: set maxBlocksPerSeq to maxSequenceLength
+        // CacheBlockIndices has length maxBlocksPerSeq, which is the linear view of the cache.
         auto const maxBlocksPerSeq
             = tc::ceilDiv(maxSequenceLength.value() + temporaryAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
         auto const minNumBlocksAlive = tc::ceilDiv(windowSize + chunkContextSize, tokensPerBlock);
@@ -584,7 +575,6 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mEnablePartialReuse{enablePartialReuse}
     , mCopyOnPartialReuse{copyOnPartialReuse}
 {
-    printf("minwei WindowBlockManager mMinNumBlocksAlive: %d\n", mMinNumBlocksAlive);
     std::map<SizeType32, SizeType32> numLayersPerPool;
 
     for (auto const layerIdx : managedLayers)
@@ -1157,7 +1147,6 @@ void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLeng
 void WindowBlockManager::addSequence(
     GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest)
 {
-    printf("minwei addSequence inputLength=%d, numContextBlocks=%d\n", inputLength, numContextBlocks);
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
     TLLM_CHECK(emplaceDone);
@@ -1530,6 +1519,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
     , mEnableHashKey{enableHashKey}
+    , mChunkContextSize{chunkContextSize}
 {
     TLLM_CHECK_DEBUG(std::find(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end(), mMaxAttentionWindow)
         != maxAttentionWindowVec.end());
@@ -1851,7 +1841,6 @@ void WindowBlockManager::addSequenceBlockIfNeeded(GenerationRequest& sequence, S
 
     auto const numTokensWithoutSink = newNumTokens - sinkBlockTokenLength;
     auto const minTokensForBlockDetach = (mMinNumBlocksAlive + 1) * getTokensPerBlock();
-    printf("minwei minTokensForBlockDetach: %d\n", minTokensForBlockDetach);
 
     auto const canDetachBlock = (numTokensWithoutSink >= minTokensForBlockDetach)
         && ((numTokensWithoutSink - minTokensForBlockDetach) % getTokensPerBlock() == 0);
@@ -1891,7 +1880,6 @@ std::optional<BlockKey> KVCacheManager::findNewContextBlock(
 void KVCacheManager::addSequence(
     RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth, OptionalRef<LlmRequest> llmRequest)
 {
-    printf("minwei addSequence inputLength: %d\n", inputLength);
     // Need to add the bubble after the sink tokens to use even block size
     inputLength += mSinkBubbleLength;
 

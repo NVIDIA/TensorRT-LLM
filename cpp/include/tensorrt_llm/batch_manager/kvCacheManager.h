@@ -375,21 +375,6 @@ public:
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> const& getCacheBlockIds(SizeType32 windowSize) const
     {
-        {
-            for (auto const& [windowSize, beamBlockIds] : mCacheBlockIds)
-            {
-                printf("Window Size %d:\n", windowSize);
-                for (size_t beamIdx = 0; beamIdx < beamBlockIds.size(); beamIdx++)
-                {
-                    printf("  Beam %zu: ", beamIdx);
-                    for (auto blockId : beamBlockIds[beamIdx])
-                    {
-                        printf("%d ", blockId);
-                    }
-                    printf("\n");
-                }
-            }
-        }
         return mCacheBlockIds.at(windowSize);
     }
 
@@ -426,11 +411,9 @@ public:
 
     void removeFirstBlock(SizeType32 windowSize)
     {
-        printf("minwei removeFirstBlock\n");
         for (auto& beamBlockIds : mCacheBlockIds.at(windowSize))
         {
-            // minwei: do not actually remove from mCacheBlockIds; set to 0 instead.
-            // beamBlockIds.erase(beamBlockIds.begin() + blockIdx);
+            // Do not actually remove from mCacheBlockIds; set to 0 instead.
             beamBlockIds[mNumBlocksRemoved] = 0;
         }
         ++mNumBlocksRemoved;
@@ -463,7 +446,7 @@ private:
     // List of block ids allocated per each window size, for each beam of the sequence.
     //
     // Removed blocks (from the beginning of the cache) are not actually removed from mCacheBlockIds, but instead
-    // the block id is set to 0.
+    // the block id is set to 0. We choose such an implementation because kernels expects a linear view of the cache from the beginning.
     std::unordered_map<SizeType32, std::vector<std::vector<KVCacheBlock::IdType>>> mCacheBlockIds;
     // Tensor of block indices allocated per each window size, for each beam of the sequence
     std::unordered_map<SizeType32, runtime::ITensor::SharedPtr> mCacheBlockIndices;
@@ -1639,6 +1622,8 @@ private:
     SizeType32 mSinkBubbleLength;
     // Number of tokens in the sink blocks
     SizeType32 mSinkBlockTokenLength;
+    // Number of tokens in the chunk context
+    SizeType32 mChunkContextSize;
     // Block manager
     BlockManager mBlockManager;
     // Map of all sequences
