@@ -1,5 +1,4 @@
 import os
-import time
 
 import requests
 
@@ -14,49 +13,55 @@ HEADERS = {
 }
 
 
-def get_nvidia_members() -> list[str]:
-    """Fetches all NVIDIA organization members."""
-    members = []
-    page = 1
-    per_page = 100
+def check_user_membership(org: str, username: str) -> bool:
+    """Checks if a user is a member of an organization using a direct API call."""
+    url = f"{GITHUB_API_URL}/orgs/{org}/members/{username}"
+    try:
+        response = requests.get(url,
+                                headers=HEADERS,
+                                timeout=10,
+                                allow_redirects=False)
 
-    while True:
-        url = f"{GITHUB_API_URL}/orgs/NVIDIA/members?per_page={per_page}&page={page}"
-        try:
-            time.sleep(0.5)
-            response = requests.get(url, headers=HEADERS)
-
-            if response.status_code == 404:
-                raise RuntimeError(
-                    f"Organization 'NVIDIA' not found (404). Cannot fetch members."
-                )
-            elif response.status_code == 403:
+        if response.status_code == 204 or response.status_code == 302:
+            print(
+                f"Membership check for '{username}' in '{org}': Positive (Status {response.status_code})."
+            )
+            return True
+        elif response.status_code == 404:
+            print(
+                f"Membership check for '{username}' in '{org}': Negative (Status {response.status_code})."
+            )
+            return False
+        elif response.status_code == 403:
+            error_message = "Details not parsable from JSON."
+            try:
                 error_message = response.json().get(
-                    "message", "") if response.content else ""
-                raise RuntimeError(
-                    f"Forbidden (403) when fetching members for 'NVIDIA'. "
-                    f"This may be due to insufficient token permissions or rate limits. Details: {error_message}. Cannot fetch members."
-                )
-
+                    "message", "No specific message from API.")
+            except requests.exceptions.JSONDecodeError:
+                if response.text:
+                    error_message = response.text
+            detail = (
+                f"Forbidden (403) checking membership for '{username}' in '{org}'. "
+                f"Token permissions (e.g., 'read:org' scope) or org restrictions likely. API msg: {error_message}"
+            )
+            print(detail)
+            raise RuntimeError(detail)
+        else:
+            print(
+                f"Unexpected status {response.status_code} checking membership for '{username}' in '{org}'. Response: {response.text[:200]}"
+            )
             response.raise_for_status()
-            page_data = response.json()
-
-            if not page_data:
-                break
-
-            for member_data in page_data:
-                if isinstance(member_data, dict) and "login" in member_data:
-                    members.append(member_data["login"].lower())
-
-            if len(page_data) < per_page:
-                break
-            page += 1
-        except Exception as e:
-            print(f"Error fetching NVIDIA members: {e}")
-            return []
-
-    print(f"Successfully fetched {len(members)} members for 'NVIDIA'.")
-    return members
+            return False
+    except requests.exceptions.Timeout:
+        print(
+            f"Timeout checking membership for '{username}' in '{org}'. Assuming not a member."
+        )
+        return False
+    except requests.exceptions.RequestException as e:
+        print(
+            f"RequestException checking membership for '{username}' in '{org}': {e}. Assuming not a member."
+        )
+        return False
 
 
 def add_label_to_pr(repo_owner: str, repo_name: str, pr_number: str,
@@ -98,13 +103,17 @@ def main():
         f"Starting NVIDIA membership check for PR author '{pr_author}' on PR #{pr_number}."
     )
 
-    nvidia_members = get_nvidia_members()
-    if not nvidia_members:
-        print("Could not retrieve NVIDIA members list. Exiting.")
+    try:
+        is_member = check_user_membership("NVIDIA", pr_author)
+    except RuntimeError as e:
+        print(
+            f"Critical error during NVIDIA membership check for '{pr_author}': {e}"
+        )
+        print("Halting script due to inability to determine membership status.")
         return
 
-    is_member = pr_author.lower() in nvidia_members
-    print(f"User '{pr_author}' is a member of NVIDIA: {is_member}")
+    print(
+        f"User '{pr_author}' is determined to be an NVIDIA member: {is_member}")
 
     if not is_member:
         print(
