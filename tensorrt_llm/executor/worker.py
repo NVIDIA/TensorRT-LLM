@@ -12,10 +12,11 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
+import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
-from .._utils import (KVCacheEventSerializer, global_mpi_rank, mpi_comm,
-                      mpi_rank, nvtx_range_debug)
+from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
+                      mpi_comm, mpi_rank, nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import PybindMirror
@@ -42,11 +43,11 @@ from .utils import (PERIODICAL_RESP_IN_AWAIT, ErrorResponse, IntraProcessQueue,
                     is_llm_response)
 
 __all__ = [
-    "ExecutorBindingsWorker",
+    "GenerationExecutorWorker",
 ]
 
 
-class ExecutorBindingsWorker(GenerationExecutor):
+class GenerationExecutorWorker(GenerationExecutor):
 
     class WorkerExit(GeneratorExit):
         pass
@@ -82,6 +83,9 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self._is_pytorch_backend = getattr(self._executor_config, "backend",
                                            None) == "pytorch"
 
+        if global_mpi_size() > 1:
+            logger.set_rank(self.global_rank)
+
         if isinstance(engine, list):
             engine = engine[self.rank]
 
@@ -92,6 +96,16 @@ class ExecutorBindingsWorker(GenerationExecutor):
             processor_batched=batched_logits_processor, replicate=False)
 
         def _create_engine():
+            device_id = self.global_rank % torch.cuda.device_count()
+            torch.cuda.set_device(device_id)
+
+            # Make sure C++ executor would use same devices/ranks as py_executor
+            global_rank = global_mpi_rank()
+            comm_ranks = mpi_comm().allgather(global_rank)
+            device_ids = mpi_comm().allgather(device_id)
+            executor_config.parallel_config = tllm.ParallelConfig(
+                participant_ids=comm_ranks, device_ids=device_ids)
+
             if isinstance(engine, Engine):
                 return tllm.Executor(engine.engine,
                                      json.dumps(engine.config.to_dict(),
@@ -121,8 +135,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
 
-            device_id = self.global_rank % torch.cuda.device_count()
-            torch.cuda.set_device(device_id)
             return create_executor(**args)
 
         self.engine = _create_engine()
@@ -544,7 +556,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
             if isinstance(self.engine, tllm.Executor):
                 self.shutdown()
                 raise self.WorkerExit(
-                    "block_subordinates() should be used in a `with ExecutorBindingsWorker() as ...:` block"
+                    "block_subordinates() should be used in a `with GenerationExecutorWorker() as ...:` block"
                 )
             from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
             if isinstance(self.engine, PyExecutor):
@@ -555,7 +567,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         self.shutdown()
-        return exc_type is None or exc_type == ExecutorBindingsWorker.WorkerExit
+        return exc_type is None or exc_type == GenerationExecutorWorker.WorkerExit
 
     def __del__(self):
         self.shutdown()
@@ -568,7 +580,7 @@ def worker_main(
     log_level: str,
     executor_config: Optional[tllm.ExecutorConfig] = None,
     batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
-    worker_cls: type = ExecutorBindingsWorker,
+    worker_cls: type = GenerationExecutorWorker,
     tracer_init_kwargs: Optional[dict] = None,
     _torch_model_class_mapping: Optional[dict] = None,
     postproc_worker_config: Optional[PostprocWorkerConfig] = None,
@@ -576,7 +588,11 @@ def worker_main(
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
+    BASE_ZMQ_CLASSES: Dict = serialization.BASE_ZMQ_CLASSES,
 ) -> None:
+    # The base classes for ZMQ serialization. Passed through from the parent process to ensure
+    # that children processes include any classes added at runtime (such as those from `register_approved_ipc_class`).
+    serialization.BASE_ZMQ_CLASSES = BASE_ZMQ_CLASSES
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
                         "green")
@@ -671,12 +687,11 @@ def worker_main(
         assert isinstance(proxy_result_queue, tuple)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
-                postproc_worker_main,
-                result_queues[i].address,
+                postproc_worker_main, result_queues[i].address,
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
-            )
+                serialization.BASE_ZMQ_CLASSES)
             postprocess_worker_futures.append(fut)
 
     # Error handling in the Worker/MPI process
@@ -695,7 +710,7 @@ def worker_main(
                         "green")
 
     try:
-        worker: ExecutorBindingsWorker = worker_cls(
+        worker: GenerationExecutorWorker = worker_cls(
             engine,
             executor_config,
             batched_logits_processor,
@@ -740,7 +755,7 @@ def worker_main(
 
                 notify_proxy_threads_to_quit()
 
-        except ExecutorBindingsWorker.WorkerExit as e:
+        except GenerationExecutorWorker.WorkerExit as e:
             # This will capture by the with-statement and exit normally.
             raise e
 
@@ -762,7 +777,7 @@ class AwaitResponseHelper:
         ipc_periodically = 2
         ipc_batched = 3
 
-    def __init__(self, worker: "ExecutorBindingsWorker"):
+    def __init__(self, worker: "GenerationExecutorWorker"):
         # TODO: make worker weakref
         self.worker = worker
         self.handler_kind: AwaitResponseHelper.HandlerKind = AwaitResponseHelper.HandlerKind.unknown

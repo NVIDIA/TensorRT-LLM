@@ -104,6 +104,7 @@ Welcome to TensorRT-LLM's Documentation!
    advanced/inference-request.md
    advanced/lora.md
    advanced/expert-parallelism.md
+   advanced/kv-cache-management.md
    advanced/kv-cache-reuse.md
    advanced/speculative-decoding.md
    advanced/disaggregated-service.md
@@ -144,6 +145,7 @@ Welcome to TensorRT-LLM's Documentation!
    blogs/quantization-in-TRT-LLM.md
    blogs/XQA-kernel.md
    blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md
+   blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md
 
 
 Indices and tables

@@ -90,6 +90,12 @@ class ADEngine(ModelEngine):
     ):
         """Build the ADEngine using the AutoDeployConfig that gets passed through from the LLM."""
 
+        # update device to contain the current default device if it's in cuda
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        device = str(device)
+
         # construct model factory
         model_kwargs = {"max_position_embeddings": seq_info.max_seq_len, **ad_config.model_kwargs}
         factory = ModelFactoryRegistry.get(ad_config.model_factory)(
@@ -216,6 +222,7 @@ class ADEngine(ModelEngine):
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
         new_tokens_device: Optional[torch.Tensor] = None,
+        gather_context_logits: bool = False,
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object

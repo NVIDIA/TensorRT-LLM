@@ -365,6 +365,12 @@ bool getEnvKVCacheTransferUseAsyncBuffer()
     return useAsyncBuffer;
 }
 
+bool getEnvKVCacheTransferUseSyncBuffer()
+{
+    static bool const useSyncBuffer = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_USE_SYNC_BUFFER");
+    return useSyncBuffer;
+}
+
 size_t getEnvKVCacheSendMaxConcurrenceNum()
 {
 
@@ -404,6 +410,11 @@ uint16_t getEnvNixlPort()
 {
     static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
     return nixlPort;
+}
+
+bool getEnvDisaggBenchmarkGenOnly()
+{
+    return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY");
 }
 
 } // namespace tensorrt_llm::common

@@ -1,10 +1,12 @@
+import copy
 import os
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.export import Dim
+from utils.llm_data import llm_models_root
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -274,3 +276,128 @@ def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+_SMALL_MODEL_CONFIGS = {
+    "meta-llama/Meta-Llama-3.1-8B-Instruct": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
+            "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        ),
+        "model_kwargs": {
+            "num_hidden_layers": 1,
+            "hidden_size": 64,
+            "intermediate_size": 64,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+        },
+    },
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1",
+            "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        ),
+        "model_kwargs": {
+            "num_hidden_layers": 2,
+            "intermediate_size": 256,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "num_local_experts": 2,
+        },
+    },
+    "microsoft/Phi-3-mini-4k-instruct": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct",
+            "microsoft/Phi-3-mini-4k-instruct",
+        ),
+        "model_kwargs": {
+            "num_hidden_layers": 2,
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+        },
+    },
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/Llama-4-Scout-17B-16E-Instruct",
+            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+        ),
+        "model_factory": "AutoModelForImageTextToText",
+        "customize_tokenizer": True,
+        "model_kwargs": {
+            "text_config": {
+                "num_hidden_layers": 1,
+                "head_dim": 64,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "intermediate_size_mlp": 64,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "num_local_experts": 2,
+            },
+            "vision_config": {
+                "num_hidden_layers": 1,
+                "hidden_size": 64,
+                "intermediate_size": 64,
+                "num_attention_heads": 2,
+            },
+        },
+    },
+    "deepseek-ai/DeepSeek-V3": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/DeepSeek-V3",
+            "deepseek-ai/DeepSeek-V3",
+        ),
+        "model_kwargs": {
+            "first_k_dense_replace": 1,
+            "num_hidden_layers": 2,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "kv_lora_rank": 128,
+            "moe_intermediate_size": 128,
+            "n_group": 2,
+            "topk_group": 2,
+            "n_routed_experts": 16,
+            "n_shared_experts": 1,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "num_experts_per_token": 2,
+            "q_lora_rank": 128,
+        },
+    },
+}
+
+
+def get_small_model_config(model_hub_id: str, **config_kwargs) -> Dict[str, Any]:
+    """
+    Get the small model configuration for a given HuggingFace model hub ID.
+
+    Args:
+        model_hub_id: The HuggingFace model hub ID (e.g., "meta-llama/Meta-Llama-3.1-8B-Instruct")
+
+    Returns:
+        Dictionary containing the model configuration
+
+    Raises:
+        KeyError: If the model_hub_id is not found in the configurations
+    """
+    if model_hub_id not in _SMALL_MODEL_CONFIGS:
+        available_models = list(_SMALL_MODEL_CONFIGS.keys())
+        raise KeyError(f"Model '{model_hub_id}' not found. Available models: {available_models}")
+
+    config = copy.deepcopy(_SMALL_MODEL_CONFIGS[model_hub_id])
+
+    # add default values for small model config
+    config["skip_loading_weights"] = True  # No weight loading to speed up things
+    config["free_mem_ratio"] = 0.00  # we don't need the cache and it may cause OOM issues
+    config["benchmark"] = False  # No benchmark to speed up things
+    config["max_tokens"] = 8  # Don't produce too many tokens to speed up things
+    config["page_size"] = 4  # Make sure paging is activated despite small max_tokens
+    config["max_batch_size"] = 2  # Minimum batching to speed up things
+    config["prompt"] = "Hello World"
+
+    # add custom config kwargs
+    config.update(config_kwargs)
+
+    return config

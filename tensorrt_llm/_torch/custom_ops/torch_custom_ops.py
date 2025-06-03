@@ -6,7 +6,8 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
 from ..attention_backend.interface import AttentionInputType
 from ..autotuner import AutoTuner, TunableRunner, TuningConfig
-from ..utils import (get_last_power_of_2_num_tokens_buckets,
+from ..utils import (compute_swizzled_sf_shape,
+                     get_last_power_of_2_num_tokens_buckets,
                      get_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2, next_positive_power_of_2)
 
@@ -64,7 +65,7 @@ class MoERunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
     ) -> List[int]:
-        x, fc2_expert_weights, min_latency_mode_tensor = inputs
+        x, _, _, min_latency_mode_tensor = inputs
         min_latency_mode = min_latency_mode_tensor.size(0) == 1
         m = x.shape[0]
 
@@ -88,11 +89,12 @@ class MoERunner(TunableRunner):
         tactic: int = -1,
         do_preparation: bool = False,
     ):
-        x, fc2_expert_weights, min_latency_mode_tensor = inputs
+        x, fc1_expert_weights, fc2_expert_weights, min_latency_mode_tensor = inputs
         min_latency_mode = min_latency_mode_tensor.size(0) == 1
         # determine if we should use min latency mode according to the profiled seq len
         self._fused_moe_runner.run_gemm_profile(
             x,
+            fc1_expert_weights,
             fc2_expert_weights,
             self.top_k,
             self.tp_size,
@@ -127,17 +129,22 @@ def fused_moe(
     use_fp8_block_scaling: bool = False,
     use_w4a8_group_scaling: bool = False,
     min_latency_mode: bool = False,
+    tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
 
+    tune_num_tokens_list = []
+    tune_num_tokens = next_positive_power_of_2(tune_max_num_tokens)
+    while tune_num_tokens > 0:
+        tune_num_tokens_list.append(tune_num_tokens)
+        tune_num_tokens //= 2
     # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
     tuning_config = TuningConfig(dynamic_tensors=(
         # input, dim 0, all valid buckets, map a seq_len to power of 2 bucket index
-        (0, 0, ((8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1),
-                next_positive_power_of_2)),
+        (0, 0, (tuple(tune_num_tokens_list), next_positive_power_of_2)),
         # min_latency_tensor, dim 0, (0 for False, 1 for True), map to it self
-        (2, 0, ((0, ), lambda x: x)),
+        (3, 0, ((0, ), lambda x: x)),
     ))
 
     # TODO: set min_latency_mode always to False due to the error in the moe_kernels
@@ -163,7 +170,7 @@ def fused_moe(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
         tuning_config,
-        [input, fc2_expert_weights, min_latency_tensor],
+        [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
         gemm_idx=1,
     )
 
@@ -171,7 +178,7 @@ def fused_moe(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
         tuning_config,
-        [input, fc2_expert_weights, min_latency_tensor],
+        [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
         gemm_idx=2,
     )
 
@@ -421,7 +428,8 @@ def attention(
     mrope_position_deltas: Optional[torch.Tensor],
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
-) -> torch.Tensor:
+    attention_chunk_size: Optional[int],
+) -> List[torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
                             if attention_input_type is not None else
@@ -431,9 +439,25 @@ def attention(
     if out_dtype is None:
         out_dtype = q.dtype
 
-    output = q.new_empty((num_tokens, num_heads * v_head_size), dtype=out_dtype)
+    if out_dtype == torch.uint8:
+        num_nvfp4_elements_per_container = 2
+        scaling_vector_size = 16
+        size_per_token = num_heads * v_head_size
+        output_act = q.new_empty(
+            (num_tokens, size_per_token // num_nvfp4_elements_per_container),
+            dtype=torch.uint8)
+        # Create a sf (scaling factors) tensor for NVFP4 (use INT8 as the container dtype).
+        output_sf = q.new_empty(compute_swizzled_sf_shape(
+            num_tokens, size_per_token // scaling_vector_size),
+                                dtype=torch.uint8)
+    else:
+        output_act = q.new_empty((num_tokens, num_heads * v_head_size),
+                                 dtype=out_dtype)
+        # NOTE(tizheng): Does this introduce overhead?
+        output_sf = torch.empty(())  # Create a placeholder, which is not used.
+
     torch.ops.trtllm.attention_inplace(
-        q, k, v, output, out_dtype, workspace, sequence_length,
+        q, k, v, output_act, output_sf, out_dtype, workspace, sequence_length,
         host_past_key_value_lengths, context_lengths, host_context_lengths,
         host_request_types, kv_cache_block_offsets, host_kv_cache_block_offsets,
         host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
@@ -450,8 +474,9 @@ def attention(
         use_paged_context_fmha, attention_input_type, is_mla_enable,
         q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
         v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
-        mla_context_paged_kv, mla_context_kv_cache_block_offsets)
-    return output
+        mla_context_paged_kv, mla_context_kv_cache_block_offsets,
+        attention_chunk_size)
+    return output_act, output_sf
 
 
 @attention.register_fake
@@ -516,7 +541,8 @@ def _(
     mrope_position_deltas: Optional[torch.Tensor],
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
-) -> torch.Tensor:
+    attention_chunk_size: Optional[int],
+) -> List[torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
                             if attention_input_type is not None else
@@ -525,4 +551,21 @@ def _(
         out_dtype = q.dtype
     is_gen_only = attention_input_type == AttentionInputType.generation_only
     v_head_size = head_size if not is_mla_enable else kv_lora_rank if is_gen_only else v_head_dim
-    return q.new_empty((num_tokens, num_heads * v_head_size), dtype=out_dtype)
+
+    if out_dtype == torch.uint8:
+        num_nvfp4_elements_per_container = 2
+        scaling_vector_size = 16
+        size_per_token = num_heads * v_head_size
+        output_act = q.new_empty(
+            (num_tokens, size_per_token // num_nvfp4_elements_per_container),
+            dtype=torch.uint8)
+        # Create a sf (scaling factors) tensor for NVFP4 (use INT8 as the container dtype).
+        output_sf = q.new_empty(compute_swizzled_sf_shape(
+            num_tokens, size_per_token // scaling_vector_size),
+                                dtype=torch.uint8)
+    else:
+        output_act = q.new_empty((num_tokens, num_heads * v_head_size),
+                                 dtype=out_dtype)
+        output_sf = torch.empty(())  # Create a placeholder, which is not used.
+
+    return output_act, output_sf
