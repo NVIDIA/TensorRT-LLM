@@ -412,7 +412,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             ctxChunkConfig.value().chunkUnitSize, mKvCacheManager->getTokensPerBlock());
     }
 
-    mCapacityScheduler = std::make_unique<CapacityScheduler>(getMaxBatchSize() * mNumMicroBatches,
+    mCapacityScheduler = std::make_unique<CapacityScheduler>(getMaxNumSequences(),
         optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), mKvCacheManager != nullptr, mNumMicroBatches > 1);
 
     mMicroBatchScheduler = std::make_unique<MicroBatchScheduler>(ctxChunkConfig, maxContextLength);
