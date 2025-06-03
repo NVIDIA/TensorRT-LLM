@@ -596,7 +596,7 @@ class MambaCacheManager(BaseResourceManager):
                 self.mamba_cache_index[r] = block
                 state_indices.append(block)
         self.state_indices = torch.as_tensor(state_indices,
-                                             dtype=torch.int,
+                                             dtype=torch.int32,
                                              device=self.ssm_states.device)
 
     def free_mamba_cache_blocks(self, request_id: int):

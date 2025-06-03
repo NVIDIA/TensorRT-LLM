@@ -1,4 +1,7 @@
 /*
+ * Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d.cpp
+ * Copyright (c) 2024, Tri Dao.
+ *
  * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,8 +16,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-// clang-format off
-// adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d.cpp
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/causalConv1d/causalConv1d.h"
@@ -182,7 +183,8 @@ void causalConv1dFwd(at::Tensor const& x, at::Tensor const& weight, std::optiona
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Static cast to signed char (AKA c10::DeviceIndex - the input to CUDAGuard) to avoid compiler warning about narrowing
+    // Static cast to signed char (AKA c10::DeviceIndex - the input to CUDAGuard) to avoid compiler warning about
+    // narrowing
     at::cuda::CUDAGuard device_guard{static_cast<signed char>(x.get_device())};
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_fwd",
@@ -277,7 +279,8 @@ void causalConv1dUpdate(at::Tensor const& x, at::Tensor const& conv_state, at::T
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    // Static cast to signed char (AKA c10::DeviceIndex - the input to CUDAGuard) to avoid compiler warning about narrowing
+    // Static cast to signed char (AKA c10::DeviceIndex - the input to CUDAGuard) to avoid compiler warning about
+    // narrowing
     at::cuda::CUDAGuard device_guard{static_cast<signed char>(x.get_device())};
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_update",

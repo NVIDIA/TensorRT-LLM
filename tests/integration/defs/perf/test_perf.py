@@ -274,7 +274,7 @@ class PerfTestMetric(NamedTuple):
     """
     Configurations of a test metric.
     """
-    # The original test name used to run the TURTLE test.
+    # The original test name used to run the oraginal perf test.
     original_test_name: str
     # The name for this particular metric.
     metric_name: str
@@ -759,7 +759,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     """
 
     def __init__(self, full_test_name: str):
-        # full_test_name is the full test name appearing in TURTLE output.
+        # full_test_name is the full test name appearing in test output.
         self._full_test_name = full_test_name
         # test_domain_name is the part before "::".
         self._test_domain_name = "::".join(full_test_name.split("::")[:-1])

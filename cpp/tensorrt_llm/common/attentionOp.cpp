@@ -996,11 +996,17 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mMaxSeqLenCacheKv = generation_params.max_attention_window_size;
         // This should be set to numDraftTokens + 1.
         tllmRunnerParams.mMaxSeqLenQ = params.acc_q_len / batch_beam;
-        tllmRunnerParams.mMaxSeqLenKv
-            = std::min(generation_params.cyclic_attention_window_size, generation_params.max_past_kv_length);
+        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_past_kv_length;
         tllmRunnerParams.mSumOfSeqLensQ = int(batch_beam * tllmRunnerParams.mMaxSeqLenQ);
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
+
+        // The attention window size.
+        tllmRunnerParams.mAttentionWindowSize = generation_params.cyclic_attention_window_size;
+        // The chunked attention size.
+        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+
+        // The scaleQ that will be applied to the BMM1 output.
         tllmRunnerParams.mScaleQ = mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))
             / sqrtf((float) (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim));
 

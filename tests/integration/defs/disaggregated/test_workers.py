@@ -4,11 +4,12 @@ import copy
 import json
 import os
 import subprocess
-from typing import List, Optional, Tuple
+from typing import Generator, List, Optional, Tuple
 
 import aiohttp
 import pytest
 import yaml
+from defs.trt_test_alternative import popen
 from transformers import AutoTokenizer
 
 from tensorrt_llm import logger
@@ -39,7 +40,7 @@ def run_disaggregated_workers(
     env: Optional[dict] = None,
     cwd: Optional[str] = None,
     num_ranks: Optional[int] = None
-) -> Tuple[subprocess.Popen, List[str], List[str]]:
+) -> Tuple[Generator[subprocess.Popen, None, None], List[str], List[str]]:
 
     ctx_servers, gen_servers = get_ctx_gen_server_urls_from_cfg(config_file)
 
@@ -53,11 +54,11 @@ def run_disaggregated_workers(
         config_file
     ]
     logger.info(f"Running workers with command: {' '.join(workers_cmd)}")
-    workers_proc = subprocess.Popen(workers_cmd,
-                                    stdout=stdout,
-                                    stderr=subprocess.STDOUT,
-                                    env=env,
-                                    cwd=cwd)
+    workers_proc = popen(workers_cmd,
+                         stdout=stdout,
+                         stderr=subprocess.STDOUT,
+                         env=env,
+                         cwd=cwd)
     return workers_proc, ctx_servers, gen_servers
 
 
@@ -234,7 +235,7 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                  ctx_servers: List[str],
                  gen_servers: List[str],
                  req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 180):
+                 server_start_timeout_secs: int = 240):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -423,7 +424,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             # send a dummy request for initialization
             dummy_request = {
                 "model": MODEL_NAME,
-                "prompt": [3] * 100,
+                "prompt": [3] * 200,
                 "max_tokens": 1,
                 "ignore_eos": True,
                 "temperature": 0.0,
@@ -500,19 +501,22 @@ def load_default_prompts(disaggregated_example_root: str):
 @contextlib.contextmanager
 def background_workers(llm_venv, config_file: str, num_ranks: int = None):
     cwd = llm_venv.get_working_directory()
-    log_file = open(os.path.join(cwd, 'output_workers.log'), 'w')
-    workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
-        config_file=config_file,
-        stdout=log_file,
-        env=llm_venv._new_env,
-        cwd=cwd,
-        num_ranks=num_ranks)
-    try:
-        yield ctx_servers, gen_servers
-    finally:
-        workers_proc.terminate()
-        workers_proc.wait()
-        log_file.close()
+
+    with open(os.path.join(cwd, 'output_workers.log'), 'w') as log_file:
+        workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
+            config_file=config_file,
+            stdout=log_file,
+            env=llm_venv._new_env,
+            cwd=cwd,
+            num_ranks=num_ranks)
+        try:
+            with workers_proc as proc:
+                yield ctx_servers, gen_servers
+        except Exception:
+            log_file.seek(0)
+            logger.error("-------- Worker output --------")
+            logger.error(log_file.read())
+            raise
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -552,7 +556,6 @@ def test_workers_kv_cache_events(disaggregated_test_root,
 def test_workers_kv_cache_aware_router(disaggregated_test_root,
                                        disaggregated_example_root, llm_venv,
                                        llama_model_root):
-    pytest.skip("https://nvbugspro.nvidia.com/bug/5301492")
     config_file = os.path.join(
         disaggregated_test_root,
         'test_configs/disagg_config_cache_aware_balance.yaml')
@@ -562,7 +565,7 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
                             4) as (ctx_servers, gen_servers):
         tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
-        asyncio.run(tester.test_multi_round_request(prompts, 6, 4))
+        asyncio.run(tester.test_multi_round_request(prompts, 16, 4))
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],

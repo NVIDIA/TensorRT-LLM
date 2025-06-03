@@ -4,13 +4,15 @@ from dataclasses import dataclass
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.handle_context_logits import \
+    HandleContextLogits
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import (
-    CreateNewDecoderRequests, HandleContextLogits, HandleGenerationLogits,
+    CreateNewDecoderRequests, HandleGenerationLogits,
     MakeDecodingBatchInputOutput)
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers)
@@ -32,11 +34,12 @@ class SampleStateTensors:
         return vars(self).values()
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class SampleState:
     scheduled_requests: ScheduledRequests
 
     logits: torch.Tensor = None
+    logits_host: torch.Tensor = None
 
     # Set when decode_async() has evaluated these to avoid computing again in update_requests()
     # log_probs[request_idx][token_idx]
@@ -49,6 +52,8 @@ class SampleState:
 
 
 class Sampler(ABC):
+
+    SampleState = SampleState
 
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
         pass
@@ -81,13 +86,14 @@ class EarlyStopSampler(Sampler):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            logits = state.logits[idx]
-            if logits.ndim == 1:
-                # For BERT: Add axis to be compatible with LogitsStorage
-                # (LogitsStorage will interpret this dim as the prompt_len which
-                # is not relevant for outputting logits of encoder only model).
-                logits = logits.unsqueeze(0)
-            request.py_result.append_context_logits(logits)
+            if request.py_return_context_logits:
+                logits = state.logits[idx]
+                if logits.ndim == 1:
+                    # For BERT: Add axis to be compatible with LogitsStorage
+                    # (LogitsStorage will interpret this dim as the prompt_len which
+                    # is not relevant for outputting logits of encoder only model).
+                    logits = logits.unsqueeze(0)
+                request.py_result.append_context_logits(logits)
 
 
 def top_k_sampling_batch(logits, top_k=50):
@@ -409,7 +415,8 @@ class TorchStarAttentionSampler(TorchSampler):
         num_tokens = request.add_new_token(new_token, beam_idx)
 
         current_logits = logits[output_token_idx].unsqueeze(0)
-        request.py_result.append_generation_logits(current_logits)
+        if request.py_return_generation_logits:
+            request.py_result.append_generation_logits(current_logits)
         if request.py_return_log_probs:
             _, log_probs = greedy_search_sampling_batch(current_logits)
             request.py_result.append_log_probs([[{
@@ -452,7 +459,7 @@ class SampleStateTensorsHostTRTLLM(SampleStateTensors):
     sequence_lengths: torch.Tensor
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class SampleStateTRTLLM(SampleState):
     host: SampleStateTensorsHostTRTLLM
     device: SampleStateTensors
@@ -460,6 +467,7 @@ class SampleStateTRTLLM(SampleState):
 
 class TRTLLMSampler(Sampler):
     MAX_DECODING_TOKENS = 1  # It must be 1 when not in speculative decoding
+    SampleState = SampleStateTRTLLM
 
     def __init__(
         self,
@@ -587,23 +595,22 @@ class TRTLLMSampler(Sampler):
         batch_size = scheduled_requests.batch_size
         beam_width = self.beam_width(scheduled_requests.all_requests)
 
-        logits = model_outputs["logits"].reshape((batch_size, beam_width, -1))
-
         self.setup_sampler_step(scheduled_requests.context_requests)
 
-        # Note: In runtimeBuffers.cpp, num_context_logits is set to:
-        #       numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
-        # Revisit this when we support chunked context.
         num_context_logits = [1] * batch_size
+        for batch_index, request in enumerate(
+                scheduled_requests.context_requests):
+            num_context_logits[
+                batch_index] = request.context_chunk_size if request.py_return_context_logits else 1
+
         logits_index = self.algs.handle_context_logits(
-            scheduled_requests.context_requests, num_context_logits, logits,
-            self.store["decoder_buffers"], self.model_config,
-            self.store["buffer_manager"], self.store["cuda_stream"])
+            scheduled_requests.context_requests, num_context_logits,
+            model_outputs["logits"], self.store["decoder_buffers"])
 
         self.algs.handle_generation_logits(
             logits_index, scheduled_requests.generation_requests,
             self.store["decoder_buffers"], self.model_config,
-            self.store["buffer_manager"], logits)
+            self.store["buffer_manager"], model_outputs["logits"])
 
         decoding_input, self.decoding_output = self.algs.make_decoding_batch_input_output(
             scheduled_requests.context_requests,
@@ -648,7 +655,7 @@ class TRTLLMSampler(Sampler):
         sampler_event.record()
 
         return SampleStateTRTLLM(scheduled_requests=scheduled_requests,
-                                 logits=logits,
+                                 logits=model_outputs["logits"],
                                  device=device,
                                  host=host,
                                  sampler_event=sampler_event)
@@ -676,7 +683,6 @@ class TRTLLMSampler(Sampler):
             seq_slot = request.seq_slot
             num_generated_tokens = request.num_draft_tokens + 1
             current_num_of_tokens = request.max_beam_num_tokens
-
             num_new_tokens = [0] * beam_width
 
             for beam in range(beam_width):

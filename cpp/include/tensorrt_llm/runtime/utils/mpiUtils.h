@@ -297,9 +297,9 @@ public:
 
     [[nodiscard]] MpiComm split(int color, int key) const;
 
-    std::shared_ptr<MpiRequest> bcastAsync(void* buffer, size_t size, MpiType dtype, int root) const;
+    std::unique_ptr<MpiRequest> bcastAsync(void* buffer, size_t size, MpiType dtype, int root) const;
 
-    std::shared_ptr<MpiRequest> bcastAsync(runtime::IBuffer& buf, int root) const;
+    std::unique_ptr<MpiRequest> bcastAsync(runtime::IBuffer& buf, int root) const;
 
     void bcast(void* buffer, size_t size, MpiType dtype, int root) const;
 
@@ -353,9 +353,9 @@ public:
         }
     }
 
-    std::shared_ptr<MpiRequest> sendAsync(
+    std::unique_ptr<MpiRequest> sendAsync(
         void const* buffer, std::size_t size, MpiType dtype, int dest, MpiTag tag) const;
-    std::shared_ptr<MpiRequest> sendAsync(runtime::IBuffer const& buf, int dest, MpiTag tag) const;
+    std::unique_ptr<MpiRequest> sendAsync(runtime::IBuffer const& buf, int dest, MpiTag tag) const;
     //! \deprecated This function is discouraged. Use the one with MpiTag enum instead.
     void sendRawTag(void const* buffer, std::size_t size, MpiType dtype, int dest, int tag) const;
     void send(void const* buffer, std::size_t size, MpiType dtype, int dest, MpiTag tag) const;
