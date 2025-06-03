@@ -139,7 +139,6 @@ class Unpickler(pickle.Unpickler):
             # is being used as part of a routine scenario, then it should be added
             # to the appropriate base classes above.
             raise ValueError(f"Import {module} | {name} is not allowed")
-        print(f"Import {module} | {name} here")
         return super().find_class(module, name)
 
 
