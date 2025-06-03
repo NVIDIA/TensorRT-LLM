@@ -1259,7 +1259,7 @@ class BaseLlmArgs(BaseModel):
                     "lora_dir is empty, so custom embedding or lm head will not be applied."
                 )
 
-        if not self.enable_lora and self.lora_config is not None and self.backend == 'pytorch':
+        if self.lora_config is not None and self.backend == 'pytorch':
             logger.warning(
                 "enable_lora is ignored when lora_config is provided for pytorch backend."
             )
