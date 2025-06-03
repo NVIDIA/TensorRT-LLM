@@ -585,13 +585,18 @@ class TRTLLMSampler(Sampler):
 
         for req in requests:
             if req.return_generation_logits:
-                # TODO: Support speculative decoding as well as in executorImpl.cpp line 1580
                 if req.py_result.generation_logits_storage is None:
                     vocab_size_padded = self.model_config.vocab_size_padded(
                         self.world_config.size)
-                    req.py_result._generation_logits.allocate_memory(
-                        req.sampling_config.beam_width, vocab_size_padded,
-                        binding_dtype_to_torch(self.logits_datatype))
+                    logits_dtype = binding_dtype_to_torch(self.logits_datatype)
+                    # Save space for the 1st token which is copied to gen logits storage from handleContextLogits,
+                    # this also initiates the lazy allocation of the logits storage
+                    req.py_result.append_generation_logits(
+                        torch.zeros((1, req.sampling_config.beam_width,
+                                     vocab_size_padded),
+                                    dtype=logits_dtype))
+
+                # Update the CPP LlmRequest with the gen logits tensor, as the CPP handleContextLogits copies its last token to it.
                 req.set_generation_logits_host(
                     req.py_result.generation_logits_storage)
 
