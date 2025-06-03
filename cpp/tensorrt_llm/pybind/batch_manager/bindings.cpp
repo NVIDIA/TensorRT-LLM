@@ -160,6 +160,8 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("context_logits", &GenLlmReq::getContextLogitsHost)
         .def_property_readonly("num_draft_tokens", &GenLlmReq::getNumDraftTokens)
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, py::arg("finish_reason"), py::arg("beam"))
+        .def("get_beam_width_by_iter", &GenLlmReq::getBeamWidthByIter, py::arg("for_next_iteration") = false)
+        .def("set_generation_logits_host", &GenLlmReq::setGenerationLogitsHost, py::arg("logits"))
         .def_property_readonly("is_finished", &GenLlmReq::isFinished)
         .def_property_readonly("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
         .def_property(
@@ -382,6 +384,7 @@ void initBindings(pybind11::module_& m)
             py::arg("max_num_sequences"), py::arg("max_beam_width"), py::arg("max_attention_window"),
             py::arg("max_tokens_per_step"), py::arg("buffer_manager"), py::arg("model_config"), py::arg("world_config"))
         .def_readwrite("logits", &tb::DecoderBuffers::logits)
+        .def("set_logits_at", &tb::DecoderBuffers::setLogitsAt, py::arg("index"), py::arg("value"))
         .def_readwrite("cache_indirection_input", &tb::DecoderBuffers::cacheIndirectionInput)
         .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
         .def_readwrite("draft_buffers", &tb::DecoderBuffers::draftBuffers);

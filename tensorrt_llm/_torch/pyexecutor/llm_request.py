@@ -48,19 +48,24 @@ class LogitsStorage:
         self.beam_width = -1
         self.vocab_size = -1
 
-    def _init(self, logits: torch.Tensor):
-        _, self.beam_width, self.vocab_size = logits.shape
+    def _lazy_init(self, logits: torch.Tensor):
+        _, beam_width, vocab_size = logits.shape
+        self.allocate_memory(beam_width, vocab_size, logits.dtype)
+
+    def allocate_memory(self, beam_width: int, vocab_size: int, dtype):
+        self.beam_width = beam_width
+        self.vocab_size = vocab_size
 
         if self.use_device_memory:
             self._storage = torch.empty(
                 (self.seq_length, self.beam_width, self.vocab_size),
-                dtype=logits.dtype,
+                dtype=dtype,
                 device='cuda',
                 requires_grad=False)
         else:
             self._storage = torch.empty(
                 (self.seq_length, self.beam_width, self.vocab_size),
-                dtype=logits.dtype,
+                dtype=dtype,
                 device='cpu',
                 pin_memory=True,
                 requires_grad=False)
@@ -71,7 +76,7 @@ class LogitsStorage:
         assert logits.ndim == 3, f"Bad logits shape, expect [num_tokens, beam_width, vocab_size], got {logits.shape}"
 
         if self.beam_width == -1:
-            self._init(logits)
+            self._lazy_init(logits)
 
         assert logits.size(1) == self.beam_width, "Beam width mismatch"
 
@@ -90,6 +95,9 @@ class LogitsStorage:
         start = 0 if all_logits else self.last_position
         return self._storage[start:self.
                              position] if self._storage is not None else None
+
+    def get_storage(self) -> torch.Tensor | None:
+        return self._storage
 
 
 class LogProbStorage:
@@ -155,6 +163,15 @@ class PyResult:
         # API expect: [beam_width, seq_length, vocab_size]
         return self._generation_logits and self._generation_logits.get(
             not self._streaming).transpose(0, 1)
+
+    @property
+    def generation_logits_storage(self) -> torch.Tensor | None:
+        storage = self._generation_logits.get_storage()
+        if storage is None:
+            return None
+        # Internal storage: [seq_length, beam_width, vocab_size]
+        # API expect: [beam_width, seq_length, vocab_size]
+        return storage if self._streaming else storage.transpose(0, 1)
 
     @property
     def log_probs(self) -> list[TokenLogprobs] | None:
@@ -227,7 +244,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             client_id=client_id,
             return_log_probs=False,
             return_context_logits=False,
-            return_generation_logits=False,
+            return_generation_logits=return_generation_logits,
             stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
             if stop_words_list else None,
             **kwargs)
