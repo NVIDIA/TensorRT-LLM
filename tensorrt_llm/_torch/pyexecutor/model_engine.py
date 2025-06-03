@@ -1137,8 +1137,9 @@ class PyTorchModelEngine(ModelEngine):
         for request in extend_requests:
             # the request has no previous tensor:
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
-            # (2) a dummy request
-            if next_draft_tokens_device is None or request.is_dummy:
+            # (2) a dummy request; or
+            # (3) the first step in the generation server of disaggregated serving
+            if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                 # get token ids, including input token ids and draft token ids
                 input_ids.append(request.get_last_tokens(0))
                 input_ids.extend(request.py_draft_tokens)
@@ -1202,8 +1203,9 @@ class PyTorchModelEngine(ModelEngine):
         for request in generation_requests:
             # the request has no previous tensor:
             # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
-            # (2) a dummy request
-            if new_tokens_device is None or request.is_dummy:
+            # (2) a dummy request; or
+            # (3) the first step in the generation server of disaggregated serving
+            if new_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                 # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
                 # can be aligned to the correct positions.
                 if not request.is_cuda_graph_dummy:
