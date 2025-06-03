@@ -197,6 +197,10 @@ bool XqaDispatcher::isSupported()
         tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
         tllmRunnerParams.mNumTokensPerPage = mFixedParams.numTokensPerBlock;
+        // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
+        // the kernel is supported.
+        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+        tllmRunnerParams.mAttentionWindowSize = INT_MAX;
 
         // Check if it is supported or not.
         auto [isSupported, info] = mTllmGenFMHARunner->isSupportedWithInfo(tllmRunnerParams);
