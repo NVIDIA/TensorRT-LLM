@@ -66,7 +66,7 @@ def mock_factory():
         # Create factory instance with mocked methods to avoid HTTP requests
         factory = AutoModelForCausalLMFactory(model="dummy_model")
         # Set model path directly to avoid prefetch
-        factory._prefetched_path = "/dummy/path"
+        factory._prefetched_model_path = "/dummy/path"
         yield factory
 
 

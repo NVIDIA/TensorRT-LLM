@@ -1,7 +1,7 @@
 import math
 import weakref
 from enum import IntEnum
-from typing import Optional, cast
+from typing import Optional, Union, cast
 
 import torch
 from torch import nn
@@ -16,7 +16,7 @@ from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
-from ..utils import get_model_extra_attrs
+from ..utils import Fp4QuantizedTensor, get_model_extra_attrs
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -198,6 +198,7 @@ class Attention(nn.Module):
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
+        self.support_nvfp4_output = self.attn.support_nvfp4_output()
 
         if not config.skip_create_weights_in_init:
             self.create_weights()
@@ -223,7 +224,7 @@ class Attention(nn.Module):
     def forward(
         self,
         position_ids: Optional[torch.LongTensor],
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
@@ -265,8 +266,11 @@ class Attention(nn.Module):
         q, k, v = self.apply_rope(qkv, position_ids)
 
         out_scale = None
+        out_scale_sf = None
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
             out_scale = self.o_proj.inv_input_scale
+        if self.o_proj.has_nvfp4 and self.support_nvfp4_output:
+            out_scale_sf = self.o_proj.input_scale
 
         q, k, v = self.convert_qkv(q, k, v)
         attn_output = self.attn.forward(
@@ -275,6 +279,7 @@ class Attention(nn.Module):
             v,
             attn_metadata,
             out_scale=out_scale,
+            out_scale_sf=out_scale_sf,
             attention_mask=attention_mask,
             mrope_config=mrope_config,
             attention_window_size=attention_window_size)

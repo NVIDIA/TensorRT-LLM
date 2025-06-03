@@ -365,6 +365,12 @@ bool getEnvKVCacheTransferUseAsyncBuffer()
     return useAsyncBuffer;
 }
 
+bool getEnvKVCacheTransferUseSyncBuffer()
+{
+    static bool const useSyncBuffer = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_USE_SYNC_BUFFER");
+    return useSyncBuffer;
+}
+
 size_t getEnvKVCacheSendMaxConcurrenceNum()
 {
 

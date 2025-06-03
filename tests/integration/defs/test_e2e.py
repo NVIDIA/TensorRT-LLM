@@ -768,7 +768,7 @@ def test_trtllm_bench_mgmn(llm_root, llm_venv):
                                              skip_engine_build=True)
 
     benchmark_cmd = \
-            f"mpirun -n 2 trtllm-llmapi-launch trtllm-bench --model {model_name} " \
+            f"mpirun --allow-run-as-root -n 2 trtllm-llmapi-launch trtllm-bench --model {model_name} " \
             f"--model_path {llama_model_dir} " \
             f"throughput " \
             f"--dataset {str(dataset_path)} --backend pytorch --tp 2"
@@ -1442,9 +1442,6 @@ def test_build_time_benchmark_sanity(llm_root, llm_venv):
     ])
 
 
-# End of HLAPI examples
-
-
 ### Pivot-To-Python examples
 def test_ptp_quickstart(llm_root, llm_venv):
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
@@ -1887,6 +1884,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         *accuracy_inputs[modality]["prompt"],
         "--media",
         *accuracy_inputs[modality]["media"],
+        "--disable_kv_cache_reuse",
     ]
     # NOTE
     # Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens.
@@ -1967,6 +1965,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             functionality_inputs[modality]["prompt"],
             "--media",
             *functionality_inputs[modality]["media"],
+            "--disable_kv_cache_reuse",
         ],
                          stdout=running_log)
 

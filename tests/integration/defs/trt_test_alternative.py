@@ -203,11 +203,12 @@ def call(*popenargs,
          **kwargs):
     if not suppress_output_info:
         print(f"Start subprocess with call({popenargs}, {kwargs})")
+    actual_timeout = get_pytest_timeout(timeout)
     with popen(*popenargs,
                start_new_session=start_new_session,
                suppress_output_info=True,
                **kwargs) as p:
-        return p.wait(timeout=timeout)
+        return p.wait(timeout=actual_timeout)
 
 
 def check_call(*popenargs, **kwargs):
@@ -223,12 +224,13 @@ def check_call(*popenargs, **kwargs):
 
 def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
     print(f"Start subprocess with check_output({popenargs}, {kwargs})")
+    actual_timeout = get_pytest_timeout(timeout)
     with Popen(*popenargs,
                stdout=subprocess.PIPE,
                start_new_session=start_new_session,
                **kwargs) as process:
         try:
-            stdout, stderr = process.communicate(None, timeout=timeout)
+            stdout, stderr = process.communicate(None, timeout=actual_timeout)
         except subprocess.TimeoutExpired as exc:
             cleanup_process_tree(process, start_new_session)
             if is_windows():
@@ -303,3 +305,26 @@ def check_call_negative_test(*popenargs, **kwargs):
             f"Subprocess expected to fail with check_call_negative_test({popenargs}, {kwargs}), but passed."
         )
         raise subprocess.CalledProcessError(1, cmd)
+
+
+def get_pytest_timeout(timeout=None):
+    try:
+        import pytest
+        marks = None
+        try:
+            current_item = pytest.current_test
+            if hasattr(current_item, 'iter_markers'):
+                marks = list(current_item.iter_markers('timeout'))
+        except (AttributeError, NameError):
+            pass
+
+        if marks and len(marks) > 0:
+            timeout_mark = marks[0]
+            timeout_pytest = timeout_mark.args[0] if timeout_mark.args else None
+            if timeout_pytest and isinstance(timeout_pytest, (int, float)):
+                return max(30, int(timeout_pytest * 0.9))
+
+    except (ImportError, Exception) as e:
+        print(f"Error getting pytest timeout: {e}")
+
+    return timeout
