@@ -53,7 +53,7 @@ from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (CutlassFusedMoE, DeepSeekV3MoeRoutingMethod,
-                                 MoeLoadBalancer, create_moe)
+                                 create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel

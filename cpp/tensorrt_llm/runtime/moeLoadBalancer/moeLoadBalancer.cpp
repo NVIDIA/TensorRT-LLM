@@ -986,7 +986,6 @@ void MoeLoadBalancer::workerThread()
     }
     addUpdateTask(nullptr);
     mComputeAndUpdateThread->join();
-    TLLM_LOG_INFO("MoeLoadBalancer worker thread stopped");
 }
 
 void MoeLoadBalancer::computeAndUpdateThread()
@@ -1005,7 +1004,6 @@ void MoeLoadBalancer::computeAndUpdateThread()
         }
         task();
     }
-    TLLM_LOG_INFO("MoeLoadBalancer compute and update thread stopped");
 }
 
 void MoeLoadBalancer::addUpdateTask(std::function<void()> task)
