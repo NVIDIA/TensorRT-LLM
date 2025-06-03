@@ -1016,7 +1016,7 @@ class Llama4InputProcessor(InputProcessor):
 
 
 @register_auto_model("Llama4ForConditionalGeneration")
-@register_input_processor(Llama4InputProcessor)
+@register_input_processor(Llama4InputProcessor, model_type="llama4")
 class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                                                              Llama4Config]):
 

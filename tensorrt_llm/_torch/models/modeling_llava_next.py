@@ -192,7 +192,7 @@ class LlavaNextInputProcessor(InputProcessor):
 
 
 @register_auto_model("LlavaNextForConditionalGeneration")
-@register_input_processor(LlavaNextInputProcessor)
+@register_input_processor(LlavaNextInputProcessor, model_type="llava_next")
 class LlavaNextModel(PreTrainedModel):
     config_class = LlavaNextConfig
 
