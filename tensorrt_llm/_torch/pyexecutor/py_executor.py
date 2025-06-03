@@ -1608,12 +1608,13 @@ class PyExecutor:
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy request
-        req = self.active_requests[-1]
-        if req.is_attention_dp_dummy:
-            req.state = LlmRequestState.GENERATION_COMPLETE
-            self.inflight_req_ids.erase(req.py_request_id)
-            self._terminate_request(req)
-            self.active_requests.remove(req)
+        for request in reversed(self.active_requests):
+            if request.is_attention_dp_dummy:
+                request.state = LlmRequestState.GENERATION_COMPLETE
+                self.inflight_req_ids.erase(request.py_request_id)
+                self._terminate_request(request)
+                self.active_requests.remove(request)
+                break
 
         for request in scheduled_requests.context_requests:
             request.move_to_next_context_chunk()
