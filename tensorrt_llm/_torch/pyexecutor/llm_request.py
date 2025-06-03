@@ -44,14 +44,12 @@ class LogitsStorage:
         self.seq_length = seq_length
         self.use_device_memory = use_device_memory
         self._should_exclude_last = should_exclude_last
-        self.position = 0
-        self.last_position = 0
+        self._logits_indices = []
 
         # Lazily initialized by _init() upon first append()
         self._storage: torch.Tensor | None = None
         self.beam_width = -1
         self.vocab_size = -1
-        self._logits_indices = []
 
     def _init(self, logits: torch.Tensor):
         _, self.beam_width, self.vocab_size = logits.shape
@@ -80,17 +78,16 @@ class LogitsStorage:
 
         assert logits.size(1) == self.beam_width, "Beam width mismatch"
 
-        new_position = logits.size(0) + self.position
+        position = 0 if not self._logits_indices else self._logits_indices[-1][1]
+        new_position = logits.size(0) + position
         if new_position > self.seq_length:
             raise ValueError(
                 f"LogitsStorage overflow. This storage can only hold {self.seq_length} logits "
-                f"({self.position} already filled) but trying to append {logits.size(0)} more logits"
+                f"({position} already filled) but trying to append {logits.size(0)} more logits"
             )
 
-        self._storage[self.position:new_position].copy_(logits,
-                                                        non_blocking=True)
-        self._logits_indices.append((self.position, new_position))
-        self.last_position, self.position = self.position, new_position
+        self._storage[position:new_position].copy_(logits, non_blocking=True)
+        self._logits_indices.append((position, new_position))
 
     def get_at(self, index: int) -> torch.Tensor | None:
         if self._should_exclude_last:
@@ -102,8 +99,12 @@ class LogitsStorage:
             return None
 
     def get_all(self):
-        max_position = self.position - 1 if self._should_exclude_last else self.position
-        return self._storage[:max_position] if self._storage is not None else None
+        try:
+            last_index = -2 if self._should_exclude_last else -1
+            max_position = self._logits_indices[last_index][1]
+        except IndexError:
+            return None
+        return self._storage[:max_position]
 
     def set_exclude_last(self, should_exclude_last: bool) -> None:
         self._should_exclude_last = should_exclude_last
