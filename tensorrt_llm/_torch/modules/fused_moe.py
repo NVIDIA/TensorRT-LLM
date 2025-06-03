@@ -1568,7 +1568,8 @@ class FusedMoE(nn.Module):
                                         cutlass_min_latency_mode, output_dtype,
                                         all_rank_num_tokens, use_dp_padding)
         elif self.is_trtllm():
-            return self.forward_trtllmgen(x, router_logits)
+            return self.forward_trtllmgen(x, router_logits, all_rank_num_tokens,
+                                          use_dp_padding)
         else:
             raise NotImplementedError(
                 f"FusedMoE only supports CUTLASS or TRTLLM backends, not {self.moe_backend}"
@@ -1713,8 +1714,13 @@ class FusedMoE(nn.Module):
             outputs = outputs[:all_rank_num_tokens[rank]]
         return outputs
 
-    def forward_trtllmgen(self, x: torch.Tensor,
-                          router_logits: torch.Tensor) -> torch.Tensor:
+    def forward_trtllmgen(
+        self,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+    ) -> torch.Tensor:
         assert self.is_trtllm()
         assert x.dtype == torch.bfloat16
 
@@ -1808,6 +1814,10 @@ class FusedMoE(nn.Module):
         if self.reduce_results and self.parallel_size > 1:
             final_hidden_states = self.all_reduce(final_hidden_states)
 
+        if use_dp_padding:
+            rank = self.mapping.tp_rank
+            final_hidden_states = final_hidden_states[:
+                                                      all_rank_num_tokens[rank]]
         return final_hidden_states
 
     def alltoall_prepare_maybe_dispatch(self, all_rank_num_tokens: list,

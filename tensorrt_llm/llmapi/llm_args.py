@@ -1769,6 +1769,8 @@ def update_llm_args_with_extra_dict(
             if field == "speculative_config":
                 llm_args_dict[field] = field_type.from_dict(
                     llm_args_dict[field])
+            elif field == "pytorch_backend_config":
+                llm_args_dict.update(llm_args_dict[field])
             else:
                 llm_args_dict[field] = field_type(**llm_args_dict[field])
             extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""

@@ -97,20 +97,22 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_gemm_sm100(at::Tensor const& mat1
     }
 
     TORCH_CHECK(outDtype == at::ScalarType::Float8_e4m3fn || outDtype == torch::kHalf || outDtype == torch::kBFloat16,
-        "outDtype must be one of fp16/bf16/e4m3. It defaults to fp16.");
+        "outDtype must be one of fp16/bf16/e4m3. It defaults to fp16. Got ", outDtype);
 
-    TORCH_CHECK(mat1.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix A dtype must be FP8.");
-    TORCH_CHECK(mat2.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix B dtype must be FP8.");
+    TORCH_CHECK(
+        mat1.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix A dtype must be FP8. Got ", mat1.scalar_type());
+    TORCH_CHECK(
+        mat2.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix B dtype must be FP8. Got ", mat2.scalar_type());
 
     TORCH_CHECK(mat1.sizes()[2] == mat2.sizes()[2], "A and B shapes cannot be multiplied (", mat1.sizes()[0], "x",
         mat1.sizes()[1], "x", mat1.sizes()[2], " and ", mat2.sizes()[0], "x", mat2.sizes()[1], "x", mat2.sizes()[2],
         ")");
 
-    TORCH_CHECK(m % tileSize == 0, "M must be a multiple of tileSize");
-    TORCH_CHECK(tileSize <= std::numeric_limits<int32_t>::max(), "tileSize must be within int32");
-    TORCH_CHECK(m <= std::numeric_limits<int32_t>::max(), "M must be within int32");
-    TORCH_CHECK(n <= std::numeric_limits<int32_t>::max(), "N must be within int32");
-    TORCH_CHECK(k <= std::numeric_limits<int32_t>::max(), "K must be within int32");
+    TORCH_CHECK(m % tileSize == 0, "M (", m, ") must be a multiple of tileSize (", tileSize, ")");
+    TORCH_CHECK(tileSize <= std::numeric_limits<int32_t>::max(), "tileSize must be within int32, got ", tileSize);
+    TORCH_CHECK(m <= std::numeric_limits<int32_t>::max(), "M must be within int32, got ", m);
+    TORCH_CHECK(n <= std::numeric_limits<int32_t>::max(), "N must be within int32, got ", n);
+    TORCH_CHECK(k <= std::numeric_limits<int32_t>::max(), "K must be within int32, got ", k);
 
     int32_t constexpr dsFp8QuantBlockSize = 128;
     if (useDeepSeekFp8)
