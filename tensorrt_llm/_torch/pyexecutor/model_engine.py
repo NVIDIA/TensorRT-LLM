@@ -326,6 +326,7 @@ class PyTorchModelEngine(ModelEngine):
         )
 
         attn_backend = pytorch_backend_config.attn_backend
+        self.ckpt = model_path  # TODO: remove
         self.model = self._load_model(
             model_path,
             mapping=self.mapping,
@@ -980,7 +981,10 @@ class PyTorchModelEngine(ModelEngine):
 
     def _init_max_seq_len(self):
         if self.max_seq_len is None:
-            inferred_max_seq_len = self.model.infer_max_seq_len()
+            config = ModelConfig.from_pretrained(self.ckpt,
+                                                 trust_remote_code=True)
+            model_cls = AutoModelForCausalLM.get_model_class_from_config(config)
+            inferred_max_seq_len = model_cls.infer_max_seq_len(config)
             logger.info(
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
             )

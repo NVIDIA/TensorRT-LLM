@@ -522,9 +522,10 @@ class DecoderModelForCausalLM(nn.Module,
     def load_weights(self, weights: Dict, skip_modules: List[str] = []):
         _load_weights_impl(self, weights, skip_modules)
 
-    def infer_max_seq_len(self) -> int:
+    @staticmethod
+    def infer_max_seq_len(config: ModelConfig) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
-        rope_scaling = getattr(self.config, 'rope_scaling', None)
+        rope_scaling = getattr(config, 'rope_scaling', None)
         rope_factor = 1
         if rope_scaling is not None:
             rope_type = rope_scaling.get('type', rope_scaling.get('rope_type'))
@@ -533,8 +534,8 @@ class DecoderModelForCausalLM(nn.Module,
 
         # Step 1: Find the upper bound of max_seq_len
         inferred_max_seq_len = 2048
-        if getattr(self.config, 'max_position_embeddings', None) is not None:
-            inferred_max_seq_len = self.config.max_position_embeddings
+        if getattr(config, 'max_position_embeddings', None) is not None:
+            inferred_max_seq_len = config.max_position_embeddings
 
         # Step 2: Scale max_seq_len with rotary scaling
         if rope_factor != 1:

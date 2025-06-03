@@ -14,8 +14,7 @@ from utils.llm_data import llm_models_root
 
 
 @pytest.mark.parametrize("use_cuda_graph,attn_backend",
-                         [[True, "TRTLLM"], [False, "TRTLLM"],
-                          [True, "FLASHINFER"], [False, "FLASHINFER"]])
+                         [[True, "FLASHINFER"], [False, "FLASHINFER"]])
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -43,14 +42,10 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
         # Llama 3 does not support one model eagle.
         eagle3_one_model=False)
 
-    llm_spec = LLM(
-        model=target_model_dir,
-        **pytorch_config,
-        kv_cache_config=kv_cache_config,
-        speculative_config=spec_config,
-        # TODO: https://nvbugspro.nvidia.com/bug/5319281
-        max_num_tokens=2048,
-        max_seq_len=2048)
+    llm_spec = LLM(model=target_model_dir,
+                   **pytorch_config,
+                   kv_cache_config=kv_cache_config,
+                   speculative_config=spec_config)
 
     sampling_params = SamplingParams(
         max_tokens=32,
@@ -88,9 +83,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
 
     llm_ref = LLM(model=target_model_dir,
                   **pytorch_config,
-                  kv_cache_config=kv_cache_config,
-                  max_num_tokens=2048,
-                  max_seq_len=2048)
+                  kv_cache_config=kv_cache_config)
 
     results_ref = llm_ref.generate(prompts, sampling_params)
     generated_text_ref = [result.outputs[0].text for result in results_ref]

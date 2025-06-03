@@ -16,6 +16,7 @@ from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import register_auto_model
+from ..models.modeling_qwen import Qwen2ForCausalLM
 
 
 class Qwen2VLInputProcessorBase(InputProcessor):
@@ -387,8 +388,9 @@ class Qwen2VLModelBase(PreTrainedModel):
     def load_weights(self, weights):
         self.llm.load_weights(weights)
 
-    def infer_max_seq_len(self) -> int:
-        return self.llm.infer_max_seq_len()
+    @staticmethod
+    def infer_max_seq_len(config: ModelConfig) -> int:
+        return Qwen2ForCausalLM.infer_max_seq_len(config)
 
     def post_config(self):
         # use llm.config as config for pytorch model engine

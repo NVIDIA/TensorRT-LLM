@@ -285,14 +285,15 @@ class BertForSequenceClassification(nn.Module):
 
         return self.model_config.pretrained_config
 
-    def infer_max_seq_len(self) -> int:
+    @staticmethod
+    def infer_max_seq_len(config: ModelConfig) -> int:
         """
         We need to define this method because BertForSequenceClassification doesn't inherit from class DecoderModelForCausalLM in tensorrt_llm/models/modeling_utils.py
         This can be improved in the future.
         """
         inferred_max_seq_len = 2048
-        if getattr(self.config, 'max_position_embeddings', None) is not None:
-            inferred_max_seq_len = self.config.max_position_embeddings
+        if getattr(config, 'max_position_embeddings', None) is not None:
+            inferred_max_seq_len = config.max_position_embeddings
 
         return inferred_max_seq_len
 

@@ -1,4 +1,4 @@
-from typing import Generic
+from typing import Generic, Type
 
 from ..model_config import ModelConfig
 from ..utils import model_extra_attrs
@@ -9,9 +9,9 @@ from .modeling_utils import (MODEL_CLASS_MAPPING, DecoderModelForCausalLM,
 class AutoModelForCausalLM(Generic[TModel, TConfig]):
 
     @staticmethod
-    def from_config(
+    def get_model_class_from_config(
         config: ModelConfig[TConfig],
-    ) -> DecoderModelForCausalLM[TModel, TConfig]:
+    ) -> Type[DecoderModelForCausalLM[TModel, TConfig]]:
         model_arch = config.pretrained_config.architectures[0]
         # Hack to detect eagle3 checkpoints. TODO: should we provide
         # our own checkpoints with the correct arch? It would let us
@@ -24,6 +24,13 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             raise ValueError(
                 f"Unknown architecture for AutoModelForCausalLM: {config.pretrained_config.architectures[0]}"
             )
+        return cls
+
+    @staticmethod
+    def from_config(
+        config: ModelConfig[TConfig],
+    ) -> DecoderModelForCausalLM[TModel, TConfig]:
+        cls = AutoModelForCausalLM.get_model_class_from_config(config)
         if issubclass(cls, DecoderModelForCausalLM):
             config.skip_create_weights_in_init = True
         extra_attrs = {}

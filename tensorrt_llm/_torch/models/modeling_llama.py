@@ -936,14 +936,15 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
         return logits
 
-    def infer_max_seq_len(self):
-        if self.model_config.attn_backend.upper() != 'TRTLLM':
+    @staticmethod
+    def infer_max_seq_len(model_config: ModelConfig):
+        if model_config.attn_backend.upper() != 'TRTLLM':
             logger.warning(
                 f"Attention backend {self.model_config.attn_backend} "
                 "does not support chunked attention. Sequence length "
                 "will be limited to 8192.")
             return 8192
-        return super().infer_max_seq_len()
+        return DecoderModelForCausalLM.infer_max_seq_len(model_config)
 
     def load_weights(self, weights: Dict):
         super().load_weights(weights, skip_modules=["draft_model"])
@@ -1111,7 +1112,8 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                 return_context_logits=return_context_logits)
             return logits
 
-    def infer_max_seq_len(self):
+    @staticmethod
+    def infer_max_seq_len(_: ModelConfig):
         # TODO: implement chunked attention to support 10M context length
         return 8192
 

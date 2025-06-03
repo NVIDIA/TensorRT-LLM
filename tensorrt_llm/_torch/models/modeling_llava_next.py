@@ -231,8 +231,12 @@ class LlavaNextModel(PreTrainedModel):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
 
-    def infer_max_seq_len(self) -> int:
-        return self.llm.infer_max_seq_len()
+    @staticmethod
+    def infer_max_seq_len(config: ModelConfig) -> int:
+        llm_config = copy.copy(config)
+        llm_config.pretrained_config = llm_config.pretrained_config.text_config
+        llm_cls = AutoModelForCausalLM.get_model_class_from_config(llm_config)
+        return llm_cls.infer_max_seq_len(llm_config)
 
     @torch.inference_mode()
     def forward(

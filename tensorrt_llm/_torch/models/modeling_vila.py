@@ -617,12 +617,8 @@ def init_llm(
     model_config: ModelConfig[PretrainedConfig],
     attn_implementation=None,
     model_max_length=None,
-    *args,
-    **kwargs,
-) -> PreTrainedModel:
-    llm_cfg = AutoConfig.from_pretrained(llm_path)
-    tokenizer = init_tokenizer(llm_path)
-
+    instantiate: bool = False,
+):
     llm_cfg = AutoConfig.from_pretrained(llm_path)
     llm_cfg._attn_implementation = attn_implementation
     llm_cfg.model_max_length = model_max_length
@@ -637,14 +633,13 @@ def init_llm(
 
     llm_model_config = copy.deepcopy(model_config)
     llm_model_config.pretrained_config = llm_cfg
-    llm = AutoModelForCausalLM.from_config(llm_model_config)
-    if llm_cfg.vocab_size != len(tokenizer):
-        warnings.warn(
-            "LLM have a different vocab size than tokenizer. Consider update the LLM checkpoint with the tokenizer's vocab size with _resize_token_embeddings()."
-        )
+    if instantiate:
+        llm = AutoModelForCausalLM.from_config(llm_model_config)
+    else:
+        llm = AutoModelForCausalLM.get_model_class_from_config(llm_model_config)
 
     model_config.pretrained_config.hidden_size = llm.config.hidden_size
-    return tokenizer, llm, llm_path, llm_cfg.vocab_size
+    return llm, llm_model_config
 
 
 class VilaConfig(LlavaConfig):
@@ -1134,9 +1129,13 @@ class VilaModel(PreTrainedModel):
         config.model_dtype = self.model_dtype
 
         self.llm_path, _, _ = _get_model_paths(config)
-        self.tokenizer, self.llm, self.llm_path, self.vocab_size = init_llm(
-            self.llm_path, model_config, *args, **kwargs
-        )  # self.llm_path may be updated if ckpt re-saving is needed & existing path is read-only
+        self.tokenizer = init_tokenizer(self.llm_path)
+        self.llm, llm_model_config = init_llm(self.llm_path, model_config)
+        if llm_model_config.pretrained_config.vocab_size != len(tokenizer):
+            warnings.warn(
+                "LLM have a different vocab size than tokenizer. Consider update the LLM checkpoint with the tokenizer's vocab size with _resize_token_embeddings()."
+            )
+
         device = kwargs.get("device", "cuda")
         self.llm.to(device=device, dtype=self.model_dtype)
 
@@ -1190,8 +1189,13 @@ class VilaModel(PreTrainedModel):
             _resize_token_embeddings(self.llm, len(self.tokenizer))
             self.vocab_size = len(self.tokenizer)
 
-    def infer_max_seq_len(self) -> int:
-        return self.llm.infer_max_seq_len()
+    @staticmethod
+    def infer_max_seq_len(model_config: ModelConfig) -> int:
+        llm_path, _, _ = _get_model_paths(config)
+        llm_cls, llm_model_config = init_llm(llm_path,
+                                             model_config,
+                                             instantiate=False)
+        return llm_cls.infer_max_seq_len(llm_model_config)
 
     def post_config(self):
         # use llm.config as config for pytorch model engine

@@ -174,6 +174,7 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     if executor_config.max_num_tokens is None:
         executor_config.max_num_tokens = 8192
+
     dist = MPIDist(mapping=mapping)
 
     spec_config = executor_config.speculative_config
