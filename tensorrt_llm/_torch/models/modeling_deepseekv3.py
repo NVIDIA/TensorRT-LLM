@@ -38,7 +38,6 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -52,8 +51,9 @@ from ..models.modeling_utils import ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (CutlassFusedMoE, DeepSeekV3MoeRoutingMethod,
-                                 MoeLoadBalancer, create_moe)
+from ..modules.fused_moe import (AlltoallMethodType, CutlassFusedMoE,
+                                 DeepSeekV3MoeRoutingMethod, MoeLoadBalancer,
+                                 create_moe, select_alltoall_method_type)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -354,8 +354,6 @@ class Deepseekv3MoE(nn.Module):
         self.use_dp = model_config.mapping.enable_attention_dp
         self.enable_alltoall = Deepseekv3MoE.should_enable_alltoall(
             model_config, top_k)
-        if self.enable_alltoall:
-            MnnvlMemory.initialize()
         self.gate = DeepseekV3Gate(
             hidden_size,
             num_experts,
@@ -452,14 +450,15 @@ class Deepseekv3MoE(nn.Module):
         if model_config.mapping.tp_size == 1:
             return False
 
-        # if not MnnvlMemory.supports_mnnvl():
-        #     return False
-
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return False
 
         # if model_config.mapping.moe_ep_size <= top_k:
         #     return False
+
+        if select_alltoall_method_type(
+                model_config.mapping) == AlltoallMethodType.NotAvailable:
+            return False
 
         return True
 

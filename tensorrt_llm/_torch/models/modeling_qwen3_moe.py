@@ -6,18 +6,16 @@ from torch import nn
 from tqdm import tqdm
 from transformers import Qwen3MoeConfig
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
-
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            allgather)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE, MoE,
-                                 Qwen3MoeRoutingMethod,
+from ..modules.fused_moe import (AlltoallMethodType, BaseMoeRoutingMethod,
+                                 CutlassFusedMoE, MoE, Qwen3MoeRoutingMethod,
                                  RenormalizeMoeRoutingMethod, RoutingMethodType,
-                                 create_moe)
+                                 create_moe, select_alltoall_method_type)
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..utils import disable_fp4_allgather
@@ -92,8 +90,6 @@ class Qwen3MoE(nn.Module):
         self.allreduce = AllReduce(self.mapping)
         self.enable_alltoall = Qwen3MoE.should_enable_alltoall(
             model_config, self.top_k)
-        if self.enable_alltoall:
-            MnnvlMemory.initialize()
 
         self.gate = Qwen3Gate(
             hidden_size=self.hidden_dim,
@@ -124,13 +120,14 @@ class Qwen3MoE(nn.Module):
         if model_config.mapping.tp_size == 1:
             return False
 
-        if not MnnvlMemory.supports_mnnvl():
-            return False
-
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return False
 
         if model_config.mapping.moe_ep_size <= top_k:
+            return False
+
+        if select_alltoall_method_type(
+                model_config.mapping) == AlltoallMethodType.NotAvailable:
             return False
 
         return True

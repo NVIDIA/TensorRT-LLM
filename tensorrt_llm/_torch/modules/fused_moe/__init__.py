@@ -1,3 +1,5 @@
+from .alltoall_method_types import (AlltoallMethodType,
+                                    select_alltoall_method_type)
 from .create_moe import create_moe, get_moe_cls
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
@@ -18,5 +20,6 @@ __all__ = [
     "LoadBalancedMoeRoutingMethod", "StaticMoeRoutingMethod",
     "DefaultMoeRoutingMethod", "DeepSeekV3MoeRoutingMethod",
     "RoutingMethodType", "RenormalizeMoeRoutingMethod", "MoE",
-    "MoEWeightLoadingMode", "get_moe_cls", "create_moe"
+    "AlltoallMethodType", "MoEWeightLoadingMode", "get_moe_cls", "create_moe",
+    "select_alltoall_method_type"
 ]
