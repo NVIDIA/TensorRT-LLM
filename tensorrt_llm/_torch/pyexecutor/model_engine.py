@@ -900,15 +900,16 @@ class PyTorchModelEngine(ModelEngine):
                     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None,
                     lora_config: Optional[LoraConfig] = None,
                     **kwargs):
-        config = ModelConfig.from_pretrained(checkpoint_dir,
-                                             trust_remote_code=True,
-                                             **kwargs)
-        config.pytorch_backend_config = self.pytorch_backend_config
-        config.spec_config = self.spec_config
-        config.max_num_tokens = max_num_tokens
-        config.moe_max_num_tokens = moe_max_num_tokens
-        config.moe_load_balancer = moe_load_balancer
-        config.lora_config = lora_config
+        config = ModelConfig.from_pretrained(
+            checkpoint_dir,
+            trust_remote_code=True,
+            enable_min_latency=self.pytorch_backend_config.enable_min_latency,
+            spec_config=self.spec_config,
+            max_num_tokens=max_num_tokens,
+            moe_max_num_tokens=moe_max_num_tokens,
+            moe_load_balancer=moe_load_balancer,
+            lora_config=lora_config,
+            **kwargs)
 
         validate_and_set_kv_cache_quant(
             config, self.pytorch_backend_config.kv_cache_dtype)
