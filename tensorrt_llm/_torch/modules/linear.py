@@ -22,24 +22,10 @@ from ..utils import Fp4QuantizedTensor
 E2M1_MAX = 6.0
 
 
-def static_quantize_e4m3_per_tensor_debug(input_tensor, scale, return_fp8=True):
-    """
-    Simple Python version of static_quantize_e4m3_per_tensor for debugging.
-
-    Args:
-        input_tensor: Input tensor (float32/float16/bfloat16)
-        scale: Single scale value (float32)
-        return_fp8: If True, convert to actual FP8 E4M3 dtype
-
-    Returns:
-        quantized_tensor: Quantized tensor (FP8 E4M3 if return_fp8=True, else float32)
-    """
-
-    # Convert to float32 for computation
+def static_quantize_e4m3_per_tensor_debug(input_tensor, scale):
     input_float = input_tensor.float()
     scale_float = float(scale)
 
-    # Step 1: Scale the input
     # The actual quantization divides by scale: quantized = input / scale
     scaled_input = input_float / scale_float
 
@@ -48,19 +34,7 @@ def static_quantize_e4m3_per_tensor_debug(input_tensor, scale, return_fp8=True):
     FP8_E4M3_MAX = 448.0
     clamped = torch.clamp(scaled_input, -FP8_E4M3_MAX, FP8_E4M3_MAX)
 
-    # Step 3: Convert to actual FP8 E4M3 dtype if requested
-    if return_fp8:
-        try:
-            # Convert to actual FP8 E4M3 format
-            fp8_tensor = clamped.to(torch.float8_e4m3fn)
-            return fp8_tensor
-        except Exception as e:
-            print(
-                f"Warning: Could not convert to FP8 E4M3 ({e}), returning float32"
-            )
-            return clamped
-    else:
-        return clamped
+    return clamped.to(torch.float8_e4m3fn)
 
 
 class WeightMode(str, enum.Enum):
@@ -419,8 +393,6 @@ class Linear(nn.Module):
                         f"in_features ({self.in_features}) must be divisible by group_size ({group_size}) "
                         f"for INT4 per-group quantization scale dimensions.")
 
-                # For W4A8, use float16 for weight scales as they're still full precision values
-                # print(f"self dtype is {self.dtype} in create weights") # todo torch.bfloat16
                 self.weight_scale = Parameter(torch.empty(
                     (self.out_features, self.in_features // group_size),
                     dtype=torch.float16),
@@ -433,10 +405,9 @@ class Linear(nn.Module):
                                                           dtype=torch.float32),
                                              requires_grad=False)
                 self.inv_input_scale = Parameter(
-                    torch.tensor(1., dtype=torch.float32),
-                    requires_grad=False)  # todo delete?
+                    torch.tensor(1., dtype=torch.float32), requires_grad=False
+                )  # todo delete?? where does it get used in other quant modes?
 
-                # (amax_input*amax_weight) / (448*6*448*6)
                 self.alpha = Parameter(torch.empty([1], dtype=torch.float32),
                                        requires_grad=False)
 
@@ -534,45 +505,30 @@ class Linear(nn.Module):
                     bias,
                     zeros=None)
             elif self.has_w4a8_awq:
-                print(f"input is {input}")
                 if self.pre_quant_scale is not None:
                     pre_quant_scale = self.pre_quant_scale.repeat(
                         input.shape[0], 1)
                     input = torch.mul(input, pre_quant_scale)
-                    print(f"input after pr wuantization is {input}")
 
                 cur_input_scale = self.input_scale
                 if input.dtype != torch.float8_e4m3fn:
                     if self.input_scale is not None:
-                        print(
-                            "static quantization!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-                        )
-                        print(f"self.input_scale is {self.input_scale}")
                         # Static quantization
                         qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                             input, self.input_scale)
 
                         p_input = static_quantize_e4m3_per_tensor_debug(
                             input, self.input_scale)
-                        print(f"{p_input == qinput }")
+                        print(f"{torch.equal(p_input, qinput)}")
                     else:
                         assert False
                         # Dynamic quantization
-                        print(
-                            "dynamic quantization!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-                        )
                         qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
                             input)
                         cur_input_scale = cur_input_scale.to(torch.float32)
                 else:
                     assert False
                     qinput = input
-
-                print(f"qinput is {qinput}")
-                print(f"self.weight is {self.weight}")
-                print(f"self.weight_scale is {self.weight_scale}")
-                print(f"self.alpha is {self.alpha}")
-                print(f"bias is {bias}")
 
                 output = torch.ops.trtllm.w4a16_gemm(
                     input=qinput,
