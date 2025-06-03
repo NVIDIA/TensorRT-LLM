@@ -27,8 +27,8 @@ BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
 
-// UPLOAD_PATH = env.uploadPath ?: "sw-tensorrt-artifacts"
-UPLOAD_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/2052"
+UPLOAD_PATH = env.uploadPath ?: "sw-tensorrt-artifacts"
+ARTIFACT_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/2052"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 
@@ -408,7 +408,7 @@ def getCommonParameters()
     return [
         'gitlabSourceRepoHttpUrl': LLM_REPO,
         'gitlabCommit': '8166649d033109319d7d08cf9541d8996848018f',
-        'artifactPath': env.artifactPath,
+        'artifactPath': ARTIFACT_PATH,
         'uploadPath': UPLOAD_PATH,
     ]
 }
