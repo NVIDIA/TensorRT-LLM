@@ -230,7 +230,8 @@ def fp8_bmm(
 
     Args:
         input: unquantized input tensor with shape (B, M, K)
-        weight: pre-quantized weight tensor with shape (B, K, N), with dtype torch.float8_e4m3fn
+        weight: pre-quantized weight tensor with shape (B, K, N), with dtype torch.float8_e4m3fn,
+            or torch.float16, or torch.bfloat16
         input_scale: a scalar tensor defined as amax / max value (448.0)
         weight_scale: a scalar tensor defined as amax / max value (448.0)
 
