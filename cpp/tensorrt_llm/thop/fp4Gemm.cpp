@@ -110,7 +110,7 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
         CHECK_INPUT(mat1, FLOAT4_E2M1X2);
         CHECK_INPUT(mat2, FLOAT4_E2M1X2);
     }
-    int shape_scale = fp4GemmType == FP4GemmType::W4A8_NVFP4_MXFP8 ? 2 : 1;
+    int mat2_k_scale = fp4GemmType == FP4GemmType::W4A8_NVFP4_MXFP8 ? 2 : 1;
 
     CHECK_INPUT(mat1Scale, SF_DTYPE);
     CHECK_INPUT(mat2Scale, SF_DTYPE);
@@ -121,11 +121,11 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
     if (mat1.dim() == 2)
     {
         TORCH_CHECK(mat2.dim() == 2, "mat2 must be a matrix");
-        TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[1] * shape_scale, "mat1 and mat2 shapes cannot be multiplied (",
+        TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[1] * mat2_k_scale, "mat1 and mat2 shapes cannot be multiplied (",
             mat1.sizes()[0], "x", mat1.sizes()[1], " and ", mat2.sizes()[0], "x", mat2.sizes()[1], ")");
         m = mat1.sizes()[0];
         n = mat2.sizes()[0];
-        k = mat1.sizes()[1] * shape_scale;
+        k = mat2.sizes()[1] * 2;
         b = 1;
     }
     else if (mat1.dim() == 3)
@@ -133,11 +133,11 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
         TORCH_CHECK(mat2.dim() == 3, "mat2 must be a batch of matrices");
         TORCH_CHECK(mat1.sizes()[0] == mat2.sizes()[0], "mat1 and mat2 must have the same batch size (",
             mat1.sizes()[0], " and ", mat2.sizes()[0], ")");
-        TORCH_CHECK(mat1.sizes()[2] == mat2.sizes()[2] * shape_scale, "mat1 and mat2 shapes cannot be multiplied (",
+        TORCH_CHECK(mat1.sizes()[2] == mat2.sizes()[2] * mat2_k_scale, "mat1 and mat2 shapes cannot be multiplied (",
             mat1.sizes()[1], "x", mat1.sizes()[2], " and ", mat2.sizes()[1], "x", mat2.sizes()[2], ")");
         m = mat1.sizes()[1];
         n = mat2.sizes()[1];
-        k = mat1.sizes()[2] * shape_scale;
+        k = mat2.sizes()[2] * 2;
         b = mat1.sizes()[0];
     }
     else
@@ -170,7 +170,6 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
     {
         out = at::detail::empty_cuda(out_shape, out_dtype.value(), mat1.device(), std::nullopt);
     }
-
     switch (out_dtype.value())
     {
     case at::ScalarType::Half:
