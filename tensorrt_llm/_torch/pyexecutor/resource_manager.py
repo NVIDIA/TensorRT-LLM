@@ -300,15 +300,13 @@ class KVCacheManager(BaseResourceManager):
                                            req_beam_width, req)
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
-                    if req.py_draft_tokens is not None:
-                        for _ in range(len(req.py_draft_tokens)):
-                            self.impl.add_token(req.py_request_id)
+                    for _ in range(len(req.py_draft_tokens)):
+                        self.impl.add_token(req.py_request_id)
 
         for req in generation_batch:
             self.impl.add_token(req.py_request_id)
-            if req.py_draft_tokens is not None:
-                for _ in range(len(req.py_draft_tokens)):
-                    self.impl.add_token(req.py_request_id)
+            for _ in range(len(req.py_draft_tokens)):
+                self.impl.add_token(req.py_request_id)
 
     def add_dummy_requests(
         self,
@@ -328,7 +326,11 @@ class KVCacheManager(BaseResourceManager):
         requests = []
         for i, req_id in enumerate(request_ids):
             sampling_params = SamplingParams()
-            token_num = token_nums[i] if token_nums is not None else 1
+            # Here 1+max_num_draft_tokens is used to extend the prompt length to
+            # a non-zero number to skip illegal memory access issue in MLA kernel
+            # during warmup.
+            token_num = token_nums[
+                i] if token_nums is not None else 1 + max_num_draft_tokens
             encoder_input_tokens = [
                 1
             ] * token_num if self.impl.cross_kv else None
@@ -343,12 +345,16 @@ class KVCacheManager(BaseResourceManager):
             req.paged_kv_block_ids = []
             if prepare_resource:
                 self.impl.add_sequence(req_id, token_num, beam_width, req)
+                for _ in range(self.num_extra_kv_tokens):
+                    self.impl.add_token(req_id)
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
-                if max_num_draft_tokens > 0:
-                    req.py_draft_tokens = [0] * max_num_draft_tokens
+                req.py_draft_tokens = [1] * max_num_draft_tokens
+                if prepare_resource:
+                    for _ in range(max_num_draft_tokens):
+                        self.impl.add_token(req_id)
             requests.append(req)
         return requests
 

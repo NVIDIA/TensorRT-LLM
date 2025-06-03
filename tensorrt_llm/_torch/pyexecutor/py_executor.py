@@ -849,14 +849,14 @@ class PyExecutor:
                 finished_requests = []
 
                 if scheduled_batch.batch_size > 0:
-                    self.resource_manager.prepare_resources(scheduled_batch)
-                    if self.draft_model_engine is not None:
-                        self._prepare_draft_tokens(scheduled_batch)
-
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
+
+                    self.resource_manager.prepare_resources(scheduled_batch)
+                    if self.draft_model_engine is not None:
+                        self._prepare_draft_tokens(scheduled_batch)
 
                     batch_outputs = self._forward_step(scheduled_batch)
 
@@ -981,6 +981,11 @@ class PyExecutor:
                 self._pause_requests(scheduled_batch.paused_requests)
 
                 if scheduled_batch.batch_size > 0:
+                    if self.kv_cache_transceiver:
+                        # For generation requests which have completed KV cache transfer
+                        self._prepare_disagg_gen_transmission_complete(
+                            scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     generation_requests = scheduled_batch.generation_requests
@@ -999,11 +1004,6 @@ class PyExecutor:
                         if req.py_batch_idx is not None:
                             new_generation_requests.append(req)
                     scheduled_batch.generation_requests = new_generation_requests
-
-                    if self.kv_cache_transceiver:
-                        # For generation requests which have completed KV cache transfer
-                        self._prepare_disagg_gen_transmission_complete(
-                            scheduled_batch)
 
                     previous_tensors_device = self.previous_batch and self.previous_batch.sample_state.device
 
@@ -1299,8 +1299,7 @@ class PyExecutor:
             request_ids=list(range(num_dummy_request)),
             is_gen=not self.has_context_request,
             prepare_resource=not self.has_context_request,
-            max_num_draft_tokens=0
-            if self.has_context_request else self.max_draft_tokens,
+            max_num_draft_tokens=self.max_draft_tokens,
         )
         for llm_request in llm_request_list:
             llm_request.is_attention_dp_dummy = True
@@ -1542,7 +1541,8 @@ class PyExecutor:
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
-                req.py_draft_tokens = req.context_phase_params.draft_tokens
+                ctx_draft_tokens = req.context_phase_params.draft_tokens
+                req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.sampling_config.beam_width
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
