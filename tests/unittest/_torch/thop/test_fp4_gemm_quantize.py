@@ -79,7 +79,7 @@ class TestFunctional(unittest.TestCase):
                                                       sf_vec_size)
 
         c = (torch.ops.trtllm.fp4_gemm(a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,
-                                       False).float().cpu())
+                                       0).float().cpu())
 
         torch.cuda.synchronize()
         c_pt = torch.nn.functional.linear(a_pt, b_pt)
@@ -256,7 +256,7 @@ class TestProfiling(unittest.TestCase):
                                                       sf_vec_size)
 
         c_ref = torch.ops.trtllm.fp4_gemm(a_fp4, b_fp4, a_sf, b_sf,
-                                          ab_global_sf, False)
+                                          ab_global_sf, 0)
 
         best_config_idx = profiler.get_best_config_id(m, n, k)
         c_actual = profiler.run_gemm(a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,

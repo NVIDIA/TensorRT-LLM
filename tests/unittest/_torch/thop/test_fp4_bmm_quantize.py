@@ -111,7 +111,7 @@ class TestFunctional(unittest.TestCase):
                                                    1 / b_global_sf, sf_vec_size)
 
         c = (torch.ops.trtllm.fp4_bmm(a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,
-                                      False).float().cpu())
+                                      0).float().cpu())
 
         torch.cuda.synchronize()
 

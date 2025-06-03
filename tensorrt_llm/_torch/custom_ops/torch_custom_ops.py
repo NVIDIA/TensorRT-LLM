@@ -257,17 +257,17 @@ class FP4GemmRunner(TunableRunner):
 
     def __init__(
         self,
-        sf_use_ue8m0: bool,
+        fp4_gemm_type: fp4_utils.FP4GemmType,
         to_userbuffers: bool,
         output_dtype: torch.dtype,
     ):
-        self.sf_use_ue8m0 = sf_use_ue8m0
+        self.fp4_gemm_type = fp4_gemm_type
         self.output_dtype = output_dtype
         self.to_userbuffers = to_userbuffers
         if output_dtype not in FP4GemmRunner.runner_dict:
             FP4GemmRunner.runner_dict[
                 output_dtype] = torch.classes.trtllm.FP4GemmRunner(
-                    output_dtype, sf_use_ue8m0)
+                    output_dtype, int(fp4_gemm_type))
         self.fp4_gemm_runner = FP4GemmRunner.runner_dict[output_dtype]
 
     def get_valid_tactics(
@@ -290,7 +290,6 @@ class FP4GemmRunner(TunableRunner):
             mat1_scale,
             mat2_scale,
             global_scale,
-            self.sf_use_ue8m0,
             self.to_userbuffers,
             tactic,
         )
@@ -310,7 +309,8 @@ def nvfp4_gemm(
     tuner = AutoTuner.get()
 
     # allocate workspace for profiling
-    nvfp4_gemm_runner = FP4GemmRunner(False, to_userbuffers, output_dtype)
+    nvfp4_gemm_runner = FP4GemmRunner(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+                                      to_userbuffers, output_dtype)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::fp4_gemm::gemm",
@@ -351,18 +351,9 @@ def w4a8_mxfp4_fp8_gemm(
 
     tuner = AutoTuner.get()
 
-    tuning_config = TuningConfig(
-        dynamic_tensors=((0, 0, (
-            lambda x: get_power_of_2_num_tokens_buckets(8192)
-            if not to_userbuffers else get_last_power_of_2_num_tokens_buckets(
-                x), lambda x: next_positive_power_of_2(x)
-            if not to_userbuffers else last_positive_power_of_2(x))), ),
-        constraints=((2, 0, fp4_scale_dims), ),
-    )
-
     # allocate workspace for profiling
-    w4a8_mxfp4_fp8_gemm_runner = FP4GemmRunner(True, to_userbuffers,
-                                               output_dtype)
+    w4a8_mxfp4_fp8_gemm_runner = FP4GemmRunner(
+        fp4_utils.FP4GemmType.W4A8_NVFP4_MXFP8, to_userbuffers, output_dtype)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::w4a8_mxfp4_fp8_gemm::gemm",
