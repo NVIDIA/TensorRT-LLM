@@ -1695,7 +1695,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         int const smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts
 
         assert(half_rotary_dim % QK_VEC_SIZE == 0);
-        if (params.position_embedding_type == PositionEmbeddingType::kROPE_M)
+        if (params.position_embedding_type == PositionEmbeddingType::kROPE_M && params.mrope_position_deltas != nullptr)
         {
             current_pos_idx += params.mrope_position_deltas[batch_idx];
         }
