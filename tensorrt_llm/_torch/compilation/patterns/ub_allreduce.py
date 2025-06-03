@@ -40,6 +40,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 strategy,
                 fusion,
                 KeywordArg('eps'),
+                Ignored(),
                 _users=2)
             allreduce_output = CallFunction(getitem, trtllm_allreduce_default,
                                             0)
@@ -117,6 +118,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 strategy,
                 fusion,
                 KeywordArg('eps'),
+                Ignored(),
                 _users=2)
             allreduce_output = CallFunction(getitem, trtllm_allreduce_default,
                                             0)
@@ -193,7 +195,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
             torch.ops.trtllm.allreduce.default, input_node,
             KeywordArg('residual_in'), KeywordArg('gamma'), KeywordArg('scale'),
             None, Ignored(), mapping.tp_group, strategy, fusion,
-            KeywordArg('eps'))
+            KeywordArg('eps'), Ignored())
         convert_pattern = MultiOutputPattern([trtllm_allreduce_default])
 
         def empty_convert_supported_ar_to_ub(
@@ -428,7 +430,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 trtllm_userbuffers_allreduce_finalize_default,
                 KeywordArg("gamma"), KeywordArg("scale"), Ignored(), Ignored(),
                 mapping.tp_group, int(AllReduceStrategy.UB),
-                KeywordArg("fusion_op"), KeywordArg("eps"))
+                KeywordArg("fusion_op"), KeywordArg("eps"), Ignored())
             ub_ar_finalize_pattern = MultiOutputPattern(
                 [trtllm_allreduce_default])
 
@@ -473,7 +475,8 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 trtllm_userbuffers_allreduce_finalize_default,
                 KeywordArg("gamma"), Ignored(), Ignored(), Ignored(),
                 mapping.tp_group, int(AllReduceStrategy.UB),
-                int(AllReduceFusionOp.RESIDUAL_RMS_NORM), KeywordArg("eps"))
+                int(AllReduceFusionOp.RESIDUAL_RMS_NORM), KeywordArg("eps"),
+                Ignored())
             ub_ar_finalize_pattern = MultiOutputPattern(
                 [trtllm_allreduce_default])
 

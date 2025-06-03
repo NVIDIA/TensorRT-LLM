@@ -23,13 +23,11 @@ def register_ar_residual_norm(custom_pass: PatternMatcherPass):
         rank=tensorrt_llm.mpi_rank(),
     )
     residual_key = KeywordArg("residual")
-    trtllm_allreduce_default = CallFunction(torch.ops.trtllm.allreduce.default,
-                                            KeywordArg("input"), None, None,
-                                            None, None, KeywordArg("workspace"),
-                                            mapping.tp_group,
-                                            KeywordArg("strategy"),
-                                            int(AllReduceFusionOp.NONE),
-                                            Ignored())
+    trtllm_allreduce_default = CallFunction(
+        torch.ops.trtllm.allreduce.default, KeywordArg("input"), None, None,
+        None, None, KeywordArg("workspace"), mapping.tp_group,
+        KeywordArg("strategy"), int(AllReduceFusionOp.NONE), Ignored(),
+        KeywordArg("trigger_completion_at_end"))
     getitem_x = CallFunction(getitem, trtllm_allreduce_default, 0)
     add_Tensor = CallFunction(aten.add.Tensor,
                               getitem_x,
