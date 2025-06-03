@@ -2135,6 +2135,6 @@ class PyExecutor:
         # before it. Since all these calls work on the same request object, then its
         # logits storage contains the logits of both the token update_requests should work
         # on, and also its next token. Thus, excluding the last generation logits from any
-        # getter is required.
+        # getter is required, when not using TorchSampler.
         return not self.disable_overlap_scheduler and not isinstance(
             self.sampler, TorchSampler)
