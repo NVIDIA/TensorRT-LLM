@@ -54,6 +54,9 @@
 namespace batchedGemm
 {
 
+namespace batchedGemm
+{
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace tg = trtllm::gen;
@@ -79,32 +82,32 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
 
     // FIXME We create explicit constructor with all options to WAR stubgen issue in TRT-LLM.
     BatchedGemmOptions(gemm::AllReduceAlgo allReduceAlgo, int clusterDimX, int clusterDimY, int clusterDimZ,
-        tg::Dtype dtypeAcc, tg::Dtype dtypeElt, tg::Dtype dtypeC, bool enablesEarlyExit, bool enablesDelayedEarlyExit,
-        bool enablesGlobalPtxKnobs, int epilogueTileM, int epilogueTileN, bool gridTriggerSecondaryA,
-        bool gridTriggerSecondaryB, bool gridWaitForPrimaryEarlyExit, bool gridWaitForPrimaryA,
-        bool gridWaitForPrimaryB, bool hoistLoadTaskInit, bool hoistMmaTaskTryWaits, int k,
-        gemm::KernelTraits kernelTraits, int m, int mmaK, int mmaM, int mmaN, bool mockAllReduce, int n,
-        int numSlicesForSplitK, int numSlicesForSliceK, int numStages, int numStagesMma, int numStagesMmaWithinWorkTile,
-        int numStagesMmaAcrossWorkTile, int numStagesWorkId, bool outputDebugTensors, bool useShuffledMatrixA,
-        bool sliceK, gemm::SplitK splitK, bool transposeMmaOutput, int tileM, int tileN, int tileK,
-        bool useUnrollLoop2xForMma, bool useCustomMmaSchedule, bool useHoistTryWaitForCustomMmaSchedule,
-        bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps,
-        bool useTwoMmaWarps, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
-        gemm::TileScheduler tileScheduler, gemmGatedAct::ActType actType, std::vector<int> batchedM,
-        std::vector<int> batchedN, BatchMode batchMode, int numBatches, bool isStaticBatch, int numTokens,
-        bool routeAct, bool gridWaitForPrimaryRouting, bool fusedAct, int numRegsPerThreadNonEpilogueWarp,
-        int numRegsPerThreadEpilogueWarp)
+        tg::Dtype dtypeAcc, tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, bool enablesEarlyExit,
+        bool enablesDelayedEarlyExit, bool enablesGlobalPtxKnobs, int epilogueLdtmDps, int epilogueLdtmBits,
+        int epilogueTileM, int epilogueTileN, bool gridTriggerSecondaryA, bool gridTriggerSecondaryB,
+        bool gridWaitForPrimaryEarlyExit, bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit,
+        bool hoistMmaTaskTryWaits, int k, gemm::KernelTraits kernelTraits, int m, int mmaK, tg::MmaKind mmaKind,
+        int mmaM, int mmaN, bool mockAllReduce, int n, int numSlicesForSplitK, int numSlicesForSliceK, int numStages,
+        int numStagesMma, int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile, int numStagesWorkId,
+        bool outputDebugTensors, bool useShuffledMatrixA, bool sliceK, gemm::SplitK splitK, bool transposeMatrixA,
+        bool transposeMatrixB, bool transposeMmaOutput, int tileM, int tileN, int tileK, bool useUnrollLoop2xForMma,
+        bool useCustomMmaSchedule, bool useHoistTryWaitForCustomMmaSchedule, bool useDeepSeekFp8, bool usePerTokenSfA,
+        bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps, tg::SfLayout sfLayoutA,
+        tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC, gemm::TileScheduler tileScheduler,
+        gemmGatedAct::ActType actType, std::vector<int> batchedM, std::vector<int> batchedN, BatchMode batchMode,
+        int numBatches, bool isStaticBatch, int numTokens, bool routeAct, bool gridWaitForPrimaryRouting, bool fusedAct,
+        int numRegsPerThreadNonEpilogueWarp, int numRegsPerThreadEpilogueWarp)
         : gemmGatedAct::GemmGatedActOptions(
-            gemm::GemmOptions(allReduceAlgo, clusterDimX, clusterDimY, clusterDimZ, dtypeAcc, dtypeElt, dtypeC,
-                enablesEarlyExit, enablesDelayedEarlyExit, enablesGlobalPtxKnobs, epilogueTileM, epilogueTileN,
-                gridTriggerSecondaryA, gridTriggerSecondaryB, gridWaitForPrimaryEarlyExit, gridWaitForPrimaryA,
-                gridWaitForPrimaryB, hoistLoadTaskInit, hoistMmaTaskTryWaits, k, kernelTraits, m, mmaK, mmaM, mmaN,
-                mockAllReduce, n, numSlicesForSplitK, numSlicesForSliceK, numStages, numStagesMma,
-                numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile, numStagesWorkId, outputDebugTensors,
-                useShuffledMatrixA, sliceK, splitK, transposeMmaOutput, tileM, tileN, tileK, useUnrollLoop2xForMma,
-                useCustomMmaSchedule, useHoistTryWaitForCustomMmaSchedule, useDeepSeekFp8, usePerTokenSfA,
-                usePerTokenSfB, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps, sfLayoutA, sfLayoutB, sfLayoutC,
-                tileScheduler),
+            gemm::GemmOptions(allReduceAlgo, clusterDimX, clusterDimY, clusterDimZ, dtypeAcc, dtypeA, dtypeB, dtypeC,
+                enablesEarlyExit, enablesDelayedEarlyExit, enablesGlobalPtxKnobs, epilogueLdtmDps, epilogueLdtmBits,
+                epilogueTileM, epilogueTileN, gridTriggerSecondaryA, gridTriggerSecondaryB, gridWaitForPrimaryEarlyExit,
+                gridWaitForPrimaryA, gridWaitForPrimaryB, hoistLoadTaskInit, hoistMmaTaskTryWaits, k, kernelTraits, m,
+                mmaK, mmaKind, mmaM, mmaN, mockAllReduce, n, numSlicesForSplitK, numSlicesForSliceK, numStages,
+                numStagesMma, numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile, numStagesWorkId,
+                outputDebugTensors, useShuffledMatrixA, sliceK, splitK, transposeMatrixA, transposeMatrixB,
+                transposeMmaOutput, tileM, tileN, tileK, useUnrollLoop2xForMma, useCustomMmaSchedule,
+                useHoistTryWaitForCustomMmaSchedule, useDeepSeekFp8, usePerTokenSfA, usePerTokenSfB, useTmaStore,
+                useTwoTmaLoadWarps, useTwoMmaWarps, sfLayoutA, sfLayoutB, sfLayoutC, tileScheduler),
             actType)
         , mBatchedM(batchedM)
         , mBatchedN(batchedN)
@@ -228,11 +231,35 @@ bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, bool isBlackw
         TLLM_CHECK_ERROR(
             options.mK % 128 == 0, "GEMM-K must be a multiple of 128 when using DeepSeek Fp8. Found ", options.mK);
 
-        TLLM_CHECK_ERROR(options.mDtypeC != tg::Dtype::E2m1 && options.mDtypeElt != tg::Dtype::E2m1,
+        TLLM_CHECK_ERROR(options.mDtypeC != tg::Dtype::E2m1 && options.mDtypeA == tg::Dtype::E4m3
+                && options.mDtypeB == tg::Dtype::E4m3,
             "E2m1 is not supported with DeepSeek FP8");
     }
 
+    if (batchM)
+    {
+        if (options.mDtypeA == tg::Dtype::MxE2m1 && options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4)
+        {
+            TLLM_CHECK_ERROR(!options.mRouteAct, "RouteAct is not supported with dtypeA = MxE2m1 and MxFp8Fp6Fp4.");
+        }
+    }
+    else
+    {
+        if (options.mDtypeB == tg::Dtype::MxE2m1 && options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4)
+        {
+            TLLM_CHECK_ERROR(!options.mRouteAct, "RouteAct is not supported with dtypeB = MxE2m1 and MxFp8Fp6Fp4.");
+        }
+    }
+
     TLLM_CHECK_ERROR(options.mUseTmaStore, "Only TMA store is supported.");
+    if (batchM)
+    {
+        TLLM_CHECK_ERROR(!options.mTransposeMatrixA, "Activations must be in k-major format");
+    }
+    else
+    {
+        TLLM_CHECK_ERROR(options.mTransposeMatrixB, "Activations must be in k-major format");
+    }
     return isValid;
 }
 
@@ -298,3 +325,5 @@ inline std::string dumpOptions(BatchedGemmOptions const& options)
 #undef TLLM_LOG_ERROR
 
 #endif // TLLM_GEN_EXPORT_INTERFACE
+
+} // namespace batchedGemm

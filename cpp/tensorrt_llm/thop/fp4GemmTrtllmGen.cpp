@@ -15,7 +15,6 @@
  */
 
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
-#include "tensorrt_llm/kernels/trtllmGenKernels/common/Dtype.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/gemm/KernelRunner.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -32,11 +31,13 @@ namespace torch_ext
 namespace
 {
 
-template <tensorrt_llm::kernels::Dtype outDtype>
+namespace tg = gemm::trtllm::gen;
+
+template <tg::Dtype outDtype>
 void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
     at::Tensor const& mat2Scale, at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k)
 {
-    auto eltType = tensorrt_llm::kernels::Dtype::E2m1;
+    auto eltType = tg::Dtype::E2m1;
 
     tensorrt_llm::kernels::TrtllmGenGemmRunnerOptions options
         = {.eltType = eltType, .outputType = outDtype, .deepSeekFp8 = false};
@@ -54,7 +55,7 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
     float* outScalePtr = globalScale.data_ptr<float>();
 
     runner.run(m, n, k, mat1.const_data_ptr(), mat1ScalePtr, mat2.const_data_ptr(), mat2ScalePtr, out.data_ptr(),
-        outScalePtr, workspace.data_ptr(), stream.stream(), mat1.get_device());
+        outScalePtr, /* cScalePtr */ nullptr, workspace.data_ptr(), stream.stream(), mat1.get_device());
 }
 
 // mat1: [M, K / 2], FLOAT4_E2M1X2
@@ -101,13 +102,13 @@ at::Tensor fp4_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Ten
     switch (out_dtype.value())
     {
     case at::ScalarType::Half:
-        runGemm<tensorrt_llm::kernels::Dtype::Fp16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k);
+        runGemm<tg::Dtype::Fp16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k);
         break;
     case at::ScalarType::BFloat16:
-        runGemm<tensorrt_llm::kernels::Dtype::Bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k);
+        runGemm<tg::Dtype::Bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k);
         break;
     case at::ScalarType::Float:
-        runGemm<tensorrt_llm::kernels::Dtype::Fp32>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k);
+        runGemm<tg::Dtype::Fp32>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k);
         break;
     default: C10_THROW_ERROR(NotImplementedError, "out_dtype must be one of fp16/bf16/fp32.");
     }
