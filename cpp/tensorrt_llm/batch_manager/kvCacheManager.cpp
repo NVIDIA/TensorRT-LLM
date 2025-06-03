@@ -1633,12 +1633,19 @@ void KVCacheManager::startScheduling()
 SizeType32 KVCacheManager::getNeededBlocksOneStep(
     LlmRequest const& req, bool twoStepsLookAhead, SizeType32 windowSize) const
 {
-    SizeType32 numRequiredBlocks = 0;
-    SizeType32 const numDraftTokens = req.getNumDraftTokens();
-    SizeType32 const generatedTokens = req.getMaxNumGeneratedTokens();
-    SizeType32 const maxTokensToAddToKVCache = req.mMaxNewTokens - generatedTokens + 1;
-    SizeType32 const numTokensPerStep = std::min(numDraftTokens + 1, maxTokensToAddToKVCache);
-    SizeType32 const numDraftTokensPerStep = std::min(numDraftTokens, maxTokensToAddToKVCache);
+    SizeType32 numRequiredBlocks{0};
+    SizeType32 numCurrTokens{0};
+    if (mSequences.count(req.mRequestId) > 0)
+    {
+        numCurrTokens = mSequences.at(req.mRequestId).getNumTokens();
+    }
+
+    auto const numDraftTokens = req.getNumDraftTokens();
+    auto const generatedTokens = numCurrTokens - req.getPromptLen();
+    auto const maxTokensToAddToKVCache = req.mMaxNewTokens - generatedTokens + 1;
+    auto const numTokensPerStep = std::min(numDraftTokens + 1, maxTokensToAddToKVCache);
+    auto const numDraftTokensPerStep = std::min(numDraftTokens, maxTokensToAddToKVCache);
+
     if ((req.isContextInitState() && req.isFirstContextChunk()) || req.isDisaggGenerationInitState())
     {
         // Assumes shared among beam = True
@@ -1657,20 +1664,17 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
         {
             return 0;
         }
-        // Here we need to check if next token or the one after would require a new block
-        // Because the active requests could be in flight, thus will only get their number
-        // of generated tokens to be updated after scheduling
-        auto const numPastTokens = req.mPromptLen + generatedTokens + mSinkBubbleLength - 1;
-        auto const numNextTokens = numPastTokens + (twoStepsLookAhead ? 2 : 1) * numTokensPerStep;
+
+        auto const numNextTokens = numCurrTokens + (twoStepsLookAhead ? 2 : 1) * numTokensPerStep;
 
         if (numNextTokens > mBlockManager.getWindowSizeMetadata(windowSize).maxTokenNum)
         {
             return 0;
         }
 
-        auto const numPastBlocks = tc::ceilDiv(numPastTokens, getTokensPerBlock());
+        auto const numCurrBlocks = tc::ceilDiv(numCurrTokens, getTokensPerBlock());
         auto const numNextBlocks = tc::ceilDiv(numNextTokens, getTokensPerBlock());
-        numRequiredBlocks = (numNextBlocks - numPastBlocks) * req.mSamplingConfig.beamWidth;
+        numRequiredBlocks = (numNextBlocks - numCurrBlocks) * req.mSamplingConfig.beamWidth;
     }
     return numRequiredBlocks;
 }
