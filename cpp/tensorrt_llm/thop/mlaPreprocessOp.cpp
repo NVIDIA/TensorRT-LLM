@@ -101,6 +101,24 @@ void appendPagedKVCacheForMLAHelper(KVBlockArray& kv_cache, torch::Tensor const&
         stream);
 }
 
+template <typename T, typename TCache>
+void invokeMLARopeAppendPagedKVAssignQHelper(KVBlockArray& kv_cache, torch::Tensor& q,
+    torch::Tensor const& latent_cache, int const num_requests, torch::Tensor const& cu_ctx_cached_kv_lens,
+    torch::Tensor const& cu_seq_lens, int const max_input_uncached_seq_len, torch::Tensor const& cos_sin_cache,
+    int const head_num, int const nope_size, int const rope_size, int const lora_size,
+    float const* kv_scale_orig_quant_ptr)
+{
+    auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+    auto* q_ptr = static_cast<T*>(q.data_ptr());
+    auto const* latent_cache_ptr = static_cast<T const*>(latent_cache.data_ptr());
+    auto const* cu_ctx_cached_kv_lens_ptr = cu_ctx_cached_kv_lens.data_ptr<int64_t>();
+    auto const* cu_seq_lens_ptr = cu_seq_lens.data_ptr<int64_t>();
+    auto const* cos_sin_cache_ptr = static_cast<float2 const*>(cos_sin_cache.data_ptr());
+    tensorrt_llm::kernels::invokeMLARopeAppendPagedKVAssignQ<T, TCache>(kv_cache, q_ptr, latent_cache_ptr, num_requests,
+        cu_ctx_cached_kv_lens_ptr, cu_seq_lens_ptr, max_input_uncached_seq_len, cos_sin_cache_ptr, head_num, nope_size,
+        rope_size, lora_size, kv_scale_orig_quant_ptr, stream);
+}
+
 /**
  * Creates a KVBlockArray object for managing KV cache
  *
@@ -461,6 +479,101 @@ void appendPagedKVCacheForMLA(torch::Tensor const& compressed_kv, torch::Tensor 
     }
 }
 
+void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor const& latent_cache, int64_t const num_contexts,
+    torch::Tensor const& cu_ctx_cached_kv_lens, torch::Tensor const& cu_seq_lens,
+    int64_t const max_input_uncached_seq_len, torch::Tensor const& cos_sin_cache, int64_t const head_num,
+    int64_t const nope_size, int64_t const rope_size, int64_t const lora_size,
+    torch::Tensor const& kv_cache_block_offsets, torch::Tensor const& host_kv_cache_block_offsets,
+    torch::Tensor const& host_kv_cache_pool_pointers, torch::Tensor const& host_kv_cache_pool_mapping,
+    torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
+    int64_t const layer_idx, int64_t const tokens_per_block, int64_t const attention_window_size,
+    int64_t const sink_token_length, int64_t const beam_width, int64_t const quant_mode)
+{
+    auto input_dtype = q.scalar_type();
+    TORCH_CHECK(input_dtype == torch::kFloat16 || input_dtype == torch::kFloat32 || input_dtype == torch::kBFloat16);
+    TORCH_CHECK(q.numel() > 0);
+    TORCH_CHECK(q.dim() == 2);
+    CHECK_TH_CUDA(q);
+    CHECK_CONTIGUOUS(q);
+    CHECK_INPUT(latent_cache, input_dtype);
+    TORCH_CHECK(latent_cache.dim() == 2);
+    CHECK_INPUT(cu_seq_lens, torch::kInt64);
+    TORCH_CHECK(cu_seq_lens.dim() == 1);
+    TORCH_CHECK(cu_seq_lens.size(0) >= num_contexts + 1);
+    CHECK_INPUT(cu_ctx_cached_kv_lens, torch::kInt64);
+    TORCH_CHECK(cu_ctx_cached_kv_lens.dim() == 1);
+    TORCH_CHECK(cu_ctx_cached_kv_lens.size(0) >= num_contexts + 1);
+    TORCH_CHECK(max_input_uncached_seq_len > 0);
+
+    auto kv_cache_quant_mode = tc::QuantMode(static_cast<uint32_t>(quant_mode));
+    int max_blocks_per_sequence = kv_cache_block_offsets.size(-1);
+    int head_size = lora_size + rope_size;
+    KVBlockArray kv_cache_buffer
+        = createKVBlockArray(num_contexts, max_blocks_per_sequence, tokens_per_block, head_size,
+            1, // num_kv_heads is always 1 for MLA
+            attention_window_size, sink_token_length, beam_width, kv_cache_quant_mode, input_dtype,
+            host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, kv_cache_block_offsets, layer_idx);
+
+    float const* kv_scale_orig_quant_ptr = nullptr;
+    float const* kv_scale_quant_orig_ptr = nullptr;
+    if (kv_cache_quant_mode.hasKvCacheQuant())
+    {
+        TLLM_CHECK_WITH_INFO(kv_cache_quant_mode.hasFp8KvCache(), "Only FP8 KV cache is supported for now");
+        TORCH_CHECK(kv_scale_orig_quant.has_value());
+        TORCH_CHECK(kv_scale_quant_orig.has_value());
+        kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
+        kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
+        TLLM_CHECK(kv_scale_orig_quant_ptr != nullptr);
+        TLLM_CHECK(kv_scale_quant_orig_ptr != nullptr);
+    }
+
+    if (input_dtype == torch::kFloat16)
+    {
+        if (kv_cache_quant_mode.hasFp8KvCache())
+        {
+            invokeMLARopeAppendPagedKVAssignQHelper<half, __nv_fp8_e4m3>(kv_cache_buffer, q, latent_cache, num_contexts,
+                cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num, nope_size,
+                rope_size, lora_size, kv_scale_orig_quant_ptr);
+        }
+        else
+        {
+            invokeMLARopeAppendPagedKVAssignQHelper<half, half>(kv_cache_buffer, q, latent_cache, num_contexts,
+                cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num, nope_size,
+                rope_size, lora_size, kv_scale_orig_quant_ptr);
+        }
+    }
+    else if (input_dtype == torch::kFloat32)
+    {
+        if (kv_cache_quant_mode.hasFp8KvCache())
+        {
+            invokeMLARopeAppendPagedKVAssignQHelper<float, __nv_fp8_e4m3>(kv_cache_buffer, q, latent_cache,
+                num_contexts, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
+                nope_size, rope_size, lora_size, kv_scale_orig_quant_ptr);
+        }
+        else
+        {
+            invokeMLARopeAppendPagedKVAssignQHelper<float, float>(kv_cache_buffer, q, latent_cache, num_contexts,
+                cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num, nope_size,
+                rope_size, lora_size, kv_scale_orig_quant_ptr);
+        }
+    }
+    else if (input_dtype == torch::kBFloat16)
+    {
+        if (kv_cache_quant_mode.hasFp8KvCache())
+        {
+            invokeMLARopeAppendPagedKVAssignQHelper<__nv_bfloat16, __nv_fp8_e4m3>(kv_cache_buffer, q, latent_cache,
+                num_contexts, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
+                nope_size, rope_size, lora_size, kv_scale_orig_quant_ptr);
+        }
+        else
+        {
+            invokeMLARopeAppendPagedKVAssignQHelper<__nv_bfloat16, __nv_bfloat16>(kv_cache_buffer, q, latent_cache,
+                num_contexts, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
+                nope_size, rope_size, lora_size, kv_scale_orig_quant_ptr);
+        }
+    }
+}
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -573,4 +686,39 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("append_paged_kv_cache_for_mla", &torch_ext::appendPagedKVCacheForMLA);
+}
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def(
+        "mla_rope_append_paged_kv_assign_q("
+        "Tensor q"
+        ", Tensor latent_cache"
+        ", int num_contexts"
+        ", Tensor cu_ctx_cached_kv_lens"
+        ", Tensor cu_seq_lens"
+        ", int max_input_uncached_seq_len"
+        ", Tensor cos_sin_cache"
+        ", int head_num"
+        ", int nope_size"
+        ", int rope_size"
+        ", int lora_size"
+        ", Tensor kv_cache_block_offsets"
+        ", Tensor host_kv_cache_block_offsets"
+        ", Tensor host_kv_cache_pool_pointers"
+        ", Tensor host_kv_cache_pool_mapping"
+        ", Tensor? kv_scale_orig_quant"
+        ", Tensor? kv_scale_quant_orig"
+        ", int layer_idx"
+        ", int tokens_per_block"
+        ", int attention_window_size"
+        ", int sink_token_length"
+        ", int beam_width"
+        ", int quant_mode"
+        ") -> ()");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("mla_rope_append_paged_kv_assign_q", &torch_ext::MLARopeAppendPagedKVAssignQ);
 }
