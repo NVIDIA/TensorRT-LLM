@@ -65,10 +65,7 @@ class LogitsStorage:
                 pin_memory=True,
                 requires_grad=False)
 
-    def set_at(self, index: int, logits: torch.Tensor):
-        """Sets the given logits starting at the given index
-        NOTE: This method doesn't affect any internal indexes used by append
-        """
+    def append(self, logits: torch.Tensor):
         if logits.ndim == 2:
             logits = logits.unsqueeze(1)
         assert logits.ndim == 3, f"Bad logits shape, expect [num_tokens, beam_width, vocab_size], got {logits.shape}"
@@ -78,19 +75,15 @@ class LogitsStorage:
 
         assert logits.size(1) == self.beam_width, "Beam width mismatch"
 
-        logits_count = logits.size(0)
-        if index + logits_count > self.seq_length:
+        new_position = logits.size(0) + self.position
+        if new_position > self.seq_length:
             raise ValueError(
                 f"LogitsStorage overflow. This storage can only hold {self.seq_length} logits "
-                f"but trying to set {logits_count} more logits at index={index}"
+                f"({self.position} already filled) but trying to append {logits.size(0)} more logits"
             )
 
-        self._storage[index:index + logits_count].copy_(logits,
+        self._storage[self.position:new_position].copy_(logits,
                                                         non_blocking=True)
-
-    def append(self, logits: torch.Tensor):
-        self.set_at(self.position, logits)
-        new_position = logits.size(0) + self.position
         self.last_position, self.position = self.position, new_position
 
     def get(self, all_logits=False):
@@ -147,11 +140,6 @@ class PyResult:
     def append_generation_logits(self, generation_logits: torch.Tensor):
         if self._generation_logits:
             self._generation_logits.append(generation_logits)
-
-    def set_generation_logits_at(self, index: int,
-                                 generation_logits: torch.Tensor):
-        if self._generation_logits:
-            self._generation_logits.set_at(index, generation_logits)
 
     def append_log_probs(self, log_probs: list[TokenLogprobs]):
         if self._log_probs:
