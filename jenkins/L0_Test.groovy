@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@dev-yuanjingx-add_slurm_config_for_dlc_general', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -147,6 +147,97 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     }
 }
 
+def runLLMTestlistOnPlatformImplMultiNode(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
+{
+    // Step 1: create LLM_ROOT dir
+    sh "pwd && ls -alh"
+    // TODO: proper way to clean workspace, maybe save in a folder named with BUILD_ID.
+    // So that it can work with multiple job running in same node
+    sh "rm -rf ./*"
+    def llmRootConfig = "${LLM_ROOT}${config}"
+    sh "mkdir ${llmRootConfig}"
+
+    def llmPath = sh (script: "realpath ${llmRootConfig}",returnStdout: true).trim()
+    def llmSrc = "${llmPath}/TensorRT-LLM/src"
+    echoNodeAndGpuInfo(pipeline, stageName)
+
+    stage ("Pulling Resource")
+    {
+        // setup HF_HOME to cache model and datasets
+        // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
+        sh "mkdir -p ${HF_HOME} && ls -alh ${HF_HOME}"
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y rsync")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
+        sh "df -h"
+
+        // download TRT-LLM tarfile
+        def tarName = BUILD_CONFIGS[config][TARNAME]
+        def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
+        sh "cd ${llmPath} && tar -zxf ${tarName}"
+    }
+
+    stage ("Execute MultiNode Testing")
+    {
+
+        writeFile(file: "${llmPath}/slurm_run.sh", text: """
+            which python3
+            python3 --version
+            apt-get install -y libffi-dev
+            nvidia-smi
+        """)
+        def mounts = """
+            ${llmPath}:${llmPath},
+            /scratch.trt_llm_data:
+            /scratch.trt_llm_data
+        """
+        srunCmdLine = [
+            "srun",
+            "--container-image=${LLM_DOCKER_IMAGE}",
+            "--container-workdir=${llmPath}",
+            "--container-mounts=${mounts}",
+            "--mpi=pmix",
+            "--container-name=trtllm",
+            "-p gb200nvl-ci",
+            "-N 2",
+            "-A oberon-gb",
+            "bash -c \"pwd && ls && slurm_run.sh\""
+        ]
+    }
+}
+
+def executeLLMTestOnSlurmMultiNode(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner)
+{
+    runner {
+        // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
+        cacheErrorAndUploadResult(stageName, {
+            runLLMTestlistOnPlatformImplMultiNode(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver)
+        }, {
+            // If the execution test list is null, remove the test result xml
+            sh """
+                ls -all ${stageName}/
+                if ! grep -q '<testcase' ${stageName}/results.xml; then
+                    rm ${stageName}/results.xml
+                fi
+            """
+            def llmPath = sh (script: "realpath .", returnStdout: true).trim()
+            def llmSrc = "${llmPath}/${LLM_ROOT}${config}/TensorRT-LLM/src"
+            // CPP tests will generate test result in ${llmSrc}/cpp/build_backup/, move these files to job result folder
+            sh "ls -all ${llmSrc}/cpp/build_backup/ || true"
+            sh "ls -all ${llmSrc}/cpp/build/ || true"
+            // Sed for CPP test result
+            sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/\" classname=\"/\" classname=\"${stageName}./g' *.xml || true"
+            sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/testsuite name=\"[^\"]*\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+            // Sed for Pytest result
+            sh "cd ${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+            // Copy CPP test result
+            sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
+            sh "ls ${stageName}/ -all"
+        })
+    }
+}
+
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312")
 {
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
@@ -200,6 +291,69 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
                 def dockerArgs = "--gpus ${gpuCount} --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
                 slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
                 executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
+            } else {
+                echo "The node does not come online in 2 hours, terminating the job"
+            }
+        }
+    } finally {
+        cleanUpNodeResources(pipeline, cluster, nodeName)
+        CloudManager.destroyNode(nodeName)
+    }
+}
+
+def runLLMTestlistOnMultiNodes(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=2, skipInstallWheel=false, cpver="cp312")
+{
+    SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
+    SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
+
+    def nodeName = "${cluster.host}-test-${UUID.randomUUID().toString()}"
+    def nodeSecret = CloudManager.createNode(nodeName)
+
+    try {
+        // Run ssh command to start node in desired cluster via SLURM
+        withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+            def remote = [
+                    ip           : cluster.ip,
+                    host         : cluster.host,
+                    user         : "${pipeline.USERNAME}",
+                    passwd       : "${pipeline.PASSWORD}",
+                    password     : "${pipeline.PASSWORD}",
+                    allowAnyHosts: true,
+            ]
+
+            Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
+            stage('Request Node via SLURM') {
+                println("Selected Cluster: ${cluster.name}")
+
+                def jenkinsSetupPath = Utils.copyLibraryResource(pipeline, "slurm_jenkins_agent_setup.sh")
+
+                Utils.exec(pipeline, script: "chmod +x ${jenkinsSetupPath}", returnStdout: true)
+
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh",)
+
+                Utils.exec(
+                    pipeline,
+                    timeout: false,
+                    script: Utils.sshUserCmd(
+                            remote,
+                            """${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl)}"""
+                    )
+                )
+                Utils.exec(pipeline, script: "echo Sleeping to allow agent initialization; sleep 30")
+            }
+        }
+
+        stage('Checking if the Node is Online') {
+            def counter = 0
+            while (!CloudManager.isNodeOnline(nodeName) && counter < 12) {
+                sleep(time: 10, unit: 'MINUTES')  // Wait 10 minutes to check status of the node again
+                counter++
+            }
+
+            if (CloudManager.isNodeOnline(nodeName)) {
+                def dockerArgs = "--gpus ${gpuCount} --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
+                slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
+                executeLLMTestOnSlurmMultiNode(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
             } else {
                 echo "The node does not come online in 2 hours, terminating the job"
             }
@@ -1634,6 +1788,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
+    multiNodesSBSAConfigs = [
+        "GB200-4_GPUs-2_Nodes-PyTorch-[Post-Merge]-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4, 2],
+    ]
+    fullSet += multiNodesSBSAConfigs.keySet()
+
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), {
             runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3])
@@ -1650,7 +1809,22 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             }
             runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1)
         }]]}
+
         parallelJobs += parallelSlurmJobs
+
+        // Add SBSA multi node Slurm jobs
+        parallelMultiNodesSBSAJobs = multiNodesSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), {
+            def config = LINUX_AARCH64_CONFIG
+            if (key.contains("single-device")) {
+                config = SINGLE_DEVICE_CONFIG
+            }
+            if (key.contains("llvm")) {
+                config = LLVM_CONFIG
+            }
+            runLLMTestlistOnMultiNodes(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1)
+        }]]}
+
+        parallelJobs += parallelMultiNodesSBSAJobs
     }
 
     docBuildSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10")
