@@ -57,7 +57,6 @@ from ..modules.fused_moe import (CutlassFusedMoE, DeepSeekV3MoeRoutingMethod,
                                  MoeLoadBalancer, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
-from ..modules.moe_load_balancer import MoeLoadBalancer
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
