@@ -2061,6 +2061,11 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         }
     }
 
+    // Check that the chunked-attention and sliding-window-attention are not enabled at the same time.
+    TLLM_CHECK_WITH_INFO(
+        !mAttentionChunkSize.has_value() || params.cyclic_attention_window_size >= params.max_past_kv_length,
+        "Chunked-attention and sliding-window-attention should not be enabled at the same time.");
+
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
     size_t offset = 0;
     size_t const cpMaxPaddedSequenceLength = (batch_beam + mCpSize - 1) / mCpSize * mCpSize;
