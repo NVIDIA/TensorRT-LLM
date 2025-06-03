@@ -107,8 +107,6 @@ public:
     DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
         SizeType32 maxTokensPerStep, runtime::BufferManager const& manager, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig);
-
-    void setLogitsAt(SizeType32 index, TensorPtr value);
 };
 
 class DecoderStepAsyncSend
