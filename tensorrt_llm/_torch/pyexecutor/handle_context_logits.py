@@ -56,8 +56,8 @@ class HandleContextLogits:
                 logits_view.shape[0], 1, logits_view.shape[1])
 
             # Save the last token logits of context into it's destined slot in generation logits storage
-            if llm_req.py_return_generation_logits:
-                llm_req.py_result.set_generation_logits_at(0, logits_view)
+            if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
+                llm_req.py_result.append_generation_logits(logits_view)
 
             # TODO: Implement this once we have beam width support
             # Scatter the output logits to the decoderLogits

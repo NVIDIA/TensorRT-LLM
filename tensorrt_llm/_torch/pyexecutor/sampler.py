@@ -8,7 +8,7 @@ from tensorrt_llm._torch.pyexecutor.handle_context_logits import \
     HandleContextLogits
 from tensorrt_llm._torch.pyexecutor.handle_generation_logits import \
     HandleGenerationLogits
-from tensorrt_llm._utils import binding_dtype_to_torch, torch_dtype_to_binding
+from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
@@ -582,18 +582,6 @@ class TRTLLMSampler(Sampler):
             self.store["decoder_input_buffers"], self.algs.decoder_state,
             self.store["cuda_stream"], self.algs.decoder.decoder_stream,
             self.executor_config.max_seq_len, self.beam_width(requests))
-
-        for req in requests:
-            if req.py_return_generation_logits and req.py_result.generation_logits is None:
-                vocab_size_padded = self.model_config.vocab_size_padded(
-                    self.world_config.size)
-                logits_dtype = binding_dtype_to_torch(self.logits_datatype)
-                # Save space for the 1st generated token logits that are handled by handle_context_logits,
-                # this also initiates the lazy allocation of the logits storage
-                req.py_result.append_generation_logits(
-                    torch.zeros(
-                        (1, req.sampling_config.beam_width, vocab_size_padded),
-                        dtype=logits_dtype))
 
         if len(decoder_requests):
             local_batch_size = len(batch_slots)
