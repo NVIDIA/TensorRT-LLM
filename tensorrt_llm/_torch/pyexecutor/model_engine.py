@@ -348,6 +348,7 @@ class PyTorchModelEngine(ModelEngine):
             layerwise_nvtx_marker.register_hooks(self.model, module_prefix)
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
+        self.attention_dp_cuda_graph_all_can_run = False
         self._disable_overlap_scheduler = self.pytorch_backend_config.disable_overlap_scheduler
         self._torch_compile_backend = None
         self.dtype = self.model.config.torch_dtype
@@ -767,9 +768,9 @@ class PyTorchModelEngine(ModelEngine):
         if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
             graph_batch_size = self.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
-            all_can_graph = all(graph_batch[0]
-                                for graph_batch in graph_batch_size)
-            if all_can_graph:
+            self.attention_dp_cuda_graph_all_can_run = all(
+                graph_batch[0] for graph_batch in graph_batch_size)
+            if self.attention_dp_cuda_graph_all_can_run:
                 new_batch_size = max(gen_only_batch[1]
                                      for gen_only_batch in graph_batch_size)
 
@@ -849,17 +850,8 @@ class PyTorchModelEngine(ModelEngine):
         spec_max_draft_tokens = spec_config.max_draft_tokens if self.is_spec_decode else 0
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = len(batch.generation_requests)
-        if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
-            all_can_graph_batch = self.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size])
-            is_all_gen_only = all(all_can_graph[0]
-                                  for all_can_graph in all_can_graph_batch)
-            all_batch_size_equal = all(
-                all_gen_only[1] == all_can_graph_batch[0][1]
-                for all_gen_only in all_can_graph_batch)
-
-            if not is_all_gen_only or not all_batch_size_equal:
-                return None
+        if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1 and not self.attention_dp_cuda_graph_all_can_run:
+            return None
 
         if not self._run_cuda_graphs or not can_run_cuda_graph:
             return None
