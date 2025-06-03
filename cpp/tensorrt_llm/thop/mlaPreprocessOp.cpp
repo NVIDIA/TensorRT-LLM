@@ -50,15 +50,15 @@ void loadPagedKVCacheForMLAHelper(torch::Tensor& compressed_kv, torch::Tensor& k
 
 template <typename T>
 void loadChunkedKVCacheForMLAHelper(torch::Tensor& output_kv, torch::Tensor& output_k_pe, KVBlockArray& kv_cache,
-    int const num_contexts, torch::Tensor const& cu_ctx_cached_kv_lens, int lora_size, int rope_size,
-    int const chunked_unit_size, int const chunked_idx)
+    int const num_contexts, torch::Tensor const& cu_ctx_chunked_len, int lora_size, int rope_size,
+    int const chunked_size, int const chunked_idx)
 {
     auto stream = at::cuda::getCurrentCUDAStream(output_kv.get_device());
 
     T* output_kv_ptr = static_cast<T*>(output_kv.data_ptr());
     T* output_k_pe_ptr = static_cast<T*>(output_k_pe.data_ptr());
     tensorrt_llm::kernels::invokeMLALoadChunkedKV<T>(output_kv_ptr, output_k_pe_ptr, kv_cache, num_contexts,
-        cu_ctx_cached_kv_lens.data_ptr<int64_t>(), lora_size, rope_size, chunked_unit_size, chunked_idx, stream);
+        cu_ctx_chunked_len.data_ptr<int64_t>(), lora_size, rope_size, chunked_size, chunked_idx, stream);
 }
 
 template <typename T>
@@ -98,19 +98,22 @@ void invokeMLARopeAppendPagedKVAssignQHelper(KVBlockArray& kv_cache, torch::Tens
 }
 
 template <typename T>
-void mergeChunkedAttentionForMLA(torch::Tensor& merged_attn, torch::Tensor const& temp_attn,
+void mergeChunkedAttentionForMLAHelper(torch::Tensor& merged_attn, torch::Tensor const& temp_attn,
     torch::Tensor& merged_softmax_stats, torch::Tensor const& temp_softmax_stats, int64_t const num_requests,
-    int64_t const num_heads, int64_t const head_size, int64_t const chunked_unit_size)
+    torch::Tensor const& cu_q_seq_lens, int64_t const max_q_seq_len, torch::Tensor const& merge_op,
+    int64_t const num_heads, int64_t const head_size)
 {
     auto stream = at::cuda::getCurrentCUDAStream(merged_attn.get_device());
     T* merged_attn_ptr = static_cast<T*>(merged_attn.data_ptr());
     T* temp_attn_ptr = static_cast<T*>(temp_attn.data_ptr());
     float* merged_softmax_stats_ptr = static_cast<float*>(merged_softmax_stats.data_ptr());
     float* temp_softmax_stats_ptr = static_cast<float*>(temp_softmax_stats.data_ptr());
+    int64_t* const cu_q_seq_lens_ptr = cu_q_seq_lens.data_ptr<int64_t>();
+    int64_t* const merge_op_ptr = merge_op.data_ptr<int64_t>();
 
     tensorrt_llm::kernels::invokeMergeAttnWithSoftmax(merged_attn_ptr, merged_softmax_stats_ptr, merged_attn_ptr,
-        merged_softmax_stats_ptr, temp_attn_ptr, temp_softmax_stats_ptr, num_requests, chunked_unit_size, num_heads,
-        head_size, stream);
+        merged_softmax_stats_ptr, temp_attn_ptr, temp_softmax_stats_ptr, num_requests, cu_q_seq_lens_ptr, max_q_seq_len,
+        merge_op_ptr, num_heads, head_size, stream);
 }
 
 /**
@@ -264,19 +267,19 @@ std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, i
 }
 
 std::vector<torch::Tensor> loadChunkedKVCacheForMLA(torch::ScalarType out_dtype, int64_t const num_contexts,
-    torch::Tensor& cu_ctx_cached_kv_lens, torch::Tensor const& kv_cache_block_offsets,
+    torch::Tensor& cu_ctx_chunked_kv_lens, torch::Tensor const& kv_cache_block_offsets,
     torch::Tensor const& host_kv_cache_pool_pointers, torch::Tensor const& host_kv_cache_pool_mapping,
     torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
     int64_t const layer_idx, int64_t const lora_size, int64_t const rope_size, int64_t const tokens_per_block,
-    int64_t const chunked_unit_size, int64_t const chunked_index, int64_t const attention_window_size,
+    int64_t const chunked_size, int64_t const chunked_index, int64_t const attention_window_size,
     int64_t const sink_token_length, int64_t const beam_width, int64_t const quant_mode)
 {
     TORCH_CHECK(out_dtype == torch::kFloat16 || out_dtype == torch::kFloat32 || out_dtype == torch::kBFloat16,
         "out_dtype only support float16, float32, bfloat16");
     TLLM_CHECK(num_contexts > 0);
-    CHECK_INPUT(cu_ctx_cached_kv_lens, torch::kInt64);
-    TORCH_CHECK(cu_ctx_cached_kv_lens.dim() == 1);
-    TORCH_CHECK(cu_ctx_cached_kv_lens.size(0) >= num_contexts + 1);
+    CHECK_INPUT(cu_ctx_chunked_kv_lens, torch::kInt64);
+    TORCH_CHECK(cu_ctx_chunked_kv_lens.dim() == 1);
+    TORCH_CHECK(cu_ctx_chunked_kv_lens.size(0) >= num_contexts + 1);
     int head_size = lora_size + rope_size;
     auto kv_cache_quant_mode = tc::QuantMode(static_cast<uint32_t>(quant_mode));
     int max_blocks_per_sequence = kv_cache_block_offsets.size(-1);
@@ -299,27 +302,28 @@ std::vector<torch::Tensor> loadChunkedKVCacheForMLA(torch::ScalarType out_dtype,
     }
 
     std::vector<torch::Tensor> outputs;
+    auto const num_ctx_cached_tokens = cu_ctx_chunked_kv_lens.index({num_contexts}).item<int64_t>();
     // compressed_kv {num_ctx_cached_tokens, lora_size}
-    outputs.push_back(torch::zeros({num_contexts * chunked_unit_size, lora_size},
-        torch::dtype(out_dtype).device(torch::kCUDA).requires_grad(false)));
+    outputs.push_back(torch::zeros(
+        {num_ctx_cached_tokens, lora_size}, torch::dtype(out_dtype).device(torch::kCUDA).requires_grad(false)));
     // k_pe {num_ctx_cached_tokens, rope_size}
-    outputs.push_back(torch::zeros({num_contexts * chunked_unit_size, rope_size},
-        torch::dtype(out_dtype).device(torch::kCUDA).requires_grad(false)));
+    outputs.push_back(torch::zeros(
+        {num_ctx_cached_tokens, rope_size}, torch::dtype(out_dtype).device(torch::kCUDA).requires_grad(false)));
 
     if (out_dtype == torch::kFloat16)
     {
         loadChunkedKVCacheForMLAHelper<half>(outputs[0], outputs[1], kv_cache_buffer, num_contexts,
-            cu_ctx_cached_kv_lens, lora_size, rope_size, chunked_unit_size, chunked_index);
+            cu_ctx_chunked_kv_lens, lora_size, rope_size, chunked_size, chunked_index);
     }
     else if (out_dtype == torch::kFloat32)
     {
         loadChunkedKVCacheForMLAHelper<float>(outputs[0], outputs[1], kv_cache_buffer, num_contexts,
-            cu_ctx_cached_kv_lens, lora_size, rope_size, chunked_unit_size, chunked_index);
+            cu_ctx_chunked_kv_lens, lora_size, rope_size, chunked_size, chunked_index);
     }
     else if (out_dtype == torch::kBFloat16)
     {
         loadChunkedKVCacheForMLAHelper<__nv_bfloat16>(outputs[0], outputs[1], kv_cache_buffer, num_contexts,
-            cu_ctx_cached_kv_lens, lora_size, rope_size, chunked_unit_size, chunked_index);
+            cu_ctx_chunked_kv_lens, lora_size, rope_size, chunked_size, chunked_index);
     }
 
     return outputs;
@@ -485,6 +489,7 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor const& latent_c
 
 void mergeChunkedAttentionForMLA(torch::Tensor& merged_attn, torch::Tensor const& temp_attn,
     torch::Tensor& merged_softmax_stats, torch::Tensor const& temp_softmax_stats, int64_t const num_requests,
+    torch::Tensor const& cu_q_seq_lens, int64_t const max_q_seq_len, torch::Tensor const& merge_op,
     int64_t const num_heads, int64_t const head_size, int64_t const chunked_unit_size)
 {
     TORCH_CHECK(merged_attn.numel() > 0);
@@ -497,18 +502,18 @@ void mergeChunkedAttentionForMLA(torch::Tensor& merged_attn, torch::Tensor const
 
     if (merged_attn.scalar_type() == torch::kFloat16)
     {
-        mergeChunkedAttentionForMLA<half>(merged_attn, temp_attn, merged_softmax_stats, temp_softmax_stats,
-            num_requests, num_heads, head_size, chunked_unit_size);
+        mergeChunkedAttentionForMLAHelper<half>(merged_attn, temp_attn, merged_softmax_stats, temp_softmax_stats,
+            num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size);
     }
     else if (merged_attn.scalar_type() == torch::kFloat32)
     {
-        mergeChunkedAttentionForMLA<float>(merged_attn, temp_attn, merged_softmax_stats, temp_softmax_stats,
-            num_requests, num_heads, head_size, chunked_unit_size);
+        mergeChunkedAttentionForMLAHelper<float>(merged_attn, temp_attn, merged_softmax_stats, temp_softmax_stats,
+            num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size);
     }
     else if (merged_attn.scalar_type() == torch::kBFloat16)
     {
-        mergeChunkedAttentionForMLA<__nv_bfloat16>(merged_attn, temp_attn, merged_softmax_stats, temp_softmax_stats,
-            num_requests, num_heads, head_size, chunked_unit_size);
+        mergeChunkedAttentionForMLAHelper<__nv_bfloat16>(merged_attn, temp_attn, merged_softmax_stats,
+            temp_softmax_stats, num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size);
     }
 }
 } // namespace torch_ext
@@ -550,7 +555,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "load_chunked_kv_cache_for_mla("
         "ScalarType out_dtype"
         ", int num_contexts"
-        ", Tensor cu_ctx_cached_kv_lens"
+        ", Tensor cu_ctx_chunked_kv_lens"
         ", Tensor kv_cache_block_offsets"
         ", Tensor host_kv_cache_pool_pointers"
         ", Tensor host_kv_cache_pool_mapping"
@@ -559,7 +564,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int layer_idx"
         ", int head_size"
         ", int tokens_per_block"
-        ", int chunked_unit_size"
+        ", int chunked_size"
         ", int chunked_index"
         ", int attention_window_size"
         ", int sink_token_length"
@@ -640,9 +645,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor merged_softmax_stats"
         ", Tensor temp_softmax_stats"
         ", int num_requests"
+        ", Tensor cu_q_seq_lens"
+        ", int max_q_seq_len"
+        ", Tensor merge_op"
         ", int num_heads"
         ", int head_size"
-        ", int chunked_unit_size"
         ") -> ()");
 }
 
