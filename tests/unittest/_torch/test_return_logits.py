@@ -141,9 +141,7 @@ def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
         pytest.skip("Nothing to test")
 
     if enable_trtllm_sampler and return_log_probs:
-        pytest.skip(
-            "TRTLLMSampler does not support gather_generation_logits or return_log_probs"
-        )
+        pytest.skip("TRTLLMSampler does not support return_log_probs")
     elif not enable_trtllm_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
@@ -188,8 +186,9 @@ def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
             assert gen_logits is not None
             assert gen_logits.ndim == 2
             assert gen_logits.shape[0] == 1
-            assert torch.argmax(gen_logits,
-                                dim=1).tolist() == output.outputs[0].token_ids
+            assert torch.argmax(
+                gen_logits,
+                dim=1).tolist()[0] == output.outputs[0].token_ids[-1]
         else:
             assert output.outputs[0].generation_logits is None
 
