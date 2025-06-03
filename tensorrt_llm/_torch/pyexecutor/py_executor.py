@@ -1610,6 +1610,7 @@ class PyExecutor:
         # handle potential attention dp dummy request
         if self.active_requests and self.active_requests[
                 -1].is_attention_dp_dummy:
+            request = self.active_requests[-1]
             request.state = LlmRequestState.GENERATION_COMPLETE
             self.inflight_req_ids.erase(request.py_request_id)
             self._terminate_request(request)
