@@ -320,7 +320,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             raise ready_signal
 
     def _abort_all_requests(self):
-        for result in self._results.values():
+        # The results can be finished during this loop, so self._results may be changed.
+        for result in list(self._results.values()):
             result.abort()
 
     def pre_shutdown(self):
@@ -337,7 +338,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         # notify the workers to quit
         if all(not f.done() for f in self.mpi_futures):
-            self.request_queue.put(None)
+            self.request_queue.put_noblock(None)
 
     def shutdown(self):
         if not self.workers_started:

@@ -6,7 +6,8 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
 from ..attention_backend.interface import AttentionInputType
 from ..autotuner import AutoTuner, TunableRunner, TuningConfig
-from ..utils import (get_last_power_of_2_num_tokens_buckets,
+from ..utils import (compute_swizzled_sf_shape,
+                     get_last_power_of_2_num_tokens_buckets,
                      get_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2, next_positive_power_of_2)
 
@@ -428,7 +429,7 @@ def attention(
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
-) -> torch.Tensor:
+) -> List[torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
                             if attention_input_type is not None else
@@ -438,9 +439,25 @@ def attention(
     if out_dtype is None:
         out_dtype = q.dtype
 
-    output = q.new_empty((num_tokens, num_heads * v_head_size), dtype=out_dtype)
+    if out_dtype == torch.uint8:
+        num_nvfp4_elements_per_container = 2
+        scaling_vector_size = 16
+        size_per_token = num_heads * v_head_size
+        output_act = q.new_empty(
+            (num_tokens, size_per_token // num_nvfp4_elements_per_container),
+            dtype=torch.uint8)
+        # Create a sf (scaling factors) tensor for NVFP4 (use INT8 as the container dtype).
+        output_sf = q.new_empty(compute_swizzled_sf_shape(
+            num_tokens, size_per_token // scaling_vector_size),
+                                dtype=torch.uint8)
+    else:
+        output_act = q.new_empty((num_tokens, num_heads * v_head_size),
+                                 dtype=out_dtype)
+        # NOTE(tizheng): Does this introduce overhead?
+        output_sf = torch.empty(())  # Create a placeholder, which is not used.
+
     torch.ops.trtllm.attention_inplace(
-        q, k, v, output, out_dtype, workspace, sequence_length,
+        q, k, v, output_act, output_sf, out_dtype, workspace, sequence_length,
         host_past_key_value_lengths, context_lengths, host_context_lengths,
         host_request_types, kv_cache_block_offsets, host_kv_cache_block_offsets,
         host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
@@ -459,7 +476,7 @@ def attention(
         v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
         mla_context_paged_kv, mla_context_kv_cache_block_offsets,
         attention_chunk_size)
-    return output
+    return output_act, output_sf
 
 
 @attention.register_fake
@@ -525,7 +542,7 @@ def _(
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
-) -> torch.Tensor:
+) -> List[torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
                             if attention_input_type is not None else
@@ -534,4 +551,21 @@ def _(
         out_dtype = q.dtype
     is_gen_only = attention_input_type == AttentionInputType.generation_only
     v_head_size = head_size if not is_mla_enable else kv_lora_rank if is_gen_only else v_head_dim
-    return q.new_empty((num_tokens, num_heads * v_head_size), dtype=out_dtype)
+
+    if out_dtype == torch.uint8:
+        num_nvfp4_elements_per_container = 2
+        scaling_vector_size = 16
+        size_per_token = num_heads * v_head_size
+        output_act = q.new_empty(
+            (num_tokens, size_per_token // num_nvfp4_elements_per_container),
+            dtype=torch.uint8)
+        # Create a sf (scaling factors) tensor for NVFP4 (use INT8 as the container dtype).
+        output_sf = q.new_empty(compute_swizzled_sf_shape(
+            num_tokens, size_per_token // scaling_vector_size),
+                                dtype=torch.uint8)
+    else:
+        output_act = q.new_empty((num_tokens, num_heads * v_head_size),
+                                 dtype=out_dtype)
+        output_sf = torch.empty(())  # Create a placeholder, which is not used.
+
+    return output_act, output_sf
