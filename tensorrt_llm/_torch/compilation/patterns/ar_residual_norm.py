@@ -49,6 +49,7 @@ def register_ar_residual_norm(custom_pass: PatternMatcherPass):
         strategy: int,
         norm_weight: torch.nn.Parameter,
         eps: float,
+        trigger_completion_at_end: bool,
     ):
         return
 
@@ -59,11 +60,13 @@ def register_ar_residual_norm(custom_pass: PatternMatcherPass):
         strategy: int,
         norm_weight: torch.nn.Parameter,
         eps: float,
+        trigger_completion_at_end: bool,
     ):
         all_reduce_output = torch.ops.trtllm.allreduce(
             input, residual, norm_weight, None, None, workspace,
             mapping.tp_group, int(strategy),
-            int(AllReduceFusionOp.RESIDUAL_RMS_NORM), float(eps))
+            int(AllReduceFusionOp.RESIDUAL_RMS_NORM), float(eps),
+            trigger_completion_at_end)
         return all_reduce_output[0], all_reduce_output[1]
 
     def extra_check(match: Match) -> bool:
