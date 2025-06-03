@@ -18,7 +18,9 @@ TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 @dataclass
 class MoeLoadBalancerConfig:
     num_slots: Optional[int] = None
-    initial_global_assignments: Optional[Dict[int, List[int]]] = None
+    initial_global_assignments: Optional[Dict[int,
+                                              List[int]]] = field(default=None,
+                                                                  repr=False)
     layer_updates_per_iter: int = 0
 
     num_experts: Optional[int] = field(default=None, init=False)
