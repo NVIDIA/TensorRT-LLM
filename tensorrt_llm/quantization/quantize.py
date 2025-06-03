@@ -285,7 +285,6 @@ def fp8_rowwise_quantize(model, quant_config: QuantConfig):
         quant_cls = None
         for cls in quant_cls_map:
             if isinstance(layer, cls):
-                print(layer)
                 quant_cls = quant_cls_map[cls]
                 break
         if quant_cls is None:

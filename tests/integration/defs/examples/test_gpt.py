@@ -788,7 +788,6 @@ def test_llm_gpt2_medium_fp8(gpt_example_root, llm_gpt2_medium_model_root,
         f"--qformat={qformat}",
         f"--output_dir={ckpt_dir}",
     ]
-    print(quantize_cmd)
     if quant_lm_head:
         quantize_cmd.append("--quantize_lm_head")
     venv_check_call(llm_venv, quantize_cmd)
@@ -807,7 +806,8 @@ def test_llm_gpt2_medium_fp8(gpt_example_root, llm_gpt2_medium_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     print('Run engines...')
-    rouge1_threshold = 17.2 if quant_lm_head else 17.4
+    rouge1_threshold = 22.8 if qformat == "fp8_pc_pt" else (
+        20.9 if quant_lm_head else 21.7)
     summary_cmd = [
         f"{gpt_example_root}/../../../summarize.py",
         f"--engine_dir={engine_dir}",
