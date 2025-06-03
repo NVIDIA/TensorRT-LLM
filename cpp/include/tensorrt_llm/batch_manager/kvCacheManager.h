@@ -1321,18 +1321,17 @@ public:
     /// @param dtype Data type used for KV cache values
     /// @param modelConfig Model configuration containing layer and head information
     /// @param worldConfig World configuration for multi-GPU setups
-    /// @param bufferManager Buffer manager for memory operations
     /// @param windowSizeToLayers Map from attention window size to vector of layer indices using that window size
     /// @param allottedPrimaryMemBytes Allotted primary memory
     /// @param allottedSecondaryMemBytes Allotted secondary memory
-    /// @param kvFactor Factor for KV cache size calculation (typically 2 for key+value)
     /// @param extraCostMemory Additional memory cost to account for CacheTransBufferManager::preAllocBufferSize
+    /// @param kvFactor Factor for KV cache size calculation (typically 2 for key+value)
     /// @return Map from window size to tuple of (primary blocks, secondary blocks)
     [[nodiscard]] static BlocksPerWindow calculateMaxNumBlocks(KvCacheConfig const& config, bool isCrossAttention,
         nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         tensorrt_llm::runtime::WorldConfig const& worldConfig,
         std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
-        uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor = 2);
+        uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor);
 
     /// @brief Calculates the maximum batch size that can fit the kv-cache, given that all sequences in the batch have
     /// the provided input and output length.
