@@ -161,7 +161,6 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("num_draft_tokens", &GenLlmReq::getNumDraftTokens)
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, py::arg("finish_reason"), py::arg("beam"))
         .def("get_beam_width_by_iter", &GenLlmReq::getBeamWidthByIter, py::arg("for_next_iteration") = false)
-        .def("set_generation_logits_host", &GenLlmReq::setGenerationLogitsHost, py::arg("logits"))
         .def_property_readonly("is_finished", &GenLlmReq::isFinished)
         .def_property_readonly("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
         .def_property(

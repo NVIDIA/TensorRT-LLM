@@ -65,7 +65,10 @@ class LogitsStorage:
                 pin_memory=True,
                 requires_grad=False)
 
-    def append(self, logits: torch.Tensor):
+    def set_at(self, index: int, logits: torch.Tensor):
+        """Sets the given logits starting at the given index
+        NOTE: This method doesn't affect any internal indexes used by append
+        """
         if logits.ndim == 2:
             logits = logits.unsqueeze(1)
         assert logits.ndim == 3, f"Bad logits shape, expect [num_tokens, beam_width, vocab_size], got {logits.shape}"
@@ -75,24 +78,25 @@ class LogitsStorage:
 
         assert logits.size(1) == self.beam_width, "Beam width mismatch"
 
-        new_position = logits.size(0) + self.position
-        if new_position > self.seq_length:
+        logits_count = logits.size(0)
+        if index + logits_count > self.seq_length:
             raise ValueError(
                 f"LogitsStorage overflow. This storage can only hold {self.seq_length} logits "
-                f"({self.position} already filled) but trying to append {logits.size(0)} more logits"
+                f"but trying to set {logits_count} more logits at index={index}"
             )
 
-        self._storage[self.position:new_position].copy_(logits,
+        self._storage[index:index + logits_count].copy_(logits,
                                                         non_blocking=True)
+
+    def append(self, logits: torch.Tensor):
+        self.set_at(self.position, logits)
+        new_position = logits.size(0) + self.position
         self.last_position, self.position = self.position, new_position
 
     def get(self, all_logits=False):
         start = 0 if all_logits else self.last_position
         return self._storage[start:self.
                              position] if self._storage is not None else None
-
-    def get_storage(self) -> torch.Tensor | None:
-        return self._storage
 
 
 class LogProbStorage:
@@ -144,6 +148,11 @@ class PyResult:
         if self._generation_logits:
             self._generation_logits.append(generation_logits)
 
+    def set_generation_logits_at(self, index: int,
+                                 generation_logits: torch.Tensor):
+        if self._generation_logits:
+            self._generation_logits.set_at(index, generation_logits)
+
     def append_log_probs(self, log_probs: list[TokenLogprobs]):
         if self._log_probs:
             self._log_probs.append(log_probs)
@@ -157,17 +166,11 @@ class PyResult:
     def generation_logits(self) -> torch.Tensor | None:
         # Internal storage: [seq_length, beam_width, vocab_size]
         # API expect: [beam_width, seq_length, vocab_size]
-        return self._generation_logits and self._generation_logits.get(
-            not self._streaming).transpose(0, 1)
-
-    @property
-    def generation_logits_storage(self) -> torch.Tensor | None:
-        storage = self._generation_logits.get_storage()
-        if storage is None:
-            return None
-        # Internal storage: [seq_length, beam_width, vocab_size]
-        # API expect: [beam_width, seq_length, vocab_size]
-        return storage if self._streaming else storage.transpose(0, 1)
+        if not self._generation_logits or (
+                storage :=
+                self._generation_logits.get(not self._streaming)) is None:
+            return
+        return storage.transpose(0, 1)
 
     @property
     def log_probs(self) -> list[TokenLogprobs] | None:
@@ -240,7 +243,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             client_id=client_id,
             return_log_probs=False,
             return_context_logits=False,
-            return_generation_logits=return_generation_logits,
+            return_generation_logits=False,
             stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
             if stop_words_list else None,
             **kwargs)

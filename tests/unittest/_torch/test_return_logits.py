@@ -68,10 +68,8 @@ def test_generate_with_return_logits(enable_trtllm_sampler: bool,
             or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
 
-    if enable_trtllm_sampler and (gather_generation_logits or return_log_probs):
-        pytest.skip(
-            "TRTLLMSampler does not support gather_generation_logits or return_log_probs"
-        )
+    if enable_trtllm_sampler and return_log_probs:
+        pytest.skip("TRTLLMSampler does not support return_log_probs")
     elif not enable_trtllm_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
@@ -132,7 +130,7 @@ def test_generate_async_with_return_logits(enable_trtllm_sampler: bool,
             or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
 
-    if enable_trtllm_sampler and (gather_generation_logits or return_log_probs):
+    if enable_trtllm_sampler and return_log_probs:
         pytest.skip(
             "TRTLLMSampler does not support gather_generation_logits or return_log_probs"
         )
