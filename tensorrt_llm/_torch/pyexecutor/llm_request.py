@@ -169,8 +169,10 @@ class PyResult:
 
     @property
     def context_logits(self) -> torch.Tensor | None:
-        return self._context_logits and self._context_logits.get_all(
-        )[:, 0]  # remove beam_width axis for context
+        if self._context_logits is None or (
+                storage := self._context_logits.get_all()) is None:
+            return None
+        return storage[:, 0]  # remove beam_width axis for context
 
     @property
     def generation_logits(self) -> torch.Tensor | None:
