@@ -3,7 +3,7 @@ from typing import List
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm.bindings.internal.batch_manager import DecoderBuffers
+from tensorrt_llm.bindings.internal.batch_manager import DecoderInputBuffers
 from tensorrt_llm.logger import logger
 
 # TODO: Implement this once return generation logits is supported
@@ -21,16 +21,20 @@ from tensorrt_llm.logger import logger
 
 class HandleContextLogits:
 
-    def __call__(self, context_requests: List[LlmRequest],
-                 num_context_logits_vec: List[int], logits: torch.Tensor,
-                 decoder_buffers: DecoderBuffers) -> int:
+    def __call__(
+        self,
+        decoder_input_buffers: DecoderInputBuffers,
+        context_requests: List[LlmRequest],
+        logits: torch.Tensor,
+        num_context_logits_vec: List[int],
+    ) -> int:
         """Handle context logits for a batch of requests.
 
         Args:
+            decoder_input_buffers: Decoder input buffers for storing intermediate results
             context_requests: List of context requests to process
-            num_context_logits_vec: Number of context logits for each request
             logits: Input logits tensor
-            decoder_buffers: Decoder buffers for storing intermediate results
+            num_context_logits_vec: Number of context logits for each request
 
         Returns:
             int: Index into logits tensor after processing all requests
@@ -38,7 +42,8 @@ class HandleContextLogits:
         logits_index = 0
 
         # Copy logits into decoderBuffers.logits
-        decoder_buffer_logits = [torch.empty(0)] * len(decoder_buffers.logits)
+        decoder_buffer_logits = [torch.empty(0)] * len(
+            decoder_input_buffers.logits)
         for batch_index, llm_req in enumerate(context_requests):
             num_context_logits = num_context_logits_vec[batch_index]
             draft_length = llm_req.num_draft_tokens if llm_req.is_last_context_chunk(
@@ -87,6 +92,6 @@ class HandleContextLogits:
             #     decoder_buffer_logits[seq_slot] = logits_view[:logits_view.shape[0], :1, :logits_view.shape[1]]
 
         # Needs to be done in bulk for the copy to work
-        decoder_buffers.logits = decoder_buffer_logits
+        decoder_input_buffers.logits = decoder_buffer_logits
 
         return logits_index
