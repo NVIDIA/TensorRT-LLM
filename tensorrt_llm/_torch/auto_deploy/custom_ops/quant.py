@@ -222,7 +222,7 @@ def fp4_linear_fake(
 @torch.compile(dynamic=True)
 def fp8_bmm(
     input: torch.Tensor,
-    weight_fp8: torch.Tensor,
+    weight: torch.Tensor,
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
 ) -> torch.Tensor:
@@ -230,7 +230,7 @@ def fp8_bmm(
 
     Args:
         input: unquantized input tensor with shape (B, M, K)
-        weight_fp8: pre-quantized weight tensor with shape (B, K, N), with dtype torch.float8_e4m3fn
+        weight: pre-quantized weight tensor with shape (B, K, N), with dtype torch.float8_e4m3fn
         input_scale: a scalar tensor defined as amax / max value (448.0)
         weight_scale: a scalar tensor defined as amax / max value (448.0)
 
@@ -239,13 +239,18 @@ def fp8_bmm(
     """
     # Ensure input is contiguous
     input = input.contiguous()
-    input_fp8 = _to_fp8(input, input_scale)
+    if input.dtype in [torch.float16, torch.bfloat16]:
+        input_fp8 = _to_fp8(input, input_scale)
+    else:
+        assert input.dtype == torch.float8_e4m3fn
+        input_fp8 = input
 
     # for none fp8 case, we need to convert to fp8
-    if weight_fp8.dtype in [torch.float16, torch.bfloat16]:
-        weight_fp8 = _to_fp8(weight_fp8, weight_scale)
+    if weight.dtype in [torch.float16, torch.bfloat16]:
+        weight_fp8 = _to_fp8(weight, weight_scale)
     else:
-        assert weight_fp8.dtype == torch.float8_e4m3fn
+        assert weight.dtype == torch.float8_e4m3fn
+        weight_fp8 = weight
 
     # Ensure weight is in the correct memory layout
     # For cuBLASLt, we need one matrix in row-major and one in column-major format
