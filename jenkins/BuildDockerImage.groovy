@@ -485,6 +485,7 @@ pipeline {
             }
             steps {
                 script {
+                    return
                     collectResultPodSpec = createKubernetesPodConfig("agent")
                     trtllm_utils.launchKubernetesPod(this, collectResultPodSpec, "alpine", {
                         // 安装wget工具
