@@ -156,7 +156,7 @@ class InferenceOptimizer:
         ############################################################################################
 
         # load weights
-        self.factory.load_or_random_init(egm, device=cm.device)
+        self.factory.load_or_random_init(egm, device=self.ad_config.checkpoint_device or cm.device)
 
         # move remaining parts to device
         move_to_device(egm, cm.device)
