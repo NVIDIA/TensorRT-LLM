@@ -1,18 +1,40 @@
 # Adapted from
 # https://github.com/deepseek-ai/DeepEP/blob/aae9fa9a6dd0fec2a723fbb85ec4b22460fab670/README.md
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-from deep_ep import Buffer
+from mpi4py import MPI
 
-from tensorrt_llm._utils import local_mpi_size
+from tensorrt_llm._utils import local_mpi_size, mpi_comm
+from tensorrt_llm.mapping import Mapping
+
+try:
+    from deep_ep import Buffer
+    deep_ep_installed = True
+except ModuleNotFoundError:
+    # Pass type hint checks
+    class DummyBuffer:
+        pass
+
+    Buffer = DummyBuffer
+    deep_ep_installed = False
+
+# Mpi4py communicator
+_comms: Dict[Mapping, MPI.Comm] = {}
 
 # Communication buffer (will allocate at runtime)
 _buffer: Optional[Buffer] = None
 
 # Set the number of SMs to use
 # NOTES: this is a static variable
-Buffer.set_num_sms(24)
+if deep_ep_installed:
+    Buffer.set_num_sms(32)
+
+
+def get_comm(mapping: Mapping):
+    if mapping not in _comms:
+        _comms[mapping] = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
+    return _comms[mapping]
 
 
 # You may call this function at the framework initialization
@@ -32,9 +54,13 @@ def get_buffer(comm, hidden_bytes: int) -> Buffer:
             num_rdma_bytes)
 
     # Allocate a buffer if not existed or not enough buffer size
-    if _buffer is None or _buffer.num_nvl_bytes < num_nvl_bytes or _buffer.num_rdma_bytes < num_rdma_bytes:
+    if _buffer is None or _buffer.low_latency_mode or _buffer.num_nvl_bytes < num_nvl_bytes or _buffer.num_rdma_bytes < num_rdma_bytes:
         if _buffer is not None:
-            raise NotImplementedError("not implemented buffer change")
+            if _buffer.low_latency_mode:
+                raise NotImplementedError(
+                    "Mixture use of get_buffer and get_low_latency_buffer.")
+            num_nvl_bytes = max(num_nvl_bytes, _buffer.num_nvl_bytes)
+            num_rdma_bytes = max(num_rdma_bytes, _buffer.num_rdma_bytes)
         _buffer = Buffer(None,
                          num_nvl_bytes,
                          num_rdma_bytes,
@@ -48,33 +74,39 @@ def get_hidden_bytes(x: torch.Tensor) -> int:
     return t.size(1) * max(t.element_size(), 2)
 
 
-def dispatch_forward(buffer: Buffer, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+def dispatch_forward(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                      topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                      num_experts: int) -> \
         Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, torch.Tensor, List, Tuple]:
+    # NOTES: an optional `previous_event` means a CUDA event captured that you want to make it as a dependency
+    # of the dispatch kernel, it may be useful with communication-computation overlap. For more information, please
+    # refer to the docs of `Buffer.dispatch`
+    global _buffer
+
     # Calculate layout before actual dispatch
     num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event = \
-        buffer.get_dispatch_layout(topk_idx, num_experts)
+        _buffer.get_dispatch_layout(topk_idx, num_experts)
     assert event.event is None
 
     # Do MoE dispatch
     # NOTES: the CPU will wait for GPU's signal to arrive, so this is not compatible with CUDA graph
     # For more advanced usages, please refer to the docs of the `dispatch` function
     recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event = \
-        buffer.dispatch(x, topk_idx=topk_idx, topk_weights=topk_weights,
-                        num_tokens_per_rank=num_tokens_per_rank, num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-                        is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert)
+        _buffer.dispatch(x, topk_idx=topk_idx, topk_weights=topk_weights,
+                         num_tokens_per_rank=num_tokens_per_rank, num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+                         is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert)
     assert event.event is None
 
     # For event management, please refer to the docs of the `EventOverlap` class
     return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle
 
 
-def combine_forward(buffer: Buffer, x: torch.Tensor,
-                    handle: Tuple) -> torch.Tensor:
+def combine_forward(x: torch.Tensor, handle: Tuple) -> torch.Tensor:
+    global _buffer
+
     # Do MoE combine
     # For more advanced usages, please refer to the docs of the `combine` function
-    combined_x, _, event = buffer.combine(x, handle)
+    combined_x, _, event = _buffer.combine(x, handle)
     assert event.event is None
 
     # For event management, please refer to the docs of the `EventOverlap` class
@@ -93,6 +125,10 @@ def low_latency_get_buffer(comm, num_max_dispatch_tokens_per_rank: int,
 
     # Allocate a buffer if not existed or not enough buffer size
     if _buffer is None or not _buffer.low_latency_mode or _buffer.num_rdma_bytes < num_rdma_bytes:
+        if _buffer is not None:
+            if not _buffer.low_latency_mode:
+                raise NotImplementedError(
+                    "Mixture use of get_buffer and get_low_latency_buffer.")
         # NOTES: for best performance, the QP number **must** be equal to the number of the local experts
         assert num_experts % world_size == 0
         _buffer = Buffer(None,
@@ -104,13 +140,14 @@ def low_latency_get_buffer(comm, num_max_dispatch_tokens_per_rank: int,
     return _buffer
 
 
-def low_latency_dispatch(buffer: Buffer, hidden_states: torch.Tensor,
-                         topk_idx: torch.Tensor,
+def low_latency_dispatch(hidden_states: torch.Tensor, topk_idx: torch.Tensor,
                          num_max_dispatch_tokens_per_rank: int,
                          num_experts: int):
+    global _buffer
+
     # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
     recv_hidden_states, recv_expert_count, handle, event, hook = \
-        buffer.low_latency_dispatch(hidden_states, topk_idx, num_max_dispatch_tokens_per_rank, num_experts, use_fp8=False)
+        _buffer.low_latency_dispatch(hidden_states, topk_idx, num_max_dispatch_tokens_per_rank, num_experts, use_fp8=False)
     assert event.event is None
     assert hook is None
 
@@ -121,12 +158,13 @@ def low_latency_dispatch(buffer: Buffer, hidden_states: torch.Tensor,
     return recv_hidden_states, recv_expert_count, handle
 
 
-def low_latency_combine(buffer: Buffer, hidden_states: torch.Tensor,
-                        topk_idx: torch.Tensor, topk_weights: torch.Tensor,
-                        handle: Tuple):
+def low_latency_combine(hidden_states: torch.Tensor, topk_idx: torch.Tensor,
+                        topk_weights: torch.Tensor, handle: Tuple):
+    global _buffer
+
     # Do MoE combine, compatible with CUDA graph (but you may restore some buffer status once you replay)
     combined_hidden_states, event, hook = \
-        buffer.low_latency_combine(hidden_states, topk_idx, topk_weights, handle)
+        _buffer.low_latency_combine(hidden_states, topk_idx, topk_weights, handle)
     assert event.event is None
     assert hook is None
 
