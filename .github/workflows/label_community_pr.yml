@@ -3,6 +3,8 @@ name: Label Community PR
 on:
   pull_request:
     types: [opened]
+permissions:
+  pull-requests: write
 
 jobs:
   label_pr:
@@ -24,6 +26,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_OWNER: ${{ github.event.repository.owner.login }}
           REPO_NAME: ${{ github.event.repository.name }}
           COMMUNITY_LABEL: "Community want to contribute"
         run: python .github/scripts/label_community_user.py
