@@ -302,7 +302,7 @@ Available parameters for the requests are listed in https://github.com/triton-in
 
 ### Disaggregated Serving
 
-To run TRT-LLM in disaggregated mode, you should launch context and generation servers using `trtllm-serve`.
+To serve the model in disaggregated mode, you should launch context and generation servers using `trtllm-serve`.
 
 For example, you can launch a single context server on port 8001 with:
 
