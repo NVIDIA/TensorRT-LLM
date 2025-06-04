@@ -121,9 +121,8 @@ To benchmark min-latency performance with MTP, you need to follow [this document
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-pytorch_backend_config:
-    use_cuda_graph: true
-    moe_backend: TRTLLM
+use_cuda_graph: true
+moe_backend: TRTLLM
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
@@ -177,9 +176,8 @@ To benchmark min-latency performance with MTP Relaxed Acceptance, you need to fo
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-pytorch_backend_config:
-    use_cuda_graph: true
-    moe_backend: TRTLLM
+use_cuda_graph: true
+moe_backend: TRTLLM
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3

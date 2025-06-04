@@ -415,6 +415,10 @@ class FlashInferAttention(AttentionDescriptor):
         else:
             scale = source_attn_node.kwargs.get("scale", None)
 
+        if not isinstance(scale, float):
+            ad_logger.warning("Provided scale is not a float. Using default scale instead.")
+            scale = None
+
         return [
             scale,  # softmax scale
             1.0,  # k_scale

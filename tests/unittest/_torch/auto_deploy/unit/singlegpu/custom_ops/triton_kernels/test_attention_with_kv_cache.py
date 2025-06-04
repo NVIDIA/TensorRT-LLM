@@ -263,6 +263,7 @@ def test_gqa_attention_kv_flash_decoding(q_d_head, v_d_head, n_heads, n_kv_heads
             output_tensor,
             output_logsumexp,
             num_blocks,
+            1.0 / math.sqrt(Q_D_HEAD),
             MAX_SEQ_LEN,
             N_HEADS,
             N_KV_HEADS,

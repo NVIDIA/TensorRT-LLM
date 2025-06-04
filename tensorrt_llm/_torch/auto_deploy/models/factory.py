@@ -19,15 +19,28 @@ class ModelFactory(ABC):
     (batch_size, seq_len, embedding_size).
     """
 
-    def __init__(self, model: Optional[str] = None, skip_loading_weights: bool = False, **kwargs):
+    def __init__(
+        self,
+        model: str,
+        tokenizer: Optional[str] = None,
+        skip_loading_weights: bool = False,
+        **kwargs,
+    ):
         self._model = model
+        self._tokenizer = tokenizer
         self.skip_loading_weights = skip_loading_weights
-        self._prefetched_path: Optional[str] = None
+        self._prefetched_model_path: Optional[str] = None
+        self._prefetched_tokenizer_path: Optional[str] = None
 
     @property
     def model(self) -> Optional[str]:
         """The model+checkpoint path."""
-        return self._prefetched_path or self._model
+        return self._prefetched_model_path or self._model
+
+    @property
+    def tokenizer(self) -> Optional[str]:
+        """The tokenizer path."""
+        return self._prefetched_tokenizer_path or self._tokenizer or self.model
 
     @abstractmethod
     def build_model(self, device: str) -> nn.Module:
@@ -82,8 +95,25 @@ class ModelFactory(ABC):
         return None
 
     def prefetch_checkpoint(self):
-        """Try prefetching checkpoint."""
-        pass
+        """Try or skip prefetching the checkpoint for the model and tokenizer."""
+        if not self._prefetched_model_path:
+            self._prefetched_model_path = self._prefetch_checkpoint(
+                self._model, self.skip_loading_weights
+            )
+        if self._tokenizer and not self._prefetched_tokenizer_path:
+            self._prefetched_tokenizer_path = self._prefetch_checkpoint(self._tokenizer, True)
+
+    def _prefetch_checkpoint(self, model_name_or_path: str, skip_prefetch_weights: bool) -> str:
+        """Optionally prefetch the checkpoint if factory supports it.
+
+        Args:
+            model_name_or_path: The model or tokenizer name or path.
+            skip_prefetch_weights: Whether to skip prefetching weights.
+
+        Returns:
+            The prefetched checkpoint path.
+        """
+        return model_name_or_path
 
     def load_or_random_init(self, model: nn.Module, device: DeviceLikeType):
         """Load the checkpoint into the model or randomly initialize the model.

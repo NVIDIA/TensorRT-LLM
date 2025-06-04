@@ -312,6 +312,7 @@ def _generate_mha_rope_fusion(
     )
 
     HEAD_BLOCK_SIZE = max(16, triton.next_power_of_2(n_heads // n_kv_heads))
+    scale = 1.0 / math.sqrt(d_head)
     gqa_attention_kv_stage1[
         (
             b,
@@ -327,6 +328,7 @@ def _generate_mha_rope_fusion(
         stage1_output_values,
         stage1_output_logsumexp,
         num_blocks,
+        scale,
         max_seq_len,
         n_heads,
         n_kv_heads,
@@ -566,13 +568,14 @@ def fused_mha_with_cache(
 
     # attention (assumed layout is bsnd)
     y = torch.empty_like(q)
+    scale = 1.0 / math.sqrt(head_dim)
     if s > 1:
         # context phase
         _context_mha(q, k, v, k_cache, v_cache, y)
     else:
         # generate phase
         cache_locs = torch.arange(0, b, device=q.device, dtype=torch.int32)
-        _generate_mha(q, k, v, k_cache, v_cache, cache_locs, input_pos, y)
+        _generate_mha(q, k, v, k_cache, v_cache, cache_locs, input_pos, scale, y)
 
     return y.view(b, s, -1)  # [b,s,n*h_d]
 

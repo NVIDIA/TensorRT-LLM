@@ -108,4 +108,4 @@ class SiglipVisionModel(nn.Module):
             r'(.*?)fc1(.*)': r'\1up_proj\2',
             r'(.*?)fc2(.*)': r'\1down_proj\2',
         }
-        _load_weights_impl(self, weights, pattern_mapping)
+        _load_weights_impl(self, weights, params_map=pattern_mapping)

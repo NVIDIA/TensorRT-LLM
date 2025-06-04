@@ -14,12 +14,13 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import DefaultMoeRoutingMethod, FusedMoE
+from ..modules.fused_moe import DefaultMoeRoutingMethod, MoE, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             duplicate_kv_weight, register_auto_model)
+                             duplicate_kv_weight, filter_weights,
+                             register_auto_model)
 
 
 class QwenMoE(nn.Module):
@@ -48,7 +49,7 @@ class QwenMoE(nn.Module):
 
         reduce_results = True
 
-        self.experts = FusedMoE(
+        self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=DefaultMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
@@ -256,14 +257,6 @@ class Qwen2MoeForCausalLM(DecoderModelForCausalLM[QwenMoeModel,
         tp_size = self.model_config.mapping.tp_size
         head_dim = self.config.hidden_size // self.config.num_attention_heads
 
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
-
         params_map = {
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
             'gate_up_proj': ['gate_proj', 'up_proj']
@@ -296,7 +289,7 @@ class Qwen2MoeForCausalLM(DecoderModelForCausalLM[QwenMoeModel,
                     module.load_weights(weights=module_weights)
                 else:
                     module_weights = filter_weights(name, weights)
-                    if isinstance(module, FusedMoE):
+                    if isinstance(module, MoE):
                         updated_module_weights = {}
                         for weight_name, weight_value in module_weights.items():
                             new_weight_name = weight_name.replace(

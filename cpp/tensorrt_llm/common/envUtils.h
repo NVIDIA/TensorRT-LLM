@@ -92,6 +92,8 @@ size_t getEnvKVCacheRecvBufferCount();
 
 bool getEnvKVCacheTransferUseAsyncBuffer();
 
+bool getEnvKVCacheTransferUseSyncBuffer();
+
 size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
@@ -99,5 +101,8 @@ size_t getEnvMemSizeForKVCacheTransferBuffer();
 uint16_t getEnvNixlPort();
 
 bool getEnvDisaggBenchmarkGenOnly();
+
+// Whether to disable the chunked-attention in the generation phase.
+bool getEnvDisableChunkedAttentionInGenPhase();
 
 } // namespace tensorrt_llm::common

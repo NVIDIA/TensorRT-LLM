@@ -259,17 +259,6 @@ class CompletionRequest(OpenAIBaseModel):
         )
         return sampling_params
 
-    def model_post_init(self, __context: Any) -> None:
-        if self.best_of is None:
-            self.best_of = self.n
-
-    @model_validator(mode="after")
-    def check_beam_search(self):
-        if (self.n > 1 or self.best_of > 1) and not self.use_beam_search:
-            raise ValueError(
-                "Only support one response per prompt without beam search")
-        return self
-
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
@@ -283,15 +272,6 @@ class CompletionRequest(OpenAIBaseModel):
         if data.get("stream_options") and not data.get("stream"):
             raise ValueError(
                 "Stream options can only be defined when stream is true.")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def verify_multi_responses(cls, data):
-        best_of = data.get("best_of")
-        n = data.get("n")
-        if best_of and n and best_of < n:
-            raise ValueError("best_of should not be smaller than n")
         return data
 
     @model_validator(mode="before")
@@ -446,7 +426,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     top_logprobs: Optional[int] = 0
     max_completion_tokens: int = Field(default=None,
                                        validation_alias='max_tokens')
-    n: Optional[int] = 1
+    n: int = 1
     presence_penalty: Optional[float] = 0.0
     response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = Field(None)
@@ -569,17 +549,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         )
         return sampling_params
 
-    def model_post_init(self, __context: Any) -> None:
-        if self.best_of is None:
-            self.best_of = self.n
-
-    @model_validator(mode="after")
-    def check_beam_search(self):
-        if (self.n > 1 or self.best_of > 1) and not self.use_beam_search:
-            raise ValueError(
-                "Only support one response per prompt without beam search")
-        return self
-
     @model_validator(mode='before')
     @classmethod
     def validate_stream_options(cls, values):
@@ -605,14 +574,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         top_logprobs = data.get("top_logprobs")
         if top_logprobs is not None and top_logprobs > 0:
             raise ValueError("top_logprobs is not supported")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def verify_multi_responses(cls, data):
-        best_of, n = data.get("best_of"), data.get("n")
-        if best_of and n and best_of < n:
-            raise ValueError("best_of should not be smaller than n")
         return data
 
     @model_validator(mode="before")

@@ -8,7 +8,7 @@ from typing import Optional
 import pytest
 from parameterized import parameterized
 
-from tensorrt_llm.executor import ExecutorBindingsProxy
+from tensorrt_llm.executor import GenerationExecutorProxy
 from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.mapping import Mapping
@@ -24,7 +24,7 @@ from .test_llm import (
     llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
     llama_v2_13b_lora_test_harness, llm_check_output,
     llm_get_stats_async_test_harness, llm_get_stats_test_harness,
-    llm_test_harness, mixtral_model_name, prompts,
+    llm_test_harness, mixtral_model_name, prompts, test_llm_api_eagle,
     tinyllama_guided_decoding_test_harness,
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
     run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
@@ -73,11 +73,11 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
     return tmpdir
 
 
+@pytest.mark.skip(reason="https://nvbugs/5266240")
 @pytest.mark.gpu2
 @pytest.mark.part0
 def test_llm_loading_from_ckpt_for_tp2(
         engine_from_checkpoint: tempfile.TemporaryDirectory):
-    pytest.skip(reason="https://nvbugspro.nvidia.com/bug/5273941")
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     llm_test_harness(engine_from_checkpoint.name,
                      prompts, ["D E F G H I J K"],
@@ -284,6 +284,13 @@ def test_llama_v2_7b_prompt_adapter_tp2():
         tensor_parallel_size=2, kv_cache_config=global_kv_cache_config_no_reuse)
 
 
+@pytest.mark.gpu2
+@pytest.mark.part0
+def test_llm_api_eagle_tp2():
+    test_llm_api_eagle(tensor_parallel_size=2,
+                       kv_cache_config=global_kv_cache_config)
+
+
 def run_command(command: str):
     try:
         result = subprocess.run(command,
@@ -375,7 +382,7 @@ class DummyExecutorMeta(type):
         return new_cls
 
 
-class DummyExecutorProxy2(ExecutorBindingsProxy):
+class DummyExecutorProxy2(GenerationExecutorProxy):
     ''' This is for testing the error occur in the thread in the Proxy. '''
 
     def __init__(
@@ -422,7 +429,7 @@ def _test_executor_handle_background_error_in_dispatch_result_thread():
     asyncio.run(task())
 
 
-class DummyExecutorProxy3(ExecutorBindingsProxy):
+class DummyExecutorProxy3(GenerationExecutorProxy):
     ''' This is for testing the error occur in a Worker process in the Proxy. '''
 
     def __init__(

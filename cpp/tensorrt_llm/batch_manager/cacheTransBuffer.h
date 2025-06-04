@@ -30,6 +30,29 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+class FabricMemory
+{
+public:
+    explicit FabricMemory(size_t size);
+    ~FabricMemory();
+
+    FabricMemory(FabricMemory const&) = delete;
+    FabricMemory& operator=(FabricMemory const&) = delete;
+
+    FabricMemory(FabricMemory&&) noexcept;
+    FabricMemory& operator=(FabricMemory&&) noexcept;
+
+    void* getPtr() const;
+    size_t getSize() const;
+
+    static size_t getAlignedSize(size_t size);
+    static bool supportFbaricMemory();
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> pImpl;
+};
+
 class CacheTransBufferManager
 {
 public:
@@ -81,12 +104,14 @@ private:
     size_t mSendBufferCount;
     size_t mTransferBufferSize;
     bool mOnlyUseDynamicBuffer;
+    bool mUseFabricMemory;
     size_t mBufferEleSize;
     nvinfer1::DataType mDataType;
     ConcurrenceResource mConcurrenceSendResource;
     ConcurrenceResource mConcurrenceRecvResource;
     KVCacheManager::BaseKVCacheManager* mCacheManager;
     runtime::BufferManager mBufferManager;
+    std::vector<std::unique_ptr<FabricMemory>> mFabricMemory;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

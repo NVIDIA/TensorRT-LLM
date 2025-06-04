@@ -134,7 +134,7 @@ McastDeviceMemory::~McastDeviceMemory()
 void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
 {
 
-    auto const& mpi_comm = tensorrt_llm::mpi::MpiComm::world();
+    auto const& mpi_comm = tensorrt_llm::mpi::MpiComm::session();
 
     CUmemAllocationHandleType const handle_type = CU_MEM_HANDLE_TYPE_FABRIC;
     CUmemAllocationProp prop = {};

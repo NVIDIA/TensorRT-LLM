@@ -212,12 +212,26 @@ public:
     {
     }
 
-    void set_params(AllReduceParams& params) const
+    void set_params(AllReduceParams& params, nvinfer1::DataType dataType, int token_num, int hidden_size,
+        AllReduceFusionOp op) const
     {
         int world_size = world_config.getSize();
+        int flag_offset = 0;
+        if (op == AllReduceFusionOp::RESIDUAL_RMS_NORM
+            && reduce_fusion::is_lamport_supported(dataType, token_num, hidden_size))
+        {
+            flag_offset = 0;
+        }
+        else
+        {
+            flag_offset = 1;
+        }
+        params.barrier_flag_ptr = static_cast<uint32_t*>(buffers.mFlagPtrs->data(flag_offset));
+        params.barrier_flag_counter_ptr = static_cast<uint32_t*>(buffers.mFlagPtrs->data(2));
         for (int i = 0; i < world_size; ++i)
         {
             params.peer_comm_buffer_ptrs[i] = buffers.mIpcMemoryHandles[0].getCommPtrs()[i];
+            params.peer_comm_buffer_ptrs[i + MAX_RANKS_PER_NODE] = buffers.mIpcMemoryHandles[1].getCommPtrs()[i];
             params.fusion_params.lamport_peer_comm_buffer_ptrs[i] = buffers.mIpcMemoryHandles[4].getCommPtrs()[i];
             params.fusion_params.lamport_peer_comm_buffer_ptrs[i + MAX_RANKS_PER_NODE]
                 = buffers.mIpcMemoryHandles[5].getCommPtrs()[i];
@@ -263,6 +277,7 @@ bool test(Workspace const& workspace, int token_num, int hidden_size, bool has_b
     std::vector<half> bias_buffer(hidden_size);
     std::vector<half> inter_buffer(message_size);
     std::vector<half> output_buffer(message_size);
+    std::vector<uint32_t> barrier_flag_buffer{1};
     float eps = 1e-6;
     random_fill(residual_buffer, -1, 1);
     random_fill(weight_buffer, -1, 1);
@@ -301,8 +316,7 @@ bool test(Workspace const& workspace, int token_num, int hidden_size, bool has_b
     in.copy_from(input_buffer.data());
 
     AllReduceParams params;
-    workspace.set_params(params);
-    params.barrier_flag = 0;
+    workspace.set_params(params, nvinfer1::DataType::kHALF, token_num, hidden_size, fusion_op);
     params.ranks_per_node = world_size;
     params.local_rank = rank;
     params.local_output_buffer_ptr = out.data();
@@ -329,13 +343,11 @@ bool test(Workspace const& workspace, int token_num, int hidden_size, bool has_b
     comm.barrier();
     for (int i = 0; i < warmup; ++i)
     {
-        params.barrier_flag += 1;
         customAllReduce(params, nvinfer1::DataType::kHALF, runtime_strategy, config, fusion_op, s);
     }
     cudaEventRecord(begin, s);
     for (int i = 0; i < iter; ++i)
     {
-        params.barrier_flag += 1;
         customAllReduce(params, nvinfer1::DataType::kHALF, runtime_strategy, config, fusion_op, s);
     }
     cudaEventRecord(end, s);
@@ -399,7 +411,8 @@ bool test_prepostnorm(Workspace const& workspace, int token_num, int hidden_size
     int message_size = token_num * hidden_size;
     int buffer_size = sizeof(half) * message_size;
     CudaBuffer in(buffer_size), out(buffer_size), residual(buffer_size), weight(hidden_size * sizeof(half)),
-        weight_pre_residual_norm(hidden_size * sizeof(half)), inter(buffer_size), bias(hidden_size * sizeof(half));
+        weight_pre_residual_norm(hidden_size * sizeof(half)), inter(buffer_size), bias(hidden_size * sizeof(half)),
+        barrier_flag(sizeof(uint32_t));
     std::vector<half> input_buffer(message_size);
     std::vector<half> residual_buffer(message_size);
     std::vector<half> weight_buffer(hidden_size);
@@ -407,6 +420,7 @@ bool test_prepostnorm(Workspace const& workspace, int token_num, int hidden_size
     std::vector<half> bias_buffer(hidden_size);
     std::vector<half> inter_buffer(message_size);
     std::vector<half> output_buffer(message_size);
+    std::vector<uint32_t> barrier_flag_buffer{1};
     float eps = 1e-6;
     random_fill(residual_buffer, -1, 1);
     random_fill(weight_buffer, -1, 1);
@@ -420,6 +434,7 @@ bool test_prepostnorm(Workspace const& workspace, int token_num, int hidden_size
     bias.copy_from(bias_buffer.data());
     inter.copy_from(inter_buffer.data());
     out.copy_from(output_buffer.data());
+    barrier_flag.copy_from(barrier_flag_buffer.data());
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
@@ -447,8 +462,7 @@ bool test_prepostnorm(Workspace const& workspace, int token_num, int hidden_size
     in.copy_from(input_buffer.data());
 
     AllReduceParams params;
-    workspace.set_params(params);
-    params.barrier_flag = 0;
+    workspace.set_params(params, nvinfer1::DataType::kHALF, token_num, hidden_size, fusion_op);
     params.ranks_per_node = world_size;
     params.local_rank = rank;
     params.local_output_buffer_ptr = out.data();
@@ -470,13 +484,11 @@ bool test_prepostnorm(Workspace const& workspace, int token_num, int hidden_size
     comm.barrier();
     for (int i = 0; i < warmup; ++i)
     {
-        params.barrier_flag += 1;
         customAllReduce(params, nvinfer1::DataType::kHALF, runtime_strategy, config, fusion_op, s);
     }
     cudaEventRecord(begin, s);
     for (int i = 0; i < iter; ++i)
     {
-        params.barrier_flag += 1;
         customAllReduce(params, nvinfer1::DataType::kHALF, runtime_strategy, config, fusion_op, s);
     }
     cudaEventRecord(end, s);
@@ -568,7 +580,6 @@ TEST(Kernel, AllReduce)
     // clang-format off
     std::vector<AllReduceStrategyConfig> configs{
         AllReduceStrategyConfig(0),
-        AllReduceStrategyConfig::USE_MEMCPY,
         AllReduceStrategyConfig::PUSH_MODE
     };
     std::vector<AllReduceFusionOp> ops{

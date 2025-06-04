@@ -30,9 +30,9 @@ from defs.common import (convert_weights, generate_summary_cmd,
                          venv_mpi_check_call)
 # yapf: disable
 from defs.conftest import (get_device_count, get_device_memory,
-                           get_host_total_memory, skip_fp8_pre_ada,
-                           skip_no_nvls, skip_post_blackwell, skip_pre_ada,
-                           skip_pre_blackwell)
+                           get_host_total_memory, get_sm_version,
+                           skip_fp8_pre_ada, skip_no_nvls, skip_post_blackwell,
+                           skip_pre_ada, skip_pre_blackwell)
 # yapf: enable
 from defs.trt_test_alternative import check_call, exists
 
@@ -3022,6 +3022,7 @@ def test_llm_llama_v3_8b_1048k_long_context_ppl(llama_example_root,
     'Llama-3-8B-Instruct-Gradient-1048k', 'Llama-3-70B-Instruct-Gradient-1048k'
 ],
                          indirect=True)
+@pytest.mark.timeout(10800 if get_sm_version() < 89 else 3600)
 def test_llm_llama_v3_1m_long_context_8gpus(llama_example_root,
                                             llama_model_root, llm_venv,
                                             engine_dir, cmodel_dir):

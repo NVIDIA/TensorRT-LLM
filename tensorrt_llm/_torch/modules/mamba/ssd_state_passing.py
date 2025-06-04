@@ -1,6 +1,20 @@
-# Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_state_passing.py
-"""We want triton==2.1.0 or 2.2.0 for this"""
+# Copyright (c) 2024, Tri Dao, Albert Gu.
+#
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import torch
 import triton
@@ -55,6 +69,7 @@ def _state_passing_fwd_kernel(
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
+    IS_CONT_BATCHED: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=1)
@@ -66,8 +81,10 @@ def _state_passing_fwd_kernel(
     final_states_ptr += (pid_b * stride_final_states_batch +
                          pid_h * stride_final_states_head)
     if HAS_INITSTATES:
-        initstates_ptr += (pid_b * stride_initstates_batch +
-                           pid_h * stride_initstates_head)
+        initstates_ptr += pid_h * stride_initstates_head
+        if not IS_CONT_BATCHED:
+            initstates_ptr += pid_b * stride_initstates_batch
+
     if HAS_SEQ_IDX:
         seq_idx_ptr += pid_b * stride_seq_idx_batch
 
@@ -76,10 +93,14 @@ def _state_passing_fwd_kernel(
     out_ptrs = out_ptr + offs_m * stride_out_dim
     final_states_ptrs = final_states_ptr + offs_m * stride_final_states_dim
 
+    # - states will be the past state of the sequence that continues on the current check
     if not HAS_INITSTATES:
         states = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
     else:
-        initstates_ptrs = initstates_ptr + offs_m * stride_initstates_dim
+        initstates_ptr += offs_m * stride_initstates_dim
+        initstates_ptrs = initstates_ptr
+        # - for cont batches, for the first chunk mean it will be the first batch's
+        #   init state
         states = tl.load(initstates_ptrs, mask=offs_m < dim,
                          other=0.0).to(tl.float32)
     tl.store(out_ptrs, states, mask=offs_m < dim)
@@ -91,10 +112,27 @@ def _state_passing_fwd_kernel(
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
         scale = tl.exp(dA_cs)
         if HAS_SEQ_IDX:
+            # - the seq to pass forward is the one that is flushed to the right
+            #   boundary.
+            # - that is given by seq_idx_new below.
             seq_idx_new = tl.load(seq_idx_ptr +
                                   (min((c + 1) * chunk_size, seqlen) - 1) *
                                   stride_seq_idx_seqlen)
-            scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+            if HAS_INITSTATES:
+                if IS_CONT_BATCHED and seq_idx != seq_idx_new:
+                    # this means in the current chunk the rightmost flushed seq
+                    # has changed.
+                    # - so we do not propagate the state from previous chunk
+                    # - but rather we load that sequence's init state
+                    initstates_ptrs = initstates_ptr + seq_idx_new * stride_initstates_batch
+
+                    # - update state with seq_idx_new's init state
+                    states = tl.load(initstates_ptrs,
+                                     mask=offs_m < dim,
+                                     other=0.0).to(tl.float32)
+            else:
+                scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+
             seq_idx = seq_idx_new
         states = scale * states + new_states
         if c < nchunks - 1:
@@ -113,11 +151,21 @@ def _state_passing_fwd(
     seq_idx=None,
     chunk_size=None,
     out_dtype=None,
+    is_cont_batched=False,
 ):
     batch, nchunks, nheads, dim = states.shape
     assert dA_chunk_cumsum.shape == (batch, nheads, nchunks)
     if initial_states is not None:
-        assert initial_states.shape == (batch, nheads, dim)
+        if is_cont_batched:
+            # - if cu_seqlens is provided, then the initial states
+            #   are used for continuous batching. In which case we
+            #   require seq_idx to be provided
+            assert seq_idx is not None, ""
+        else:
+            # - this is the regular batching case, where initial
+            #   states are used are for each example of the batch.
+            assert initial_states.shape == (batch, nheads, dim)
+
     if seq_idx is not None:
         assert chunk_size is not None
         seqlen = seq_idx.shape[-1]
@@ -165,5 +213,6 @@ def _state_passing_fwd(
               (0, 0)),
             HAS_INITSTATES=initial_states is not None,
             HAS_SEQ_IDX=seq_idx is not None,
+            IS_CONT_BATCHED=is_cont_batched,
         )
     return out, final_states

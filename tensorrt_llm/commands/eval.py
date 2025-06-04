@@ -19,7 +19,6 @@ import click
 import tensorrt_llm.profiler as profiler
 
 from .._torch.llm import LLM as PyTorchLLM
-from .._torch.pyexecutor.config import PyTorchConfig
 from ..evaluate import (GSM8K, MMLU, CnnDailymail, GPQADiamond, GPQAExtended,
                         GPQAMain)
 from ..llmapi import LLM, BuildConfig, KvCacheConfig
@@ -113,9 +112,6 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
 
     if backend == "tensorrt":
         backend = None
-    pytorch_backend_config = None
-    if backend == "pytorch":
-        pytorch_backend_config = PyTorchConfig()
 
     llm_args = {
         "model": model,
@@ -128,7 +124,6 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         "build_config": build_config,
         "kv_cache_config": kv_cache_config,
         "backend": backend,
-        "pytorch_backend_config": pytorch_backend_config,
     }
 
     if extra_llm_api_options is not None:

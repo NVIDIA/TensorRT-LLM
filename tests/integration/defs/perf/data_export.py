@@ -350,7 +350,7 @@ def write_gpu_monitoring_no_test_results(logpath,
 
 def get_log(fpath):
     """
-    Converts TURTLE log output into an ordered dict of stdout and stderr.
+    Converts log output into an ordered dict of stdout and stderr.
     Used for raw_result for test_result.
 
     Args:

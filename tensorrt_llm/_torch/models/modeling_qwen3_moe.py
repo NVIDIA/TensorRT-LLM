@@ -14,16 +14,17 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod, FusedMoE,
+from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE, MoE,
                                  Qwen3MoeRoutingMethod,
-                                 RenormalizeMoeRoutingMethod, RoutingMethodType)
+                                 RenormalizeMoeRoutingMethod, RoutingMethodType,
+                                 create_moe)
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..utils import disable_fp4_allgather
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, duplicate_kv_weight,
-                             register_auto_model)
+                             filter_weights, register_auto_model)
 
 
 class Qwen3Gate(nn.Module):
@@ -104,7 +105,7 @@ class Qwen3MoE(nn.Module):
             moe_backend=model_config.moe_backend,
         )
 
-        self.experts = FusedMoE(
+        self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
             hidden_size=self.hidden_dim,
@@ -154,8 +155,8 @@ class Qwen3MoE(nn.Module):
                                           self.mapping,
                                           dim=0,
                                           sizes=all_rank_num_tokens)
-            elif not self.experts.is_cutlass() or (not self.experts.has_fp8_qdq
-                                                   and self.experts.has_nvfp4):
+            elif not isinstance(self.experts, CutlassFusedMoE) or (
+                    not self.experts.has_fp8_qdq and self.experts.has_nvfp4):
                 # Use padding when not using the cutlass path or when x_sf in self.experts is not None
                 use_dp_padding = True
                 max_num_token = max(all_rank_num_tokens)
@@ -365,14 +366,6 @@ class Qwen3MoeForCausalLM(DecoderModelForCausalLM[Qwen3MoEModel,
             self.config, "head_dim",
             self.config.hidden_size // self.config.num_attention_heads)
 
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
-
         params_map = {
             "qkv_proj": ["q_proj", "k_proj", "v_proj"],
             "gate_up_proj": ["gate_proj", "up_proj"]
@@ -408,7 +401,7 @@ class Qwen3MoeForCausalLM(DecoderModelForCausalLM[Qwen3MoEModel,
                     module.load_weights(weights=module_weights)
                 else:
                     module_weights = filter_weights(name, weights)
-                    if isinstance(module, FusedMoE):
+                    if isinstance(module, MoE):
                         updated_module_weights = {}
                         for weight_name, weight_value in module_weights.items():
                             new_weight_name = (weight_name.replace(

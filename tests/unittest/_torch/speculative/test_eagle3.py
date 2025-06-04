@@ -7,7 +7,6 @@ import torch
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import BuildConfig, EagleDecodingConfig, KvCacheConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -24,7 +23,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
 
     models_path = llm_models_root()
 
-    pytorch_config = PyTorchConfig(
+    pytorch_config = dict(
         disable_overlap_scheduler=True,
         use_cuda_graph=use_cuda_graph,
         # Only create a single CUDA graph to prevent OOM in CI
@@ -49,7 +48,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
         build_config = BuildConfig(max_seq_len=2048)
 
     llm_spec = LLM(model=target_model_dir,
-                   pytorch_backend_config=pytorch_config,
+                   **pytorch_config,
                    kv_cache_config=kv_cache_config,
                    speculative_config=spec_config,
                    build_config=build_config)
@@ -89,7 +88,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
     llm_spec.shutdown()
 
     llm_ref = LLM(model=target_model_dir,
-                  pytorch_backend_config=pytorch_config,
+                  **pytorch_config,
                   kv_cache_config=kv_cache_config,
                   build_config=build_config)
 

@@ -1,38 +1,13 @@
 import json
 from functools import partial
-from typing import Any, Dict, List, TextIO, Tuple
+from typing import List, TextIO, Tuple
 
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
-from tensorrt_llm.inputs import (INPUT_FORMATTER_MAP, default_image_loader,
-                                 default_video_loader)
-
-
-def prepare_multimodal_inputs(model_dir: str,
-                              model_type: str,
-                              modality: str,
-                              prompts: List[str],
-                              media: List[List[str]],
-                              image_data_format: str = "pt",
-                              num_frames: int = 8) -> List[Dict[str, Any]]:
-    assert model_type in INPUT_FORMATTER_MAP, f"Model type {model_type} not in supported list of models: {INPUT_FORMATTER_MAP.keys()}"
-    formatter = INPUT_FORMATTER_MAP[model_type]
-
-    inputs = []
-    if modality == "image":
-        inputs = default_image_loader(prompts, media, image_data_format)
-    elif modality == "video":
-        inputs = default_video_loader(prompts, media, image_data_format,
-                                      num_frames)
-    else:
-        raise ValueError(f"Unsupported modality: {modality}")
-
-    inputs = formatter(model_dir, inputs)
-
-    return inputs
+from tensorrt_llm.inputs import default_multimodal_input_loader
 
 
 def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
@@ -132,11 +107,13 @@ def create_dataset_from_stream(
         assert modality in [
             "image", "video"
         ], f"Modality must be one of ['image', 'video'] but got {modality}."
-        prompts = prepare_multimodal_inputs(model_dir,
-                                            model_type,
-                                            modality,
-                                            prompts=prompts,
-                                            media=media_paths)  # list of dicts
+        prompts = default_multimodal_input_loader(
+            tokenizer=tokenizer,
+            model_dir=model_dir,
+            model_type=model_type,
+            modality=modality,
+            prompts=prompts,
+            media=media_paths)  # list of dicts
 
     all_isl = []
     all_seq_len = []

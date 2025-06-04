@@ -74,10 +74,9 @@ srun -l \
 
         # This is optional
         cat > /tmp/pytorch_extra_args.txt << EOF
-pytorch_backend_config:
-    use_cuda_graph: false
-    cuda_graph_padding_enabled: false
-    print_iter_log: true
+use_cuda_graph: false
+cuda_graph_padding_enabled: false
+print_iter_log: true
 enable_attention_dp: false
 EOF
 

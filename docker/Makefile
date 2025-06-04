@@ -45,6 +45,7 @@ PYTHON_VERSION     ?=
 NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
 NGC_REPO           ?= nvcr.io/nvidia/tensorrt-llm
 NGC_USE_STAGING    ?= 0
+NGC_AUTO_REPO      ?= $(if $(filter 1,$(NGC_USE_STAGING)),$(NGC_STAGING_REPO),$(NGC_REPO))
 
 define add_local_user
 	docker build \
@@ -160,24 +161,24 @@ release_run: WORK_DIR = /app/tensorrt_llm
 
 # For x86_64
 jenkins_%: IMAGE_WITH_TAG = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-jenkins_%: STAGE = devel
+jenkins_%: STAGE = tritondevel
 
 # For aarch64
 jenkins-aarch64_%: IMAGE_WITH_TAG = $(shell grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-jenkins-aarch64_%: STAGE = devel
+jenkins-aarch64_%: STAGE = tritondevel
 
 # For x86_64
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell grep 'LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-jenkins-rockylinux8_%: STAGE = devel
+jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
 jenkins-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
 
-rockylinux8_%: STAGE = devel
+rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvidia/cuda
 rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
 
 # For x86_64 and aarch64
-ubuntu22_%: STAGE = devel
+ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
 ubuntu22_%: BASE_TAG = 12.9.0-devel-ubuntu22.04
 
@@ -202,7 +203,8 @@ ngc-devel_%: IMAGE_TAG = $(TRT_LLM_VERSION)
 ngc-devel_push: DOCKER_BUILD_ARGS = --push
 ngc-devel_push: ngc-devel_build ;
 
-ngc-devel_run: IMAGE_NAME = $(if $(filter 1,$(NGC_USE_STAGING)),$(NGC_STAGING_REPO),$(NGC_REPO))
+ngc-devel_run:  IMAGE_NAME = $(NGC_AUTO_REPO)
+ngc-devel_pull: IMAGE_NAME = $(NGC_AUTO_REPO)
 
 ngc-release_%: STAGE = release
 ngc-release_%: DOCKER_BUILD_OPTS = --pull --load --platform linux/$(PLATFORM)
@@ -210,8 +212,11 @@ ngc-release_%: DEVEL_IMAGE = $(NGC_STAGING_REPO)/devel:$(TRT_LLM_VERSION)
 ngc-release_%: IMAGE_NAME = $(NGC_STAGING_REPO)
 ngc-release_%: IMAGE_TAG = $(TRT_LLM_VERSION)-$(PLATFORM)
 
-ngc-release_run: IMAGE_NAME = $(if $(filter 1,$(NGC_USE_STAGING)),$(NGC_STAGING_REPO),$(NGC_REPO))
-ngc-release_run: WORK_DIR = /app/tensorrt_llm
+ngc-release_run:  WORK_DIR = /app/tensorrt_llm
+ngc-release_run:  IMAGE_NAME = $(NGC_AUTO_REPO)
+ngc-release_run:  IMAGE_TAG = $(TRT_LLM_VERSION)
+ngc-release_pull: IMAGE_NAME = $(NGC_AUTO_REPO)
+ngc-release_pull: IMAGE_TAG = $(TRT_LLM_VERSION)
 
 ngc-manifest_%: STAGE = release
 ngc-manifest_%: IMAGE_NAME = $(NGC_STAGING_REPO)

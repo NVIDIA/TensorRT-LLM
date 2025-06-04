@@ -48,10 +48,10 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
     act_a_fp8, act_a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
     act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
 
+    output_expected = a @ b.t()
+
     output = torch.ops.trtllm.fp8_block_scaling_gemm(act_a_fp8, act_b_fp8,
                                                      act_a_sf, act_b_sf)
-
-    output_expected = a @ b.t()
     diff = calc_diff(output, output_expected)
     assert diff < 1e-3
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
@@ -161,7 +161,7 @@ def test_fp8_blockscale_gemm_trtllmgen(dtype):
     if dtype == torch.float8_e4m3fn:
         a = torch.randn((m, k), device='cuda',
                         dtype=torch.float32).to(torch.float8_e4m3fn)
-        a_scale = 2 * torch.rand(
+        a_scale = 2 * torch.randn(
             (k // tile_size, m), device='cuda').to(torch.float)
 
     else:
@@ -171,7 +171,7 @@ def test_fp8_blockscale_gemm_trtllmgen(dtype):
 
     b = torch.randn((n, k), device='cuda',
                     dtype=torch.float32).to(torch.float8_e4m3fn)
-    b_scale = 2 * torch.rand(
+    b_scale = 2 * torch.randn(
         (n // tile_size, k // tile_size), device='cuda').to(torch.float)
 
     c_expected = fp8_block_scaling_gemm_reference(a, b, a_scale, b_scale,

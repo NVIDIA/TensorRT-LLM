@@ -4,7 +4,7 @@ import json
 import os
 import types
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -176,17 +176,18 @@ class AutoModelForCausalLMFactory(ModelFactory):
         return CacheConfig(dtype=kv_cache_dtype)
 
     def init_tokenizer(self) -> Optional[Any]:
-        """Initialize the tokenizer for the model."""
-        if not self.model:
+        """Initialize the tokenizer—either a custom name or the model's default."""
+        if self.tokenizer is None:
             return None
-        return self.autotokenizer_from_pretrained(self.model, **self.tokenizer_kwargs)
+        return self.autotokenizer_from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
 
-    def _get_ignore_patterns(self, repo_id: str):
+    @staticmethod
+    def _get_ignore_patterns(repo_id: str, skip_prefetch_weights: bool) -> List[str]:
         """Get the ignore patterns for the HF repo."""
         ignore_patterns = ["*.pt", "*.pth"]
         bin_pattern = "*.bin*"
         safetensors_pattern = "*.safetensors*"
-        if self.skip_loading_weights:
+        if skip_prefetch_weights:
             ignore_patterns.extend([bin_pattern, safetensors_pattern])
             return ignore_patterns
 
@@ -259,7 +260,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
             f"{WEIGHTS_INDEX_NAME}, or {WEIGHTS_NAME}."
         )
 
-    def prefetch_checkpoint(self):
+    def _prefetch_checkpoint(self, model_name_or_path: str, skip_prefetch_weights: bool) -> str:
         """Prefetch checkpoint from a HF repo if needed.
 
         We support the native HF/torch formats in the following order of precedence:
@@ -267,27 +268,23 @@ class AutoModelForCausalLMFactory(ModelFactory):
             1. safetensors
             2. pytorch_model.bin
         """
-        # already prefetched
-        if self._prefetched_path:
-            return
-
         # check if it's a repo id and if so download the repo
         is_hf_repo = True
         try:
-            validate_repo_id(self.model)
+            validate_repo_id(model_name_or_path)
         except HFValidationError:
             is_hf_repo = False
         if is_hf_repo:
             ad_logger.info("Pre-fetching checkpoint directory from HF repo.")
-            ignore_patterns = self._get_ignore_patterns(self.model)
-            fetched_dir = snapshot_download(self.model, ignore_patterns=ignore_patterns)
+            ignore_patterns = self._get_ignore_patterns(model_name_or_path, skip_prefetch_weights)
+            fetched_dir = snapshot_download(model_name_or_path, ignore_patterns=ignore_patterns)
         else:
-            fetched_dir = self.model
+            fetched_dir = model_name_or_path
 
         # at this point it should be a directory (either the original one or the download dir)
         assert os.path.isdir(fetched_dir), f"Checkpoint path {fetched_dir} is not a directory."
 
-        self._prefetched_path = fetched_dir
+        return fetched_dir
 
     def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
         """Load the checkpoint into the model."""
@@ -332,6 +329,12 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
         self.model_kwargs["text_config"]["max_position_embeddings"] = self.model_kwargs[
             "max_position_embeddings"
         ]
+
+        # additional heuristic to propagate use of num_hidden_layers
+        # TODO (lucaslie): WAR until we have better support on dashboard to control model_kwargs
+        nhl_key = "num_hidden_layers"
+        if nhl_key in self.model_kwargs:
+            self.model_kwargs["text_config"][nhl_key] = self.model_kwargs[nhl_key]
 
     @property
     def automodel_from_config(self):

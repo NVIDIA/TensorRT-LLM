@@ -15,13 +15,13 @@ from .trt_test_alternative import call, check_call, print_info
 @pytest.fixture(autouse=True)
 def stop_triton_server():
     # Make sure Triton server are killed before each test.
-    call(f"pkill -9 tritonserver", shell=True)
-    call(f"pkill -9 trtllmExecutorWorker", shell=True)
+    call(f"pkill -9 -f tritonserver", shell=True)
+    call(f"pkill -9 -f trtllmExecutorWorker", shell=True)
     time.sleep(2)
     yield
     # Gracefully terminate Triton Server after each test.
-    call(f"pkill tritonserver", shell=True)
-    call(f"pkill trtllmExecutorWorker", shell=True)
+    call(f"pkill -f tritonserver", shell=True)
+    call(f"pkill -f trtllmExecutorWorker", shell=True)
     time.sleep(8)
 
 
@@ -2145,6 +2145,7 @@ def test_llama_v3_speculative_decoding_bls(
     tensorrt_llm_llama_example_root,
     llama_v3_8b_model_root,
     llama_v3_70b_model_root,
+    tensorrt_llm_example_root,
     llm_backend_inflight_batcher_llm_root,
     llm_backend_dataset_root,
     llm_backend_venv,
@@ -2161,16 +2162,19 @@ def test_llama_v3_speculative_decoding_bls(
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build engine
     DRAFT_ENGINE_DIR = prepare_llama_v3_8b_engine(
+        tensorrt_llm_example_root,
         tensorrt_llm_llama_example_root,
         llama_v3_8b_model_root,
         data_type=DATA_TYPE)
     CONTROL_ENGINE_DIR = prepare_llama_v3_70b_engine(
         "control_ifb",
+        tensorrt_llm_example_root,
         tensorrt_llm_llama_example_root,
         llama_v3_70b_model_root,
         data_type=DATA_TYPE)
     TARGET_ENGINE_DIR = prepare_llama_v3_70b_engine(
         "target_ifb",
+        tensorrt_llm_example_root,
         tensorrt_llm_llama_example_root,
         llama_v3_70b_model_root,
         data_type=DATA_TYPE)
@@ -2310,6 +2314,7 @@ def test_gpt_175b_dummyWeights_ifb(
     EXCLUDE_INPUT_IN_OUTPUT,
     inflight_batcher_llm_client_root,
     tensorrt_llm_gpt_example_root,
+    tensorrt_llm_example_root,
     gpt_tokenizer_model_root,
     llm_backend_venv,
 ):
@@ -2321,7 +2326,8 @@ def test_gpt_175b_dummyWeights_ifb(
 
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build Engine
-    ENGINE_PATH = prepare_gpt_175b_engine("ifb", tensorrt_llm_gpt_example_root)
+    ENGINE_PATH = prepare_gpt_175b_engine("ifb", tensorrt_llm_gpt_example_root,
+                                          tensorrt_llm_example_root)
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
     prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)

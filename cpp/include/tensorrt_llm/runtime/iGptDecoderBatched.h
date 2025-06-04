@@ -119,8 +119,7 @@ public:
 
     //! @brief Setup the decoder before calling `forward()`
     virtual void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
-        SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+        SizeType32 maxSequenceLength, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig)
         = 0;
 
@@ -128,10 +127,14 @@ public:
     virtual void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots) = 0;
 
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
-    virtual CudaEvent forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
+    virtual CudaEvent forwardAsync(
+        decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input)
+        = 0;
 
     //! @brief Run one step for all requests and wait for completion on the host.
-    virtual void forward(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
+    virtual void forward(
+        decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input)
+        = 0;
 
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned

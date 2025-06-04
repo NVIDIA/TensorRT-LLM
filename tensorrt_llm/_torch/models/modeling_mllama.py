@@ -34,7 +34,8 @@ from ..modules.linear import TensorParallelMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from .modeling_llama import LlamaAttention
-from .modeling_utils import duplicate_kv_weight, register_auto_model
+from .modeling_utils import (duplicate_kv_weight, filter_weights,
+                             register_auto_model)
 
 
 class MllamaDecoderLayer(DecoderLayer):
@@ -334,14 +335,6 @@ class MllamaForConditionalGeneration(nn.Module):
         text_config = self.config.pretrained_config.text_config
         text_head_dim = text_config.hidden_size // text_config.num_attention_heads
         vision_head_dim = vision_config.hidden_size // vision_config.attention_heads
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
 
         params_map = {
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],

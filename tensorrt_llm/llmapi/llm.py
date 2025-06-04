@@ -2,7 +2,9 @@ import atexit
 import json
 import os
 import shutil
+import socket
 import tempfile
+import time
 import weakref
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Sequence, Union
@@ -86,6 +88,7 @@ LLM_DOCSTRING = LLMARGS_EXPLICIT_DOCSTRING + """
     Attributes:
         tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
         workspace (pathlib.Path): The directory to store intermediate files.
+        llm_id (str): The unique ID of the LLM instance.
 """
 
 
@@ -110,11 +113,9 @@ class LLM:
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
+        self._llm_id = None
 
         try:
-            self.pytorch_backend_config = kwargs.pop('pytorch_backend_config',
-                                                     None)
-
             llm_args_cls = TorchLlmArgs if kwargs.get(
                 'backend', None) == 'pytorch' else TrtLlmArgs
 
@@ -188,6 +189,16 @@ class LLM:
     @property
     def workspace(self) -> Path:
         return Path(self._workspace.name) if self._on_trt_backend else None
+
+    @property
+    def llm_id(self) -> str:
+        if self._llm_id is None:
+            hostname = socket.gethostname()
+            pid = os.getpid()
+            timestamp = int(time.time() * 1000)
+            self._llm_id = f"{hostname}-{pid}-{timestamp}"
+
+        return self._llm_id
 
     def generate(
         self,
@@ -301,14 +312,6 @@ class LLM:
                 and disaggregated_params.request_type == "context_only"
                 and not self._on_trt_backend):
             sampling_params.max_tokens = 1
-
-        max_batch_size = self.args.max_batch_size
-        max_batch_size = max_batch_size or self.args.build_config.max_batch_size
-
-        if sampling_params.n > max_batch_size:
-            raise ValueError(
-                f"SamplingParams.n ({sampling_params.n}) should not exceed max_batch_size ({max_batch_size})"
-            )
 
         inputs = prompt_inputs(inputs)
 
@@ -510,10 +513,28 @@ class LLM:
                 f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({build_config.max_seq_len})")
 
-        if sampling_params.use_beam_search and sampling_params.n > build_config.max_beam_width:
-            raise ValueError(
-                f"sampling_params's n ({sampling_params.n}) should not exceed max_beam_width ({build_config.max_beam_width}) when use_beam_search is True"
-            )
+        if sampling_params.use_beam_search and sampling_params.best_of > build_config.max_beam_width:
+            if sampling_params.n == sampling_params.best_of:
+                raise ValueError(
+                    f"sampling_params.n ({sampling_params.n}) cannot exceed max_beam_width ({build_config.max_beam_width}) when use_beam_search is True"
+                )
+            else:
+                raise ValueError(
+                    f"sampling_params.best_of ({sampling_params.best_of}) cannot exceed max_beam_width ({build_config.max_beam_width}) when use_beam_search is True"
+                )
+
+        max_batch_size = self.args.max_batch_size
+        if max_batch_size is None:
+            max_batch_size = build_config.max_batch_size
+        if not sampling_params.use_beam_search and sampling_params.best_of > max_batch_size:
+            if sampling_params.n == sampling_params.best_of:
+                raise ValueError(
+                    f"sampling_params.n ({sampling_params.n}) cannot exceed max_batch_size ({max_batch_size}) when use_beam_search is False"
+                )
+            else:
+                raise ValueError(
+                    f"sampling_params.best_of ({sampling_params.best_of}) cannot exceed max_batch_size ({max_batch_size}) when use_beam_search is False"
+                )
 
         if sampling_params.prompt_logprobs and not build_config.gather_context_logits:
             raise ValueError(
@@ -625,7 +646,8 @@ class LLM:
         update_executor_config(
             executor_config,
             backend=self.args.backend,
-            pytorch_backend_config=self.pytorch_backend_config,
+            pytorch_backend_config=self.args.get_pytorch_backend_config()
+            if self.args.backend == "pytorch" else None,
             mapping=self.args.parallel_config.to_mapping(),
             build_config=self.args.build_config
             if self._on_trt_backend else None,

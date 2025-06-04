@@ -226,7 +226,9 @@ class MTPSampler(TorchSampler):
     def __init__(self, max_seq_len: int, config: MTPConfig):
         super().__init__(max_seq_len, False)
         self.mapping = None
-        self.draft_len = config.num_nextn_predict_layers
+        self.draft_len = 0
+        if config is not None:
+            self.draft_len = config.num_nextn_predict_layers
 
     def _draft_meet_max_token_stop_criteria(self, request: LlmRequest,
                                             num_tokens: int, beam_idx: int):
@@ -261,8 +263,7 @@ class MTPSampler(TorchSampler):
                 if self._draft_meet_max_token_stop_criteria(
                         request, num_tokens, beam_idx):
                     should_stop = True
-                if not should_stop:
-                    request.py_draft_tokens = next_draft_tokens_list[idx]
+                request.py_draft_tokens = next_draft_tokens_list[idx]
                 request.py_decoding_iter += 1
             idx += 1
 
@@ -284,8 +285,7 @@ class MTPSampler(TorchSampler):
                 if self._draft_meet_max_token_stop_criteria(
                         request, num_tokens, beam_idx):
                     should_stop = True
-                if not should_stop:
-                    request.py_draft_tokens = next_draft_tokens_list[idx]
+                request.py_draft_tokens = next_draft_tokens_list[idx]
                 request.py_rewind_len = self.draft_len - (num_new_tokens - 1)
                 request.py_decoding_iter += 1
             idx += 1

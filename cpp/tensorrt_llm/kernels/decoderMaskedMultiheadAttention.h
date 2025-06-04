@@ -102,6 +102,10 @@ struct Multihead_attention_params_base
     int batch_size = 0;
     // The beam width
     int beam_width = 0;
+    // The chunked attention size.
+    int chunked_attention_size = INT_MAX;
+    // The chunked attention size in log2.
+    int chunked_attention_size_log2 = 0;
     // By default, max_attention_window_size == cyclic_attention_window_size
     // unless each layer has different cyclic kv cache length.
     // Max cache capacity (used to allocate KV cache)
