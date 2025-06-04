@@ -20,21 +20,22 @@ class AlltoallMethodType(IntEnum):
     DeepEPLowLatency = 3
 
 
-def select_alltoall_method_type(mapping: Mapping) -> AlltoallMethodType:
+def select_alltoall_method_type(mapping: Mapping,
+                                use_cuda_graph: bool) -> AlltoallMethodType:
     if MnnvlMemory.supports_mnnvl():
         return AlltoallMethodType.MNNVL
 
     if deep_ep_installed:
-        if os.environ.get("TRTLLM_ALLOW_NO_CUDA_GRAPHS", "0") == "1":
-            intranode = mapping.moe_ep_size <= local_mpi_size()
-            if intranode:
-                return AlltoallMethodType.DeepEP
-            else:
-                # TODO: Detect IBGDA support
-                if os.environ.get("TRTLLM_CAN_USE_IBGDA", "0") == "1":
-                    return AlltoallMethodType.DeepEP
-        else:
-            if os.environ.get("TRTLLM_CAN_USE_IBGDA", "0") == "1":
+        intranode = mapping.moe_ep_size <= local_mpi_size()
+        ibgda = os.environ.get("TRTLLM_CAN_USE_IBGDA",
+                               "0") == "1"  # TODO: Auto detect IBGDA support
+        if use_cuda_graph:
+            # Here we can only choose DeepEPLowLatency since only this method supports CUDA Graphs.
+            if ibgda:
                 return AlltoallMethodType.DeepEPLowLatency
+        else:
+            # Here we can choose DeepEP or DeepEPLowLatency if both are available. Now DeepEP is faster.
+            if intranode or ibgda:
+                return AlltoallMethodType.DeepEP
 
     return AlltoallMethodType.NotAvailable

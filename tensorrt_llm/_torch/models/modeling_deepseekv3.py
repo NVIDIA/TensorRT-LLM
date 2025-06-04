@@ -457,7 +457,8 @@ class Deepseekv3MoE(nn.Module):
             return False
 
         if select_alltoall_method_type(
-                model_config.mapping) == AlltoallMethodType.NotAvailable:
+                model_config.mapping, model_config.pytorch_backend_config.
+                use_cuda_graph) == AlltoallMethodType.NotAvailable:
             return False
 
         return True

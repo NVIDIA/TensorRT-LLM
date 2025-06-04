@@ -15,14 +15,6 @@ SchedulerOutput = namedtuple("SchedulerOutput", [
     "fitting_disagg_gen_init_requests", "num_fitting_requests"
 ])
 
-_decoding_cuda_graphs_support = True
-
-
-# In the decoding phase, disable CUDA Graphs capture if ops that do not support CUDA Graphs are used
-def set_no_decoding_cuda_graphs_support():
-    global _decoding_cuda_graphs_support
-    _decoding_cuda_graphs_support = False
-
 
 class ScheduledRequests:
     # to be aligned with ScheduledRequests in cpp/tensorrt_llm/batch_manager/common.h
@@ -38,7 +30,7 @@ class ScheduledRequests:
 
     @property
     def can_run_cuda_graph(self) -> bool:
-        return (not self.context_requests) and _decoding_cuda_graphs_support
+        return (not self.context_requests)
 
     @property
     def batch_size(self) -> int:

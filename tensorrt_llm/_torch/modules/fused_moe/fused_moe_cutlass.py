@@ -4,8 +4,6 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
-from tensorrt_llm._torch.pyexecutor.scheduler import \
-    set_no_decoding_cuda_graphs_support
 from tensorrt_llm._utils import logger
 
 from ...distributed import allgather, reducescatter
@@ -183,7 +181,8 @@ class CutlassFusedMoE(MoE):
                 "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
                                            == "1") and qm.has_nvfp4()
             self.alltoall_method_type = select_alltoall_method_type(
-                model_config.mapping)
+                model_config.mapping,
+                model_config.pytorch_backend_config.use_cuda_graph)
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 MnnvlMemory.initialize()
                 self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
@@ -193,7 +192,6 @@ class CutlassFusedMoE(MoE):
                     deep_ep_utils.get_comm(model_config.mapping),
                     deep_ep_utils.get_hidden_bytes(
                         torch.empty(1, hidden_size, dtype=dtype)))
-                set_no_decoding_cuda_graphs_support()
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 self.deep_ep_max_num_tokens = min(model_config.max_num_tokens,
                                                   self.moe_max_num_tokens)
