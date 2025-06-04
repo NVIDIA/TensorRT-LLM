@@ -1652,7 +1652,6 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
         build_config=BuildConfig(gather_context_logits=True),
         tensor_parallel_size=tp_size,
         gather_generation_logits=True,
-        fast_build=True,
     )
 
     prompts = ["A B C D E F G H I J K"]
