@@ -20,7 +20,7 @@ from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
 
-from ..conftest import llm_models_root
+from ..conftest import llm_models_root, parametrize_with_ids, skip_pre_hopper
 from ..trt_test_alternative import popen
 from .accuracy_core import GSM8K, MMLU, LlmapiAccuracyTestHarness
 
@@ -216,6 +216,57 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
         pytest.skip("https://nvbugs/5297821")
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      tensor_parallel_size=4) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+
+    @parametrize_with_ids("overlap_scheduler", [True, False])
+    @parametrize_with_ids("mtp_nextn",
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
+        ctx_server_config = {
+            "pytorch_backend_config": {
+                "disable_overlap_scheduler": True
+            }
+        }
+        gen_server_config = {
+            "pytorch_backend_config": {
+                "disable_overlap_scheduler": not overlap_scheduler
+            }
+        }
+        if mtp_nextn > 0:
+            ctx_server_config["speculative_config"] = {
+                "decoding_type": "MTP",
+                "num_nextn_predict_layers": mtp_nextn
+            }
+            gen_server_config["speculative_config"] = {
+                "decoding_type": "MTP",
+                "num_nextn_predict_layers": mtp_nextn
+            }
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,

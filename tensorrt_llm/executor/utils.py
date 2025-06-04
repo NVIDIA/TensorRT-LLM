@@ -10,7 +10,6 @@ from strenum import StrEnum
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.bindings.executor import Response
 from tensorrt_llm.llmapi.utils import print_colored_debug
-from tensorrt_llm.logger import logger
 
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
@@ -27,10 +26,6 @@ class LlmLauncherEnvs(StrEnum):
     TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT = "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT"
 
 
-PERIODICAL_RESP_IN_AWAIT = os.getenv(
-    LlmLauncherEnvs.TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT) == "1"
-
-
 def get_spawn_proxy_process_ipc_addr_env() -> str | None:
     ''' Get the IPC address for the spawn proxy process dynamically. '''
     return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR)
@@ -45,10 +40,6 @@ def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes | None:
 def get_spawn_proxy_process_env() -> bool:
     ''' Get the environment variable for the spawn proxy process dynamically. '''
     return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS) == "1"
-
-
-if PERIODICAL_RESP_IN_AWAIT:
-    logger.info("Using periodical responses in await_responses")
 
 
 def create_mpi_comm_session(
@@ -146,7 +137,7 @@ class IntraProcessQueue:
 class WorkerCommIpcAddrs(NamedTuple):
     ''' IPC addresses (str) and HMAC keys (bytes) for communication with the worker processes. '''
     request_queue_addr: tuple[str, Optional[bytes]]
-    request_error_queue_addr: tuple[str, Optional[bytes]]
+    worker_init_status_queue_addr: tuple[str, Optional[bytes]]
     result_queue_addr: tuple[str, Optional[bytes]]
     stats_queue_addr: tuple[str, Optional[bytes]]
     kv_cache_events_queue_addr: tuple[str, Optional[bytes]]
