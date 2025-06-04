@@ -804,9 +804,9 @@ class PyTorchModelEngine(ModelEngine):
         if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
             graph_batch_size = self.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
-            self.attention_dp_cuda_graph_all_can_run = all(
-                graph_batch[0] for graph_batch in graph_batch_size)
-            if self.attention_dp_cuda_graph_all_can_run:
+            all_can_graph = all(graph_batch[0]
+                                for graph_batch in graph_batch_size)
+            if all_can_graph:
                 new_batch_size = max(gen_only_batch[1]
                                      for gen_only_batch in graph_batch_size)
 
@@ -840,7 +840,7 @@ class PyTorchModelEngine(ModelEngine):
 
         scheduled_requests.generation_requests.extend(
             [self.cuda_graph_dummy_request] * padding_size)
-
+        self.attention_dp_cuda_graph_all_can_run = True
         return padding_size
 
     @contextlib.contextmanager
