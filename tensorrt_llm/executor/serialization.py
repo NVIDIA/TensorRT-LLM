@@ -61,7 +61,7 @@ BASE_ZMQ_CLASSES = {
         "BatchingType", "CapacitySchedulerPolicy", "ContextPhaseParams",
         "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
         "FinishReason", "KvCacheConfig", "KvCacheTransferMode",
-        "KvCacheRetentionConfig", "CacheTransceiverConfig",
+        "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig", "DynamicBatchConfig", "ContextChunkingPolicy",
         "CacheTransceiverConfig"
