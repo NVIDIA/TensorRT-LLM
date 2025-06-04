@@ -8,8 +8,8 @@ from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 
-from tensorrt_llm.inputs import default_multimodal_input_loader
 from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.inputs import default_multimodal_input_loader
 from tensorrt_llm.inputs import (INPUT_FORMATTER_MAP, default_image_loader,
                                  default_video_loader)
 
