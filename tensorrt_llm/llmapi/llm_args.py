@@ -1764,15 +1764,18 @@ def update_llm_args_with_extra_dict(
         "pytorch_backend_config": PyTorchConfig,
         "cache_transceiver_config": CacheTransceiverConfig,
     }
-    for field, field_type in field_mapping.items():
-        if field in llm_args_dict:
-            if field == "speculative_config":
-                llm_args_dict[field] = field_type.from_dict(
-                    llm_args_dict[field])
+    for field_name, field_type in field_mapping.items():
+        if field_name in llm_args_dict:
+            if field_name == "speculative_config":
+                llm_args_dict[field_name] = field_type.from_dict(
+                    llm_args_dict[field_name])
+            elif field_name == "pytorch_backend_config":
+                llm_args_dict.update(llm_args_dict[field_name])
             else:
-                llm_args_dict[field] = field_type(**llm_args_dict[field])
+                llm_args_dict[field_name] = field_type(
+                    **llm_args_dict[field_name])
             extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
-            logger.warning(f"Overriding {field} {extra_llm_str}")
+            logger.warning(f"Overriding {field_name} {extra_llm_str}")
 
     llm_args = llm_args | llm_args_dict
     return llm_args
