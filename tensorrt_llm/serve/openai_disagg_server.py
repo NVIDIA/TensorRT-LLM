@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 import asyncio
 import copy
-import json
 import logging
 import os
 import signal
@@ -129,14 +128,6 @@ class OpenAIDisaggServer:
 
             if ctx_response is not None and len(ctx_response.choices) != 1:
                 raise ValueError("Context server did not return a single choice. This is not expected")
-
-            # First yield the context response if it's not None
-            if ctx_response is not None:
-                # Remove the disaggregated params from the context response
-                data = ctx_response.model_dump()
-                del data['choices'][0]['disaggregated_params']
-                data = json.dumps(data)
-                yield f"data: {data}\n\n".encode('utf-8')
 
             #If request finished after first token not due to length, return right away and skip gen
             if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
