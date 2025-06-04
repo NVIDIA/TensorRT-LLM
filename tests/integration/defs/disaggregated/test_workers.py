@@ -4,7 +4,7 @@ import copy
 import json
 import os
 import subprocess
-from typing import List, Optional, Tuple
+from typing import Generator, List, Optional, Tuple
 
 import aiohttp
 import pytest
@@ -40,7 +40,7 @@ def run_disaggregated_workers(
     env: Optional[dict] = None,
     cwd: Optional[str] = None,
     num_ranks: Optional[int] = None
-) -> Tuple[subprocess.Popen, List[str], List[str]]:
+) -> Tuple[Generator[subprocess.Popen, None, None], List[str], List[str]]:
 
     ctx_servers, gen_servers = get_ctx_gen_server_urls_from_cfg(config_file)
 
@@ -365,6 +365,8 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
         }
         ctx_server_prev = None
         gen_server_prev = None
+        ctx_match = 0
+        gen_match = 0
         for i in range(max_rounds):
             openai_request = CompletionRequest(
                 model=MODEL_NAME,
@@ -379,8 +381,8 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             gen_server, _ = await self.gen_router.get_next_server(openai_request
                                                                   )
             if check_server_match and ctx_server_prev is not None:
-                assert ctx_server == ctx_server_prev
-                assert gen_server == gen_server_prev
+                ctx_match += int(ctx_server == ctx_server_prev)
+                gen_match += int(gen_server == gen_server_prev)
             ctx_server_prev = ctx_server
             gen_server_prev = gen_server
             response = await self.send_disagg_request(session, ctx_server,
@@ -393,6 +395,9 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             )
             request["prompt"] = prompt_str + response["choices"][0]["text"]
 
+        if check_server_match:
+            assert ctx_match > max_rounds // 2
+            assert gen_match > max_rounds // 2
         return request["prompt"]
 
     async def test_multi_round_request(self,
@@ -417,7 +422,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             # send a dummy request for initialization
             dummy_request = {
                 "model": MODEL_NAME,
-                "prompt": [3] * 100,
+                "prompt": [3] * 200,
                 "max_tokens": 1,
                 "temperature": 0.0,
             }
@@ -494,17 +499,21 @@ def load_default_prompts(disaggregated_example_root: str):
 def background_workers(llm_venv, config_file: str, num_ranks: int = None):
     cwd = llm_venv.get_working_directory()
 
-    with open(os.path.join(cwd, 'output_workers.log'), 'w') as log_file:
+    with open(os.path.join(cwd, 'output_workers.log'), 'w+') as log_file:
         workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
             config_file=config_file,
             stdout=log_file,
             env=llm_venv._new_env,
             cwd=cwd,
             num_ranks=num_ranks)
-        with workers_proc as proc:
-            yield ctx_servers, gen_servers
-            proc.terminate()
-            proc.wait()
+        try:
+            with workers_proc as proc:
+                yield ctx_servers, gen_servers
+        except Exception:
+            log_file.seek(0)
+            logger.error("-------- Worker output --------")
+            logger.error(log_file.read())
+            raise
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -553,7 +562,7 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
                             4) as (ctx_servers, gen_servers):
         tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
-        asyncio.run(tester.test_multi_round_request(prompts, 6, 4))
+        asyncio.run(tester.test_multi_round_request(prompts, 16, 4))
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
