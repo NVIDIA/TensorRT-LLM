@@ -15,7 +15,6 @@ def _clean_files(src_dir: PathLike, extend_files: str) -> None:
         ".devcontainer",
         "docker/README.md",
         "jenkins",
-        "scripts/collect_unittests.py",
         "scripts/package_trt_llm.py",
         "scripts/git_replace.py",
         "tests/integration",

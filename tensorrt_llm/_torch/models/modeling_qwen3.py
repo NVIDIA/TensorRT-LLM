@@ -26,8 +26,10 @@ class Qwen3Attention(Attention):
         self,
         model_config: ModelConfig[Qwen3Config],
         layer_idx: Optional[int] = None,
+        fuse_qk_norm_rope: bool = True,
     ):
         config = model_config.pretrained_config
+
         if getattr(config, "rope_scaling", None) is not None:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.from_string(
@@ -40,19 +42,26 @@ class Qwen3Attention(Attention):
                 rope=RopeParams.from_config(config),
             )
 
+        self.fuse_qk_norm_rope = fuse_qk_norm_rope
+
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
-            pos_embd_params=pos_embd_params,
+            pos_embd_params=pos_embd_params
+            if not self.fuse_qk_norm_rope else None,
+            qk_norm_type=QkNormType.pre_rope,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=config.attention_bias,
             config=model_config,
-            qk_norm_type=QkNormType.pre_rope,
         )
+
+        # If fuse_qk_norm_rope is true, we pass pos_embd_params=None to super().__init__,
+        # so we need to do assignment to record the actual pos_embd_params.
+        self.pos_embd_params = pos_embd_params
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=1e-6,
@@ -84,6 +93,21 @@ class Qwen3Attention(Attention):
         )
 
         return q, k
+
+    def apply_rope(self, qkv: torch.Tensor, position_ids: torch.Tensor):
+        if not self.fuse_qk_norm_rope:
+            return super().apply_rope(qkv, position_ids)
+        else:
+            return self.apply_qk_norm_rope(qkv, position_ids)
+
+    def apply_qk_norm_rope(self, qkv, position_ids):
+        torch.ops.trtllm.fused_qk_norm_rope(
+            qkv, self.num_heads, self.num_key_value_heads,
+            self.num_key_value_heads, self.head_dim,
+            self.q_norm.variance_epsilon, self.q_norm.weight,
+            self.k_norm.weight, self.pos_embd_params.rope.theta,
+            self.pos_embd_params.is_neox, position_ids.view(-1))
+        return qkv, None, None
 
 
 class Qwen3DecoderLayer(DecoderLayer):

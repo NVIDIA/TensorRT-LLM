@@ -22,8 +22,7 @@ def match_repeat_kv(gm: GraphModule) -> GraphModule:
     """
     graph = gm.graph
 
-    # Track replacements to avoid processing nodes multiple times
-    replacements_made = False
+    num_kv_patterns = 0
 
     # Iterate through nodes in the graph
     for node in list(graph.nodes):
@@ -33,11 +32,12 @@ def match_repeat_kv(gm: GraphModule) -> GraphModule:
             if match_info:
                 ad_logger.debug(f"Found repeat_kv pattern at {node}")
                 _replace_with_repeat_kv(graph, match_info)
-                replacements_made = True
+                num_kv_patterns += 1
 
     # Clean up the graph if we made any replacements
-    if replacements_made:
+    if num_kv_patterns:
         gm = canonicalize_graph(gm)
+    ad_logger.info(f"Found {num_kv_patterns} repeat_kv patterns")
 
     return gm
 
@@ -54,7 +54,7 @@ def match_eager_attention(gm: GraphModule) -> GraphModule:
     graph = gm.graph
 
     # Track replacements to avoid processing nodes multiple times
-    replacements_made = False
+    num_eager_patterns = 0
 
     # Iterate through nodes in the graph
     for node in list(graph.nodes):
@@ -64,12 +64,12 @@ def match_eager_attention(gm: GraphModule) -> GraphModule:
             if match_info:
                 ad_logger.debug(f"Found eager attention pattern at {node}")
                 _replace_with_sdpa(graph, match_info)
-                replacements_made = True
+                num_eager_patterns += 1
 
     # Clean up the graph if we made any replacements
-    if replacements_made:
+    if num_eager_patterns:
         gm = canonicalize_graph(gm)
-
+    ad_logger.info(f"Found {num_eager_patterns} eager attention patterns")
     return gm
 
 
@@ -87,7 +87,7 @@ def match_grouped_attention(gm: GraphModule) -> GraphModule:
     graph = gm.graph
 
     # Track replacements to avoid processing nodes multiple times
-    replacements_made = False
+    num_grouped_patterns = 0
 
     # Iterate through nodes in the graph
     for node in list(graph.nodes):
@@ -97,12 +97,12 @@ def match_grouped_attention(gm: GraphModule) -> GraphModule:
             if match_info:
                 ad_logger.debug(f"Found grouped attention pattern at {node}")
                 _replace_with_grouped_sdpa(graph, match_info)
-                replacements_made = True
+                num_grouped_patterns += 1
 
     # Clean up the graph if we made any replacements
-    if replacements_made:
+    if num_grouped_patterns:
         gm = canonicalize_graph(gm)
-
+    ad_logger.info(f"Found {num_grouped_patterns} grouped attention patterns")
     return gm
 
 
@@ -120,7 +120,7 @@ def match_causal_attn_mask(gm: GraphModule) -> GraphModule:
     graph = gm.graph
 
     # Track replacements to avoid processing nodes multiple times
-    replacements_made = False
+    num_causal_patterns = 0
 
     # Iterate through nodes in the graph
     for node in list(graph.nodes):
@@ -144,20 +144,21 @@ def match_causal_attn_mask(gm: GraphModule) -> GraphModule:
 
         ad_logger.debug(f"Found causal attention mask at {node}")
 
-        # Create new arguments with None mask and is_causal=True
-        new_args = list(node.args)
-        new_args[3] = None  # Set mask to None
+        # construct the new args list with args provided to the node and the default values otherwise
+        new_args = []
+        for idx, arg in enumerate(node.target._schema.arguments):
+            # In case arg is provided to the node, use it
+            if idx < len(node.args):
+                new_args.append(node.args[idx])
+            # In case arg is not provided to the node, use the default value
+            elif arg.has_default_value:
+                new_args.append(arg.default_value)
+            else:
+                raise ValueError(f"Missing required argument: {arg.name}")
 
-        # Check if we have enough arguments to set is_causal
-        if len(new_args) > 5:
-            new_args[5] = True  # Set is_causal to True
-        else:
-            # If is_causal wasn't specified (using default value), extend args
-            while len(new_args) < 5:
-                new_args.append(
-                    node.args[len(new_args)] if len(node.args) > len(new_args) else None
-                )
-            new_args.append(True)  # Append is_causal=True
+        # Create new arguments with None mask and is_causal=True
+        new_args[3] = None  # Set mask to None
+        new_args[5] = True  # Set is_causal to True
 
         # Create new node with updated arguments
         with graph.inserting_before(node):
@@ -169,12 +170,12 @@ def match_causal_attn_mask(gm: GraphModule) -> GraphModule:
         # Replace the old node with the new one
         node.replace_all_uses_with(new_node)
 
-        replacements_made = True
+        num_causal_patterns += 1
 
     # Clean up the graph if we made any replacements
-    if replacements_made:
+    if num_causal_patterns:
         gm = canonicalize_graph(gm)
-
+    ad_logger.info(f"Found {num_causal_patterns} causal mask attention patterns")
     return gm
 
 
@@ -767,7 +768,7 @@ def match_attention_layout(gm: GraphModule, attention_op: Type[AttentionDescript
     }
 
     graph = gm.graph
-    replacements_made = False
+    num_bsnd_patterns = 0
 
     # Look for SDPA operations
     for sdpa_node in list(graph.nodes):
@@ -827,11 +828,13 @@ def match_attention_layout(gm: GraphModule, attention_op: Type[AttentionDescript
         # Replace the old node with the transposed output
         sdpa_node.replace_all_uses_with(output_updated)
 
-        replacements_made = True
+        num_bsnd_patterns += 1
 
     # Clean up the graph if we made any replacements
-    if replacements_made:
+    if num_bsnd_patterns:
         gm = canonicalize_graph(gm)
         ad_logger.debug(f"Transformed graph for bsnd layout: {gm}")
+
+    ad_logger.info(f"Found and matched {num_bsnd_patterns} attention layouts")
 
     return gm

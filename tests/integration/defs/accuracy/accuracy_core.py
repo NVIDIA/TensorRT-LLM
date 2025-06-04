@@ -434,6 +434,9 @@ class CliFlowAccuracyTestHarness:
             f"--dtype={self.dtype}",
         ]
 
+        if "nemotron_nas" in self.EXAMPLE_FOLDER:
+            convert_cmd.append("--trust_remote_code")
+
         if self.MODEL_FORMAT == "NEMO":
             convert_cmd.append(f"--nemo_ckpt_path={self.MODEL_PATH}")
         else:

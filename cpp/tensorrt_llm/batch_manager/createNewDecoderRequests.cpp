@@ -169,13 +169,12 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     BufferManager manager{std::make_shared<CudaStream>(decoderStream.get())};
 
-    auto const& jointOutputIdsShape = decoderState.getJointDecodingOutput().ids->getShape();
-    auto const batchSize = jointOutputIdsShape.d[0];
+    auto const batchSize = decoderState.getMaxBatchSize();
     TLLM_CHECK(0 <= batchSize && batchSlot < batchSize);
-    auto const maxBeamWidth = jointOutputIdsShape.d[1];
+    auto const maxBeamWidth = decoderState.getMaxBeamWidth();
     auto const beamWidth = samplingConfig.beamWidth;
     TLLM_CHECK_WITH_INFO(beamWidth <= maxBeamWidth,
-        tc::fmtstr("Beam width (%d) must be smaller than maxBeamWidth (" FMT_DIM ") passed to decoder setup function.",
+        tc::fmtstr("Beam width (%d) must be smaller than maxBeamWidth (%d) passed to decoder setup function.",
             beamWidth, maxBeamWidth));
     auto const& requestIds = request.ids;
     auto const inputLength = request.inputLen;

@@ -35,7 +35,7 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
         default: null
       scheduler_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.SchedulerConfig]
+        annotation: tensorrt_llm.llmapi.llm_args.SchedulerConfig
         default: null
       extended_runtime_perf_knob_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig]
@@ -81,6 +81,18 @@ methods:
       max_cpu_loras:
         annotation: int
         default: 4
+      # postproc worker
+      num_postprocess_workers:
+        annotation: int
+        default: 0
+      postprocess_tokenizer_dir:
+        annotation: Optional[str]
+        default: null
+      # reasoning
+      reasoning_parser:
+        annotation: Optional[str]
+        default: null
+      # kwargs
       kwargs:
         annotation: Any
         default: inspect._empty
@@ -139,4 +151,7 @@ methods:
 properties:
   workspace:
     annotation: pathlib.Path
+    default: inspect._empty
+  llm_id:
+    annotation: str
     default: inspect._empty

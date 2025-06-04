@@ -220,6 +220,19 @@ from tensorrt_llm.sampling_params import SamplingParams
     required=False,
     help="Path where output should be written to.",
 )
+@optgroup.option(
+    "--enable_chunked_context",
+    is_flag=True,
+    default=False,
+    help="Enable chunking in prefill stage for enhanced throughput benchmark.",
+)
+@optgroup.option(
+    "--scheduler_policy",
+    type=click.Choice(["guaranteed_no_evict", "max_utilization"]),
+    default="guaranteed_no_evict",
+    help=
+    "KV cache scheduler policy: guaranteed_no_evict prevents request eviction, max_utilization optimizes for throughput.",
+)
 @click.pass_obj
 def throughput_command(
     bench_env: BenchmarkEnvironment,
@@ -282,7 +295,7 @@ def throughput_command(
     if backend and backend.lower() in ["pytorch", "autodeploy"]:
         # If we're dealing with a model name, perform a snapshot download to
         # make sure we have a local copy of the model.
-        if bench_env.checkpoint_path is None:
+        if checkpoint_path is None:
             snapshot_download(model)
 
         exec_settings = get_settings(params, metadata, bench_env.model,
@@ -316,6 +329,8 @@ def throughput_command(
     kv_cache_percent = params.pop("kv_cache_free_gpu_mem_fraction")
     beam_width = params.pop("beam_width")
     streaming: bool = params.pop("streaming")
+    enable_chunked_context: bool = params.pop("enable_chunked_context")
+    scheduler_policy: str = params.pop("scheduler_policy")
 
     # Update configuration with runtime options
     exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
@@ -323,7 +338,8 @@ def throughput_command(
     exec_settings["settings_config"]["max_num_tokens"] = runtime_max_tokens
     exec_settings["settings_config"]["beam_width"] = beam_width
     exec_settings["settings_config"][
-        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION
+    exec_settings["settings_config"]["chunking"] = enable_chunked_context
 
     # Dynamic runtime features.
     exec_settings["settings_config"]["dynamic_max_batch_size"] = True
@@ -340,10 +356,14 @@ def throughput_command(
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['backend'] = backend
 
-        if "pytorch_backend_config" in kwargs and iteration_log is not None:
-            kwargs["pytorch_backend_config"].enable_iter_perf_stats = True
+        if backend == "pytorch" and iteration_log is not None:
+            kwargs["enable_iter_perf_stats"] = True
 
         if runtime_config.backend == 'pytorch':
+            if kwargs.pop("extended_runtime_perf_knob_config", None):
+                logger.warning(
+                    "Ignore extended_runtime_perf_knob_config for pytorch backend."
+                )
             llm = PyTorchLLM(**kwargs)
         else:
             llm = LLM(**kwargs)

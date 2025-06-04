@@ -81,14 +81,14 @@ methods:
         annotation: Optional[int]
         default: null
       max_input_len:
-        annotation: int
-        default: 1024
+        annotation: Optional[int]
+        default: null
       max_seq_len:
         annotation: Optional[int]
         default: null
       max_beam_width:
-        annotation: int
-        default: 1
+        annotation: Optional[int]
+        default: null
       max_num_tokens:
         annotation: Optional[int]
         default: null
@@ -103,7 +103,7 @@ methods:
         annotation: bool
         default: false
       kv_cache_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConfig]
+        annotation: tensorrt_llm.llmapi.llm_args.KvCacheConfig
         default: null
     return_annotation: None
   generate:

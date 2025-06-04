@@ -299,7 +299,7 @@ def test_fp8_batched_gemm_trtllmgen(test_case: BatchedGemmTestCase) -> None:
         c_ref = output
 
     epilogue_tile_m = 64 if use_deep_seek_fp8 else 128
-    if low_latency:
+    if low_latency and not use_deep_seek_fp8:
         b_fp8_shuffled = []
         for bi in range(b):
             b_fp8_shuffled.append(

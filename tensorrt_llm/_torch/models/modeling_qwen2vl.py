@@ -445,12 +445,12 @@ class Qwen2VLModelBase(PreTrainedModel):
 
 
 @register_auto_model("Qwen2VLForConditionalGeneration")
-@register_input_processor(Qwen2VLInputProcessor)
+@register_input_processor(Qwen2VLInputProcessor, model_type="qwen2_vl")
 class Qwen2VLModel(Qwen2VLModelBase):
     pass
 
 
 @register_auto_model("Qwen2_5_VLForConditionalGeneration")
-@register_input_processor(Qwen2_5_VLInputProcessor)
+@register_input_processor(Qwen2_5_VLInputProcessor, model_type="qwen2_5_vl")
 class Qwen2_5_VLModel(Qwen2VLModelBase):
     pass

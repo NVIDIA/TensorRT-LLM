@@ -369,9 +369,8 @@ int32_t GemmGatedActInterface::run(GemmGatedActConfig const& config, void* works
 
     // Create kernel params.
     auto kernelParams = gemmGatedAct::KernelParams::setKernelParams(options, data.mInputBuffers.mPtrA,
-        reinterpret_cast<float const*>(data.mInputBuffers.mPtrSfA), data.mInputBuffers.mPtrPerTokenSfA,
-        data.mInputBuffers.mPtrB, reinterpret_cast<float const*>(data.mInputBuffers.mPtrSfB),
-        data.mInputBuffers.mPtrPerTokenSfB, data.mOutputBuffers.mPtrC,
+        data.mInputBuffers.mPtrSfA, data.mInputBuffers.mPtrPerTokenSfA, data.mInputBuffers.mPtrB,
+        data.mInputBuffers.mPtrSfB, data.mInputBuffers.mPtrPerTokenSfB, data.mOutputBuffers.mPtrC,
         reinterpret_cast<float const*>(data.mInputBuffers.mPtrScaleC), data.mOutputBuffers.mPtrSfC,
         reinterpret_cast<float const*>(data.mInputBuffers.mPtrScaleGate), reinterpret_cast<float*>(dRowMax),
         reinterpret_cast<uint32_t*>(dRowMaxBars));
@@ -407,7 +406,9 @@ int32_t GemmGatedActInterface::run(GemmGatedActConfig const& config, void* works
 
     // Run the kernel.
     auto result = trtllm::gen::launchKernel((void*) &kernelParams, cudaStream, config.mSharedMemSize, cuFunction,
-        block3, grid3, cluster3, config.mOptions.mGridWaitForPrimary);
+        block3, grid3, cluster3,
+        config.mOptions.mGridWaitForPrimaryEarlyExit | config.mOptions.mGridWaitForPrimaryA
+            | config.mOptions.mGridWaitForPrimaryB);
     if (result != CUDA_SUCCESS)
     {
         return -1;
