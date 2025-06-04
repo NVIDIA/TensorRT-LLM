@@ -140,3 +140,6 @@ properties:
   workspace:
     annotation: pathlib.Path
     default: inspect._empty
+  llm_id:
+    annotation: str
+    default: inspect._empty

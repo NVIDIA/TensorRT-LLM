@@ -4,7 +4,8 @@ import numpy as np
 import torch
 from mpi4py import MPI
 
-from tensorrt_llm._torch.modules.moe_load_balancer import HostMoeTensorSharer
+from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import \
+    HostMoeTensorSharer
 
 
 class TestHostMoeTensorSharer(unittest.TestCase):

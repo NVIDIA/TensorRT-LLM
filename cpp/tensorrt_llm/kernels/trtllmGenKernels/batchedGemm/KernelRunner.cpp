@@ -26,11 +26,13 @@ namespace tensorrt_llm
 namespace kernels
 {
 
+using namespace batchedGemm::batchedGemm;
+
 TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunnerOptions const& options_)
     : mOptions(options_)
 {
     // Select a GEMM kernel config to use
-    auto const bmm = batchedGemm::BatchedGemmInterface();
+    auto const bmm = BatchedGemmInterface();
     auto const configs = bmm.getBatchedGemmConfigs();
 
     mPassingConfigIndices.clear();
@@ -40,7 +42,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         auto const options = configs[i].mOptions;
         auto const tileSize = mOptions.transposeMmaOutput ? options.mTileN : options.mTileM;
         // When we include low-latency kernels we can set transposeMmaOutput via constructor
-        if (options.mDtypeElt == mOptions.eltType && options.mDtypeC == mOptions.outputType
+        if (options.mDtypeA == mOptions.eltType && options.mDtypeC == mOptions.outputType
             && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
             && options.mTransposeMmaOutput == mOptions.transposeMmaOutput && options.mRouteAct == mOptions.routeAct
             && options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch
@@ -59,7 +61,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
     std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim)
 {
-    batchedGemm::BatchedGemmData gemmData;
+    BatchedGemmData gemmData;
     gemmData.mProblemDimensions.mNumBatches = numBatches;
     gemmData.mProblemDimensions.mNumTokens = numTokens;
     gemmData.mProblemDimensions.mBatchM = !mOptions.transposeMmaOutput;
@@ -74,7 +76,7 @@ size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n,
 
     selectGemmConfig(m, n, k, batchedTokens, numTokens, numBatches, maxNumCtasInBatchDim);
 
-    auto bmm = batchedGemm::BatchedGemmInterface();
+    auto bmm = BatchedGemmInterface();
     auto const configs = bmm.getBatchedGemmConfigs();
     TLLM_CHECK_WITH_INFO(
         mSelectedConfigIndex.has_value(), "No valid kernel found for given param config and problem size");
@@ -89,9 +91,9 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     int32_t const* ctaIdxXyToBatchIdx, int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
     void* workspace, CUstream stream, int device)
 {
-    auto bmm = batchedGemm::BatchedGemmInterface();
+    auto bmm = BatchedGemmInterface();
 
-    batchedGemm::BatchedGemmData gemmData;
+    BatchedGemmData gemmData;
 
     auto const configs = bmm.getBatchedGemmConfigs();
     TLLM_CHECK_WITH_INFO(
@@ -195,10 +197,10 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
 void TrtllmGenBatchedGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k,
     std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim)
 {
-    auto const bmm = batchedGemm::BatchedGemmInterface();
+    auto const bmm = BatchedGemmInterface();
     auto const configs = bmm.getBatchedGemmConfigs();
 
-    batchedGemm::BatchedGemmData gemmData;
+    BatchedGemmData gemmData;
     // Dims
     gemmData.mProblemDimensions.mNumBatches = numBatches;
     gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -226,7 +228,18 @@ void TrtllmGenBatchedGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t 
             }
 
             // Then by unroll loop 2x for mma
-            return optionsA.mUseUnrollLoop2xForMma;
+            if (optionsA.mUseUnrollLoop2xForMma != optionsB.mUseUnrollLoop2xForMma)
+            {
+                return optionsA.mUseUnrollLoop2xForMma;
+            }
+
+            // Then by tile scheduler (persistent scheduler is better for FC2 in MoE)
+            if (!optionsA.mRouteAct)
+            {
+                return optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
+            }
+
+            return optionsA.mTileM > optionsB.mTileM;
         });
 
     for (auto const& configIndex : sortedIndices)

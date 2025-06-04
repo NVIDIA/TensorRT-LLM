@@ -66,6 +66,7 @@ BASE_ZMQ_CLASSES = {
         "SchedulerConfig", "DynamicBatchConfig"
     ],
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig"],
+    "tensorrt_llm._torch.model_config": ["MoeLoadBalancerConfig"],
     "tensorrt_llm.builder": ["BuildConfig"],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
     "tensorrt_llm.executor.postproc_worker": [

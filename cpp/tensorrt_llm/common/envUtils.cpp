@@ -417,4 +417,9 @@ bool getEnvDisaggBenchmarkGenOnly()
     return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY");
 }
 
+bool getEnvDisableChunkedAttentionInGenPhase()
+{
+    return getBoolEnv("TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE");
+}
+
 } // namespace tensorrt_llm::common

@@ -19,7 +19,7 @@ from tensorrt_llm import logger
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
                                                 DisaggregatedParams)
 from tensorrt_llm.serve.router import (KvCacheAwareRouter,
-                                       KvCacheAwareServerState,
+                                       KvCacheAwareServerState, ServerRole,
                                        block_key_hasher)
 
 
@@ -360,9 +360,11 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                  tokens_per_block: int = 32):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
-        self.ctx_router = KvCacheAwareRouter(ctx_servers,
+        self.ctx_router = KvCacheAwareRouter(server_role=ServerRole.CONTEXT,
+                                             servers=ctx_servers,
                                              tokens_per_block=tokens_per_block)
-        self.gen_router = KvCacheAwareRouter(gen_servers,
+        self.gen_router = KvCacheAwareRouter(server_role=ServerRole.GENERATION,
+                                             servers=gen_servers,
                                              tokens_per_block=tokens_per_block)
         self.model_name = model_name
 

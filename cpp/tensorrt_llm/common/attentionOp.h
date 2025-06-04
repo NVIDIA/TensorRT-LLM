@@ -322,6 +322,12 @@ public:
         return mSM;
     }
 
+    [[nodiscard]] bool supportsNvFp4Output() const
+    {
+        bool needsUlyssesPostprocess = mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1;
+        return mEnableContextFMHA && mEnableXQA && !needsUlyssesPostprocess;
+    }
+
     [[nodiscard]] int32_t* multiBlockSemaphores() const
     {
         return mMultiBlockSemaphores.get();

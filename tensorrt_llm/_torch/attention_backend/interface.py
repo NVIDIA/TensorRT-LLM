@@ -556,6 +556,10 @@ class AttentionBackend(Generic[TMetadata]):
     def support_mla(cls) -> bool:
         return False
 
+    @classmethod
+    def support_nvfp4_output(cls) -> bool:
+        return False
+
 
 @dataclass(kw_only=True, unsafe_hash=True)
 class MLAParams:
