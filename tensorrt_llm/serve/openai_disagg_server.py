@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 import asyncio
 import copy
-import json
 import logging
 import os
 import signal
@@ -103,24 +102,23 @@ class OpenAIDisaggServer:
                                         gen_server: str,
                                         gen_req: Union[CompletionRequest, ChatCompletionRequest]):
         try:
-            # First yield the context response if it's not None
-            if ctx_response is not None:
-                # Remove the disaggregated params from the context response
-                data = ctx_response.model_dump()
-                del data['choices'][0]['disaggregated_params']
-                data = json.dumps(data)
-                yield f"data: {data}\n\n".encode('utf-8')
 
-            # Then yield the generation responses
-            if isinstance(gen_req, CompletionRequest):
-                gen_response = await self.send_completion_request(gen_server, gen_req)
-            elif isinstance(gen_req, ChatCompletionRequest):
-                gen_response = await self.send_chat_request(gen_server, gen_req)
+            if ctx_response is not None and len(ctx_response.choices) != 1:
+                raise ValueError("Context server did not return a single choice. This is not expected")
+
+            #If request finished after first token not due to length, return right away and skip gen
+            if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
+                yield f"data: [DONE]\n\n".encode('utf-8')
             else:
-                raise TypeError("Invalid request type: {type(gen_req).__name__}")
+                if isinstance(gen_req, CompletionRequest):
+                    gen_response = await self.send_completion_request(gen_server, gen_req)
+                elif isinstance(gen_req, ChatCompletionRequest):
+                    gen_response = await self.send_chat_request(gen_server, gen_req)
+                else:
+                    raise TypeError("Invalid request type: {type(gen_req).__name__}")
 
-            async for chunk in gen_response.body_iterator:
-                yield chunk
+                async for chunk in gen_response.body_iterator:
+                    yield chunk
 
         finally:
             await self.gen_router.finish_request(gen_req)
