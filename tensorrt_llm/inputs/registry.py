@@ -36,7 +36,11 @@ class InputProcessor(Protocol):
 class DefaultInputProcessor(InputProcessor):
     """Preprocess the inputs to the model."""
 
-    def __init__(self, model_path, model_config, tokenizer) -> None:
+    def __init__(self,
+                 model_path,
+                 model_config,
+                 tokenizer,
+                 trust_remote_code: bool = True) -> None:
         self.tokenizer = tokenizer
         self.model_config = model_config
         self.model_path = model_path
@@ -104,7 +108,10 @@ def register_input_processor(processor_cls: Type[InputProcessor],
     return wrapper
 
 
-def create_input_processor(model_path_or_dir: str, tokenizer):
+def create_input_processor(model_path_or_dir: str,
+                           tokenizer,
+                           trust_remote_code: bool = True,
+                           use_fast: bool = True):
     """
     Create an input processor for a specific model.
     """
@@ -113,8 +120,8 @@ def create_input_processor(model_path_or_dir: str, tokenizer):
 
     model_config = None
     try:
-        config = ModelConfig.from_pretrained(model_path_or_dir,
-                                             trust_remote_code=True)
+        config = ModelConfig.from_pretrained(
+            model_path_or_dir, trust_remote_code=trust_remote_code)
         model_config = config.pretrained_config
     except (ValueError, EnvironmentError):
         config = None
@@ -128,6 +135,6 @@ def create_input_processor(model_path_or_dir: str, tokenizer):
             input_processor_cls = None
         if input_processor_cls is not None:
             return input_processor_cls(model_path_or_dir, model_config,
-                                       tokenizer)
+                                       tokenizer, trust_remote_code, use_fast)
 
     return DefaultInputProcessor(None, None, tokenizer)

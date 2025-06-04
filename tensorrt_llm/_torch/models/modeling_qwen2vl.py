@@ -20,12 +20,16 @@ from .modeling_utils import register_auto_model
 
 class Qwen2VLInputProcessorBase(InputProcessor):
 
-    def __init__(self, model_path: str, model_config: PretrainedConfig,
-                 tokenizer: AutoTokenizer):
+    def __init__(self,
+                 model_path: str,
+                 model_config: PretrainedConfig,
+                 tokenizer: AutoTokenizer,
+                 trust_remote_code: bool = True,
+                 use_fast: bool = True):
         self.model_config = model_config
         self.tokenizer = tokenizer
-        self.processor = AutoProcessor.from_pretrained(model_path,
-                                                       use_fast=False)
+        self.processor = AutoProcessor.from_pretrained(
+            model_path, use_fast=use_fast, trust_remote_code=trust_remote_code)
 
         # NOTE: Using attn_implementation='flash_attention_2' to avoid the issue of vision model's GPU OOM.
         model = self.get_model_class().from_pretrained(

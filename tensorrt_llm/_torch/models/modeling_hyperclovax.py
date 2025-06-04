@@ -405,15 +405,19 @@ def determine_non_vision_query_lengths(input_ids: torch.LongTensor, pad_id: int,
 
 class HCXVisionInputProcessor(InputProcessor):
 
-    def __init__(self, model_path: str, model_config: PretrainedConfig,
-                 tokenizer: AutoTokenizer):
+    def __init__(self,
+                 model_path: str,
+                 model_config: PretrainedConfig,
+                 tokenizer: AutoTokenizer,
+                 trust_remote_code: bool = True,
+                 use_fast: bool = True):
 
         self.pretrained_config = model_config
         self.tokenizer = tokenizer
-        self.processor = AutoProcessor.from_pretrained(model_path,
-                                                       trust_remote_code=True,
-                                                       use_fast=False)
-
+        self.processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code, use_fast=use_fast)
+        self.tllm_image_token_id = self.pretrained_config.language_config[
+            "vocab_size"] + 1
         if DISAGG:
             self.mm_encoder = HCXVisionModel(self.pretrained_config,
                                              skip_processor=True)
@@ -465,7 +469,7 @@ class HCXVisionInputProcessor(InputProcessor):
                     batch_idx,
                     input_start + token_len:input_start + token_len +
                     vision_query_lengths[batch_idx][multi_img_idx],
-                ] = self.pretrained_config.language_config["vocab_size"] + 1
+                ] = self.tllm_image_token_id
 
                 input_start += token_len + vision_query_lengths[batch_idx][
                     multi_img_idx]
@@ -492,7 +496,6 @@ class HCXVisionInputProcessor(InputProcessor):
                 is_video_list=is_video_list,
                 **mm_processor_kwargs,
             )
-            # print(f'[INFO] preprocessed_image: {preprocessed_image}')
 
         input_ids = self.tokenizer.encode(text_prompt,
                                           add_special_tokens=False,
@@ -552,12 +555,14 @@ class HCXVisionModel:
         model_path = self.pretrained_config._name_or_path
 
         # TODO: Remove this when we refactor LlmRequuest
+        # NOTE: trust_remote_code can be removed once we refactor LlmRequuest
         self.skip_processor = skip_processor
         if not self.skip_processor:
             self.processor = AutoProcessor.from_pretrained(
                 model_path, trust_remote_code=True, use_fast=False)
 
         # NOTE: There is no way of importing mm_projector, HCXVisionCAbstractor from HF. So, can not do the sharded_loading.
+        # NOTE: trust_rmemote_code can be removed once we change the model into TRT-LLM's format
         model = transformers.AutoModelForCausalLM.from_pretrained(
             model_path, trust_remote_code=True)
         model.eval()

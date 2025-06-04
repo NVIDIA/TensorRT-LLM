@@ -52,6 +52,8 @@ git clone https://huggingface.co/naver-hyperclovax/HyperCLOVAX-SEED-Vision-Instr
 To quickly run HyperCLOVAX-SEED-Text, you can use [examples/pytorch/quickstart_advanced.py](../../../pytorch/quickstart_advanced.py):
 
 ```bash
+pip install -r requirements.txt
+
 python ../../../pytorch/quickstart_advanced.py --model_dir hf_models/$MODEL_NAME
 ```
 
@@ -67,6 +69,8 @@ The output will be like:
 To quickly run HyperCLOVAX-SEED-Vision, you can use [examples/pytorch/quickstart_multimodal.py](../../../pytorch/quickstart_multimodal.py):
 
 ```bash
+pip install -r requirements.txt
+
 python ../../../pytorch/quickstart_multimodal.py --model_dir hf_models/$MODEL_NAME
 ```
 
@@ -85,6 +89,8 @@ The next section describes how to convert the weights from the [HuggingFace (HF)
 ### Convert checkpoint and build TensorRT engine(s)
 
 ```bash
+pip install -r requirements.txt
+
 # Build a single-GPU float16 engine from HF weights.
 
 # Build the HyperCLOVAX model using a single GPU and FP16.
@@ -139,7 +145,7 @@ trtllm-build \
 
 ### FP8 Post-Training Quantization
 
-The examples below use the NVIDIA Modelopt (Algorithmic Model Optimization) toolkit for the model quantization process.
+The examples below use the NVIDIA Modelopt toolkit for the model quantization process.
 
 First, make sure the Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
@@ -160,7 +166,7 @@ trtllm-build \
 
 ### SmoothQuant
 
-The examples below use the NVIDIA Modelopt (Algorithmic Model Optimization) toolkit for the model quantization process.
+The examples below use the NVIDIA Modelopt toolkit for the model quantization process.
 
 First, make sure the Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 
@@ -180,7 +186,7 @@ trtllm-build \
 
 ### Groupwise quantization (AWQ)
 
-The examples below use the NVIDIA Modelopt (Algorithmic Model Optimization) toolkit for the model quantization process.
+The examples below use the NVIDIA Modelopt toolkit for the model quantization process.
 
 First, make sure the Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
 

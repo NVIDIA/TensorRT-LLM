@@ -110,6 +110,7 @@ class LLM:
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
+                 use_fast: bool = True,
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
@@ -134,6 +135,7 @@ class LLM:
                 dtype=dtype,
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
+                use_fast=use_fast,
                 **kwargs)
 
         except Exception as e:
@@ -571,8 +573,9 @@ class LLM:
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
-        self.input_processor = create_input_processor(self._hf_model_dir,
-                                                      self.tokenizer)
+        self.input_processor = create_input_processor(
+            self._hf_model_dir, self.tokenizer, self.args.trust_remote_code,
+            self.args.use_fast)
         self.tokenizer = self.input_processor.tokenizer
 
         max_batch_size = self.args.max_batch_size

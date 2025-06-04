@@ -26,10 +26,15 @@ from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 class LlavaNextInputProcessor(InputProcessor):
 
-    def __init__(self, model_path, model_config, tokenizer):
+    def __init__(self,
+                 model_path,
+                 model_config,
+                 tokenizer,
+                 trust_remote_code: bool = True,
+                 use_fast: bool = True):
         self.tokenizer = tokenizer
-        self.processor = AutoProcessor.from_pretrained(model_path,
-                                                       use_fast=True)
+        self.processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code, use_fast=use_fast)
         self.model_config = model_config
 
         self.device = 'cuda'
