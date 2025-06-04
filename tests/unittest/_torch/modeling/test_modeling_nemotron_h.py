@@ -431,7 +431,13 @@ def test_nemotron_h_llm_api():
         " the head of state and head of government of",
     ]
 
-    sampling_params = SamplingParams(max_tokens=9, temperature=0.0)
-    results = nemotron_h.generate(text_prompts, sampling_params)
-    for result, expected_completion in zip(results, expected_completions):
-        assert result.text == expected_completion
+    sampling_params = SamplingParams(max_tokens=9,
+                                     temperature=0.0,
+                                     add_special_tokens=False)
+
+    try:
+        results = nemotron_h.generate(text_prompts, sampling_params)
+        for result, expected_completion in zip(results, expected_completions):
+            assert result.outputs[0].text == expected_completion
+    finally:
+        nemotron_h.shutdown()
