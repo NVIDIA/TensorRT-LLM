@@ -60,10 +60,11 @@ BASE_ZMQ_CLASSES = {
     ["ClusterInfo", "MathThroughput"],
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm.bindings.executor": [
-        "BatchingType", "CacheTransceiverConfig", "CapacitySchedulerPolicy", "ContextPhaseParams",
-        "ContextChunkingPolicy", "DynamicBatchConfig", "ExecutorConfig",
-        "ExtendedRuntimePerfKnobConfig", "Response", "Result", "FinishReason",
-        "KvCacheConfig", "KvCacheTransferMode", "KvCacheRetentionConfig",
+        "BatchingType", "CacheTransceiverConfig", "CapacitySchedulerPolicy",
+        "ContextPhaseParams", "ContextChunkingPolicy", "DynamicBatchConfig",
+        "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
+        "FinishReason", "KvCacheConfig", "KvCacheTransferMode",
+        "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig"
     ],
