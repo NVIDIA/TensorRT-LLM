@@ -491,7 +491,6 @@ perf/test_perf.py::test_perf[qwen_14b_chat-cppmanager-exe-plugin_ifb-float16-inp
 perf/test_perf.py::test_perf[llama_v3.1_70b-bench-bfloat16-input_output_len:1024,1024-tp:2-gpus:2] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
 perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:128,128-quant:int8-gpus:2] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
 perf/test_perf.py::test_perf[starcoder2_3b-bench-pytorch-float16-input_output_len:512,200] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
-accuracy/test_llm_api_pytorch.py::TestLlama3_2_1B::test_fp8_pp2 SKIP (https://nvbugspro.nvidia.com/bug/5312750)
 test_e2e.py::test_openai_reasoning SKIP (https://nvbugs/5310329)
 triton_server/test_triton_llm.py::test_llava[False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.7-max_utilization-1-1-1-False-tensorrt_llm_bls] SKIP (https://nvbugs/5308432)
 test_e2e.py::test_trtllm_bench_llmapi_launch[trt_backend-llama-v3-llama3-8b] SKIP (https://nvbugs/5320234)
