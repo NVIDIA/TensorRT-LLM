@@ -27,8 +27,9 @@ _buffer: Optional[Buffer] = None
 
 # Set the number of SMs to use
 # NOTES: this is a static variable
+# Cannot exceed 2*num_qps_per_rank for internode
 if deep_ep_installed:
-    Buffer.set_num_sms(32)
+    Buffer.set_num_sms(24)
 
 
 def get_comm(mapping: Mapping):
