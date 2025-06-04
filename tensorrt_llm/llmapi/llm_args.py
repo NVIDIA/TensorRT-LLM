@@ -1448,9 +1448,6 @@ class TrtLlmArgs(BaseLlmArgs):
 
 LlmArgs = TrtLlmArgs
 
-LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(LlmArgs,
-                                                            indent=' ' * 4)
-
 
 class LoadFormat(Enum):
     AUTO = 0
@@ -1814,3 +1811,10 @@ def get_model_format(model_dir: str) -> _ModelFormatKind:
         )
     else:
         return model_format
+
+
+TRT_LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(TrtLlmArgs,
+                                                                indent=' ' * 4)
+TORCH_LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(TorchLlmArgs,
+                                                                  indent=' ' *
+                                                                  4)
