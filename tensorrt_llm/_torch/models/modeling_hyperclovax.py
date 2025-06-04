@@ -514,7 +514,7 @@ class HCXVisionInputProcessor(InputProcessor):
             if isinstance(images[0], Image.Image):
                 images = [torch.from_numpy(np.array(image)) for image in images]
             elif isinstance(images[0], torch.Tensor):
-                # NOTE: HyperCLOVA-SEED-Vision-Instruct-3B uses the image data in the format of (H, W, C)
+                # NOTE: HyperCLOVA-SEED-Vision-Instruct-3B uses the image data in the format of (H, W, C), otherwise gives an error.
                 images = [image.permute(1, 2, 0) for image in images]
 
         input_ids, preprocessed_image = self._preprocess(
