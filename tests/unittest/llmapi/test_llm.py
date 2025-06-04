@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from utils.util import skip_single_gpu
 
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.executor import (ExecutorBindingsWorker, LoRARequest,
+from tensorrt_llm.executor import (GenerationExecutorWorker, LoRARequest,
                                    PromptAdapterRequest, RequestError)
 from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
                                  GuidedDecodingParams, KvCacheConfig,
@@ -1194,7 +1194,7 @@ def test_llm_api_medusa_tp2():
 
 
 @pytest.mark.part0
-def test_llm_api_eagle():
+def test_llm_api_eagle(**llm_kwargs):
     prompts = [
         "Hello, my name is",
         "The president of the United States is",
@@ -1202,7 +1202,6 @@ def test_llm_api_eagle():
         "The future of AI is",
     ]
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
-    build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=True)
 
@@ -1218,11 +1217,19 @@ def test_llm_api_eagle():
                                             [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], \
                                             [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
     )
+
+    # in test_llm_multi_gpu, kv_cache_config is passed as a kwarg
+    if "kv_cache_config" in llm_kwargs:
+        kv_cache_config = llm_kwargs["kv_cache_config"]
+        del llm_kwargs["kv_cache_config"]
+
     llm = LLM(model=get_model_path("vicuna-7b-v1.3"),
-              build_config=build_config,
               kv_cache_config=kv_cache_config,
               speculative_config=speculative_config,
-              fast_build=True)
+              max_batch_size=1,
+              max_seq_len=1024,
+              fast_build=True,
+              **llm_kwargs)
 
     outputs = llm.generate(prompts, sampling_params)
 
@@ -1233,9 +1240,8 @@ def test_llm_api_eagle():
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
-@skip_single_gpu
 @pytest.mark.part0
-def test_llm_api_eagle_tp2():
+def test_llm_api_eagle2(**llm_kwargs):
     prompts = [
         "Hello, my name is",
         "The president of the United States is",
@@ -1243,29 +1249,29 @@ def test_llm_api_eagle_tp2():
         "The future of AI is",
     ]
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
-    build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=True)
 
     speculative_config = EagleDecodingConfig(
         max_draft_len=63,
-                      speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
-
+        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
-                            eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
-                                            [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
-                                            [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
-                                            [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], \
-                                            [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], \
-                                            [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
-    )
+        use_dynamic_tree=True,
+        dynamic_tree_max_topK=10)
+
+    # in test_llm_multi_gpu, kv_cache_config is passed as a kwarg
+    if "kv_cache_config" in llm_kwargs:
+        kv_cache_config = llm_kwargs["kv_cache_config"]
+        del llm_kwargs["kv_cache_config"]
+
     llm = LLM(model=get_model_path("vicuna-7b-v1.3"),
-              build_config=build_config,
               kv_cache_config=kv_cache_config,
               speculative_config=speculative_config,
-              tensor_parallel_size=2,
-              fast_build=True)
+              max_batch_size=1,
+              max_seq_len=1024,
+              fast_build=True,
+              **llm_kwargs)
 
     outputs = llm.generate(prompts, sampling_params)
 
@@ -1593,7 +1599,7 @@ def check_llm_return_context_logits(tp_size=1):
 
     # Check the WAR for returning logits performance
     if tp_size == 1:
-        assert isinstance(llm._executor, ExecutorBindingsWorker)
+        assert isinstance(llm._executor, GenerationExecutorWorker)
 
 
 def check_llm_return_generation_logits(tp_size=1):
@@ -1617,7 +1623,7 @@ def check_llm_return_generation_logits(tp_size=1):
 
     # Check the WAR for returning logits performance
     if tp_size == 1:
-        assert isinstance(llm._executor, ExecutorBindingsWorker)
+        assert isinstance(llm._executor, GenerationExecutorWorker)
 
 
 def test_llm_return_context_logits():
@@ -1726,7 +1732,7 @@ def test_llm_return_logprobs_streaming():
     llm_return_logprobs_test_harness(2, 2, False, True, streaming=True)
 
 
-class DummyExecutorWorker3(ExecutorBindingsWorker):
+class DummyExecutorWorker3(GenerationExecutorWorker):
     should_raise_error = True
 
     def __init__(self, *args, **kwargs):
@@ -1879,11 +1885,10 @@ def llm_get_stats_test_harness(tp_size: int = 1,
 
     if pytorch_backend:
         from tensorrt_llm._torch import LLM as LLM_torch
-        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-        llm_args_extra["pytorch_backend_config"] = PyTorchConfig(
-            enable_iter_perf_stats=True,
-            enable_iter_req_stats=enable_iter_req_stats,
-            disable_overlap_scheduler=not use_overlap)
+        llm_args_extra.update(
+            dict(enable_iter_perf_stats=True,
+                 enable_iter_req_stats=enable_iter_req_stats,
+                 disable_overlap_scheduler=not use_overlap))
         LLM_CLASS = LLM_torch
     else:
         LLM_CLASS = LLM
@@ -1921,6 +1926,65 @@ def test_llm_get_stats(return_context_logits, enable_iter_req_stats):
                                enable_iter_req_stats=enable_iter_req_stats)
 
 
+def test_llm_get_queued_stats():
+
+    enable_iter_req_stats = True
+    use_overlap = False
+    tp_size = 1
+
+    num_requests = 10
+    repeated_prompts = ["A B C D E F G H I J K L M"] * num_requests
+
+    llm_args_extra = {}
+    sampling_args_extra = {}
+
+    from tensorrt_llm._torch import LLM as LLM_torch
+
+    llm_args_extra.update(
+        dict(enable_iter_perf_stats=True,
+             enable_iter_req_stats=enable_iter_req_stats,
+             disable_overlap_scheduler=not use_overlap))
+    LLM_CLASS = LLM_torch
+
+    llm = LLM_CLASS(model=llama_model_path,
+                    kv_cache_config=global_kvcache_config,
+                    tensor_parallel_size=tp_size,
+                    fast_build=True,
+                    max_batch_size=1,
+                    **llm_args_extra)
+
+    max_tokens = 10
+    sampling_params = SamplingParams(max_tokens=max_tokens,
+                                     **sampling_args_extra)
+
+    max_tries = 10
+    has_queue_requests = False
+
+    while not has_queue_requests and max_tries > 0:
+        max_tries -= 1
+        # Generate outputs, which will queue requests
+        for output in llm.generate(repeated_prompts,
+                                   sampling_params=sampling_params):
+            print(output)
+
+        results = llm.get_stats(2)
+
+        for index, result in enumerate(results):
+            if "requestStats" in result:
+                for requestStat in result["requestStats"]:
+                    if requestStat["stage"] == "QUEUED":
+                        has_queue_requests = True
+                        assert requestStat["numGeneratedTokens"] == 0
+
+        if not has_queue_requests:
+            print("No queued requests found, retrying...")
+            asyncio.sleep(1)
+        else:
+            print("Found queued requests, breaking out of the loop.")
+
+    assert has_queue_requests
+
+
 def llm_get_stats_async_test_harness(tp_size: int = 1,
                                      return_context_logits: bool = False,
                                      pytorch_backend: bool = False,
@@ -1949,11 +2013,10 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
 
     if pytorch_backend:
         from tensorrt_llm._torch import LLM as LLM_torch
-        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-        llm_args_extra["pytorch_backend_config"] = PyTorchConfig(
-            enable_iter_perf_stats=True,
-            enable_iter_req_stats=enable_iter_req_stats,
-            disable_overlap_scheduler=not use_overlap)
+        llm_args_extra.update(
+            dict(enable_iter_perf_stats=True,
+                 enable_iter_req_stats=enable_iter_req_stats,
+                 disable_overlap_scheduler=not use_overlap))
         LLM_CLASS = LLM_torch
     else:
         LLM_CLASS = LLM
@@ -2199,7 +2262,7 @@ def test_llm_abort_request(llm_for_sampling_params,
 
 
 def test_llm_sampling_params_n_lt_max_batch_size():
-    sampling_params = SamplingParams(n=2, best_of=1)
+    sampling_params = SamplingParams(n=2, top_p=0.95)
     build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,

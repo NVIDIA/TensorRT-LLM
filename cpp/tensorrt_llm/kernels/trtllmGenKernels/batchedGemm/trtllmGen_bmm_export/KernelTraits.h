@@ -21,6 +21,9 @@
 #include "trtllm/gen/DtypeDecl.h"
 #include <cassert>
 
+namespace batchedGemm
+{
+
 namespace gemm
 {
 
@@ -132,6 +135,26 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind)
+{
+    if (mmaKind == tg::MmaKind::Auto)
+    {
+        std::cout << "mmaKind != tg::MmaKind::Auto" << std::endl;
+        assert(false);
+        return -1;
+    }
+    if (mmaKind == tg::MmaKind::MxFp8Fp6Fp4)
+    {
+        return 8;
+    }
+    else
+    {
+        return tg::dtypeGetNumBits(dtype);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 class KernelTraits
 {
 public:
@@ -139,11 +162,12 @@ public:
     KernelTraits() {}
 
     // The constructor.
-    KernelTraits(tg::Dtype dtypeElt, tg::Dtype dtypeC, tg::Dtype dtypeAcc, int32_t tileM, int32_t tileN, int32_t tileK,
-        int32_t epilogueTileM, int32_t epilogueTileN, int32_t numStages, int32_t numStagesMma,
-        int32_t numSlicesForSplitK, int32_t numSlicesForSliceK, SplitK splitK, bool useTmaStore,
+    KernelTraits(tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeAcc, tg::MmaKind mmaKind,
+        int32_t tileM, int32_t tileN, int32_t tileK, int32_t epilogueTileM, int32_t epilogueTileN, int32_t numStages,
+        int32_t numStagesMma, int32_t numSlicesForSplitK, int32_t numSlicesForSliceK, SplitK splitK, bool useTmaStore,
         bool transposeMmaOutput, AllReduceAlgo allReduceAlgo, bool usePersistentScheduler, bool useDeepSeekFp8,
         bool usePerTokenSfA, bool usePerTokenSfB)
+        : mMmaKind{mmaKind}
     {
         //
         // SMEM
@@ -164,6 +188,11 @@ public:
             // [..gmemC0..][..gmemC1..][..rowMax..][..sliceK..]
             //
 
+            if (mMmaKind == tg::MmaKind::Auto)
+            {
+                mMmaKind = dtypeGetMmaKind(dtypeA, dtypeB);
+            }
+
             std::vector<std::pair<int32_t, int32_t>> numBytesAndAlignmentPerSmemChunk;
             std::vector<bool> firstChunkReuseSmem;
             // Buffer names for inspection purposes.
@@ -172,7 +201,8 @@ public:
             // LoadA
             {
                 // Number of bytes in load A shared memory.
-                auto const numSmemBytesLoadA = numStages * tileM * tileK * tg::dtypeGetNumBits(dtypeElt) / 8 /* bits */;
+                auto const numSmemBytesLoadA
+                    = numStages * tileM * tileK * getNumSmemBitsPerElt(dtypeA, mMmaKind) / 8 /* bits */;
                 // Number of bytes for load A alignment for TMA load.
                 auto const numBytesAlignmentLoadA = 1024;
                 // loadA is already at first chunk. No need to reuse it.
@@ -187,7 +217,8 @@ public:
             // LoadB
             {
                 // Number of bytes in load B shared memory.
-                auto const numSmemBytesLoadB = numStages * tileN * tileK * tg::dtypeGetNumBits(dtypeElt) / 8 /* bits */;
+                auto const numSmemBytesLoadB
+                    = numStages * tileN * tileK * getNumSmemBitsPerElt(dtypeB, mMmaKind) / 8 /* bits */;
                 // Number of bytes for load B alignment for TMA load.
                 auto const numBytesAlignmentLoadB = 1024;
                 // No need to reuse the first chunk.
@@ -207,7 +238,7 @@ public:
             {
                 // Number of bytes in save shuffled B in shared memory.
                 auto const numSmemBytesLoadB = numSlicesForSliceK > 1
-                    ? numStages * tileN * tileK * tg::dtypeGetNumBits(dtypeElt) / 8 /* bits */
+                    ? numStages * tileN * tileK * getNumSmemBitsPerElt(dtypeB, mMmaKind) / 8 /* bits */
                     : 0;
                 // Number of bytes for load B alignment for TMA load.
                 auto const numBytesAlignmentLoadB = 1024;
@@ -372,7 +403,7 @@ public:
             {
                 // Number of columns for A.
                 auto const numTmemColsA = numSlicesForSliceK > 1 ? numStages * tileK
-                        / (numSlicesForSliceK * tg::dtypeGetNumBits(tg::Dtype::UInt32) / tg::dtypeGetNumBits(dtypeElt))
+                        / (numSlicesForSliceK * tg::dtypeGetNumBits(tg::Dtype::UInt32) / tg::dtypeGetNumBits(dtypeA))
                                                                  : 0;
                 // Number of columns for A alignment.
                 auto const numColsAlignmentA = 4;
@@ -385,13 +416,12 @@ public:
                 firstChunkReuseTmem.emplace_back(reuseChunksTmemA);
             }
 
-            bool const useBlockScaling = tg::dtypeIsBlockFmt(dtypeElt);
-
             // Sf A
             {
+                bool const useBlockScalingA = tg::dtypeIsBlockFmt(dtypeA);
                 // Number of columns for scaling factors of A.
                 auto const numTmemColsSfA
-                    = useBlockScaling ? ((tileK / 64) * 2 * tg::ceilDiv(tileM, 64)) * numStages : 0;
+                    = useBlockScalingA ? ((tileK / 64) * 2 * tg::ceilDiv(tileM, 64)) * numStages : 0;
                 // Number of columns for Sf alignment.
                 auto const numColsAlignmentSfA = 2;
                 // No need to reuse TMEM.
@@ -405,9 +435,10 @@ public:
 
             // Sf B
             {
+                bool const useBlockScalingB = tg::dtypeIsBlockFmt(dtypeB);
                 // Number of columns for scaling factors of B.
                 auto const numTmemColsSfB
-                    = useBlockScaling ? ((tileK / 64) * 2 * tg::ceilDiv(tileN, 64)) * numStages : 0;
+                    = useBlockScalingB ? ((tileK / 64) * 2 * tg::ceilDiv(tileN, 64)) * numStages : 0;
                 // Number of columns for Sf alignment.
                 auto const numColsAlignmentSfB = 2;
                 // No need to reuse TMEM.
@@ -426,6 +457,8 @@ public:
     }
 
 public:
+    // The MMA kind.
+    tg::MmaKind mMmaKind;
     // Helper for SMEM allocation.
     MemAllocatorHelper mSmemAllocatorHelper;
     // Helper for TMEM allocation.
@@ -556,3 +589,5 @@ inline int32_t getTmemOffsetSfB(KernelTraits traits)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace gemm
+
+} // namespace batchedGemm

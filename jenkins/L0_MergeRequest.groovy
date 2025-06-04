@@ -28,10 +28,10 @@ UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifac
 // Container configuration
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505191345-4400"
-LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-aarch64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505191345-4400"
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310-trt10.10.0.31-skip-tritondevel-202505191345-4400"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312-trt10.10.0.31-skip-tritondevel-202505191345-4400"
+LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505211401-4539"
+LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-aarch64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505211401-4539"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310-trt10.10.0.31-skip-tritondevel-202505211401-4539"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312-trt10.10.0.31-skip-tritondevel-202505211401-4539"
 
 // TODO: Move common variables to an unified location
 BUILD_CORES_REQUEST = "8"
@@ -1006,6 +1006,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             ]
                         }
 
+                        if (env.testPhase2StageName) {
+                            parameters += [
+                                'testPhase2StageName': env.testPhase2StageName,
+                            ]
+                        }
+
                         echo "trigger SBSA test job, params: ${parameters}"
 
                         def status = triggerJob(
@@ -1035,6 +1041,43 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             }
         },
     ]
+    def dockerBuildJob = [
+        "Build-Docker-Images": {
+            script {
+                stage("[Build-Docker-Images] Remote Run") {
+                    def parameters = getCommonParameters()
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
+                    def branch = env.gitlabBranch ? env.gitlabBranch : "main"
+                    if (globalVars[GITHUB_PR_API_URL]) {
+                        branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                    }
+
+                    parameters += [
+                        'enableFailFast': enableFailFast,
+                        'branch': branch,
+                        'action': "push",
+                        'globalVars': globalVarsJson,
+                    ]
+
+                    echo "trigger BuildDockerImages job, params: ${parameters}"
+
+                    def status = triggerJob("/LLM/helpers/BuildDockerImages", parameters)
+                    if (status != "SUCCESS") {
+                        error "Downstream job did not succeed"
+                    }
+                }
+            }
+        }
+    ]
+    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+        stages += dockerBuildJob
+    }
+    if (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") || testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images")) {
+        stages += dockerBuildJob
+        testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
+        testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
+        echo "Will run Build-Docker-Images job"
+    }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {

@@ -1251,7 +1251,7 @@ void MixtureOfExpertsGemmProfiler::runTactic(int m, int n, int k, MixtureOfExper
     char* workspace_ptr_char, cudaStream_t const& stream)
 {
     checkInit();
-    backend.runProfiler(m, tactic, workspace_ptr_char, stream);
+    backend.runProfiler(m, tactic, workspace_ptr_char, /*expert_weights*/ nullptr, stream);
 }
 
 auto MixtureOfExpertsGemmProfiler::getTactics(int m, int n, int k) const -> std::vector<Config>
@@ -1264,7 +1264,7 @@ void MixtureOfExpertsGemmProfiler::initTmpData(
     int m, int n, int k, char* workspace, size_t ws_size, cudaStream_t stream)
 {
     checkInit();
-    backend.prepare(m, workspace, stream);
+    backend.prepare(m, workspace, /*expert_weights*/ nullptr, stream);
 }
 
 void MixtureOfExpertsGemmProfiler::checkInit()
@@ -1278,6 +1278,6 @@ void MixtureOfExpertsGemmProfiler::checkInit()
     auto& plugin = *mRunner;
     backend.init(*plugin.mMOERunner, backend.mGemmToProfile, plugin.mType, plugin.mWeightType, plugin.mOutputType,
         plugin.mNumExperts, plugin.mExpertsPerToken, plugin.mExpertHiddenSize, plugin.mExpertInterSize,
-        plugin.mGroupSize, plugin.mActivationType, plugin.hasBias(), plugin.hasLora(), /*minLatencyMode*/ false,
-        plugin.getParallelismConfig());
+        plugin.mGroupSize, plugin.mActivationType, plugin.hasBias(), plugin.hasLora(), /*min_latency_mode=*/false,
+        /*need_weights=*/true, plugin.getParallelismConfig());
 }
