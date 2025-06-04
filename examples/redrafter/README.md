@@ -74,9 +74,8 @@ Similary we can use and fp8 quantised base model and an fp16 draft head.
 python ../../../quantization/quantize.py --model_dir ./tmp/Qwen/7B/ \
                                    --dtype float16 \
                                    --qformat fp8 \
-                                   --kv_cache_dtype fp8 \
                                    --output_dir ./qwen_checkpoint_1gpu_fp8 \
-                                   --calib_size 512
+                                   --calib_size 1024
 
 # From the `examples/models/redrafter/` directory, run,
 python convert_checkpoint.py --model_dir ./qwen_checkpoint_1gpu_fp8 \
