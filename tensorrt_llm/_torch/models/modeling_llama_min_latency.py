@@ -15,7 +15,7 @@ from ...models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PredefinedAttentionMask
 from ..model_config import ModelConfig
-from ..modules.fused_moe import (BaseMoeRoutingMethod, FusedMoE,
+from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
                                  FusedMoEQuantScalesFP8,
                                  Llama4RenormalizeMoeRoutingMethod,
                                  MoEWeightLoadingMode)
@@ -432,7 +432,7 @@ class Llama4MinLatencyAttention(Llama4Attention):
                                      all_reduce_params, skip_attn_scaling)
 
 
-class Llama4MinLatencyFusedMoE(FusedMoE):
+class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
 
     def __init__(
         self,

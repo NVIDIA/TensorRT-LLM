@@ -53,7 +53,7 @@ export TRTLLM_USE_MPI_KVCACHE=1
 mpirun -n <total_num_ranks> trtllm-serve disaggregated_mpi_worker -c disagg_config.yaml
 ```
 where `<total_num_ranks>` is the sum of `TP*PP` for all context and generation servers. For the example above, `total_num_ranks` is 3
-since `TP` and `PP` is 1 for all context and generation servers.
+since `TP` and `PP` is 1 for the two context and one generation server.
 
 The `disagg_config.yaml` file must now contain the configuration parameters of the context and generation servers. For example,
 it could look like:
@@ -66,7 +66,7 @@ backend: "pytorch"
 use_cuda_graph: False
 disable_overlap_scheduler: True
 context_servers:
-  num_instances: 1
+  num_instances: 2
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   kv_cache_config:
@@ -98,7 +98,7 @@ curl http://localhost:8000/v1/completions     -H "Content-Type: application/json
         "temperature": 0
     }' -w "\n"
 ```
-Or using the provided client:
+Or using the provided client parsing the prompts from a file and sending request to the disaggregated server specified in the `disagg_config.yaml` file at the `chat` endpoint:
 ```
-python3 ./clients/disagg_client.py -c disagg_config.yaml -p ./clients/prompts.json
+python3 ./clients/disagg_client.py -c disagg_config.yaml -p ./clients/prompts.json -e chat
 ```

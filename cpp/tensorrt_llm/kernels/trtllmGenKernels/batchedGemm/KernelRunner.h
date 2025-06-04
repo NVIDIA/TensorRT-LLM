@@ -19,7 +19,6 @@
 #include <cuda.h>
 #include <optional>
 
-#include "tensorrt_llm/kernels/trtllmGenKernels/common/Dtype.h"
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm
@@ -29,8 +28,8 @@ namespace kernels
 
 struct TrtllmGenBatchedGemmRunnerOptions
 {
-    trtllm::gen::Dtype eltType;
-    trtllm::gen::Dtype outputType;
+    batchedGemm::trtllm::gen::Dtype eltType;
+    batchedGemm::trtllm::gen::Dtype outputType;
     bool deepSeekFp8{false};
     bool fusedAct{false};
     bool routeAct{false};

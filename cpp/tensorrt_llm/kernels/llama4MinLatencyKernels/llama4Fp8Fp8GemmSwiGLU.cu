@@ -80,7 +80,7 @@ void dispatch_llama4_fp8_fp8_gemm_swiglu_hidden_in(void const* __restrict__ A, v
 
     void* args[] = {(void*) &A, (void*) &B, (void*) &C, (void*) &in_scale, (void*) &out_scale_inv, (void*) &num_tokens,
         (void*) &hidden_in, (void*) &hidden_out};
-    launch_kernel_fdl(grid_size, dim3(BLOCK_SIZE), stream, func_ptr, args, 8);
+    launch_kernel_pdl(grid_size, dim3(BLOCK_SIZE), stream, func_ptr, args, 8);
 }
 
 template <int TILE_TOKEN>

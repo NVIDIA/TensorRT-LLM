@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 import math
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
@@ -157,7 +157,7 @@ def load_weights_fused_gate_up_helper(
     return (gate_weight, up_weight)
 
 
-class LinearMethodBase:
+class LinearMethodBase(ABC):
     """
     Base class for all linear methods.
     """

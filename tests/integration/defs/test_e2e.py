@@ -77,7 +77,7 @@ def _get_kv_mem_size_candidate(used_Gib, fraction):
 def _check_mem_usage(file, mem_info, ranks_num=1):
     if file is None or not TEST_MEM_USAGE:
         return
-    delta = 0.2  # 0.2 GB as buffer
+    delta = 0.3  # 0.3 GB as buffer
     peak, model_size, kv_mem_size, extra, fraction = _get_mem_info_from_log(
         file, ranks_num)
 

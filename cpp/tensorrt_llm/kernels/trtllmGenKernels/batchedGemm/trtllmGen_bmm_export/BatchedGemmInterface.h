@@ -29,6 +29,9 @@
 namespace batchedGemm
 {
 
+namespace batchedGemm
+{
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // BatchedGemmData
@@ -84,7 +87,7 @@ struct BatchedGemmData
 
     struct InputBuffers
     {
-        // The matrix A. The data type is controlled by options.mDtypeElt.
+        // The matrix A. The data type is controlled by options.mDtypeA.
         //
         // If (routeAct == true && batchM), the shape is [M, K]
         // Else
@@ -93,8 +96,12 @@ struct BatchedGemmData
         //      Logical strides are [K, 1].
         //
         //   If batchN:
-        //      Logical shape is [B, divUpMul(M, tileM), K].
-        //      Logical strides are [divUpMul(M, tileM) * K, K, 1].
+        //      If transposeMatrixA is false
+        //         Logical shape is [B, divUpMul(M, tileM), K].
+        //         Logical strides are [divUpMul(M, tileM) * K, K, 1].
+        //      If transposeMatrixA is true
+        //         Logical shape is [B, K, divUpMul(M, tileM)].
+        //         Logical strides are [K * divUpMul(M, tileM), divUpMul(M, tileM), 1].
         void const* mPtrA{nullptr};
 
         // The block scaling factors to dequantize A.
@@ -137,7 +144,7 @@ struct BatchedGemmData
         //
         void const* mPtrPerTokenSfA{nullptr};
 
-        // The matrix B. The data type is controlled by options.mDtypeElt.
+        // The matrix B. The data type is controlled by options.mDtypeB.
         //
         // If (routeAct == true && batchN), the shape is [N, K]
         //
@@ -147,8 +154,12 @@ struct BatchedGemmData
         //      Logical strides are [K, 1].
         //
         //   If batchM:
-        //      Logical shape is [B, divUpMul(N, tileN), K].
-        //      Logical strides are [divUpMul(N, tileN) * K, K, 1].
+        //      If transposeMatrixB is true
+        //         Logical shape is [B, divUpMul(N, tileN), K].
+        //         Logical strides are [divUpMul(N, tileN) * K, K, 1].
+        //      If transposeMatrixB is false
+        //         Logical shape is [B, K, divUpMul(N, tileN)].
+        //         Logical strides are [K * divUpMul(N, tileN), divUpMul(N, tileN), 1].
         void const* mPtrB{nullptr};
 
         // The scaling factors to dequantize B.
@@ -547,7 +558,8 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     auto options = getOptionsFromConfigAndData(config, batchedGemmData);
 
     bool const batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
-    bool const useDeepSeekFp8 = options.mUseDeepSeekFp8 && options.mDtypeElt == tg::Dtype::E4m3;
+    bool const useDeepSeekFp8
+        = options.mUseDeepSeekFp8 && options.mDtypeA == tg::Dtype::E4m3 && options.mDtypeB == tg::Dtype::E4m3;
 
     auto workspaceSizes = getWorkspaceSizesInBytes(config, batchedGemmData);
     float* dPtrRowMax{nullptr};
@@ -601,7 +613,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
         batchedGemmData.mInputBuffers.mPtrScaleGate, batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax,
         dPtrRowMaxBars, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
         batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx,
-        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit);
+        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit, maxNumCtasInBatchDim);
 
     // The size of the grid.
     std::vector<int32_t> grid{numCtaX, numCtaY, numCtaZ};
@@ -642,3 +654,5 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
 } // namespace batchedGemm
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+} // namespace batchedGemm

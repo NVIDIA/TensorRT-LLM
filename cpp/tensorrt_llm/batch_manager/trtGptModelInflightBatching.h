@@ -448,6 +448,8 @@ private:
     std::unique_ptr<runtime::TllmRuntime> mRuntime;
     // Decoder that generates new tokens from the logits.
     std::unique_ptr<runtime::GptDecoderBatched> mDecoder;
+    // Decoder state for all requests
+    std::unique_ptr<runtime::decoder::DecoderState> mDecoderState;
     // Synchronization handles for decoder
     std::vector<std::optional<runtime::CudaEvent>> mDecoderFinishedEvents;
 

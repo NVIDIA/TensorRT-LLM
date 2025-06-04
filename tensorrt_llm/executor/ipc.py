@@ -120,11 +120,16 @@ class ZeroMqQueue:
             data = serialization.dumps(obj)
             if self.use_hmac_encryption:
                 # Send pickled data with HMAC appended
-                signed_data = self._sign_data(data)
-                self.socket.send(signed_data)
-            else:
-                # Send data without HMAC
-                self.socket.send(data)
+                data = self._sign_data(data)
+            self.socket.send(data)
+
+    def put_noblock(self, obj: Any):
+        self.setup_lazily()
+        with nvtx_range_debug("send", color="blue", category="IPC"):
+            data = serialization.dumps(obj)
+            if self.use_hmac_encryption:
+                data = self._sign_data(data)
+            self.socket.send(data, flags=zmq.NOBLOCK)
 
     async def put_async(self, obj: Any):
         self.setup_lazily()
