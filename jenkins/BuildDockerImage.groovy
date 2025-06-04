@@ -202,7 +202,7 @@ def buildImage(config, imageKeyToTag)
     def imageWithTag = "${IMAGE_NAME}/${makefileStage}:${tag}"
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.makefileStage}:${dependentTag}"
 
-    if (target == "ngc-release" and env.triggerByPostMerge) {
+    if (target == "ngc-release" && env.triggerByPostMerge) {
         dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
         imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
     }
@@ -247,16 +247,16 @@ def buildImage(config, imageKeyToTag)
         // Fix the triton image pull timeout issue
         def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
-        containerGenFailure = null
+        def containerGenFailure = null
 
-        if (dependentTarget) {
-            stage ("make ${dependentTarget}_${action} (${arch})") {
+        if (dependent) {
+            stage ("make ${dependent.target}_${action} (${arch})") {
                 retry(3) {
                     retry(3) {
                         sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
                     }
                     sh """
-                    cd ${LLM_ROOT} && make -C docker ${dependentTarget}_${action} \
+                    cd ${LLM_ROOT} && make -C docker ${dependent.target}_${action} \
                     TORCH_INSTALL_TYPE=${torchInstallType} \
                     IMAGE_WITH_TAG=${dependentImageWithTag} \
                     STAGE=${dependent.makefileStage} \
