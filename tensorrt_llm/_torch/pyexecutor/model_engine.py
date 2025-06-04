@@ -1016,10 +1016,19 @@ class PyTorchModelEngine(ModelEngine):
         return model
 
     def _init_max_seq_len(self):
+        inferred_max_seq_len = self.model.infer_max_seq_len()
         if self.max_seq_len is None:
-            inferred_max_seq_len = self.model.infer_max_seq_len()
             logger.info(
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
+            )
+            self.max_seq_len = inferred_max_seq_len
+
+        elif inferred_max_seq_len < self.max_seq_len:
+            # NOTE: py_executor_creator makes sure that the executor uses this
+            # smaller value as its max_seq_len too.
+            logger.warning(
+                f"Specified {self.max_seq_len=} is larger than what the model can support "
+                f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
             )
             self.max_seq_len = inferred_max_seq_len
 
@@ -1185,7 +1194,15 @@ class PyTorchModelEngine(ModelEngine):
                 num_draft_tokens = len(request.py_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
                 draft_lens.append(num_draft_tokens)
-                prompt_lengths.append(request.py_prompt_len)
+
+                if self.is_spec_decode and self.spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend):
+                    # We're treating the prompt lengths as context requests here, so
+                    # the the prompt lens should not include the cached tokens.
+                    prompt_lengths.append(1 + num_draft_tokens)
+                else:
+                    prompt_lengths.append(request.py_prompt_len)
+
                 sequence_lengths.append(1 + num_draft_tokens)
                 gather_ids.extend(
                     list(
