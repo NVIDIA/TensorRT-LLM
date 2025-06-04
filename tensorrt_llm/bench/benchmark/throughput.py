@@ -295,7 +295,7 @@ def throughput_command(
     if backend and backend.lower() in ["pytorch", "autodeploy"]:
         # If we're dealing with a model name, perform a snapshot download to
         # make sure we have a local copy of the model.
-        if bench_env.checkpoint_path is None:
+        if checkpoint_path is None:
             snapshot_download(model)
 
         exec_settings = get_settings(params, metadata, bench_env.model,
@@ -360,6 +360,10 @@ def throughput_command(
             kwargs["enable_iter_perf_stats"] = True
 
         if runtime_config.backend == 'pytorch':
+            if kwargs.pop("extended_runtime_perf_knob_config", None):
+                logger.warning(
+                    "Ignore extended_runtime_perf_knob_config for pytorch backend."
+                )
             llm = PyTorchLLM(**kwargs)
         else:
             llm = LLM(**kwargs)

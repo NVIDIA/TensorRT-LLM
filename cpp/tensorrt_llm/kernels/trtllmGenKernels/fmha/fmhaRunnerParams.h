@@ -313,6 +313,8 @@ struct TllmGenSelectKernelParams
     MultiCtasKvMode mMultiCtasKvMode;
     // Force using GmemRedution for the multiCtasKvMode.
     bool mForceGmemReduction;
+    // The mask type.
+    TrtllmGenAttentionMaskType mMaskType;
     // Reuse smemK for V or not (only work with MLA generation kernels).
     bool mReuseSmemKForV;
     // Do we need to select a new kernel as the parameters have been updated.
@@ -331,6 +333,7 @@ struct TllmGenSelectKernelParams
         // Note the CgaSmemReduction will be enabled based on the heuristic.
         , mMultiCtasKvMode(params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction : MultiCtasKvMode::Disabled)
         , mForceGmemReduction(false)
+        , mMaskType(params.mMaskType)
         , mReuseSmemKForV(false)
         , mSelectNewKernel(false)
         , mTileScheduler(params.mTileScheduler)

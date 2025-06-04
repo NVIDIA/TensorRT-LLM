@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, List, Literal, Optional, Tuple
 
 import yaml
@@ -15,6 +16,11 @@ __all__ = [
 ]
 
 
+class ServerRole(Enum):
+    CONTEXT = 0
+    GENERATION = 1
+
+
 @dataclass
 class CtxGenServerConfig():
     type: Literal['ctx', 'gen']
@@ -28,6 +34,7 @@ class CtxGenServerConfig():
 class RouterConfig():
     type: str = "round_robin"
     args: dict = field(default_factory=dict)
+    server_role: ServerRole = None
 
 
 @dataclass
@@ -43,6 +50,14 @@ class DisaggServerConfig():
     ctx_router_config: Optional[RouterConfig] = None
     gen_router_config: Optional[RouterConfig] = None
     conditional_disagg_config: Optional[ConditionalDisaggConfig] = None
+
+
+@dataclass
+class MetadataServerConfig():
+    server_type: Literal['etcd']
+    hostname: str = "localhost"
+    port: int = 2379
+    health_check_timeout: float = 5.0
 
 
 def parse_disagg_config_file(yaml_config_file: str):
@@ -85,6 +100,9 @@ def extract_disagg_cfg(hostname: str = 'localhost',
 
     ctx_router_config = extract_router_config(context_servers)
     gen_router_config = extract_router_config(generation_servers)
+    ctx_router_config.server_role = ServerRole.CONTEXT
+    gen_router_config.server_role = ServerRole.GENERATION
+
     conditional_disagg_config = ConditionalDisaggConfig(
         **conditional_disagg_config) if conditional_disagg_config else None
 
@@ -220,3 +238,14 @@ def split_world_comm(
     )
 
     return is_leader, instance_idx, sub_comm
+
+
+def parse_metadata_server_config_file(
+    metadata_server_config_file: Optional[str]
+) -> Optional[MetadataServerConfig]:
+    if metadata_server_config_file is None:
+        return None
+
+    with open(metadata_server_config_file, 'r') as file:
+        config = yaml.safe_load(file)
+        return MetadataServerConfig(**config)
