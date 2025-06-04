@@ -188,7 +188,7 @@ class TestNemotronH(unittest.TestCase):
         nemotron_h = NemotronHForCausalLM(model_config).to(device)
 
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
-        weights = load_weights(model_dir, mapping=mapping)
+        weights = load_weights(model_dir)
         nemotron_h.load_weights(weights)
 
         text_prompts = [
