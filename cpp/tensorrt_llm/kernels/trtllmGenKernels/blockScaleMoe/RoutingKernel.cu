@@ -47,10 +47,10 @@ static constexpr int NumThreads = 256;
 static constexpr int NumBlocksPerCluster = 8;
 static constexpr int WarpSize = 32;
 static constexpr int NumWarps = NumThreads / WarpSize;
-static constexpr int NumTopGroups = 4;
 static constexpr int NumExpertsPerGroup = WarpSize;
 static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopExperts = 8;
+static constexpr int MaxNumTopGroups = 4;
 
 // Performance tuning knob.
 static constexpr int NumEltsPerOffsetTilePerThread = 8;
