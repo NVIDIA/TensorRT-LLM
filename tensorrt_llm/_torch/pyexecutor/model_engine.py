@@ -459,6 +459,7 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = KV_CACHE_MANAGER_KEY
         self.lora_model_config: Optional[LoraModelConfig] = None
+        self.cuda_graph_dummy_request = None
 
     def set_lora_model_config(self, lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str]):
