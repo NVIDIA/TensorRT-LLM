@@ -16,11 +16,14 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from utils.llm_data import llm_models_root
 from utils.util import skip_gpu_memory_less_than
 
+from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.model_engine import load_weights
 from tensorrt_llm._torch.pyexecutor.resource_manager import \
     MambaHybridCacheManager
-from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.bindings.executor import KvCacheConfig as KvCacheConfigCpp
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.sampling_params import SamplingParams
 
 
 def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
@@ -173,7 +176,7 @@ class TestNemotronH(unittest.TestCase):
 
     @skip_gpu_memory_less_than(
         (2 * 8 + 1) * 2**30)  # 8B, bf16, plus 1 GB for good measure
-    def test_nemotron_correctness(self):
+    def test_nemotron_h_correctness(self):
         model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
         nemotron_h_config = NemotronHConfig.from_pretrained(model_dir)
 
@@ -212,9 +215,9 @@ class TestNemotronH(unittest.TestCase):
         max_seq_len = num_blocks * tokens_per_block
         max_batch_size = num_prompts
 
-        kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
-                                        tokens_per_block,
-                                        enable_block_reuse=False)
+        kv_cache_config = KvCacheConfigCpp(max_tokens=num_blocks *
+                                           tokens_per_block,
+                                           enable_block_reuse=False)
         kv_cache_manager = MambaHybridCacheManager(
             # mamba cache parameters
             nemotron_h.config.hidden_size,
@@ -413,3 +416,31 @@ class TestNemotronH(unittest.TestCase):
                                        rtol=0.0)
 
         kv_cache_manager.shutdown()
+
+    # TODO: once LLM API supports context and generation logits, use it in above test and remove this one
+    @skip_gpu_memory_less_than(
+        (2 * 8 + 1) * 2**30)  # 8B, bf16, plus 1 GB for good measure
+    def test_nemotron_h_llm_api(self):
+        model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
+        text_prompts = [
+            "The future of AI is",
+            "The president of the United States is",
+        ]
+        num_prompts = len(text_prompts)
+
+        nemotron_h = LLM(
+            model=model_dir,
+            use_cuda_graph=False,
+            max_batch_size=num_prompts,
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        )
+
+        expected_completions = [
+            " bright, with endless possibilities for innovation and growth",
+            " the head of state and head of government of",
+        ]
+
+        sampling_params = SamplingParams(max_tokens=9, temperature=0.0)
+        results = nemotron_h.generate(text_prompts, sampling_params)
+        for result, expected_completion in zip(results, expected_completions):
+            self.assertEqual(result.text, expected_completion)
