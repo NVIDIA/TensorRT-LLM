@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -47,6 +46,9 @@ class MTPConfig(SpecConfig):
     # Filter out tokens with a large probability gap between the top-1 token's log probability.
     relaxed_delta: float = 0.
 
+    # Whether to use vanilla MTP
+    use_mtp_vanilla: bool = False
+
     # TODO: Hard code for DeepSeek R1
     # When encounter <think>, start thinking phase.
     # When encounter </think>, end thinking phase.
@@ -61,8 +63,7 @@ class MTPConfig(SpecConfig):
 
     def update_from_model_config(self, model_config):
         assert self.num_nextn_predict_layers > 0
-        force_vanilla = os.environ.get("TRTLLM_FORCE_MTP_VANILLA", "0") == "1"
-        if model_config.num_nextn_predict_layers == 1 and not force_vanilla:
+        if model_config.num_nextn_predict_layers == 1 and not self.use_mtp_vanilla:
             self.spec_dec_mode = SpeculativeDecodingMode.MTP_EAGLE
             self.num_extra_kv_tokens = self.num_nextn_predict_layers - 1
 
