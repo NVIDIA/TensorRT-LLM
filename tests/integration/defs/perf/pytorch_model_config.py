@@ -70,7 +70,7 @@ def get_model_yaml_config(model_label: str,
     if 'pytorch' in model_label and 'loras' in model_label:
         lora_config = {
             'lora_config': {
-                'lora_dir': [*lora_dirs],
+                'lora_dir': lora_dirs if lora_dirs is not None else [],
                 'max_lora_rank': 64,
                 'lora_target_modules': ['attn_q', 'attn_k', 'attn_v'],
                 'trtllm_modules_to_hf_modules': {
