@@ -1172,14 +1172,11 @@ class PyTorchModelEngine(ModelEngine):
         request_ids_with_previous_batch = []
         num_extend_reqs_wo_previous_batch = 0
         for request in extend_requests:
-            if next_draft_tokens_device is None or request.py_batch_idx is None:
-                # the request has no previous device tensors:
-                # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
-                # (2) request.py_batch_idx is None, which means the request has no previous batch.
-                # the second condition includes dummy generation requests created for CUDA graph padding or
-                # attention DP. These dummy generation requests should be at the head of generation_requests.
-                # TODO: move the dummy generation requests to the end of generation_requests to align with
-                # the logic for those requests in generation_requests.
+            # the request has no previous tensor:
+            # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
+            # (2) a dummy request; or
+            # (3) the first step in the generation server of disaggregated serving
+            if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                 # get token ids, including input token ids and draft token ids
                 input_ids.append(request.get_last_tokens(0))
                 input_ids.extend(request.py_draft_tokens)
@@ -1241,13 +1238,13 @@ class PyTorchModelEngine(ModelEngine):
                 range(len(position_ids),
                       len(position_ids) + len(generation_requests))))
         for request in generation_requests:
-            if new_tokens_device is None or request.py_batch_idx is None or request.is_cuda_graph_dummy:
-                # the request has no previous tensor:
-                # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
-                # (2) request.py_batch_idx is None, which means the request has no previous batch; or
-                # (3) request.is_cuda_graph_dummy, which means dummy generation requests created for CUDA graph padding.
-                # these dummy generation requests should be at the end of generation_requests.
-                # skip adding their input_ids so that new_tokens_device can be aligned to the correct positions.
+            # the request has no previous tensor:
+            # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
+            # (2) a dummy request; or
+            # (3) the first step in the generation server of disaggregated serving
+            if new_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
+                # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
+                # can be aligned to the correct positions.
                 if not request.is_cuda_graph_dummy:
                     input_ids.append(request.get_last_tokens(0))
                 past_seen_token_num = request.max_beam_num_tokens - 1
