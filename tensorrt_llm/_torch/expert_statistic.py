@@ -62,10 +62,11 @@ class ExpertStatistic:
 
     def _set_iter(self, iter_id: int) -> bool:
         self.current_iter_id = iter_id
-        if iter_id == self.stop:
+        if iter_id in (self.start, self.stop):
             logger.info(
-                f'[ExpertStatistic] Rank={self.rank_id}, saving iter={iter_id}, start={self.start}, stop={self.stop}'
+                f"[ExpertStatistic] Rank={self.rank_id}, iter={iter_id}, start={self.start}, stop={self.stop}"
             )
+        if iter_id == self.stop:
             path = os.environ.get('EXPERT_STATISTIC_PATH', 'expert_statistic')
             if not os.path.exists(path):
                 os.makedirs(path, exist_ok=True)
