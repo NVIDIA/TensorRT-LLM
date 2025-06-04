@@ -1,6 +1,5 @@
 import math
 import weakref
-from enum import IntEnum
 from typing import Optional, Union, cast
 
 import torch
@@ -23,15 +22,6 @@ from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
 
-class QkNormType(IntEnum):
-    """
-    The type of QK normalization.
-    """
-    none = 0  # No normalization applied to Q and K
-    pre_rope = 1  # Apply normalization before Rope
-    post_rope = 2  # Apply normalization after Rope
-
-
 class Attention(nn.Module):
 
     def __init__(
@@ -43,7 +33,6 @@ class Attention(nn.Module):
         max_position_embeddings: int,
         bias: bool,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-        qk_norm_type: QkNormType = QkNormType.none,
         layer_idx: Optional[int] = None,
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
@@ -61,7 +50,6 @@ class Attention(nn.Module):
             max_position_embeddings (int): The maximum position embeddings.
             bias (bool): Whether to use bias in the linear layers.
             pos_embd_params (PositionalEmbeddingParams): The positional embedding parameters.
-            qk_norm_type (QkNormType): The type of QK normalization.
             layer_idx (int): The layer index.
             dtype (torch.dtype): The data type.
             dense_bias (bool): Whether to use bias in the output projection layer.
@@ -81,7 +69,6 @@ class Attention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
-        self.qk_norm_type = qk_norm_type
         self.dense_bias = dense_bias
         self.q_scaling = q_scaling
 
@@ -172,8 +159,7 @@ class Attention(nn.Module):
         # enable_rope_fusion: Whether to fuse RoPE into the attention OP.
         # If true, RoPE will be applied in self.attn.forward.
         # If false, RoPE will be applied in self.apply_rope.
-        self.enable_rope_fusion = attn_cls.support_fused_rope(
-        ) and self.qk_norm_type != QkNormType.post_rope
+        self.enable_rope_fusion = attn_cls.support_fused_rope()
 
         self.rotary_emb = None
         if not self.enable_rope_fusion and self.pos_embd_params is not None:
@@ -263,7 +249,9 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-        q, k, v = self.apply_rope(qkv, position_ids)
+        q, k, v = qkv, None, None
+
+        q, k, v = self.apply_rope(q, k, v, position_ids)
 
         out_scale = None
         out_scale_sf = None
@@ -290,32 +278,25 @@ class Attention(nn.Module):
                                   layer_idx=self.layer_idx)
         return attn_output
 
-    def apply_qk_norm(self, q, k):
-        raise NotImplementedError(
-            f"QK norm is not implemented for {self.__class__.__name__}."
-            "Please override the `apply_qk_norm` method in the subclass.")
-
-    def apply_rope(self, qkv: torch.Tensor, position_ids: torch.Tensor):
+    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                   v: Optional[torch.Tensor], position_ids: torch.Tensor):
         """
-        Apply RoPE to the query and key, possibly including QK norm.
+        Apply RoPE to the query and key.
+        It is possible that k/v is None and q is the concatenated qkv tensor, for both input and output, up to the implementation.
+        Before self.attn.forward, convert_qkv will be called to make sure that the format of (q, k, v) satisfies the requirement of self.attn.
+        This method could be overridden in the subclass, in which extra functionalities such as q_norm/k_norm could be added.
         Args:
-            qkv (torch.Tensor): The query, key, and value tensor.
+            q (torch.Tensor): The query tensor.
+            k (Optional[torch.Tensor]): The key tensor.
+            v (Optional[torch.Tensor]): The value tensor.
             position_ids (torch.Tensor): The position IDs of each token for RoPE.
         Returns:
             tuple: A tuple of (q, k, v).
-            This method could be overridden in the subclass, it is possible that k/v is None and q is the concatenated qkv tensor, up to the implementation.
-            Before self.attn.forward, convert_qkv will be called to make sure that the format of (q, k, v) satisfies the requirement of self.attn.
         """
-        q, k, v = qkv, None, None
-        if self.qk_norm_type == QkNormType.pre_rope:
-            q, k, v = self.split_qkv(q, k, v)
-            q, k = self.apply_qk_norm(q, k)
+        q, k, v = self.split_qkv(q, k, v)
+        # If RoPE is fused into the attention OP, do not apply RoPE here.
         if not self.enable_rope_fusion and position_ids is not None:
-            q, k, v = self.split_qkv(q, k, v)
             q, k = self.rotary_emb(position_ids, [q, k])
-            if self.qk_norm_type == QkNormType.post_rope:
-                q, k = self.apply_qk_norm(q, k)
-
         return q, k, v
 
 
