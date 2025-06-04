@@ -48,6 +48,7 @@ def _create_linear_from_configs(model_config: ModelConfig[PretrainedConfig],
 
 
 class NemotronNASAttention(Attention):
+    NON_NEOX_TYPES = ("mistral_yarn", "rope_llama4")
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int):
@@ -61,6 +62,9 @@ class NemotronNASAttention(Attention):
             pos_embd_params=PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
                 rope=RopeParams.from_config(config),
+                is_neox=getattr(model_config.pretrained_config,
+                                "position_embedding_type", None)
+                not in self.NON_NEOX_TYPES,
             ),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
