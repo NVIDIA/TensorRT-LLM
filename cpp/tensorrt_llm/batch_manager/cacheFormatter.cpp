@@ -37,6 +37,35 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest)
+{
+    size_t requestBlockNum = llmRequest.getRequestedBlockHashes().size();
+    constexpr SizeType32 beam{0};
+    auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
+    if (common::getEnvDisableSelectiveCacheTransfer())
+    {
+        return blockRange;
+    }
+    if (requestBlockNum < blockRange.size() && requestBlockNum > 0)
+    {
+        // handle block reuse, the prefix blocks are reused
+        // TODO(zhengd): pass the hashes directly instead of from llmRequest; use hash instead of block num
+        auto const& ids = blockRange.getBlockIds();
+        blockRange.setBlockIds({ids.end() - requestBlockNum, ids.end()});
+    }
+    return blockRange;
+}
+
+BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest)
+{
+    if (common::getEnvDisableSelectiveCacheTransfer())
+    {
+        constexpr SizeType32 beam{0};
+        return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
+    }
+    return BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
+}
+
 void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
     std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
     SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
@@ -47,17 +76,8 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
 
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
     TLLM_CHECK(!connections.empty());
-    constexpr SizeType32 beam{0};
     auto& blockManager = mCacheManager->getBlockManager();
-    size_t requestBlockNum = llmRequest.getRequestedBlockHashes().size();
-    auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId, beam);
-    if (requestBlockNum < blockRange.size() && requestBlockNum > 0)
-    {
-        // handle block reuse, the prefix blocks are reused
-        // TODO(zhengd): pass the hashes directly instead of from llmRequest; use hash instead of block num
-        auto const& ids = blockRange.getBlockIds();
-        blockRange.setBlockIds({ids.end() - requestBlockNum, ids.end()});
-    }
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
 
     auto const numPools = blockManager.getNumPools();
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
@@ -278,7 +298,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
         "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
         llmRequest.getContextPhaseParams().value().getReqId());
     TLLM_CHECK(!connections.empty());
-    auto blockRange = BlockRange::fromNewlyAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId);
+    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();

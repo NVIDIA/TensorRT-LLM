@@ -286,11 +286,13 @@ class Llama4MoE(nn.Module):
                 (0, 0, 0,
                  max_num_token_across_dp_ranks - hidden_states.shape[0]))
         router_logits = self.router(hidden_states)
-        routed_output = self.experts(hidden_states,
-                                     router_logits,
-                                     cutlass_min_latency_mode,
-                                     all_rank_num_tokens=all_rank_num_tokens,
-                                     use_dp_padding=use_dp_padding)
+        routed_output = self.experts(
+            hidden_states,
+            router_logits,
+            cutlass_min_latency_mode=cutlass_min_latency_mode,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+        )
         return routed_output
 
     def forward(
@@ -761,15 +763,6 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
     ):
         super().__init__(LlamaModel(model_config), model_config)
 
-    def infer_max_seq_len(self):
-        if self.model_config.attn_backend.upper() != 'TRTLLM':
-            logger.warning(
-                f"Attention backend {self.model_config.attn_backend} "
-                "does not support chunked attention. Sequence length "
-                "will be limited to 8192.")
-            return 8192
-        return super().infer_max_seq_len()
-
 
 class Llama4InputProcessor(InputProcessor):
 
@@ -869,8 +862,14 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                return_context_logits=return_context_logits)
 
     def infer_max_seq_len(self):
-        # TODO: implement chunked attention to support 10M context length
-        return 8192
+        if self.model_config.attn_backend.upper() != 'TRTLLM':
+            logger.warning(
+                f"Attention backend {self.model_config.attn_backend} "
+                "does not support chunked attention. Sequence length "
+                "will be limited to 8192.")
+            return 8192
+
+        return super().infer_max_seq_len()
 
     def load_weights(self, weights: Dict):
         new_weights = {}

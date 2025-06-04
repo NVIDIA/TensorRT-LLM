@@ -105,6 +105,11 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mHeadDimV = mFixedParams.headSizeV;
         tllmRunnerParams.mNumTokensPerPage = mFixedParams.numTokensPerBlock;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
+        // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
+        // the kernel is supported.
+        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+        tllmRunnerParams.mAttentionWindowSize = INT_MAX;
+
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
     }
     else

@@ -545,6 +545,50 @@ class PyTorchModelEngine(ModelEngine):
                 result = None
             return result
 
+        def get_autotune_warmup_request():
+            available_tokens = kv_cache_manager.get_num_available_tokens(
+                self.max_draft_len)
+            num_tokens_per_request = min(
+                min(available_tokens, self.max_seq_len - 1),
+                self.max_num_tokens)
+
+            available_blocks = kv_cache_manager.get_num_free_blocks()
+
+            # Calculate number of full-length requests and remaining tokens
+            # Each request has num_tokens_per_request tokens, except possibly the last one
+            full_len_request_num = self.max_num_tokens // num_tokens_per_request
+            remaining_tokens = self.max_num_tokens % num_tokens_per_request
+
+            request_num = full_len_request_num if remaining_tokens == 0 else full_len_request_num + 1
+
+            if self.max_num_tokens > available_blocks * kv_cache_manager.tokens_per_block:
+                return None, None
+
+            requests = kv_cache_manager.add_dummy_requests(
+                request_ids=list(range(full_len_request_num)),
+                token_nums=[num_tokens_per_request] * full_len_request_num,
+                is_gen=False,
+                max_num_draft_tokens=self.max_draft_len)
+
+            if remaining_tokens > 0:
+                final_request = kv_cache_manager.add_dummy_requests(
+                    request_ids=[full_len_request_num],
+                    token_nums=[remaining_tokens],
+                    is_gen=False,
+                    max_num_draft_tokens=self.max_draft_len)
+
+                requests += final_request
+
+            if spec_resource_manager is not None:
+                spec_resource_manager.add_dummy_requests(
+                    request_ids=list(range(request_num)))
+
+            result = ScheduledRequests()
+            result.context_requests = requests
+            result.generation_requests = []
+
+            return result, _create_extra_inputs(1, self.max_num_tokens)
+
         @contextlib.contextmanager
         def release_batch(result):
             try:
@@ -632,26 +676,18 @@ class PyTorchModelEngine(ModelEngine):
 
             if self.pytorch_backend_config.autotuner_enabled:
                 with no_cuda_graph(), autotune():
-                    available_tokens = kv_cache_manager.get_num_available_tokens(
-                        self.max_draft_len)
-                    num_tokens_per_request = min(
-                        min(available_tokens, self.max_seq_len - 1),
-                        self.max_num_tokens)
-                    with release_batch(
-                            get_torch_compile_warmup_request(
-                                1, num_tokens_per_request)) as batch:
+                    result, extra_model_inputs = get_autotune_warmup_request()
+                    with release_batch(result) as batch:
                         if batch is None:
                             # No KV cache space!
                             pass
                         else:
                             logger.info(
                                 f"Run autotuning warmup for batch size={1}")
-                            self.forward(
-                                batch,
-                                new_tensors_device=None,
-                                resource_manager=resource_manager,
-                                extra_model_inputs=_create_extra_inputs(
-                                    1, num_tokens_per_request))
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager,
+                                         extra_model_inputs=extra_model_inputs)
                             torch.cuda.synchronize()
 
                     logger.info(f"Autotuner Cache size after warmup " +
@@ -1136,14 +1172,11 @@ class PyTorchModelEngine(ModelEngine):
         request_ids_with_previous_batch = []
         num_extend_reqs_wo_previous_batch = 0
         for request in extend_requests:
-            if next_draft_tokens_device is None or request.py_batch_idx is None:
-                # the request has no previous device tensors:
-                # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
-                # (2) request.py_batch_idx is None, which means the request has no previous batch.
-                # the second condition includes dummy generation requests created for CUDA graph padding or
-                # attention DP. These dummy generation requests should be at the head of generation_requests.
-                # TODO: move the dummy generation requests to the end of generation_requests to align with
-                # the logic for those requests in generation_requests.
+            # the request has no previous tensor:
+            # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
+            # (2) a dummy request; or
+            # (3) the first step in the generation server of disaggregated serving
+            if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                 # get token ids, including input token ids and draft token ids
                 input_ids.append(request.get_last_tokens(0))
                 input_ids.extend(request.py_draft_tokens)
@@ -1205,13 +1238,13 @@ class PyTorchModelEngine(ModelEngine):
                 range(len(position_ids),
                       len(position_ids) + len(generation_requests))))
         for request in generation_requests:
-            if new_tokens_device is None or request.py_batch_idx is None or request.is_cuda_graph_dummy:
-                # the request has no previous tensor:
-                # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
-                # (2) request.py_batch_idx is None, which means the request has no previous batch; or
-                # (3) request.is_cuda_graph_dummy, which means dummy generation requests created for CUDA graph padding.
-                # these dummy generation requests should be at the end of generation_requests.
-                # skip adding their input_ids so that new_tokens_device can be aligned to the correct positions.
+            # the request has no previous tensor:
+            # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
+            # (2) a dummy request; or
+            # (3) the first step in the generation server of disaggregated serving
+            if new_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
+                # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
+                # can be aligned to the correct positions.
                 if not request.is_cuda_graph_dummy:
                     input_ids.append(request.get_last_tokens(0))
                 past_seen_token_num = request.max_beam_num_tokens - 1
