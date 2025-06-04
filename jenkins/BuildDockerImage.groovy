@@ -201,10 +201,12 @@ def buildImage(config, imageKeyToTag)
 
     def imageWithTag = "${IMAGE_NAME}/${makefileStage}:${tag}"
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.makefileStage}:${dependentTag}"
+    def customImageWithTag = "${IMAGE_NAME}/${makefileStage}:${customTag}"
 
     if (target == "ngc-release" && env.triggerByPostMerge) {
         dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
         imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
+        customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
     }
 
     if (target == "ngc-release") {
@@ -296,7 +298,7 @@ def buildImage(config, imageKeyToTag)
                 sh """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${customTag} \
+                IMAGE_WITH_TAG=${customImageWithTag} \
                 STAGE=${makefileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """
