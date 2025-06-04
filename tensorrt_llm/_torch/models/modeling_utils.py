@@ -350,11 +350,10 @@ class DecoderModelForCausalLM(nn.Module,
         self.has_custom_lm_head = False
 
         if config.mapping.enable_attention_dp:
-            self.lm_head = LMHead(
-                vocab_size,
-                hidden_size,
-                dtype=config.pretrained_config.torch_dtype,
-            )
+            self.lm_head = LMHead(vocab_size,
+                                  hidden_size,
+                                  dtype=config.pretrained_config.torch_dtype,
+                                  allreduce_strategy=config.allreduce_strategy)
         else:
             # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
             # will considering per layer QuantConfig in the future.
@@ -374,7 +373,7 @@ class DecoderModelForCausalLM(nn.Module,
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
-            )
+                allreduce_strategy=config.allreduce_strategy)
 
             if self.has_custom_lm_head:
                 with torch.no_grad():

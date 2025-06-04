@@ -193,14 +193,13 @@ class MllamaForCausalLM(nn.Module):
 
         # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
         # will considering per layer QuantConfig in the future.
-        self.lm_head = LMHead(
-            text_config.vocab_size,
-            text_config.hidden_size,
-            dtype=text_config.torch_dtype,
-            mapping=config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
-        )
+        self.lm_head = LMHead(text_config.vocab_size,
+                              text_config.hidden_size,
+                              dtype=text_config.torch_dtype,
+                              mapping=config.mapping,
+                              tensor_parallel_mode=TensorParallelMode.COLUMN,
+                              gather_output=True,
+                              allreduce_strategy=config.allreduce_strategy)
         # use embedding weights in lm_head if tie word embedding is enabled
         if text_config.tie_word_embeddings:
             assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
@@ -293,7 +292,8 @@ class MllamaForConditionalGeneration(nn.Module):
             pretrained_config.vision_config.vision_output_dim,
             pretrained_config.text_config.hidden_size,
             bias=True,
-            dtype=config.pretrained_config.vision_config.torch_dtype)
+            dtype=config.pretrained_config.vision_config.torch_dtype,
+            allreduce_strategy=model_config.allreduce_strategy)
         self.logits_processor = LogitsProcessor()
 
     def infer_max_seq_len(self) -> int:

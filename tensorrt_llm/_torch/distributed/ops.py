@@ -375,7 +375,7 @@ class AllReduce(nn.Module):
 
     def __init__(self,
                  mapping: Mapping,
-                 strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+                 strategy: AllReduceStrategy,
                  dtype: Optional[torch.dtype] = None):
         super().__init__()
         """

@@ -45,7 +45,8 @@ class QwenMoE(nn.Module):
                            self.num_experts,
                            bias=False,
                            dtype=config.torch_dtype,
-                           quant_config=None)
+                           quant_config=None,
+                           allreduce_strategy=model_config.allreduce_strategy)
 
         reduce_results = True
 
@@ -67,11 +68,13 @@ class QwenMoE(nn.Module):
             config=model_config,
         )
 
-        self.shared_expert_gate = Linear(self.hidden_dim,
-                                         1,
-                                         bias=False,
-                                         dtype=config.torch_dtype,
-                                         quant_config=None)
+        self.shared_expert_gate = Linear(
+            self.hidden_dim,
+            1,
+            bias=False,
+            dtype=config.torch_dtype,
+            quant_config=None,
+            allreduce_strategy=model_config.allreduce_strategy)
 
     def forward(
         self,
@@ -199,7 +202,7 @@ class QwenMoeModel(DecoderModel):
             mapping=config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
-        )
+            allreduce_strategy=model_config.allreduce_strategy)
         self.layers = nn.ModuleList([
             QwenMoeDecoderLayer(
                 model_config,

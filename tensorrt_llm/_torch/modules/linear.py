@@ -13,7 +13,8 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
-from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
+from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
+                                     AllReduceStrategy)
 from tensorrt_llm.mapping import Mapping
 
 from ...models.modeling_utils import QuantConfig
@@ -644,21 +645,21 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
 class Linear(nn.Module):
 
     def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        dtype: torch.dtype = None,
-        mapping: Optional[Mapping] = None,
-        tensor_parallel_mode: Optional[TensorParallelMode] = None,
-        gather_output: bool = False,  # COLUMN parallel only
-        quant_config: Optional[QuantConfig] = None,
-        weights_loading_config: Optional[WeightsLoadingConfig] = None,
-        reduce_output: bool = True,  # ROW parallel only
-        skip_create_weights_in_init: bool = False,
-        use_custom_cublas_mm: bool = False,
-        lora: Optional[LoraLayer] = None,
-    ):
+            self,
+            in_features: int,
+            out_features: int,
+            bias: bool = True,
+            dtype: torch.dtype = None,
+            mapping: Optional[Mapping] = None,
+            tensor_parallel_mode: Optional[TensorParallelMode] = None,
+            gather_output: bool = False,  # COLUMN parallel only
+            quant_config: Optional[QuantConfig] = None,
+            weights_loading_config: Optional[WeightsLoadingConfig] = None,
+            reduce_output: bool = True,  # ROW parallel only
+            skip_create_weights_in_init: bool = False,
+            use_custom_cublas_mm: bool = False,
+            lora: Optional[LoraLayer] = None,
+            allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO):
         from ..distributed import AllReduce
 
         super().__init__()
@@ -694,8 +695,10 @@ class Linear(nn.Module):
         self.in_features = local_in_features
         self.out_features = local_out_features
 
+        self.allreduce_strategy = allreduce_strategy
         self.all_reduce = AllReduce(
-            mapping=self.mapping) if reduce_output else None
+            mapping=self.mapping,
+            strategy=allreduce_strategy) if reduce_output else None
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm

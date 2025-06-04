@@ -175,7 +175,7 @@ class NemotronHModel(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
-        )
+            allreduce_strategy=model_config.allreduce_strategy)
 
         # create layers
         layers = []

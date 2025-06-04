@@ -116,7 +116,7 @@ class Gemma3Attention(Attention):
 
 class Gemma3MLP(nn.Module):
 
-    def __init__(self, config: Gemma3TextConfig):
+    def __init__(self, config: ModelConfig[Gemma3TextConfig]):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -125,15 +125,18 @@ class Gemma3MLP(nn.Module):
         self.gate_proj = Linear(self.hidden_size,
                                 self.intermediate_size,
                                 bias=False,
-                                dtype=self.dtype)
+                                dtype=self.dtype,
+                                allreduce_strategy=config.allreduce_strategy)
         self.up_proj = Linear(self.hidden_size,
                               self.intermediate_size,
                               bias=False,
-                              dtype=self.dtype)
+                              dtype=self.dtype,
+                              allreduce_strategy=config.allreduce_strategy)
         self.down_proj = Linear(self.intermediate_size,
                                 self.hidden_size,
                                 bias=False,
-                                dtype=self.dtype)
+                                dtype=self.dtype,
+                                allreduce_strategy=config.allreduce_strategy)
         self.act_fn = ACT2FN[config.hidden_activation]
 
     def forward(self, x):
@@ -218,7 +221,7 @@ class Gemma3TextModel(DecoderModel):
             mapping=config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
-        )
+            allreduce_strategy=model_config.allreduce_strategy)
         self.layers = nn.ModuleList([
             Gemma3DecoderLayer(
                 model_config,

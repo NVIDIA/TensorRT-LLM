@@ -356,7 +356,7 @@ class VanillaMoE(nn.ModuleList):
         self.parallel_size = self.mapping.tp_size
 
         self.all_reduce = AllReduce(mapping=self.mapping,
-                                    strategy=model_config.allreduce_backend)
+                                    strategy=model_config.allreduce_strategy)
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
@@ -935,7 +935,7 @@ class FusedMoE(nn.Module):
         self.parallel_size = self.mapping.tp_size
 
         self.all_reduce = AllReduce(mapping=self.mapping,
-                                    strategy=model_config.allreduce_backend)
+                                    strategy=model_config.allreduce_strategy)
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 

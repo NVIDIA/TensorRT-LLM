@@ -79,7 +79,7 @@ class MoE(nn.Module):
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
         self.all_reduce = AllReduce(mapping=self.mapping,
-                                    strategy=model_config.allreduce_backend)
+                                    strategy=model_config.allreduce_strategy)
 
     @abstractmethod
     def create_weights(self):

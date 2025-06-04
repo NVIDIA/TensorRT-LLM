@@ -39,7 +39,8 @@ class MixtralMoE(nn.Module):
                            self.num_experts,
                            bias=False,
                            dtype=config.torch_dtype,
-                           quant_config=None)
+                           quant_config=None,
+                           allreduce_strategy=model_config.allreduce_strategy)
 
         reduce_results = True
 

@@ -127,7 +127,7 @@ class QwenModel(DecoderModel):
             mapping=config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
-        )
+            allreduce_strategy=model_config.allreduce_strategy)
         self.layers = nn.ModuleList([
             QwenDecoderLayer(
                 model_config,
@@ -229,10 +229,13 @@ class Qwen2ForProcessRewardModel(DecoderModelForCausalLM[QwenModel,
         self.score = nn.Sequential(
             Linear(config.hidden_size,
                    config.hidden_size,
-                   dtype=config.torch_dtype), nn.ReLU(),
+                   dtype=config.torch_dtype,
+                   allreduce_strategy=model_config.allreduce_strategy),
+            nn.ReLU(),
             Linear(config.hidden_size,
                    self.num_labels,
-                   dtype=config.torch_dtype))
+                   dtype=config.torch_dtype,
+                   allreduce_strategy=model_config.allreduce_strategy))
 
     def forward(self,
                 attn_metadata: AttentionMetadata,
@@ -273,10 +276,13 @@ class Qwen2ForRewardModel(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
         self.score = nn.Sequential(
             Linear(config.hidden_size,
                    config.hidden_size,
-                   dtype=config.torch_dtype), nn.ReLU(),
+                   dtype=config.torch_dtype,
+                   allreduce_strategy=model_config.allreduce_strategy),
+            nn.ReLU(),
             Linear(config.hidden_size,
                    self.num_labels,
-                   dtype=config.torch_dtype))
+                   dtype=config.torch_dtype,
+                   allreduce_strategy=model_config.allreduce_strategy))
 
     def forward(self,
                 attn_metadata: AttentionMetadata,

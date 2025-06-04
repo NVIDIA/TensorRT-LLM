@@ -295,7 +295,8 @@ class Qwen3MoEModel(DecoderModel):
             self.embed_tokens = Embedding(
                 config.pretrained_config.vocab_size,
                 config.pretrained_config.hidden_size,
-                dtype=config.pretrained_config.torch_dtype)
+                dtype=config.pretrained_config.torch_dtype,
+                allreduce_strategy=model_config.allreduce_strategy)
         else:
             self.embed_tokens = Embedding(
                 config.pretrained_config.vocab_size,
@@ -304,7 +305,7 @@ class Qwen3MoEModel(DecoderModel):
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
-            )
+                allreduce_strategy=model_config.allreduce_strategy)
         self.layers = nn.ModuleList([
             Qwen3MoEDecoderLayer(
                 model_config,
