@@ -346,7 +346,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-sbsa",
             build_wheel: true,
-            arch: "arm64"
+            arch: "arm64",
             makefileStage: "release",
         ],
         "Build CI image (x86_64 tritondevel)": [:],
