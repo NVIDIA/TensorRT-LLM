@@ -42,6 +42,7 @@ examples/test_nemotron.py::test_llm_nemotron_4_15b_2gpus[bfloat16-int4_awq] SKIP
 examples/test_multimodal.py::test_llm_multimodal_general[video-neva-pp:1-tp:1-bfloat16-bs:8-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5000026)
 examples/test_whisper.py::test_llm_whisper_general[large-v3-enable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/4866931)
 examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] SKIP (https://nvbugs/4961624)
+examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-chunked_summarization_long] SKIP (https://nvbugs/5321371)
 test_e2e.py::test_openai_completions_example SKIP (https://nvbugspro.nvidia.com/bug/5004744)
 cpp/test_e2e.py::test_model[fp8-chatglm-90] SKIP (https://nvbugs/5034830)
 full:B200_PCIe/examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-enable_gemm_plugin] SKIP (Disable for Blackwell)
@@ -352,13 +353,10 @@ perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20-gpus:2] SK
 perf/test_perf.py::test_perf[t5-bench-float16-maxbs:1-input_output_len:128,20-gpus:2] SKIP
 perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:128,128-reqs:80-gpus:8] SKIP
 perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:512,32-reqs:80-gpus:8] SKIP
-full:B200/perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:512-input_output_len:128,128-ep:8-tp:8-gpus:8] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
-full:B200/perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
-full:B200/perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-tp:8-gpus:8] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
+full:NVIDIA_B200/perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:512-input_output_len:128,128-ep:8-tp:8-gpus:8] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
+full:NVIDIA_B200/perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
+full:NVIDIA_B200/perf/test_perf.py::test_perf[deepseek_r1_fp8-bench-pytorch-float8-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-tp:8-gpus:8] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
 full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float8-input_output_len:128,128] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
-full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-tp:2-gpus:2] SKIP #https://docs.google.com/spreadsheets/d/1EvwCcJ5o2zmhVxFFxAAz-49UzswMlfN2y5K37Fkyw7A/edit?gid=907483661#gid=907483661
-full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[llama_v3.3_nemotron_49b-bench-pytorch-bfloat16-input_output_len:128,128-tp:2-gpus:2] SKIP #https://docs.google.com/spreadsheets/d/1EvwCcJ5o2zmhVxFFxAAz-49UzswMlfN2y5K37Fkyw7A/edit?gid=907483661#gid=907483661
-full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp4-bench-pytorch-float4-input_output_len:128,128] SKIP #https://docs.google.com/spreadsheets/d/1EvwCcJ5o2zmhVxFFxAAz-49UzswMlfN2y5K37Fkyw7A/edit?gid=907483661#gid=907483661
 full:B200/perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float16-input_output_len:128,128-quant:fp8] SKIP (https://nvbugspro.nvidia.com/bug/5150255)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-int8_sq-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5232405)
 accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache SKIP (https://nvbugs/5231310)
@@ -454,7 +452,6 @@ perf/test_perf.py::test_perf[qwen_14b_chat-cppmanager-exe-plugin_ifb-float16-inp
 perf/test_perf.py::test_perf[llama_v3.1_70b-bench-bfloat16-input_output_len:1024,1024-tp:2-gpus:2] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
 perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:128,128-quant:int8-gpus:2] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
 perf/test_perf.py::test_perf[starcoder2_3b-bench-pytorch-float16-input_output_len:512,200] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding SKIP (https://nvbugs/5303555)
 test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b] SKIP (https://nvbugs/5302895)
 test_e2e.py::test_trtllm_bench_llmapi_launch[trt_backend-llama-v3-llama3-8b] SKIP (https://nvbugs/5302895)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False] SKIP (https://nvbugs/5303573)

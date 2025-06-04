@@ -263,8 +263,7 @@ class MTPSampler(TorchSampler):
                 if self._draft_meet_max_token_stop_criteria(
                         request, num_tokens, beam_idx):
                     should_stop = True
-                if not should_stop:
-                    request.py_draft_tokens = next_draft_tokens_list[idx]
+                request.py_draft_tokens = next_draft_tokens_list[idx]
                 request.py_decoding_iter += 1
             idx += 1
 
@@ -286,8 +285,7 @@ class MTPSampler(TorchSampler):
                 if self._draft_meet_max_token_stop_criteria(
                         request, num_tokens, beam_idx):
                     should_stop = True
-                if not should_stop:
-                    request.py_draft_tokens = next_draft_tokens_list[idx]
+                request.py_draft_tokens = next_draft_tokens_list[idx]
                 request.py_rewind_len = self.draft_len - (num_new_tokens - 1)
                 request.py_decoding_iter += 1
             idx += 1

@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from tensorrt_llm._torch.modules.moe_load_balancer import (
+from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, SingleLayerMoeLoadBalancer, get_moe_load_balancer,
     moe_load_balancer_add_single_layer)
 

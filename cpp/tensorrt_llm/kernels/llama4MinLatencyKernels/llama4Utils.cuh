@@ -66,7 +66,7 @@ constexpr bool ENABLE_PREEXIT = 0;
 
 } // namespace llama4_fp8_fp8_gemm_swiglu
 
-inline void launch_kernel_fdl(
+inline void launch_kernel_pdl(
     dim3 grid_dim, dim3 block_dim, cudaStream_t stream, void* kernel_func, void* args[], int num_args)
 {
     cudaLaunchConfig_t config;

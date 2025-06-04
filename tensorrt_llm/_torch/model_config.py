@@ -66,21 +66,48 @@ class MoeLoadBalancerConfig:
 class ModelConfig(Generic[TConfig]):
     pretrained_config: Optional[TConfig] = None
     mapping: Mapping = field(default_factory=Mapping)
+
+    # quantization configs
     quant_config: QuantConfig = field(default_factory=QuantConfig)
     # TODO(qijun): support per linear layer quantization
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     # Delay weights creation to DecoderModelForCausalLM.__post_init__
     # to support mixed quantization.
     skip_create_weights_in_init: bool = False
+
+    spec_config: Optional["SpecConfig"] = None
+    lora_config: Optional["LoraConfig"] = None
+
     is_generation: bool = True
     max_num_tokens: int = 8192
+
     moe_max_num_tokens: Optional[int] = None
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
 
+    # If true, enable min-latency mode. Currently only used for Llama4.
+    enable_min_latency: bool = False
+
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
+
+    _frozen: bool = field(default=False, init=False, repr=False)
+
+    def __setattr__(self, key, value):
+        """
+        Prevent modification of frozen instance attributes.
+        However, we allow modification of 'extra_attrs' attributes for torch.compile
+        and 'pretrained_config' attributes for mutimodal models. All the other
+        attributes are frozen.
+        This can be bypassed by manually setting '_frozen' to False. The design is
+        to discourage modifying the attributes unintentionally.
+        """
+        if self._frozen:
+            if key not in ('_frozen', 'extra_attrs', 'pretrained_config'):
+                raise AttributeError(
+                    f"Cannot modify ModelConfig.'{key}' - instance is frozen")
+        super().__setattr__(key, value)
 
     def __post_init__(self):
         if self.pretrained_config and hasattr(self.pretrained_config,
@@ -221,10 +248,12 @@ class ModelConfig(Generic[TConfig]):
                     128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
                 quant_config.group_size = block_size[0]
 
-        return cls(pretrained_config=pretrained_config,
-                   quant_config=quant_config,
-                   quant_config_dict=layer_quant_config,
-                   **kwargs)
+        model_config = cls(pretrained_config=pretrained_config,
+                           quant_config=quant_config,
+                           quant_config_dict=layer_quant_config,
+                           **kwargs)
+        model_config._frozen = True
+        return model_config
 
     def get_bindings_model_config(self) -> "ModelConfigCpp":
         """
