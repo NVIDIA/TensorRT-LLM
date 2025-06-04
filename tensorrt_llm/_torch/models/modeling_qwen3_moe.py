@@ -187,7 +187,9 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.self_attn = Qwen3Attention(
             model_config,
             layer_idx=layer_idx,
-        )
+            # tmp disable fuse_qk_norm_rope on Hopper and above to use xqa per better performance
+            fuse_qk_norm_rope=False
+            if torch.cuda.get_device_capability() <= (9, 0) else True)
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
