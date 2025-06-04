@@ -1119,9 +1119,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
-            self.force_vanilla = os.environ.get("TRTLLM_FORCE_MTP_VANILLA",
-                                                "0") == "1"
-            if ckpt_nextn == 1 and not self.force_vanilla:
+            if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
                 mtp_layer = DeepseekV3MTP(model_config, self.num_hidden_layers,
                                           self.model.aux_stream_dict)
                 self.model.layers.append(mtp_layer)
