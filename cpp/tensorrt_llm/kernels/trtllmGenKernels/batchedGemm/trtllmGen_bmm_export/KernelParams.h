@@ -33,6 +33,9 @@ inline T ceilDiv(T m, T n)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+namespace batchedGemm
+{
+
 namespace tg = trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -62,12 +65,18 @@ struct KernelParams
     //    Tile box strides are [tileK, 1].
     //
     // If batchN:
-    //    Logical shape is [B, divUpMul(M, tileM), K].
-    //    Logical strides are [divUpMul(M, tileM) * K, K, 1].
-    //    Tile box shape is [1, tileM, tileK].
-    //    Tile box strides are [0, tileK, 1].
+    //    If transposeMatrixA is false
+    //       Logical shape is [B, divUpMul(M, tileM), K].
+    //       Logical strides are [divUpMul(M, tileM) * K, K, 1].
+    //       Tile box shape is [1, tileM, tileK].
+    //       Tile box strides are [0, tileK, 1].
+    //    If transposeMatrixA is true
+    //       Logical shape is [B, K, divUpMul(M, tileM)].
+    //       Logical strides are [K * divUpMul(M, tileM), divUpMul(M, tileM), 1].
+    //       Tile box shape is [1, tileK, tileM].
+    //       Tile box strides are [0, tileM, 1].
     //
-    // Dtype is set from options.mDtypeElt.
+    // Dtype is set from options.mDtypeA.
     CUtensorMap tmaA[1];
 
     // TMA descriptor for B.
@@ -75,10 +84,16 @@ struct KernelParams
     // makeTmaShapeStrideAbc.
     //
     // If batchM:
-    //    Logical shape is [B, divUpMul(N, tileN), K].
-    //    Logical strides are [divUpMul(N, tileN) * K, K, 1].
-    //    Tile box shape is [1, tileN, tileK].
-    //    Tile box strides are [0, tileK, 1].
+    //    If transposeMatrixB is true
+    //       Logical shape is [B, divUpMul(N, tileN), K].
+    //       Logical strides are [divUpMul(N, tileN) * K, K, 1].
+    //       Tile box shape is [1, tileN, tileK].
+    //       Tile box strides are [0, tileK, 1].
+    //    If transposeMatrixB is false
+    //       Logical shape is [B, K, divUpMul(N, tileN)].
+    //       Logical strides are [K * divUpMul(N, tileN), divUpMul(N, tileN), 1].
+    //       Tile box shape is [1, tileK, tileN].
+    //       Tile box strides are [0, tileN, 1].
     //
     // If batchN:
     //    Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B), K].
@@ -86,7 +101,7 @@ struct KernelParams
     //    Tile box shape is [tileN, tileK].
     //    Tile box strides are [tileK, 1].
     //
-    // Dtype is set from options.mDtypeElt.
+    // Dtype is set from options.mDtypeB.
     CUtensorMap tmaB[1];
 
     // TMA descriptor for C, (when useTmaStore is true)
@@ -157,7 +172,7 @@ struct KernelParams
     void const* ptrA;
 
     // The stride for matrix A in bytes.
-    // Equals to K * dtypeGetNumBits(dtypeElt) / 8.
+    // Equals to K * dtypeGetNumBits(dtypeA) / 8.
     uint64_t strideInBytesA;
 
     // The input matrix B.
@@ -165,7 +180,7 @@ struct KernelParams
     // Otherwise, check layout of tmaB to see the shape and strides.
     void const* ptrB;
     // The stride for matrix B in bytes.
-    // Equals to K * dtypeGetNumBits(dtypeElt) / 8.
+    // Equals to K * dtypeGetNumBits(dtypeB) / 8.
     uint64_t strideInBytesB;
 
     // The output matrix C. Check "logical" layout of tmaC to see the shape and strides.
@@ -463,9 +478,15 @@ struct KernelParams
     };
 
     // Create the TMA shape/stride for A/B/C.
-    static auto makeTmaShapeStrideAbc(
-        bool const transposeMmaOutput, bool const useFusedAct, int mM, int mN, int mK, MatrixType matrixType)
+    static auto makeTmaShapeStrideAbc(bool const transposeMatrixA, bool const transposeMatrixB,
+        bool const transposeMmaOutput, bool const useFusedAct, int numBatches, int mM, int mN, int mK,
+        MatrixType matrixType)
     {
+        // Weights matrix is A if we transpose the output of MMA (to have it M-major).
+        // Otherwise, it is B, when the output of MMA is K-major.
+        bool const isWeights = (matrixType == MatrixType::MatrixA && transposeMmaOutput)
+            || (matrixType == MatrixType::MatrixB && !transposeMmaOutput);
+
         auto numTokens = (matrixType == MatrixType::MatrixA || matrixType == MatrixType::MatrixC) ? mM : mN;
         auto hiddenSize = (matrixType == MatrixType::MatrixC) ? mN : mK;
         if (matrixType == MatrixType::MatrixC && transposeMmaOutput)
@@ -486,10 +507,28 @@ struct KernelParams
         // Note that TMA descriptor expects the first dimension's stride to be
         // 1, so swap the first two dimension so that the hiddenSize dimension comes first.
         auto shape = std::vector<uint64_t>{static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(numTokens)};
+        // If the matrix is a weights matrix, we use 3D logical shape for it (B, M, K) or (B, N, K).
+        // Ativations matrix is 2D (sum(divUpMul(M[bi], tileM) for bi in B), K).
+        if (isWeights)
+        {
+            shape.push_back(static_cast<uint64_t>(numBatches));
+        }
 
         // Assemble the stride (strideTokens, 1).
         // Swap the first two dimension as mentioned before.
         auto stride = std::vector<uint64_t>{1, static_cast<uint64_t>(hiddenSize)};
+        if (isWeights)
+        {
+            stride.push_back(static_cast<uint64_t>(hiddenSize * numTokens));
+        }
+
+        // Apply transpose if necessary
+        if ((matrixType == MatrixType::MatrixA && transposeMatrixA)
+            || (matrixType == MatrixType::MatrixB && !transposeMatrixB))
+        {
+            std::swap(shape[0], shape[1]);
+            stride[1] = numTokens;
+        }
 
         return std::make_tuple(shape, stride);
     }
@@ -574,7 +613,7 @@ struct KernelParams
             return std::make_tuple(shape, stride, tileShapes);
         }
 
-        default: assert(false && "Unsupported SF layout");
+        default: throw std::runtime_error("Unsupported SF layout");
         }
         return std::make_tuple(std::vector<uint64_t>{}, std::vector<uint64_t>{}, std::vector<uint32_t>{});
     }
@@ -583,13 +622,14 @@ struct KernelParams
         int32_t const m, int32_t const n, int32_t const k, std::vector<int32_t> const& batchedM,
         std::vector<int32_t> const& batchedN, int32_t const tileM, int32_t const tileN, int32_t const tileK,
         int32_t const epilogueTileM, int32_t const epilogueTileN, bool const useDeepSeekFp8, bool const useTmaStore,
-        bool const transposeMmaOutput, tg::SfLayout sfLayoutB, bool const useFusedAct, tg::Dtype dtypeElt,
-        tg::Dtype dtypeC, void const* ptrA, void const* ptrB, void* ptrC, void const* dSfA, void const* dSfB,
-        void const* ptrPerTokenSfA, void const* ptrPerTokenSfB, void* dSfC, float const* ptrScaleC,
-        float const* ptrScaleGate, int32_t const* ptrRouteMap, float* rowMax, uint32_t* rowMaxBars,
-        bool isStaticBatch = true, int32_t const* ptrNumNonExitingCtas = nullptr,
-        int32_t const* ptrTotalNumPaddedTokens = nullptr, int32_t const* ptrCtaIdxXyToBatchIdx = nullptr,
-        int32_t const* ptrCtaIdxXyToMnLimit = nullptr)
+        bool const transposeMatrixA, bool const transposeMatrixB, bool const transposeMmaOutput, tg::SfLayout sfLayoutB,
+        bool const useFusedAct, tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::MmaKind mmaKind,
+        void const* ptrA, void const* ptrB, void* ptrC, void const* dSfA, void const* dSfB, void const* ptrPerTokenSfA,
+        void const* ptrPerTokenSfB, void* dSfC, float const* ptrScaleC, float const* ptrScaleGate,
+        int32_t const* ptrRouteMap, float* rowMax, uint32_t* rowMaxBars, bool isStaticBatch = true,
+        int32_t const* ptrNumNonExitingCtas = nullptr, int32_t const* ptrTotalNumPaddedTokens = nullptr,
+        int32_t const* ptrCtaIdxXyToBatchIdx = nullptr, int32_t const* ptrCtaIdxXyToMnLimit = nullptr,
+        int32_t const maxNumCtas = MaxNumCtas)
     {
 
         static_assert(sizeof(KernelParams) <= 32 * 1024, "sizeof(KernelParams) has to be less or equal than 32KB");
@@ -597,7 +637,10 @@ struct KernelParams
         // Create the return struct.
         KernelParams params;
 
-        assert(numBatches <= KernelParams::MaxBatchSize && "GEMM batch limit reached.");
+        if (numBatches > KernelParams::MaxBatchSize)
+        {
+            throw std::runtime_error("GEMM batch limit reached.");
+        }
 
         params.ptrRouteMap = ptrRouteMap;
         params.numTokens = numTokens;
@@ -635,7 +678,10 @@ struct KernelParams
                 int32_t tokensPerTile = mn;
 
                 // Make sure we do not exceed the launch limit.
-                assert(ctaOffset + numCtas <= MaxNumCtas && "Too many CTAs");
+                if (ctaOffset + numCtas > MaxNumCtas)
+                {
+                    throw std::runtime_error("Too many CTAs");
+                }
 
                 for (int32_t cta = 0; cta < numCtas; cta++)
                 {
@@ -655,7 +701,7 @@ struct KernelParams
             params.ptrTotalNumPaddedTokens = ptrTotalNumPaddedTokens;
             params.ptrCtaIdxXyToBatchIdx = ptrCtaIdxXyToBatchIdx;
             params.ptrCtaIdxXyToMnLimit = ptrCtaIdxXyToMnLimit;
-            ctaOffset = MaxNumCtas;
+            ctaOffset = maxNumCtas;
         }
 
         if (useDeepSeekFp8 && dtypeC == tg::Dtype::E4m3)
@@ -665,8 +711,8 @@ struct KernelParams
 
         params.ptrA = ptrA;
         params.ptrB = ptrB;
-        params.strideInBytesA = k * tg::dtypeGetNumBits(dtypeElt) / 8;
-        params.strideInBytesB = k * tg::dtypeGetNumBits(dtypeElt) / 8;
+        params.strideInBytesA = k * tg::dtypeGetNumBits(dtypeA) / 8;
+        params.strideInBytesB = k * tg::dtypeGetNumBits(dtypeB) / 8;
 
         params.ptrSfA = dSfA;
         params.ptrSfB = dSfB;
@@ -675,36 +721,44 @@ struct KernelParams
         if (!batchM)
         {
             // A is the expert
-            assert(0 == m % tileM && "0 == mM %% tileM");
+            if (0 != m % tileM)
+            {
+                throw std::runtime_error("0 == mM %% tileM");
+            }
             params.tileStridePerBatch = m / tileM;
             params.nm = m;
             // Shape/stride for gmem tensor A.
-            auto [shapeA, strideA]
-                = makeTmaShapeStrideAbc(transposeMmaOutput, useFusedAct, m * numBatches, n, k, MatrixType::MatrixA);
+            auto [shapeA, strideA] = makeTmaShapeStrideAbc(transposeMatrixA, transposeMatrixB, transposeMmaOutput,
+                useFusedAct, numBatches, m, n, k, MatrixType::MatrixA);
             // Build tma descriptor for A.
-            params.tmaA[0]
-                = gemm::buildNdTmaDescriptor(dtypeElt, shapeA, strideA, tileM, tileK, const_cast<void*>(ptrA));
+            params.tmaA[0] = gemm::buildNdTmaDescriptor(dtypeA, mmaKind, shapeA, strideA,
+                transposeMatrixA ? tileK : tileM, transposeMatrixA ? tileM : tileK, const_cast<void*>(ptrA));
 
             // The input is padded:
             // [act0, padding, padding, ... TileN size .., act1, padding, padding, ...]
             auto const inputNumTokens = ctaOffset * tileN;
             // B is the activation
             // Shape/stride for gmem tensor B.
-            auto [shapeB, strideB]
-                = makeTmaShapeStrideAbc(transposeMmaOutput, useFusedAct, m, inputNumTokens, k, MatrixType::MatrixB);
+            auto [shapeB, strideB] = makeTmaShapeStrideAbc(transposeMatrixA, transposeMatrixB, transposeMmaOutput,
+                useFusedAct, numBatches, m, inputNumTokens, k, MatrixType::MatrixB);
             // Build tma descriptor for B.
-            params.tmaB[0]
-                = gemm::buildNdTmaDescriptor(dtypeElt, shapeB, strideB, tileN, tileK, const_cast<void*>(ptrB));
+            params.tmaB[0] = gemm::buildNdTmaDescriptor(dtypeB, mmaKind, shapeB, strideB,
+                !transposeMatrixB ? tileK : tileN, !transposeMatrixB ? tileN : tileK, const_cast<void*>(ptrB));
 
-            if (dtypeElt == tg::Dtype::E2m1 || dtypeElt == tg::Dtype::MxE4m3)
+            if (dtypeA == tg::Dtype::E2m1 || dtypeA == tg::Dtype::MxE4m3 || dtypeA == tg::Dtype::MxE2m1)
             {
-                tg::Dtype const dTypeSf = (dtypeElt == tg::Dtype::E2m1) ? tg::Dtype::E4m3 : tg::Dtype::UE8m0;
+                tg::Dtype const dTypeSf = (dtypeA == tg::Dtype::E2m1) ? tg::Dtype::E4m3 : tg::Dtype::UE8m0;
 
                 // Build TMA descriptor for gmem A block scaling factors.
                 auto [shapeSfA, strideSfA, tileShapesSfA] = makeTmaShapeStrideSfAb(
-                    m * numBatches, n, k, MatrixType::MatrixA, tileM, tileN, tileK, dtypeElt, tg::SfLayout::R128c4);
+                    m * numBatches, n, k, MatrixType::MatrixA, tileM, tileN, tileK, dtypeA, tg::SfLayout::R128c4);
                 params.tmaSfA[0]
                     = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(dSfA));
+            }
+
+            if (dtypeB == tg::Dtype::E2m1 || dtypeB == tg::Dtype::MxE4m3 || dtypeB == tg::Dtype::MxE2m1)
+            {
+                tg::Dtype const dTypeSf = (dtypeB == tg::Dtype::E2m1) ? tg::Dtype::E4m3 : tg::Dtype::UE8m0;
 
                 // The input is padded:
                 // [act0, padding, padding, ... TileN size .., act1, padding, padding, ...]
@@ -712,7 +766,7 @@ struct KernelParams
 
                 // Build TMA descriptor for gmem B block scaling factors.
                 auto [shapeSfB, strideSfB, tileShapesSfB] = makeTmaShapeStrideSfAb(
-                    m, inputNumTokensSfB, k, MatrixType::MatrixB, tileM, tileN, tileK, dtypeElt, sfLayoutB);
+                    m, inputNumTokensSfB, k, MatrixType::MatrixB, tileM, tileN, tileK, dtypeB, sfLayoutB);
                 params.tmaSfB[0]
                     = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfB, strideSfB, tileShapesSfB, const_cast<void*>(dSfB));
             }
@@ -721,8 +775,8 @@ struct KernelParams
             if (useTmaStore)
             {
                 // Shape/stride for gmem tensor C.
-                auto [shapeC, strideC] = makeTmaShapeStrideAbc(
-                    transposeMmaOutput, useFusedAct, m, ctaOffset * tileN, k, MatrixType::MatrixC);
+                auto [shapeC, strideC] = makeTmaShapeStrideAbc(transposeMatrixA, transposeMatrixB, transposeMmaOutput,
+                    useFusedAct, numBatches, m, ctaOffset * tileN, k, MatrixType::MatrixC);
 
                 // Swap M and N tiles for the M-major epilogue.
                 auto outputTileM = transposeMmaOutput ? epilogueTileN : epilogueTileM;
@@ -734,7 +788,8 @@ struct KernelParams
                     outputTileN /= 2;
                 }
                 // Build tma descriptor for C.
-                params.tmaC[0] = gemm::buildNdTmaDescriptor(dtypeC, shapeC, strideC, outputTileM, outputTileN, ptrC);
+                params.tmaC[0] = gemm::buildNdTmaDescriptor(
+                    dtypeC, tg::MmaKind::Auto, shapeC, strideC, outputTileM, outputTileN, ptrC);
             }
             else
             {
@@ -744,30 +799,33 @@ struct KernelParams
         else
         {
             // B is the expert
-            assert(0 == n % tileN && "0 == mN %% tileN");
+            if (0 != n % tileN)
+            {
+                throw std::runtime_error("0 == mN %% tileN");
+            }
             params.tileStridePerBatch = n / tileN;
             params.nm = n;
             // Shape/stride for gmem tensor B.
-            auto [shapeB, strideB]
-                = makeTmaShapeStrideAbc(transposeMmaOutput, useFusedAct, m, n * numBatches, k, MatrixType::MatrixB);
+            auto [shapeB, strideB] = makeTmaShapeStrideAbc(transposeMatrixA, transposeMatrixB, transposeMmaOutput,
+                useFusedAct, numBatches, m, n, k, MatrixType::MatrixB);
             // Build tma descriptor for B.
-            params.tmaB[0]
-                = gemm::buildNdTmaDescriptor(dtypeElt, shapeB, strideB, tileN, tileK, const_cast<void*>(ptrB));
+            params.tmaB[0] = gemm::buildNdTmaDescriptor(dtypeB, mmaKind, shapeB, strideB,
+                !transposeMatrixB ? tileK : tileN, !transposeMatrixB ? tileN : tileK, const_cast<void*>(ptrB));
 
             // A is the activation
             // Shape/stride for gmem tensor A.
             // The input is padded:
             // [act0, padding, padding, ... tileM size .., act1, padding, padding, ...]
             auto const inputNumTokens = ctaOffset * tileM;
-            auto [shapeA, strideA]
-                = makeTmaShapeStrideAbc(transposeMmaOutput, useFusedAct, inputNumTokens, n, k, MatrixType::MatrixA);
+            auto [shapeA, strideA] = makeTmaShapeStrideAbc(transposeMatrixA, transposeMatrixB, transposeMmaOutput,
+                useFusedAct, numBatches, inputNumTokens, n, k, MatrixType::MatrixA);
             // Build tma descriptor for A.
-            params.tmaA[0]
-                = gemm::buildNdTmaDescriptor(dtypeElt, shapeA, strideA, tileM, tileK, const_cast<void*>(ptrA));
+            params.tmaA[0] = gemm::buildNdTmaDescriptor(dtypeA, mmaKind, shapeA, strideA,
+                transposeMatrixA ? tileK : tileM, transposeMatrixA ? tileM : tileK, const_cast<void*>(ptrA));
 
-            if (dtypeElt == tg::Dtype::E2m1 || dtypeElt == tg::Dtype::MxE4m3)
+            if (dtypeA == tg::Dtype::E2m1 || dtypeA == tg::Dtype::MxE4m3 || dtypeA == tg::Dtype::MxE2m1)
             {
-                tg::Dtype const dTypeSf = (dtypeElt == tg::Dtype::E2m1) ? tg::Dtype::E4m3 : tg::Dtype::UE8m0;
+                tg::Dtype const dTypeSf = (dtypeA == tg::Dtype::E2m1) ? tg::Dtype::E4m3 : tg::Dtype::UE8m0;
 
                 // The input is padded:
                 // [act0, padding, padding, ... tileM size .., act1, padding, padding, ...]
@@ -775,13 +833,18 @@ struct KernelParams
 
                 // Build TMA descriptor for gmem A block scaling factors.
                 auto [shapeSfA, strideSfA, tileShapesSfA] = makeTmaShapeStrideSfAb(
-                    inputNumTokensSfA, n, k, MatrixType::MatrixA, tileM, tileN, tileK, dtypeElt, tg::SfLayout::R128c4);
+                    inputNumTokensSfA, n, k, MatrixType::MatrixA, tileM, tileN, tileK, dtypeA, tg::SfLayout::R128c4);
                 params.tmaSfA[0]
                     = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(dSfA));
+            }
+
+            if (dtypeB == tg::Dtype::E2m1 || dtypeB == tg::Dtype::MxE4m3 || dtypeB == tg::Dtype::MxE2m1)
+            {
+                tg::Dtype const dTypeSf = (dtypeB == tg::Dtype::E2m1) ? tg::Dtype::E4m3 : tg::Dtype::UE8m0;
 
                 // Build TMA descriptor for gmem B block scaling factors.
                 auto [shapeSfB, strideSfB, tileShapesSfB] = makeTmaShapeStrideSfAb(
-                    m, n * numBatches, k, MatrixType::MatrixB, tileM, tileN, tileK, dtypeElt, sfLayoutB);
+                    m, n * numBatches, k, MatrixType::MatrixB, tileM, tileN, tileK, dtypeB, sfLayoutB);
                 params.tmaSfB[0]
                     = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfB, strideSfB, tileShapesSfB, const_cast<void*>(dSfB));
             }
@@ -790,8 +853,8 @@ struct KernelParams
             if (useTmaStore)
             {
                 // Shape/stride for gmem tensor C.
-                auto [shapeC, strideC] = makeTmaShapeStrideAbc(
-                    transposeMmaOutput, useFusedAct, ctaOffset * tileM, n, k, MatrixType::MatrixC);
+                auto [shapeC, strideC] = makeTmaShapeStrideAbc(transposeMatrixA, transposeMatrixB, transposeMmaOutput,
+                    useFusedAct, numBatches, ctaOffset * tileM, n, k, MatrixType::MatrixC);
 
                 // Swap M and N tiles for the M-major epilogue.
                 auto outputTileM = transposeMmaOutput ? epilogueTileN : epilogueTileM;
@@ -803,7 +866,8 @@ struct KernelParams
                     outputTileN /= 2;
                 }
                 // Build tma descriptor for C.
-                params.tmaC[0] = gemm::buildNdTmaDescriptor(dtypeC, shapeC, strideC, outputTileM, outputTileN, ptrC);
+                params.tmaC[0] = gemm::buildNdTmaDescriptor(
+                    dtypeC, tg::MmaKind::Auto, shapeC, strideC, outputTileM, outputTileN, ptrC);
             }
             else
             {
@@ -836,7 +900,7 @@ struct KernelParams
         void const* ptrPerTokenSfB, void* dSfC, float const* ptrScaleC, float const* ptrScaleGate,
         int32_t const* routeMap, float* rowMax, uint32_t* rowMaxBars, int32_t const* ptrNumNonExitingCtas = nullptr,
         int32_t const* ptrTotalNumPaddedTokens = nullptr, int32_t const* ptrCtaIdxXyToBatchIdx = nullptr,
-        int32_t const* ptrCtaIdxXyToMnLimit = nullptr)
+        int32_t const* ptrCtaIdxXyToMnLimit = nullptr, int32_t const maxNumCtas = MaxNumCtas)
     {
 
         bool const useFusedAct = options.mFusedAct;
@@ -844,12 +908,15 @@ struct KernelParams
         return setKernelParams(options.mNumBatches, options.mNumTokens, batchM, options.mM, options.mN, options.mK,
             options.mBatchedM, options.mBatchedN, options.mTileM, options.mTileN, options.mTileK,
             options.mEpilogueTileM, options.mEpilogueTileN, options.mUseDeepSeekFp8, options.mUseTmaStore,
-            options.mTransposeMmaOutput, options.mSfLayoutB, useFusedAct, options.mDtypeElt, options.mDtypeC, ptrA,
-            ptrB, ptrC, dSfA, dSfB, ptrPerTokenSfA, ptrPerTokenSfB, dSfC, ptrScaleC, ptrScaleGate, routeMap, rowMax,
-            rowMaxBars, options.mIsStaticBatch, ptrNumNonExitingCtas, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
-            ptrCtaIdxXyToMnLimit);
+            options.mTransposeMatrixA, options.mTransposeMatrixB, options.mTransposeMmaOutput, options.mSfLayoutB,
+            useFusedAct, options.mDtypeA, options.mDtypeB, options.mDtypeC, options.mMmaKind, ptrA, ptrB, ptrC, dSfA,
+            dSfB, ptrPerTokenSfA, ptrPerTokenSfB, dSfC, ptrScaleC, ptrScaleGate, routeMap, rowMax, rowMaxBars,
+            options.mIsStaticBatch, ptrNumNonExitingCtas, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
+            ptrCtaIdxXyToMnLimit, maxNumCtas);
     }
 #endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+} // namespace batchedGemm

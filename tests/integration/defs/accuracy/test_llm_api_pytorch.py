@@ -885,9 +885,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     def test_nvfp4_8gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                          attention_dp, cuda_graph, overlap_scheduler,
                          max_batch_size, moe_backend):
-        #TODO: remove after the test failure for TRTLLM backend is fixed
-        if moe_backend == "TRTLLM":
-            pytest.skip("https://nvbugs/5302441")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,

@@ -717,7 +717,7 @@ class Llama4Model(DecoderModel):
 
         # If enable_min_latency is True, we will use min-latency mode.
         DecoderLayerClass = Llama4DecoderLayer
-        if model_config.pytorch_backend_config.enable_min_latency:
+        if model_config.enable_min_latency:
             from .modeling_llama_min_latency import Llama4MinLatencyDecoderLayer
             DecoderLayerClass = Llama4MinLatencyDecoderLayer
 
@@ -879,12 +879,14 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 trust_remote_code=True,
                 attn_backend=model_config.attn_backend,
                 moe_backend=model_config.moe_backend,
-                mapping=model_config.mapping)
-            draft_config.spec_config = model_config.spec_config
-            draft_config.max_num_tokens = model_config.max_num_tokens
-            draft_config.moe_max_num_tokens = model_config.moe_max_num_tokens
+                mapping=model_config.mapping,
+                spec_config=model_config.spec_config,
+                max_num_tokens=model_config.max_num_tokens,
+                moe_max_num_tokens=model_config.moe_max_num_tokens)
+
             draft_config.quant_config.kv_cache_quant_algo = \
                 model_config.quant_config.kv_cache_quant_algo
+
             self.draft_model = Eagle3LlamaForCausalLM(
                 draft_config, model_config.pretrained_config.num_hidden_layers)
             self.spec_worker = get_spec_worker(model_config.spec_config,
@@ -935,15 +937,6 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
             )
 
         return logits
-
-    def infer_max_seq_len(self):
-        if self.model_config.attn_backend.upper() != 'TRTLLM':
-            logger.warning(
-                f"Attention backend {self.model_config.attn_backend} "
-                "does not support chunked attention. Sequence length "
-                "will be limited to 8192.")
-            return 8192
-        return super().infer_max_seq_len()
 
     def load_weights(self, weights: Dict):
         super().load_weights(weights, skip_modules=["draft_model"])
@@ -1014,7 +1007,7 @@ class Llama4InputProcessor(InputProcessor):
 
 
 @register_auto_model("Llama4ForConditionalGeneration")
-@register_input_processor(Llama4InputProcessor)
+@register_input_processor(Llama4InputProcessor, model_type="llama4")
 class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                                                              Llama4Config]):
 
@@ -1112,8 +1105,14 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
             return logits
 
     def infer_max_seq_len(self):
-        # TODO: implement chunked attention to support 10M context length
-        return 8192
+        if self.model_config.attn_backend.upper() != 'TRTLLM':
+            logger.warning(
+                f"Attention backend {self.model_config.attn_backend} "
+                "does not support chunked attention. Sequence length "
+                "will be limited to 8192.")
+            return 8192
+
+        return super().infer_max_seq_len()
 
     def load_weights(self, weights: Dict):
         new_weights = {}
