@@ -316,7 +316,7 @@ private:
             // The maximum attention window (the maximum number of tokensKv that will be attended to).
             int maxAttentionWindow{params.mMaxSeqLenKv};
             // Some of the tilesKv will be skipped if the sliding window attention or chunked attention is used.
-            if (isSlidingOrChunkedCausalMask(params.mMaskType))
+            if (isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType))
             {
                 if (params.mMaxSeqLenKv > params.mAttentionWindowSize)
                 {
@@ -486,25 +486,24 @@ private:
         }
 
         // The mask type.
-        TrtllmGenAttentionMaskType maskType = params.mMaskType;
+        selectKernelParams.mMaskType = params.mMaskType;
         // Enable sliding window or chunked causal if the max kv sequence length exceeds attention window size or
         // chunked attention size.
         // This is supported by causal-mask context kernels and generation-phase kernels.
-        if ((maskType == TrtllmGenAttentionMaskType::Causal || !isContextKernel(params.mKernelType))
-            && (params.mMaxSeqLenKv > params.mAttentionWindowSize
-                || params.mMaxSeqLenKv > params.mChunkedAttentionSize))
+        if ((selectKernelParams.mMaskType == TrtllmGenAttentionMaskType::Causal || !isContextKernel(params.mKernelType))
+            && (params.mMaxSeqLenKv > params.mAttentionWindowSize || params.mChunkedAttentionSize != INT_MAX))
         {
             TLLM_CHECK_WITH_INFO(params.mMaxSeqLenKv <= params.mAttentionWindowSize
                     || params.mMaxSeqLenKv <= params.mChunkedAttentionSize,
                 "Sliding window attention and chunked attention should not be used together");
-            maskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
+            selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
         }
         // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
         int numTokensPerPage = (!isPagedKv(params.mQkvLayout)) ? 0 : params.mNumTokensPerPage;
 
         // Debug info.
         std::string info = "qkvLayout=" + std::to_string(static_cast<int>(params.mQkvLayout))
-            + ", maskType=" + std::to_string(static_cast<int>(maskType))
+            + ", maskType=" + std::to_string(static_cast<int>(selectKernelParams.mMaskType))
             + ", kernelType=" + std::to_string(static_cast<int>(kernelType))
             + ", tileScheduler=" + std::to_string(static_cast<int>(selectKernelParams.mTileScheduler))
             + ", multiCtasKvMode=" + std::to_string(static_cast<int>(selectKernelParams.mMultiCtasKvMode))
@@ -517,8 +516,8 @@ private:
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
 
         return std::make_pair(
-            hashID(static_cast<int>(params.mQkvLayout), static_cast<int>(maskType), static_cast<int>(kernelType),
-                static_cast<int>(selectKernelParams.mTileScheduler),
+            hashID(static_cast<int>(params.mQkvLayout), static_cast<int>(selectKernelParams.mMaskType),
+                static_cast<int>(kernelType), static_cast<int>(selectKernelParams.mTileScheduler),
                 static_cast<int>(selectKernelParams.mMultiCtasKvMode), selectKernelParams.mHeadDimPerCtaV,
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeKv, numTokensPerPage,
                 maxNumHeadsQPerKvInCta, selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma),
