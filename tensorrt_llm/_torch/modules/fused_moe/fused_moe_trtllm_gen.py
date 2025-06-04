@@ -72,7 +72,7 @@ class TRTLLMGenFusedMoE(MoE):
         assert not self.use_dp, "AttentionDP is not supported in TRTLLMGenFusedMoE."
 
         self.num_slots = self.num_experts
-        self.expert_size_per_partition = self.num_experts // self.hidden_size
+        self.expert_size_per_partition = self.num_experts // self.ep_size
         self.initial_global_assignments = [
             (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
             self.num_experts for ep_rank in range(self.ep_size)
