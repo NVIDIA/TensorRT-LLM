@@ -131,3 +131,23 @@ API Reference
     :undoc-members:
     :special-members: __init__
     :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.NGramDecodingConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.LlmArgs
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.TorchLlmArgs
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.TrtLlmArgs
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:

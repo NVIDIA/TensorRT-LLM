@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.20.0rc3" />
+  <meta name="docsearch:version" content="0.21.0rc0" />
 
 
   </head>
@@ -336,6 +336,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
@@ -357,6 +358,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
@@ -421,6 +423,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
@@ -455,6 +458,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 </ul>
 </div>
 </nav></div>
@@ -2191,6 +2195,18 @@
 <dd></dd></dl>
 
 <dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime11ModelConfig18getFirstLocalLayerE10SizeType3210SizeType32">
+<span id="_CPPv3NK12tensorrt_llm7runtime11ModelConfig18getFirstLocalLayerE10SizeType3210SizeType32"></span><span id="_CPPv2NK12tensorrt_llm7runtime11ModelConfig18getFirstLocalLayerE10SizeType3210SizeType32"></span><span id="tensorrt_llm::runtime::ModelConfig::getFirstLocalLayer__SizeType32.SizeType32C"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1ModelConfig_1a2c819f0d4717a6ad56c2f701f0ff1698"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getFirstLocalLayer</span></span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">pipelineParallelism</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">pipelineParallelismRank</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig18getFirstLocalLayerE10SizeType3210SizeType32" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp function">
 <dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime11ModelConfig20countLowerRankLayersE9LayerType10SizeType3210SizeType32">
 <span id="_CPPv3NK12tensorrt_llm7runtime11ModelConfig20countLowerRankLayersE9LayerType10SizeType3210SizeType32"></span><span id="_CPPv2NK12tensorrt_llm7runtime11ModelConfig20countLowerRankLayersE9LayerType10SizeType3210SizeType32"></span><span id="tensorrt_llm::runtime::ModelConfig::countLowerRankLayers__LayerType.SizeType32.SizeType32C"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1ModelConfig_1a4c9cabd1675a0db58bce743a0ac0470e"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">countLowerRankLayers</span></span></span><span class="sig-paren">(</span>
 
@@ -2204,8 +2220,15 @@
 <dd></dd></dl>
 
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime11ModelConfig11getNbLayersE10SizeType32">
-<span id="_CPPv3NK12tensorrt_llm7runtime11ModelConfig11getNbLayersE10SizeType32"></span><span id="_CPPv2NK12tensorrt_llm7runtime11ModelConfig11getNbLayersE10SizeType32"></span><span id="tensorrt_llm::runtime::ModelConfig::getNbLayers__SizeType32C"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1ModelConfig_1aefd69a08c1409f90a4e948d857cc08b1"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getNbLayers</span></span></span><span class="sig-paren">(</span><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">pipelineParallelism</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">1</span></span></em><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig11getNbLayersE10SizeType32" title="Link to this definition">#</a><br /></dt>
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime11ModelConfig11getNbLayersE10SizeType3210SizeType32">
+<span id="_CPPv3NK12tensorrt_llm7runtime11ModelConfig11getNbLayersE10SizeType3210SizeType32"></span><span id="_CPPv2NK12tensorrt_llm7runtime11ModelConfig11getNbLayersE10SizeType3210SizeType32"></span><span id="tensorrt_llm::runtime::ModelConfig::getNbLayers__SizeType32.SizeType32C"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1ModelConfig_1aba756e17c1d83a61adf10f12a3787479"></span><span class="k"><span class="pre">inline</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getNbLayers</span></span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">pipelineParallelism</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">pipelineParallelismRank</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig11getNbLayersE10SizeType3210SizeType32" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 <dl class="cpp function">
@@ -11200,6 +11223,19 @@ one more than decoding draft tokens for prediction from primary head </p>
 </dd></dl>
 
 <dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState18getSequenceLengthsE10SizeType32">
+<span id="_CPPv3NK12tensorrt_llm7runtime7decoder12DecoderState18getSequenceLengthsE10SizeType32"></span><span id="_CPPv2NK12tensorrt_llm7runtime7decoder12DecoderState18getSequenceLengthsE10SizeType32"></span><span id="tensorrt_llm::runtime::decoder::DecoderState::getSequenceLengths__SizeType32C"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder_1_1DecoderState_1ad9521ae6439b0704412f786c854c9145"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState9TensorPtrE" title="tensorrt_llm::runtime::decoder::DecoderState::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getSequenceLengths</span></span></span><span class="sig-paren">(</span><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">batchIdx</span></span></em><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState18getSequenceLengthsE10SizeType32" title="Link to this definition">#</a><br /></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>batchIdx</strong> – index of the batch </p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>[maxBeamWidth], sequence lengths for request <code class="docutils literal notranslate"><span class="pre">batchIdx</span></code>, on gpu </p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="cpp function">
 <dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState15getAllNewTokensEv">
 <span id="_CPPv3NK12tensorrt_llm7runtime7decoder12DecoderState15getAllNewTokensEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime7decoder12DecoderState15getAllNewTokensEv"></span><span id="tensorrt_llm::runtime::decoder::DecoderState::getAllNewTokensC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder_1_1DecoderState_1a1313811f8c18a59d45a542374ee5f6df"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState9TensorPtrE" title="tensorrt_llm::runtime::decoder::DecoderState::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getAllNewTokens</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState15getAllNewTokensEv" title="Link to this definition">#</a><br /></dt>
 <dd><p>Get maxTokensPerStep tokens generated in the last forward pass. </p>
@@ -11269,6 +11305,11 @@ one more than decoding draft tokens for prediction from primary head </p>
 </dd>
 </dl>
 </dd></dl>
+
+<dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState15getMaxBatchSizeEv">
+<span id="_CPPv3NK12tensorrt_llm7runtime7decoder12DecoderState15getMaxBatchSizeEv"></span><span id="_CPPv2NK12tensorrt_llm7runtime7decoder12DecoderState15getMaxBatchSizeEv"></span><span id="tensorrt_llm::runtime::decoder::DecoderState::getMaxBatchSizeC"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1decoder_1_1DecoderState_1afa651d891bae6694a10aa7288c3724d9"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime10SizeType32E" title="tensorrt_llm::runtime::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getMaxBatchSize</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState15getMaxBatchSizeEv" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
 
 <dl class="cpp function">
 <dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState15getMaxBeamWidthEv">
@@ -11498,6 +11539,11 @@ one more than decoding draft tokens for prediction from primary head </p>
 <dl class="cpp var">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime16AllReduceBuffers18mAllReduceCommPtrsE">
 <span id="_CPPv3N12tensorrt_llm7runtime16AllReduceBuffers18mAllReduceCommPtrsE"></span><span id="_CPPv2N12tensorrt_llm7runtime16AllReduceBuffers18mAllReduceCommPtrsE"></span><span id="tensorrt_llm::runtime::AllReduceBuffers::mAllReduceCommPtrs__TensorPtr"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1AllReduceBuffers_1ab48e63279d11f42d71c3621820d2520c"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime16AllReduceBuffers9TensorPtrE" title="tensorrt_llm::runtime::AllReduceBuffers::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mAllReduceCommPtrs</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime16AllReduceBuffers18mAllReduceCommPtrsE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp var">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm7runtime16AllReduceBuffers9mFlagPtrsE">
+<span id="_CPPv3N12tensorrt_llm7runtime16AllReduceBuffers9mFlagPtrsE"></span><span id="_CPPv2N12tensorrt_llm7runtime16AllReduceBuffers9mFlagPtrsE"></span><span id="tensorrt_llm::runtime::AllReduceBuffers::mFlagPtrs__TensorPtr"></span><span class="target" id="classtensorrt__llm_1_1runtime_1_1AllReduceBuffers_1a304f00427fcda4b28d5b235fef1a544c"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm7runtime16AllReduceBuffers9TensorPtrE" title="tensorrt_llm::runtime::AllReduceBuffers::TensorPtr"><span class="n"><span class="pre">TensorPtr</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mFlagPtrs</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm7runtime16AllReduceBuffers9mFlagPtrsE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 <dl class="cpp var">
@@ -12171,8 +12217,9 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig12getVocabSizeEv"><code class="docutils literal notranslate"><span class="pre">getVocabSize()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig18getVocabSizePaddedE10SizeType32"><code class="docutils literal notranslate"><span class="pre">getVocabSizePadded()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig16countLocalLayersE9LayerType10SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">countLocalLayers()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig18getFirstLocalLayerE10SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">getFirstLocalLayer()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig20countLowerRankLayersE9LayerType10SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">countLowerRankLayers()</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig11getNbLayersE10SizeType32"><code class="docutils literal notranslate"><span class="pre">getNbLayers()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig11getNbLayersE10SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">getNbLayers()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig20getNbAttentionLayersE10SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">getNbAttentionLayers()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig14getNbRnnLayersE10SizeType3210SizeType32"><code class="docutils literal notranslate"><span class="pre">getNbRnnLayers()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime11ModelConfig10getNbHeadsEv"><code class="docutils literal notranslate"><span class="pre">getNbHeads()</span></code></a></li>
@@ -13526,6 +13573,7 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState11getLogProbsEv"><code class="docutils literal notranslate"><span class="pre">getLogProbs()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState11getLogProbsE10SizeType32"><code class="docutils literal notranslate"><span class="pre">getLogProbs()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState18getSequenceLengthsEv"><code class="docutils literal notranslate"><span class="pre">getSequenceLengths()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState18getSequenceLengthsE10SizeType32"><code class="docutils literal notranslate"><span class="pre">getSequenceLengths()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState15getAllNewTokensEv"><code class="docutils literal notranslate"><span class="pre">getAllNewTokens()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState18getNextDraftTokensEv"><code class="docutils literal notranslate"><span class="pre">getNextDraftTokens()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState25getPrevDraftTokensLengthsEv"><code class="docutils literal notranslate"><span class="pre">getPrevDraftTokensLengths()</span></code></a></li>
@@ -13533,6 +13581,7 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState24getAcceptedLengthsCumSumEv"><code class="docutils literal notranslate"><span class="pre">getAcceptedLengthsCumSum()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState22getAcceptedPackedPathsEv"><code class="docutils literal notranslate"><span class="pre">getAcceptedPackedPaths()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState16getFinishedStepsEv"><code class="docutils literal notranslate"><span class="pre">getFinishedSteps()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState15getMaxBatchSizeEv"><code class="docutils literal notranslate"><span class="pre">getMaxBatchSize()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState15getMaxBeamWidthEv"><code class="docutils literal notranslate"><span class="pre">getMaxBeamWidth()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState20getMaxSequenceLengthEv"><code class="docutils literal notranslate"><span class="pre">getMaxSequenceLength()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState27getMaxDecodingDecoderTokensEv"><code class="docutils literal notranslate"><span class="pre">getMaxDecodingDecoderTokens()</span></code></a></li>
@@ -13566,6 +13615,7 @@ one more than decoding draft tokens for prediction from primary head </p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime16AllReduceBuffers9TensorPtrE"><code class="docutils literal notranslate"><span class="pre">TensorPtr</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime16AllReduceBuffers16AllReduceBuffersE10SizeType3210SizeType3210SizeType3210SizeType32RK13BufferManagerRK11WorldConfigKb"><code class="docutils literal notranslate"><span class="pre">AllReduceBuffers()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime16AllReduceBuffers18mAllReduceCommPtrsE"><code class="docutils literal notranslate"><span class="pre">mAllReduceCommPtrs</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime16AllReduceBuffers9mFlagPtrsE"><code class="docutils literal notranslate"><span class="pre">mFlagPtrs</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm7runtime16AllReduceBuffers17mIpcMemoryHandlesE"><code class="docutils literal notranslate"><span class="pre">mIpcMemoryHandles</span></code></a></li>
 </ul>
 </li>
@@ -13716,6 +13766,15 @@ one more than decoding draft tokens for prediction from primary head </p>
     
   </p>
 </div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on June 03, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ae2ce6">9ae2ce6</a>.</p>
+  
+</div></div>
       
     </div>
   

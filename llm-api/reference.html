@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.20.0rc3" />
+  <meta name="docsearch:version" content="0.21.0rc0" />
 
 
   </head>
@@ -336,6 +336,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
@@ -357,6 +358,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
@@ -421,6 +423,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
@@ -455,6 +458,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 </ul>
 </div>
 </nav></div>
@@ -548,41 +552,39 @@
 <li><p><strong>moe_expert_parallel_size</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The expert parallel size for MoE models’s expert weights. Defaults to None.</p></li>
 <li><p><strong>enable_attention_dp</strong> (<em>bool</em>) – Enable attention data parallel. Defaults to False.</p></li>
 <li><p><strong>cp_config</strong> (<em>Optional</em><em>[</em><em>dict</em><em>]</em>) – Context parallel config. Defaults to None.</p></li>
-<li><p><strong>auto_parallel</strong> (<em>bool</em>) – Enable auto parallel mode. Defaults to False.</p></li>
-<li><p><strong>auto_parallel_world_size</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The world size for auto parallel mode. Defaults to None.</p></li>
 <li><p><strong>load_format</strong> (<em>Literal</em><em>[</em><em>'auto'</em><em>, </em><em>'dummy'</em><em>]</em>) – The format to load the model. Defaults to auto.</p></li>
-<li><p><strong>enable_tqdm</strong> (<em>bool</em>) – Enable tqdm for progress bar. Defaults to False.</p></li>
 <li><p><strong>enable_lora</strong> (<em>bool</em>) – Enable LoRA. Defaults to False.</p></li>
 <li><p><strong>lora_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.lora_manager.LoraConfig</em><em>]</em>) – LoRA configuration for the model. Defaults to None.</p></li>
 <li><p><strong>enable_prompt_adapter</strong> (<em>bool</em>) – Enable prompt adapter. Defaults to False.</p></li>
 <li><p><strong>max_prompt_adapter_token</strong> (<em>int</em>) – The maximum number of prompt adapter tokens. Defaults to 0.</p></li>
 <li><p><strong>quant_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.QuantConfig" title="tensorrt_llm.models.modeling_utils.QuantConfig"><em>tensorrt_llm.models.modeling_utils.QuantConfig</em></a><em>]</em>) – Quantization config. Defaults to None.</p></li>
-<li><p><strong>calib_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.CalibConfig" title="tensorrt_llm.llmapi.llm_args.CalibConfig"><em>tensorrt_llm.llmapi.llm_args.CalibConfig</em></a><em>]</em>) – Calibration config. Defaults to None.</p></li>
-<li><p><strong>build_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BuildConfig" title="tensorrt_llm.builder.BuildConfig"><em>tensorrt_llm.builder.BuildConfig</em></a><em>]</em>) – Build config. Defaults to None.</p></li>
-<li><p><strong>kv_cache_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.KvCacheConfig" title="tensorrt_llm.llmapi.llm_args.KvCacheConfig"><em>tensorrt_llm.llmapi.llm_args.KvCacheConfig</em></a><em>]</em>) – KV cache config. Defaults to None.</p></li>
+<li><p><strong>kv_cache_config</strong> (<a class="reference internal" href="#tensorrt_llm.llmapi.KvCacheConfig" title="tensorrt_llm.llmapi.llm_args.KvCacheConfig"><em>tensorrt_llm.llmapi.llm_args.KvCacheConfig</em></a>) – KV cache config. Defaults to None.</p></li>
 <li><p><strong>enable_chunked_prefill</strong> (<em>bool</em>) – Enable chunked prefill. Defaults to False.</p></li>
 <li><p><strong>guided_decoding_backend</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – Guided decoding backend. Defaults to None.</p></li>
 <li><p><strong>batched_logits_processor</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.sampling_params.BatchedLogitsProcessor</em><em>]</em>) – Batched logits processor. Defaults to None.</p></li>
 <li><p><strong>iter_stats_max_iterations</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum number of iterations for iter stats. Defaults to None.</p></li>
 <li><p><strong>request_stats_max_iterations</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum number of iterations for request stats. Defaults to None.</p></li>
-<li><p><strong>workspace</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The workspace for the model. Defaults to None.</p></li>
-<li><p><strong>embedding_parallel_mode</strong> (<em>str</em>) – The embedding parallel mode. Defaults to SHARDING_ALONG_VOCAB.</p></li>
-<li><p><strong>fast_build</strong> (<em>bool</em>) – Enable fast build. Defaults to False.</p></li>
-<li><p><strong>enable_build_cache</strong> (<em>Union</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BuildCacheConfig" title="tensorrt_llm.llmapi.build_cache.BuildCacheConfig"><em>tensorrt_llm.llmapi.build_cache.BuildCacheConfig</em></a><em>, </em><em>bool</em><em>]</em>) – Enable build cache. Defaults to False.</p></li>
 <li><p><strong>peft_cache_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.llmapi.llm_args.PeftCacheConfig</em><em>]</em>) – PEFT cache config. Defaults to None.</p></li>
-<li><p><strong>scheduler_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.SchedulerConfig" title="tensorrt_llm.llmapi.llm_args.SchedulerConfig"><em>tensorrt_llm.llmapi.llm_args.SchedulerConfig</em></a><em>]</em>) – Scheduler config. Defaults to None.</p></li>
+<li><p><strong>scheduler_config</strong> (<a class="reference internal" href="#tensorrt_llm.llmapi.SchedulerConfig" title="tensorrt_llm.llmapi.llm_args.SchedulerConfig"><em>tensorrt_llm.llmapi.llm_args.SchedulerConfig</em></a>) – Scheduler config. Defaults to None.</p></li>
 <li><p><strong>cache_transceiver_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.CacheTransceiverConfig" title="tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig"><em>tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig</em></a><em>]</em>) – Cache transceiver config. Defaults to None.</p></li>
-<li><p><strong>speculative_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig" title="tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.MedusaDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.EagleDecodingConfig" title="tensorrt_llm.llmapi.llm_args.EagleDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.MTPDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MTPDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – Speculative decoding config. Defaults to None.</p></li>
+<li><p><strong>speculative_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig" title="tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.MedusaDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.EagleDecodingConfig" title="tensorrt_llm.llmapi.llm_args.EagleDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.MTPDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MTPDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.NGramDecodingConfig" title="tensorrt_llm.llmapi.llm_args.NGramDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – Speculative decoding config. Defaults to None.</p></li>
 <li><p><strong>batching_type</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BatchingType" title="tensorrt_llm.llmapi.llm_args.BatchingType"><em>tensorrt_llm.llmapi.llm_args.BatchingType</em></a><em>]</em>) – Batching type. Defaults to None.</p></li>
 <li><p><strong>normalize_log_probs</strong> (<em>bool</em>) – Normalize log probabilities. Defaults to False.</p></li>
-<li><p><strong>gather_generation_logits</strong> (<em>bool</em>) – Gather generation logits. Defaults to False.</p></li>
-<li><p><strong>extended_runtime_perf_knob_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig" title="tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig"><em>tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig</em></a><em>]</em>) – Extended runtime perf knob config. Defaults to None.</p></li>
 <li><p><strong>max_batch_size</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum batch size. Defaults to None.</p></li>
 <li><p><strong>max_input_len</strong> (<em>int</em>) – The maximum input length. Defaults to 1024.</p></li>
 <li><p><strong>max_seq_len</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum sequence length. Defaults to None.</p></li>
 <li><p><strong>max_beam_width</strong> (<em>int</em>) – The maximum beam width. Defaults to 1.</p></li>
 <li><p><strong>max_num_tokens</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum number of tokens. Defaults to None.</p></li>
 <li><p><strong>backend</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The backend to use. Defaults to None.</p></li>
+<li><p><strong>gather_generation_logits</strong> (<em>bool</em>) – Gather generation logits. Defaults to False.</p></li>
+<li><p><strong>enable_tqdm</strong> (<em>bool</em>) – Enable tqdm for progress bar. Defaults to False.</p></li>
+<li><p><strong>build_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BuildConfig" title="tensorrt_llm.builder.BuildConfig"><em>tensorrt_llm.builder.BuildConfig</em></a><em>]</em>) – Build config. Defaults to None.</p></li>
+<li><p><strong>workspace</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The workspace for the model. Defaults to None.</p></li>
+<li><p><strong>enable_build_cache</strong> (<em>Union</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BuildCacheConfig" title="tensorrt_llm.llmapi.build_cache.BuildCacheConfig"><em>tensorrt_llm.llmapi.build_cache.BuildCacheConfig</em></a><em>, </em><em>bool</em><em>]</em>) – Enable build cache. Defaults to False.</p></li>
+<li><p><strong>extended_runtime_perf_knob_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig" title="tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig"><em>tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig</em></a><em>]</em>) – Extended runtime perf knob config. Defaults to None.</p></li>
+<li><p><strong>calib_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.CalibConfig" title="tensorrt_llm.llmapi.llm_args.CalibConfig"><em>tensorrt_llm.llmapi.llm_args.CalibConfig</em></a><em>]</em>) – Calibration config. Defaults to None.</p></li>
+<li><p><strong>embedding_parallel_mode</strong> (<em>str</em>) – The embedding parallel mode. Defaults to SHARDING_ALONG_VOCAB.</p></li>
+<li><p><strong>fast_build</strong> (<em>bool</em>) – Enable fast build. Defaults to False.</p></li>
 <li><p><strong>kwargs</strong> (<em>Any</em>) – Advanced arguments passed to <cite>LlmArgs</cite>.</p></li>
 </ul>
 </dd>
@@ -1860,6 +1862,8 @@ The BatchedLogitsProcessor class is recommended for callback creation. The callb
 <dd><em class="sig-param"><span class="n"><span class="pre">token_range_retention_configs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">list</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig" title="tensorrt_llm.bindings.executor.KvCacheRetentionConfig.TokenRangeRetentionConfig"><span class="pre">tensorrt_llm.bindings.executor.KvCacheRetentionConfig.TokenRangeRetentionConfig</span></a><span class="p"><span class="pre">]</span></span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decode_retention_priority</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">35</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decode_duration_ms</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">datetime.timedelta</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">transfer_mode</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tensorrt_llm.bindings.executor.KvCacheTransferMode</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">DRAM</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">directory</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.__init__" title="Link to this definition">#</a></dt>
@@ -1876,8 +1880,18 @@ The BatchedLogitsProcessor class is recommended for callback creation. The callb
 <dd></dd></dl>
 
 <dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KvCacheRetentionConfig.directory">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">directory</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.directory" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.KvCacheRetentionConfig.token_range_retention_configs">
 <em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">token_range_retention_configs</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.token_range_retention_configs" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KvCacheRetentionConfig.transfer_mode">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">transfer_mode</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.transfer_mode" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1926,18 +1940,39 @@ validated to form a valid model.</p>
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig.max_ngram_size">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">max_ngram_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">3</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.max_ngram_size" title="Link to this definition">#</a></dt>
 <dd><p>Number of tokens per NGram.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_positive_values</span></code></p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig.max_verification_set_size">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">max_verification_set_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">4</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.max_verification_set_size" title="Link to this definition">#</a></dt>
 <dd><p>Number of NGrams in verification branch per step.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_positive_values</span></code></p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig.max_window_size">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">max_window_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">4</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.max_window_size" title="Link to this definition">#</a></dt>
 <dd><p>Number of NGrams in lookahead branch per step.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_positive_values</span></code></p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py attribute">
@@ -1946,9 +1981,9 @@ validated to form a valid model.</p>
 <dd><p>Configuration for the model, should be a dictionary conforming to [<cite>ConfigDict</cite>][pydantic.config.ConfigDict].</p>
 </dd></dl>
 
-<dl class="py method">
+<dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values">
-<em class="property"><span class="pre">classmethod</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">v</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -2011,6 +2046,7 @@ validated to form a valid model.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">num_eagle_layers</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_non_leaves_per_layer</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">pytorch_eagle_weights_path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">eagle3_one_model</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#EagleDecodingConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.EagleDecodingConfig" title="Link to this definition">#</a></dt>
@@ -2023,6 +2059,11 @@ validated to form a valid model.</p>
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.EagleDecodingConfig.dynamic_tree_max_topK">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">dynamic_tree_max_topK</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.EagleDecodingConfig.dynamic_tree_max_topK" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.EagleDecodingConfig.eagle3_one_model">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">eagle3_one_model</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.EagleDecodingConfig.eagle3_one_model" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -3172,6 +3213,957 @@ changed, you should remove the caches manually.</p>
 
 </dd></dl>
 
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.NGramDecodingConfig">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">NGramDecodingConfig</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_draft_len</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Path</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">prompt_lookup_num_tokens</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_matching_ngram_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">4</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">is_keep_all</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">is_use_oldest</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">is_public_pool</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#NGramDecodingConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.NGramDecodingConfig" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">DecodingBaseConfig</span></code></p>
+<p>Configuration for NGram drafter speculative decoding.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>prompt_lookup_num_tokens</strong> – int
+The length maximum of draft tokens (can be understood as length maximum of output draft tokens).</p></li>
+<li><p><strong>max_matching_ngram_size</strong> – int
+The length maximum of searching tokens (can be understood as length maximum of input tokens to search).</p></li>
+<li><p><strong>is_keep_all</strong> – bool = True
+Whether to keep all candidate pattern-matches pairs, only one match is kept for each pattern if False.</p></li>
+<li><p><strong>is_use_oldest</strong> – bool = True
+Whether to provide the oldest match when pattern is hit, the newest one is provided if False.</p></li>
+<li><p><strong>is_public_pool</strong> – bool = True
+Whether to use a common pool for all requests, or the pool is private for each request if False.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.NGramDecodingConfig.decoding_type">
+<span class="sig-name descname"><span class="pre">decoding_type</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'NGram'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.NGramDecodingConfig.decoding_type" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.NGramDecodingConfig.from_dict">
+<em class="property"><span class="pre">classmethod</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">from_dict</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">data</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#NGramDecodingConfig.from_dict"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.NGramDecodingConfig.from_dict" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.NGramDecodingConfig.is_keep_all">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">is_keep_all</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.NGramDecodingConfig.is_keep_all" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.NGramDecodingConfig.is_public_pool">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">is_public_pool</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.NGramDecodingConfig.is_public_pool" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.NGramDecodingConfig.is_use_oldest">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">is_use_oldest</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.NGramDecodingConfig.is_use_oldest" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.NGramDecodingConfig.max_matching_ngram_size">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">max_matching_ngram_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">4</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.NGramDecodingConfig.max_matching_ngram_size" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.NGramDecodingConfig.model_config">
+<span class="sig-name descname"><span class="pre">model_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">ConfigDict</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.NGramDecodingConfig.model_config" title="Link to this definition">#</a></dt>
+<dd><p>Configuration for the model, should be a dictionary conforming to [<cite>ConfigDict</cite>][pydantic.config.ConfigDict].</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.NGramDecodingConfig.prompt_lookup_num_tokens">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">prompt_lookup_num_tokens</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">2</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.NGramDecodingConfig.prompt_lookup_num_tokens" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LlmArgs">
+<span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">LlmArgs</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LlmArgs" title="Link to this definition">#</a></dt>
+<dd><p>alias of <a class="reference internal" href="#tensorrt_llm.llmapi.TrtLlmArgs" title="tensorrt_llm.llmapi.llm_args.TrtLlmArgs"><code class="xref py py-class docutils literal notranslate"><span class="pre">TrtLlmArgs</span></code></a></p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">TorchLlmArgs</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">*</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">model:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">~pathlib.Path</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">~pathlib.Path</span> <span class="pre">|</span> <span class="pre">~transformers.tokenization_utils_base.PreTrainedTokenizerBase</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.tokenizer.TokenizerBase</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer_mode:</span> <span class="pre">~typing.Literal['auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">'slow']</span> <span class="pre">=</span> <span class="pre">'auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">skip_tokenizer_init:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">trust_remote_code:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tensor_parallel_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">dtype:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">revision:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer_revision:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">pipeline_parallel_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">context_parallel_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">gpus_per_node:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_cluster_parallel_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tensor_parallel_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_expert_parallel_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_attention_dp:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">cp_config:</span> <span class="pre">dict</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">load_format:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.LoadFormat</span> <span class="pre">=</span> <span class="pre">LoadFormat.AUTO</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_lora:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_lora_rank:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_loras:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">4</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_cpu_loras:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">4</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">lora_config:</span> <span class="pre">~tensorrt_llm.lora_manager.LoraConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_prompt_adapter:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_prompt_adapter_token:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">quant_config:</span> <span class="pre">~tensorrt_llm.models.modeling_utils.QuantConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.KvCacheConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_chunked_prefill:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">guided_decoding_backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">batched_logits_processor:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">iter_stats_max_iterations:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">request_stats_max_iterations:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">peft_cache_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.PeftCacheConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">scheduler_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.SchedulerConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">cache_transceiver_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">speculative_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">batching_type:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.BatchingType</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">normalize_log_probs:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_batch_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_input_len:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1024</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_seq_len:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_beam_width:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_num_tokens:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">gather_generation_logits:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">_num_postprocess_workers:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">_postprocess_tokenizer_dir:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">_reasoning_parser:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">decoding_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">_mpi_session:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">build_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_cuda_graph:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_batch_sizes:</span> <span class="pre">~typing.List[int]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_max_batch_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_padding_enabled:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">disable_overlap_scheduler:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_max_num_tokens:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_load_balancer:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">attn_backend:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'TRTLLM'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_backend:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'CUTLASS'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">mixed_sampler:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_trtllm_sampler:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_dtype:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_kv_cache:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_iter_perf_stats:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_iter_req_stats:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">print_iter_log:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_enabled:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_fullgraph:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_inductor_enabled:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_piecewise_cuda_graph:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_enable_userbuffers:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">autotuner_enabled:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_layerwise_nvtx_marker:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">auto_deploy_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_min_latency:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">**extra_data:</span> <span class="pre">~typing.Any</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">BaseLlmArgs</span></code></p>
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.attn_backend">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">attn_backend</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'TRTLLM'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.attn_backend" title="Link to this definition">#</a></dt>
+<dd><p>Attention backend to use.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.auto_deploy_config">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">auto_deploy_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">object</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.auto_deploy_config" title="Link to this definition">#</a></dt>
+<dd><p>Auto deploy config.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.autotuner_enabled">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">autotuner_enabled</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.autotuner_enabled" title="Link to this definition">#</a></dt>
+<dd><p>Enable autotuner only when torch compile is enabled.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.build_config">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">build_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">object</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.build_config" title="Link to this definition">#</a></dt>
+<dd><p>Build config.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.convert_load_format">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">convert_load_format</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">load_format</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.convert_load_format"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.convert_load_format" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_batch_sizes">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cuda_graph_batch_sizes</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_batch_sizes" title="Link to this definition">#</a></dt>
+<dd><p>List of batch sizes to create CUDA graphs for.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_max_batch_size">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cuda_graph_max_batch_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_max_batch_size" title="Link to this definition">#</a></dt>
+<dd><p>Maximum batch size for CUDA graphs.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_max_batch_size</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_padding_enabled">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cuda_graph_padding_enabled</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_padding_enabled" title="Link to this definition">#</a></dt>
+<dd><p>If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.decoding_config">
+<span class="sig-name descname"><span class="pre">decoding_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">object</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.decoding_config" title="Link to this definition">#</a></dt>
+<dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.msg">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.msg" title="Link to this definition">#</a></dt>
+<dd><p>The deprecation message to be emitted.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.wrapped_property">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.wrapped_property" title="Link to this definition">#</a></dt>
+<dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.field_name">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.field_name" title="Link to this definition">#</a></dt>
+<dd><p>The name of the field being deprecated.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.disable_overlap_scheduler">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">disable_overlap_scheduler</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.disable_overlap_scheduler" title="Link to this definition">#</a></dt>
+<dd><p>Disable the overlap scheduler.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.enable_iter_perf_stats">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_iter_perf_stats</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_iter_perf_stats" title="Link to this definition">#</a></dt>
+<dd><p>Enable iteration performance statistics.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.enable_iter_req_stats">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_iter_req_stats</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_iter_req_stats" title="Link to this definition">#</a></dt>
+<dd><p>If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.enable_layerwise_nvtx_marker">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_layerwise_nvtx_marker</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_layerwise_nvtx_marker" title="Link to this definition">#</a></dt>
+<dd><p>If true, enable layerwise nvtx marker.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.enable_min_latency">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_min_latency</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_min_latency" title="Link to this definition">#</a></dt>
+<dd><p>If true, enable min-latency mode. Currently only used for Llama4.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.enable_trtllm_sampler">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_trtllm_sampler</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_trtllm_sampler" title="Link to this definition">#</a></dt>
+<dd><p>If true, will use the TRTLLM sampler instead of the PyTorch sampler. The TRTLLM sampler has a wide coverage of sampling strategies.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.extra_resource_managers">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">extra_resource_managers</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">object</span><span class="p"><span class="pre">]</span></span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.extra_resource_managers" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.get_pytorch_backend_config">
+<span class="sig-name descname"><span class="pre">get_pytorch_backend_config</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">PyTorchConfig</span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.get_pytorch_backend_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.get_pytorch_backend_config" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.kv_cache_dtype">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">kv_cache_dtype</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'auto'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.kv_cache_dtype" title="Link to this definition">#</a></dt>
+<dd><p>Data type for KV cache.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.load_format">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">load_format</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">LoadFormat</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">LoadFormat.AUTO</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.load_format" title="Link to this definition">#</a></dt>
+<dd><p>How to load the model weights. By default, detect the weight type from the model checkpoint.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">convert_load_format</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.max_cpu_loras">
+<span class="sig-name descname"><span class="pre">max_cpu_loras</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_cpu_loras" title="Link to this definition">#</a></dt>
+<dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id10">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id10" title="Link to this definition">#</a></dt>
+<dd><p>The deprecation message to be emitted.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id11">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id11" title="Link to this definition">#</a></dt>
+<dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id12">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id12" title="Link to this definition">#</a></dt>
+<dd><p>The name of the field being deprecated.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.max_lora_rank">
+<span class="sig-name descname"><span class="pre">max_lora_rank</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_lora_rank" title="Link to this definition">#</a></dt>
+<dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id13">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id13" title="Link to this definition">#</a></dt>
+<dd><p>The deprecation message to be emitted.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id14">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id14" title="Link to this definition">#</a></dt>
+<dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id15">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id15" title="Link to this definition">#</a></dt>
+<dd><p>The name of the field being deprecated.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.max_loras">
+<span class="sig-name descname"><span class="pre">max_loras</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_loras" title="Link to this definition">#</a></dt>
+<dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id16">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id16" title="Link to this definition">#</a></dt>
+<dd><p>The deprecation message to be emitted.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id17">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id17" title="Link to this definition">#</a></dt>
+<dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id18">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id18" title="Link to this definition">#</a></dt>
+<dd><p>The name of the field being deprecated.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.mixed_sampler">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">mixed_sampler</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.mixed_sampler" title="Link to this definition">#</a></dt>
+<dd><p>If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.model_config">
+<span class="sig-name descname"><span class="pre">model_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">ConfigDict</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'arbitrary_types_allowed':</span> <span class="pre">True,</span> <span class="pre">'extra':</span> <span class="pre">'allow'}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.model_config" title="Link to this definition">#</a></dt>
+<dd><p>Configuration for the model, should be a dictionary conforming to [<cite>ConfigDict</cite>][pydantic.config.ConfigDict].</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.model_post_init">
+<span class="sig-name descname"><span class="pre">model_post_init</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">_TorchLlmArgs__context</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.model_post_init"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.model_post_init" title="Link to this definition">#</a></dt>
+<dd><p>Override this method to perform additional initialization after <cite>__init__</cite> and <cite>model_construct</cite>.
+This is useful if you want to do some validation that requires the entire model to be initialized.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.moe_backend">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">moe_backend</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'CUTLASS'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.moe_backend" title="Link to this definition">#</a></dt>
+<dd><p>MoE backend to use.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.moe_load_balancer">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">moe_load_balancer</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">object</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.moe_load_balancer" title="Link to this definition">#</a></dt>
+<dd><p>Configuration for MoE load balancing.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.moe_max_num_tokens">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">moe_max_num_tokens</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.moe_max_num_tokens" title="Link to this definition">#</a></dt>
+<dd><p>If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.print_iter_log">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">print_iter_log</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.print_iter_log" title="Link to this definition">#</a></dt>
+<dd><p>Print iteration logs.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_enable_userbuffers">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_enable_userbuffers</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_enable_userbuffers" title="Link to this definition">#</a></dt>
+<dd><p>When torch compile is enabled, userbuffers is enabled by default.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_enabled">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_enabled</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_enabled" title="Link to this definition">#</a></dt>
+<dd><p>Enable torch.compile optimization.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_fullgraph">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_fullgraph</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_fullgraph" title="Link to this definition">#</a></dt>
+<dd><p>Enable full graph compilation in torch.compile.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_inductor_enabled">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_inductor_enabled</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_inductor_enabled" title="Link to this definition">#</a></dt>
+<dd><p>Enable inductor backend in torch.compile.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_piecewise_cuda_graph">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_piecewise_cuda_graph</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_piecewise_cuda_graph" title="Link to this definition">#</a></dt>
+<dd><p>Enable piecewise CUDA graph in torch.compile.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.use_cuda_graph">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">use_cuda_graph</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.use_cuda_graph" title="Link to this definition">#</a></dt>
+<dd><p>If true, use CUDA graphs for decoding. CUDA graphs are only created for the batch sizes in cuda_graph_batch_sizes, and are enabled for batches that consist of decoding requests <em>only</em> (the reason is that it’s hard to capture a single graph with prefill requests since the input shapes are a function of the sequence lengths). Note that each CUDA graph can use up to 200 MB of extra memory.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.use_kv_cache">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">use_kv_cache</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.use_kv_cache" title="Link to this definition">#</a></dt>
+<dd><p>Whether to use KV cache.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_config">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_cuda_graph_config</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_cuda_graph_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_config" title="Link to this definition">#</a></dt>
+<dd><p>Validate CUDA graph configuration.</p>
+<p>Ensures that:
+1. If cuda_graph_batch_sizes is provided, cuda_graph_max_batch_size must be 0
+2. If cuda_graph_batch_sizes is not provided, it is generated based on cuda_graph_max_batch_size
+3. If both are provided, cuda_graph_batch_sizes must match the generated values</p>
+</dd></dl>
+
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_max_batch_size">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_cuda_graph_max_batch_size</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">cuda_graph_max_batch_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_cuda_graph_max_batch_size"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_max_batch_size" title="Link to this definition">#</a></dt>
+<dd><p>Validate cuda_graph_max_batch_size is non-negative.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">TrtLlmArgs</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">*</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">model:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">~pathlib.Path</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">~pathlib.Path</span> <span class="pre">|</span> <span class="pre">~transformers.tokenization_utils_base.PreTrainedTokenizerBase</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.tokenizer.TokenizerBase</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer_mode:</span> <span class="pre">~typing.Literal['auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">'slow']</span> <span class="pre">=</span> <span class="pre">'auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">skip_tokenizer_init:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">trust_remote_code:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tensor_parallel_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">dtype:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">revision:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer_revision:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">pipeline_parallel_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">context_parallel_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">gpus_per_node:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_cluster_parallel_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_tensor_parallel_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">moe_expert_parallel_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_attention_dp:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">cp_config:</span> <span class="pre">dict</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">load_format:</span> <span class="pre">~typing.Literal['auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">'dummy']</span> <span class="pre">=</span> <span class="pre">'auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_lora:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_lora_rank:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_loras:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">4</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_cpu_loras:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">4</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">lora_config:</span> <span class="pre">~tensorrt_llm.lora_manager.LoraConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_prompt_adapter:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_prompt_adapter_token:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">quant_config:</span> <span class="pre">~tensorrt_llm.models.modeling_utils.QuantConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.KvCacheConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_chunked_prefill:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">guided_decoding_backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">batched_logits_processor:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">iter_stats_max_iterations:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">request_stats_max_iterations:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">peft_cache_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.PeftCacheConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">scheduler_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.SchedulerConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">cache_transceiver_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">speculative_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">batching_type:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.BatchingType</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">normalize_log_probs:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_batch_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_input_len:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1024</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_seq_len:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_beam_width:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_num_tokens:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">gather_generation_logits:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">_num_postprocess_workers:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">_postprocess_tokenizer_dir:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">_reasoning_parser:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">decoding_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">_mpi_session:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">auto_parallel:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">auto_parallel_world_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_tqdm:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">build_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">workspace:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_build_cache:</span> <span class="pre">object</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">extended_runtime_perf_knob_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">calib_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.CalibConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">embedding_parallel_mode:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'SHARDING_ALONG_VOCAB'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">fast_build:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">**extra_data:</span> <span class="pre">~typing.Any</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">BaseLlmArgs</span></code></p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.auto_parallel">
+<span class="sig-name descname"><span class="pre">auto_parallel</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.auto_parallel" title="Link to this definition">#</a></dt>
+<dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.msg">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.msg" title="Link to this definition">#</a></dt>
+<dd><p>The deprecation message to be emitted.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.wrapped_property">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.wrapped_property" title="Link to this definition">#</a></dt>
+<dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.field_name">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.field_name" title="Link to this definition">#</a></dt>
+<dd><p>The name of the field being deprecated.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.auto_parallel_config">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">auto_parallel_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">AutoParallelConfig</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.auto_parallel_config" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.auto_parallel_world_size">
+<span class="sig-name descname"><span class="pre">auto_parallel_world_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.auto_parallel_world_size" title="Link to this definition">#</a></dt>
+<dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id19">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id19" title="Link to this definition">#</a></dt>
+<dd><p>The deprecation message to be emitted.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id20">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id20" title="Link to this definition">#</a></dt>
+<dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id21">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id21" title="Link to this definition">#</a></dt>
+<dd><p>The name of the field being deprecated.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.build_config">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">build_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">object</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.build_config" title="Link to this definition">#</a></dt>
+<dd><p>Build config.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.calib_config">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">calib_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#tensorrt_llm.llmapi.CalibConfig" title="tensorrt_llm.llmapi.llm_args.CalibConfig"><span class="pre">CalibConfig</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.calib_config" title="Link to this definition">#</a></dt>
+<dd><p>Calibration config.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.decoding_config">
+<span class="sig-name descname"><span class="pre">decoding_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">object</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.decoding_config" title="Link to this definition">#</a></dt>
+<dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id22">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id22" title="Link to this definition">#</a></dt>
+<dd><p>The deprecation message to be emitted.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id23">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id23" title="Link to this definition">#</a></dt>
+<dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id24">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id24" title="Link to this definition">#</a></dt>
+<dd><p>The name of the field being deprecated.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.embedding_parallel_mode">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">embedding_parallel_mode</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'SHARDING_ALONG_VOCAB'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.embedding_parallel_mode" title="Link to this definition">#</a></dt>
+<dd><p>The embedding parallel mode.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.enable_build_cache">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_build_cache</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">object</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_build_cache" title="Link to this definition">#</a></dt>
+<dd><p>Enable build cache.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.enable_tqdm">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_tqdm</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_tqdm" title="Link to this definition">#</a></dt>
+<dd><p>Enable tqdm for progress bar.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.extended_runtime_perf_knob_config">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">extended_runtime_perf_knob_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig" title="tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig"><span class="pre">ExtendedRuntimePerfKnobConfig</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.extended_runtime_perf_knob_config" title="Link to this definition">#</a></dt>
+<dd><p>Extended runtime perf knob config.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.fast_build">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">fast_build</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.fast_build" title="Link to this definition">#</a></dt>
+<dd><p>Enable fast build.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.max_cpu_loras">
+<span class="sig-name descname"><span class="pre">max_cpu_loras</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_cpu_loras" title="Link to this definition">#</a></dt>
+<dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id25">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id25" title="Link to this definition">#</a></dt>
+<dd><p>The deprecation message to be emitted.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id26">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id26" title="Link to this definition">#</a></dt>
+<dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id27">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id27" title="Link to this definition">#</a></dt>
+<dd><p>The name of the field being deprecated.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.max_lora_rank">
+<span class="sig-name descname"><span class="pre">max_lora_rank</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_lora_rank" title="Link to this definition">#</a></dt>
+<dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id28">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id28" title="Link to this definition">#</a></dt>
+<dd><p>The deprecation message to be emitted.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id29">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id29" title="Link to this definition">#</a></dt>
+<dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id30">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id30" title="Link to this definition">#</a></dt>
+<dd><p>The name of the field being deprecated.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.max_loras">
+<span class="sig-name descname"><span class="pre">max_loras</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_loras" title="Link to this definition">#</a></dt>
+<dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id31">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id31" title="Link to this definition">#</a></dt>
+<dd><p>The deprecation message to be emitted.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id32">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id32" title="Link to this definition">#</a></dt>
+<dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="id33">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id33" title="Link to this definition">#</a></dt>
+<dd><p>The name of the field being deprecated.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.model_config">
+<span class="sig-name descname"><span class="pre">model_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">ConfigDict</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'arbitrary_types_allowed':</span> <span class="pre">True,</span> <span class="pre">'extra':</span> <span class="pre">'allow'}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_config" title="Link to this definition">#</a></dt>
+<dd><p>Configuration for the model, should be a dictionary conforming to [<cite>ConfigDict</cite>][pydantic.config.ConfigDict].</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.model_post_init">
+<span class="sig-name descname"><span class="pre">model_post_init</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">_TrtLlmArgs__context</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs.model_post_init"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_post_init" title="Link to this definition">#</a></dt>
+<dd><p>Override this method to perform additional initialization after <cite>__init__</cite> and <cite>model_construct</cite>.
+This is useful if you want to do some validation that requires the entire model to be initialized.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.workspace">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">workspace</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.workspace" title="Link to this definition">#</a></dt>
+<dd><p>The workspace for the model.</p>
+</dd></dl>
+
+</dd></dl>
+
 </section>
 
 
@@ -3371,7 +4363,9 @@ changed, you should remove the caches manually.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.__init__"><code class="docutils literal notranslate"><span class="pre">__init__()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.decode_duration_ms"><code class="docutils literal notranslate"><span class="pre">decode_duration_ms</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.decode_retention_priority"><code class="docutils literal notranslate"><span class="pre">decode_retention_priority</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.directory"><code class="docutils literal notranslate"><span class="pre">directory</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.token_range_retention_configs"><code class="docutils literal notranslate"><span class="pre">token_range_retention_configs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheRetentionConfig.transfer_mode"><code class="docutils literal notranslate"><span class="pre">transfer_mode</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig"><code class="docutils literal notranslate"><span class="pre">LookaheadDecodingConfig</span></code></a><ul class="nav section-nav flex-column">
@@ -3383,7 +4377,7 @@ changed, you should remove the caches manually.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.max_verification_set_size"><code class="docutils literal notranslate"><span class="pre">max_verification_set_size</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.max_window_size"><code class="docutils literal notranslate"><span class="pre">max_window_size</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values"><code class="docutils literal notranslate"><span class="pre">validate_positive_values()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values"><code class="docutils literal notranslate"><span class="pre">validate_positive_values</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MedusaDecodingConfig"><code class="docutils literal notranslate"><span class="pre">MedusaDecodingConfig</span></code></a><ul class="nav section-nav flex-column">
@@ -3397,6 +4391,7 @@ changed, you should remove the caches manually.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.EagleDecodingConfig"><code class="docutils literal notranslate"><span class="pre">EagleDecodingConfig</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.EagleDecodingConfig.decoding_type"><code class="docutils literal notranslate"><span class="pre">decoding_type</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.EagleDecodingConfig.dynamic_tree_max_topK"><code class="docutils literal notranslate"><span class="pre">dynamic_tree_max_topK</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.EagleDecodingConfig.eagle3_one_model"><code class="docutils literal notranslate"><span class="pre">eagle3_one_model</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.EagleDecodingConfig.eagle_choices"><code class="docutils literal notranslate"><span class="pre">eagle_choices</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.EagleDecodingConfig.from_dict"><code class="docutils literal notranslate"><span class="pre">from_dict()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.EagleDecodingConfig.greedy_sampling"><code class="docutils literal notranslate"><span class="pre">greedy_sampling</span></code></a></li>
@@ -3576,6 +4571,129 @@ changed, you should remove the caches manually.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CacheTransceiverConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig"><code class="docutils literal notranslate"><span class="pre">NGramDecodingConfig</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.decoding_type"><code class="docutils literal notranslate"><span class="pre">decoding_type</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.from_dict"><code class="docutils literal notranslate"><span class="pre">from_dict()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.is_keep_all"><code class="docutils literal notranslate"><span class="pre">is_keep_all</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.is_public_pool"><code class="docutils literal notranslate"><span class="pre">is_public_pool</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.is_use_oldest"><code class="docutils literal notranslate"><span class="pre">is_use_oldest</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.max_matching_ngram_size"><code class="docutils literal notranslate"><span class="pre">max_matching_ngram_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.prompt_lookup_num_tokens"><code class="docutils literal notranslate"><span class="pre">prompt_lookup_num_tokens</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LlmArgs"><code class="docutils literal notranslate"><span class="pre">LlmArgs</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs"><code class="docutils literal notranslate"><span class="pre">TorchLlmArgs</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.attn_backend"><code class="docutils literal notranslate"><span class="pre">attn_backend</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.auto_deploy_config"><code class="docutils literal notranslate"><span class="pre">auto_deploy_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.autotuner_enabled"><code class="docutils literal notranslate"><span class="pre">autotuner_enabled</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.build_config"><code class="docutils literal notranslate"><span class="pre">build_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.convert_load_format"><code class="docutils literal notranslate"><span class="pre">convert_load_format</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_batch_sizes"><code class="docutils literal notranslate"><span class="pre">cuda_graph_batch_sizes</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_max_batch_size"><code class="docutils literal notranslate"><span class="pre">cuda_graph_max_batch_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.cuda_graph_padding_enabled"><code class="docutils literal notranslate"><span class="pre">cuda_graph_padding_enabled</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.decoding_config"><code class="docutils literal notranslate"><span class="pre">decoding_config</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.msg"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.wrapped_property"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.field_name"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.disable_overlap_scheduler"><code class="docutils literal notranslate"><span class="pre">disable_overlap_scheduler</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_iter_perf_stats"><code class="docutils literal notranslate"><span class="pre">enable_iter_perf_stats</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_iter_req_stats"><code class="docutils literal notranslate"><span class="pre">enable_iter_req_stats</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_layerwise_nvtx_marker"><code class="docutils literal notranslate"><span class="pre">enable_layerwise_nvtx_marker</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_min_latency"><code class="docutils literal notranslate"><span class="pre">enable_min_latency</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_trtllm_sampler"><code class="docutils literal notranslate"><span class="pre">enable_trtllm_sampler</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.extra_resource_managers"><code class="docutils literal notranslate"><span class="pre">extra_resource_managers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.get_pytorch_backend_config"><code class="docutils literal notranslate"><span class="pre">get_pytorch_backend_config()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.kv_cache_dtype"><code class="docutils literal notranslate"><span class="pre">kv_cache_dtype</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.load_format"><code class="docutils literal notranslate"><span class="pre">load_format</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_cpu_loras"><code class="docutils literal notranslate"><span class="pre">max_cpu_loras</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id10"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id11"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id12"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_lora_rank"><code class="docutils literal notranslate"><span class="pre">max_lora_rank</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id13"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id14"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id15"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_loras"><code class="docutils literal notranslate"><span class="pre">max_loras</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id16"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id17"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id18"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.mixed_sampler"><code class="docutils literal notranslate"><span class="pre">mixed_sampler</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.model_post_init"><code class="docutils literal notranslate"><span class="pre">model_post_init()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.moe_backend"><code class="docutils literal notranslate"><span class="pre">moe_backend</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.moe_load_balancer"><code class="docutils literal notranslate"><span class="pre">moe_load_balancer</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.moe_max_num_tokens"><code class="docutils literal notranslate"><span class="pre">moe_max_num_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.print_iter_log"><code class="docutils literal notranslate"><span class="pre">print_iter_log</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_enable_userbuffers"><code class="docutils literal notranslate"><span class="pre">torch_compile_enable_userbuffers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_enabled"><code class="docutils literal notranslate"><span class="pre">torch_compile_enabled</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_fullgraph"><code class="docutils literal notranslate"><span class="pre">torch_compile_fullgraph</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_inductor_enabled"><code class="docutils literal notranslate"><span class="pre">torch_compile_inductor_enabled</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_piecewise_cuda_graph"><code class="docutils literal notranslate"><span class="pre">torch_compile_piecewise_cuda_graph</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.use_cuda_graph"><code class="docutils literal notranslate"><span class="pre">use_cuda_graph</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.use_kv_cache"><code class="docutils literal notranslate"><span class="pre">use_kv_cache</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_config"><code class="docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_max_batch_size"><code class="docutils literal notranslate"><span class="pre">validate_cuda_graph_max_batch_size</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs"><code class="docutils literal notranslate"><span class="pre">TrtLlmArgs</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.auto_parallel"><code class="docutils literal notranslate"><span class="pre">auto_parallel</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.msg"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.wrapped_property"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.field_name"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.auto_parallel_config"><code class="docutils literal notranslate"><span class="pre">auto_parallel_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.auto_parallel_world_size"><code class="docutils literal notranslate"><span class="pre">auto_parallel_world_size</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id19"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id20"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id21"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.build_config"><code class="docutils literal notranslate"><span class="pre">build_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.calib_config"><code class="docutils literal notranslate"><span class="pre">calib_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.decoding_config"><code class="docutils literal notranslate"><span class="pre">decoding_config</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id22"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id23"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id24"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.embedding_parallel_mode"><code class="docutils literal notranslate"><span class="pre">embedding_parallel_mode</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_build_cache"><code class="docutils literal notranslate"><span class="pre">enable_build_cache</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_tqdm"><code class="docutils literal notranslate"><span class="pre">enable_tqdm</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.extended_runtime_perf_knob_config"><code class="docutils literal notranslate"><span class="pre">extended_runtime_perf_knob_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.fast_build"><code class="docutils literal notranslate"><span class="pre">fast_build</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_cpu_loras"><code class="docutils literal notranslate"><span class="pre">max_cpu_loras</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id25"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id26"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id27"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_lora_rank"><code class="docutils literal notranslate"><span class="pre">max_lora_rank</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id28"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id29"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id30"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_loras"><code class="docutils literal notranslate"><span class="pre">max_loras</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id31"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id32"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id33"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_post_init"><code class="docutils literal notranslate"><span class="pre">model_post_init()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.workspace"><code class="docutils literal notranslate"><span class="pre">workspace</span></code></a></li>
+</ul>
+</li>
 </ul>
   </nav></div>
 
@@ -3666,6 +4784,15 @@ changed, you should remove the caches manually.</p>
     
   </p>
 </div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on June 03, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ae2ce6">9ae2ce6</a>.</p>
+  
+</div></div>
       
     </div>
   

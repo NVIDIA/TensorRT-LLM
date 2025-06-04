@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.20.0rc3" />
+  <meta name="docsearch:version" content="0.21.0rc0" />
 
 
   </head>
@@ -336,6 +336,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
@@ -357,6 +358,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
@@ -421,6 +423,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
@@ -455,6 +458,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 </ul>
 </div>
 </nav></div>
@@ -529,7 +533,7 @@
                     <span class="p">[</span><span class="o">--</span><span class="n">profiling_verbosity</span> <span class="p">{</span><span class="n">layer_names_only</span><span class="p">,</span><span class="n">detailed</span><span class="p">,</span><span class="n">none</span><span class="p">}]</span>
                     <span class="p">[</span><span class="o">--</span><span class="n">strip_plan</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">weight_sparsity</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">weight_streaming</span><span class="p">]</span>
                     <span class="p">[</span><span class="o">--</span><span class="n">fast_build</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">workers</span> <span class="n">WORKERS</span><span class="p">]</span>
-                    <span class="p">[</span><span class="o">--</span><span class="n">log_level</span> <span class="p">{</span><span class="n">internal_error</span><span class="p">,</span><span class="n">error</span><span class="p">,</span><span class="n">warning</span><span class="p">,</span><span class="n">info</span><span class="p">,</span><span class="n">verbose</span><span class="p">,</span><span class="n">debug</span><span class="p">}]</span>
+                    <span class="p">[</span><span class="o">--</span><span class="n">log_level</span> <span class="p">{</span><span class="n">internal_error</span><span class="p">,</span><span class="n">error</span><span class="p">,</span><span class="n">warning</span><span class="p">,</span><span class="n">info</span><span class="p">,</span><span class="n">verbose</span><span class="p">,</span><span class="n">debug</span><span class="p">,</span><span class="n">trace</span><span class="p">}]</span>
                     <span class="p">[</span><span class="o">--</span><span class="n">enable_debug_output</span><span class="p">]</span>
                     <span class="p">[</span><span class="o">--</span><span class="n">visualize_network</span> <span class="n">VISUALIZE_NETWORK</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">dry_run</span><span class="p">]</span>
                     <span class="p">[</span><span class="o">--</span><span class="n">monitor_memory</span><span class="p">]</span> <span class="p">[</span><span class="o">--</span><span class="n">logits_dtype</span> <span class="p">{</span><span class="n">float16</span><span class="p">,</span><span class="n">float32</span><span class="p">}]</span>
@@ -665,7 +669,7 @@
 <p>Default: <code class="docutils literal notranslate"><span class="pre">1</span></code></p>
 </dd>
 <dt><kbd>--log_level</kbd></dt>
-<dd><p>Possible choices: internal_error, error, warning, info, verbose, debug</p>
+<dd><p>Possible choices: internal_error, error, warning, info, verbose, debug, trace</p>
 <p>The logging level.</p>
 <p>Default: <code class="docutils literal notranslate"><span class="pre">'info'</span></code></p>
 </dd>
@@ -1048,6 +1052,15 @@
     
   </p>
 </div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on June 03, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ae2ce6">9ae2ce6</a>.</p>
+  
+</div></div>
       
     </div>
   

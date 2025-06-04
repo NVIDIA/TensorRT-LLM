@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -61,7 +61,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.20.0rc3" />
+  <meta name="docsearch:version" content="0.21.0rc0" />
 
 
   </head>
@@ -334,6 +334,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
@@ -355,6 +356,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/llm_quantization.html">Generation with Quantization</a></li>
@@ -419,6 +421,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
@@ -453,6 +456,7 @@
 <li class="toctree-l1"><a class="reference internal" href="quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 </ul>
 </div>
 </nav></div>
@@ -651,9 +655,8 @@ The command to generate synthetic dataset will be attached to the max throughput
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">YOUR_DATA_PATH</span><span class="o">=</span>&lt;your<span class="w"> </span>dataset<span class="w"> </span>file<span class="w"> </span>following<span class="w"> </span>the<span class="w"> </span>format&gt;
 
 cat<span class="w"> </span>&gt;./extra-llm-api-config.yml<span class="s">&lt;&lt;EOF</span>
-<span class="s">pytorch_backend_config:</span>
-<span class="s">    use_cuda_graph: true</span>
-<span class="s">    moe_backend: TRTLLM</span>
+<span class="s">use_cuda_graph: true</span>
+<span class="s">moe_backend: TRTLLM</span>
 <span class="s">speculative_config:</span>
 <span class="s">    decoding_type: MTP</span>
 <span class="s">    num_nextn_predict_layers: 3</span>
@@ -720,21 +723,20 @@ python<span class="w"> </span><span class="si">${</span><span class="nv">YOUR_WO
 <span class="nv">YOUR_DATA_PATH</span><span class="o">=</span>./dataset.txt
 
 cat<span class="w"> </span>&gt;./extra-llm-api-config.yml<span class="w"> </span><span class="s">&lt;&lt;EOF</span>
-<span class="s">pytorch_backend_config:</span>
-<span class="s">    use_cuda_graph: true</span>
-<span class="s">    cuda_graph_padding_enabled: true</span>
-<span class="s">    cuda_graph_batch_sizes:</span>
-<span class="s">    - 1</span>
-<span class="s">    - 2</span>
-<span class="s">    - 4</span>
-<span class="s">    - 8</span>
-<span class="s">    - 16</span>
-<span class="s">    - 32</span>
-<span class="s">    - 64</span>
-<span class="s">    - 128</span>
-<span class="s">    - 256</span>
-<span class="s">    - 384</span>
-<span class="s">    print_iter_log: true</span>
+<span class="s">use_cuda_graph: true</span>
+<span class="s">cuda_graph_padding_enabled: true</span>
+<span class="s">cuda_graph_batch_sizes:</span>
+<span class="s">- 1</span>
+<span class="s">- 2</span>
+<span class="s">- 4</span>
+<span class="s">- 8</span>
+<span class="s">- 16</span>
+<span class="s">- 32</span>
+<span class="s">- 64</span>
+<span class="s">- 128</span>
+<span class="s">- 256</span>
+<span class="s">- 384</span>
+<span class="s">print_iter_log: true</span>
 <span class="s">enable_attention_dp: true</span>
 <span class="s">EOF</span>
 
@@ -777,8 +779,7 @@ To do the benchmark, run the following command:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">YOUR_DATA_PATH</span><span class="o">=</span>&lt;your<span class="w"> </span>dataset<span class="w"> </span>file<span class="w"> </span>following<span class="w"> </span>the<span class="w"> </span>format&gt;
 
 cat<span class="w"> </span>&gt;./extra-llm-api-config.yml<span class="s">&lt;&lt;EOF</span>
-<span class="s">pytorch_backend_config:</span>
-<span class="s">    use_cuda_graph: true</span>
+<span class="s">use_cuda_graph: true</span>
 <span class="s">speculative_config:</span>
 <span class="s">    decoding_type: MTP</span>
 <span class="s">    num_nextn_predict_layers: 3</span>
@@ -827,10 +828,9 @@ python<span class="w"> </span><span class="si">${</span><span class="nv">YOUR_WO
 <span class="nv">YOUR_DATA_PATH</span><span class="o">=</span>./dataset.txt
 
 cat<span class="w"> </span>&gt;./extra-llm-api-config.yml<span class="s">&lt;&lt;EOF</span>
-<span class="s">pytorch_backend_config:</span>
-<span class="s">    use_cuda_graph: true</span>
-<span class="s">    cuda_graph_batch_sizes:</span>
-<span class="s">    - 128</span>
+<span class="s">use_cuda_graph: true</span>
+<span class="s">cuda_graph_batch_sizes:</span>
+<span class="s">- 128</span>
 <span class="s">enable_attention_dp: true</span>
 <span class="s">EOF</span>
 
@@ -1049,6 +1049,15 @@ For more details on <code class="docutils literal notranslate"><span class="pre"
     
   </p>
 </div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on June 03, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ae2ce6">9ae2ce6</a>.</p>
+  
+</div></div>
       
     </div>
   

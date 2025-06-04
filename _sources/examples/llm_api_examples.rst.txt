@@ -11,6 +11,7 @@ LLM Examples
    llm_inference_async
    llm_inference_distributed
    llm_logits_processor
+   llm_eagle2_decoding
    llm_inference_kv_events
    llm_lookahead_decoding
    llm_quantization
