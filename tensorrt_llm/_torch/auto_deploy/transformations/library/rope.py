@@ -107,9 +107,10 @@ def _interleaved_rope_repl(q, k, cos, sin, unsqueeze_dim):
 def _complex_rope_pattern(xq, xk, freqs_cis, unsqueeze_dim=1):
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs = freqs_cis.unsqueeze(unsqueeze_dim)
-    xq_out = torch.view_as_real(xq_ * freqs).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs).flatten(3)
+    freqs_q = freqs_cis.unsqueeze(unsqueeze_dim)
+    freqs_k = freqs_cis.unsqueeze(unsqueeze_dim)
+    xq_out = torch.view_as_real(xq_ * freqs_q).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_k).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -180,6 +181,7 @@ def match_rope_pattern(gm: GraphModule) -> GraphModule:
 
     num_matches = patterns.apply(graph)
     gm = canonicalize_graph(gm)
+    ad_logger.info(f"Found and matched {num_matches} RoPE patterns")
     return gm, num_matches
 
 
