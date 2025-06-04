@@ -89,7 +89,9 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
             dtype=torch.float32,
             device="cuda")  # [prompt_length, hidden_size]
 
-        accepted_tokens = torch.tensor([[0]], dtype=torch.int, device="cuda")
+        accepted_tokens = torch.tensor([[0, -1]],
+                                       dtype=torch.int,
+                                       device="cuda")
         num_accepted_tokens = torch.tensor([1], dtype=torch.int, device="cuda")
 
         ref_input_ids = torch.tensor([6, 7, 8, 9, 0],
@@ -119,16 +121,16 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
             False,
         ]]
 
-        # test_cases += [[
-        #     'case0_is_thop_true', num_nextn_predict_layers, input_ids,
-        #     position_ids, seq_lens,
-        #     torch.tensor(mtp_past_hidden_states_ptrs_v2, device="cuda"),
-        #     torch.tensor(mtp_past_tokens_ptrs_v2,
-        #                  device="cuda"), mtp_hidden_states_tensor_pool_v2,
-        #     mtp_tokens_tensor_pool_v2, previous_layer_hidden_states,
-        #     request_ids, num_contexts, accepted_tokens, num_accepted_tokens,
-        #     attn_metadata, ref_input_ids, ref_previous_hidden_states, True
-        # ]]
+        test_cases += [[
+            'case0_is_thop_true', num_nextn_predict_layers, input_ids,
+            position_ids, seq_lens,
+            torch.tensor(mtp_past_hidden_states_ptrs_v2, device="cuda"),
+            torch.tensor(mtp_past_tokens_ptrs_v2,
+                         device="cuda"), mtp_hidden_states_tensor_pool_v2,
+            mtp_tokens_tensor_pool_v2, previous_layer_hidden_states,
+            request_ids, num_contexts, accepted_tokens, num_accepted_tokens,
+            attn_metadata, ref_input_ids, ref_previous_hidden_states, True
+        ]]
 
         ################# CASE 1 ##########################
         # MTP0, BS=3, 3 context request
@@ -193,7 +195,7 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
             (len(input_ids), hidden_size), dtype=torch.float32,
             device="cuda")  # [prompt_length, hidden_size]
 
-        accepted_tokens = torch.tensor([[0], [1], [2]],
+        accepted_tokens = torch.tensor([[0, -1], [1, -1], [2, -1]],
                                        dtype=torch.int,
                                        device="cuda")
         num_accepted_tokens = torch.tensor([1, 1, 1],
@@ -219,16 +221,16 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
             attn_metadata, ref_input_ids, ref_previous_hidden_states, False
         ]]
 
-        # test_cases += [[
-        #     'case1_is_thop_true', num_nextn_predict_layers, input_ids,
-        #     position_ids, seq_lens,
-        #     torch.tensor(mtp_past_hidden_states_ptrs_v2, device="cuda"),
-        #     torch.tensor(mtp_past_tokens_ptrs_v2,
-        #                  device="cuda"), mtp_hidden_states_tensor_pool_v2,
-        #     mtp_tokens_tensor_pool_v2, previous_layer_hidden_states,
-        #     request_ids, num_contexts, accepted_tokens, num_accepted_tokens,
-        #     attn_metadata, ref_input_ids, ref_previous_hidden_states, True
-        # ]]
+        test_cases += [[
+            'case1_is_thop_true', num_nextn_predict_layers, input_ids,
+            position_ids, seq_lens,
+            torch.tensor(mtp_past_hidden_states_ptrs_v2, device="cuda"),
+            torch.tensor(mtp_past_tokens_ptrs_v2,
+                         device="cuda"), mtp_hidden_states_tensor_pool_v2,
+            mtp_tokens_tensor_pool_v2, previous_layer_hidden_states,
+            request_ids, num_contexts, accepted_tokens, num_accepted_tokens,
+            attn_metadata, ref_input_ids, ref_previous_hidden_states, True
+        ]]
 
         ################## CASE 2 ##########################
         # BS=1, 1 generation request, num_nextn_predict_layers = 1
@@ -272,7 +274,7 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
             (len(input_ids), hidden_size), dtype=torch.float32,
             device="cuda")  # [prompt_length, hidden_size]
 
-        accepted_tokens = torch.tensor([[43, 0]],
+        accepted_tokens = torch.tensor([[43, -1]],
                                        dtype=torch.int,
                                        device="cuda")
 
@@ -298,16 +300,16 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
             attn_metadata, ref_input_ids, ref_previous_hidden_states, False
         ]]
 
-        # test_cases += [[
-        #     'case2_is_thop_true', num_nextn_predict_layers, input_ids,
-        #     position_ids, seq_lens,
-        #     torch.tensor(mtp_past_hidden_states_ptrs_v1, device="cuda"),
-        #     torch.tensor(mtp_past_tokens_ptrs_v1,
-        #                  device="cuda"), mtp_hidden_states_tensor_pool_v1,
-        #     mtp_tokens_tensor_pool_v1, previous_layer_hidden_states,
-        #     request_ids, num_contexts, accepted_tokens, num_accepted_tokens,
-        #     attn_metadata, ref_input_ids, ref_previous_hidden_states, True
-        # ]]
+        test_cases += [[
+            'case2_is_thop_true', num_nextn_predict_layers, input_ids,
+            position_ids, seq_lens,
+            torch.tensor(mtp_past_hidden_states_ptrs_v1, device="cuda"),
+            torch.tensor(mtp_past_tokens_ptrs_v1,
+                         device="cuda"), mtp_hidden_states_tensor_pool_v1,
+            mtp_tokens_tensor_pool_v1, previous_layer_hidden_states,
+            request_ids, num_contexts, accepted_tokens, num_accepted_tokens,
+            attn_metadata, ref_input_ids, ref_previous_hidden_states, True
+        ]]
 
         ################## CASE 3 ##########################
         # BS=3, 3 generation request, num_nextn_predict_layers = 3
@@ -389,7 +391,7 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
             (12, hidden_size), device='cuda', dtype=torch.float32)  # useless
 
         accepted_tokens = torch.tensor(
-            [[22, 0, 0, 0], [31, 32, 0, 0], [0, 40, 41, 42]],
+            [[22, -1, -1, -1], [31, 32, -1, -1], [0, 40, 41, 42]],
             dtype=torch.int,
             device="cuda")
 
@@ -427,16 +429,16 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
             attn_metadata, ref_input_ids, ref_previous_hidden_states, False
         ]]
 
-        # test_cases += [[
-        #     'case3_is_thop_true', num_nextn_predict_layers, input_ids,
-        #     position_ids, seq_lens,
-        #     torch.tensor(mtp_past_hidden_states_ptrs_v1, device="cuda"),
-        #     torch.tensor(mtp_past_tokens_ptrs_v1,
-        #                  device="cuda"), mtp_hidden_states_tensor_pool_v1,
-        #     mtp_tokens_tensor_pool_v1, previous_layer_hidden_states,
-        #     request_ids, num_contexts, accepted_tokens, num_accepted_tokens,
-        #     attn_metadata, ref_input_ids, ref_previous_hidden_states, True
-        # ]]
+        test_cases += [[
+            'case3_is_thop_true', num_nextn_predict_layers, input_ids,
+            position_ids, seq_lens,
+            torch.tensor(mtp_past_hidden_states_ptrs_v1, device="cuda"),
+            torch.tensor(mtp_past_tokens_ptrs_v1,
+                         device="cuda"), mtp_hidden_states_tensor_pool_v1,
+            mtp_tokens_tensor_pool_v1, previous_layer_hidden_states,
+            request_ids, num_contexts, accepted_tokens, num_accepted_tokens,
+            attn_metadata, ref_input_ids, ref_previous_hidden_states, True
+        ]]
 
         return test_cases
 

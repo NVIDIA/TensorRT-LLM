@@ -566,7 +566,6 @@ class MTPWorker(nn.Module):
         input_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         num_accepted_tokens: torch.Tensor,
-        accepted_tokens: torch.Tensor,
         spec_metadata: MTPSpecMetadata,
         attn_metadata: AttentionMetadata,
     ):
@@ -587,10 +586,6 @@ class MTPWorker(nn.Module):
             num_accepted_tokens: torch.Tensor
                 [batch_size]
                 Number of accepted tokens per request.
-
-            accepted_tokens: torch.Tensor
-                [batch_size, max_draft_tokens + 1]
-                Accepted token ids. Flattened.
 
             spec_metadata: MTPSpecMetadata
                 MTP speculative decoding metadata
@@ -632,8 +627,7 @@ class MTPWorker(nn.Module):
                 input_ids, seq_lens, hidden_states,
                 spec_metadata.mtp_hidden_states_ptrs,
                 spec_metadata.mtp_past_tokens_ptrs, num_accepted_tokens,
-                accepted_tokens, mtp_num_modules, batch_size, num_contexts,
-                hidden_size)
+                mtp_num_modules, batch_size, num_contexts, hidden_size)
         else:
             assert len(spec_metadata.request_ids) == batch_size
             mtp_past_hidden_states_pool = spec_metadata.mtp_hidden_states_manager.mtp_past_hidden_states_pool
@@ -990,14 +984,14 @@ class MTPWorker(nn.Module):
              ) = torch.ops.trtllm.mtp_prepare_drafter_inputs_op(
                  input_ids, attn_metadata.seq_lens_cuda,
                  spec_metadata.mtp_hidden_states_ptrs,
-                 spec_metadata.mtp_past_tokens_ptrs, hidden_states, None,
-                 return_input_ids, return_hidden_states, mtp_num_modules, 0,
-                 batch_size, num_contexts, hidden_size)
+                 spec_metadata.mtp_past_tokens_ptrs, hidden_states,
+                 accepted_tokens, num_accepted_tokens, return_input_ids,
+                 return_hidden_states, mtp_num_modules, batch_size,
+                 num_contexts, hidden_size)
 
         else:
             return_input_ids_list = []
             return_hidden_states_list = []
-            position_ids_list = []
             # Calculate cumulative sequence lengths for indexing
             last_tokens_idx = torch.cumsum(
                 attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
@@ -1013,7 +1007,6 @@ class MTPWorker(nn.Module):
                     accepted_tokens[:num_contexts, 0]
                 return_input_ids_list.append(input_ids_ctx)
                 return_hidden_states_list.append(hidden_states_ctx)
-                position_ids_list.append(position_ids[:num_ctx_tokens])
             # generation
             if num_gens > 0:
                 slot_ids = spec_metadata.slot_ids[num_contexts:batch_size]
@@ -1029,16 +1022,22 @@ class MTPWorker(nn.Module):
                     slot_ids].flatten(0, 1)
                 return_input_ids_list.append(input_ids_gen.flatten(0, 1))
                 return_hidden_states_list.append(hidden_states_gen)
-                position_ids_gen = position_ids[num_ctx_tokens:].reshape(
-                    num_gens, mtp_num_modules + 1)[:, -mtp_num_modules:]
-                position_ids_gen = position_ids_gen - (
-                    1 + mtp_num_modules - num_accepted_tokens.unsqueeze(0))
-                position_ids_list.append(position_ids_gen)
             # Concatenate into continuous buffers
             return_input_ids = torch.concat(return_input_ids_list, dim=0)
             return_hidden_states = torch.concat(return_hidden_states_list,
                                                 dim=0)
-            return_position_ids = torch.concat(position_ids_list, dim=-1)
+
+        # update position_ids
+        position_ids_list = []
+        if num_contexts > 0:
+            position_ids_list.append(position_ids[:num_ctx_tokens])
+        if num_gens > 0:
+            position_ids_gen = position_ids[num_ctx_tokens:].reshape(
+                num_gens, mtp_num_modules + 1)[:, -mtp_num_modules:]
+            position_ids_gen = position_ids_gen - (
+                1 + mtp_num_modules - num_accepted_tokens.unsqueeze(0))
+            position_ids_list.append(position_ids_gen)
+        return_position_ids = torch.concat(position_ids_list, dim=-1)
 
         return {
             "input_ids": return_input_ids,
