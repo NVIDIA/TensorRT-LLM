@@ -719,11 +719,10 @@ class TRTLLMSampler(Sampler):
                     request.add_new_token(new_token, beam)
 
                     if request.py_return_log_probs:
-                        cum_log_probs.append(
-                            state.host.cum_log_probs[seq_slot * beam_width +
-                                                     beam].item())
+                        # NOTE: Log probs with drafting has not been tested yet.
                         begin_log_probs_offset = request.prompt_len if request.sampling_config.beam_width == 1 else 0
-                        current_token = seq_len - request.prompt_len - 1
+                        current_token = seq_len - request.prompt_len - len(
+                            num_new_tokens[beam]) + step
 
                         log_probs.append({
                             new_token.item():
@@ -732,6 +731,12 @@ class TRTLLMSampler(Sampler):
                                      current_token].item(),
                                     rank=1)
                         })
+
+                if len(num_new_tokens[beam]
+                       ) > 0 and request.py_return_log_probs:
+                    cum_log_probs.append(
+                        state.host.cum_log_probs[seq_slot * beam_width +
+                                                 beam].item())
 
                 finish_reason = finish_reasons_host[seq_slot * beam_width +
                                                     beam].item()
