@@ -63,9 +63,9 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
     at::Tensor const& mat2Scale, at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k, int64_t batch_count,
     tkc::CutlassGemmConfig const& gemmConfig, FP4GemmType fp4GemmType)
 {
-    if (fp4GemmType == FP4GemmType::W4A8_NVFP4_MXFP8)
+    if (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
     {
-        CutlassFp4GemmRunner<T, FP4GemmType::W4A8_NVFP4_MXFP8> gemmRunner;
+        CutlassFp4GemmRunner<T, FP4GemmType::W4A8_MXFP4_MXFP8> gemmRunner;
         int64_t const wsBytes = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
 
         at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, mat1.device(), std::nullopt);
@@ -100,7 +100,7 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
     std::optional<c10::ScalarType> out_dtype, bool to_userbuffers = false,
     tkc::CutlassGemmConfig const* maybe_config = nullptr)
 {
-    if (fp4GemmType == FP4GemmType::W4A8_NVFP4_MXFP8)
+    if (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
     {
         CHECK_INPUT(mat1, torch::kFloat8_e4m3fn);
         CHECK_INPUT(mat2, FLOAT4_E2M1X2);
@@ -110,7 +110,7 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
         CHECK_INPUT(mat1, FLOAT4_E2M1X2);
         CHECK_INPUT(mat2, FLOAT4_E2M1X2);
     }
-    int mat2_k_scale = fp4GemmType == FP4GemmType::W4A8_NVFP4_MXFP8 ? 2 : 1;
+    int mat2_k_scale = fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8 ? 2 : 1;
 
     CHECK_INPUT(mat1Scale, SF_DTYPE);
     CHECK_INPUT(mat2Scale, SF_DTYPE);
@@ -208,9 +208,9 @@ public:
     {
         if (outputDtype == at::ScalarType::Half)
         {
-            if (mfp4GemmType == FP4GemmType::W4A8_NVFP4_MXFP8)
+            if (mfp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
             {
-                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<half, FP4GemmType::W4A8_NVFP4_MXFP8>>();
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<half, FP4GemmType::W4A8_MXFP4_MXFP8>>();
             }
             else if (mfp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
             {
@@ -219,9 +219,9 @@ public:
         }
         else if (outputDtype == at::ScalarType::Float)
         {
-            if (mfp4GemmType == FP4GemmType::W4A8_NVFP4_MXFP8)
+            if (mfp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
             {
-                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<float, FP4GemmType::W4A8_NVFP4_MXFP8>>();
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<float, FP4GemmType::W4A8_MXFP4_MXFP8>>();
             }
             else if (mfp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
             {
@@ -231,9 +231,9 @@ public:
 #ifdef ENABLE_BF16
         else if (outputDtype == at::ScalarType::BFloat16)
         {
-            if (mfp4GemmType == FP4GemmType::W4A8_NVFP4_MXFP8)
+            if (mfp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
             {
-                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<__nv_bfloat16, FP4GemmType::W4A8_NVFP4_MXFP8>>();
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<__nv_bfloat16, FP4GemmType::W4A8_MXFP4_MXFP8>>();
             }
             else if (mfp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
             {

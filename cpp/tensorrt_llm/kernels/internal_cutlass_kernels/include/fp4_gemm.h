@@ -66,7 +66,7 @@ public:
 enum class FP4GemmType
 {
     W4A4_NVFP4_NVFP4,
-    W4A8_NVFP4_MXFP8,
+    W4A8_MXFP4_MXFP8,
 };
 
 template <typename T, FP4GemmType gemmType = FP4GemmType::W4A4_NVFP4_NVFP4>

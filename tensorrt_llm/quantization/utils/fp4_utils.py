@@ -26,7 +26,7 @@ __all__ = ['float4_e2m1x2', 'float4_sf_dtype', 'pad_up', 'fp4_buckets']
 
 class FP4GemmType(IntEnum):
     W4A4_NVFP4_NVFP4 = 0
-    W4A8_NVFP4_MXFP8 = 1
+    W4A8_MXFP4_MXFP8 = 1
 
 
 def get_fp4_shape(input_shape, sf_vec_size):

@@ -353,7 +353,7 @@ def w4a8_mxfp4_fp8_gemm(
 
     # allocate workspace for profiling
     w4a8_mxfp4_fp8_gemm_runner = FP4GemmRunner(
-        fp4_utils.FP4GemmType.W4A8_NVFP4_MXFP8, to_userbuffers, output_dtype)
+        fp4_utils.FP4GemmType.W4A8_MXFP4_MXFP8, to_userbuffers, output_dtype)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::w4a8_mxfp4_fp8_gemm::gemm",
