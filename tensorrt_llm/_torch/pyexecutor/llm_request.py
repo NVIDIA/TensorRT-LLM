@@ -121,16 +121,20 @@ class LogProbStorage:
     def append(self,
                new_probs: list[TokenLogprobs],
                cum_log_probs: Optional[list[float]] = None):
+        """
+        new_probs: [beam_width, num_tokens]
+        cum_log_probs: [beam_width]
+        """
         if self.beam_width == -1:
             self._init(new_probs)
 
         assert len(new_probs) == self.beam_width, "Beam width mismatch"
-        for idx, probs in enumerate(new_probs):
-            self.log_probs[idx].extend(probs)
+        for beam_idx, probs in enumerate(new_probs):
+            self.log_probs[beam_idx].extend(probs)
             if cum_log_probs is not None:
-                self.cum_log_probs[idx] += cum_log_probs[idx]
+                self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
             else:
-                self.cum_log_probs[idx] += sum(
+                self.cum_log_probs[beam_idx] += sum(
                     next(iter(prob.values())).logprob for prob in probs)
 
 
