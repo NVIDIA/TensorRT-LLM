@@ -31,8 +31,9 @@ from ..inputs import (PromptInputs, create_input_processor,
                       create_input_processor_with_hash, prompt_inputs)
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .llm_args import (LLMARGS_EXPLICIT_DOCSTRING, PybindMirror, TorchLlmArgs,
-                       TrtLlmArgs, _AutoDeployLlmArgs)
+from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
+                       TRT_LLMARGS_EXPLICIT_DOCSTRING, PybindMirror,
+                       TorchLlmArgs, TrtLlmArgs, _AutoDeployLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -83,8 +84,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         ]
 
 
-LLM_DOCSTRING = LLMARGS_EXPLICIT_DOCSTRING + """
-        kwargs (Any): Advanced arguments passed to `LlmArgs`.
+TRT_LLM_DOCSTRING = TRT_LLMARGS_EXPLICIT_DOCSTRING + """
 
     Attributes:
         tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
@@ -92,8 +92,17 @@ LLM_DOCSTRING = LLMARGS_EXPLICIT_DOCSTRING + """
         llm_id (str): The unique ID of the LLM instance.
 """
 
+TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
+
+    Attributes:
+        tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
+"""
+
 
 class BaseLLM:
+    """
+    The base class for all LLM classes.
+    """
 
     def __init__(self,
                  model: Union[str, Path],
@@ -790,9 +799,9 @@ class BaseLLM:
         self.shutdown()
 
 
-@append_docstring(LLM_DOCSTRING)
-class LLM(BaseLLM):
-    """LLM class is the main class for running a LLM model.
+@append_docstring(TRT_LLM_DOCSTRING)
+class TrtLLM(BaseLLM):
+    """LLM class is the main class for running a LLM model using TensorRT-LLM backend.
 
     Parameters:
 """
@@ -843,7 +852,12 @@ class LLM(BaseLLM):
                 shutil.copy(file, target_engine_dir / file.name)
 
 
+@append_docstring(TORCH_LLM_DOCSTRING)
 class TorchLLM(BaseLLM):
+    """LLM class is the main class for running a LLM model using PyTorch backend.
+
+    Parameters:
+"""
 
     def __init__(self,
                  model: Union[str, Path],
@@ -858,8 +872,36 @@ class TorchLLM(BaseLLM):
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
-        kwargs_dict = dict(kwargs)
-        kwargs_dict['backend'] = 'pytorch'
-        super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
-                         trust_remote_code, tensor_parallel_size, dtype,
-                         revision, tokenizer_revision, **kwargs_dict)
+        kwargs.pop('backend', None)
+        super().__init__(model,
+                         tokenizer,
+                         tokenizer_mode,
+                         skip_tokenizer_init,
+                         trust_remote_code,
+                         tensor_parallel_size,
+                         dtype,
+                         revision,
+                         tokenizer_revision,
+                         backend='pytorch',
+                         **kwargs)
+
+
+TLLM_USE_TRT_ENGINE = os.environ.get("TLLM_USE_TRT_ENGINE", "1")
+
+
+class LLM(TrtLLM if TLLM_USE_TRT_ENGINE == "1" else TorchLLM):
+    pass
+
+
+_LLM_REPR = "TrtLLM" if TLLM_USE_TRT_ENGINE == "1" else "TorchLLM"
+
+# sphinx will ignore the LLM's docstring if it is not explicitly set
+LLM.__doc__ = \
+    f"""LLM class is the main class for running a LLM model.
+
+    This class is an alias of {_LLM_REPR}. You can switch between the TensorRT backend
+    and the PyTorch backend by setting the TLLM_USE_TRT_ENGINE environment to 1 or 0.
+    The default backend is the TensorRT backend.
+
+    Parameters:
+""" + TRT_LLM_DOCSTRING if TLLM_USE_TRT_ENGINE == "1" else TORCH_LLM_DOCSTRING
