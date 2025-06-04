@@ -91,16 +91,14 @@ struct WindowSizeMetadata
                                          // Only needed when chunked context + sliding window attention are used
                                          // together. And it should only be considered when allocating blocks.
     SizeType32 numNonSinkTokensInWindow; // Number of non-sink tokens in the attention window
-    SizeType32 minNumBlocksAlive; // Minimum number of blocks alive in the attention window, e.g. context_chunk_size +
-                                  // sliding_window_size
 
     std::string toString()
     {
         return tensorrt_llm::common::fmtstr(
             "WindowSizeMetadata{ .absolutePoolsOffset=%d, .numPools=%d, .maxTokenNum=%d, .maxBlocksPerSeq=%d, "
-            ".maxNumBlocks=%d, .temporaryAttentionWindow=%d, .numNonSinkTokensInWindow=%d, .minNumBlocksAlive=%d }",
+            ".maxNumBlocks=%d, .temporaryAttentionWindow=%d, .numNonSinkTokensInWindow=%d}",
             absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq, maxNumBlocks, temporaryAttentionWindow,
-            numNonSinkTokensInWindow, minNumBlocksAlive);
+            numNonSinkTokensInWindow);
     }
 };
 
@@ -376,6 +374,14 @@ public:
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> const& getCacheBlockIds(SizeType32 windowSize) const
     {
+        {
+            auto result = mCacheBlockIds.at(windowSize)[0];
+            std::cout << "minwei getCacheBlockIds: ";
+            for (int i = 0; i < result.size(); i++) {
+                std::cout << result[i] << " ";
+            }
+            std::cout << std::endl;
+        }
         return mCacheBlockIds.at(windowSize);
     }
 
@@ -412,6 +418,7 @@ public:
 
     void removeFirstBlock(SizeType32 windowSize)
     {
+        printf("minwei first block removed\n");
         for (auto& beamBlockIds : mCacheBlockIds.at(windowSize))
         {
             // Do not actually remove from mCacheBlockIds; set to -1 instead.
@@ -517,7 +524,7 @@ public:
     using BlockMap = std::unordered_multimap<size_t, BlockPtr>;
     using BlockMapIterRange = std::pair<BlockMap::const_iterator, BlockMap::const_iterator>;
 
-    explicit WindowBlockManager(nvinfer1::DataType dtype, SizeType32 windowSize, SizeType32 minNumBlocksAlive,
+    explicit WindowBlockManager(nvinfer1::DataType dtype, SizeType32 windowSize,
         std::vector<SizeType32> const& managedLayers, std::vector<SizeType32> const& numKvHeadsPerLayer,
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool,
         SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream,
@@ -567,7 +574,7 @@ public:
 
     //! \brief Add a new block to the sequence if needed
     void addSequenceBlockIfNeeded(GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength,
-        bool const enableBlockReuse, SizeType32 const numNonSinkTokensInWindow);
+        bool const enableBlockReuse, SizeType32 const numNonSinkTokensInWindow, SizeType32 const temporaryAttentionWindow);
 
     //! \brief Remove a block from the sequence if needed
     void removeSequenceBlockIfNeeded(GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength,
@@ -735,7 +742,7 @@ public:
         std::optional<TempAttentionWindowInputs> const& inputs) const
     {
 
-        if (inputs && inputs->pagedContextFMHA && (inputs->maxInputLen > mWindowSize))
+        if (inputs && inputs->pagedContextFMHA)
         {
             auto window = std::min(inputs->maxNumTokens, inputs->maxInputLen - mWindowSize);
             window = std::max(window, 0); // clamp negative values to 0
@@ -773,7 +780,6 @@ private:
 private:
     nvinfer1::DataType mDataType;
     SizeType32 mWindowSize;
-    SizeType32 mMinNumBlocksAlive;
 
     // Number of blocks in pools
     SizeType32 mNumPrimaryBlocks;
@@ -853,7 +859,7 @@ public:
     explicit BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
         SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
         SizeType32 maxNumSequences, CudaStreamPtr stream, std::optional<SizeType32> maxSequenceLength,
-        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 chunkContextSize,
+        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
         std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
         SizeType32 sinkTokenLength, SizeType32 sinkBubbleLength, bool onboardBlocks,
         CacheType cacheType = CacheType::kSELF,
@@ -1333,7 +1339,7 @@ public:
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
-        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 chunkContextSize,
+        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
         std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
         SizeType32 sinkTokenLength, CudaStreamPtr stream, std::optional<SizeType32> maxSequenceLength,
         bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
@@ -1343,7 +1349,7 @@ public:
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
-        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 chunkContextSize,
+        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
         std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
         SizeType32 sinkTokenLength, int64_t stream, std::optional<SizeType32> maxSequenceLength,
         bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
@@ -1353,7 +1359,7 @@ public:
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
-        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 chunkContextSize,
+        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
         std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
         SizeType32 sinkTokenLength, CudaStreamPtr stream, std::optional<SizeType32> maxSequenceLength,
         bool enableBlockReuse = true, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
@@ -1363,7 +1369,7 @@ public:
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
-        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 chunkContextSize,
+        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
         std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
         SizeType32 sinkTokenLength, int64_t stream, std::optional<SizeType32> maxSequenceLength,
         bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
@@ -1624,8 +1630,6 @@ private:
     SizeType32 mSinkBubbleLength;
     // Number of tokens in the sink blocks
     SizeType32 mSinkBlockTokenLength;
-    // Number of tokens in the chunk context
-    SizeType32 mChunkContextSize;
     // Block manager
     BlockManager mBlockManager;
     // Map of all sequences

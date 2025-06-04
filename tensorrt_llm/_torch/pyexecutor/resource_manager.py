@@ -21,6 +21,7 @@ if ENABLE_MULTI_DEVICE:
 
     from tensorrt_llm._utils import mpi_comm
 
+TempAttentionWindowInputs = tensorrt_llm.bindings.internal.batch_manager.TempAttentionWindowInputs
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
 KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -185,6 +186,12 @@ class KVCacheManager(BaseResourceManager):
 
         # Note that this stream is unused for now. Will be used for copying to host
         # when that feature is enabled.
+
+        temp_attention_window_inputs = TempAttentionWindowInputs()
+        temp_attention_window_inputs.paged_context_fmha = True
+        temp_attention_window_inputs.max_input_len = max_seq_len
+        temp_attention_window_inputs.max_num_tokens = context_chunk_size
+
         self._stream = torch.cuda.Stream()
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
@@ -195,8 +202,7 @@ class KVCacheManager(BaseResourceManager):
             'max_num_sequences': max_batch_size,
             'max_beam_width': 1,  # TODO: more than 1 beam?
             'max_attention_window_vec': [self.max_attention_window],
-            'chunk_context_size': context_chunk_size,
-            'temp_attention_window_inputs': None,
+            'temp_attention_window_inputs': temp_attention_window_inputs,
             'dtype': dtype,
             'sink_token_length': sink_token_length,
             'stream': self._stream.cuda_stream,
