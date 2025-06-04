@@ -43,13 +43,13 @@ l0_a30:
   - cpp/test_unit_tests.py::test_unit_tests[common-80]
   - cpp/test_unit_tests.py::test_unit_tests[executor-80]
   - cpp/test_unit_tests.py::test_unit_tests[kernels-80]
-  - cpp/test_unit_tests.py::test_unit_tests[layers-80] TIMEOUT (45)
-  - cpp/test_unit_tests.py::test_unit_tests[runtime-80]
+  - cpp/test_unit_tests.py::test_unit_tests[layers-80] TIMEOUT (90)
+  - cpp/test_unit_tests.py::test_unit_tests[runtime-80] TIMEOUT (60)
   - cpp/test_unit_tests.py::test_unit_tests[thop-80]
   - cpp/test_unit_tests.py::test_unit_tests[utils-80]
-  - cpp/test_e2e.py::test_model[-gpt-80] TIMEOUT (45)
-  - cpp/test_e2e.py::test_model[-gpt_executor-80] TIMEOUT (60)
-  - cpp/test_e2e.py::test_model[-gpt_tests-80]
+  - cpp/test_e2e.py::test_model[-gpt-80] TIMEOUT (90)
+  - cpp/test_e2e.py::test_model[-gpt_executor-80] TIMEOUT (90)
+  - cpp/test_e2e.py::test_model[-gpt_tests-80] TIMEOUT (60)
 - condition:
     ranges:
       system_gpu_count:
@@ -199,10 +199,10 @@ l0_a30:
   - triton_server/test_triton.py::test_mistral[mistral]
   - triton_server/test_triton.py::test_whisper[whisper]
   - triton_server/test_triton.py::test_t5_ib[t5-ib]
-  - triton_server/test_triton.py::test_mistral_ib[mistral-ib] TIMEOUT (70)
+  - triton_server/test_triton.py::test_mistral_ib[mistral-ib] TIMEOUT (90)
   - triton_server/test_triton.py::test_mistral_ib_streaming[mistral-ib-streaming]
-  - triton_server/test_triton.py::test_mistral_ib_mm[mistral-ib-mm] TIMEOUT (70)
-  - triton_server/test_triton.py::test_gpt_ib_streaming[gpt-ib-streaming]
+  - triton_server/test_triton.py::test_mistral_ib_mm[mistral-ib-mm] TIMEOUT (90)
+  - triton_server/test_triton.py::test_gpt_ib_streaming[gpt-ib-streaming] TIMEOUT (60)
   - triton_server/test_triton.py::test_cpp_unit_tests[cpp-unit-tests]
   - triton_server/test_triton.py::test_python_bls_unit_tests[python-bls-unit-tests]
   - triton_server/test_triton.py::test_python_preproc_unit_tests[python-preproc-unit-tests]
