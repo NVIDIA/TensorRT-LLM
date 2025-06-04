@@ -105,6 +105,8 @@ def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 @Field
 def DEBUG_MODE = "debug"
+@Field
+def DETAILED_LOG = "detailed_log"
 
 def testFilter = [
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
@@ -121,6 +123,7 @@ def testFilter = [
     (ONLY_PYTORCH_FILE_CHANGED): false,
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
+    (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
