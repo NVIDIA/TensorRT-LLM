@@ -16,11 +16,13 @@
 
 #pragma once
 
-#include "bufferManager.h"
-#include "tllmBuffers.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/tllmBuffers.h"
 
 #include <cuda.h>
 #include <unistd.h>
+
+class VirtualMemoryManagerTest;
 
 namespace tensorrt_llm::runtime
 {
@@ -86,19 +88,19 @@ public:
                       // This CUDAVirtualMemory cannot be used anymore.
     };
 
-    Status status() const noexcept
+    [[nodiscard]] Status status() const noexcept
     {
-        if (creator == nullptr)
+        if (mCreator == nullptr)
         {
             return INVALID;
         }
 
-        if (state == 0 && handle == 0)
+        if (mState == 0 && mHandle == 0)
         {
             return RELEASED;
         }
 
-        if (state == configurators.size() && handle != 0)
+        if (mState == mConfigurators.size() && mHandle != 0)
         {
             return MATERIALIZED;
         }
@@ -130,14 +132,28 @@ public:
 
     CUDAVirtualMemory(CUDAVirtualMemory const&) = delete;
     CUDAVirtualMemory& operator=(CUDAVirtualMemory const&) = delete;
-    CUDAVirtualMemory(CUDAVirtualMemory&&) noexcept = default;
-    CUDAVirtualMemory& operator=(CUDAVirtualMemory&&) noexcept = default;
 
-    CUDAVirtualMemory() = default;
+    CUDAVirtualMemory(CUDAVirtualMemory&& other) noexcept
+    {
+        mCreator = std::move(other.mCreator);
+        mConfigurators = std::move(other.mConfigurators);
+        mHandle = other.mHandle;
+        mState = other.mState;
+        new (&other) CUDAVirtualMemory; // Put other into default constructed state
+    }
+
+    CUDAVirtualMemory& operator=(CUDAVirtualMemory&& other)
+    {
+        this->~CUDAVirtualMemory(); // May throw if current virtual memory need release
+        new (this) CUDAVirtualMemory(std::move(other));
+        return *this;
+    }
+
+    CUDAVirtualMemory() noexcept = default;
 
     CUDAVirtualMemory(CreatorPtr creator, Configurators configurators)
-        : creator(std::move(creator))
-        , configurators(std::move(configurators))
+        : mCreator(std::move(creator))
+        , mConfigurators(std::move(configurators))
     {
     }
 
@@ -146,7 +162,7 @@ public:
         // Calling release() is necessary if materialize() succeed or threw an exception.
         // If release() is already called by the user, whether succeed or threw an exception,
         // we shouldn't call release() again.
-        if (handle != 0 && state != INVALID_STATE)
+        if (mHandle != 0 && mState != INVALID_STATE)
         {
             release();
         }
@@ -154,15 +170,15 @@ public:
 
     explicit operator bool() const noexcept
     {
-        return creator != nullptr;
+        return mCreator != nullptr;
     }
 
 private:
     constexpr static size_t INVALID_STATE = static_cast<size_t>(-1);
-    size_t state = 0;
-    CUmemGenericAllocationHandle handle{};
-    std::unique_ptr<Creator> creator;
-    std::vector<std::unique_ptr<Configurator>> configurators;
+    size_t mState = 0;
+    CUmemGenericAllocationHandle mHandle{};
+    std::unique_ptr<Creator> mCreator;
+    std::vector<std::unique_ptr<Configurator>> mConfigurators;
 };
 
 /**
@@ -298,6 +314,7 @@ struct BackedConfigurator : CUDAVirtualMemory::Configurator
         , mBackType(backType)
         , mStream(stream)
         , mOndemand(ondemand)
+        , mEvent()
     {
     }
 
@@ -305,7 +322,7 @@ struct BackedConfigurator : CUDAVirtualMemory::Configurator
     {
         if (mBackedStorage != nullptr)
         {
-            TLLM_CU_CHECK(cuMemcpyHtoDAsync_v2(mAddress, mBackedStorage.get(), mSize, mStream));
+            TLLM_CU_CHECK(cuMemcpyHtoDAsync_v2(mAddress, mBackedStorage->data(), mSize, mStream));
         }
         if (mOndemand)
         {
@@ -325,6 +342,9 @@ struct BackedConfigurator : CUDAVirtualMemory::Configurator
             }
         }
         TLLM_CU_CHECK(cuMemcpyDtoHAsync_v2(mBackedStorage->data(), mAddress, mSize, mStream));
+        // We have to synchronize here, or the memory may be unmapped before the copy operation.
+        TLLM_CU_CHECK(cuEventRecord(mEvent.get(), mStream));
+        mEvent.synchronize();
     }
 
     CUdeviceptr mAddress;
@@ -334,6 +354,7 @@ struct BackedConfigurator : CUDAVirtualMemory::Configurator
     bool mOndemand;
 
     BufferManager::IBufferPtr mBackedStorage;
+    CudaEvent mEvent;
 };
 
 class CudaVirtualMemoryManager
@@ -400,8 +421,8 @@ public:
      * and any exception thrown by `release` will be logged.
      *
      * If any CUDAVirtualMemory threw an exception during `materialize` or `release`, it will be removed from the
-     * manager. Call `retrieveBadHandles` to retrieve handles of all CUDAVirtualMemory that got removed due to
-     * exception.
+     * manager. Successfully roll backed CUDAVirtualMemory will not be removed.
+     * Call `retrieveBadHandles` to retrieve handles of all CUDAVirtualMemory that got removed due to exception.
      */
     size_t materializeWithMark(std::string const& mark);
 
@@ -430,23 +451,9 @@ private:
     PointerMemoryMap mMemories;
     MarkEntryMap mEntries;
     std::vector<uintptr_t> mBadHandles;
+
+    friend VirtualMemoryManagerTest;
 };
-
-static_assert(sizeof(void*) == sizeof(CUdeviceptr));
-
-static CUdeviceptr deviceptr_cast(void* ptr)
-{
-    CUdeviceptr ret{};
-    std::memcpy(&ret, ptr, sizeof(CUdeviceptr));
-    return ret;
-}
-
-static void* deviceptr_cast(CUdeviceptr ptr)
-{
-    void* ret{};
-    std::memcpy(&ptr, ret, sizeof(CUdeviceptr));
-    return ret;
-}
 
 // Update to MemoryCounters is done in LocalCreator to more precisely reflect the memory usage.
 class CudaVirtualAddressAllocator
@@ -481,7 +488,7 @@ public:
          * @param manager    Manager used to track and manage virtual memories
          * @param mark       The mark for allocated memories
          * @param mode       Backed storage mode
-         * @param backStream The CUDA stream used for backed operations
+         * @param backStream The CUDA stream used for restoring memory content
          *                   Note: Virtual Address Allocation is not async. The stream is not used in allocation.
          */
         Configuration(

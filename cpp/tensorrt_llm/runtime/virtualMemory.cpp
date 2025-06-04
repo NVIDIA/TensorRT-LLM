@@ -47,13 +47,13 @@ ScopeGuard(bool const&, T) -> ScopeGuard<T>;
 void CUDAVirtualMemory::materialize()
 {
     TLLM_CHECK_WITH_INFO(status() == RELEASED, "virtual memory not in RELEASED status, is: %d", status());
-    handle = creator->create();
+    mHandle = mCreator->create();
 
     // Track the number of configurators ran, so release can correctly teardown.
-    for (auto const& conf : configurators)
+    for (auto const& conf : mConfigurators)
     {
-        conf->setup(handle); // May throw
-        ++state;
+        conf->setup(mHandle); // May throw
+        ++mState;
     }
 }
 
@@ -85,10 +85,10 @@ static bool safe_invoke_helper(std::exception_ptr& ep, char const* msg, Callable
 
 void CUDAVirtualMemory::release()
 {
-    TLLM_CHECK_WITH_INFO(status() == MATERIALIZED || (status() == ERRORED && state != INVALID_STATE),
+    TLLM_CHECK_WITH_INFO(status() == MATERIALIZED || (status() == ERRORED && mState != INVALID_STATE),
         "virtual memory not in MATERIALIZED status, is: %d", status());
-    size_t const count = configurators.size();
-    size_t const start = count - state;
+    size_t const count = mConfigurators.size();
+    size_t const start = count - mState;
 
     // Revert materialize(). Only configurators that ran setup() successfully
     // will have their teardown() been called.
@@ -98,15 +98,15 @@ void CUDAVirtualMemory::release()
     auto const* msg = "Multiple exceptions thrown during release. The previous exception is: %s";
     for (size_t i = start; i < count; ++i)
     {
-        safe_invoke_helper(ePtr, msg, &Configurator::teardown, configurators[count - i].get(), handle);
+        safe_invoke_helper(ePtr, msg, &Configurator::teardown, mConfigurators[count - i - 1].get(), mHandle);
     }
-    safe_invoke_helper(ePtr, msg, &Creator::release, creator.get(), handle);
-    handle = {};
-    state = 0;
+    safe_invoke_helper(ePtr, msg, &Creator::release, mCreator.get(), mHandle);
+    mHandle = {};
+    mState = 0;
 
     if (ePtr != nullptr)
     {
-        state = INVALID_STATE;
+        mState = INVALID_STATE;
         std::rethrow_exception(ePtr);
     }
 }
@@ -115,9 +115,13 @@ void CudaVirtualMemoryManager::add(uintptr_t handle, std::string mark, CUDAVirtu
 {
     bool success = false;
 
-    auto [memIt, exist] = mMemories.try_emplace(handle, Entry{});
     TLLM_CHECK_WITH_INFO(
-        !exist, "CudaVirtualMemoryManager: handle 0x%016zx already being used by another memory", handle);
+        memory.status() == CUDAVirtualMemory::RELEASED || memory.status() == CUDAVirtualMemory::MATERIALIZED,
+        "CudaVirtualMemoryManager: bad virtual memory status");
+
+    auto [memIt, created] = mMemories.try_emplace(handle, Entry{});
+    TLLM_CHECK_WITH_INFO(
+        created, "CudaVirtualMemoryManager: handle 0x%016zx already being used by another memory", handle);
     ScopeGuard eraseMemIt{success, [&] { mMemories.erase(memIt); }};
 
     auto entryIt = mEntries.emplace(std::move(mark), memIt);
@@ -133,16 +137,16 @@ void CudaVirtualMemoryManager::add(uintptr_t handle, std::string mark, CUDAVirtu
     std::unique_lock lock(mMutex);
     bool success = false;
 
-    auto [memIt, exist] = mMemories.try_emplace(handle,
+    auto [memIt, created] = mMemories.try_emplace(handle,
         Entry{
             {std::move(creator), std::move(configurators)},
         });
     TLLM_CHECK_WITH_INFO(
-        !exist, "CudaVirtualMemoryManager: handle 0x%016zx already being used by another memory", handle);
+        created, "CudaVirtualMemoryManager: handle 0x%016zx already being used by another memory", handle);
     ScopeGuard eraseMemIt{success, [&] { mMemories.erase(memIt); }};
 
-    auto const entryIt = mEntries.emplace(mark, memIt);
-    entryIt->second->second.mEntryIt = entryIt;
+    auto const entryIt = mEntries.emplace(std::move(mark), memIt);
+    memIt->second.mEntryIt = entryIt;
     ScopeGuard eraseMarkIt{success, [&] { mEntries.erase(entryIt); }};
 
     try
@@ -206,7 +210,7 @@ size_t CudaVirtualMemoryManager::releaseWithMark(std::string const& mark)
     {
         auto handle = it->second->first;
         auto& memory = it->second->second.mMemory;
-        ++it; // `it` will be invalidated by unsafeRemove(handle)
+        ++it; // element referenced by `it` will be invalidated by unsafeRemove(handle)
         if (memory.status() == CUDAVirtualMemory::MATERIALIZED)
         {
             if (!safe_invoke_helper(ePtr,
@@ -274,6 +278,22 @@ size_t CudaVirtualMemoryManager::materializeWithMark(std::string const& mark)
         throw;
     }
     return count;
+}
+
+static_assert(sizeof(void*) == sizeof(CUdeviceptr));
+
+static CUdeviceptr deviceptr_cast(void* ptr)
+{
+    CUdeviceptr ret{};
+    std::memcpy(&ret, &ptr, sizeof(CUdeviceptr));
+    return ret;
+}
+
+static void* deviceptr_cast(CUdeviceptr ptr)
+{
+    void* ret{};
+    std::memcpy(&ret, &ptr, sizeof(CUdeviceptr));
+    return ret;
 }
 
 void CudaVirtualAddressAllocator::allocateImpl(PointerType* ptr, std::size_t n) const
