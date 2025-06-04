@@ -459,7 +459,6 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = KV_CACHE_MANAGER_KEY
         self.lora_model_config: Optional[LoraModelConfig] = None
-        self.cuda_graph_dummy_request = None
 
     def set_lora_model_config(self, lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str]):
@@ -477,6 +476,10 @@ class PyTorchModelEngine(ModelEngine):
         if kv_cache_manager is None:
             logger.info("Skipping warm up as no KV Cache manager allocated.")
             return
+
+        # The lifetime of model engine and kv cache manager can be different.
+        # Reset the global cuda graph dummy request to None in warmup.
+        self.cuda_graph_dummy_request = None
 
         def get_cuda_graph_warmup_request(batch_size):
             available_blocks = kv_cache_manager.get_num_free_blocks()
