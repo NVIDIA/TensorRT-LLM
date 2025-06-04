@@ -16,7 +16,7 @@ from tensorrt_llm import logger
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
                                                 DisaggregatedParams)
 from tensorrt_llm.serve.router import (KvCacheAwareRouter,
-                                       KvCacheAwareServerState,
+                                       KvCacheAwareServerState, ServerRole,
                                        block_key_hasher)
 
 MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
@@ -350,8 +350,10 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                  server_start_timeout_secs: int = 180):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
-        self.ctx_router = KvCacheAwareRouter(ctx_servers)
-        self.gen_router = KvCacheAwareRouter(gen_servers)
+        self.ctx_router = KvCacheAwareRouter(server_role=ServerRole.CONTEXT,
+                                             servers=ctx_servers)
+        self.gen_router = KvCacheAwareRouter(server_role=ServerRole.GENERATION,
+                                             servers=gen_servers)
 
     async def multi_round_request(self,
                                   session: aiohttp.ClientSession,

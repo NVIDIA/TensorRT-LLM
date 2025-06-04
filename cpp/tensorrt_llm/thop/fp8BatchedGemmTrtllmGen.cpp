@@ -29,7 +29,7 @@
 
 namespace
 {
-namespace tg = trtllm::gen;
+namespace tg = batchedGemm::trtllm::gen;
 
 template <tg::Dtype outDtype>
 void runBatchedGemm(at::Tensor& out, at::Tensor& outSfC, at::Tensor const& mat1, at::Tensor const& mat2,

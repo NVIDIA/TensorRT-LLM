@@ -336,7 +336,7 @@ def create_py_executor_instance(
                 "Guided decoding is not supported with overlap scheduler.")
 
     logger.info(
-        f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"
+        f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}, max_batch_size={executor_config.max_batch_size}"
     )
 
     for key, value in pytorch_backend_config.extra_resource_managers.items():
@@ -405,13 +405,9 @@ def create_py_executor_instance(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules)
 
-    if mapping.has_pp():
-        num_micro_batches = mapping.pp_size
-    else:
-        num_micro_batches = 1 if pytorch_backend_config.disable_overlap_scheduler else 2
+    max_num_sequences = executor_config.max_batch_size * mapping.pp_size
 
-    resources["seq_slot_manager"] = SeqSlotManager(
-        executor_config.max_batch_size * num_micro_batches)
+    resources["seq_slot_manager"] = SeqSlotManager(max_num_sequences)
 
     resource_manager = ResourceManager(resources)
 
@@ -422,10 +418,11 @@ def create_py_executor_instance(
                                                        last=True)
 
     capacity_scheduler = BindCapacityScheduler(
-        executor_config.max_batch_size,
+        max_num_sequences,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,
-        num_micro_batches=num_micro_batches)
+        two_step_lookahead=mapping.has_pp()
+        or not pytorch_backend_config.disable_overlap_scheduler)
     mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
                                            executor_config.max_num_tokens,
                                            ctx_chunk_config)

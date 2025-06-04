@@ -341,20 +341,17 @@ void initBindings(pybind11::module_& m)
             [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getFinishReasons()); });
 
     py::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
-        .def(py::init<tr::GptDecoderBatched::CudaStreamPtr, tr::SpeculativeDecodingMode const&, nvinfer1::DataType>(),
-            py::arg("stream"), py::arg("speculative_decoding_mode"), py::arg("dtype"))
+        .def(py::init<tr::GptDecoderBatched::CudaStreamPtr>(), py::arg("stream"))
         .def("setup", &tr::GptDecoderBatched::setup, py::arg("mode"), py::arg("max_batch_size"),
-            py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("sink_token_length"),
-            py::arg("max_sequence_length"), py::arg("max_tokens_per_step"), py::arg("dtype"), py::arg("model_config"),
+            py::arg("max_beam_width"), py::arg("max_sequence_length"), py::arg("dtype"), py::arg("model_config"),
             py::arg("world_config"))
-        .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("output"), py::arg("input"))
+        .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("decoder_state"), py::arg("output"),
+            py::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
         .def_property_readonly(
             "decoder_stream",
             [](tr::GptDecoderBatched& self) -> tr::CudaStream const& { return *self.getDecoderStream(); },
-            py::return_value_policy::reference)
-        .def_property_readonly(
-            "decoder_state", py::overload_cast<>(&tr::GptDecoderBatched::getDecoderState, py::const_));
+            py::return_value_policy::reference);
 
     m.def(
         "lamport_initialize_all",
