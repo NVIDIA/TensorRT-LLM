@@ -1933,11 +1933,19 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         *accuracy_inputs[modality]["media"],
         "--disable_kv_cache_reuse",
     ]
-    # NOTE
-    # Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens for video.
+    # NOTE: Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens for video.
     if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
                       ] and modality == "video":
         cmd.append("--max_num_tokens=16384")
+    elif model_name == "hyperclovax-seed-instruct-3b":
+        hyperclovax_example_root = Path(
+            os.path.join(llm_root, "examples", "models", "contrib",
+                         "hyperclovax"))
+        llm_venv.run_cmd([
+            '-m', 'pip', 'install', '-r',
+            str(hyperclovax_example_root / "requirements.txt")
+        ])
+        cmd.append('--trust_remote_code')
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
     def parse_output(text):

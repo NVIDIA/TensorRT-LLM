@@ -191,7 +191,7 @@ class LlavaNextInputProcessor(InputProcessor):
             [self._process(tensor) for tensor in mm_tensor])
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_features.to('cpu')
+            "mm_embedding": mm_features
         }
 
 

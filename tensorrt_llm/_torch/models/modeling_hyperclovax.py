@@ -539,7 +539,7 @@ class HCXVisionInputProcessor(InputProcessor):
             #                                dim=0)
 
         return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_embeds.to('cpu'),
+            "mm_embedding": mm_embeds,
         }
 
 
@@ -554,12 +554,12 @@ class HCXVisionModel:
 
         model_path = self.pretrained_config._name_or_path
 
-        # TODO: Remove this when we refactor LlmRequuest
-        # NOTE: trust_remote_code can be removed once we refactor LlmRequuest
+        # TODO: Remove this when we refactor LlmRequest
+        # NOTE: trust_remote_code can be removed once we refactor LlmRequest
         self.skip_processor = skip_processor
         if not self.skip_processor:
             self.processor = AutoProcessor.from_pretrained(
-                model_path, trust_remote_code=True, use_fast=False)
+                model_path, trust_remote_code=True, use_fast=True)
 
         # NOTE: There is no way of importing mm_projector, HCXVisionCAbstractor from HF. So, can not do the sharded_loading.
         # NOTE: trust_rmemote_code can be removed once we change the model into TRT-LLM's format
@@ -772,7 +772,7 @@ class HCXVisionModel:
 
 
 @register_auto_model("HCXVisionForCausalLM")
-@register_input_processor(HCXVisionInputProcessor)
+@register_input_processor(HCXVisionInputProcessor, model_type="hyperclovax_vlm")
 class HCXVisionForCausalLM(PreTrainedModel):
 
     def __init__(self, model_config: ModelConfig):

@@ -92,17 +92,13 @@ def main():
     device = "cuda" if args.use_fast else "cpu"
     inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
                                              model_dir=llm._hf_model_dir,
-                                            
-                                       model_type=model_type,
+                                             model_type=model_type,
                                              modality=args.modality,
-                                      
                                              prompts=args.prompt,
-                                      
                                              media=args.media,
                                              image_data_format=image_format,
-                                      
                                              num_frames=args.num_frames,
-                                       device=device)
+                                             device=device)
 
     outputs = llm.generate(inputs, sampling_params)
 

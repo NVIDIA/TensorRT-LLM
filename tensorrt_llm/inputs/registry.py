@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple, Type, TypeVar
 
 from torch import nn
 
+from ..logger import logger
 from ..sampling_params import SamplingParams
 from .data import TextPrompt
 from .utils import ALL_SUPPORTED_MULTIMODAL_MODELS
@@ -132,6 +133,7 @@ def create_input_processor(model_path_or_dir: str,
             input_processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type \
                 .get(model_cls)
         except RuntimeError:  # unregistered model
+            logger.info("Unregistered model, using DefaultInputProcessor")
             input_processor_cls = None
         if input_processor_cls is not None:
             return input_processor_cls(model_path_or_dir, model_config,
