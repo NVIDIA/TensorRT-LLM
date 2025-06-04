@@ -1,4 +1,4 @@
-from typing import Any, Dict, Generic, Optional, Tuple, TypeVar
+from typing import Any, Dict, Generic, Optional, Tuple
 
 import torch
 from torch import nn
@@ -19,8 +19,6 @@ from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata, get_spec_worker
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              register_auto_model)
-
-TAttention = TypeVar("TAttention", bound=Attention)
 
 
 class Eagle3Attention(Attention):
@@ -316,7 +314,21 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
         return hidden_states
 
 
-class Eagle3OneEnginelForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
+def get_draft_model(model_config, draft_config):
+    assert getattr(model_config, 'spec_config', None) != None
+    spec_dec_mode = model_config.spec_config.spec_dec_mode
+    if spec_dec_mode.is_eagle3_one_model():
+        return Eagle3ForCausalLM(
+            Eagle3DraftModel(draft_config,
+                             model_config.pretrained_config.num_hidden_layers),
+            draft_config)
+    else:
+        raise NotImplemented(
+            f"get_draft_model does not support speculative decoding mode {spec_dec_mode}."
+        )
+
+
+class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
 
     def __init__(self, model: TModel, model_config: ModelConfig[TConfig]):
@@ -325,10 +337,9 @@ class Eagle3OneEnginelForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
         self.draft_model = None
-        if hasattr(
-                model_config, "spec_config"
-        ) and model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_eagle3_one_model(
-        ):
+        if getattr(
+                model_config, 'spec_config', None
+        ) and model_config.spec_config.spec_dec_mode.use_one_engine():
             draft_config = ModelConfig.from_pretrained(
                 model_config.spec_config.draft_model_path,
                 trust_remote_code=True,
@@ -342,11 +353,7 @@ class Eagle3OneEnginelForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             draft_config.quant_config.kv_cache_quant_algo = \
                 model_config.quant_config.kv_cache_quant_algo
 
-            self.draft_model = Eagle3ForCausalLM(
-                Eagle3DraftModel(
-                    draft_config,
-                    model_config.pretrained_config.num_hidden_layers),
-                draft_config)
+            self.draft_model = get_draft_model(model_config, draft_config)
             self.spec_worker = get_spec_worker(model_config.spec_config,
                                                model_config.mapping)
 

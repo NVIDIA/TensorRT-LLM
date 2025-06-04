@@ -35,7 +35,7 @@ from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from ..utils import Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
-from .modeling_speculative import Eagle3OneEnginelForCausalLM
+from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, register_auto_model)
 
@@ -771,7 +771,7 @@ class LlamaModel(DecoderModel):
 
 
 @register_auto_model("LlamaForCausalLM")
-class LlamaForCausalLM(Eagle3OneEnginelForCausalLM[LlamaModel, LlamaConfig]):
+class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
 
     def __init__(
         self,
@@ -849,7 +849,7 @@ class Llama4InputProcessor(InputProcessor):
 
 @register_auto_model("Llama4ForConditionalGeneration")
 @register_input_processor(Llama4InputProcessor, model_type="llama4")
-class Llama4ForConditionalGeneration(Eagle3OneEnginelForCausalLM[Llama4Model,
+class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                                                  Llama4Config]):
 
     def __init__(
@@ -933,4 +933,3 @@ class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
-
