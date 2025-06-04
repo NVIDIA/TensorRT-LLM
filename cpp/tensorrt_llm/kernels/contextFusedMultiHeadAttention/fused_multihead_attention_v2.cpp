@@ -278,6 +278,8 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
     }
 
     auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
+    throw tensorrt_llm::common::TllmException(__FILE__, __LINE__,
+        tensorrt_llm::common::fmtstr("[TensorRT-LLM][ERROR] kernelMeta.mFuncName: %s.", kernelMeta.mFuncName).c_str());
     if (kernelMeta.launcher != nullptr)
     {
         kernelMeta.launcher(params, launch_params, stream);
