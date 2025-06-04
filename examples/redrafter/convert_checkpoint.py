@@ -42,6 +42,7 @@ DRAFTER_TLLM_WEIGHT_PREFIX = "drafter."
 
 # Add new models here as needed
 REDRAFTER_MAP = {"QWenForCausalLM": "ReDrafterForQWenLM",
+                 "Qwen2ForCausalLM": "ReDrafterForQWenLM",
                  "LLaMAForCausalLM": "ReDrafterForLLaMALM"}
 
 def parse_arguments():
@@ -302,28 +303,20 @@ def convert_and_save(
         rank=rank,
         tp_size=tp_size,
     )
-
-    # Load model configuration
-    config_path = os.path.join(hf_base_model_dir, 'config.json')
-    stade_dict_path = os.path.join(hf_base_model_dir, f'rank{rank}.safetensors')
-
-    model_config = PretrainedConfig.from_json_file(config_path)
-    model_config = copy.deepcopy(model_config)
-
-    # Prepare rank-specific configuration
-    rank_config = copy.deepcopy(model_config)
-    rank_config.set_rank(rank)
-
+    
     # Load and prepare weights
+    stade_dict_path = os.path.join(hf_base_model_dir, f'rank{rank}.safetensors')
     weights_safe = safetensors.safe_open(stade_dict_path, framework="pt")
     weights = {k: weights_safe.get_tensor(k) for k in weights_safe.keys()}
 
     # Convert bfloat16 tensors to float16
     # TODO: Support ReDrafter for bfloat16.
-    weights = {
-        k: v.to(torch.float16) if v.dtype == torch.bfloat16 else v
-        for k, v in weights.items()
-    }
+    if any([v.dtype == torch.bfloat16 for k, v in weights.items()]):
+        print(f"Warning: converting bf16 layers to fp16.")
+        weights = {
+            k: v.to(torch.float16) if v.dtype == torch.bfloat16 else v
+            for k, v in weights.items()
+        }
 
     if hf_drafter_model is not None:
         drafter_weights = hf_drafter(
