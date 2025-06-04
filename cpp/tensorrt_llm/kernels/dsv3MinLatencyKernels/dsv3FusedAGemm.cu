@@ -609,8 +609,12 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
 template <typename T, int kHdIn, int kHdOut, int kTileN>
 void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens, cudaStream_t const stream)
 {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-
+    auto const sm = tensorrt_llm::common::getSMVersion();
+    if (sm < 90)
+    {
+        std::cerr << "FusedAGemm required CUDA ARCH >= SM_90, not supported on this architecture" << std::endl;
+        assert(false);
+    }
     constexpr int gemm_m = kHdOut; // 2112
     int const gemm_n = num_tokens; // 16
     constexpr int gemm_k = kHdIn;  // 7168
@@ -649,10 +653,6 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
     TLLM_CUDA_CHECK(
         cudaLaunchKernelEx(&config, fused_a_gemm_kernel<batch_size, gemm_m, gemm_k, tile_m, tile_n, tile_k, stage_cnt>,
             output, mat_a, mat_b, gemm_n));
-#else
-    std::cerr << "FusedAGemm required CUDA ARCH >= SM_90, not supported on this architecture" << std::endl;
-    assert(false);
-#endif
 }
 
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8>(

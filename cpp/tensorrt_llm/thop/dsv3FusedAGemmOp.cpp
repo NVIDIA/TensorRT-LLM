@@ -50,33 +50,36 @@ th::Tensor dsv3_fused_a_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b
     TORCH_CHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1); // Row-major
     TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
     TORCH_CHECK(!bias.has_value(), "bias is not support yet");
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    if (num_tokens >= 1 && num_tokens <= 16 && hd_in == kHdIn && hd_out == kHdOut)
+    auto const sm = tensorrt_llm::common::getSMVersion();
+    if (sm >= 90)
     {
-        auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
-        if (num_tokens <= 8)
+        if (num_tokens >= 1 && num_tokens <= 16 && hd_in == kHdIn && hd_out == kHdOut)
         {
-            tk::dsv3MinLatencyKernels::invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 8>(
-                reinterpret_cast<__nv_bfloat16*>(out.mutable_data_ptr()),
-                reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-                reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens, stream);
+            auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
+            if (num_tokens <= 8)
+            {
+                tk::dsv3MinLatencyKernels::invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 8>(
+                    reinterpret_cast<__nv_bfloat16*>(out.mutable_data_ptr()),
+                    reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+                    reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens, stream);
+            }
+            else
+            {
+                tk::dsv3MinLatencyKernels::invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 16>(
+                    reinterpret_cast<__nv_bfloat16*>(out.mutable_data_ptr()),
+                    reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+                    reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens, stream);
+            }
         }
         else
         {
-            tk::dsv3MinLatencyKernels::invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 16>(
-                reinterpret_cast<__nv_bfloat16*>(out.mutable_data_ptr()),
-                reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-                reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens, stream);
+            cublas_mm_out(mat_a, mat_b, bias, out);
         }
     }
     else
     {
         cublas_mm_out(mat_a, mat_b, bias, out);
     }
-#else
-    cublas_mm_out(mat_a, mat_b, bias, out);
-#endif
     return out;
 }
 

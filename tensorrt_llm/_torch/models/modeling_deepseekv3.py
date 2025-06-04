@@ -190,69 +190,15 @@ class DeepseekV3Linear(Linear):
 
     def apply_linear(self,
                      input,
-                     weight,
                      bias,
                      lora_params: Optional[dict] | None = None,
-                     layer_idx: Optional[int] | None = None) -> torch.Tensor:
-        if self.has_any_quant:
-            qc = self.quant_config
-            if self.has_fp8_qdq:
-                cur_input_scale = self.input_scale
-                if input.dtype != torch.float8_e4m3fn:
-                    if self.input_scale is not None:
-                        # Static quantization
-                        qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                            input, self.input_scale)
-                    else:
-                        # Dynamic quantization
-                        qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
-                            input)
-                        cur_input_scale = cur_input_scale.to(torch.float32)
-                else:
-                    qinput = input
-                # This op does not support bias now.
-                output = torch.ops.trtllm.cublas_scaled_mm(
-                    qinput,
-                    weight.t(),
-                    scale_a=cur_input_scale,
-                    scale_b=self.weight_scale,
-                    bias=None,
-                    out_dtype=self.dtype or input.dtype,
-                )
-                if bias is not None:
-                    output = output + bias
-            elif self.has_fp8_block_scales:
-                if input.dtype == torch.float8_e4m3fn:
-                    input = input.to(torch.bfloat16) * self.input_scale
-                assert input.dtype == torch.bfloat16
-
-                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                    input)
-
-                output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                    act_input_fp8, self.weight, act_input_sf, self.weight_scale)
-                if bias is not None:
-                    output = output + bias
-            elif self.has_nvfp4:
-                if isinstance(input, Fp4QuantizedTensor):
-                    act_fp4, act_sf = input.fp4_tensor, input.scaling_factor
-                else:
-                    act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-                        input, self.input_scale, self.scaling_vector_size,
-                        False)
-
-                output = torch.ops.trtllm.nvfp4_gemm(act_fp4, self.weight,
-                                                     act_sf, self.weight_scale,
-                                                     self.alpha, False,
-                                                     self.dtype)
-                if bias is not None:
-                    output = output + bias
-            else:
-                # TODO(zhenhuanc): support other quant mode
-                raise ValueError(f'unsupported quant mode: {qc.quant_mode}')
-        else:
+                     layer_idx: Optional[int] | None = None):
+        num_tokens = input.shape[0]
+        if (not self.has_any_quant) and num_tokens >= 1 and num_tokens <= 16:
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
                 input, self.weight.t(), bias, None)
+        else:
+            output = super().apply_linear(input, bias, lora_params, layer_idx)
         return output
 
 
