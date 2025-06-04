@@ -938,6 +938,11 @@ class BaseLlmArgs(BaseModel):
         default=None,
         description="The parser to separate reasoning content from output.")
 
+    auto_deploy_config: Optional[object] = Field(
+        default=None,
+        description="Auto deploy config.",
+        json_schema_extra={"type": f"Optional[AutoDeployConfig]"})
+
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
         default=None,
@@ -1645,12 +1650,6 @@ class TorchLlmArgs(BaseLlmArgs):
 
     enable_layerwise_nvtx_marker: bool = Field(
         default=False, description="If true, enable layerwise nvtx marker.")
-
-    auto_deploy_config: Optional[object] = Field(
-        default=None,
-        description="Auto deploy config.",
-        exclude_from_json=True,
-        json_schema_extra={"type": f"Optional[AutoDeployConfig]"})
 
     load_format: Union[str, LoadFormat] = Field(
         default=LoadFormat.AUTO,
