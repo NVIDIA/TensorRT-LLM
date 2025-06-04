@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List, NamedTuple
+from typing import Dict, List, NamedTuple, Union
 
 import torch
 from torch import nn
@@ -60,10 +60,6 @@ class FusedMoEMethodBase(ABC):
     """
     Base class for all fused MoE methods.
     """
-
-    # Cache the permute indices during weight loading to avoid recompute
-    # This assumes the same input shape always results in the same permute indices
-    _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
 
     def create_weights(self, module: torch.nn.Module, weight_dtype: torch.dtype,
                        w3_w1_weight_shape: tuple[int, int, int],
@@ -999,6 +995,53 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
     weight_dtype = float4_sf_dtype
     block_scales_dtype = torch.float8_e4m3fn
 
+    # Cache the permute indices during weight loading to avoid recompute
+    # This assumes the same input shape always results in the same permute indices
+    _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
+
+    def _maybe_get_cached_w3_w1_permute_indices(
+            self,
+            dst_w3_w1_weight: torch.Tensor,
+            epilogue_tile_m: int,
+            num_elts_per_sf: Union[None, int] = None) -> torch.Tensor:
+        if dst_w3_w1_weight.shape not in self._cache_permute_indices:
+            # Get permute indices and chain them together
+            permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
+                dst_w3_w1_weight)
+            if num_elts_per_sf is None:
+                permute1 = get_shuffle_matrix_a_row_indices(
+                    dst_w3_w1_weight, epilogue_tile_m=epilogue_tile_m)
+            else:
+                permute1 = get_shuffle_matrix_sf_a_row_indices(
+                    dst_w3_w1_weight,
+                    epilogue_tile_m=epilogue_tile_m,
+                    num_elts_per_sf=num_elts_per_sf)
+            # Memoize permute indices as recompute is **very** costly
+            self._cache_permute_indices[
+                dst_w3_w1_weight.shape] = permute0[permute1].to(
+                    dst_w3_w1_weight.device)
+        permute_indices = self._cache_permute_indices[dst_w3_w1_weight.shape]
+        return permute_indices
+
+    def _maybe_get_cached_w2_permute_indices(
+            self,
+            dst_w2_weight: torch.Tensor,
+            epilogue_tile_m: int,
+            num_elts_per_sf: Union[None, int] = None) -> torch.Tensor:
+        if dst_w2_weight.shape not in self._cache_permute_indices:
+            if num_elts_per_sf is None:
+                permute_indices = (get_shuffle_matrix_a_row_indices(
+                    dst_w2_weight, epilogue_tile_m).to(dst_w2_weight.device))
+            else:
+                permute_indices = (get_shuffle_matrix_sf_a_row_indices(
+                    dst_w2_weight,
+                    epilogue_tile_m=epilogue_tile_m,
+                    num_elts_per_sf=num_elts_per_sf).to(dst_w2_weight.device))
+            # Memoize permute indices as recompute is **very** costly
+            self._cache_permute_indices[dst_w2_weight.shape] = permute_indices
+        permute_indices = self._cache_permute_indices[dst_w2_weight.shape]
+        return permute_indices
+
     def create_weights(self, module: torch.nn.Module):
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
         block_scales_vec_size = 1
@@ -1044,21 +1087,13 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
         dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
 
-        # Get permute indices and chain them together
-        if dst_w3_w1_weight.shape not in self._cache_permute_indices:
-            permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
-                dst_w3_w1_weight)
-            permute1 = get_shuffle_matrix_a_row_indices(
-                dst_w3_w1_weight, epilogue_tile_m=epilogue_tile_m)
-            # Memoize permute indices as recompute is **very** costly
-            self._cache_permute_indices[
-                dst_w3_w1_weight.shape] = permute0[permute1].to(
-                    dst_w3_w1_weight.device)
-        permute = self._cache_permute_indices[dst_w3_w1_weight.shape]
+        # Get permute indices
+        permute_indices = self._maybe_get_cached_w3_w1_permute_indices(
+            dst_w3_w1_weight, epilogue_tile_m)
 
         # Shuffle the weight according to permute indices
         processed_w31_weight_shard = torch.ops.trtllm.shuffle_matrix(
-            dst_w3_w1_weight, permute.to(dst_w3_w1_weight.device))
+            dst_w3_w1_weight, permute_indices.to(dst_w3_w1_weight.device))
 
         # Copy the result into device buffer
         dst_w3_w1_weight.copy_(processed_w31_weight_shard.view(
@@ -1079,15 +1114,13 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
         # Get permuted indices
-        if dst_w2_weight.shape not in self._cache_permute_indices:
-            # Memoize permute indices as recompute is **very** costly
-            self._cache_permute_indices[dst_w2_weight.shape] = (
-                get_shuffle_matrix_a_row_indices(
-                    dst_w2_weight, epilogue_tile_m).to(dst_w2_weight.device))
-        permute = self._cache_permute_indices[dst_w2_weight.shape]
+        permute_indices = self._maybe_get_cached_w2_permute_indices(
+            dst_w2_weight, epilogue_tile_m)
+
         # Shuffle the weight according to permute indices
         processed_w2_weight = torch.ops.trtllm.shuffle_matrix(
-            dst_w2_weight, permute.to(dst_w2_weight.device))
+            dst_w2_weight, permute_indices.to(dst_w2_weight.device))
+
         # Copy the result into device buffer
         dst_w2_weight.copy_(processed_w2_weight.view(dst_w2_weight.dtype),
                             non_blocking=True)
@@ -1122,22 +1155,16 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         # trtllm-gen specific block scales preprocessing logics
         epilogue_tile_m = 128  # FIXME
 
-        # Get permute indices and chain them together
-        if dst_w3_w1_weight_scale.shape not in self._cache_permute_indices:
-            permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
-                dst_w3_w1_weight_scale)
-            permute1 = get_shuffle_matrix_sf_a_row_indices(
-                dst_w3_w1_weight_scale.view(float4_sf_dtype), epilogue_tile_m,
-                16)
-            # Memoize permute indices as recompute is **very** costly
-            self._cache_permute_indices[
-                dst_w3_w1_weight_scale.shape] = permute0[permute1].to(
-                    dst_w3_w1_weight_scale.device)
-        permute = self._cache_permute_indices[dst_w3_w1_weight_scale.shape]
+        # Get permute indices
+        permute_indices = self._maybe_get_cached_w3_w1_permute_indices(
+            dst_w3_w1_weight_scale.view(float4_sf_dtype),
+            epilogue_tile_m,
+            num_elts_per_sf=16)
 
         # Shuffle the weight according to permute indices
         w3_w1_weight_scale = torch.ops.trtllm.shuffle_matrix(
-            dst_w3_w1_weight_scale.view(float4_sf_dtype), permute)
+            dst_w3_w1_weight_scale.view(float4_sf_dtype), permute_indices)
+
         # Assert should only be removed during debugging
         assert w3_w1_weight_scale.is_cuda, "w3_w1_weight_scale.is_cuda should be true or suffer from slow speed"
         # Interleave the weight.
@@ -1162,23 +1189,23 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
 
         # trtllm-gen specific block scales preprocessing logics
         epilogue_tile_m = 128  # FIXME: read from kernel
+
         # Assert should only be removed during debugging
         assert dst_w2_weight_scale.is_cuda, "dst_w2_weight_scale.is_cuda should be true or suffer from slow speed"
 
-        if dst_w2_weight_scale.shape not in self._cache_permute_indices:
-            # Memoize permute indices as recompute is **very** costly
-            self._cache_permute_indices[
-                dst_w2_weight_scale.
-                shape] = get_shuffle_matrix_sf_a_row_indices(
-                    dst_w2_weight_scale.view(float4_sf_dtype), epilogue_tile_m,
-                    16).to(dst_w2_weight_scale.device)
-        permute = self._cache_permute_indices[dst_w2_weight_scale.shape]
+        # Get permute indices
+        permute_indices = self._maybe_get_cached_w2_permute_indices(
+            dst_w2_weight_scale.view(float4_sf_dtype),
+            epilogue_tile_m,
+            num_elts_per_sf=16)
+
         # Shuffle the weight according to permute indices
         w_shuffled = torch.ops.trtllm.shuffle_matrix(
-            dst_w2_weight_scale.view(dtype=float4_sf_dtype), permute)
+            dst_w2_weight_scale.view(dtype=float4_sf_dtype), permute_indices)
+        # Interleave the weight.
         processed_w2_weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
             w_shuffled)
-        # Interleave the weight and copy
+        # Copy the result into device buffer
         dst_w2_weight_scale.copy_(
             processed_w2_weight_scale.view(
                 self.block_scales_dtype).reshape(orig_shape))
