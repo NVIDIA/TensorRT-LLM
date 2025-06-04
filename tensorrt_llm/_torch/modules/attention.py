@@ -843,7 +843,7 @@ class MLA(nn.Module):
         assert latent_cache is not None
         trtllm_attention = cast(TrtllmAttention, self.mha)
 
-        # # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
+        # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
         trtllm_attention.mla_rope_append_paged_kv_assign_q(
             q, latent_cache, attn_metadata)
 
