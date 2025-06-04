@@ -17,6 +17,7 @@
 #pragma once
 
 #include "trtllm/gen/DtypeDecl.h"
+#include "trtllm/gen/MmaDecl.h"
 #include <iostream>
 
 #ifdef TLLM_ENABLE_CUDA
@@ -24,6 +25,9 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/half.h>
 #endif
+
+namespace batchedGemm
+{
 
 namespace gemm
 {
@@ -36,9 +40,11 @@ namespace tg = trtllm::gen;
 
 #ifdef TLLM_ENABLE_CUDA
 
-inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> const& shapes,
+inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, std::vector<uint64_t> const& shapes,
     std::vector<uint64_t> const& strides, int32_t tileSizeMn, int32_t tileSizeK, void* gmemAddr, bool doSwizzle = true)
 {
+    // The multiplication factor of the data padding in SMEM.
+    int32_t padMultiplier = 1;
     CUtensorMap desc{};
     // The data type.
     CUtensorMapDataType tmaDataFormat{CU_TENSOR_MAP_DATA_TYPE_FLOAT32};
@@ -58,19 +64,37 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
     {
         tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
     }
+    else if (dtype == tg::Dtype::MxE2m1)
+    {
+        if (mmaKind == tg::MmaKind::MxFp8Fp6Fp4)
+        {
+            padMultiplier = 2;
+            tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
+        }
+        else if (mmaKind == tg::MmaKind::MxFp4NvFp4 || mmaKind == tg::MmaKind::Auto)
+        {
+            tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
+        }
+        else
+        {
+            std::cerr << "Invalid dtype / mmaKind combination " << tg::dtypeToString(dtype) << "/"
+                      << tg::mmaKindToString(mmaKind) << std::endl;
+            assert(false);
+        }
+    }
     else if (dtype == tg::Dtype::Fp32)
     {
         tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
     }
     else
     {
-        std::cerr << "buildNdTmaDescriptor: unexpected dtype " << static_cast<int32_t>(dtype) << std::endl;
+        std::cerr << "buildNdTmaDescriptor: unexpected dtype " << tg::dtypeToString(dtype) << std::endl;
         assert(false);
     }
 
     // The swizzle type.
     CUtensorMapSwizzle swizzleType{CU_TENSOR_MAP_SWIZZLE_NONE};
-    int32_t tileKSizeInBytes = (tileSizeK * tg::dtypeGetNumBits(dtype)) / /* bits */ 8;
+    int32_t tileKSizeInBytes = (tileSizeK * tg::dtypeGetNumBits(dtype) * padMultiplier) / /* bits */ 8;
     if (doSwizzle)
     {
         if ((tileKSizeInBytes % 128) == 0)
@@ -119,7 +143,7 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
     }
 
     // Set the number of elements in the packed uint32_t element.
-    auto const numEltsPerUInt32 = 4 * /* bits */ 8 / tg::dtypeGetNumBits(dtype);
+    auto const numEltsPerUInt32 = 4 * /* bits */ 8 / (tg::dtypeGetNumBits(dtype) * padMultiplier);
     // The number of elements in 128B.
     auto const numEltsIn128B = numEltsPerUInt32 /*4B*/ * 32;
     // The number of tile K hidden size (per token) in each block of shared memory.
@@ -193,7 +217,7 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
     }
     else
     {
-        std::cerr << "buildSfTmaDescriptor: unexpected dtype " << static_cast<int32_t>(dtype) << std::endl;
+        std::cerr << "buildSfTmaDescriptor: unexpected dtype " << tg::dtypeToString(dtype) << std::endl;
         assert(false);
     }
 
@@ -288,3 +312,5 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace gemm
+
+} // namespace batchedGemm

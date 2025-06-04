@@ -239,7 +239,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_max_new_tokens = self.max_new_tokens
         self.py_batch_idx = None
         self.py_rewind_len = 0
-        self.py_draft_tokens = self.draft_tokens
+        self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
         self.py_last_draft_tokens = None
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
@@ -267,6 +267,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         response = super().create_response(use_fast_logits, mpi_world_rank)
         return LlmResponse(response,
                            self.py_result) if response is not None else None
+
+    @property
+    def is_dummy(self):
+        return self.is_attention_dp_dummy or self.is_cuda_graph_dummy
 
 
 def convert_wordlist(word_list) -> List[List[int]]:

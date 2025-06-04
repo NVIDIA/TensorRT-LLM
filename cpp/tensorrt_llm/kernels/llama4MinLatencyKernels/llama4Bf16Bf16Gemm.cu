@@ -45,7 +45,7 @@ __global__ void llama4_bf16_bf16_gemm_kernel(int num_tokens,
     int const row = blockIdx.x % NUM_EXPERTS; // Matrix row / Output element index
     int const tid = threadIdx.x;              // Thread ID within the block
 
-    // FDL prefetch all B data
+    // PDL prefetch all B data
     aligned_bf16x4 b_vec[GEMM_K / BLOCK_SIZE / VEC_SIZE];
 #pragma unroll
     for (int chunk = 0; chunk < GEMM_K / BLOCK_SIZE / VEC_SIZE; chunk++)
@@ -113,7 +113,7 @@ void llama4_bf16_bf16_gemm_launcher(
     int const grid_size = NUM_EXPERTS * num_tokens;
 
     void* args[] = {(void*) &num_tokens, (void*) &A, (void*) &B, (void*) &C};
-    launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) llama4_bf16_bf16_gemm_kernel, args, 4);
+    launch_kernel_pdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) llama4_bf16_bf16_gemm_kernel, args, 4);
 }
 
 void llama4_bf16_bf16_gemm_op(int num_tokens, void const* A, void const* B, void* C, cudaStream_t stream)
