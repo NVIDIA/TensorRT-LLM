@@ -19,6 +19,8 @@ import numpy as np
 import tensorrt as trt
 import torch
 
+from tensorrt_llm.logger import logger
+
 from .._common import default_net, default_trtnet
 from .._utils import set_obj_attrs, str_dtype_to_torch, str_dtype_to_trt
 from ..functional import (AllReduceFusionOp, AllReduceParams, Tensor,
@@ -532,10 +534,37 @@ class RowLinear(LinearBase):
             if fuse_bias_into_all_reduce:
                 all_reduce_params.bias = self.bias.value
             if not self.is_expert:
+                logger.info(
+                    '[linear.py][collect_and_bias] ---Invoking allreduce---, fuse_bias_into_all_reduce=',
+                    fuse_bias_into_all_reduce)
                 x = allreduce(x,
                               self.tp_group,
                               all_reduce_params=all_reduce_params)
+                logger.info(
+                    '[linear.py][collect_and_bias] ---Returning from allreduce---, fuse_bias_into_all_reduce=',
+                    fuse_bias_into_all_reduce)
+
+                if all_reduce_params is not None and all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
+                    _, inter_output = x
+                    logger.info(
+                        f'[linear.py][collect_and_bias] ---Inter output shape: {inter_output.shape}'
+                    )
+                    logger.info(
+                        f'[linear.py][collect_and_bias] ---Inter output dtype: {inter_output.dtype}'
+                    )
+                    logger.info(
+                        f'[linear.py][collect_and_bias] ---Inter output content: {inter_output}'
+                    )
+                    inter_output_name = f"{inter_output.name.replace('/', '_')}_debug_inter_output_FUSION_ONLY"
+                    logger.info(
+                        f'[linear.py][collect_and_bias][FUSION-ONLY] inter_output name: {inter_output_name}'
+                    )
+                    inter_output.mark_output(inter_output_name)
+
                 if need_bias and not fuse_bias_into_all_reduce:
+                    logger.info(
+                        '[linear.py][collect_and_bias] ---Having returned from allreduce---, need_bias=',
+                        need_bias)
                     bias = cast(self.bias.value, x.dtype)
                     x = x + bias
             else:

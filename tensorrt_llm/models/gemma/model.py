@@ -15,6 +15,7 @@
 import math
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.gemma.convert import (QuantizeModifiers, Weights,
                                                load_gemma_weights_from_hf_model,
                                                non_modelopt_quantize_if_needed)
@@ -137,11 +138,41 @@ class GemmaDecoderLayer(Module):
         # assert not (
         #     default_net().plugin_config.reduce_fusion and self.has_residual_mlp
         # ), "Custom all reduce and residual mlp can't be enabled at the same time."
+        logger.info('[GemmaDecoderLayer.forward] ###Beginning of the method###')
         if default_net(
         ).plugin_config.reduce_fusion and self.local_layer_idx > 0:
             hidden_states, residual = hidden_states  #FIXME:AN need to check if appropriate residual value is hidden state is pulled out.
+
+            logger.info(
+                f'[FUSION] BEGINNING: hidden_states shape: {hidden_states.shape}'
+            )
+            logger.info(
+                f'[FUSION] BEGINNING: hidden_states dtype: {hidden_states.dtype}'
+            )
+            logger.info(
+                f'[FUSION] BEGINNING: hidden_states content: {hidden_states}')
+            hidden_states_name = f"{hidden_states.name.replace('/', '_')}_begining_debug_hidden_states_FUSION"
+            logger.info(
+                f'[FUSION] BEGINNING: hidden_states name: {hidden_states_name}')
+            hidden_states.mark_output(hidden_states_name)
         else:
             residual = hidden_states
+
+            logger.info(
+                f'[NO_FUSION] BEGINNING: hidden_states shape: {hidden_states.shape}'
+            )
+            logger.info(
+                f'[NO_FUSION] BEGINNING: hidden_states dtype: {hidden_states.dtype}'
+            )
+            logger.info(
+                f'[NO_FUSION] BEGINNING: hidden_states content: {hidden_states}'
+            )
+            hidden_states_name = f"{hidden_states.name.replace('/', '_')}_begining_debug_hidden_states_NO_FUSION"
+            logger.info(
+                f'[NO_FUSION] BEGINNING: hidden_states name: {hidden_states_name}'
+            )
+            hidden_states.mark_output(hidden_states_name)
+
             hidden_states = self.input_layernorm(hidden_states)
 
         attention_output = self.attention(
@@ -165,17 +196,50 @@ class GemmaDecoderLayer(Module):
         if use_cache:
             attention_output, presents = attention_output
 
+        logger.info(
+            '[GemmaDecoderLayer.forward] ---Beginning of allreduce chain---')
         if default_net().plugin_config.reduce_fusion:
             hidden_states, residual = attention_output
+
+            logger.info(f'[FUSION] residual shape: {residual.shape}')
+            logger.info(f'[FUSION] residual dtype: {residual.dtype}')
+            logger.info(f'[FUSION] residual content: {residual}')
+            residual_name = f"{residual.name.replace('/', '_')}_debug_residual_FUSION"
+            logger.info(f'[FUSION] residual name: {residual_name}')
+            residual.mark_output(residual_name)
         else:
             if self.config.inter_layernorms:
                 attention_output = self.post_layernorm(attention_output)
             hidden_states = residual + attention_output
             residual = hidden_states
+
+            logger.info(f'[NO_FUSION] residual shape: {residual.shape}')
+            logger.info(f'[NO_FUSION] residual dtype: {residual.dtype}')
+            logger.info(f'[NO_FUSION] residual content: {residual}')
+            residual_name = f"{residual.name.replace('/', '_')}_debug_residual_NO_FUSION"
+            logger.info(f'[NO_FUSION] residual name: {residual_name}')
+            residual.mark_output(residual_name)
+
             if self.config.inter_layernorms:
                 hidden_states = self.pre_feedforward_layernorm(hidden_states)
             else:
                 hidden_states = self.post_layernorm(hidden_states)
+            logger.info(
+                f'[GemmaDecoderLayer.forward] hidden_states shape: {hidden_states.shape}'
+            )
+            logger.info(
+                f'[GemmaDecoderLayer.forward] hidden_states dtype: {hidden_states.dtype}'
+            )
+            logger.info(
+                f'[GemmaDecoderLayer.forward] hidden_states content: {hidden_states}'
+            )
+            hidden_states_name = f"{hidden_states.name.replace('/', '_')}_debug_hidden_states_NO_FUSION"
+            logger.info(
+                f'[GemmaDecoderLayer.forward] hidden_states name: {hidden_states_name}'
+            )
+            hidden_states.mark_output(hidden_states_name)
+        logger.info('[GemmaDecoderLayer.forward] ---End of allreduce chain---')
+        logger.info('[GemmaDecoderLayer.forward] ###End of the method###')
 
         if next_layer_input_layernorm_args is not None:
             hidden_states = self.mlp(
