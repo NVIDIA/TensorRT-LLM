@@ -353,6 +353,7 @@ class FP8BatchedGemmRunner(TunableRunner):
         self.low_latency_kernel = low_latency_kernel
         self.tile_size = tile_size
         self.epilogue_tile_m = epilogue_tile_m
+        self.tuning_config = self.get_tuning_config()
 
         instance_key = (output_dtype, use_deep_seek_fp8, low_latency_kernel,
                         tile_size, epilogue_tile_m)
@@ -407,7 +408,6 @@ class FP8BatchedGemmRunner(TunableRunner):
 
         return tactics
 
-
     def get_default_valid_tactic(
         self,
         inputs: List[torch.Tensor],
@@ -425,10 +425,7 @@ class FP8BatchedGemmRunner(TunableRunner):
 
         return default_tactic
 
-
-    def get_dynamic_tensor_specs(
-        self
-    ) -> Tuple[DynamicTensorSpec, ...]:
+    def get_dynamic_tensor_specs(self) -> Tuple[DynamicTensorSpec, ...]:
         """Get the dynamic tensor specs for use with the AutoTuner."""
 
         # These indices correspond to the 0th input tensor and it's first dimension
@@ -441,10 +438,9 @@ class FP8BatchedGemmRunner(TunableRunner):
         m_values = (8, 16, 32, 64, 128, 256, 512, 1024, 2048)
         round_rule = lambda x: last_positive_power_of_2(x)
 
-        spec = DynamicTensorSpec(
-            MAT1_IDX, TUNED_DIM, m_values, round_rule)
+        specs = (DynamicTensorSpec(MAT1_IDX, TUNED_DIM, m_values, round_rule), )
 
-        return (spec, )
+        return specs
 
     def get_constraint_specs(self) -> Tuple[ConstraintSpec, ...]:
         """Get the constraint specs for the dynamic tensors for use with the AutoTuner.
@@ -469,10 +465,21 @@ class FP8BatchedGemmRunner(TunableRunner):
             SFS_A_IDX = 2
             CONSTRAINED_DIM = 1
 
-            constraint_dq_sfs_a = (ConstraintSpec(
-                SFS_A_IDX, CONSTRAINED_DIM, _constrain_dq_sfs_a_dim1),)
+            constraint_dq_sfs_a = (ConstraintSpec(SFS_A_IDX, CONSTRAINED_DIM,
+                                                  _constrain_dq_sfs_a_dim1), )
 
         return constraint_dq_sfs_a
+
+    def get_tuning_config(self) -> TuningConfig:
+        """Get the tuning configuration for the AutoTuner."""
+
+        dynamic_tensor_specs = self.get_dynamic_tensor_specs()
+        constraint_specs = self.get_constraint_specs()
+
+        tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
+                                     constraint_specs=constraint_specs)
+
+        return tuning_config
 
 
 @torch.library.custom_op("trtllm::fp8_batched_gemm_trtllmgen", mutates_args=())
@@ -497,18 +504,12 @@ def fp8_batched_gemm_trtllmgen(
 
     tuner = AutoTuner.get()
 
-    dynamic_tensor_specs = kernel_runner.get_dynamic_tensor_specs()
-    constraint_specs = kernel_runner.get_constraint_specs()
-
-    tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
-                                 constraint_specs=constraint_specs)
-
     inputs = [mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c]
 
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_batched_gemm_trtllmgen::batched_gemm",
         [kernel_runner],
-        tuning_config,
+        kernel_runner.tuning_config,
         inputs,
     )
 

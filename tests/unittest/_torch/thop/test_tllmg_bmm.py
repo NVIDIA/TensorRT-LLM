@@ -346,7 +346,7 @@ class TestFP8BatchedGemmTRTLLMGen:
                     atol=1e-2,
                     rtol=1e-2)
 
-    def test_autotunable_thop(self, test_case: BatchedGemmTestCase) -> None:
+    def test_autotuned_thop(self, test_case: BatchedGemmTestCase) -> None:
         torch.random.manual_seed(42)
 
         b = test_case.b
