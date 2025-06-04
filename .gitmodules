@@ -20,3 +20,6 @@
 [submodule "3rdparty/xgrammar"]
 	path = 3rdparty/xgrammar
 	url = https://github.com/mlc-ai/xgrammar.git
+[submodule "3rdparty/bytedance-flux"]
+	path = 3rdparty/bytedance-flux
+	url = https://github.com/bytedance/flux.git

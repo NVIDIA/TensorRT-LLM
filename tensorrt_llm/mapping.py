@@ -372,6 +372,10 @@ class Mapping(object):
     def local_rank(self):
         return self.rank % self.gpus_per_node
 
+    @property
+    def nnode(self):
+        return (self.world_size + self.gpus_per_node - 1) // self.gpus_per_node
+
     def has_cp(self):
         return self.cp_size > 1
 

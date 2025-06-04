@@ -8,6 +8,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ...model_config import ModelConfig
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
+from .fused_moe_flux import FluxFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
 from .fused_moe_wide_ep import WideEPMoE
@@ -42,8 +43,13 @@ def get_moe_cls(
                 f"Check out details in quant_config: {quant_config}"
                 "Using CutlassFusedMoE instead.")
             return CutlassFusedMoE
+<<<<<<< HEAD
     elif moe_backend.upper() == "WIDEEP":
         return WideEPMoE
+=======
+    elif moe_backend.upper() == "FLUX":
+        return FluxFusedMoE
+>>>>>>> 9ae6ae029 (introduce flux op[first version])
     else:
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
 
@@ -138,6 +144,28 @@ def create_moe(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+        )
+    elif moe_cls == FluxFusedMoE:
+        assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in FluxFusedMoE."
+        assert not enable_alltoall, "enable_alltoall is not supported in FluxFusedMoE."
+        assert moe_load_balancer is None, "moe_load_balancer is not supported in FluxFusedMoE."
+        assert model_config.mapping.enable_attention_dp, "FluxFusedMoE should be used with attention dp"
+
+        pack_weights = True
+
+        return moe_cls(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=reduce_results,
+            model_config=model_config,
+            aux_stream=aux_stream,
+            weight_loading_mode=weight_loading_mode,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            enable_alltoall=enable_alltoall,
+            pack_weights=pack_weights,
         )
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")
