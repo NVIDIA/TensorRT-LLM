@@ -1979,7 +1979,9 @@ class PyExecutor:
         logger.debug(
             f'before gather, rank = {self.dist.rank}, responses = {responses}')
         if self.enable_attention_dp:
-            if not self.gather_all_responses:
+            if self.dist.world_size == 1:
+                responses_list = [responses]
+            elif not self.gather_all_responses:
                 responses_list = self.dist.tp_gather(responses)
             else:
                 responses_list = self.dist.allgather(responses)
