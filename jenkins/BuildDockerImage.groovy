@@ -404,8 +404,10 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             script {
                 stage(key) {
                     config.stageName = key
-                    trtllm_utils.launchKubernetesPod(pipeline, config.podConfig, "docker") {
-                        buildImage(config, imageKeyToTag)
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        trtllm_utils.launchKubernetesPod(pipeline, config.podConfig, "docker") {
+                            buildImage(config, imageKeyToTag)
+                        }
                     }
                 }
             }
