@@ -2,7 +2,7 @@ from ..disaggregated_params import DisaggregatedParams
 from ..executor import CompletionOutput, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
-from .llm import LLM, RequestOutput
+from .llm import LLM, RequestOutput, TorchLLM, TrtLLM
 from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        DynamicBatchConfig, EagleDecodingConfig,
@@ -45,4 +45,6 @@ __all__ = [
     'LlmArgs',
     'TorchLlmArgs',
     'TrtLlmArgs',
+    'TrtLLM',
+    'TorchLLM',
 ]
