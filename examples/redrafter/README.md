@@ -64,10 +64,37 @@ trtllm-build --checkpoint_dir ./tllm_checkkpoint_1gpu_redrafter \
              --gemm_plugin float16 \
              --speculative_decoding_mode explicit_draft_tokens \
              --max_batch_size 4
-
 ```
 
 Note that the `speculative_decoding_mode` is set to `explicit_draft_tokens` which is how we categorized ReDrafter.
+
+Similary we can use and fp8 quantised base model and an fp16 draft head. 
+```bash
+# From the `examples/models/core/qwen/` directory, run the below, to quantize model into FP8 and export trtllm checkpoint
+python ../../../quantization/quantize.py --model_dir ./tmp/Qwen/7B/ \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir ./qwen_checkpoint_1gpu_fp8 \
+                                   --calib_size 512
+
+# From the `examples/models/redrafter/` directory, run,
+python convert_checkpoint.py --model_dir ./qwen_checkpoint_1gpu_fp8 \
+                             --drafter_model_dir ./qwen-7b-drafter \
+                             --output_dir ./tllm_checkkpoint_1gpu_redrafter \
+                             --dtype float16 \
+                             --redrafter_num_beams 1 \
+                             --redrafter_draft_len_per_beam 3
+
+# Build trtllm engines from the trtllm checkpoint
+# Enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable`
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
+             --output_dir ./engine_outputs \
+             --gemm_plugin fp8 \
+             --speculative_decoding_mode explicit_draft_tokens \
+             --max_beam_width 1 \
+             --max_batch_size 4
+```
 
 ### Run
 
