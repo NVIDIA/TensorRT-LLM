@@ -11,18 +11,16 @@ from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
 from tensorrt_llm.lora_manager import HfLoraLoader
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...logger import logger
-from ...mapping import Mapping
 from ...models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed.communicator import pp_recv, pp_send
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import FusedMoE
+from ..modules.fused_moe import MoE, VanillaMoE
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
@@ -356,13 +354,6 @@ class DecoderModelForCausalLM(nn.Module,
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
-                mapping=Mapping(
-                    world_size=1,
-                    tp_size=1,
-                    rank=0,
-                ),
-                tensor_parallel_mode=None,
-                gather_output=False,
             )
         else:
             # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
@@ -428,7 +419,7 @@ class DecoderModelForCausalLM(nn.Module,
         quant_config_dict = self.model_config.quant_config_dict
         if quant_config_dict is not None:
             for name, module in self.named_modules():
-                if isinstance(module, FusedMoE):
+                if isinstance(module, (MoE, VanillaMoE)):
                     for n, q in quant_config_dict.items():
                         # all linear layers inside FusedMoE share the same quant config
                         if name in n:
@@ -528,8 +519,8 @@ class DecoderModelForCausalLM(nn.Module,
             return_context_logits,
         )
 
-    def load_weights(self, weights: Dict):
-        _load_weights_impl(self, weights)
+    def load_weights(self, weights: Dict, skip_modules: List[str] = []):
+        _load_weights_impl(self, weights, skip_modules)
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
@@ -631,8 +622,18 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
     return renamed_weights
 
 
+def filter_weights(prefix, weights: Dict):
+    result = {}
+    for k, v in weights.items():
+        if k.startswith(prefix):
+            new_k = k[len(prefix) + 1:]
+            result[new_k] = v
+    return result
+
+
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
+                       skip_modules: List[str] = [],
                        params_map: Optional[Dict[str, str]] = None):
     if not hasattr(model, 'model_config') or not isinstance(
             model.model_config, ModelConfig):
@@ -649,14 +650,6 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         model.config, "head_dim",
         model.config.hidden_size // model.config.num_attention_heads)
 
-    def filter_weights(prefix, weights: Dict):
-        result = {}
-        for k, v in weights.items():
-            if k.startswith(prefix):
-                new_k = k[len(prefix) + 1:]
-                result[new_k] = v
-        return result
-
     params_map = {
         'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
         'gate_up_proj': ['gate_proj', 'up_proj']
@@ -665,6 +658,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     for name, module in tqdm(list(model.named_modules()),
                              desc="Loading weights"):
         if len(module._parameters) > 0:
+            # skip load weights if module is in skip_modules
+            if any(skip_module in name for skip_module in skip_modules):
+                continue
+
             # skip load weights if tie word embeddings is enabled and layer is lm_head
             if model.config.tie_word_embeddings and name.startswith("lm_head"):
                 continue

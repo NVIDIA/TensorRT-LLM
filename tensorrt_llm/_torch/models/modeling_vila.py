@@ -1109,7 +1109,7 @@ class VilaInputProcessor(InputProcessor):
 
 
 @register_auto_model(VilaConfig.model_architecture)
-@register_input_processor(VilaInputProcessor)
+@register_input_processor(VilaInputProcessor, model_type="llava_llama")
 class VilaModel(PreTrainedModel):
     config_class = VilaConfig
 

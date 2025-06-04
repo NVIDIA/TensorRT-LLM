@@ -1,5 +1,3 @@
-import asyncio
-from collections import defaultdict
 from functools import partial
 from typing import (Any, Callable, Coroutine, Dict, Iterable, List, Literal,
                     Optional, Tuple, TypeAlias, TypedDict, Union, cast)
@@ -9,11 +7,13 @@ from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
 from openai.types.chat import (ChatCompletionContentPartTextParam,
                                ChatCompletionMessageParam)
-from transformers import AutoConfig, ProcessorMixin
+from transformers import AutoConfig
 from typing_extensions import Required
 
-from tensorrt_llm.inputs import async_load_image, async_load_video
-from tensorrt_llm.llmapi.tokenizer import TokenizerBase
+from tensorrt_llm.inputs import (ConversationMessage, MultimodalData,
+                                 MultimodalDataTracker,
+                                 add_multimodal_placeholders, async_load_image,
+                                 async_load_video)
 from tensorrt_llm.logger import logger
 
 
@@ -26,12 +26,6 @@ class ChatCompletionContentPartVideoParam(TypedDict, total=False):
     """Type definition for video content part parameters."""
     video_url: Required[VideoURL]
     type: Required[Literal["video_url"]]
-
-
-class ConversationMessage(TypedDict):
-    """Type definition for conversation message structure."""
-    role: str
-    content: str
 
 
 # Type Aliases and Constants
@@ -57,63 +51,6 @@ MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
     }
 
 
-class AsyncMultimodalDataTracker:
-    """Tracks and manages multimodal data for async processing."""
-
-    def __init__(self, model_config: AutoConfig):
-        self.model_config = model_config
-        self.mm_data = defaultdict[str](list)
-        self.mm_placeholder_counts = defaultdict[str](int)
-
-    async def retrieve_all_mm_data(self) -> Optional[Dict[str, List[Any]]]:
-        """Retrieve all collected multimodal data."""
-        if not self.mm_data:
-            return None
-
-        return {
-            modality: await asyncio.gather(*items)
-            for modality, items in self.mm_data.items()
-        }
-
-    def retrieve_multimodal_placeholder(self, modality: str,
-                                        current_count: int) -> Optional[str]:
-        """Get the appropriate placeholder for a given modality and model type."""
-        model_type = self.model_config.model_type
-
-        if modality == "image":
-            if model_type in ("qwen2_vl", "qwen2_5_vl"):
-                return "<|vision_start|><|image_pad|><|vision_end|>"
-            elif model_type in ("mllama", "llama4"):
-                return "<|image|>"
-            raise TypeError(f"Unknown {modality} model type: {model_type}")
-        elif modality == "video":
-            if model_type in ("qwen2_vl", "qwen2_5_vl"):
-                return "<|vision_start|><|video_pad|><|vision_end|>"
-            raise TypeError(f"Unknown {modality} model type: {model_type}")
-        raise TypeError(f"Unknown modality: {modality}")
-
-    def add_mm_data(self, media_type: str, data: Coroutine):
-        current_count = len(self.mm_data[media_type]) + 1
-        placeholder = self.retrieve_multimodal_placeholder(
-            media_type, current_count)
-        self.mm_data[media_type].append(data)
-        if placeholder:
-            self.mm_placeholder_counts[placeholder] += 1
-
-    def mm_data_counts(self) -> Dict[str, int]:
-        """Get the count of multimodal placeholders."""
-        return dict(self.mm_placeholder_counts)
-
-
-def add_multimodal_placeholders(text_prompt: str,
-                                mm_placeholder_counts: dict[str, int]) -> str:
-    """Add multimodal placeholders to the text prompt."""
-    placeholders = []
-    for placeholder in mm_placeholder_counts:
-        placeholders.extend([placeholder] * mm_placeholder_counts[placeholder])
-    return "\n".join(placeholders + [text_prompt])
-
-
 def _parse_chat_message_content_mm_part(
     part: ChatCompletionContentPartParam
 ) -> tuple[str, Union[str, dict[str, str]]]:
@@ -130,9 +67,7 @@ def _parse_chat_message_content_mm_part(
 
 
 def parse_chat_message_content_part(
-    part: ChatCompletionMessageParam,
-    mm_data_tracker: AsyncMultimodalDataTracker,
-) -> Optional[str]:
+    part: ChatCompletionMessageParam, ) -> Optional[Any]:
     """Parse a single part of a chat message."""
     if isinstance(part, str):
         return part
@@ -159,8 +94,7 @@ def parse_chat_message_content_part(
                 logger.error(f"Failed to load image: {str(e)}")
                 return None
 
-        mm_data_tracker.add_mm_data("image", load_image_async())
-        return None
+        return MultimodalData(modality="image", data=load_image_async())
 
     if part_type == "video_url":
         str_content = cast(str, content)
@@ -172,8 +106,7 @@ def parse_chat_message_content_part(
                 logger.error(f"Failed to load video: {str(e)}")
                 return None
 
-        mm_data_tracker.add_mm_data("video", load_video_async())
-        return None
+        return MultimodalData(modality="video", data=load_video_async())
 
     raise NotImplementedError(f"Unknown part type: {part_type}")
 
@@ -181,29 +114,27 @@ def parse_chat_message_content_part(
 def parse_chat_message_content_parts(
     role: str,
     parts: Iterable[ChatCompletionMessageParam],
-    mm_data_tracker: AsyncMultimodalDataTracker,
-) -> List[ConversationMessage]:
+) -> ConversationMessage:
     """Parse multiple parts of a chat message."""
-    content_parts = []
+    text_parts = []
+    media_parts = []
     for part in parts:
-        parse_res = parse_chat_message_content_part(part, mm_data_tracker)
+        parse_res = parse_chat_message_content_part(part)
         if parse_res:
-            content_parts.append(parse_res)
+            if isinstance(parse_res, str):
+                text_parts.append(parse_res)
+            else:
+                media_parts.append(parse_res)
 
-    text_prompt = "\n".join(content_parts)
-    mm_placeholder_counts = mm_data_tracker.mm_data_counts()
+    text_prompt = "\n".join(text_parts)
 
-    if mm_placeholder_counts:
-        text_prompt = add_multimodal_placeholders(text_prompt,
-                                                  mm_placeholder_counts)
-
-    return [ConversationMessage(role=role, content=text_prompt)]
+    return ConversationMessage(role=role,
+                               content=text_prompt,
+                               media=media_parts)
 
 
 def parse_chat_message_content(
-    message: ChatCompletionMessageParam,
-    mm_data_tracker: AsyncMultimodalDataTracker,
-) -> List[ConversationMessage]:
+    message: ChatCompletionMessageParam, ) -> ConversationMessage:
     """Parse the content of a chat message."""
     role = message["role"]
     content = message.get("content")
@@ -218,7 +149,6 @@ def parse_chat_message_content(
     result = parse_chat_message_content_parts(
         role,
         content,
-        mm_data_tracker,
     )
     return result
 
@@ -230,65 +160,25 @@ def parse_chat_messages_coroutines(
         Any, Any, Optional[Dict[str, List[Any]]]]]]:
     """Parse multiple chat messages and return conversation and coroutine."""
     conversation = []
-    mm_data_tracker = AsyncMultimodalDataTracker(model_config)
+    mm_data_tracker = MultimodalDataTracker(model_config.model_type)
 
     for msg in messages:
-        sub_messages = parse_chat_message_content(msg, mm_data_tracker)
-        conversation.extend(sub_messages)
+        parsed_msg = parse_chat_message_content(msg)
+        conversation.append(parsed_msg)
+        if parsed_msg["media"]:
+            for mdata in parsed_msg["media"]:
+                mm_data_tracker.add_data(mdata["modality"], mdata["data"])
+    mm_placeholder_counts = mm_data_tracker.placeholder_counts()
+    if mm_placeholder_counts:
+        parsed_msg["content"] = add_multimodal_placeholders(
+            model_config.model_type, parsed_msg["content"],
+            mm_placeholder_counts)
 
-    return conversation, mm_data_tracker.retrieve_all_mm_data()
-
-
-def resolve_hf_chat_template(
-    tokenizer: TokenizerBase,
-    processor: ProcessorMixin,
-    chat_template: Optional[str],
-    tools: Optional[list[dict[str, Any]]],
-) -> Optional[str]:
-    """Resolve the appropriate chat template to use."""
-
-    # 1. If chat_template is not None, return it
-    if chat_template is not None:
-        return chat_template
-
-    # 2. If tool is not provided, use the processor's default chat template
-    if not tools and processor and hasattr(processor, 'chat_template'):
-        return processor.chat_template
-
-    # 3. If tool is provided, use the tool
-    try:
-        return tokenizer.get_chat_template(chat_template, tools=tools)
-    except Exception:
-        logger.debug("Failed to load AutoTokenizer chat template for %s",
-                     tokenizer.name_or_path)
-    return None
+    return conversation, mm_data_tracker.retrieve_all_async(
+    ), mm_placeholder_counts
 
 
-def apply_chat_template(
-    *,
-    tokenizer: TokenizerBase,
-    processor: ProcessorMixin,
-    conversation: list[ConversationMessage],
-    add_generation_prompt: bool,
-    tools: Optional[list[dict[str, Any]]] = None,
-    documents: Optional[list[dict[str, str]]] = None,
-    chat_template: Optional[str] = None,
-    chat_template_kwargs: Optional[dict[str, Any]] = None,
-) -> str:
-    """Apply chat template to the conversation."""
-    hf_chat_template = resolve_hf_chat_template(tokenizer, processor,
-                                                chat_template, tools)
-
-    if hf_chat_template is None:
+def check_multiple_response(n: int, backend: Optional[str]):
+    if n > 1 and backend == "pytorch":
         raise ValueError(
-            "No chat template found for the given tokenizer and tools.")
-
-    return tokenizer.apply_chat_template(
-        conversation=conversation,
-        tokenize=False,
-        add_generation_prompt=add_generation_prompt,
-        tools=tools,
-        documents=documents,
-        chat_template=hf_chat_template,
-        **(chat_template_kwargs or {}),
-    )
+            "Multiple response is not supported in PyTorch workflow")

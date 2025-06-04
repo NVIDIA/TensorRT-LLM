@@ -8,6 +8,7 @@ from typing import Dict, List
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm.quantization.utils import fp4_utils
 
 is_torch_compiling_flag = False
 
@@ -102,6 +103,12 @@ _disable_fp4_allgather = os.getenv("TLLM_DISABLE_FP4_ALLGATHER", "0") == "1"
 
 def disable_fp4_allgather():
     return _disable_fp4_allgather
+
+
+def compute_swizzled_sf_shape(row: int, col: int):
+    padded_row = (row + 128 - 1) // 128 * 128
+    padded_col = (col + 4 - 1) // 4 * 4
+    return padded_row, padded_col
 
 
 def swizzle_sf(sf: torch.Tensor,
@@ -207,7 +214,15 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
     while m >= 1:
         num_token_buckets.append(m)
         m //= 2
-    return num_token_buckets
+    return tuple(num_token_buckets)
+
+
+def fp4_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp4 scale tensor.
+    """
+    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
+                                                     sf_vec_size=16)
+    return scale_shape * 2
 
 
 _enable_piecewise_cuda_graph = True

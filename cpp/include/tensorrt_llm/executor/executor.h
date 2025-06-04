@@ -560,11 +560,15 @@ public:
 
     explicit KvCacheRetentionConfig(std::vector<TokenRangeRetentionConfig> const& tokenRangeRetentionPriorities,
         RetentionPriority decodeRetentionPriority = kDefaultRetentionPriority,
-        std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt);
+        std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt,
+        KvCacheTransferMode transferMode = KvCacheTransferMode::DRAM,
+        std::optional<std::string> directory = std::nullopt);
 
     [[nodiscard]] std::vector<TokenRangeRetentionConfig> getTokenRangeRetentionConfigs() const;
     [[nodiscard]] RetentionPriority getDecodeRetentionPriority() const;
     [[nodiscard]] std::optional<std::chrono::milliseconds> getDecodeDurationMs() const;
+    [[nodiscard]] KvCacheTransferMode getTransferMode() const;
+    [[nodiscard]] std::optional<std::string> getDirectory() const;
 
     /// @brief Convert the token range data into an entry per kv block. Returns a tuple of vectors corresponding to the
     /// priorities and durations for each block.
@@ -575,7 +579,8 @@ public:
     {
         return mTokenRangeRetentionConfigs == other.mTokenRangeRetentionConfigs
             && mDecodeRetentionPriority == other.mDecodeRetentionPriority
-            && mDecodeDurationMs == other.mDecodeDurationMs;
+            && mDecodeDurationMs == other.mDecodeDurationMs && mTransferMode == other.mTransferMode
+            && mDirectory == other.mDirectory;
     }
 
 private:
@@ -587,6 +592,10 @@ private:
     RetentionPriority mDecodeRetentionPriority;
     /// @brief The duration in ms that decode blocks should remain at their assigned priority level.
     std::optional<std::chrono::milliseconds> mDecodeDurationMs;
+    /// @brief The transfer mode for the block.
+    KvCacheTransferMode mTransferMode;
+    /// @brief Name of the directory if transfer mode is GDS or POSIX_DEBUG_FALLBACK.
+    std::optional<std::string> mDirectory;
 };
 
 /// @brief A class that holds information about the request

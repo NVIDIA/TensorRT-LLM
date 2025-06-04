@@ -13,10 +13,11 @@ from .._graph import canonicalize_graph
 def match_moe_pattern(gm: GraphModule) -> GraphModule:
     graph = gm.graph
 
-    ad_logger.info("MoE Pattern Matching")
     ad_logger.debug("Before MoE Pattern Matching: " + str(gm))
     # Preprocessing: Identify boundary nodes (e.g. residual connections) in the graph.
     boundary_nodes = identify_regions_between_residuals(gm)
+
+    num_moe_patterns = 0
 
     for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         # Step 1: Identify Expert Compute pattern
@@ -85,8 +86,13 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
         while _remove_dead_inplace_nodes_in_region(gm.graph, start_boundary, end_boundary):
             gm.graph.eliminate_dead_code()
 
+        num_moe_patterns += 1
+
     gm = canonicalize_graph(gm)
+
+    ad_logger.info(f"Found {num_moe_patterns} MoE Patterns")
     ad_logger.debug("After MoE Pattern Matching: " + str(gm))
+
     return gm
 
 
@@ -95,18 +101,19 @@ def fuse_moe(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     Scan the FX graph and replace all calls to torch.ops.moe.torch_moe with
     torch.ops.moe.trtllm_fused_moe.
     """
-    ad_logger.info("MoE fusion")
     ad_logger.debug("Before MoE fusion: " + str(gm))
 
     with cuda_memory_tracker():
-        _insert_fused_moe_ops(gm)
-        gm = canonicalize_graph(gm)
+        fused_key_counter = _insert_fused_moe_ops(gm)
+        if fused_key_counter:
+            gm = canonicalize_graph(gm)
 
+    ad_logger.info(f"Found {fused_key_counter} MoE fusions")
     ad_logger.debug("After MoE fusion: " + str(gm))
     return gm
 
 
-def _insert_fused_moe_ops(gm: GraphModule):
+def _insert_fused_moe_ops(gm: GraphModule) -> int:
     fused_key_counter = 0
     graph = gm.graph
 
@@ -151,6 +158,8 @@ def _insert_fused_moe_ops(gm: GraphModule):
 
         node.replace_all_uses_with(new_node)
         graph.erase_node(node)
+
+    return fused_key_counter
 
 
 def _find_lowest_common_ancessor(nodes: list[Node]) -> Optional[Node]:

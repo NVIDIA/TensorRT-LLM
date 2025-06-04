@@ -568,7 +568,7 @@ def quant_dequant_per_tensor_fp8(a):
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [16, 64, 1024])
+@pytest.mark.parametrize("num_tokens", [16, 64, 1024, 4096])
 @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (32, 1, 1, 5),
                                          (72, 1, 1, 6), (256, 8, 4, 8)])
 @pytest.mark.parametrize("hidden_size", [512])
@@ -583,6 +583,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
     padding = 8
     routed_scaling = 2.5
     routing_method_type = RoutingMethodType.DeepSeekV3
+    tile_tokens_dim = 8 if num_tokens < 1024 else 32
 
     assert top_k <= num_experts
     assert top_k <= 8
@@ -629,7 +630,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
         expert_logits, routing_bias, hidden_states, hidden_states_scale,
         gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales, num_experts,
         top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
-        routed_scaling, routing_method_type)
+        routed_scaling, tile_tokens_dim, routing_method_type)
 
     output_dequant_actual = output.to(torch.float)
     #
@@ -666,7 +667,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024])
+@pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024, 4096])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024])
 @pytest.mark.parametrize(
@@ -737,6 +738,7 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     routed_scaling = routing_info["routed_scaling"]
     num_experts = routing_info["num_experts"]
     routing_method_type = routing_info["routing_method_type"]
+    tile_tokens_dim = 8
 
     assert top_k <= num_experts
     assert top_k <= 8
@@ -918,7 +920,7 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
         gemm1_scales_fp4_shuffled, gemm2_weights_fp4_shuffled,
         gemm2_scales_fp4_shuffled, scale_c_fc1, scale_gate_fc1, scale_c_fc2,
         num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
-        num_experts, routed_scaling, routing_method_type)
+        num_experts, routed_scaling, tile_tokens_dim, routing_method_type)
 
     output_dequant_actual = output.to(torch.float)
 
@@ -951,7 +953,7 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024])
+@pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024, 4096])
 @pytest.mark.parametrize("expert_info", [(128, 0, 0, 1, True)])
 @pytest.mark.parametrize("hidden_size", [2048])
 @pytest.mark.parametrize("intermediate_size", [2048])
@@ -967,6 +969,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     padding = 8
     routed_scaling = 2.5
     routing_method_type = RoutingMethodType.Llama4
+    tile_tokens_dim = 8
 
     assert top_k <= num_experts
     assert top_k <= 8
@@ -1063,12 +1066,12 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
                                                       args.gemm2_scales_global)
 
     output = torch.ops.trtllm.fp8_per_tensor_scale_moe_runner(
-        expert_logits.to(torch.bfloat16)
-        if use_routing_scales_on_input else expert_logits, routing_bias,
-        hidden_states_quant, gemm1_weights_fp8_shuffled, scale_c_fc1,
-        scale_gate_fc1, gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts,
-        top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
-        routed_scaling, use_routing_scales_on_input, routing_method_type)
+        expert_logits.to(torch.bfloat16) if use_routing_scales_on_input else
+        expert_logits, routing_bias, hidden_states_quant,
+        gemm1_weights_fp8_shuffled, scale_c_fc1, scale_gate_fc1,
+        gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts, top_k, n_groups,
+        top_k_groups, intermediate_size, 0, num_experts, routed_scaling,
+        use_routing_scales_on_input, tile_tokens_dim, routing_method_type)
 
     output_dequant_actual = output.to(torch.float)
 
