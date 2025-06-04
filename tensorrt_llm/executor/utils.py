@@ -103,7 +103,7 @@ class ProcessPoolExecutorSession(MpiSession):
 
 class ErrorResponse(NamedTuple):
     client_id: int
-    error_msg: str
+    error_msg: Optional[Exception | str]
     request_id: int
 
 

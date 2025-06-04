@@ -1517,19 +1517,6 @@ class DummyError(Exception):
     pass
 
 
-class DummyExecutorMeta(type):
-
-    def __new__(cls, name, bases, dic, worker_cls):
-        new_cls = super().__new__(cls, name, bases, dic)
-
-        @classmethod
-        def create(cls, engine, executor_config, *args, **kwargs):
-            return worker_cls(engine=engine, executor_config=executor_config)
-
-        new_cls.create = create
-        return new_cls
-
-
 def check_llm_return_context_logits(tp_size=1):
     build_config = BuildConfig(gather_context_logits=True)
 
@@ -1687,87 +1674,36 @@ def test_llm_return_logprobs_streaming():
     llm_return_logprobs_test_harness(2, 2, False, True, streaming=True)
 
 
-class DummyExecutorWorker3(GenerationExecutorWorker):
-    should_raise_error = True
+class DummyExecutorWorker(GenerationExecutorWorker):
+    should_raise_system_error = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.counter = 0
-        self.failed_requests = set()
-
     def _engine_response_callback(self, response: tllm.Response):
-        if response.client_id in self.failed_requests:
-            return response
         # Making the first response failed, and the subsequent responses successful
-        if DummyExecutorWorker3.should_raise_error:
-            DummyExecutorWorker3.should_raise_error = False
-            print(f"Raise error for {response.client_id}")
-            self.failed_requests.add(response.client_id)
+        if DummyExecutorWorker.should_raise_system_error:
+            DummyExecutorWorker.should_raise_system_error = False
+            print(f"Raise system error for {response.client_id}")
             return tllm.Response(
-                request_id=0,  # dummy value
-                client_id=response.client_id,
-                error_msg="Test error")
+                request_id=None,  # dummy value
+                client_id=None,
+                error_msg="Test system error")
         else:
             return response
 
 
-DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
-                                   worker_cls=DummyExecutorWorker3)
+def test_llm_system_error_handler():
+    build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
+    llm = LLM(llama_model_path,
+              build_config=build_config,
+              executor_cls=DummyExecutorWorker,
+              kv_cache_config=global_kvcache_config,
+              fast_build=True)
 
-
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5063025")
-def test_llm_handling_per_requeust_error():
-    llm = LLM(
-        model=llama_model_path,
-        executor_cls=DummyExecutor3,
-        kv_cache_config=global_kvcache_config,
-        fast_build=True,
-    )
-    # The dummy executor will delay the responses
-    sampling_params = SamplingParams(max_tokens=6)
-
-    def batch_task():
-        DummyExecutorWorker3.should_raise_error = True
-        with pytest.raises(RequestError):
-            for output in llm.generate(prompts,
-                                       sampling_params=sampling_params):
-                print(output)
-
-        for output in llm.generate(prompts, sampling_params=sampling_params):
-            print(output)
-
-    batch_task()
-
-
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5063025")
-def test_llm_handling_per_requeust_error_async():
-    llm = LLM(
-        model=llama_model_path,
-        executor_cls=DummyExecutor3,
-        kv_cache_config=global_kvcache_config,
-        fast_build=True,
-    )
-    # The dummy executor will delay the responses
-    sampling_params = SamplingParams(max_tokens=6)
-
-    # test in streaming mode
-    async def task():
-        # 10 requests, each request will get error, while the whole LLM instance is still alive
-        with pytest.raises(RequestError):
-            DummyExecutorWorker3.should_raise_error = True
-            async for output in llm.generate_async(
-                    prompts[0], streaming=True,
-                    sampling_params=sampling_params):
-                print(output)
-
-        DummyExecutorWorker3.should_raise_error = False
-        async for output in llm.generate_async(prompts[0],
-                                               streaming=True,
-                                               sampling_params=sampling_params):
-            print(output)
-
-    asyncio.run(task())
+    DummyExecutorWorker.should_raise_system_error = True
+    output = llm.generate(prompts)
+    print(output)
 
 
 def validate_stats(results,
