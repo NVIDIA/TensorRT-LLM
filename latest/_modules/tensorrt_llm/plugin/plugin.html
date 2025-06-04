@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.20.0rc3" />
+  <meta name="docsearch:version" content="0.21.0rc0" />
 
 
   </head>
@@ -329,6 +329,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_quantization.html">Generation with Quantization</a></li>
@@ -350,6 +351,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_quantization.html">Generation with Quantization</a></li>
@@ -414,6 +416,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
@@ -448,6 +451,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 </ul>
 </div>
 </nav></div>
@@ -533,7 +537,8 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._ipc_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">IpcMemory</span><span class="p">,</span> <span class="n">can_access_peer</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">get_sm_version</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..bindings.internal.runtime</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">lamport_initialize</span><span class="p">,</span>
-                                         <span class="n">lamport_initialize_all</span><span class="p">)</span>
+                                         <span class="n">lamport_initialize_all</span><span class="p">,</span>
+                                         <span class="n">max_workspace_size_lowprecision</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
 
@@ -1191,7 +1196,7 @@
 <span class="sd">              Then, each instance of allreduce will reference that tensor automatically.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">POINTERS_PER_RANK</span> <span class="o">=</span> <span class="mi">7</span>
-    <span class="n">POINTERS_OF_COUNTER</span> <span class="o">=</span> <span class="mi">2</span>
+    <span class="n">POINTERS_OF_COUNTER</span> <span class="o">=</span> <span class="mi">3</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">workspace</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1226,6 +1231,17 @@
         <span class="k">return</span> <span class="mi">8_000_000</span>
 
     <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_workspace_size_lowprecision</span><span class="p">(</span><span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">max_workspace_size_lowprecision</span><span class="p">(</span><span class="n">tp_size</span><span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">initialize_lowprecision_buffers</span><span class="p">(</span><span class="n">workspace</span><span class="p">:</span> <span class="s2">&quot;torch.tensor&quot;</span><span class="p">,</span>
+                                        <span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">trtllm</span><span class="o">.</span><span class="n">initialize_static_lowprecision_buffers</span><span class="p">(</span>
+            <span class="n">workspace</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">allocate_workspace</span><span class="p">(</span><span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span>
                            <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">IpcMemory</span><span class="p">],</span> <span class="s2">&quot;torch.tensor&quot;</span><span class="p">]:</span>
         <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
@@ -1239,11 +1255,11 @@
         <span class="n">ipc_buffers_pong</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">ipc_buffers_size</span><span class="p">,</span>
                                      <span class="n">is_p2p_supported</span><span class="p">)</span>
         <span class="n">ipc_barriers_in</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span>
-            <span class="n">mapping</span><span class="p">,</span> <span class="n">IpcMemory</span><span class="o">.</span><span class="n">IPC_BARRIERS_SIZE_PER_GPU</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
-            <span class="n">is_p2p_supported</span><span class="p">)</span>
+            <span class="n">mapping</span><span class="p">,</span> <span class="n">IpcMemory</span><span class="o">.</span><span class="n">IPC_BARRIERS_SIZE_PER_GPU</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">*</span>
+            <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span> <span class="n">is_p2p_supported</span><span class="p">)</span>
         <span class="n">ipc_barriers_out</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span>
-            <span class="n">mapping</span><span class="p">,</span> <span class="n">IpcMemory</span><span class="o">.</span><span class="n">IPC_BARRIERS_SIZE_PER_GPU</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
-            <span class="n">is_p2p_supported</span><span class="p">)</span>
+            <span class="n">mapping</span><span class="p">,</span> <span class="n">IpcMemory</span><span class="o">.</span><span class="n">IPC_BARRIERS_SIZE_PER_GPU</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">*</span>
+            <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span> <span class="n">is_p2p_supported</span><span class="p">)</span>
         <span class="n">lamport_buffers_size</span> <span class="o">=</span> <span class="mi">1</span> <span class="k">if</span> <span class="n">force_deterministic</span> <span class="k">else</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
         <span class="n">lamport_buffers_0</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">lamport_buffers_size</span><span class="p">,</span>
                                       <span class="n">is_p2p_supported</span><span class="p">)</span>
@@ -1261,16 +1277,55 @@
                 <span class="n">lamport_buffers_size</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="n">buffers</span> <span class="o">=</span> <span class="p">[</span>
-            <span class="n">ipc_buffers_ping</span><span class="p">,</span> <span class="n">ipc_buffers_pong</span><span class="p">,</span> <span class="n">ipc_barriers_in</span><span class="p">,</span>
-            <span class="n">ipc_barriers_out</span><span class="p">,</span> <span class="n">lamport_buffers_0</span><span class="p">,</span> <span class="n">lamport_buffers_1</span><span class="p">,</span>
-            <span class="n">lamport_buffers_2</span>
+            <span class="n">ipc_buffers_ping</span><span class="p">,</span>
+            <span class="n">ipc_buffers_pong</span><span class="p">,</span>
+            <span class="n">ipc_barriers_in</span><span class="p">,</span>
+            <span class="n">ipc_barriers_out</span><span class="p">,</span>
+            <span class="n">lamport_buffers_0</span><span class="p">,</span>
+            <span class="n">lamport_buffers_1</span><span class="p">,</span>
+            <span class="n">lamport_buffers_2</span><span class="p">,</span>
+            <span class="c1"># Start from 1 since 0 represents released state for barrier at the beginning of the all_reduce.</span>
+            <span class="c1"># The last element is the barrier flag counter.</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
         <span class="p">]</span>
 
         <span class="k">return</span> <span class="n">buffers</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
             <span class="n">ipc_buffers_ping</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="n">ipc_buffers_pong</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span>
             <span class="n">ipc_barriers_in</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="n">ipc_barriers_out</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span>
             <span class="n">lamport_buffers_0</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="n">lamport_buffers_1</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span>
-            <span class="n">lamport_buffers_2</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+            <span class="n">lamport_buffers_2</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="p">[</span><span class="n">buffers</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()]</span> <span class="o">+</span>
+            <span class="p">[</span><span class="n">buffers</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="mi">1</span><span class="p">:]</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()]</span> <span class="o">+</span> <span class="p">[</span><span class="n">buffers</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="mi">2</span><span class="p">:]</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()],</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
+            <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cpu&quot;</span><span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">allocate_lowprecision_workspace</span><span class="p">(</span>
+            <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span>
+            <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">IpcMemory</span><span class="p">],</span> <span class="s2">&quot;torch.tensor&quot;</span><span class="p">]:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+        <span class="c1"># Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.</span>
+        <span class="n">is_p2p_supported</span> <span class="o">=</span> <span class="n">can_access_peer</span><span class="p">(</span><span class="n">mapping</span><span class="p">)</span>
+        <span class="n">ipc_buffers_size</span> <span class="o">=</span> <span class="n">size</span>
+        <span class="n">ipc_buffers_ping</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">ipc_buffers_size</span><span class="p">,</span>
+                                     <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">ipc_buffers_pong</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">ipc_buffers_size</span><span class="p">,</span>
+                                     <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">ipc_barriers_in</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span>
+            <span class="n">mapping</span><span class="p">,</span> <span class="n">IpcMemory</span><span class="o">.</span><span class="n">IPC_BARRIERS_SIZE_PER_GPU</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
+            <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">ipc_barriers_out</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span>
+            <span class="n">mapping</span><span class="p">,</span> <span class="n">IpcMemory</span><span class="o">.</span><span class="n">IPC_BARRIERS_SIZE_PER_GPU</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
+            <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">buffers</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">ipc_buffers_ping</span><span class="p">,</span> <span class="n">ipc_buffers_pong</span><span class="p">,</span> <span class="n">ipc_barriers_in</span><span class="p">,</span>
+            <span class="n">ipc_barriers_out</span>
+        <span class="p">]</span>
+
+        <span class="k">return</span> <span class="n">buffers</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
+            <span class="n">ipc_buffers_ping</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="n">ipc_buffers_pong</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span>
+            <span class="n">ipc_barriers_in</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="n">ipc_barriers_out</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span> <span class="o">+</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span>
+            <span class="p">[</span><span class="mi">0</span><span class="p">],</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
             <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cpu&quot;</span><span class="p">)</span>
 
@@ -1423,6 +1478,15 @@
     
   </p>
 </div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on June 03, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ae2ce6">9ae2ce6</a>.</p>
+  
+</div></div>
       
     </div>
   

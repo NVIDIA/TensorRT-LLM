@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.20.0rc3';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.20.0rc3" />
+  <meta name="docsearch:version" content="0.21.0rc0" />
 
 
   </head>
@@ -329,6 +329,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_quantization.html">Generation with Quantization</a></li>
@@ -350,6 +351,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_eagle2_decoding.html">Generate Text Using Eagle2 Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_inference_kv_events.html">Get KV Cache Events</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/llm_quantization.html">Generation with Quantization</a></li>
@@ -414,6 +416,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
@@ -448,6 +451,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 </ul>
 </div>
 </nav></div>
@@ -551,7 +555,7 @@
                                    <span class="n">WeightOnlyQuantRowLinear</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..quantization.mode</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">KV_CACHE_QUANT_ALGO_LIST</span><span class="p">,</span> <span class="n">QUANT_ALGO_LIST</span><span class="p">,</span>
                                  <span class="n">W8A8_SQ_PLUGIN_LIST</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..quantization.utils.fp4_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">float4_sf_dtype</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..quantization.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">fp4_utils</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..top_model_mixin</span><span class="w"> </span><span class="kn">import</span> <span class="n">TopModelMixin</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.convert_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">weight_only_quantize_dict</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.generation_mixin</span><span class="w"> </span><span class="kn">import</span> <span class="n">GenerationMixin</span>
@@ -603,6 +607,7 @@
     <span class="n">LOOKAHEAD_DECODING</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">EXPLICIT_DRAFT_TOKENS</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">EAGLE</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
+    <span class="n">NGRAM</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
 
 <div class="viewcode-block" id="SpeculativeDecodingMode.from_arguments">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.SpeculativeDecodingMode.from_arguments">[docs]</a>
@@ -620,6 +625,8 @@
             <span class="k">return</span> <span class="n">SpeculativeDecodingMode</span><span class="o">.</span><span class="n">EXPLICIT_DRAFT_TOKENS</span>
         <span class="k">elif</span> <span class="n">args</span><span class="o">.</span><span class="n">speculative_decoding_mode</span> <span class="o">==</span> <span class="s2">&quot;eagle&quot;</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">SpeculativeDecodingMode</span><span class="o">.</span><span class="n">EAGLE</span>
+        <span class="k">elif</span> <span class="n">args</span><span class="o">.</span><span class="n">speculative_decoding_mode</span> <span class="o">==</span> <span class="s2">&quot;ngram&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">SpeculativeDecodingMode</span><span class="o">.</span><span class="n">NGRAM</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">assert</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">&quot;Unknown speculative_decoding_mode &quot;</span> <span class="o">+</span> <span class="n">args</span><span class="o">.</span><span class="n">speculative_decoding_mode</span></div>
 </div>
@@ -2389,15 +2396,18 @@
         <span class="c1"># Interleave block scale for NVFP4 plugin.</span>
         <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="nb">list</span><span class="p">(</span><span class="n">weights</span><span class="p">):</span>
             <span class="k">if</span> <span class="n">name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s1">&#39;weights_scaling_factor&#39;</span><span class="p">):</span>
-                <span class="n">ori_shape</span> <span class="o">=</span> <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span>
+                <span class="n">out_features</span><span class="p">,</span> <span class="n">in_features</span> <span class="o">=</span> <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span>
+                <span class="n">nrows</span> <span class="o">=</span> <span class="n">fp4_utils</span><span class="o">.</span><span class="n">pad_up</span><span class="p">(</span><span class="n">out_features</span><span class="p">,</span> <span class="mi">128</span><span class="p">)</span>
+                <span class="n">ncols</span> <span class="o">=</span> <span class="n">fp4_utils</span><span class="o">.</span><span class="n">pad_up</span><span class="p">(</span><span class="n">in_features</span><span class="p">,</span> <span class="mi">4</span><span class="p">)</span>
                 <span class="n">new_name</span> <span class="o">=</span> <span class="n">name</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">&#39;weights_scaling_factor&#39;</span><span class="p">,</span>
                                         <span class="s1">&#39;weights_block_scaling_factor&#39;</span><span class="p">)</span>
                 <span class="n">weights</span><span class="p">[</span><span class="n">new_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
                 <span class="n">weights</span><span class="p">[</span>
                     <span class="n">new_name</span> <span class="o">+</span>
                     <span class="s2">&quot;_interleaved&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">nvfp4_block_scale_interleave</span><span class="p">(</span>
-                        <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">float4_sf_dtype</span><span class="p">)</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(</span>
-                        <span class="p">))</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">ori_shape</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">float4_sf_dtype</span><span class="p">)</span>
+                        <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">fp4_utils</span><span class="o">.</span><span class="n">float4_sf_dtype</span><span class="p">)</span><span class="o">.</span><span class="n">cpu</span><span class="p">(</span>
+                        <span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">())</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">nrows</span><span class="p">,</span> <span class="n">ncols</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
+                            <span class="n">fp4_utils</span><span class="o">.</span><span class="n">float4_sf_dtype</span><span class="p">)</span>
                 <span class="n">weights</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s1">&#39;weights_scaling_factor_2&#39;</span><span class="p">):</span>
                 <span class="n">new_name</span> <span class="o">=</span> <span class="n">name</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">&#39;weights_scaling_factor_2&#39;</span><span class="p">,</span>
@@ -2649,6 +2659,15 @@
     
   </p>
 </div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on June 03, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ae2ce6">9ae2ce6</a>.</p>
+  
+</div></div>
       
     </div>
   

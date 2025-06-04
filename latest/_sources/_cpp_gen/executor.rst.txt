@@ -16,6 +16,12 @@ ________
 .. doxygenfile:: tensor.h
    :project: TensorRT-LLM
 
+transferAgent.h
+_______________
+
+.. doxygenfile:: transferAgent.h
+   :project: TensorRT-LLM
+
 serialization.h
 _______________
 
