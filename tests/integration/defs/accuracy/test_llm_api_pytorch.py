@@ -781,8 +781,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252559")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
-        if torch_compile:
-            pytest.skip()
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
