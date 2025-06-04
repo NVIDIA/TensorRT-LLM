@@ -310,10 +310,10 @@ protected:
         auto const oldMax = mMaxAttentionWindow;
         mMaxAttentionWindow = newMaxAttentionWindow;
         std::for_each(std::begin(mMaxAttentionWindowVec), std::end(mMaxAttentionWindowVec),
-            [oldMax, newMaxAttentionWindow](SizeType32 w)
+            [oldMax, newMaxAttentionWindow](SizeType32& w)
             {
                 TLLM_CHECK_DEBUG_WITH_INFO(w <= oldMax, "A window can't be larger than oldMax");
-                return std::min(w, newMaxAttentionWindow); // clamp vec to newMaxAttentionWindow
+                w = std::min(w, newMaxAttentionWindow); // clamp vec to newMaxAttentionWindow
             });
     }
 
