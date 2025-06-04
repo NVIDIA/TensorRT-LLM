@@ -85,6 +85,8 @@ TargetRanksInfo TargetRanksInfoForDP(
         ? peerCacheState.getParallelConfig().mTensorParallelism / peerCacheState.getParallelConfig().mDPsize
         : peerTPNum;
 
+    int selfNbHeadsPerLayer = selfCacheState.getModelConfig().mNbKvHeadsPerLayer[0];
+    int peerNbHeadsPerLayer = peerCacheState.getModelConfig().mNbKvHeadsPerLayer[0];
     int selfTPrankInDPGroup = selfTpRank % selfTPSizeOneDPGroup;
 
     {
@@ -112,12 +114,26 @@ TargetRanksInfo TargetRanksInfoForDP(
             retRanks.push_back(irank);
         }
     }
-    return {mDomainPPSize, mDomainTPSize, std::move(retRanks)};
+    int mDuplicateHeadFactor = 1;
+    int mPeerDuplicateHeadFactor = 1;
+    if (selfNbHeadsPerLayer * selfTPSizeOneDPGroup > peerNbHeadsPerLayer * peerTPSizeOneDPGroup)
+    {
+        mDuplicateHeadFactor
+            = (selfNbHeadsPerLayer * selfTPSizeOneDPGroup) / (peerNbHeadsPerLayer * peerTPSizeOneDPGroup);
+    }
+    if (peerNbHeadsPerLayer * peerTPSizeOneDPGroup > selfNbHeadsPerLayer * selfTPSizeOneDPGroup)
+    {
+        mPeerDuplicateHeadFactor
+            = (peerNbHeadsPerLayer * peerTPSizeOneDPGroup) / (selfNbHeadsPerLayer * selfTPSizeOneDPGroup);
+    }
+
+    return {mDomainPPSize, mDomainTPSize, std::move(retRanks), mDuplicateHeadFactor, mPeerDuplicateHeadFactor};
 }
 
 TargetRanksInfo targetIRanks(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank)
 {
+    return TargetRanksInfoForDP(peerCacheState, selfCacheState, selfRank);
     if (selfCacheState.getAttentionConfig().mAttentionType == CacheState::AttentionType::kMLA
         || selfCacheState.getParallelConfig().mEnableAttentionDP
         || peerCacheState.getParallelConfig().mEnableAttentionDP)
@@ -140,8 +156,9 @@ TargetRanksInfo targetIRanks(
     int iTpRankEndInclude = (endHeadId - 1) / iNbKvHeads;
     int iPpRankStart = startLayerId / iNbLayers;
     int iPpRankEndInclude = (endLayerId - 1) / iNbLayers;
-
+    // TODO: headId  duplicate
     int iTPNum = peerCacheState.getParallelConfig().mTensorParallelism;
+    int oTPNum = selfCacheState.getParallelConfig().mTensorParallelism;
     std::vector<int> retRanks;
 
     for (int i = iTpRankStart; i <= iTpRankEndInclude; i++)
@@ -156,7 +173,18 @@ TargetRanksInfo targetIRanks(
     int mDomainPPSize = iPpRankEndInclude - iPpRankStart + 1;
     int mDomainTPSize = iTpRankEndInclude - iTpRankStart + 1;
     TLLM_CHECK(!retRanks.empty());
-    return {mDomainPPSize, mDomainTPSize, std::move(retRanks)};
+    int mDuplicateHeadFactor = 1;
+    int mPeerDuplicateHeadFactor = 1;
+    if (iNbKvHeads * iTPNum > oNbKvHeads * oTPNum)
+    {
+        mPeerDuplicateHeadFactor = (iNbKvHeads * iTPNum) / (oNbKvHeads * oTPNum);
+    }
+    if (oNbKvHeads * oTPNum > iNbKvHeads * iTPNum)
+    {
+        mDuplicateHeadFactor = (oNbKvHeads * oTPNum) / (iNbKvHeads * iTPNum);
+    }
+
+    return {mDomainPPSize, mDomainTPSize, std::move(retRanks), mDuplicateHeadFactor, mPeerDuplicateHeadFactor};
 }
 
 template <typename T>
@@ -791,6 +819,10 @@ void splitKVCache(std::vector<runtime::ITensor::SharedPtr> const& kVCacheBlocks,
     {
         outputCacheNum = targetRankInfo.mDomainPPSize;
     }
+    else
+    {
+        outputCacheNum = outputCacheNum / targetRankInfo.mPeerDuplicateHeadFactor;
+    }
     TLLM_CHECK(outputCacheNum == outputSplitBlocks.size());
     TLLM_CHECK(inputBlockNum > 0);
     auto cacheBlockSize = kVCacheBlocks.at(0)->getSize();
@@ -840,7 +872,8 @@ void splitKVCache(std::vector<runtime::ITensor::SharedPtr> const& kVCacheBlocks,
     int iTPNum = destCacheState.getParallelConfig().mTensorParallelism;
     int oTPNum = selfCacheState.getParallelConfig().mTensorParallelism;
     int layerNumDomainPP = numLayers / DomainPPSize;
-    int headNumDomainTP = headNum / DomainTPSize;
+    int headNumDomainTP
+        = headNum / (DomainTPSize / targetRankInfo.mPeerDuplicateHeadFactor); // TODO: duplicate head factor
     int kvFactor = selfCacheState.getAttentionConfig().mKvFactor;
     bool isMLA = selfCacheState.getAttentionConfig().mAttentionType == CacheState::AttentionType::kMLA;
     constexpr int mlaSubWarpSize = 16;
@@ -1017,6 +1050,10 @@ void concatenateKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
     {
         inputCacheNum = targetRankInfo.mDomainPPSize;
     }
+    else
+    {
+        inputCacheNum = inputCacheNum / targetRankInfo.mPeerDuplicateHeadFactor;
+    }
     TLLM_CHECK(inputCacheNum == inputSplitBlocks.size());
     TLLM_CHECK(outputBlockNum > 0);
     auto cacheBlockSize = outputKvCacheBlocks.at(0)->getSize();
@@ -1064,7 +1101,8 @@ void concatenateKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSpl
     int iTPNum = destCacheState.getParallelConfig().mTensorParallelism;
     int oTPNum = selfCacheState.getParallelConfig().mTensorParallelism;
     int layerNumDomainPP = numLayers / DomainPPSize;
-    int headNumDomainTP = headNum / DomainTPSize;
+    int headNumDomainTP
+        = headNum / (DomainTPSize / targetRankInfo.mPeerDuplicateHeadFactor); // TODO: duplicate head factor
     int kvFactor = selfCacheState.getAttentionConfig().mKvFactor;
 
     bool isMLA = selfCacheState.getAttentionConfig().mAttentionType == CacheState::AttentionType::kMLA;

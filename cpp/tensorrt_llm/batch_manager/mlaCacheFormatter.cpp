@@ -41,7 +41,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 // some context rank in connection
 std::vector<executor::kv_cache::Connection const*> MLACacheFormatter::pickRecvConnections(
     std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-    SizeType32 selfIdx, CacheState const& destConfig)
+    SizeType32 selfIdx, CacheState const& destConfig) const
 {
 
     TLLM_CHECK(!connections.empty());
