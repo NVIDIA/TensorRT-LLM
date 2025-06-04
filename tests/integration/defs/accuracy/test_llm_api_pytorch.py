@@ -450,7 +450,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if torch_compile and attention_dp:
             pytest.skip("https://nvbugs/5252559")
         # OOM on H100 with default free_gpu_memory_fraction=0.9
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
