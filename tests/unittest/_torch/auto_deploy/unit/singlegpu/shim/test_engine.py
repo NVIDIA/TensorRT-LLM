@@ -41,9 +41,9 @@ def get_inference_model(cache_seq_interface):
 
 @pytest.mark.parametrize("engine_cls", [ADEngine, DemoEngine])
 @pytest.mark.parametrize(
-    "attn_backend, page_size", [("TritonWithFlattenedInputs", 0), ("FlashInfer", 2)]
+    "attn_backend, attn_page_size", [("TritonWithFlattenedInputs", 0), ("FlashInfer", 2)]
 )
-def test_engine(engine_cls: Type[ADEngine], attn_backend: str, page_size: int):
+def test_engine(engine_cls: Type[ADEngine], attn_backend: str, attn_page_size: int):
     """Test the SimpleEngine functionality."""
 
     seed = 1234  # Set random seed for model param init
@@ -58,7 +58,7 @@ def test_engine(engine_cls: Type[ADEngine], attn_backend: str, page_size: int):
     sequence_info = SequenceInfo(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
-        page_size=page_size,
+        page_size=attn_page_size,
     )
     sequence_info.to(device)
 

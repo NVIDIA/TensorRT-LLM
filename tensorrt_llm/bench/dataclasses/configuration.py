@@ -9,12 +9,12 @@ from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.auto_deploy.shim import AutoDeployConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DynamicBatchConfig,
                                  ExtendedRuntimePerfKnobConfig, KvCacheConfig,
                                  SchedulerConfig)
+from tensorrt_llm.llmapi.llm_args import AutoDeployLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
@@ -110,8 +110,8 @@ class PerformanceOptions:
     def get_pytorch_perf_config(self) -> PyTorchConfig:
         return self.pytorch_config
 
-    def get_autodeploy_perf_config(self) -> AutoDeployConfig:
-        ad_config = AutoDeployConfig(**self.pytorch_config)
+    def get_autodeploy_perf_config(self) -> AutoDeployLlmArgs:
+        ad_config = AutoDeployLlmArgs(**self.pytorch_config)
         ad_config.attn_backend = "FlashInfer"
         ad_config.torch_compile_enabled = True
         ad_config.skip_loading_weights = True
