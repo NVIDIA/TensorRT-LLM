@@ -452,8 +452,6 @@ perf/test_perf.py::test_perf[qwen_14b_chat-cppmanager-exe-plugin_ifb-float16-inp
 perf/test_perf.py::test_perf[llama_v3.1_70b-bench-bfloat16-input_output_len:1024,1024-tp:2-gpus:2] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
 perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:128,128-quant:int8-gpus:2] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
 perf/test_perf.py::test_perf[starcoder2_3b-bench-pytorch-float16-input_output_len:512,200] SKIP (https://nvbugspro.nvidia.com/bug/5295411)
-test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b] SKIP (https://nvbugs/5302895)
-test_e2e.py::test_trtllm_bench_llmapi_launch[trt_backend-llama-v3-llama3-8b] SKIP (https://nvbugs/5302895)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False] SKIP (https://nvbugs/5303573)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True] SKIP (https://nvbugs/5303573)
 test_e2e.py::test_openai_multi_chat_example SKIP (https://nvbugs/5236980)

@@ -63,7 +63,8 @@ BASE_ZMQ_CLASSES = {
         "FinishReason", "KvCacheConfig", "KvCacheTransferMode",
         "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
-        "SchedulerConfig", "DynamicBatchConfig"
+        "SchedulerConfig", "DynamicBatchConfig", "ContextChunkingPolicy",
+        "CacheTransceiverConfig"
     ],
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig"],
     "tensorrt_llm._torch.model_config": ["MoeLoadBalancerConfig"],
@@ -108,6 +109,9 @@ BASE_ZMQ_CLASSES = {
     ],
     "torch._utils": ["_rebuild_tensor_v2"],
     "torch.storage": ["_load_from_bytes"],
+    "transformers.tokenization_utils_fast": ["PreTrainedTokenizerFast"],
+    "tokenizers": ["Tokenizer", "AddedToken"],
+    "tokenizers.models": ["Model"],
 }
 
 
