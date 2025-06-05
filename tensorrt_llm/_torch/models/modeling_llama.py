@@ -120,7 +120,7 @@ class Llama4Attention(Attention):
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
                    v: Optional[torch.Tensor], position_ids: torch.Tensor):
-        # Llama applies QK norm after RoPE.
+        # Llama4 applies QK norm after RoPE.
 
         q, k, v = self.split_qkv(q, k, v)
         if position_ids is not None:
