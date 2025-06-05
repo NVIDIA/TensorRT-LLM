@@ -1,27 +1,22 @@
+import pickle
+import sys
+import traceback
 from typing import Dict, List, Optional
 
+import cloudpickle
 import torch
 import torch.nn as nn
+from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 
-
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
                                                    DefaultMoeRoutingMethod,
                                                    FluxFusedMoE)
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
-from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
-import pickle
-import sys
-import traceback
-
-import cloudpickle
-
-from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
-import tensorrt_llm
 from tensorrt_llm.mapping import Mapping
-
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -33,20 +28,22 @@ MPI.pickle.__init__(
 SEED = 12345
 SEQ_LEN = 128
 
+
 def inf_to_nan(tensor):
-    return torch.where(torch.isinf(tensor), torch.tensor(float('nan'), device=tensor.device), tensor)
+    return torch.where(torch.isinf(tensor),
+                       torch.tensor(float('nan'), device=tensor.device), tensor)
+
 
 def relative_error(pred, target):
     abs_error = torch.abs(pred - target)
-    
+
     re = torch.where(
-        torch.abs(target) > 1e-8, 
-        abs_error / torch.abs(target),
-        torch.zeros_like(abs_error)
-    )
+        torch.abs(target) > 1e-8, abs_error / torch.abs(target),
+        torch.zeros_like(abs_error))
     mask = torch.isfinite(re)
     valid_re = re[mask]
     return valid_re.max(), valid_re.mean()
+
 
 def absolute_error(pred, target):
     ae = torch.abs(pred - target)
@@ -56,82 +53,83 @@ def absolute_error(pred, target):
 
 
 def run_single_rank(single_rank_forward_func, routing_method, num_experts,
-                    hidden_size, intermediate_size, dtype, world_size, tp_size, ep_size):
+                    hidden_size, intermediate_size, dtype, world_size, tp_size,
+                    ep_size):
     rank = tensorrt_llm.mpi_rank()
     try:
-        single_rank_forward_func(routing_method, num_experts,
-                    hidden_size, intermediate_size, dtype, world_size, tp_size, ep_size, rank)
+        single_rank_forward_func(routing_method, num_experts, hidden_size,
+                                 intermediate_size, dtype, world_size, tp_size,
+                                 ep_size, rank)
     except Exception:
         traceback.print_exc()
         raise
     return True
 
+
 @torch.inference_mode
-def fused_moe(    
-    routing_method,
-    num_experts: int,
-    hidden_size: int,
-    intermediate_size: int,
-    dtype: torch.dtype,
-    world_size: int,
-    tp_size: int,
-    ep_size: int,
-    rank: int):
+def fused_moe(routing_method, num_experts: int, hidden_size: int,
+              intermediate_size: int, dtype: torch.dtype, world_size: int,
+              tp_size: int, ep_size: int, rank: int):
     try:
         torch.cuda.set_device(rank)
         torch.manual_seed(SEED)
         torch.cuda.manual_seed(SEED)
-        x = torch.rand((SEQ_LEN, hidden_size), dtype=dtype, device='cuda') * 2 - 1
+        x = torch.rand(
+            (SEQ_LEN, hidden_size), dtype=dtype, device='cuda') * 2 - 1
         router_logits = torch.randn((SEQ_LEN, num_experts), dtype=dtype).cuda()
 
         weights = {}
         for expert_id in range(num_experts):
-            w1_weight = torch.rand((intermediate_size, hidden_size),
-                                    dtype=dtype).cuda() * 2 - 1
-            w2_weight = torch.rand((hidden_size, intermediate_size),
-                                    dtype=dtype).cuda() * 2 - 1
-            w3_weight = torch.rand((intermediate_size, hidden_size),
-                                    dtype=dtype).cuda() * 2 - 1
+            w1_weight = torch.rand(
+                (intermediate_size, hidden_size), dtype=dtype).cuda() * 2 - 1
+            w2_weight = torch.rand(
+                (hidden_size, intermediate_size), dtype=dtype).cuda() * 2 - 1
+            w3_weight = torch.rand(
+                (intermediate_size, hidden_size), dtype=dtype).cuda() * 2 - 1
             weights[f"{expert_id}.w1.weight"] = w1_weight
             weights[f"{expert_id}.w2.weight"] = w2_weight
             weights[f"{expert_id}.w3.weight"] = w3_weight
 
         model_config = ModelConfig()
-        model_config.mapping = Mapping(
-            world_size=world_size,
-            rank=rank,
-            tp_size=world_size,
-            moe_tp_size=tp_size,
-            moe_ep_size=ep_size,
-            enable_attention_dp=True)
+        model_config.mapping = Mapping(world_size=world_size,
+                                       rank=rank,
+                                       tp_size=world_size,
+                                       moe_tp_size=tp_size,
+                                       moe_ep_size=ep_size,
+                                       enable_attention_dp=True)
         fused_moe = FluxFusedMoE(num_experts=num_experts,
-                         routing_method=routing_method,
-                         hidden_size=hidden_size,
-                         intermediate_size=intermediate_size,
-                         dtype=dtype,
-                         model_config=model_config)
+                                 routing_method=routing_method,
+                                 hidden_size=hidden_size,
+                                 intermediate_size=intermediate_size,
+                                 dtype=dtype,
+                                 model_config=model_config)
 
         fused_moe.load_weights([weights])
         fused_moe.cuda()
 
         ref_fused_moe = RefGatedMLPFusedMoE(num_experts=num_experts,
-                                        routing_method=routing_method,
-                                        hidden_size=hidden_size,
-                                        intermediate_size=intermediate_size,
-                                        dtype=dtype,
-                                        model_config=ModelConfig())
+                                            routing_method=routing_method,
+                                            hidden_size=hidden_size,
+                                            intermediate_size=intermediate_size,
+                                            dtype=dtype,
+                                            model_config=ModelConfig())
         ref_fused_moe.load_weights([weights])
         ref_fused_moe.cuda()
 
-        output = fused_moe(x, router_logits, False, None, [SEQ_LEN for _ in range(world_size)], True)
+        output = fused_moe(x, router_logits, False, None,
+                           [SEQ_LEN for _ in range(world_size)], True)
         ref_output = ref_fused_moe(x, router_logits)
-         
+
         torch.cuda.synchronize()
-        ae_max, ae_mean  = absolute_error(output, ref_output)
+        ae_max, ae_mean = absolute_error(output, ref_output)
         re_max, re_mean = relative_error(output, ref_output)
 
         try:
-            torch.testing.assert_close(inf_to_nan(output), inf_to_nan(ref_output), rtol=0.2, atol=0.2, equal_nan=True)
+            torch.testing.assert_close(inf_to_nan(output),
+                                       inf_to_nan(ref_output),
+                                       rtol=0.2,
+                                       atol=0.2,
+                                       equal_nan=True)
         except Exception:
             if re_mean > 0.005:
                 traceback.print_exc()
@@ -140,7 +138,10 @@ def fused_moe(
         traceback.print_exc()
         raise
 
-def test_fused_moe(dtype=torch.float16, experts=72, RoutingMethodCls=DefaultMoeRoutingMethod):
+
+def test_fused_moe(dtype=torch.float16,
+                   experts=72,
+                   RoutingMethodCls=DefaultMoeRoutingMethod):
     HIDDEN_SIZE = 2560
     INTERMEDIATE_SIZE = 1536
     NUM_EXPERTS = experts
@@ -153,8 +154,10 @@ def test_fused_moe(dtype=torch.float16, experts=72, RoutingMethodCls=DefaultMoeR
     with MPIPoolExecutor(max_workers=total_workers) as executor:
         results = executor.map(
             run_single_rank,
-            *zip(*[(fused_moe, routing_method, NUM_EXPERTS,
-                    HIDDEN_SIZE, INTERMEDIATE_SIZE, dtype, total_workers, TP_SIZE, EP_SIZE)] * total_workers))
+            *zip(
+                *[(fused_moe, routing_method, NUM_EXPERTS, HIDDEN_SIZE,
+                   INTERMEDIATE_SIZE, dtype, total_workers, TP_SIZE, EP_SIZE)] *
+                total_workers))
         for r in results:
             assert r is True
 
@@ -207,8 +210,9 @@ class RefGatedMLPFusedMoE(nn.Module):
             expert_inputs = hidden_states[batch_idx].to(self.dtype)
 
             output = self.experts[expert_id](expert_inputs).to(self.dtype)
-            final_hidden_states[batch_idx] += routing_weights[
-                batch_idx, nth_expert, None] * output
+            final_hidden_states[batch_idx] += routing_weights[batch_idx,
+                                                              nth_expert,
+                                                              None] * output
 
         final_hidden_states = final_hidden_states.reshape(hidden_states.shape)
         return final_hidden_states
@@ -260,6 +264,7 @@ class RefGatedMLPFusedMoE(nn.Module):
 
             self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
             self.experts[expert].down_proj.load_weights(down_proj_weights)
+
 
 if __name__ == '__main__':
     test_fused_moe()

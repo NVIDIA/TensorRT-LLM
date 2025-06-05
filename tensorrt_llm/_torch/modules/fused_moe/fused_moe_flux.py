@@ -51,7 +51,6 @@ class FluxFusedMoE(VanillaMoE):
             enable_alltoall=enable_alltoall,
             pack_weights=pack_weights,
         )
-        self.create_weights()
         self._check_configs()
         # Flux will create tensors when initializing nvshmem, so we need to use no_dispatch mode to avoid creating tensors in Meta Mode
         with no_dispatch():
@@ -61,7 +60,7 @@ class FluxFusedMoE(VanillaMoE):
         # set up flux related ctx according to: https://github.com/bytedance/flux/blob/main/examples/moe.py
         self.dist_env = get_dist_env(self.mapping)
         tp_env = flux.DistEnvTPWithEP(tp_group=self.dist_env.get_world(),
-                                      nnodes=self.mapping.nnode,
+                                      nnodes=self.mapping.node_num,
                                       ep_group=get_ep_group(self.mapping))
         topk = self.routing_method.get_experts_per_token()
         # flux_m_max is the size for the shared memory(nvshmem) used by flux
@@ -96,8 +95,6 @@ class FluxFusedMoE(VanillaMoE):
         self,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-        cutlass_min_latency_mode: bool = False,
-        output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
         **kwargs,
@@ -117,7 +114,9 @@ class FluxFusedMoE(VanillaMoE):
 
         # split the gate_up_proj_weight into up_proj_weight and gate_weight since flux does not support fused GatedMLP
         up_proj_weight, gate_weight = torch.split(
-            self.gate_up_proj_weight, self.intermediate_size_per_partition, dim=1)
+            self.gate_up_proj_weight,
+            self.intermediate_size_per_partition,
+            dim=1)
 
         # Flux requires global token_selected_experts and token_final_scales on each rank
         token_selected_experts, token_final_scales = allgather(
@@ -126,8 +125,6 @@ class FluxFusedMoE(VanillaMoE):
             dim=0,
             sizes=None if use_dp_padding else all_rank_num_tokens)
 
-
-
         splits_gpu = torch.bincount(token_selected_experts.view(-1),
                                     minlength=self.num_experts).to(torch.int32)
         splits_cpu = splits_gpu.to("cpu")
@@ -135,13 +132,12 @@ class FluxFusedMoE(VanillaMoE):
 
         nrows_ep = torch.sum(splits_cpu[self.expert_start:self.expert_end])
 
-
         # output buffer of gate and up_proj for the first GEMM
         flux_intermediate_output = [
-            torch.zeros((nrows_ep, self.intermediate_size_per_partition), dtype=self.dtype, device=torch.cuda.current_device())
-            for _ in range(2)
+            torch.zeros((nrows_ep, self.intermediate_size_per_partition),
+                        dtype=self.dtype,
+                        device=torch.cuda.current_device()) for _ in range(2)
         ]
-
 
         weights = [gate_weight.contiguous(), up_proj_weight.contiguous()]
         self.flux_ag_op.forward_multiple_weights(
@@ -153,7 +149,6 @@ class FluxFusedMoE(VanillaMoE):
         gate_output, up_proj_output = flux_intermediate_output[
             0], flux_intermediate_output[1]
         gated_mlp_output = F.silu(gate_output) * up_proj_output
-
 
         reshaped_routing_scores = token_final_scales.to(
             gated_mlp_output.dtype).reshape(-1, 1)
@@ -188,28 +183,30 @@ class FluxFusedMoE(VanillaMoE):
         assert len(weights) == 1
         weights = weights[0]
 
-        def load_expert_gate_up_proj_weight(gate_weight,
-                                     up_proj_weight,
-                                     dst_gate_up_proj_weight: torch.Tensor):
+        def load_expert_gate_up_proj_weight(
+                gate_weight, up_proj_weight,
+                dst_gate_up_proj_weight: torch.Tensor):
             gate_weight_shard = load_weight_shard(gate_weight, self.tp_size,
-                                                self.tp_rank,
-                                                TensorParallelMode.COLUMN)
-            up_proj_weight_shard = load_weight_shard(up_proj_weight, self.tp_size,
-                                                self.tp_rank,
-                                                TensorParallelMode.COLUMN)
+                                                  self.tp_rank,
+                                                  TensorParallelMode.COLUMN)
+            up_proj_weight_shard = load_weight_shard(up_proj_weight,
+                                                     self.tp_size, self.tp_rank,
+                                                     TensorParallelMode.COLUMN)
 
-            w31_weight_shard = torch.cat([up_proj_weight_shard, gate_weight_shard],
-                                         dim=0)
-            dst_gate_up_proj_weight.copy_(w31_weight_shard.view(
-                dst_gate_up_proj_weight.dtype))
+            w31_weight_shard = torch.cat(
+                [up_proj_weight_shard, gate_weight_shard], dim=0)
+            dst_gate_up_proj_weight.copy_(
+                w31_weight_shard.view(dst_gate_up_proj_weight.dtype))
 
         def load_expert_down_proj_weight(down_proj_weight,
-                                  dst_down_proj_weight: torch.Tensor):
-            down_proj_weight_shard = load_weight_shard(down_proj_weight, self.tp_size,
-                                                self.tp_rank,
-                                                TensorParallelMode.ROW)
+                                         dst_down_proj_weight: torch.Tensor):
+            down_proj_weight_shard = load_weight_shard(down_proj_weight,
+                                                       self.tp_size,
+                                                       self.tp_rank,
+                                                       TensorParallelMode.ROW)
 
-            dst_down_proj_weight.copy_(down_proj_weight_shard.view(dst_down_proj_weight.dtype))
+            dst_down_proj_weight.copy_(
+                down_proj_weight_shard.view(dst_down_proj_weight.dtype))
 
         # Use multi-threading to load expert weights in parallel.
         # Even though CPython has global interpreter lock (GIL),
@@ -225,8 +222,8 @@ class FluxFusedMoE(VanillaMoE):
                 up_proj_weight = weights[f"{expert_id}.w3.weight"]
                 down_proj_weight = weights[f"{expert_id}.w2.weight"]
             elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_up_proj_weight = weights["gate_up_proj"][expert_id].transpose(
-                    0, 1)
+                w1_up_proj_weight = weights["gate_up_proj"][
+                    expert_id].transpose(0, 1)
                 gate_weight, up_proj_weight = w1_up_proj_weight.chunk(2, dim=0)
                 down_proj_weight = weights["down_proj"][expert_id].transpose(
                     0, 1).contiguous()
@@ -235,15 +232,16 @@ class FluxFusedMoE(VanillaMoE):
                     f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
                 )
 
-            thread = threading.Thread(target=load_expert_gate_up_proj_weight,
-                                      args=(gate_weight, up_proj_weight,
-                                            self.gate_up_proj_weight.data[expert_idx]))
+            thread = threading.Thread(
+                target=load_expert_gate_up_proj_weight,
+                args=(gate_weight, up_proj_weight,
+                      self.gate_up_proj_weight.data[expert_idx]))
             thread.start()
             threads.append(thread)
 
-            thread = threading.Thread(target=load_expert_down_proj_weight,
-                                      args=(down_proj_weight,
-                                            self.down_proj_weight.data[expert_idx]))
+            thread = threading.Thread(
+                target=load_expert_down_proj_weight,
+                args=(down_proj_weight, self.down_proj_weight.data[expert_idx]))
             thread.start()
             threads.append(thread)
 
@@ -256,8 +254,8 @@ class FluxFusedMoE(VanillaMoE):
         self._weights_created = True
         weight_dtype = self.dtype
         gate_up_proj_weight_shape = (self.expert_size_per_partition,
-                              self.intermediate_size_per_partition * 2,
-                              self.hidden_size)
+                                     self.intermediate_size_per_partition * 2,
+                                     self.hidden_size)
         down_proj_weight_shape = (
             self.expert_size_per_partition,
             self.hidden_size,
@@ -265,13 +263,13 @@ class FluxFusedMoE(VanillaMoE):
         )
 
         # Fused gate_up_proj (column parallel)
-        gate_up_proj_weight = nn.Parameter(torch.empty(gate_up_proj_weight_shape,
-                                                dtype=weight_dtype),
-                                    requires_grad=False)
+        gate_up_proj_weight = nn.Parameter(torch.empty(
+            gate_up_proj_weight_shape, dtype=weight_dtype),
+                                           requires_grad=False)
         self.register_parameter("gate_up_proj_weight", gate_up_proj_weight)
 
         # down_proj (row parallel)
         down_proj_weight = nn.Parameter(torch.empty(down_proj_weight_shape,
-                                             dtype=weight_dtype),
-                                 requires_grad=False)
+                                                    dtype=weight_dtype),
+                                        requires_grad=False)
         self.register_parameter("down_proj_weight", down_proj_weight)
