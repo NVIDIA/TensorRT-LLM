@@ -26,7 +26,6 @@ from utils.util import skip_pre_blackwell
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams)
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -100,12 +99,12 @@ def row_linear_residual_norm_fusion_forward(
     MPI.COMM_WORLD.barrier()
 
     allreduce = AllReduce(
-        model_config=ModelConfig(mapping=Mapping(
+        mapping=Mapping(
             world_size=tensor_parallel_size,
             tp_size=tensor_parallel_size,
             rank=tensor_parallel_rank,
         ),
-                                 strategy=AllReduceStrategy.MNNVL),
+        strategy=AllReduceStrategy.MNNVL,
         dtype=dtype,
     )
 

@@ -17,7 +17,6 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm.mapping import Mapping
 
 from ...models.modeling_utils import QuantConfig
-from ..model_config import ModelConfig
 from ..utils import Fp4QuantizedTensor
 
 
@@ -695,8 +694,8 @@ class Linear(nn.Module):
         self.in_features = local_in_features
         self.out_features = local_out_features
 
-        self.all_reduce = AllReduce(model_config=ModelConfig(
-            mapping=self.mapping)) if reduce_output else None
+        self.all_reduce = AllReduce(
+            mapping=self.mapping) if reduce_output else None
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
