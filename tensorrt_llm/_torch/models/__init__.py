@@ -17,6 +17,7 @@ from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_nemotron_nas import NemotronNASForCausalLM
 from .modeling_phi3 import Phi3ForCausalLM
 from .modeling_phi4mm import Phi4MMForCausalLM
+from .modeling_orangina import OranginaForCausalLM
 from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
                             Qwen2ForRewardModel)
 from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
@@ -58,6 +59,7 @@ __all__ = [
     "Qwen2_5_VLModel",
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
+    "OranginaForCausalLM",
 ]
 
 if transformers.__version__ >= "4.45.1":

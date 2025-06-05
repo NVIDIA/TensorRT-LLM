@@ -1,8 +1,9 @@
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import nn
+from tqdm import tqdm
 
 from tensorrt_llm._torch.distributed import AllReduceParams
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -14,13 +15,13 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention, QkNormType
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (MoEWeightLoadingMode,
+from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
                                  RenormalizeMoeRoutingMethod, create_moe)
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..utils import Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             register_auto_model)
+                             filter_weights, register_auto_model)
 
 
 @dataclass
@@ -131,7 +132,8 @@ class MLPBlock(torch.nn.Module):
             in_features=pretrained_config.hidden_size,
             out_features=pretrained_config.num_experts,
             dtype=pretrained_config.torch_dtype,
-            use_custom_cublas_mm=True,  # TODO: check perf
+            use_custom_cublas_mm=
+            False,  # TODO: check perf & cublass mm can not support bias.
         )
 
         self.routing_method = RenormalizeMoeRoutingMethod(
@@ -165,7 +167,7 @@ class MLPBlock(torch.nn.Module):
         g = self.gate(t)
 
         # TODO: add bias and customized swiglu to MoE kernels
-        t = self.experts(x=t, routing_logits=g)
+        t = self.experts(x=t, router_logits=g)
         return x + t
 
 
@@ -264,7 +266,6 @@ class Transformer(DecoderModel):
 
 
 # TODO: fix plumbing for OranginaModelConfig
-# TODO: implement weight loading
 @register_auto_model("OranginaForCausalLM")
 class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
                                                   OranginaModelConfig]):
@@ -303,3 +304,49 @@ class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
             attn_metadata,
             return_context_logits,
         )
+
+    def load_weights(self, weights: Dict):
+        # TODO: remove the upcast
+        for k, v in weights.items():
+            if v.dtype == torch.float8_e5m2:
+                weights[k] = v.to(self.model.dtype)
+
+        params_map = {
+            # TRTLLM module name : Orangina module name
+            "qkv_proj": "qkv",
+            "o_proj": "out",
+            "lm_head": "unembedding",
+            "sinks": "sdpa.sinks",
+            # "experts": ["mlp1", "mlp2"]
+        }
+        for name, module in tqdm(list(self.named_modules()),
+                                 desc="Loading weights"):
+            if len(module._parameters) <= 0:
+                continue
+            names = name.split(".")
+            if names[-1] in params_map:
+                names[-1] = params_map[names[-1]]
+            # Drop the first "model" prefix
+            if names[0] == 'model':
+                name = '.'.join(names[1:])
+            else:
+                name = '.'.join(names)
+            module_weights = filter_weights(name, weights)
+            # TODO: Make sure MoE is fused or not.
+            if isinstance(module, MoE):
+                pass
+            elif isinstance(module, AttentionBlock):
+                module_weight = filter_weights(name, weights)
+                module.sinks.data = module_weight[name]
+            # TODO: Make sure QKV is fused or not.
+            elif hasattr(module, "load_weights"):
+                # Load Attention module weights.
+                if 'qkv' in name:
+                    continue
+                module.load_weights(weights=[module_weights])
+            else:
+                # Load LN weights.
+                for n, p in module._parameters.items():
+                    if p is not None:
+                        p.data.copy_(module_weights[n.replace(
+                            "weight", "scale")][:])
