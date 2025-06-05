@@ -631,7 +631,7 @@ class CachedModelLoader:
         self.model_loader = ModelLoader(self.llm_args)
 
         if self.llm_args.backend is not None:
-            if self.llm_args.backend not in ["pytorch", "autodeploy"]:
+            if self.llm_args.backend not in ["pytorch", "_autodeploy"]:
                 raise ValueError(
                     f'backend {self.llm_args.backend} is not supported.')
 
