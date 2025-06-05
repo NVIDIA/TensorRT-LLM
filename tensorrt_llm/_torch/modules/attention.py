@@ -51,14 +51,14 @@ class Attention(nn.Module):
             num_key_value_heads (int): The number of key value heads.
             max_position_embeddings (int): The maximum position embeddings.
             bias (bool): Whether to use bias in the linear layers.
-            pos_embd_params (PositionalEmbeddingParams): The positional embedding parameters.
-            rope_fusion (bool): Whether to fuse RoPE into the attention OP (self.attn) and skip applying RoPE using a standalone module (self.rotary_emb). If None, the attnention backend will decide whether the fusion is supported.
-            layer_idx (int): The layer index.
+            pos_embd_params (Optional[PositionalEmbeddingParams]): The positional embedding parameters.
+            rope_fusion (Optional[bool]): Whether to fuse RoPE into the attention OP and skip applying unfused RoPE. If None, whether to fuse is decided by the capability of the attention backend.
+            layer_idx (Optional[int]): The layer index.
             dtype (torch.dtype): The data type.
-            dense_bias (bool): Whether to use bias in the output projection layer.
-            config (ModelConfig): The model configuration.
+            dense_bias (Optional[bool]): Whether to use bias in the output projection layer.
+            config (Optional[ModelConfig]): The model configuration.
             q_scaling (float): The scaling factor for the qk_scale. The definition is $O = softmax(QK^T * qk_scale) * V, qk_scale = 1 / (sqrt(head_dim) * q_scaling)$. The default value is 1.0.
-            attention_chunk_size (int): See [Chunked Attention] below.
+            attention_chunk_size (Optional[int]): See [Chunked Attention] below.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -159,6 +159,9 @@ class Attention(nn.Module):
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
+        # Whether to fuse RoPE into the attention OP.
+        # If true, RoPE will be applied in self.attn.forward.
+        # If false, RoPE will be applied in self.apply_rope.
         self.rope_fusion = rope_fusion
         if self.rope_fusion and not attn_cls.support_fused_rope():
             logger.warning(
