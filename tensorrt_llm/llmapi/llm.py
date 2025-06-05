@@ -352,7 +352,7 @@ class LLM:
                 # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
                 # In the future, we should refactor this to:
                 # 1. Extend support for more modalities and models
-                # 2. Decouple input processor into distinct phases (preprocessor (all preprocessing logics), vision model (fuse in model fwd), etc.)
+                # 2. Decouple input processor into distinct phases (preprocessor (all preprocessing logics), vision model (fuse in model fwd), etc.
                 input_processor_with_hash = create_input_processor_with_hash(
                     self.input_processor)
                 with nvtx_range_debug("input_processor_with_hash"):
