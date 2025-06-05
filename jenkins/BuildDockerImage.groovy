@@ -204,7 +204,7 @@ def buildImage(config, imageKeyToTag)
     def customImageWithTag = "${IMAGE_NAME}/${makefileStage}:${customTag}"
 
     if (target == "ngc-release") {
-        if (env.triggerByPostMerge) {
+        if (env.triggerByPostMerge == true) {
             echo "Use NGC artifacts for post merge build"
             dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
             imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
