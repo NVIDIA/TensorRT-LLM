@@ -50,16 +50,15 @@ class Qwen3Attention(Attention):
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
-            pos_embd_params=pos_embd_params
-            if not self.fuse_qk_norm_rope else None,
+            pos_embd_params=pos_embd_params if not self.fuse_qk_norm_rope else
+            None,  # If fuse_qk_norm_rope is true, we pass pos_embd_params=None to super().__init__ to skip RoPE in other places
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=config.attention_bias,
             config=model_config,
         )
 
-        # If fuse_qk_norm_rope is true, we pass pos_embd_params=None to super().__init__ to skip RoPE in other places,
-        # and we need to do assignment to record the actual pos_embd_params.
+        # Record pos_embd_params for fused qk_norm_rope.
         self.pos_embd_params = pos_embd_params
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
@@ -105,7 +104,6 @@ class Qwen3Attention(Attention):
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
                    v: Optional[torch.Tensor], position_ids: torch.Tensor):
         # Qwen3 applies QK norm before RoPE.
-
         if not self.fuse_qk_norm_rope:
             q, k, v = self.split_qkv(q, k, v)
             q, k = self.apply_qk_norm(q, k)

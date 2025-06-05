@@ -5,6 +5,7 @@ from typing import Optional, Union, cast
 import torch
 from torch import nn
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
@@ -33,6 +34,7 @@ class Attention(nn.Module):
         max_position_embeddings: int,
         bias: bool,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
+        rope_fusion: Optional[bool] = None,
         layer_idx: Optional[int] = None,
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
@@ -50,6 +52,7 @@ class Attention(nn.Module):
             max_position_embeddings (int): The maximum position embeddings.
             bias (bool): Whether to use bias in the linear layers.
             pos_embd_params (PositionalEmbeddingParams): The positional embedding parameters.
+            rope_fusion (bool): Whether to fuse RoPE into the attention OP (self.attn) and skip applying RoPE using a standalone module (self.rotary_emb). If None, the attnention backend will decide whether the fusion is supported.
             layer_idx (int): The layer index.
             dtype (torch.dtype): The data type.
             dense_bias (bool): Whether to use bias in the output projection layer.
@@ -156,13 +159,18 @@ class Attention(nn.Module):
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
-        # enable_rope_fusion: Whether to fuse RoPE into the attention OP.
-        # If true, RoPE will be applied in self.attn.forward.
-        # If false, RoPE will be applied in self.apply_rope.
-        self.enable_rope_fusion = attn_cls.support_fused_rope()
+        self.rope_fusion = rope_fusion
+        if self.rope_fusion and not attn_cls.support_fused_rope():
+            logger.warning(
+                "rope_fusion is true but the attention backend does not support it. Will disable rope_fusion."
+            )
+            self.rope_fusion = False
+        # If rope_fusion is not specified, enable if the attention backend supports it.
+        if self.rope_fusion is None:
+            self.rope_fusion = attn_cls.support_fused_rope()
 
         self.rotary_emb = None
-        if not self.enable_rope_fusion and self.pos_embd_params is not None:
+        if not self.rope_fusion and self.pos_embd_params is not None:
             self.rotary_emb = RotaryEmbedding(
                 self.pos_embd_params.rope,
                 head_dim=self.head_dim,
@@ -175,8 +183,7 @@ class Attention(nn.Module):
             self.num_heads,
             self.head_dim,
             self.num_key_value_heads,
-            pos_embd_params=self.pos_embd_params
-            if self.enable_rope_fusion else None,
+            pos_embd_params=self.pos_embd_params if self.rope_fusion else None,
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
@@ -295,7 +302,7 @@ class Attention(nn.Module):
         """
         q, k, v = self.split_qkv(q, k, v)
         # If RoPE is fused into the attention OP, do not apply RoPE here.
-        if not self.enable_rope_fusion and position_ids is not None:
+        if not self.rope_fusion and position_ids is not None:
             q, k = self.rotary_emb(position_ids, [q, k])
         return q, k, v
 
@@ -581,14 +588,14 @@ class MLA(nn.Module):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        self.enable_rope_fusion = self.mha.support_fused_rope()
+        self.rope_fusion = self.mha.support_fused_rope()
         self.support_fused_qkv = self.mha.support_fused_qkv()
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope,
             head_dim=self.qk_rope_head_dim,
             is_neox=pos_embd_params.is_neox,
         )
-        self.apply_rotary_emb = not self.enable_rope_fusion
+        self.apply_rotary_emb = not self.rope_fusion
 
         if not config.skip_create_weights_in_init:
             self.create_weights()

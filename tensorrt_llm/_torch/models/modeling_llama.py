@@ -75,6 +75,8 @@ class Llama4Attention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
             pos_embd_params=pos_embd_params,
+            rope_fusion=not self.
+            use_qk_norm,  # Llama4 uses qk_norm after RoPE, so it is not possible to fuse RoPE into the attention OP with qk_norm.
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
@@ -82,7 +84,6 @@ class Llama4Attention(Attention):
         )
 
         if self.use_qk_norm:
-            assert self.use_rope, "QK norm should not be used for nope layers"
             self.head_dim = config.hidden_size // config.num_attention_heads
             self.qk_norm = RMSNorm(hidden_size=self.head_dim,
                                    eps=1e-6,
@@ -90,9 +91,6 @@ class Llama4Attention(Attention):
                                    has_weights=False)
             self.aux_stream = aux_stream
             self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
-
-            # Llama4 uses qk_norm after RoPE, so it is not possible to fuse RoPE into the attention OP.
-            self.enable_rope_fusion = False
 
         self.attn_temperature_tuning = attn_temperature_tuning and nope_layer
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
@@ -120,11 +118,10 @@ class Llama4Attention(Attention):
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
                    v: Optional[torch.Tensor], position_ids: torch.Tensor):
-        # Llama4 applies QK norm after RoPE.
-
         q, k, v = self.split_qkv(q, k, v)
         if position_ids is not None:
             q, k, v = super().apply_rope(q, k, v, position_ids)
+        # Llama4 applies QK norm after RoPE.
         if self.use_qk_norm:
             q, k = self.apply_qk_norm(q, k)
 
