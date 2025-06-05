@@ -139,14 +139,14 @@ def run_disaggregated_test(example_dir,
                       stdout=output_workers,
                       stderr=subprocess.STDOUT,
                       env=env,
-                      cwd=cwd),
+                      cwd=cwd) as worker_proc,
                 # Start server
                 open('output_disagg.log', 'w') as output_disagg,
                 popen(server_cmd,
                       stdout=output_disagg,
                       stderr=subprocess.STDOUT,
                       env=env,
-                      cwd=cwd)):
+                      cwd=cwd) as disagg_proc):
             client_dir = f"{example_dir}/clients"
             for _ in range(num_iters):
                 client_cmd = [
@@ -156,25 +156,33 @@ def run_disaggregated_test(example_dir,
                     '--server-start-timeout',
                     str(server_start_timeout)
                 ]
-                check_call(client_cmd, env=env)
+                check_call(client_cmd,
+                           env=env,
+                           poll_procs=[worker_proc, disagg_proc])
 
                 # Streaming client run
                 streaming_client_cmd = client_cmd + [
                     '--streaming', '-o', 'output_streaming.json'
                 ]
-                check_call(streaming_client_cmd, env=env)
+                check_call(streaming_client_cmd,
+                           env=env,
+                           poll_procs=[worker_proc, disagg_proc])
 
                 # Run the chat completion endpoint test only for TinyLlama
                 if test_desc == "overlap":
                     chat_client_cmd = client_cmd + [
                         '-e', 'chat', '-o', 'output_chat.json'
                     ]
-                    check_call(chat_client_cmd, env=env)
+                    check_call(chat_client_cmd,
+                               env=env,
+                               poll_procs=[worker_proc, disagg_proc])
 
                     streaming_chat_client_cmd = chat_client_cmd + [
                         '--streaming', '-o', 'output_streaming_chat.json'
                     ]
-                    check_call(streaming_chat_client_cmd, env=env)
+                    check_call(streaming_chat_client_cmd,
+                               env=env,
+                               poll_procs=[worker_proc, disagg_proc])
 
                 # Verify outputs
                 not_expected_strings = ["Berlin Berlin"]
