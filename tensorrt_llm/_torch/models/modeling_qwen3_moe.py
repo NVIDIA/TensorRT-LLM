@@ -90,7 +90,7 @@ class Qwen3MoE(nn.Module):
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.mapping = model_config.mapping
         self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_backend)
+                                   strategy=model_config.allreduce_strategy)
         self.enable_alltoall = Qwen3MoE.should_enable_alltoall(
             model_config, self.top_k)
         if self.enable_alltoall:
@@ -204,7 +204,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_backend)
+                                   strategy=model_config.allreduce_strategy)
         self.next_layer_layernorm: RMSNorm = None
 
         self.fusion_config = EagerFusionConfig()
