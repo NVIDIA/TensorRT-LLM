@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -58,8 +59,23 @@ class Eagle3SpecMetadata(SpecMetadata):
     is_draft_model: bool = False
     is_first_draft: bool = False  # only used for prepare
     apply_eagle3_fc: bool = False
-    old_request_ids: Optional[List[int]] = None
-    old_seq_lens: Optional[List[int]] = None
+    last_draft_request_ids: Optional[List[int]] = None
+    last_draft_seq_lens: Optional[List[int]] = None
+    last_target_request_ids: Optional[List[int]] = None
+    last_target_seq_lens: Optional[List[int]] = None
+    _last_metadata: Optional[SpecMetadata] = None
+
+    @property
+    def last_metadata(self) -> Optional[SpecMetadata]:
+        return self._last_metadata
+
+    @last_metadata.setter
+    def last_metadata(self, metadata: Optional[SpecMetadata]):
+        self._last_metadata = metadata
+        # Update old request ids and seq lens from last metadata
+        if metadata is not None:
+            self.last_draft_request_ids = copy.copy(metadata.request_ids)
+            self.last_draft_seq_lens = copy.copy(metadata.seq_lens)
 
     def __post_init__(self):
         if self.num_layers == 1:
@@ -89,16 +105,17 @@ class Eagle3SpecMetadata(SpecMetadata):
         if self.is_draft_model:
             hidden_states_gather_ids = []
 
-            # Update old request ids and seq lens from last metadata
-            if not self.is_first_draft:
-                self.old_request_ids = self.last_metadata.request_ids
-                self.old_seq_lens = self.last_metadata.seq_lens
+            last_request_ids = (self.last_target_request_ids
+                                if self.is_first_draft else
+                                self.last_draft_request_ids)
+            last_seq_lens = (self.last_target_seq_lens if self.is_first_draft
+                             else self.last_draft_seq_lens)
             # Get the start index of each request in last forward
-            seq_start_ids, old_seq_lens = {}, {}
+            seq_start_idx, last_id2seqlens = {}, {}
             seq_start = 0
-            for req_id, seqlen in zip(self.old_request_ids, self.old_seq_lens):
-                seq_start_ids[req_id] = seq_start
-                old_seq_lens[req_id] = seqlen
+            for req_id, seqlen in zip(last_request_ids, last_seq_lens):
+                seq_start_idx[req_id] = seq_start
+                last_id2seqlens[req_id] = seqlen
                 seq_start += seqlen
             # If this is the first draft, we need to read all of the accepted
             # hidden states, otherwise, we only need to read the last token
@@ -106,12 +123,12 @@ class Eagle3SpecMetadata(SpecMetadata):
                 for req_id, seqlen in zip(self.request_ids, self.seq_lens):
                     hidden_states_gather_ids.extend(
                         list(
-                            range(seq_start_ids[req_id],
-                                  seq_start_ids[req_id] + seqlen)))
+                            range(seq_start_idx[req_id],
+                                  seq_start_idx[req_id] + seqlen)))
             else:
                 for req_id in self.request_ids:
-                    hidden_states_gather_ids.append(seq_start_ids[req_id] +
-                                                    old_seq_lens[req_id] - 1)
+                    hidden_states_gather_ids.append(seq_start_idx[req_id] +
+                                                    last_id2seqlens[req_id] - 1)
             self.hidden_states_gather_ids_host = torch.tensor(
                 hidden_states_gather_ids, dtype=torch.int, pin_memory=True)
             self.apply_eagle3_fc = True if self.is_first_draft else False
@@ -158,8 +175,8 @@ class Eagle3SpecMetadata(SpecMetadata):
         self.hidden_states[0:num_tokens, 0:hidden_size].copy_(
             target_metadata.hidden_states[0:num_tokens, 0:hidden_size],
             non_blocking=True)
-        self.old_request_ids = target_metadata.request_ids
-        self.old_seq_lens = target_metadata.seq_lens
+        self.last_target_request_ids = target_metadata.request_ids
+        self.last_target_seq_lens = target_metadata.seq_lens
         self.is_draft_model = True
         self.is_first_draft = True
 
