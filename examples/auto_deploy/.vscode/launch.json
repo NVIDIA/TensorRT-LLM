@@ -8,7 +8,7 @@
             "program": "build_and_run_ad.py",
             "args": [
                 "--config",
-                "{\"batch_size\": 2, \"page_size\": 16, \"world_size\": 2, \"compile_backend\": \"torch-simple\", \"attn_backend\": \"FlashInfer\",\"model_factory\": \"AutoModelForCausalLM\", \"model\": \"meta-llama/Meta-Llama-3.1-8B-Instruct\", \"benchmark\": false}",
+                "{\"batch_size\": 2, \"attn_page_size\": 16, \"world_size\": 2, \"compile_backend\": \"torch-simple\", \"attn_backend\": \"FlashInfer\",\"model_factory\": \"AutoModelForCausalLM\", \"model\": \"meta-llama/Meta-Llama-3.1-8B-Instruct\", \"benchmark\": false}",
                 "--model-kwargs",
                 "{}",
                 // "{\"num_hidden_layers\": 3}",

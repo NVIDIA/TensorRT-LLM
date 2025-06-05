@@ -280,6 +280,8 @@ class PyExecutor:
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
             raise e
+        finally:
+            self._executor_loop_cleanup()
 
     def start_worker(self):
         self.worker_lock.acquire()
@@ -833,7 +835,6 @@ class PyExecutor:
                     self._process_iter_stats(finished_requests,
                                              self.active_requests,
                                              previous_batch)
-        self._executor_loop_cleanup()
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
@@ -958,8 +959,6 @@ class PyExecutor:
                             scheduled_requests=scheduled_batch),
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
-
-        self._executor_loop_cleanup()
 
     def _prepare_draft_requests(self):
         try:
@@ -1107,8 +1106,6 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
-
-        self._executor_loop_cleanup()
 
     def _process_previous_batch(self):
         self._update_requests(self.previous_batch.sample_state)
@@ -1625,15 +1622,17 @@ class PyExecutor:
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy request
-        req = self.active_requests[-1]
-        if req.is_attention_dp_dummy:
-            req.state = LlmRequestState.GENERATION_COMPLETE
-            self.inflight_req_ids.erase(req.py_request_id)
-            self._terminate_request(req)
-            self.active_requests.remove(req)
+        if self.active_requests and self.active_requests[
+                -1].is_attention_dp_dummy:
+            request = self.active_requests[-1]
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            self.inflight_req_ids.erase(request.py_request_id)
+            self._terminate_request(request)
+            self.active_requests.remove(request)
 
         for request in scheduled_requests.context_requests:
-            request.move_to_next_context_chunk()
+            if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
+                request.move_to_next_context_chunk()
             if request.get_context_remaining_length() == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
 
