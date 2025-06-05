@@ -282,7 +282,7 @@ class Attention(nn.Module):
                    v: Optional[torch.Tensor], position_ids: torch.Tensor):
         """
         Apply RoPE to the query and key.
-        It is possible that k/v is None and q is the concatenated qkv tensor, for both input and output, up to the implementation.
+        Depending on the implementation, q, k, v could be either fused (q, k, v = concat(q, k, v), None, None) or unfused (none of q, k, v is None).
         Before self.attn.forward, convert_qkv will be called to make sure that the format of (q, k, v) satisfies the requirement of self.attn.
         This method could be overridden in the subclass, in which extra functionalities such as q_norm/k_norm could be added.
         Args:
