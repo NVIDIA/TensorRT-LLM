@@ -1565,7 +1565,7 @@ def test_ptq_quickstart_advanced_bs1(llm_root, llm_venv):
         str(example_root / "quickstart_advanced.py"),
         "--use_cuda_graph",
         "--cuda_graph_padding_enabled",
-        "cuda_graph_batch_sizes",
+        "--cuda_graph_batch_sizes",
         "8",
         "--disable_overlap_scheduler",
         "--enable_attention_dp",
@@ -1573,6 +1573,8 @@ def test_ptq_quickstart_advanced_bs1(llm_root, llm_venv):
         "4",
         "--moe_ep_size",
         "4",
+        "--prompt",
+        "\"NVIDIA is a great company because\"",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
     ])
