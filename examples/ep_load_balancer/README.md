@@ -2,8 +2,6 @@
 
 Effective load balancing is crucial when leveraging large-scale expert parallelism. As described in the [DeepSeek-V3 paper](https://arxiv.org/abs/2412.19437), redundant experts can be introduced to rebalance the workload across GPUs. This mechanism is known as the Expert Parallelism Load Balancer ([EPLB](https://github.com/deepseek-ai/EPLB)).
 
-> **Note:** Currently, only the offline EP load balancer is supported.
-
 ## Offline EP Load Balancer
 
 ### Step 1: Run Inference and Collect Statistics
