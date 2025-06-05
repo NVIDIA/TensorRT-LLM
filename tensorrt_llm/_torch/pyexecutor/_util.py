@@ -505,31 +505,54 @@ def create_py_executor_instance(
                       start_worker=start_worker)
 
 
-def instantiate_sampler(model_engine: PyTorchModelEngine,
+def create_torch_sampler_args(engine: PyTorchModelEngine,
+                              executor_config: ExecutorConfig,
+                              pytorch_backend_config: PyTorchConfig):
+    pretrained_config = engine.model.model_config.pretrained_config
+    vocab_size = pretrained_config.vocab_size
+    assert vocab_size is not None
+    assert engine.max_seq_len is not None
+    max_draft_tokens = (0 if executor_config.speculative_config is None else
+                        executor_config.speculative_config.max_draft_tokens)
+    return TorchSampler.Args(
+        max_seq_len=engine.max_seq_len,
+        max_draft_tokens=max_draft_tokens,
+        max_batch_size=executor_config.max_batch_size,
+        max_beam_width=executor_config.max_beam_width,
+        vocab_size=vocab_size,
+        mixed_sampler=pytorch_backend_config.mixed_sampler,
+    )
+
+
+def instantiate_sampler(engine: PyTorchModelEngine,
                         executor_config: ExecutorConfig,
                         pytorch_backend_config: PyTorchConfig,
                         mapping: Mapping):
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
-        sampler = TorchStarAttentionSampler(
-            max_seq_len=model_engine.max_seq_len)
-    elif model_engine.spec_config is not None and model_engine.spec_config.spec_dec_mode.has_spec_decoder(
-    ):
-        sampler = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
-                                   spec_config=model_engine.spec_config)
-    elif pytorch_backend_config.enable_trtllm_sampler:
+        return TorchStarAttentionSampler(max_seq_len=engine.max_seq_len)
+    trtllm_sampler = pytorch_backend_config.enable_trtllm_sampler
+    early_stop = not engine.model.model_config.is_generation
+    has_spec_dec = engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
+    )
+    if sum([early_stop, trtllm_sampler, has_spec_dec]) > 1:
+        msg = f"Only one can be True: {[early_stop, trtllm_sampler, has_spec_dec]=}"
+        raise ValueError(msg)
+
+    if trtllm_sampler:
         decoding_mode = get_decoding_mode(executor_config)
-        sampler = TRTLLMSampler(
-            executor_config, model_engine.model, model_engine.dtype, mapping,
-            decoding_mode, pytorch_backend_config.disable_overlap_scheduler)
-    elif not model_engine.model.model_config.is_generation:
+        return TRTLLMSampler(executor_config, engine.model, engine.dtype,
+                             mapping, decoding_mode,
+                             pytorch_backend_config.disable_overlap_scheduler)
+    if early_stop:
         # NOTE: choose sampler based on model type
-        sampler = EarlyStopSampler()
+        return EarlyStopSampler()
+    sampler_args = create_torch_sampler_args(engine, executor_config,
+                                             pytorch_backend_config)
+    if has_spec_dec:
+        return get_spec_decoder(engine.spec_config, sampler_args)
     else:
-        sampler = TorchSampler(
-            max_seq_len=model_engine.max_seq_len,
-            mixed_sampler=pytorch_backend_config.mixed_sampler)
-    return sampler
+        return TorchSampler(sampler_args)
 
 
 def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:

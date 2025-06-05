@@ -12,6 +12,7 @@ from ....bindings.internal.batch_manager import CacheType
 from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ....mapping import Mapping
 from ...distributed import MPIDist
+from ...pyexecutor._util import create_torch_sampler_args
 from ...pyexecutor.config import PyTorchConfig
 from ...pyexecutor.model_engine import ModelEngine
 from ...pyexecutor.py_executor import PyExecutor
@@ -300,10 +301,11 @@ def create_autodeploy_executor(
     )
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
-    # search sampler with speculative decoding
-    sampler = TorchSampler(max_seq_len=max_seq_len)
-
     # creating the executor object
+    py_config: PyTorchConfig = executor_config.pytorch_backend_config
+    # search sampler with speculative decoding
+    sampler_args = create_torch_sampler_args(engine, executor_config, py_config)
+    sampler = TorchSampler(sampler_args)
     py_executor = PyExecutor(
         resource_manager,
         scheduler,
