@@ -1031,7 +1031,7 @@ class BaseLlmArgs(BaseModel):
         model_obj = _ModelWrapper(self.model)
 
         if model_obj.is_local_model and self.backend not in [
-                'pytorch', 'autodeploy'
+                'pytorch', '_autodeploy'
         ]:
             # Load parallel_config from the engine.
             model_format = get_model_format(self.model)
@@ -1149,7 +1149,7 @@ class BaseLlmArgs(BaseModel):
 
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
-                if self.backend not in ['pytorch', 'autodeploy']:
+                if self.backend not in ['pytorch', '_autodeploy']:
                     eagle_config = _EagleConfig(
                         self.speculative_config.eagle_choices,
                         self.speculative_config.greedy_sampling,
@@ -1169,7 +1169,7 @@ class BaseLlmArgs(BaseModel):
                         eagle3_one_model)
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
-                assert self.backend in ['pytorch', 'autodeploy']
+                assert self.backend in ['pytorch', '_autodeploy']
                 assert self.speculative_config.prompt_lookup_num_tokens > 0 and self.speculative_config.max_matching_ngram_size > 0
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 from tensorrt_llm._torch.speculative import NGramConfig
@@ -1226,7 +1226,7 @@ class BaseLlmArgs(BaseModel):
                 )
 
         if self.enable_lora and self.lora_config is not None and self.backend in [
-                'pytorch', 'autodeploy'
+                'pytorch', '_autodeploy'
         ]:
             logger.warning(
                 f"enable_lora is ignored when lora_config is provided for {self.backend} backend."
@@ -1259,7 +1259,7 @@ class BaseLlmArgs(BaseModel):
             v.build_config.plugin_config.nccl_plugin = None
 
         if v.enable_lora and v.lora_config is None and v.backend not in [
-                'pytorch', 'autodeploy'
+                'pytorch', '_autodeploy'
         ]:
             v.build_config.plugin_config.lora_plugin = 'auto'
             if v.max_lora_rank is not None:
@@ -1816,7 +1816,7 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
 
-class AutoDeployLlmArgs(TorchLlmArgs):
+class _AutoDeployLlmArgs(TorchLlmArgs):
     """LLM arguments specifically for AutoDeploy backend.
 
     This class extends TorchLlmArgs with AutoDeploy-specific configuration options.
@@ -1914,8 +1914,8 @@ class AutoDeployLlmArgs(TorchLlmArgs):
         )
 
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
-    def get_pytorch_backend_config(self) -> "AutoDeployLlmArgs":
-        """Return the AutoDeployLlmArgs (self) object."""
+    def get_pytorch_backend_config(self) -> "_AutoDeployLlmArgs":
+        """Return the _AutoDeployLlmArgs (self) object."""
         return self
 
 

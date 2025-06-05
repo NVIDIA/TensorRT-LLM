@@ -30,8 +30,8 @@ from ..executor.utils import (create_mpi_comm_session,
 from ..inputs import PromptInputs, create_input_processor, prompt_inputs
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .llm_args import (LLMARGS_EXPLICIT_DOCSTRING, AutoDeployLlmArgs,
-                       PybindMirror, TorchLlmArgs, TrtLlmArgs)
+from .llm_args import (LLMARGS_EXPLICIT_DOCSTRING, PybindMirror, TorchLlmArgs,
+                       TrtLlmArgs, _AutoDeployLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -119,8 +119,8 @@ class LLM:
             backend = kwargs.get('backend', None)
             if backend == 'pytorch':
                 llm_args_cls = TorchLlmArgs
-            elif backend == 'autodeploy':
-                llm_args_cls = AutoDeployLlmArgs
+            elif backend == '_autodeploy':
+                llm_args_cls = _AutoDeployLlmArgs
             else:
                 llm_args_cls = TrtLlmArgs
 
@@ -480,7 +480,7 @@ class LLM:
                     )
                 sampling_params._setup(self.tokenizer)
             # auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.
-            if self.args.backend not in ["pytorch", "autodeploy"]:
+            if self.args.backend not in ["pytorch", "_autodeploy"]:
                 if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
                     sampling_params.return_context_logits = True
                     sampling_params._context_logits_auto_enabled = True
@@ -497,7 +497,7 @@ class LLM:
     def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams) -> None:
 
-        if self.args.backend in ["pytorch", "autodeploy"]:
+        if self.args.backend in ["pytorch", "_autodeploy"]:
             # TODO: remove these checks after PyTorch backend
             # fully support TopK prompt and generation logprobs.
             if sampling_params.prompt_logprobs:
@@ -509,7 +509,7 @@ class LLM:
                     f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
                 )
             return
-        elif self.args.backend == "autodeploy":
+        elif self.args.backend == "_autodeploy":
             return
 
         build_config = self.args.build_config
@@ -662,7 +662,7 @@ class LLM:
             self._executor_config,
             backend=self.args.backend,
             pytorch_backend_config=self.args.get_pytorch_backend_config()
-            if self.args.backend in ["pytorch", "autodeploy"] else None,
+            if self.args.backend in ["pytorch", "_autodeploy"] else None,
             mapping=self.args.parallel_config.to_mapping(),
             build_config=self.args.build_config
             if self._on_trt_backend else None,
@@ -710,7 +710,7 @@ class LLM:
         # TODO smor- need to refine what is the desired behavior if lora is enabled
         # in terms of the tokenizer initialization process
         if hasattr(self.args, "backend") and self.args.backend in [
-                "pytorch", "autodeploy"
+                "pytorch", "_autodeploy"
         ] and self.args.lora_config is not None:
             num_lora_dirs = len(self.args.lora_config.lora_dir)
             if num_lora_dirs == 1:

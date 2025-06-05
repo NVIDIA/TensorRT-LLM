@@ -15,7 +15,7 @@ from ....executor.request import GenerationRequest
 from ....executor.result import CompletionOutput, GenerationResult
 from ....inputs.registry import create_input_processor
 from ....llmapi.llm import LLM, RequestOutput
-from ....llmapi.llm_args import AutoDeployLlmArgs
+from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ....llmapi.tokenizer import TokenizerBase
 from ....sampling_params import SamplingParams
 from ..custom_ops.attention_interface import SequenceInfo
@@ -352,7 +352,7 @@ class DemoLLM(LLM):
         **kwargs,
     ):
         try:
-            self.args: AutoDeployLlmArgs = AutoDeployLlmArgs.from_kwargs(
+            self.args: _AutoDeployLlmArgs = _AutoDeployLlmArgs.from_kwargs(
                 model=model,
                 tokenizer=tokenizer,
                 tokenizer_mode=tokenizer_mode,
@@ -362,7 +362,7 @@ class DemoLLM(LLM):
                 dtype=dtype,
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
-                backend=kwargs.pop("backend", "autodeploy"),
+                backend=kwargs.pop("backend", "_autodeploy"),
                 **kwargs,
             )
 

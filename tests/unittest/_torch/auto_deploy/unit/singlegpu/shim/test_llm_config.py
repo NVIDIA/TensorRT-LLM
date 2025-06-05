@@ -5,15 +5,15 @@ import pytest
 from tensorrt_llm._torch.auto_deploy.shim.demollm import DemoLLM
 from tensorrt_llm._torch.auto_deploy.transformations.transform import InferenceOptimizer
 from tensorrt_llm.llmapi.llm import LLM
-from tensorrt_llm.llmapi.llm_args import AutoDeployLlmArgs
+from tensorrt_llm.llmapi.llm_args import _AutoDeployLlmArgs
 
 # ================================
-# AutoDeployLlmArgs Direct Tests
+# _AutoDeployLlmArgs Direct Tests
 # ================================
 
 
 def test_custom_values():
-    """Test that AutoDeployLlmArgs correctly accepts custom values."""
+    """Test that _AutoDeployLlmArgs correctly accepts custom values."""
     custom_kwargs = {
         "model": "test-model",
         "model_factory": "AutoModelForImageTextToText",
@@ -27,7 +27,7 @@ def test_custom_values():
         "max_seq_len": 2048,
     }
 
-    args = AutoDeployLlmArgs(**custom_kwargs)
+    args = _AutoDeployLlmArgs(**custom_kwargs)
 
     assert args.model_factory == "AutoModelForImageTextToText"
     assert args.model_kwargs == {
@@ -46,20 +46,20 @@ def test_custom_values():
 def test_free_mem_ratio_validation():
     """Test free_mem_ratio validation."""
     # Valid values
-    AutoDeployLlmArgs(model="test-model", free_mem_ratio=0.0)
-    AutoDeployLlmArgs(model="test-model", free_mem_ratio=1.0)
-    AutoDeployLlmArgs(model="test-model", free_mem_ratio=0.5)
+    _AutoDeployLlmArgs(model="test-model", free_mem_ratio=0.0)
+    _AutoDeployLlmArgs(model="test-model", free_mem_ratio=1.0)
+    _AutoDeployLlmArgs(model="test-model", free_mem_ratio=0.5)
 
     # Invalid values
     with pytest.raises(ValueError):
-        AutoDeployLlmArgs(model="test-model", free_mem_ratio=-0.1)
+        _AutoDeployLlmArgs(model="test-model", free_mem_ratio=-0.1)
     with pytest.raises(ValueError):
-        AutoDeployLlmArgs(model="test-model", free_mem_ratio=1.1)
+        _AutoDeployLlmArgs(model="test-model", free_mem_ratio=1.1)
 
 
 def test_get_pytorch_backend_config():
     """Test that get_pytorch_backend_config returns self."""
-    args = AutoDeployLlmArgs(model="test-model")
+    args = _AutoDeployLlmArgs(model="test-model")
     assert args.get_pytorch_backend_config() is args
 
 
@@ -91,10 +91,10 @@ def test_config_params():
         (DemoLLM, None, {}, True),  # DemoLLM doesn't use backend param, should call executor
         (
             LLM,
-            "autodeploy",
-            {"backend": "autodeploy"},
+            "_autodeploy",
+            {"backend": "_autodeploy"},
             False,
-        ),  # LLM with autodeploy backend, no executor call
+        ),  # LLM with _autodeploy backend, no executor call
     ],
 )
 @patch("tensorrt_llm._torch.auto_deploy.shim.demollm.DemoGenerationExecutor")
@@ -132,7 +132,7 @@ def test_config_flow(
 
     # Verify args were created correctly
     assert hasattr(instance, "args")
-    assert isinstance(instance.args, AutoDeployLlmArgs)
+    assert isinstance(instance.args, _AutoDeployLlmArgs)
 
     # Common assertions for both APIs
     assert instance.args.model_factory == test_config_params["model_factory"]
@@ -150,7 +150,7 @@ def test_config_flow(
         assert call_kwargs["world_size"] == test_config_params["tensor_parallel_size"]
         assert call_kwargs["model"] == test_config_params["model"]
     else:
-        # For LLM with autodeploy backend, executor should not be called directly
+        # For LLM with _autodeploy backend, executor should not be called directly
         pass
 
 
@@ -168,7 +168,7 @@ def test_compile_backend_mapping(
     mock_factory_registry, use_cuda_graph, torch_compile_enabled, expected_backend
 ):
     """Test that compile backend is correctly determined from config."""
-    ad_config = AutoDeployLlmArgs(
+    ad_config = _AutoDeployLlmArgs(
         model="test-model",
         use_cuda_graph=use_cuda_graph,
         torch_compile_enabled=torch_compile_enabled,
@@ -186,7 +186,7 @@ def test_invalid_model_factory():
     """Test behavior with invalid model factory."""
     # Pydantic validates Literal types at runtime, so this should raise ValidationError
     with pytest.raises(Exception):  # Could be ValidationError or ValueError
-        AutoDeployLlmArgs(model="test-model", model_factory="InvalidFactory")
+        _AutoDeployLlmArgs(model="test-model", model_factory="InvalidFactory")
 
 
 @pytest.mark.parametrize(
@@ -199,5 +199,5 @@ def test_invalid_model_factory():
 )
 def test_attention_backend_page_size_logic(attn_backend, expected_attn_page_size):
     """Test attn_page_size logic for different attention backends."""
-    args = AutoDeployLlmArgs(model="test-model", attn_backend=attn_backend, max_seq_len=1024)
+    args = _AutoDeployLlmArgs(model="test-model", attn_backend=attn_backend, max_seq_len=1024)
     assert args.attn_page_size == expected_attn_page_size

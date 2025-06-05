@@ -241,7 +241,7 @@ from tensorrt_llm import LLM
 # Construct the LLM high-level interface object with autodeploy as backend
 llm = LLM(
     model=<HF_MODEL_CARD_OR_DIR>,
-    backend="autodeploy",
+    backend="_autodeploy",
     tensor_parallel_size=<NUM_WORLD_RANK>,
     use_cuda_graph=True, # set True if using "torch-opt" as compile backend
     torch_compile_enabled=True, # set True if using "torch-opt" as compile backend

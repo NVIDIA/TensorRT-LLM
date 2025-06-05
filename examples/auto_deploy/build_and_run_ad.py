@@ -51,7 +51,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
     }
     llm = llm_lookup[config.runtime](
         model=factory.model,
-        backend="autodeploy",
+        backend="_autodeploy",
         max_seq_len=config.max_seq_len,
         max_batch_size=config.max_batch_size,
         # AutoDeploy-specific parameters

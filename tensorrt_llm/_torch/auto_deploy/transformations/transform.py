@@ -5,7 +5,7 @@ import gc
 import torch
 from torch.fx import GraphModule
 
-from ....llmapi.llm_args import AutoDeployLlmArgs
+from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
 from ..distributed import common as dist_ad
@@ -43,7 +43,7 @@ class InferenceOptimizer:
         self,
         factory: ModelFactory,
         *,  # TODO: temporary until we have a better config system
-        ad_config: AutoDeployLlmArgs,
+        ad_config: _AutoDeployLlmArgs,
         visualize: bool = False,
     ):
         self.factory = factory

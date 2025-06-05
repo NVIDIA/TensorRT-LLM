@@ -9,16 +9,16 @@ from simple_config import SimpleConfig
 
 from tensorrt_llm._torch.auto_deploy.models import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.transformations.transform import InferenceOptimizer
-from tensorrt_llm.llmapi.llm_args import AutoDeployLlmArgs
+from tensorrt_llm.llmapi.llm_args import _AutoDeployLlmArgs
 
 
-def _check_ad_config(simple_config: SimpleConfig, ad_config: AutoDeployLlmArgs):
+def _check_ad_config(simple_config: SimpleConfig, ad_config: _AutoDeployLlmArgs):
     # Verify that ad_config was captured
     assert ad_config is not None, "ad_config should have been captured"
 
-    # Check that ad_config is an instance of AutoDeployLlmArgs
-    assert isinstance(ad_config, AutoDeployLlmArgs), (
-        f"Expected AutoDeployLlmArgs, got {type(ad_config)}"
+    # Check that ad_config is an instance of _AutoDeployLlmArgs
+    assert isinstance(ad_config, _AutoDeployLlmArgs), (
+        f"Expected _AutoDeployLlmArgs, got {type(ad_config)}"
     )
 
     # Fields that map directly from simple_config to ad_config
@@ -72,9 +72,9 @@ def _check_ad_config(simple_config: SimpleConfig, ad_config: AutoDeployLlmArgs):
         f"{simple_config.compile_backend}, got {ad_config.torch_compile_enabled}"
     )
 
-    # backend should always be "autodeploy"
-    assert ad_config.backend == "autodeploy", (
-        f"Expected backend 'autodeploy', got {ad_config.backend}"
+    # backend should always be "_autodeploy"
+    assert ad_config.backend == "_autodeploy", (
+        f"Expected backend '_autodeploy', got {ad_config.backend}"
     )
 
 

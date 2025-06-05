@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Union
 
 
-# TODO: remove and unify with AutoDeployLlmArgs
+# TODO: remove and unify with _AutoDeployLlmArgs
 @dataclass
 class SimpleConfig:
     """Experiment Configuration."""

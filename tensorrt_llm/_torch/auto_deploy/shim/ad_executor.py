@@ -9,7 +9,7 @@ from tensorrt_llm._utils import nvtx_range
 from ...._utils import mpi_rank, mpi_world_size
 from ....bindings.executor import ExecutorConfig
 from ....bindings.internal.batch_manager import CacheType
-from ....llmapi.llm_args import AutoDeployLlmArgs
+from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ....mapping import Mapping
 from ...distributed import MPIDist
 from ...pyexecutor.config import PyTorchConfig
@@ -85,11 +85,11 @@ class ADEngine(ModelEngine):
     def build_from_config(
         cls,
         model: str,
-        ad_config: AutoDeployLlmArgs,
+        ad_config: _AutoDeployLlmArgs,
         seq_info: SequenceInfo,
         device: DeviceLikeType,
     ):
-        """Build the ADEngine using the AutoDeployLlmArgs that gets passed through from the LLM."""
+        """Build the ADEngine using the _AutoDeployLlmArgs that gets passed through from the LLM."""
 
         # update device to contain the current default device if it's in cuda
         device = torch.device(device)
@@ -246,7 +246,7 @@ def create_autodeploy_executor(
 ):
     """Create an AutoDeploy executor from the given configuration and checkpoint directory.
 
-    This is the entrypoint API to the autodeploy backend.
+    This is the entrypoint API to the _autodeploy backend.
     """
     # initialize process groups
     world_size = mpi_world_size()
@@ -259,9 +259,9 @@ def create_autodeploy_executor(
     dist.initialize_or_skip(rank, world_size, port)
 
     # some config
-    msg = "pytorch_backend_config must be an AutoDeployLlmArgs object"
-    assert isinstance(executor_config.pytorch_backend_config, AutoDeployLlmArgs), msg
-    ad_config: AutoDeployLlmArgs = executor_config.pytorch_backend_config
+    msg = "pytorch_backend_config must be an _AutoDeployLlmArgs object"
+    assert isinstance(executor_config.pytorch_backend_config, _AutoDeployLlmArgs), msg
+    ad_config: _AutoDeployLlmArgs = executor_config.pytorch_backend_config
 
     max_batch_size = ad_config.max_batch_size
     max_seq_len = ad_config.max_seq_len
