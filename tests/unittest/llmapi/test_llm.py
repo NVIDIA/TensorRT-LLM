@@ -1893,10 +1893,12 @@ def llm_get_stats_test_harness(tp_size: int = 1,
     else:
         LLM_CLASS = LLM
 
+    if not pytorch_backend:
+        llm_args_extra["fast_build"] = True
+
     llm = LLM_CLASS(model=llama_model_path,
                     kv_cache_config=global_kvcache_config,
                     tensor_parallel_size=tp_size,
-                    fast_build=True,
                     **llm_args_extra)
 
     max_tokens = 5
@@ -2020,11 +2022,11 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
         LLM_CLASS = LLM_torch
     else:
         LLM_CLASS = LLM
+        llm_args_extra["fast_build"] = True
 
     llm = LLM_CLASS(model=llama_model_path,
                     kv_cache_config=global_kvcache_config,
                     tensor_parallel_size=tp_size,
-                    fast_build=True,
                     **llm_args_extra)
 
     max_tokens = 6
@@ -2158,8 +2160,8 @@ def test_llm_dynamic_batch_config():
 def run_llm_with_postprocess_parallel(tp_size: int = 1):
     sampling_params = SamplingParams(max_tokens=6)
 
-    postproc_settings = dict(_num_postprocess_workers=2,
-                             _postprocess_tokenizer_dir=llama_model_path)
+    postproc_settings = dict(num_postprocess_workers=2,
+                             postprocess_tokenizer_dir=llama_model_path)
 
     llm_test_harness(llama_model_path,
                      prompts, ["D E F G H I J K"],
@@ -2186,13 +2188,16 @@ def run_llm_with_postprocess_parallel_and_result_handler(
     post_proc_params = PostprocParams(
         post_processor=perform_faked_oai_postprocess,
         postproc_args=post_proc_args)
+    kwargs = {}
+    if backend != "pytorch":
+        kwargs["fast_build"] = True
     llm = LLM(model=llama_model_path,
               backend=backend,
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
-              _num_postprocess_workers=2,
-              _postprocess_tokenizer_dir=llama_model_path,
-              fast_build=True)
+              num_postprocess_workers=2,
+              postprocess_tokenizer_dir=llama_model_path,
+              **kwargs)
     golden_result = "DEFGHI"
     for i, output in enumerate(
             llm.generate_async(prompts[0],
