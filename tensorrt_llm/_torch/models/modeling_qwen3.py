@@ -50,8 +50,9 @@ class Qwen3Attention(Attention):
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
-            pos_embd_params=pos_embd_params if not self.fuse_qk_norm_rope else
-            None,  # If fuse_qk_norm_rope is true, we pass pos_embd_params=None to super().__init__ to skip RoPE in other places
+            pos_embd_params=pos_embd_params,
+            rope_fusion=not self.
+            fuse_qk_norm_rope,  # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb will be skipped in the overridden apply_rope.
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=config.attention_bias,
