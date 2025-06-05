@@ -1847,7 +1847,7 @@ class PyExecutor:
             }
 
             spec_metadata = self.model_engine.last_spec_metadata
-            draft_model_spec_metadata = self.draft_model_engine.get_spec_metadata(
+            draft_model_spec_metadata = self.draft_model_engine.get_batch_spec_metadata(
                 draft_batch, self.resource_manager)
             draft_model_spec_metadata.update_from_target_metadata(spec_metadata)
             outputs = self.draft_model_engine.forward(draft_batch,
@@ -1910,10 +1910,9 @@ class PyExecutor:
                 draft_batch.generation_requests = new_requests
                 previous_batch = sample_state
             self._update_requests(previous_batch)
-
-            _pad_to_max_draft_tokens()
             new_requests = _process_decoded_tokens(
                 previous_batch.scheduled_requests)
+            _pad_to_max_draft_tokens()
 
         except Exception as e:
             traceback.print_exc()
