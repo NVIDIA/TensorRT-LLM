@@ -1154,39 +1154,39 @@ struct DMA
                 // Per batch tensor size.
                 uint32_t tensor_size_qkv[4];
                 // Stride size in bytes. Assumes least significant dim is 1 (?)
-                uint64_t tensor_stride_qk[3], tensor_stride_v[3];
+                uint64_t tensor_size_qk[3], tensor_size_v[3];
                 uint32_t v_offset;
                 // Total sequence length.
                 int const total_seqlen = params.is_s_padded ? (params.b * params.s) : launch_params.total_q_seqlen;
                 tensor_size_qkv[0] = params.d; // params.d;
                 tensor_size_qkv[3] = total_seqlen;
-                tensor_stride_qk[0] = params.d * Kernel_traits::ELEMENT_BYTES;
-                tensor_stride_qk[2] = params.qkv_stride_in_bytes;
-                tensor_stride_v[1] = 0;
-                tensor_stride_v[2] = params.qkv_stride_in_bytes;
+                tensor_size_qk[0] = params.d * Kernel_traits::ELEMENT_BYTES;
+                tensor_size_qk[2] = params.qkv_stride_in_bytes;
+                tensor_size_v[1] = 0;
+                tensor_size_v[2] = params.qkv_stride_in_bytes;
                 if (params.h_kv < params.h)
                 {
                     // Take MQA as non-heads-interleaved.
                     tensor_size_qkv[1] = params.h + params.h_kv;
                     tensor_size_qkv[2] = 1;
-                    tensor_stride_qk[1] = 0;
-                    tensor_stride_v[0] = params.dv * Kernel_traits::ELEMENT_BYTES;
+                    tensor_size_qk[1] = 0;
+                    tensor_size_v[0] = params.dv * Kernel_traits::ELEMENT_BYTES;
                     v_offset = (params.h + params.h_kv) * params.d * Kernel_traits::ELEMENT_BYTES;
                 }
                 else if (HEADS_INTERLEAVED)
                 {
                     tensor_size_qkv[1] = 2;
                     tensor_size_qkv[2] = params.h;
-                    tensor_stride_qk[1] = (2 * params.d + params.dv) * Kernel_traits::ELEMENT_BYTES;
-                    tensor_stride_v[0] = tensor_stride_qk[1];
+                    tensor_size_qk[1] = (2 * params.d + params.dv) * Kernel_traits::ELEMENT_BYTES;
+                    tensor_size_v[0] = tensor_size_qk[1];
                     v_offset = 2 * params.d * Kernel_traits::ELEMENT_BYTES;
                 }
                 else
                 {
                     tensor_size_qkv[1] = params.h;
                     tensor_size_qkv[2] = 2;
-                    tensor_stride_qk[1] = params.h * tensor_stride_qk[0];
-                    tensor_stride_v[0] = params.dv * Kernel_traits::ELEMENT_BYTES;
+                    tensor_size_qk[1] = params.h * tensor_size_qk[0];
+                    tensor_size_v[0] = params.dv * Kernel_traits::ELEMENT_BYTES;
                     v_offset = 2 * params.h * params.d * Kernel_traits::ELEMENT_BYTES;
                 }
 
@@ -1245,7 +1245,7 @@ struct DMA
                 box_size[3] = STEP_Q;
                 qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, desc_format,
                     fmha::cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
-                    fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_stride_qk,
+                    fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_size_qk,
                     traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &params.tma_desc_q);
 
                 // O: 16
@@ -1262,7 +1262,7 @@ struct DMA
                 box_size[3] = STEP_KV;
                 qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, desc_format,
                     fmha::cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
-                    fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_stride_qk,
+                    fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_size_qk,
                     traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &params.tma_desc_kv);
 
                 // V: STEP_KV.
@@ -1272,7 +1272,7 @@ struct DMA
 
                 qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr + v_offset, desc_format,
                     fmha::cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode,
-                    fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_stride_v,
+                    fmha::cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_size_v,
                     traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &params.tma_desc_v);
             }
             else
