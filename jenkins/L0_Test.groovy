@@ -1210,7 +1210,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += x86SlurmTestConfigs.keySet()
 
     parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [trtllm_utils.createKubernetesPodConfig(image: LLM_DOCKER_IMAGE, type: "slurm"), {
-    def config = VANILLA_CONFIG
+        def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
         }
