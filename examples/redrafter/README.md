@@ -71,7 +71,7 @@ Note that the `speculative_decoding_mode` is set to `explicit_draft_tokens` whic
 Similary we can use an fp8 quantised base model and an fp16 draft head. 
 ```bash
 # From the `examples/models/core/qwen/` directory, run the below, to quantize model into FP8 and export trtllm checkpoint
-python ../../../quantization/quantize.py --model_dir ./tmp/Qwen/7B/ \
+python ../../../quantization/quantize.py --model_dir ./Qwen2.5-7B-Instruct/ \
                                    --dtype float16 \
                                    --qformat fp8 \
                                    --output_dir ./qwen_checkpoint_1gpu_fp8 \
