@@ -94,27 +94,18 @@ namespace
 std::pair<std::vector<SizeType32>, std::vector<SizeType32>> getActiveSlots(
     RequestVector const& contextRequests, RequestVector const& generationRequests)
 {
-    std::vector<std::pair<SizeType32, SizeType32>> slots;
+    std::vector<SizeType32> activeSlots;
+    std::vector<SizeType32> generationSteps;
     for (auto const& requests : {contextRequests, generationRequests})
     {
         for (auto const& llmReq : requests)
         {
             if (llmReq->isGenerationInProgressState() || llmReq->isLastContextChunk())
             {
-                slots.push_back({llmReq->mSeqSlot.value(), llmReq->getDecodingIter()});
+                activeSlots.push_back(llmReq->mSeqSlot.value());
+                generationSteps.push_back(llmReq->getDecodingIter());
             }
         }
-    }
-
-    std::sort(slots.begin(), slots.end(),
-        [](std::pair<SizeType32, SizeType32> const& a, std::pair<SizeType32, SizeType32> const& b)
-        { return a.first < b.first; });
-
-    std::vector<SizeType32> activeSlots, generationSteps;
-    for (auto const& slot : slots)
-    {
-        activeSlots.push_back(slot.first);
-        generationSteps.push_back(slot.second);
     }
 
     return {activeSlots, generationSteps};
