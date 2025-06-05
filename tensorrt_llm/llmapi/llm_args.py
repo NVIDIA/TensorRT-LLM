@@ -1086,7 +1086,7 @@ class BaseLlmArgs(BaseModel):
             self.speculative_model
         ) if self.speculative_model is not None else None
         if model_obj.is_local_model and self.backend not in [
-                'pytorch', 'autodeploy'
+                'pytorch', '_autodeploy'
         ]:
             # Load parallel_config from the engine.
             self.model_format = get_model_format(self.model)

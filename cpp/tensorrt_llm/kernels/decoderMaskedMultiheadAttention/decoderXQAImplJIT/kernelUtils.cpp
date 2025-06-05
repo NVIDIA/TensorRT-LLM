@@ -62,8 +62,9 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
         // TODO: remove this when the kernel bug for num_kv_heads <= 128 gets fixed.
         return false;
     }
-    if (!contains({PositionEmbeddingType::kROPE_GPTJ, PositionEmbeddingType::kROPE_GPT_NEOX,
-                      PositionEmbeddingType::kROPE_M, PositionEmbeddingType::kLONG_ROPE},
+    if (!contains(
+            {PositionEmbeddingType::kROPE_GPTJ, PositionEmbeddingType::kROPE_GPT_NEOX, PositionEmbeddingType::kROPE_M,
+                PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kLEARNED_ABSOLUTE},
             xqaParams.position_embedding_type))
     {
         return false;
