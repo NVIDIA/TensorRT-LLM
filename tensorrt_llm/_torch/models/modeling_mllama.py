@@ -292,8 +292,7 @@ class MllamaForConditionalGeneration(nn.Module):
             pretrained_config.vision_config.vision_output_dim,
             pretrained_config.text_config.hidden_size,
             bias=True,
-            dtype=config.pretrained_config.vision_config.torch_dtype,
-            allreduce_strategy=model_config.allreduce_strategy)
+            dtype=config.pretrained_config.vision_config.torch_dtype)
         self.logits_processor = LogitsProcessor()
 
     def infer_max_seq_len(self) -> int:
