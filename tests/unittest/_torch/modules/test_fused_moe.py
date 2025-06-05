@@ -102,7 +102,6 @@ def test_fused_moe(moe_cls, dtype, experts, RoutingMethodCls, mapping=None):
         torch.cuda.synchronize()
         torch.testing.assert_close(output, ref_output, rtol=0.2, atol=0.2)
         m //= 2
-    return True
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
@@ -121,7 +120,7 @@ def test_fused_moe_multi_gpu(moe_cls, ep_size):
                             moe_tp_size=world_size // ep_size))] * world_size),
         )
         for r in results:
-            assert r is True
+            assert r is None
 
 
 @skip_pre_hopper
