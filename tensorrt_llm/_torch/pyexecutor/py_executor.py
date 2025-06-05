@@ -1846,15 +1846,9 @@ class PyExecutor:
                                  scheduled_requests.generation_requests)
             }
 
-            spec_metadata = self.model_engine.last_spec_metadata
-            draft_model_spec_metadata = self.draft_model_engine.get_batch_spec_metadata(
-                draft_batch, self.resource_manager)
-            draft_model_spec_metadata.update_from_target_metadata(spec_metadata)
             outputs = self.draft_model_engine.forward(draft_batch,
                                                       self.resource_manager)
-
-            if spec_metadata.spec_dec_mode.is_eagle3() and hasattr(
-                    self.draft_model_engine.model.model, 'd2t'):
+            if hasattr(self.draft_model_engine.model.model, 'd2t'):
                 outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
             sample_state = self._sample_async(draft_batch, outputs)
@@ -1881,7 +1875,7 @@ class PyExecutor:
             # this? Just needs proper kernel support.
             def _pad_to_max_draft_tokens():
                 for req in scheduled_requests.generation_requests:
-                    max_draft_tokens = spec_metadata.max_draft_tokens
+                    max_draft_tokens = self.max_draft_tokens
                     num_draft_tokens = len(req.py_draft_tokens)
                     req.py_draft_tokens.extend(
                         0 for _ in range(max_draft_tokens - num_draft_tokens))
@@ -1889,7 +1883,7 @@ class PyExecutor:
             draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
             draft_batch.context_requests = []
 
-            for _ in range(spec_metadata.max_draft_tokens - 1):
+            for i in range(self.max_draft_tokens - 1):
                 if len(draft_batch.generation_requests) == 0:
                     break
 
@@ -1898,8 +1892,7 @@ class PyExecutor:
                     self.resource_manager,
                     new_tensors_device=previous_batch.device)
 
-                if spec_metadata.spec_dec_mode.is_eagle3() and hasattr(
-                        self.draft_model_engine.model.model, 'd2t'):
+                if hasattr(self.draft_model_engine.model.model, 'd2t'):
                     outputs[
                         'd2t'] = self.draft_model_engine.model.model.d2t.data
                 sample_state = self._sample_async(draft_batch, outputs)

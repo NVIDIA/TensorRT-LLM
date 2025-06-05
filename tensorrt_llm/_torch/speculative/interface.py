@@ -155,8 +155,6 @@ class SpecMetadata:
     num_extra_kv_tokens: Optional[int] = 0  # Number of layers in target model
     # The number of layers
     num_layers: int = 0
-    # The last metadata
-    last_metadata: Optional["SpecMetadata"] = None
 
     def prepare(self):
         """
@@ -187,9 +185,4 @@ class SpecMetadata:
         """
         Some spec decode algorithms require hidden states from the target
         model. Use this method to record them. By default, does nothing.
-        """
-
-    def update_from_target_metadata(self, target_metadata):
-        """
-        Update the spec metadata from the target metadata.
         """

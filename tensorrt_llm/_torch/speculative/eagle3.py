@@ -1,4 +1,3 @@
-import copy
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -9,7 +8,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+from ..pyexecutor.llm_request import LlmRequest
+from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
+from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 from .mtp import MTPSampler
 
@@ -47,6 +49,56 @@ class Eagle3Config(SpecConfig):
         return input_tokens[1:]
 
 
+class Eagle3ResourceManager(BaseResourceManager):
+
+    def __init__(self, config: Eagle3Config, dtype: torch.dtype,
+                 hidden_size: int, max_num_requests: int, max_seq_len: int):
+        self.dtype = dtype
+        self.max_draft_tokens = config.max_draft_tokens
+        self.hidden_size = hidden_size
+        self.max_num_requests = max_num_requests
+        self.max_seq_len = max_seq_len
+        self.slot_manager = SlotManager(max_num_requests)
+
+        # empty hidden states tensor
+        self.hidden_states = torch.empty(
+            (max_num_requests * self.max_seq_len, self.hidden_size * 3),
+            dtype=self.dtype,
+            device='cuda')
+        # sequence length, only used for metadata preparation
+        self.seq_lens = {i: 0 for i in range(max_num_requests)}
+        # whether the next draft forward is the first
+        self.is_first_draft = True
+
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        context_batch = scheduled_batch.context_requests
+        # allocate hidden state tensors
+        for req in context_batch:
+            if req.is_first_context_chunk():
+                self.slot_manager.add_slot(req.request_id)
+        # reset the flag before model forward
+        self.is_first_draft = True
+
+    def update_resources(self, scheduled_batch: ScheduledRequests):
+        pass
+
+    def free_resources(self, request: LlmRequest):
+        self.slot_manager.remove_slot(request.request_id)
+
+    def add_dummy_requests(self, request_ids: List[int]):
+        for rid in request_ids:
+            self.slot_manager.add_slot(rid)
+
+    def shutdown(self):
+        pass
+
+    def get_max_resource_count(self) -> int:
+        return self.max_num_requests
+
+    def get_needed_resource_to_completion(self, request: LlmRequest):
+        return 0
+
+
 @dataclass
 class Eagle3SpecMetadata(SpecMetadata):
     hidden_states: List[torch.Tensor] = field(default_factory=list)
@@ -57,25 +109,8 @@ class Eagle3SpecMetadata(SpecMetadata):
     max_num_tokens: int = 0
     dtype: torch.dtype = torch.bfloat16
     is_draft_model: bool = False
-    is_first_draft: bool = False  # only used for prepare
     apply_eagle3_fc: bool = False
-    last_draft_request_ids: Optional[List[int]] = None
-    last_draft_seq_lens: Optional[List[int]] = None
-    last_target_request_ids: Optional[List[int]] = None
-    last_target_seq_lens: Optional[List[int]] = None
-    _last_metadata: Optional[SpecMetadata] = None
-
-    @property
-    def last_metadata(self) -> Optional[SpecMetadata]:
-        return self._last_metadata
-
-    @last_metadata.setter
-    def last_metadata(self, metadata: Optional[SpecMetadata]):
-        self._last_metadata = metadata
-        # Update old request ids and seq lens from last metadata
-        if metadata is not None:
-            self.last_draft_request_ids = copy.copy(metadata.request_ids)
-            self.last_draft_seq_lens = copy.copy(metadata.seq_lens)
+    eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
 
     def __post_init__(self):
         if self.num_layers == 1:
@@ -87,11 +122,6 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.layers_to_capture = (1, self.num_layers // 2 - 1,
                                       self.num_layers - 4)
 
-        self.hidden_states = torch.empty(
-            (self.max_num_tokens, self.hidden_size * self.num_capture_layers),
-            dtype=self.dtype,
-            device='cuda')
-
         # Initialize to 0 to avoid reading uninitialized memory during warmup
         self.hidden_states_gather_ids = torch.zeros([self.max_num_tokens],
                                                     dtype=torch.int,
@@ -101,43 +131,31 @@ class Eagle3SpecMetadata(SpecMetadata):
         self.hidden_states_gather_ids_host = None
 
     def prepare(self):
-        # Gather ids for reading hidden states in draft model forward
-        if self.is_draft_model:
-            hidden_states_gather_ids = []
-
-            last_request_ids = (self.last_target_request_ids
-                                if self.is_first_draft else
-                                self.last_draft_request_ids)
-            last_seq_lens = (self.last_target_seq_lens if self.is_first_draft
-                             else self.last_draft_seq_lens)
-            # Get the start index of each request in last forward
-            seq_start_idx, last_id2seqlens = {}, {}
-            seq_start = 0
-            for req_id, seqlen in zip(last_request_ids, last_seq_lens):
-                seq_start_idx[req_id] = seq_start
-                last_id2seqlens[req_id] = seqlen
-                seq_start += seqlen
+        is_first_draft = self.eagle3_resource_manager.is_first_draft
+        # Prepare hidden states gather ids
+        hidden_states_gather_ids = []
+        max_seq_len = self.eagle3_resource_manager.max_seq_len
+        for req_id, seq_len in zip(self.request_ids, self.seq_lens):
+            slot_id = self.eagle3_resource_manager.slot_manager.get_slot(req_id)
+            old_seq_len = self.eagle3_resource_manager.seq_lens[slot_id]
+            start_idx = slot_id * max_seq_len
             # If this is the first draft, we need to read all of the accepted
             # hidden states, otherwise, we only need to read the last token
-            if self.is_first_draft:
-                for req_id, seqlen in zip(self.request_ids, self.seq_lens):
-                    hidden_states_gather_ids.extend(
-                        list(
-                            range(seq_start_idx[req_id],
-                                  seq_start_idx[req_id] + seqlen)))
+            if is_first_draft or self.is_draft_model:
+                hidden_states_gather_ids.extend(
+                    list(range(start_idx, start_idx + old_seq_len)))
             else:
-                for req_id in self.request_ids:
-                    hidden_states_gather_ids.append(seq_start_idx[req_id] +
-                                                    last_id2seqlens[req_id] - 1)
-            self.hidden_states_gather_ids_host = torch.tensor(
-                hidden_states_gather_ids, dtype=torch.int, pin_memory=True)
-            self.apply_eagle3_fc = True if self.is_first_draft else False
-            self.is_first_draft = False
+                hidden_states_gather_ids.append(start_idx + old_seq_len - 1)
+            self.eagle3_resource_manager.seq_lens[slot_id] = seq_len
+        self.hidden_states_gather_ids_host = torch.tensor(
+            hidden_states_gather_ids, dtype=torch.int, pin_memory=True)
+        self.apply_eagle3_fc = True if is_first_draft and self.is_draft_model else False
+        if self.is_draft_model:
+            self.eagle3_resource_manager.is_first_draft = False
 
     def prepare_device(self):
-        if self.is_draft_model:
-            self.hidden_states_gather_ids[:self.num_tokens].copy_(
-                self.hidden_states_gather_ids_host, non_blocking=True)
+        self.hidden_states_gather_ids[:self.num_tokens].copy_(
+            self.hidden_states_gather_ids_host, non_blocking=True)
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
@@ -147,38 +165,27 @@ class Eagle3SpecMetadata(SpecMetadata):
             layer_id: int,
             hidden_states: torch.Tensor,
             residual: Optional[torch.Tensor] = None) -> None:
+        token_idx = self.hidden_states_gather_ids[:self.num_tokens]
+        eagle3_hidden_states = self.eagle3_resource_manager.hidden_states
         for i, captured_layer_id in enumerate(self.layers_to_capture):
             if captured_layer_id == layer_id:
-                num_tokens = hidden_states.shape[0]
                 to_save = hidden_states + residual if residual is not None else hidden_states
-                self.hidden_states[:num_tokens, i * self.hidden_size:(i + 1) *
-                                   self.hidden_size].copy_(to_save,
-                                                           non_blocking=True)
+                eagle3_hidden_states[:, i * self.hidden_size:(i + 1) *
+                                     self.hidden_size].index_copy_(
+                                         0, token_idx, to_save)
                 break
 
     def get_hidden_states(
         self,
         preprocess_func: Optional[callable] = None,
     ):
-        hidden_states = self.hidden_states[
+        hidden_states = self.eagle3_resource_manager.hidden_states[
             self.hidden_states_gather_ids[:self.num_tokens], :]
         if self.apply_eagle3_fc and preprocess_func is not None:
             hidden_states = preprocess_func(hidden_states)
         else:
             hidden_states = hidden_states[:, :self.hidden_size]
         return hidden_states
-
-    @torch.inference_mode()
-    def update_from_target_metadata(self, target_metadata):
-        num_tokens = target_metadata.num_tokens
-        hidden_size = target_metadata.hidden_size * target_metadata.num_capture_layers
-        self.hidden_states[0:num_tokens, 0:hidden_size].copy_(
-            target_metadata.hidden_states[0:num_tokens, 0:hidden_size],
-            non_blocking=True)
-        self.last_target_request_ids = target_metadata.request_ids
-        self.last_target_seq_lens = target_metadata.seq_lens
-        self.is_draft_model = True
-        self.is_first_draft = True
 
 
 class Eagle3Sampler(TorchSampler):
