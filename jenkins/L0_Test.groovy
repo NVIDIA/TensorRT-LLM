@@ -1403,6 +1403,17 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
         sh "bash -c 'pip3 show tensorrt || true'"
     }
 
+    // Build nightly package (with local version) for internal testing
+    echo "building nightly package with local version"
+    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && TRTLLM_NIGHTLY_BUILD=1 python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}")
+    }
+
+    // Figure out nightly package name, e.g. tensorrt_llm-0.20.0rc2+nightly20250507.gb6cfe08-cp312-cp312-linux_x86_64.whl
+    def nightlyPkg = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 *nightly*.whl').trim()
+    echo "uploading ${nightlyPkg} to ${cpu_arch}/${wheel_path}"
+    trtllm_utils.uploadArtifacts("tensorrt_llm/build/${nightlyPkg}",  "${UPLOAD_PATH}/${cpu_arch}/${wheel_path}")
+
     return wheelName
 }
 
@@ -1770,6 +1781,10 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                 def env = []
                 if (key.contains("manylinux")) {
                     env = ["LD_LIBRARY_PATH+=:/usr/local/cuda/compat"]
+                }
+                if (key.contains("PY312-DLFW")) {
+                    // Install nightly build package for DLFW environment testing only
+                    env = ["TRTLLM_INSTALL_NIGHTLY_PKG=1"]
                 }
                 withEnv(env) {
                     wheelName = runLLMBuildFromPackage(pipeline, cpu_arch, values[3], wheelPath, cpver)
