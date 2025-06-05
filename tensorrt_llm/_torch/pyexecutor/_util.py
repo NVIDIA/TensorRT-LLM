@@ -391,7 +391,7 @@ def create_py_executor_instance(
                 "Guided decoding is not supported with overlap scheduler.")
 
     logger.info(
-        f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}, max_batch_size={executor_config.max_batch_size}"
+        f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"
     )
 
     for key, value in pytorch_backend_config.extra_resource_managers.items():

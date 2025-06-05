@@ -43,7 +43,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path to a serialized TRT-LLM engine.",
 )
 @optgroup.option("--backend",
-                 type=click.Choice(["pytorch", "autodeploy"]),
+                 type=click.Choice(["pytorch", "_autodeploy"]),
                  default=None,
                  help="Set to 'pytorch' for pytorch path. Default is cpp path.")
 @optgroup.option(
@@ -292,7 +292,7 @@ def throughput_command(
         logger.info(metadata.get_summary_for_print())
 
     # Engine configuration parsing
-    if backend and backend.lower() in ["pytorch", "autodeploy"]:
+    if backend and backend.lower() in ["pytorch", "_autodeploy"]:
         # If we're dealing with a model name, perform a snapshot download to
         # make sure we have a local copy of the model.
         if checkpoint_path is None:
@@ -360,10 +360,6 @@ def throughput_command(
             kwargs["enable_iter_perf_stats"] = True
 
         if runtime_config.backend == 'pytorch':
-            if kwargs.pop("extended_runtime_perf_knob_config", None):
-                logger.warning(
-                    "Ignore extended_runtime_perf_knob_config for pytorch backend."
-                )
             llm = PyTorchLLM(**kwargs)
         else:
             llm = LLM(**kwargs)
