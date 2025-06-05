@@ -1433,6 +1433,20 @@ def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
     ])
 
 
+@pytest.mark.skip_less_device_memory(80000)
+def test_trtllm_benchmark_serving(llm_root, llm_venv):
+    example_root = Path(os.path.join(llm_root, "examples", "apps"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_trtllm_serve_benchmark.py")])
+
+
 def test_build_time_benchmark_sanity(llm_root, llm_venv):
     temp = tempfile.TemporaryDirectory()
     llm_venv.run_cmd([
