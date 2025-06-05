@@ -68,15 +68,14 @@ CubinObj CompileEngine::compile() const
         case PositionEmbeddingType::kROPE_GPTJ: ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_GPTJ; break;
         case PositionEmbeddingType::kROPE_GPT_NEOX:
         case PositionEmbeddingType::kLONG_ROPE: ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NEOX; break;
-        // For kROPE_M, set ropeStyle to TLLM_XQA_JIT_ROPE_NONE to let XQA kernel not apply RoPE.
-        // At runtime, a separate kernel (see invokeQKVPreprocessing) will be launched to apply RoPE.
-        case PositionEmbeddingType::kROPE_M: ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE; break;
         default: TLLM_THROW("TllmXqaJit: Bad RoPE type");
         }
     }
     else
     {
         // Make it explicit that Ampere-style kernel doesn't apply RoPE in the kernel.
+        // For kROPE_M, set ropeStyle to TLLM_XQA_JIT_ROPE_NONE to let XQA kernel not apply RoPE.
+        // At runtime, a separate kernel (see invokeQKVPreprocessing) will be launched to apply RoPE.
         ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE;
     }
     if (applyRoPEInXqaKernel)
