@@ -52,13 +52,10 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="The total number of expert slots after load rebalance.")
-    parser.add_argument(
-        "--layer_updates_per_iter",
-        type=int,
-        default=0,
-        help=
-        "The number of iterations for each MoE weight update. 0 means no MoE weight update."
-    )
+    parser.add_argument("--layer_updates_per_iter",
+                        type=int,
+                        default=0,
+                        help="The number of layers to update per iteration.")
     args = parser.parse_args()
 
     meta_info, statistic = load_expert_statistic(args.expert_statistic_path)

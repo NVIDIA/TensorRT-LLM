@@ -93,6 +93,11 @@ num_slots: 288
 layer_updates_per_iter: 0
 ```
 
+`layer_updates_per_iter` is the number of layers of which the MoE weights are updated per iteration; `layer_updates_per_iter` of 0 means MoE weights are not updated during inference, so it is static EP Load Balancer.
+
+`initial_global_assignments` is a dict that maps MoE layer index to a list of length 288 (`num_slots`); at layer `i`, the `j`-th expert slot is assigned with expert ID `initial_global_assignments[i][j]`. For each layer, every successive 8 expert slots are assigned to a rank.
+
+
 ### Step 3: Run Inference with the EPLB Configuration
 
 Set up some environment variables:
@@ -154,4 +159,41 @@ Clearly, the load is much more balanced now — on average, the hottest rank rec
 
 
 ## Online EP Load Balancer
-Doc coming soon.
+
+Online EP Load Balancer is more suitable for production deployment needs to react timely to the online traffic changes. We still use 8 expert slots per rank and 36-way expert parallelism.
+
+Prepare the EPLB configuration file:
+
+```bash
+cat > ./moe_load_balancer.yaml <<EOF
+num_slots: 288
+layer_updates_per_iter: 2
+EOF
+```
+
+`layer_updates_per_iter` of 2 means that at each iteration, the MoE weights of 2 layers are updated dynamically according to the online statistics. Different from offline EP Load Balancer, `initial_global_assignments` is not important anymore, since the expert assignments will be properly and regularly updated during the inference. Hence, `initial_global_assignments` can be omitted in the configuration.
+
+Run 36-way expert parallelism inference with the EPLB configuration incorporated:
+
+```bash
+cat > ./extra_llm_api_options_eplb.yaml <<EOF
+enable_attention_dp: true
+use_cuda_graph: true
+moe_load_balancer: ./moe_load_balancer.yaml
+EOF
+
+trtllm-llmapi-launch \
+trtllm-bench --model ${MODEL_NAME} \
+    --model_path ${MODEL_PATH} \
+    throughput \
+    --tp 36 \
+    --ep 36 \
+    --extra_llm_api_options ./extra_llm_api_options_eplb.yaml \
+    --kv_cache_free_gpu_mem_fraction 0.75 \
+    --backend pytorch \
+    --dataset ./dataset.json \
+    --warmup 0 \
+    --eos_id -1
+```
+
+> **Note:** Similar to offline EP Load Balancer, you can enable expert ID counting to verify the effectiveness of EPLB, but remember to disable it when running inference for benchmarking or production purposes.
