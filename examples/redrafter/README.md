@@ -51,7 +51,7 @@ python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3 \
                               --dtype float16
 
 # From this directory, `examples/redrafter/`, run,
-python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3-ckpt \
+python convert_checkpoint.py --base_model_checkpoint_dir ./vicuna-7b-v1.3-ckpt \
                              --drafter_model_dir ./vicuna-7b-drafter \
                              --output_dir ./tllm_checkkpoint_1gpu_redrafter \
                              --dtype float16 \
@@ -78,7 +78,7 @@ python ../../../quantization/quantize.py --model_dir ./tmp/Qwen/7B/ \
                                    --calib_size 1024
 
 # From this directory, `examples/redrafter/`, run,
-python convert_checkpoint.py --model_dir ./qwen_checkpoint_1gpu_fp8 \
+python convert_checkpoint.py --base_model_checkpoint_dir ./qwen_checkpoint_1gpu_fp8 \
                              --drafter_model_dir ./qwen-7b-drafter \
                              --output_dir ./tllm_checkkpoint_1gpu_redrafter \
                              --dtype float16 \

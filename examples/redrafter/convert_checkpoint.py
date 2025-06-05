@@ -47,7 +47,7 @@ REDRAFTER_MAP = {"QWenForCausalLM": "ReDrafterForQWenLM",
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dir", type=str, default=None, required=True)
+    parser.add_argument("--base_model_checkpoint_dir", type=str, default=None, required=True)
     parser.add_argument("--drafter_model_dir",
                         type=str,
                         default=None,
@@ -290,7 +290,7 @@ def hf_redrafter_config(
 def convert_and_save(
     rank: int,
     tp_size: int,
-    hf_base_model_dir: str,
+    base_model_checkpoint_dir: str,
     hf_drafter_model: Optional[AutoModel],
     dtype: str,
     use_parallel_embedding: bool,
@@ -305,7 +305,7 @@ def convert_and_save(
     )
     
     # Load and prepare weights
-    stade_dict_path = os.path.join(hf_base_model_dir, f'rank{rank}.safetensors')
+    stade_dict_path = os.path.join(base_model_checkpoint_dir, f'rank{rank}.safetensors')
     weights_safe = safetensors.safe_open(stade_dict_path, framework="pt")
     weights = {k: weights_safe.get_tensor(k) for k in weights_safe.keys()}
 
@@ -335,7 +335,7 @@ def convert_and_save(
 def multi_worker_convert_and_save(
     workers: int,
     tp_size: int,
-    hf_base_model_dir: str,
+    base_model_checkpoint_dir: str,
     hf_drafter_model: Optional[AutoModel],
     dtype: str,
     use_parallel_embedding: bool,
@@ -348,7 +348,7 @@ def multi_worker_convert_and_save(
                 convert_and_save,
                 rank,
                 tp_size,
-                hf_base_model_dir,
+                base_model_checkpoint_dir,
                 hf_drafter_model,
                 dtype,
                 use_parallel_embedding,
@@ -375,8 +375,8 @@ def create_and_save_config(args):
         pp_size=1,
     )
 
-    hf_base_model_dir = args.model_dir
-    config_path = os.path.join(hf_base_model_dir, 'config.json')
+    base_checkpoint_dir = args.base_model_checkpoint_dir
+    config_path = os.path.join(base_checkpoint_dir, 'config.json')
     model_config = PretrainedConfig.from_json_file(config_path)
     tllm_model_config = copy.deepcopy(model_config)
 
@@ -405,7 +405,7 @@ def main():
         os.makedirs(args.output_dir)
 
     drafter_hf_config = create_and_save_config(args)
-    hf_base_model_dir = args.model_dir
+    base_checkpoint_dir = args.base_model_checkpoint_dir
 
     hf_drafter_model: Optional[AutoModel] = None
     if args.drafter_model_dir:
@@ -435,7 +435,7 @@ def main():
     multi_worker_convert_and_save(
         args.workers,
         args.tp_size,
-        hf_base_model_dir,
+        base_checkpoint_dir,
         hf_drafter_model,
         args.dtype,
         args.use_parallel_embedding,
