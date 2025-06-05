@@ -47,7 +47,6 @@ static constexpr int NumThreads = 256;
 static constexpr int NumBlocksPerCluster = 8;
 static constexpr int WarpSize = 32;
 static constexpr int NumWarps = NumThreads / WarpSize;
-static constexpr int NumExpertsPerGroup = WarpSize;
 static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopExperts = 8;
 static constexpr int MaxNumTopGroups = 4;
@@ -377,7 +376,15 @@ __global__ void routingMainKernel(KernelParams params)
             { // bound of params.mNumLimitedGroups
                 auto groupIdx = topGroupIdx[ii];
                 expertIdxGroup[ii] = groupIdx * params.mNumExpertsPerGroup + laneIdx;
-                expertScoreGroup[ii] = expertSelected ? smemScoreBias[expertIdxGroup[ii]] : invalidScoreFloat;
+                // note: expertSelected implies laneIdx < params.mNumExpertsPerGroup.
+                // we have params.mNumExpertsPerGroup == params.mNumExperts / params.mNumExpertGroups,
+                // thus groupIdx <= params.mNumExpertGroups - 1 =>
+                // groupIdx * params.mNumExpertsPerGroup <= params.mNumExperts - params.mNumExpertsPerGroup
+                // => expertIdxGroup[ii] < params.mNumExperts <= NumThreads,
+                // so the access is safe here
+                expertScoreGroup[ii] = groupIdx < params.mNumExpertGroups && expertSelected
+                    ? smemScoreBias[expertIdxGroup[ii]]
+                    : invalidScoreFloat;
             }
         }
         else
@@ -1215,9 +1222,6 @@ void run(Data const& data, void* stream)
     TLLM_CHECK_WITH_INFO(
         data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
     TLLM_CHECK_WITH_INFO(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got %d", data.mPaddingLog2);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts / data.mNumExpertGroups <= NumExpertsPerGroup,
-        "Routing kernel expects number of experts per group <= %d, got %d", NumExpertsPerGroup,
-        data.mNumExperts / data.mNumExpertGroups);
     int const numBlocks = data.mNumTokens;
 
     if (data.mPtrExpertWeightsFull != nullptr)
