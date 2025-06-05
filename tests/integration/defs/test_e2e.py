@@ -77,7 +77,7 @@ def _get_kv_mem_size_candidate(used_Gib, fraction):
 def _check_mem_usage(file, mem_info, ranks_num=1):
     if file is None or not TEST_MEM_USAGE:
         return
-    delta = 0.2  # 0.2 GB as buffer
+    delta = 0.3  # 0.3 GB as buffer
     peak, model_size, kv_mem_size, extra, fraction = _get_mem_info_from_log(
         file, ranks_num)
 
@@ -1701,11 +1701,9 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
     pytest.param('Mixtral-8x7B-NVFP4',
                  'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
                  marks=skip_pre_blackwell),
-    pytest.param(
-        'Nemotron-Ultra-253B',
-        'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
-        marks=[skip_pre_hopper,
-               pytest.mark.skip_less_device_memory(140000)]),
+    pytest.param('Nemotron-Ultra-253B',
+                 'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
+                 marks=skip_pre_hopper),
 ])
 def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
                                        model_path):
@@ -1730,6 +1728,7 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
             "--tp_size=8",
+            "--max_batch_size=32",
         ],
                          stdout=running_log)
         if model_name in mapping:

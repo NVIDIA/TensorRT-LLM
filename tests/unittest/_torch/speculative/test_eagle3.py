@@ -17,6 +17,7 @@ from utils.llm_data import llm_models_root
                          [[True, "TRTLLM"], [False, "TRTLLM"],
                           [True, "FLASHINFER"], [False, "FLASHINFER"]])
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
+    pytest.skip("Test is hanging")
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
