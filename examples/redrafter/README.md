@@ -53,13 +53,13 @@ python convert_checkpoint.py --model_dir ./vicuna-7b-v1.3 \
 # From this directory, `examples/redrafter/`, run,
 python convert_checkpoint.py --base_model_checkpoint_dir ./vicuna-7b-v1.3-ckpt \
                              --drafter_model_dir ./vicuna-7b-drafter \
-                             --output_dir ./tllm_checkkpoint_1gpu_redrafter \
+                             --output_dir ./tllm_checkpoint_1gpu_redrafter \
                              --dtype float16 \
                              --redrafter_num_beams 4 \
                              --redrafter_draft_len_per_beam 5
 
 
-trtllm-build --checkpoint_dir ./tllm_checkkpoint_1gpu_redrafter \
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_redrafter \
              --output_dir ./tmp/redrafter/7B/trt_engines/fp16/1-gpu/ \
              --gemm_plugin float16 \
              --speculative_decoding_mode explicit_draft_tokens \
@@ -68,7 +68,7 @@ trtllm-build --checkpoint_dir ./tllm_checkkpoint_1gpu_redrafter \
 
 Note that the `speculative_decoding_mode` is set to `explicit_draft_tokens` which is how we categorized ReDrafter.
 
-Similary we can use and fp8 quantised base model and an fp16 draft head. 
+Similary we can use an fp8 quantised base model and an fp16 draft head. 
 ```bash
 # From the `examples/models/core/qwen/` directory, run the below, to quantize model into FP8 and export trtllm checkpoint
 python ../../../quantization/quantize.py --model_dir ./tmp/Qwen/7B/ \
@@ -80,7 +80,7 @@ python ../../../quantization/quantize.py --model_dir ./tmp/Qwen/7B/ \
 # From this directory, `examples/redrafter/`, run,
 python convert_checkpoint.py --base_model_checkpoint_dir ./qwen_checkpoint_1gpu_fp8 \
                              --drafter_model_dir ./qwen-7b-drafter \
-                             --output_dir ./tllm_checkkpoint_1gpu_redrafter \
+                             --output_dir ./tllm_checkpoint_1gpu_fp8 \
                              --dtype float16 \
                              --redrafter_num_beams 1 \
                              --redrafter_draft_len_per_beam 3
