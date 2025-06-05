@@ -302,6 +302,7 @@ class PyTorchModelEngine(ModelEngine):
         spec_config: Optional[SpecConfig] = None,
         guided_decoding_config: Optional[GuidedDecodingConfig] = None,
         lora_config: Optional[LoraConfig] = None,
+        is_draft_model: bool = False,
     ):
         self.ub_buffers = None
         self.batch_size = batch_size
@@ -316,10 +317,7 @@ class PyTorchModelEngine(ModelEngine):
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
-        # We keep a reference to the last used spec metadata to
-        # accommodate certain target/draft model use cases. See
-        # py_executor.py for how this is used.
-        self.last_spec_metadata = None
+        self.is_draft_model = is_draft_model
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
@@ -759,7 +757,8 @@ class PyTorchModelEngine(ModelEngine):
                 self.spec_config,
                 self.batch_size,
                 max_num_tokens=self.max_num_tokens,
-                spec_resource_manager=spec_resource_manager)
+                spec_resource_manager=spec_resource_manager,
+                is_draft_model=self.is_draft_model)
 
         if self.spec_metadata is not None:
             return self.spec_metadata
@@ -767,7 +766,8 @@ class PyTorchModelEngine(ModelEngine):
             self.spec_config,
             self.batch_size,
             max_num_tokens=self.max_num_tokens,
-            spec_resource_manager=spec_resource_manager)
+            spec_resource_manager=spec_resource_manager,
+            is_draft_model=self.is_draft_model)
         return self.spec_metadata
 
     def _get_padded_batch(self, scheduled_requests: ScheduledRequests,
@@ -1380,8 +1380,6 @@ class PyTorchModelEngine(ModelEngine):
             inputs['lora_params'] = lora_params
 
         if spec_metadata is not None:
-            # set last metadata before update
-            spec_metadata.last_metadata = self.last_spec_metadata
             # update spec metadata
             total_draft_lens = sum(draft_lens)
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
@@ -1525,7 +1523,6 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = num_tokens
             spec_metadata.seq_lens = sequence_lengths
-            spec_metadata.last_metadata = self.last_spec_metadata
             spec_metadata.prepare()
             spec_metadata.prepare_device()
             inputs['spec_metadata'] = spec_metadata
@@ -1964,7 +1961,6 @@ class PyTorchModelEngine(ModelEngine):
         if kv_cache_manager is None:
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
                 scheduled_requests, attn_metadata, spec_metadata)
-            self.last_spec_metadata = spec_metadata
 
             return self._forward_step(inputs, gather_ids, gather_context_logits)
 
@@ -1986,7 +1982,6 @@ class PyTorchModelEngine(ModelEngine):
                                                       attn_metadata,
                                                       spec_metadata,
                                                       new_tensors_device)
-            self.last_spec_metadata = spec_metadata
 
             self.iter_counter += 1
 

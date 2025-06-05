@@ -1,5 +1,6 @@
 from .eagle3 import (Eagle3OneModelDecoder, Eagle3OneModelSpecMetadata,
-                     Eagle3OneModelWorker, Eagle3Sampler, Eagle3SpecMetadata)
+                     Eagle3OneModelWorker, Eagle3ResourceManager, Eagle3Sampler,
+                     Eagle3SpecMetadata)
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramPoolManager
@@ -8,7 +9,8 @@ from .ngram import NGramPoolManager
 def get_spec_metadata(spec_config,
                       max_num_requests,
                       max_num_tokens,
-                      spec_resource_manager=None):
+                      spec_resource_manager=None,
+                      is_draft_model=False):
     if spec_config.spec_dec_mode.is_mtp():
         return MTPSpecMetadata(
             max_draft_tokens=spec_config.max_draft_tokens,
@@ -23,7 +25,8 @@ def get_spec_metadata(spec_config,
                                   num_layers=spec_config.num_layers,
                                   hidden_size=spec_config.hidden_size,
                                   max_num_tokens=max_num_tokens,
-                                  dtype=spec_config.dtype)
+                                  dtype=spec_config.dtype,
+                                  is_draft_model=is_draft_model)
     elif spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSpecMetadata(
             max_draft_tokens=spec_config.max_draft_tokens,
@@ -36,7 +39,8 @@ def get_spec_metadata(spec_config,
         return None
 
 
-def get_spec_resource_manager(spec_config, model_config, max_num_requests):
+def get_spec_resource_manager(spec_config, model_config, max_num_requests,
+                              max_seq_len):
     if spec_config.spec_dec_mode.is_mtp_eagle():
         if spec_config.use_relaxed_acceptance_for_thinking:
             return MTPHiddenStatesManager(spec_config, model_config.torch_dtype,
@@ -50,6 +54,10 @@ def get_spec_resource_manager(spec_config, model_config, max_num_requests):
                                       max_num_requests)
     elif spec_config.spec_dec_mode.is_ngram():
         return NGramPoolManager(spec_config, max_num_requests)
+    elif spec_config.spec_dec_mode.is_eagle3():
+        return Eagle3ResourceManager(spec_config, model_config.torch_dtype,
+                                     model_config.hidden_size, max_num_requests,
+                                     max_seq_len)
     else:
         return None
 
