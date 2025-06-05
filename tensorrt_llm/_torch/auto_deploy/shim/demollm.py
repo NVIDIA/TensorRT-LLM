@@ -15,7 +15,7 @@ from ....executor.request import GenerationRequest
 from ....executor.result import CompletionOutput, GenerationResult
 from ....inputs.registry import create_input_processor
 from ....llmapi.llm import LLM, RequestOutput
-from ....llmapi.llm_utils import LlmArgs
+from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ....llmapi.tokenizer import TokenizerBase
 from ....sampling_params import SamplingParams
 from ..custom_ops.attention_interface import SequenceInfo
@@ -349,11 +349,10 @@ class DemoLLM(LLM):
         dtype: str = "auto",
         revision: Optional[str] = None,
         tokenizer_revision: Optional[str] = None,
-        **kwargs: Any,
+        **kwargs,
     ):
         try:
-            self.pytorch_backend_config = kwargs.pop("auto_deploy_config", None)
-            self.args = LlmArgs.from_kwargs(
+            self.args: _AutoDeployLlmArgs = _AutoDeployLlmArgs.from_kwargs(
                 model=model,
                 tokenizer=tokenizer,
                 tokenizer_mode=tokenizer_mode,
@@ -363,6 +362,7 @@ class DemoLLM(LLM):
                 dtype=dtype,
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
+                backend=kwargs.pop("backend", "_autodeploy"),
                 **kwargs,
             )
 
@@ -376,9 +376,9 @@ class DemoLLM(LLM):
 
         # construct sequence info object
         seq_info = SequenceInfo(
-            max_seq_len=self.args.build_config.max_seq_len,
-            max_batch_size=self.args.build_config.max_batch_size,
-            page_size=self.args.build_config.plugin_config.tokens_per_block,
+            max_seq_len=self.args.max_seq_len,
+            max_batch_size=self.args.max_batch_size,
+            page_size=self.args.attn_page_size,
         )
 
         # construct demo executor + engine
@@ -386,7 +386,7 @@ class DemoLLM(LLM):
             world_size=tensor_parallel_size,
             tokenizer=self.tokenizer,
             model=model,
-            ad_config=self.pytorch_backend_config,
+            ad_config=self.args.get_pytorch_backend_config(),
             seq_info=seq_info,
             device="cuda",
         )
