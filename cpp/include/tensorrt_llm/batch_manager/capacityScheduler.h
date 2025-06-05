@@ -126,6 +126,23 @@ private:
     SizeType32 mMaxNumRequests;
 };
 
+/// @brief Schedule requests using the PREFILL_FIRST policy
+class PrefillFirstScheduler : public BaseCapacityScheduler
+{
+public:
+    PrefillFirstScheduler(SizeType32 maxNumRequests,
+        LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
+
+    [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
+        kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
+        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
+        OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
+
+private:
+    SizeType32 mMaxNumRequests;
+};
+
 /// @brief Schedule requests using the STATIC_BATCH policy
 class StaticBatchScheduler : public GuaranteedNoEvictScheduler
 {
@@ -169,7 +186,7 @@ public:
 
 private:
     std::variant<std::monostate, MaxRequestsScheduler, MaxUtilizationScheduler, GuaranteedNoEvictScheduler,
-        StaticBatchScheduler>
+        StaticBatchScheduler, PrefillFirstScheduler>
         mScheduler;
 };
 
