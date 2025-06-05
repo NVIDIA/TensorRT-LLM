@@ -51,7 +51,7 @@ def add_multimodal_arguments(parser):
                             'mllama',
                             'internvl',
                             'qwen2_vl',
-                            'nvlm_d2',
+                            'llama_nemotron_nano_vl',
                         ],
                         help="Model type")
     parser.add_argument(
@@ -135,8 +135,8 @@ class VisionEngineBuilder:
             build_internvl_engine(args)
         elif args.model_type == 'qwen2_vl':
             build_qwen2_vl_engine(args)
-        elif args.model_type == "nvlm_d2":
-            build_cosmos_8b_engine(args)
+        elif args.model_type == "llama_nemotron_nano_vl":
+            build_llama_nemotron_nano_vl_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
@@ -1269,12 +1269,10 @@ def build_qwen2_vl_engine(args):
                      min_hw_dims=args.min_hw_dims,
                      max_hw_dims=args.max_hw_dims)
 
-def build_cosmos_8b_engine(args):
+def build_llama_nemotron_nano_vl_engine(args):
     model = AutoModel.from_pretrained(
         args.model_path,
-        #use_flash_attn=False,
         trust_remote_code=True,
-        #torch_dtype=torch.float16,
     )
 
     class RadioWithNeck(torch.nn.Module):
@@ -1319,7 +1317,7 @@ def build_cosmos_8b_engine(args):
     # temporary fix due to TRT onnx export bug
     for block in wrapper.vision_model.model.blocks:
         block.attn.fused_attn = False
-    image = torch.randn((1, 3, 512, 512), device=args.device, dtype=model.dtype) #torch.float16)
+    image = torch.randn((1, 3, 512, 512), device=args.device, dtype=model.dtype)
     export_onnx(wrapper, image, f'{args.output_dir}/onnx')
     build_trt_engine(
         args.model_type,
@@ -1327,6 +1325,6 @@ def build_cosmos_8b_engine(args):
         f'{args.output_dir}/onnx',
         args.output_dir,
         args.max_batch_size,
-        dtype=model.dtype, #torch.bfloat16,
+        dtype=model.dtype,
         engine_name='visual_encoder.engine',
     )

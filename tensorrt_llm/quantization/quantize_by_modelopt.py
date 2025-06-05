@@ -143,7 +143,7 @@ MODEL_NAME_PATTERN_MAP = {
     "DeepseekForCausalLM": "deepseek",
     "GraniteForCausalLM": "granite",
     "GraniteMoeForCausalLM": "granitemoe",
-    "NVLM_D2": "nvlm_d2",
+    "Llama_Nemotron_Nano_VL": "llama_nemotron_nano_vl",
 }
 
 MULTIMODAL_DATASETS = ['scienceqa', 'science_qa']
@@ -278,12 +278,11 @@ def get_model(ckpt_path: str,
                                                       device_map="cuda",
                                                       torch_dtype=torch_dtype,
                                                       trust_remote_code=True)
-    elif hf_config.model_type == "NVLM_D2":
+    elif hf_config.model_type == "Llama_Nemotron_Nano_VL":
         from transformers import AutoModel
         model = AutoModel.from_pretrained(
             ckpt_path,
-            #device_map="cuda",
-            #torch_dtype="auto",
+            device_map=device,
         )
         model = model.language_model
     else:
@@ -646,7 +645,7 @@ def quantize_and_export(*,
                                   max_seq_length=tokenizer_max_seq_length,
                                   model_type=model_type,
                                   device=device)
-    elif model_type == "nvlm_d2":
+    elif model_type == "llama_nemotron_nano_vl":
         tokenizer = get_tokenizer(model_dir,
                                   max_seq_length=tokenizer_max_seq_length,
                                   model_type=model_type)
