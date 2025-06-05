@@ -45,7 +45,7 @@ trtllm-bench --model ${MODEL_NAME} \
     --eos_id -1
 ```
 
-After inference, review the dumped statistic files in `$EXPERT_STATISTIC_PATH`. For each layer and iteration, the load imbalance can be measured using simple metrics such as the standard deviation or the imbalance ratio. Given the routed token counts for all ranks, the imbalance ratio is defined as $(max - mean) / mean$, which represents the excessive workload received by the hottest rank. A perfectly balanced load would have an imbalance ratio of 0. Run the provided [`report_load_statistics.py`] script:
+After inference, review the dumped statistic files in `$EXPERT_STATISTIC_PATH`. For each layer and iteration, the load imbalance can be measured using simple metrics such as the standard deviation or the imbalance ratio. Given the routed token counts for all ranks, the imbalance ratio is defined as $(max - mean) / mean$, which represents the excessive workload received by the hottest rank. A perfectly balanced load would have an imbalance ratio of 0. Run the [`report_load_statistics.py`](./report_load_statistics.py) script:
 
 ```bash
 python report_load_statistics.py --expert_statistic_path $EXPERT_STATISTIC_PATH
@@ -129,7 +129,7 @@ trtllm-bench --model ${MODEL_NAME} \
     --eos_id -1
 ```
 
-Run the provided [`report_load_statistics.py`] script again:
+Run the [`report_load_statistics.py`](./report_load_statistics.py) script again:
 
 ```bash
 python report_load_statistics.py --expert_statistic_path $EXPERT_STATISTIC_PATH
