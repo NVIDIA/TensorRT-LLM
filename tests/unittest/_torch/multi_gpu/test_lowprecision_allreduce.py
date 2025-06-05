@@ -22,6 +22,7 @@ from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm._torch.distributed import AllReduceStrategy
+from tensorrt_llm._torch.model_config import ModelConfig
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -87,8 +88,9 @@ def run_single_rank(dtype, strategy, message_size):
                 rank=self.rank,
             )
 
-            self.allreduce = AllReduce(mapping=self.mapping,
-                                       strategy=self.strategy).cuda()
+            self.allreduce = AllReduce(model_config=ModelConfig(
+                mapping=self.mapping,
+                allreduce_backend=self.strategy), ).cuda()
 
             self.input_tensors = []
             for i in range(self.world_size):

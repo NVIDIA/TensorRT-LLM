@@ -958,6 +958,11 @@ class BaseLlmArgs(BaseModel):
         exclude=True,  # exclude from serialization
         alias="_mpi_session")
 
+    allreduce_strategy: Optional[str] = Field(
+        default="AUTO",
+        description="The optional AllReduce strategy to use.",
+        json_schema_extra={"type": "Optional[MpiSession]"})
+
     @print_traceback_on_error
     def model_post_init(self, __context: Any):
 
