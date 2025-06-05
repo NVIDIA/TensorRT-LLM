@@ -151,3 +151,7 @@ average  1024.0  53.976442         0.115378
 Clearly, the load is much more balanced now — on average, the hottest rank receives only about 0.11 times more routed tokens than the mean.
 
 > **Note:** The expert ID counting could significantly hurt performance, so remember to disable it by unsetting `EXPERT_STATISTIC_ITER_RANGE` when running inference for benchmarking or production purposes.
+
+
+## Online EP Load Balancer
+Doc coming soon.
