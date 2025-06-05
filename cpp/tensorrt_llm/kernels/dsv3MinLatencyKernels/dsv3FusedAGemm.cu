@@ -35,6 +35,7 @@ namespace tensorrt_llm::kernels::dsv3MinLatencyKernels
 __device__ void hmma_16_8_16_f32acc_bf16ab(
     float (&d_reg)[4], const bf16_t (&a_reg)[8], const bf16_t (&b_reg)[4], float const (&c_reg)[4])
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     uint32_t a0 = *reinterpret_cast<uint32_t const*>(a_reg + 0);
     uint32_t a1 = *reinterpret_cast<uint32_t const*>(a_reg + 2);
     uint32_t a2 = *reinterpret_cast<uint32_t const*>(a_reg + 4);
@@ -50,6 +51,7 @@ __device__ void hmma_16_8_16_f32acc_bf16ab(
         : "=f"(d_reg[0]), "=f"(d_reg[1]), "=f"(d_reg[2]), "=f"(d_reg[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(d_reg[0]), "f"(d_reg[1]), "f"(d_reg[2]),
         "f"(d_reg[3]));
+#endif
 }
 
 extern "C"
@@ -59,18 +61,22 @@ extern "C"
 
 __device__ void ldgsts_128(void const* gPtr, void* sPtr, uint32_t pred)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     if (pred)
     {
         uint32_t smemPtrAsUint32 = __nvvm_get_smem_pointer(sPtr);
         asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" ::"r"(smemPtrAsUint32), "l"(gPtr), "n"(16));
     }
+#endif
 }
 
 __device__ void ldsm_x4(void* smem_ptr, uint32_t* reg_ptr)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                  : "=r"(reg_ptr[0]), "=r"(reg_ptr[1]), "=r"(reg_ptr[2]), "=r"(reg_ptr[3])
                  : "r"(__nvvm_get_smem_pointer(smem_ptr)));
+#endif
 }
 
 template <class Type>
@@ -87,14 +93,17 @@ __device__ int apply_swizzle_343_on_elem_row_col(int row_idx_, int col_idx_)
 __device__ void initialize_barrier(uint64_t* smem_barrier, // 64 bits user-manged barrier in smem
     int thread_count = 1)                                  // Thread count expected to arrive/wait on this barrier
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_barrier);
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(smem_int_ptr), "r"(thread_count));
+#endif
 }
 
 // Barrier wait
 __device__ void wait_barrier(uint64_t* smem_barrier, // 64 bits user-manged barrier in smem
     int phase_bit)                                   // Current phase bit the barrier waiting to flip
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_barrier);
     asm volatile(
         "{\n"
@@ -106,10 +115,12 @@ __device__ void wait_barrier(uint64_t* smem_barrier, // 64 bits user-manged barr
         "DONE:\n"
         "}\n" ::"r"(smem_int_ptr),
         "r"(phase_bit));
+#endif
 }
 
 __device__ bool try_wait_barrier(uint64_t* smem_ptr, int phase_bit)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     uint32_t wait_complete;
     uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_ptr);
     asm volatile(
@@ -121,23 +132,28 @@ __device__ bool try_wait_barrier(uint64_t* smem_ptr, int phase_bit)
         : "=r"(wait_complete)
         : "r"(smem_int_ptr), "r"(phase_bit));
     return static_cast<bool>(wait_complete);
+#endif
 }
 
 // Barrier arrive
 __device__ void arrive_barrier(uint64_t* smem_barrier) // 64 bits user-manged barrier in smem
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_barrier);
     asm volatile(
         "{\n"
         ".reg .b64 state; \n"
         "mbarrier.arrive.shared::cta.b64   state, [%0];\n"
         "}\n" ::"r"(smem_int_ptr));
+#endif
 }
 
 __device__ void ldgsts_arrive(uint64_t* smem_barrier)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_barrier);
     asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" : : "r"(smem_int_ptr));
+#endif
 }
 
 template <int gemm_k, int tile_m, int tile_k, int stage_cnt>
@@ -174,6 +190,7 @@ public:
 
     __device__ void prepare()
     {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 // swizzle, that's what we want.
 #pragma unroll
         for (int i = 0; i < a_inst_cnt_per_iter; i++)
@@ -184,10 +201,12 @@ public:
             k_idx = apply_swizzle_343_on_elem_row_col<bf16_t>(m_idx, k_idx);
             a_smem_offsets[i] = m_idx * tile_k + k_idx;
         }
+#endif
     }
 
     __device__ void issue_mainloop()
     {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #pragma unroll 1
         for (int loop_idx = 0; loop_idx < k_iter_cnt; loop_idx++)
         {
@@ -221,6 +240,7 @@ public:
             phase_bit = next_phase_bit;
             gmem_a += per_mma_warp_k;
         }
+#endif
     }
 
     bf16_t const* gmem_a;
@@ -270,6 +290,7 @@ public:
 
     __device__ void prepare()
     {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 // swizzle, that's what we want.
 #pragma unroll
         for (int i = 0; i < b_inst_cnt_per_iter; i++)
@@ -281,10 +302,12 @@ public:
             b_smem_offsets[i] = n_idx * tile_k + k_idx;
             preds[i] = n_idx < gemm_n;
         }
+#endif
     }
 
     __device__ void issue_mainloop()
     {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
         asm volatile("griddepcontrol.wait;");
 #pragma unroll 1
         for (int loop_idx = 0; loop_idx < k_iter_cnt; loop_idx++)
@@ -318,6 +341,7 @@ public:
             phase_bit = next_phase_bit;
             gmem_b += per_mma_warp_k;
         }
+#endif
     }
 
     bf16_t const* gmem_b;
@@ -376,6 +400,7 @@ private:
 public:
     __device__ void prepare()
     {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #pragma unroll
         for (int i = 0; i < k_phase_cnt; i++)
         {
@@ -398,10 +423,12 @@ public:
                 b_smem_offsets[n_iter_idx][i] = n_idx * tile_k + k_idx;
             }
         }
+#endif
     }
 
     __device__ void issue_mainloop()
     {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #pragma unroll 1
         for (int loop_idx = 0; loop_idx < k_iter_cnt; loop_idx++)
         {
@@ -442,10 +469,12 @@ public:
             phase_bit = stage_idx == stage_cnt ? phase_bit ^ 1 : phase_bit;
             stage_idx = stage_idx == stage_cnt ? 0 : stage_idx;
         }
+#endif
     }
 
     __device__ void epi()
     {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
         asm volatile("bar.sync %0, %1;" : : "r"(1), "r"(thread_cnt));
         // reorganize the acc_reg
         constexpr int thread_m = 2;
@@ -516,6 +545,7 @@ public:
                 }
             }
         }
+#endif
     }
 
     bf16_t* gmem_c;
@@ -542,6 +572,7 @@ template <int batch_size, int gemm_m, int gemm_k, int tile_m, int tile_n, int ti
 __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
     bf16_t* output, bf16_t const* mat_a, bf16_t const* mat_b, int gemm_n)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     constexpr int load_thread_cnt = 128;
     constexpr int compute_thread_cnt = 128;
     constexpr int thread_cnt = load_thread_cnt + compute_thread_cnt;
@@ -604,6 +635,7 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
         mma_computer.epi();
     }
     asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <typename T, int kHdIn, int kHdOut, int kTileN>
