@@ -217,7 +217,7 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
         TLLM_CHECK((cacheBlockSize * blockNum) % targetNum == 0);
         auto const targetBufferSize = (cacheBlockSize * blockNum) / targetNum * peerDuplicateHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
-        TLLM_LOG_INFO(" formatOutput bufferTargetNum: %d, targetNum: %d, peerDuplicateHeadFactor: %d dupliacete:%d ",
+        TLLM_LOG_DEBUG(" formatOutput bufferTargetNum: %d, targetNum: %d, peerDuplicateHeadFactor: %d dupliacete:%d ",
             bufferTargetNum, targetNum, peerDuplicateHeadFactor, targetInfo.mDuplicateHeadFactor);
 
         auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
@@ -363,7 +363,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
 
     auto pickUpConnections = pickRecvConnections(connections, selfConfig, selfIdx, destConfig);
 
-    TLLM_LOG_INFO("pickUpConnections size: %d connections size: %d", pickUpConnections.size(), connections.size());
+    TLLM_LOG_DEBUG("pickUpConnections size: %d connections size: %d", pickUpConnections.size(), connections.size());
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
@@ -689,6 +689,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
 {
     if (selfConfig.getDataType() != destConfig.getDataType())
     {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: selfConfig.getDataType() != destConfig.getDataType()");
         return false;
     }
 
@@ -697,18 +698,22 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
 
     if (setVecSelf.size() != 1)
     {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support equal number of heads per layer");
         return false;
     }
     if (selfConfig.getAttentionConfig().mAttentionType != destConfig.getAttentionConfig().mAttentionType)
     {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support same attention type");
         return false;
     }
     if (selfConfig.getAttentionConfig().mKvFactor != destConfig.getAttentionConfig().mKvFactor)
     {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support same kv factor");
         return false;
     }
     if (selfConfig.getAttentionConfig().mAttentionType == CacheState::AttentionType::kMLA)
     {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support non-MLA");
         return false;
     }
 
@@ -717,29 +722,34 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
 
     if (setVecDest.size() != 1)
     {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support same number of heads per layer");
         return false;
     }
     if (selfConfig.getModelConfig().mTokensPerBlock != destConfig.getModelConfig().mTokensPerBlock
         || selfConfig.getModelConfig().mSizePerHead != destConfig.getModelConfig().mSizePerHead)
     {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support same tokens per block and size per head");
         return false;
     }
     if (selfConfig.getModelConfig().mNbKvHeadsPerLayer.size() != destConfig.getModelConfig().mNbKvHeadsPerLayer.size())
     {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support same number of layers");
+        return false;
+    }
+    int selfNumLayers = selfConfig.getModelConfig().mNbKvHeadsPerLayer.size();
+    int selfPPSize = selfConfig.getParallelConfig().mPipelineParallelism;
+    if (selfNumLayers % selfPPSize != 0)
+    {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers must be divisible by pipeline parallelism");
+        return false;
+    }
+    int destNumLayers = destConfig.getModelConfig().mNbKvHeadsPerLayer.size();
+    int destPPSize = destConfig.getParallelConfig().mPipelineParallelism;
+    if (destNumLayers % destPPSize != 0)
+    {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers must be divisible by pipeline parallelism");
         return false;
     }
     return true;
-
-    /*
-    int selfTPInDP = selfConfig.getParallelConfig().mEnableAttentionDP
-        ? selfConfig.getParallelConfig().mTensorParallelism / selfConfig.getParallelConfig().mDPsize
-        : selfConfig.getParallelConfig().mTensorParallelism;
-    int destTPInDP = destConfig.getParallelConfig().mEnableAttentionDP
-        ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
-        : destConfig.getParallelConfig().mTensorParallelism;
-    int selfNumHeads = selfConfig.getModelConfig().mNbKvHeadsPerLayer[0] * selfTPInDP;
-    int destNumHeads = destConfig.getModelConfig().mNbKvHeadsPerLayer[0] * destTPInDP;
-    return selfNumHeads == destNumHeads;
-    */
 }
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

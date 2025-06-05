@@ -1368,6 +1368,12 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate2, Asymmetrical
         testing::Values(4), testing::Values(2), testing::Values(4), testing::Values(16),
         testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
         testing::Values(false), testing::Values(false), testing::Values(false)));
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate4, AsymmetricalCacheTestWithDP,
+    testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1, 2), testing::Values(2),
+        testing::Values(4), testing::Values(1, 2), testing::Values(4), testing::Values(16),
+        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(false), testing::Values(false), testing::Values(false)));
+
 #endif
 
 TEST(targetTest, CacheStateNODP)

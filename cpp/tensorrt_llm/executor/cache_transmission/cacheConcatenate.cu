@@ -134,57 +134,6 @@ TargetRanksInfo targetIRanks(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank)
 {
     return TargetRanksInfoForDP(peerCacheState, selfCacheState, selfRank);
-    if (selfCacheState.getAttentionConfig().mAttentionType == CacheState::AttentionType::kMLA
-        || selfCacheState.getParallelConfig().mEnableAttentionDP
-        || peerCacheState.getParallelConfig().mEnableAttentionDP)
-    {
-        return TargetRanksInfoForDP(peerCacheState, selfCacheState, selfRank);
-    }
-    int iPPNum = peerCacheState.getParallelConfig().mPipelineParallelism; // TODO:
-    int oPPNum = selfCacheState.getParallelConfig().mPipelineParallelism;
-    int oNbKvHeads = selfCacheState.getModelConfig().mNbKvHeadsPerLayer[0];
-    int oNbLayers = selfCacheState.getModelConfig().mNbKvHeadsPerLayer.size() / oPPNum;
-    int iNbKvHeads = peerCacheState.getModelConfig().mNbKvHeadsPerLayer[0];
-    int iNbLayers = peerCacheState.getModelConfig().mNbKvHeadsPerLayer.size() / iPPNum;
-    int oTpRank = selfRank % selfCacheState.getParallelConfig().mTensorParallelism;
-    int oPpRank = selfRank / selfCacheState.getParallelConfig().mTensorParallelism;
-    int startHeadId = oTpRank * oNbKvHeads;
-    int endHeadId = (oTpRank + 1) * oNbKvHeads;
-    int startLayerId = oPpRank * oNbLayers;
-    int endLayerId = (oPpRank + 1) * oNbLayers;
-    int iTpRankStart = startHeadId / iNbKvHeads;
-    int iTpRankEndInclude = (endHeadId - 1) / iNbKvHeads;
-    int iPpRankStart = startLayerId / iNbLayers;
-    int iPpRankEndInclude = (endLayerId - 1) / iNbLayers;
-    // TODO: headId  duplicate
-    int iTPNum = peerCacheState.getParallelConfig().mTensorParallelism;
-    int oTPNum = selfCacheState.getParallelConfig().mTensorParallelism;
-    std::vector<int> retRanks;
-
-    for (int i = iTpRankStart; i <= iTpRankEndInclude; i++)
-    {
-        for (int j = iPpRankStart; j <= iPpRankEndInclude; j++)
-        {
-            int irank = j * iTPNum + i;
-            retRanks.push_back(irank);
-        }
-    }
-    // [tp ,pp]  order
-    int mDomainPPSize = iPpRankEndInclude - iPpRankStart + 1;
-    int mDomainTPSize = iTpRankEndInclude - iTpRankStart + 1;
-    TLLM_CHECK(!retRanks.empty());
-    int mDuplicateHeadFactor = 1;
-    int mPeerDuplicateHeadFactor = 1;
-    if (iNbKvHeads * iTPNum > oNbKvHeads * oTPNum)
-    {
-        mPeerDuplicateHeadFactor = (iNbKvHeads * iTPNum) / (oNbKvHeads * oTPNum);
-    }
-    if (oNbKvHeads * oTPNum > iNbKvHeads * iTPNum)
-    {
-        mDuplicateHeadFactor = (oNbKvHeads * oTPNum) / (iNbKvHeads * iTPNum);
-    }
-
-    return {mDomainPPSize, mDomainTPSize, std::move(retRanks), mDuplicateHeadFactor, mPeerDuplicateHeadFactor};
 }
 
 template <typename T>
