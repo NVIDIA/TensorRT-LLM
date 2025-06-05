@@ -127,7 +127,6 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
     {
         return;
     }
-    constexpr SizeType32 beam{0};
     auto& blockManager = mCacheManager->getBlockManager();
     auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
 
