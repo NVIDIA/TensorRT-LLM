@@ -3,7 +3,7 @@
 By NVIDIA TensorRT-LLM Team
 
 ## Table of Contents
-- [Scaling Expert Parallelism in TensorRT-LLM(Part 1: Design and Implementation of Large-scale EP)](#scaling-expert-parallelism-in-tensorrt-llmpart-1-design-and-implementation-of-large-scale-ep)
+- [Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)](#scaling-expert-parallelism-in-tensorrt-llmpart-1-design-and-implementation-of-large-scale-ep)
   - [Table of Contents](#table-of-contents)
   - [Motivation of large-scale EP](#motivation-of-large-scale-ep)
     - [Observations over one machine translation dataset](#observations-over-one-machine-translation-dataset)
