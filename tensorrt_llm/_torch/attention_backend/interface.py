@@ -163,11 +163,6 @@ class AttentionMetadata:
         if self._seq_lens is not None:
             self._seq_lens = self._seq_lens.pin_memory()
 
-        if self.has_cross_sub_metadata:
-            self.cross._seq_lens = self._seq_lens
-
-    def seq_lens_device(self):
-        if self._seq_lens is not None:
             if self.is_cuda_graph and self._seq_lens_cuda is not None:
                 # Very important: do not reallocate if we are using CUDA graphs.
                 # This copy is safe because the batch size is guaranteed to not
