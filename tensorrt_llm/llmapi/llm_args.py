@@ -1083,11 +1083,12 @@ class BaseLlmArgs(BaseModel):
                         "max_batch_size", "max_num_tokens", "max_seq_len",
                         "max_input_len", "max_beam_width"
                 ]:
-                    if key in kwargs and getattr(b, key) is not None:
-                        if kwargs[key] is not None and kwargs[key] != getattr(
-                                b, key):
+                    if getattr(b, key) is not None:
+                        if (key in kwargs and kwargs[key] is not None
+                                and kwargs[key] != getattr(b, key)):
                             logger.warning(
                                 f"overriding {key} from build_config")
+                        # build_config's value will always overwrite the corresponding option
                         kwargs[key] = getattr(b, key)
 
         ret = cls(**kwargs)
