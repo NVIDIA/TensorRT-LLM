@@ -203,13 +203,13 @@ def buildImage(config, imageKeyToTag)
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.makefileStage}:${dependentTag}"
     def customImageWithTag = "${IMAGE_NAME}/${makefileStage}:${customTag}"
 
-    if (target == "ngc-release" && env.triggerByPostMerge) {
-        dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
-        imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
-        customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
-    }
-
     if (target == "ngc-release") {
+        if (env.triggerByPostMerge) {
+            echo "Use NGC artifacts for post merge build"
+            dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
+            imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
+            customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
+        }
         imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
         imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
     }
@@ -464,6 +464,7 @@ pipeline {
                     echo "env.gitlabCommit is: ${env.gitlabCommit}"
                     echo "LLM_REPO is: ${LLM_REPO}"
                     echo "env.globalVars is: ${env.globalVars}"
+                    sh "env | sort"
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                 }
