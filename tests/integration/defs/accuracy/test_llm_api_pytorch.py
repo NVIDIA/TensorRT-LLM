@@ -17,7 +17,7 @@ import pytest
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import MoeLoadBalancerConfig
 from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
-                                 MTPDecodingConfig, SamplingParams)
+                                 MTPDecodingConfig, SamplingParams, NGramDecodingConfig)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -237,7 +237,30 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         with llm:
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, extra_acc_spec="eagle3")
+            task.evaluate(llm)
+            
+    def test_ngram(self):
+        pytorch_config = dict(disable_overlap_scheduler=True)
+
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+        draft_len = 4
+        spec_config = NGramDecodingConfig(
+            prompt_lookup_num_tokens=draft_len,
+            max_matching_ngram_size=draft_len,
+            is_keep_all=True,
+            is_use_oldest=True,
+            is_public_pool=True,
+        )
+
+        llm = LLM(model=self.MODEL_PATH,
+                    **pytorch_config,
+                    kv_cache_config=kv_cache_config,
+                    speculative_config=spec_config)
+
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
