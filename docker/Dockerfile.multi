@@ -16,67 +16,54 @@ LABEL com.nvidia.ai-terms="https://www.nvidia.com/en-us/agreements/enterprise-so
 ENV BASH_ENV=${BASH_ENV:-/etc/bash.bashrc}
 ENV ENV=${ENV:-/etc/shinit_v2}
 ARG GITHUB_MIRROR=""
-ENV GITHUB_MIRROR=$GITHUB_MIRROR
-RUN echo "Using GitHub mirror: $GITHUB_MIRROR"
 SHELL ["/bin/bash", "-c"]
 
 # Clean up the pip constraint file from the base NGC PyTorch image.
-RUN [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true
+ENV GITHUB_MIRROR=$GITHUB_MIRROR
+RUN [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true && \
+    echo "Using GitHub mirror: $GITHUB_MIRROR"
 
 FROM base AS devel
 
 ARG PYTHON_VERSION="3.12.3"
-RUN echo "Using Python version: $PYTHON_VERSION"
-COPY docker/common/install_base.sh install_base.sh
-RUN bash ./install_base.sh $PYTHON_VERSION && rm install_base.sh
-
-COPY docker/common/install_cmake.sh install_cmake.sh
-RUN bash ./install_cmake.sh && rm install_cmake.sh
-
-COPY docker/common/install_ccache.sh install_ccache.sh
-RUN bash ./install_ccache.sh && rm install_ccache.sh
-
-# Only take effect when the base image is Rocky Linux 8 with old CUDA version.
-COPY docker/common/install_cuda_toolkit.sh install_cuda_toolkit.sh
-RUN bash ./install_cuda_toolkit.sh && rm install_cuda_toolkit.sh
-
-# Download & install latest TRT release
 ARG TRT_VER
 ARG CUDA_VER
 ARG CUDNN_VER
 ARG NCCL_VER
 ARG CUBLAS_VER
-COPY docker/common/install_tensorrt.sh install_tensorrt.sh
-RUN bash ./install_tensorrt.sh \
-    --TRT_VER=${TRT_VER} \
-    --CUDA_VER=${CUDA_VER} \
-    --CUDNN_VER=${CUDNN_VER} \
-    --NCCL_VER=${NCCL_VER} \
-    --CUBLAS_VER=${CUBLAS_VER} && \
-    rm install_tensorrt.sh
-
-# Install latest Polygraphy
-COPY docker/common/install_polygraphy.sh install_polygraphy.sh
-RUN bash ./install_polygraphy.sh && rm install_polygraphy.sh
-
-# Install mpi4py
-COPY docker/common/install_mpi4py.sh install_mpi4py.sh
-RUN bash ./install_mpi4py.sh && rm install_mpi4py.sh
-
-# Install PyTorch
 ARG TORCH_INSTALL_TYPE="skip"
-COPY docker/common/install_pytorch.sh install_pytorch.sh
-RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
-
-# Install OpenCV with FFMPEG support
-RUN pip3 uninstall -y opencv && rm -rf /usr/local/lib/python3*/dist-packages/cv2/
-RUN pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
+COPY docker/common/install_base.sh \
+     docker/common/install_cmake.sh \
+     docker/common/install_ccache.sh \
+     docker/common/install_cuda_toolkit.sh \
+     docker/common/install_tensorrt.sh \
+     docker/common/install_polygraphy.sh \
+     docker/common/install_mpi4py.sh \
+     docker/common/install_pytorch.sh \
+     ./
 
 # WARs against security issues inherited from pytorch:25.04
 # * https://github.com/advisories/GHSA-vqfr-h8mv-ghfj
 # * https://github.com/advisories/GHSA-7cx3-6m66-7c5m
 # * https://github.com/advisories/GHSA-5rjg-fvgr-3xxf
-RUN pip3 install --upgrade --no-cache-dir \
+RUN echo "Using Python version: $PYTHON_VERSION" && \
+    bash ./install_base.sh $PYTHON_VERSION && rm install_base.sh && \
+    bash ./install_cmake.sh && rm install_cmake.sh && \
+    bash ./install_ccache.sh && rm install_ccache.sh && \
+    bash ./install_cuda_toolkit.sh && rm install_cuda_toolkit.sh && \
+    bash ./install_tensorrt.sh \
+    --TRT_VER=${TRT_VER} \
+    --CUDA_VER=${CUDA_VER} \
+    --CUDNN_VER=${CUDNN_VER} \
+    --NCCL_VER=${NCCL_VER} \
+    --CUBLAS_VER=${CUBLAS_VER} && \
+    rm install_tensorrt.sh && \
+    bash ./install_polygraphy.sh && rm install_polygraphy.sh && \
+    bash ./install_mpi4py.sh && rm install_mpi4py.sh && \
+    bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh && \
+    pip3 uninstall -y opencv && rm -rf /usr/local/lib/python3*/dist-packages/cv2/ && \
+    pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir && \
+    pip3 install --upgrade --no-cache-dir \
     "h11>=0.16" \
     "tornado>=6.5.0" \
     "setuptools>=78.1.1,<80"
@@ -120,6 +107,14 @@ ARG BUILD_WHEEL_ARGS="--clean --python_bindings --benchmarks"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
     python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
 
+# Workaround to reduce the number of layers
+FROM scratch as tmp
+
+COPY examples /app/tensorrt_llm/examples
+COPY README.md /app/tensorrt_llm/README.md
+COPY docs /app/tensorrt_llm/docs
+COPY cpp/include /app/tensorrt_llm/include
+
 FROM ${DEVEL_IMAGE} AS release
 
 # Create a cache directory for pip
@@ -127,16 +122,13 @@ RUN mkdir -p /root/.cache/pip
 
 WORKDIR /app/tensorrt_llm
 COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
+
+COPY --from=tmp / /
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install tensorrt_llm*.whl && \
     rm tensorrt_llm*.whl && \
-    pip cache purge
-
-COPY README.md ./
-COPY docs docs
-COPY cpp/include include
-
-RUN ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/bin")') bin && \
+    pip cache purge && \
+    ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/bin")') bin && \
     test -f bin/executorWorker && \
     ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
     test -f lib/libnvinfer_plugin_tensorrt_llm.so && \
@@ -153,7 +145,6 @@ COPY --from=wheel \
      ${CPP_BUILD_DIR}/benchmarks/disaggServerBenchmark \
      benchmarks/cpp/
 
-COPY examples examples
 RUN chmod -R a+w examples && \
     rm -v \
       benchmarks/cpp/bertBenchmark.cpp \
