@@ -151,7 +151,7 @@ In the below example:
 | `"mla_backend"` | Specifies implementation for multi-head latent attention |
 | `"max_seq_len"` | Maximum sequence length for inference/cache |
 | `"max_batch_size"` | Maximum dimension for statically allocated KV cache |
-| `"page_size"` | Page size for attention |
+| `"attn_page_size"` | Page size for attention |
 | `"benchmark"` | Indicates whether to run the built-in benchmark for token generation |
 
 For default values and additional configuration options, refer to the [simple_config.py](./simple_config.py) file.
@@ -236,37 +236,25 @@ Here is an example of how you can build an LLM object with AutoDeploy integratio
 
 ```
 from tensorrt_llm import LLM
-from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm._torch.auto_deploy.shim import AutoDeployConfig
 
-# 1. Set up the build configuration
-build_config = BuildConfig(
-    max_seq_len=<MAX_SEQ_LEN>,
-    max_batch_size=<MAX_BS>,
-)
-build_config.plugin_config.tokens_per_block = <PAGE_SIZE>
-# if using "TritonWithFlattenedInputs" as backend, <PAGE_SIZE> should equal to <MAX_SEQ_LEN>
-# Refer to examples/auto_deploy/simple_config.py (line 109) for details.
 
-# 2. Set up AutoDeploy configuration
-# AutoDeploy will use its own cache implementation
-model_kwargs = {"use_cache":False}
-
-ad_config = AutoDeployConfig(
-    use_cuda_graph=True, # set True if using "torch-opt" as compile backend
-    torch_compile_enabled=True, # set True if using "torch-opt" as compile backend
-    model_kwargs=model_kwargs,
-    attn_backend="TritonWithFlattenedInputs", # choose between "TritonWithFlattenedInputs" and "FlashInfer"
-    skip_loading_weights=False,
-)
-
-# 3. Construct the LLM high-level interface object with autodeploy as backend
+# Construct the LLM high-level interface object with autodeploy as backend
 llm = LLM(
     model=<HF_MODEL_CARD_OR_DIR>,
-    backend="autodeploy",
-    build_config=build_config,
-    auto_deploy_config=ad_config,
+    backend="_autodeploy",
     tensor_parallel_size=<NUM_WORLD_RANK>,
+    use_cuda_graph=True, # set True if using "torch-opt" as compile backend
+    torch_compile_enabled=True, # set True if using "torch-opt" as compile backend
+    model_kwargs={"use_cache": False}, # AutoDeploy uses its own cache implementation
+    attn_backend="TritonWithFlattenedInputs", # choose between "TritonWithFlattenedInputs" and "FlashInfer"
+    attn_page_size=64, # page size for attention (tokens_per_block, should be == max_seq_len for triton)
+    skip_loading_weights=False,
+    model_factory="AutoModelForCausalLM", # choose appropriate model factory
+    mla_backend="MultiHeadLatentAttention", # for models that support MLA
+    free_mem_ratio=0.8, # fraction of available memory for cache
+    simple_shard_only=False, # tensor parallelism sharding strategy
+    max_seq_len=<MAX_SEQ_LEN>,
+    max_batch_size=<MAX_BATCH_SIZE>,
 )
 
 ```
