@@ -606,6 +606,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     device='cpu',
                     pin_memory=True,
                 )
+                self.ctx_uncached_token_indptr = torch.zeros(
+                    (self.max_num_requests + 1, ),
+                    device='cuda',
+                    dtype=torch.int64,
+                )
+                self.host_ctx_uncached_token_indptr = torch.zeros_like(
+                    self.ctx_uncached_token_indptr,
+                    device='cpu',
+                    pin_memory=True,
+                )
                 # context full seqlens include cached tokens and uncached tokens
                 self.ctx_kv_indptr = torch.zeros(
                     (self.max_num_requests + 1, ),
@@ -712,13 +722,22 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.num_ctx_cached_tokens = cached_token_lens[:self.
                                                            num_contexts].sum(
                                                            ).item()
+            self.max_ctx_cached_token_len = cached_token_lens[:self.
+                                                              num_contexts].max(
+                                                              ).item()
             self.max_ctx_kv_len = kv_lens[:self.num_contexts].max().item()
             self.max_ctx_seq_len = self.seq_lens[:self.num_contexts].max().item(
             )
+            # total_q_tokens
+            self.num_ctx_seq_len = self.seq_lens[:self.num_contexts].sum().item(
+            )
         else:
             self.num_ctx_cached_tokens = 0
+            self.max_ctx_cached_token_len = 0
             self.max_ctx_kv_len = 0
             self.max_ctx_seq_len = 0
+            # total_q_tokens
+            self.num_ctx_seq_len = 0
         torch.cumsum(cached_token_lens[:self.num_contexts],
                      dim=0,
                      dtype=torch.int64,
@@ -727,7 +746,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.ctx_cached_token_indptr[:self.num_contexts + 1].copy_(
             self.host_ctx_cached_token_indptr[:self.num_contexts + 1],
             non_blocking=True)
-
+        torch.cumsum(
+            self.seq_lens[:self.num_contexts],
+            dim=0,
+            dtype=torch.int64,
+            out=self.host_ctx_uncached_token_indptr[1:self.num_contexts + 1])
+        self.ctx_uncached_token_indptr[:self.num_contexts + 1].copy_(
+            self.host_ctx_uncached_token_indptr[:self.num_contexts + 1],
+            non_blocking=True)
         torch.cumsum(kv_lens[:self.num_contexts],
                      dim=0,
                      dtype=torch.int64,
@@ -1012,6 +1038,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self,
         metadata: TrtllmAttentionMetadata,
         chunked_idx: int,
+        cu_chunked_seq_len: torch.Tensor,
         out_dtype: torch.dtype,
     ) -> torch.Tensor:
         assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
@@ -1021,7 +1048,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if metadata.max_ctx_cached_token_len == 0:
             return torch.empty((0, metadata.kv_cache_manager.head_dim),
                                dtype=out_dtype,
-                               device=metadata.ctx_cached_token_indptr.device)
+                               device=cu_chunked_seq_len.device)
 
         sink_token_length = 0
         beam_width = 1
@@ -1029,7 +1056,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         output_kv, output_k_pe = torch.ops.trtllm.load_chunked_kv_cache_for_mla(
             out_dtype,
             metadata.num_contexts,
-            metadata.metadata.ctx_cached_token_indptr,
+            cu_chunked_seq_len,
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
@@ -1038,7 +1065,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.layer_idx,
             metadata.kv_cache_manager.head_dim,
             metadata.kv_cache_manager.tokens_per_block,
-            metadata.runtime_features.chunk_unit_size,
+            metadata.runtime_features.normal_chunk_size,
             chunked_idx,
             metadata.kv_cache_manager.max_seq_len,
             sink_token_length,
@@ -1127,6 +1154,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         temp_attn: torch.Tensor,
         softmax_stats: torch.Tensor,
         temp_softmax_stats: torch.Tensor,
+        merge_op: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
     ) -> None:
         assert self.is_mla_enable and self.mla_params is not None
@@ -1138,7 +1166,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             softmax_stats,
             temp_softmax_stats,
             metadata.num_contexts,
+            metadata.ctx_uncached_token_indptr,  # cu_q_seq_len
+            metadata.max_ctx_seq_len,  # max_q_seq_len
+            merge_op,
             self.num_heads,
             self.mla_params.v_head_dim,
-            metadata.runtime_features.chunk_unit_size,
         )
