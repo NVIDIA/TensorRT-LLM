@@ -1,5 +1,5 @@
-import copy
 import math
+from dataclasses import replace
 from typing import Dict, List, Optional
 
 import torch
@@ -27,11 +27,9 @@ class VanillaMoE(nn.ModuleList):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream: Optional[torch.cuda.Stream] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
-        enable_alltoall: bool = False,
         pack_weights: bool = False,
     ):
         from ...distributed import AllReduce
@@ -86,7 +84,9 @@ class VanillaMoE(nn.ModuleList):
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
         if self.use_dp:
             max_num_tokens *= model_config.mapping.world_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens if model_config.moe_max_num_tokens is not None else max_num_tokens
+        self.moe_max_num_tokens = (model_config.moe_max_num_tokens
+                                   if model_config.moe_max_num_tokens
+                                   is not None else max_num_tokens)
 
         self.enable_alltoall = False
 
@@ -100,14 +100,16 @@ class VanillaMoE(nn.ModuleList):
     def create_experts(self, module_list: nn.ModuleList = None):
         if module_list is None:
             module_list = self
-        model_config = copy.copy(self.model_config)
-        model_config.mapping = Mapping(
-            world_size=self.mapping.moe_tp_size,
-            tp_size=self.mapping.moe_tp_size,
-            rank=self.mapping.moe_tp_rank,
+        model_config = replace(
+            self.model_config,
+            mapping=Mapping(
+                world_size=self.mapping.moe_tp_size,
+                tp_size=self.mapping.moe_tp_size,
+                rank=self.mapping.moe_tp_rank,
+            ),
+            quant_config=self.quant_config,
+            skip_create_weights_in_init=False,
         )
-        model_config.quant_config = self.quant_config
-        model_config.skip_create_weights_in_init = False
         for expert_idx in range(self.num_experts):
             if self.expert_start <= expert_idx < self.expert_end:
                 module_list[expert_idx] = GatedMLP(

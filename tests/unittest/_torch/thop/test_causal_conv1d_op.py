@@ -26,11 +26,11 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 
 @pytest.mark.parametrize(
-    "dim, dconv, req_type, dtype, batch_size, max_seq_len, remove_padding, apply_silu",
+    "dim, dconv, req_type, dtype, batch_size, max_seq_len, remove_padding, apply_silu, paged_cache",
     list(
         product([2048], [4], ['context', 'generation'],
                 ['float16', 'float32', 'bfloat16'], [5], [16], [False, True],
-                [False, True])) +
+                [False, True], [False, True])) +
     # long sequence tests to cover the int overflow issue
     list(
         map(
@@ -42,9 +42,9 @@ from tensorrt_llm.llmapi.utils import get_total_gpu_memory
                        "The long sequence test needs at least 33GB memory, skipping"
                        )),
             product([5376], [4], ['context'], ['float16', 'bfloat16'], [2],
-                    [131072], [False, True], [False, True]))))
+                    [131072], [False, True], [False, True], [False]))))
 def test_causal_conv1d(dim, dconv, req_type, dtype, batch_size, max_seq_len,
-                       remove_padding, apply_silu):
+                       remove_padding, apply_silu, paged_cache):
     device = "cuda"
     seq_len = max_seq_len if req_type == "context" else 1
     mean = 0.0
@@ -94,11 +94,22 @@ def test_causal_conv1d(dim, dconv, req_type, dtype, batch_size, max_seq_len,
     else:
         x_in_out = x.detach().clone()
 
-    conv_state_in_out = conv_state.detach().clone()
+    if paged_cache:
+        padded_batch_size = 2 * batch_size
+        cache_indices = torch.randperm(padded_batch_size,
+                                       device=device,
+                                       dtype=torch.int32)[:batch_size]
+        conv_state_in_out = torch.empty([padded_batch_size, dim, dconv - 1],
+                                        dtype=torch_dtype,
+                                        device=device)
+        conv_state_in_out[cache_indices] = conv_state.detach().clone()
+    else:
+        cache_indices = None
+        conv_state_in_out = conv_state.detach().clone()
+
     conv_weight_input = conv_weight.squeeze(1).contiguous()
 
     if req_type == "context":
-        cache_indices = None
         has_initial_state = None
 
         torch.ops.trtllm.causal_conv1d_fwd(
@@ -112,11 +123,12 @@ def test_causal_conv1d(dim, dconv, req_type, dtype, batch_size, max_seq_len,
             apply_silu,
             PAD_SLOT_ID,
         )
-        outputs = (x_in_out, conv_state_in_out)
+        outputs = (x_in_out, conv_state_in_out[cache_indices]
+                   if cache_indices is not None else conv_state_in_out)
 
     else:
+        conv_state_indices = cache_indices
         cache_seqlens = None
-        conv_state_indices = None
 
         torch.ops.trtllm.causal_conv1d_update(
             x_in_out,
@@ -128,7 +140,8 @@ def test_causal_conv1d(dim, dconv, req_type, dtype, batch_size, max_seq_len,
             conv_state_indices,
             PAD_SLOT_ID,
         )
-        outputs = (x_in_out, conv_state_in_out)
+        outputs = (x_in_out, conv_state_in_out[cache_indices]
+                   if cache_indices is not None else conv_state_in_out)
 
     out_ref = torch.zeros_like(x)
     conv_state_ref = torch.zeros_like(conv_state)

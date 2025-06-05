@@ -5,11 +5,12 @@ import gc
 import torch
 from torch.fx import GraphModule
 
+from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
 from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
-from ..shim.interface import AutoDeployConfig, CachedSequenceInterface
+from ..shim.interface import CachedSequenceInterface
 from ..utils.logger import ad_logger
 from ._graph import canonicalize_graph, lift_to_meta, move_to_device
 from .export import torch_export_to_gm
@@ -42,12 +43,10 @@ class InferenceOptimizer:
         self,
         factory: ModelFactory,
         *,  # TODO: temporary until we have a better config system
-        ad_config: AutoDeployConfig,
+        ad_config: _AutoDeployLlmArgs,
         visualize: bool = False,
     ):
         self.factory = factory
-        self.attn_backend = ad_config.attn_backend
-        self.mla_backend = ad_config.mla_backend
 
         self.ad_config = ad_config
         # Map Pytorch config to AutoDeploy compile backends.
@@ -61,10 +60,6 @@ class InferenceOptimizer:
             compile_backend = "torch-simple"
         self.compile_backend = compile_backend
         self.visualize = visualize
-
-        # look up attention op
-        self.attention_op = AttentionRegistry.get(self.attn_backend)
-        self.mla_op = AttentionRegistry.get(self.mla_backend)
 
     def __call__(self, cm: CachedSequenceInterface) -> GraphModule:
         """Transform a model into an optimized inference model.
@@ -118,13 +113,15 @@ class InferenceOptimizer:
         egm = match_causal_attn_mask(egm)
 
         # Match attention layout expected by our backend
-        egm = match_attention_layout(egm, self.attention_op)
+        egm = match_attention_layout(egm, AttentionRegistry.get(self.ad_config.attn_backend))
 
         # Match rope
         egm = match_explicit_rope(egm)
         egm = match_complex_rope(egm)
         # Match RoPE layout expected by our backend
-        egm = match_rope_layout(egm, self.attention_op.get_attention_layout())
+        egm = match_rope_layout(
+            egm, AttentionRegistry.get(self.ad_config.attn_backend).get_attention_layout()
+        )
 
         ############################################################################################
         # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
@@ -200,7 +197,8 @@ class InferenceOptimizer:
         egm = update_in_out_nodes(egm, cm)
 
         # detect attention op and replace with cache-aware op
-        for attn_descriptor in [self.attention_op, self.mla_op]:
+        for a_backend in [self.ad_config.attn_backend, self.ad_config.mla_backend]:
+            attn_descriptor = AttentionRegistry.get(a_backend)
             egm = insert_cached_attention(egm, cm, attn_descriptor, self.factory.get_cache_config())
 
         # initialize cache on correct device

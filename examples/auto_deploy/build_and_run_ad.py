@@ -8,10 +8,9 @@ import torch
 from simple_config import SimpleConfig
 
 from tensorrt_llm._torch.auto_deploy.models import ModelFactoryRegistry
-from tensorrt_llm._torch.auto_deploy.shim import AutoDeployConfig, DemoLLM
+from tensorrt_llm._torch.auto_deploy.shim import DemoLLM
 from tensorrt_llm._torch.auto_deploy.utils.benchmark import benchmark, store_benchmark_results
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
-from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.llmapi.llm import LLM, RequestOutput
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -33,27 +32,6 @@ def get_config_and_check_args() -> SimpleConfig:
 
 def build_llm_from_config(config: SimpleConfig) -> LLM:
     """Builds a LLM object from our config."""
-    # set up builder config
-    build_config = BuildConfig(max_seq_len=config.max_seq_len, max_batch_size=config.max_batch_size)
-    build_config.plugin_config.tokens_per_block = config.page_size
-
-    # setup AD config
-    ad_config = AutoDeployConfig(
-        # Both torch-opt and torch-cudagraph invoke cudagraphs
-        use_cuda_graph=config.compile_backend in ["torch-opt", "torch-cudagraph"],
-        # Both torch-opt and torch-compile invoke torch.compile
-        torch_compile_enabled=config.compile_backend in ["torch-opt", "torch-compile"],
-        model_factory=config.model_factory,
-        model_kwargs=config.model_kwargs,
-        attn_backend=config.attn_backend,
-        mla_backend=config.mla_backend,
-        skip_loading_weights=config.skip_loading_weights,
-        cuda_graph_max_batch_size=config.max_batch_size,
-        free_mem_ratio=config.free_mem_ratio,
-        simple_shard_only=config.simple_shard_only,
-    )
-    ad_logger.info(f"AutoDeploy Config: {ad_config}")
-
     # TODO: let's see if prefetching can't be done through the LLM api?
     # I believe the "classic workflow" invoked via the LLM api can do that.
     # put everything into the HF model Factory and try pre-fetching the checkpoint
@@ -73,9 +51,21 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
     }
     llm = llm_lookup[config.runtime](
         model=factory.model,
-        backend="autodeploy",
-        build_config=build_config,
-        auto_deploy_config=ad_config,
+        backend="_autodeploy",
+        max_seq_len=config.max_seq_len,
+        max_batch_size=config.max_batch_size,
+        # AutoDeploy-specific parameters
+        use_cuda_graph=config.compile_backend in ["torch-opt", "torch-cudagraph"],
+        torch_compile_enabled=config.compile_backend in ["torch-opt", "torch-compile"],
+        model_factory=config.model_factory,
+        model_kwargs=config.model_kwargs,
+        attn_backend=config.attn_backend,
+        mla_backend=config.mla_backend,
+        skip_loading_weights=config.skip_loading_weights,
+        cuda_graph_max_batch_size=config.max_batch_size,
+        free_mem_ratio=config.free_mem_ratio,
+        simple_shard_only=config.simple_shard_only,
+        attn_page_size=config.attn_page_size,  # Now passed directly as AutoDeploy parameter
         tensor_parallel_size=config.world_size,
         tokenizer=factory.init_tokenizer() if config.customize_tokenizer else None,
     )

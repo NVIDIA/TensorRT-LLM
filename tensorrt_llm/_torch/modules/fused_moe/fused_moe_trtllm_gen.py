@@ -156,6 +156,13 @@ class TRTLLMGenFusedMoE(MoE):
         if self.has_fp8_block_scales:
             x_val, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
 
+            # FIXME: tile_tokens_dim is hardcoded for now
+            tile_tokens_dim = 8
+            if 8 < x.shape[0] and x.shape[0] < 1024:
+                tile_tokens_dim = 16
+            elif x.shape[0] >= 1024:
+                tile_tokens_dim = 32
+
             final_hidden_states = torch.ops.trtllm.fp8_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
@@ -174,6 +181,7 @@ class TRTLLMGenFusedMoE(MoE):
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
+                tile_tokens_dim,
                 self.routing_method.routing_method_type,
             )
         elif self.has_nvfp4:
@@ -182,6 +190,9 @@ class TRTLLMGenFusedMoE(MoE):
             hidden_states_fp4, hidden_states_scale_linear_fp4 = torch.ops.trtllm.fp4_quantize(
                 x, self.fc31_input_scale, 16, scale_factor_use_ue8m0,
                 is_scale_factor_swizzled)
+
+            # FIXME: tile_tokens_dim is hardcoded for now
+            tile_tokens_dim = 8
 
             final_hidden_states = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
@@ -204,6 +215,7 @@ class TRTLLMGenFusedMoE(MoE):
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
                 routed_scaling_factor,
+                tile_tokens_dim,
                 self.routing_method.routing_method_type,
             )
         else:

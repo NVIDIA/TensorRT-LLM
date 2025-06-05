@@ -1831,6 +1831,22 @@ def get_sm_version():
     return prop.major * 10 + prop.minor
 
 
+def get_gpu_device_list():
+    "get device list"
+    with tempfile.TemporaryDirectory() as temp_dirname:
+        suffix = ".exe" if is_windows() else ""
+        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
+        cmd = " ".join(["nvidia-smi" + suffix, "-L"])
+        output = check_output(cmd, shell=True, cwd=temp_dirname)
+    return [l.strip() for l in output.strip().split("\n")]
+
+
+def check_device_contain(keyword_list):
+    "check device not contain keyword"
+    device = get_gpu_device_list()[0]
+    return any(keyword in device for keyword in keyword_list)
+
+
 skip_pre_ada = pytest.mark.skipif(
     get_sm_version() < 89,
     reason="This test is not supported in pre-Ada architecture")
@@ -1846,6 +1862,10 @@ skip_pre_blackwell = pytest.mark.skipif(
 skip_post_blackwell = pytest.mark.skipif(
     get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
+
+skip_device_contain_gb200 = pytest.mark.skipif(
+    check_device_contain(["GB200"]),
+    reason="This test is not supported on GB200 or GB100")
 
 skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
                                   reason="NVLS is not supported")
@@ -1875,20 +1895,10 @@ def skip_device_not_contain(request):
     if request.node.get_closest_marker('skip_device_not_contain'):
         keyword_list = request.node.get_closest_marker(
             'skip_device_not_contain').args[0]
-        device = get_gpu_device_list()[0]
-        if not any(keyword in device for keyword in keyword_list):
+        if not check_device_contain(keyword_list):
             pytest.skip(
-                f"Device {device} does not contain keyword in {keyword_list}.")
-
-
-def get_gpu_device_list():
-    "get device list"
-    with tempfile.TemporaryDirectory() as temp_dirname:
-        suffix = ".exe" if is_windows() else ""
-        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
-        cmd = " ".join(["nvidia-smi" + suffix, "-L"])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
-    return [l.strip() for l in output.strip().split("\n")]
+                f"Device {get_gpu_device_list()[0]} does not contain keyword in {keyword_list}."
+            )
 
 
 def get_device_count():

@@ -66,6 +66,11 @@ public:
         return executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx).mIRanks;
     }
 
+    [[nodiscard]] BaseKVCacheManager* getCacheManager() const
+    {
+        return mCacheManager;
+    }
+
     static bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx);
     static std::vector<executor::kv_cache::Connection const*> pickRecvConnections(
         std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
