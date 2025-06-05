@@ -4,15 +4,15 @@ set -ex
 
 TRT_VER="10.11.0.33"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-04.html#rel-25-04
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-05.html#rel-25-05
 CUDA_VER="12.9" # 12.9.0
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
 CUDNN_VER="9.10.1.4-1"
-# NCCL version 2.26.3 used in the NGC PyTorch 25.04 image but not existing in public.
-# Use NCCL version 2.26.5 instead.
-NCCL_VER="2.26.5-1+cuda12.9"
-# cuBLAS version 12.9.0.2 used in the NGC PyTorch 25.04 image but not existing in public.
+# NCCL version 2.26.5-1+cuda12.9 used in the NGC PyTorch 25.05 image but not existing in public.
+# There is a perf regression, we have to downgrade NCCL version to 2.25.1-1+cuda12.8 instead.
+NCCL_VER="2.25.1-1+cuda12.8"
+# cuBLAS version 12.9.0.13 used in the NGC PyTorch 25.05 image but not existing in public.
 # Use cuBLAS version 12.9.0.13 instead.
 CUBLAS_VER="12.9.0.13-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
