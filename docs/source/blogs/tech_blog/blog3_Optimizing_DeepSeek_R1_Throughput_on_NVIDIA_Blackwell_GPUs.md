@@ -2,6 +2,8 @@
 
 By NVIDIA TensorRT-LLM team
 ## Table of Contents
+- [Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers](#optimizing-deepseek-r1-throughput-on-nvidia-blackwell-gpus-a-deep-dive-for-developers)
+  - [Table of Contents](#table-of-contents)
   - [Introduction](#introduction)
   - [Precision strategy](#precision-strategy)
   - [Parallel strategy](#parallel-strategy)

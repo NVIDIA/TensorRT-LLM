@@ -81,18 +81,6 @@ methods:
       max_cpu_loras:
         annotation: int
         default: 4
-      # postproc worker
-      num_postprocess_workers:
-        annotation: int
-        default: 0
-      postprocess_tokenizer_dir:
-        annotation: Optional[str]
-        default: null
-      # reasoning
-      reasoning_parser:
-        annotation: Optional[str]
-        default: null
-      # kwargs
       kwargs:
         annotation: Any
         default: inspect._empty

@@ -152,7 +152,10 @@ def llama_7b_multi_lora_test_harness(**llm_kwargs) -> None:
     # (2) provide a lora_dir to infer the lora_target_modules.
     lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
                              max_lora_rank=8)
-    llm = LLM(hf_model_dir, lora_config=lora_config, **llm_kwargs)
+    llm = LLM(hf_model_dir,
+              fast_build=True,
+              lora_config=lora_config,
+              **llm_kwargs)
 
     prompts = [
         "美国的首都在哪里? \n答案:",
@@ -294,7 +297,10 @@ def test_codellama_fp8_with_bf16_lora() -> None:
                                  lora_target_modules=target_modules,
                                  max_lora_rank=8)
 
-        llm = LLM(model_dir, quant_config=quant_config, lora_config=lora_config)
+        llm = LLM(model_dir,
+                  quant_config=quant_config,
+                  fast_build=True,
+                  lora_config=lora_config)
 
         prompts = [
             "Write a function that calculates the Fibonacci sequence.",

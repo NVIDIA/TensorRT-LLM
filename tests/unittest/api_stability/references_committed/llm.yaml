@@ -81,14 +81,14 @@ methods:
         annotation: Optional[int]
         default: null
       max_input_len:
-        annotation: Optional[int]
-        default: null
+        annotation: int
+        default: 1024
       max_seq_len:
         annotation: Optional[int]
         default: null
       max_beam_width:
-        annotation: Optional[int]
-        default: null
+        annotation: int
+        default: 1
       max_num_tokens:
         annotation: Optional[int]
         default: null

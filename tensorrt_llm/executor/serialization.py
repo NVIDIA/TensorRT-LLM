@@ -10,7 +10,7 @@ import pickle  # nosec B403
 BASE_ZMQ_CLASSES = {
     "builtins": [
         "Exception", "ValueError", "NotImplementedError", "AttributeError",
-        "AssertionError", "RuntimeError"
+        "AssertionError"
     ],  # each Exception Error class needs to be added explicitly
     "collections": ["OrderedDict"],
     "datetime": ["timedelta"],
