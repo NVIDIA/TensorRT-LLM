@@ -1701,11 +1701,9 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
     pytest.param('Mixtral-8x7B-NVFP4',
                  'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
                  marks=skip_pre_blackwell),
-    pytest.param(
-        'Nemotron-Ultra-253B',
-        'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
-        marks=[skip_pre_hopper,
-               pytest.mark.skip_less_device_memory(140000)]),
+    pytest.param('Nemotron-Ultra-253B',
+                 'nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1',
+                 marks=skip_pre_hopper),
 ])
 def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
                                        model_path):
@@ -1730,6 +1728,7 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
             "--tp_size=8",
+            "--max_batch_size=32",
         ],
                          stdout=running_log)
         if model_name in mapping:
