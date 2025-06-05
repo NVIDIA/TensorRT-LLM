@@ -1,4 +1,7 @@
-from .eagle3 import (Eagle3OneModelDecoder, Eagle3OneModelSpecMetadata,
+from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
+from tensorrt_llm._torch.speculative.interface import SpecConfig
+
+from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3Sampler, Eagle3SpecMetadata)
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
@@ -52,15 +55,15 @@ def get_spec_resource_manager(spec_config, model_config, max_num_requests):
         return None
 
 
-def get_spec_decoder(max_seq_len, spec_config):
-    if spec_config.spec_dec_mode.is_mtp():
-        return MTPSampler(max_seq_len, spec_config)
-    elif spec_config.spec_dec_mode.is_eagle3():
-        return Eagle3Sampler(max_seq_len)
-    elif spec_config.spec_dec_mode.is_eagle3_one_model():
-        return Eagle3OneModelDecoder(max_seq_len, spec_config)
-    else:
-        return None
+def get_spec_decoder(config: SpecConfig, sampler_args: TorchSampler.Args):
+    if config.spec_dec_mode.is_mtp():
+        return MTPSampler(sampler_args, nextn=config.num_nextn_predict_layers)
+    elif config.spec_dec_mode.is_eagle3():
+        return Eagle3Sampler(sampler_args)
+    elif config.spec_dec_mode.is_eagle3_one_model():
+        return Eagle3OneModelSampler(sampler_args)
+    raise ValueError(
+        f"Unsupported speculative decoding mode: {config.spec_dec_mode}")
 
 
 def get_num_spec_layers(spec_config):
