@@ -1,7 +1,7 @@
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
 from dataclasses import dataclass
-from typing import List
+from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
 import PIL
@@ -16,10 +16,23 @@ default_hasher = blake3
 @dataclass
 class MultimodalInput:
     multimodal_hashes: List[List[int]]
-    # multimodal_positions contains only the start position of each chunk
-    # This is different from mm_positions elsewhere which contains all positions of multimodal tokens
+    """Hash values for multimodal data items (e.g., images).
+
+    Each element is a list of 8 integers representing the hash digest of a multimodal item.
+    """
+
     multimodal_positions: List[int]
+    """Starting positions of each multimodal chunk in the token sequence.
+
+    Contains only the start position of each chunk, not all positions of multimodal tokens.
+    This is different from mm_positions elsewhere which contains all positions.
+    """
+
     multimodal_lengths: List[int]
+    """Length (number of tokens) of each multimodal item.
+
+    Combined with multimodal_positions, this defines the token spans for each multimodal item.
+    """
 
     def __post_init__(self):
         """Validate input data structure and consistency."""
@@ -53,12 +66,14 @@ class MultimodalInput:
             )
 
     @classmethod
-    def from_components(cls, mm_hashes, mm_positions, mm_lengths):
+    def from_components(cls, mm_hashes: List[List[int]],
+                        mm_positions: List[int],
+                        mm_lengths: List[int]) -> 'MultimodalInput':
         return cls(multimodal_hashes=mm_hashes,
                    multimodal_positions=mm_positions,
                    multimodal_lengths=mm_lengths)
 
-    def to_tensor(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def to_tensor(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convert data to tensors"""
         return (
             # int32 to match the type in TRTLLM SizeType32
@@ -87,7 +102,8 @@ def serialize_item(obj: object) -> bytes:
     raise ValueError(f"Unsupported object type: {type(obj)}")
 
 
-def apply_mm_hashes(mm_data, hash_lib=default_hasher):
+def apply_mm_hashes(mm_data: Dict[str, Any],
+                    hash_lib=default_hasher) -> Dict[str, List[str]]:
     """Apply hashing to multimodal data items."""
 
     def _hash_image(image):
@@ -112,7 +128,7 @@ def apply_mm_hashes(mm_data, hash_lib=default_hasher):
     return mm_hashes
 
 
-def hexdigest_to_int32(hex_digest: str) -> list[int]:
+def hexdigest_to_int32(hex_digest: str) -> List[int]:
     """Convert a 256-bit hexadecimal digest to 8 int32 values."""
     if len(hex_digest) != 64:
         raise ValueError(
@@ -128,7 +144,8 @@ def hexdigest_to_int32(hex_digest: str) -> list[int]:
     return result
 
 
-def find_mm_token_lengths(mm_data, input_processor):
+def find_mm_token_lengths(mm_data: Dict[str, Any],
+                          input_processor: Any) -> List[int]:
     """Get multimodal token lengths from multimodal data items. """
 
     mm_items = {
@@ -140,11 +157,15 @@ def find_mm_token_lengths(mm_data, input_processor):
     for modality, items in mm_items.items():
         if modality != "image":
             #TODO: support other modalities
-            return []
+            raise ValueError(
+                f"Unsupported modality: {modality}. Only 'image' modality is currently supported for hashing."
+            )
         if not hasattr(input_processor, "get_num_tokens_per_image"):
             #TODO: backward compatibility for models that don't yet have get_num_tokens_per_image implemented
             #TODO: only support qwen2_vl for now
-            return []
+            raise AttributeError(
+                f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_image' method required for multimodal hashing."
+            )
 
         modality_token_lengths = []
         for item in items:
@@ -161,10 +182,11 @@ def find_mm_token_lengths(mm_data, input_processor):
     return num_mm_tokens['image']  # flatten all mm instances to a single list
 
 
-def find_mm_token_positions(input_ids,
-                            num_mm_tokens,
-                            vocab_size,
-                            mm_token_ids=None):
+def find_mm_token_positions(input_ids: Union[torch.Tensor, List[int],
+                                             np.ndarray],
+                            num_mm_tokens: List[int],
+                            vocab_size: int,
+                            mm_token_ids: torch.Tensor = None) -> List[int]:
     """Get multimodal token positions using IDs > vocab_size and known lengths.
 
     This function finds multimodal tokens (with IDs > vocab_size) and uses the
@@ -219,8 +241,10 @@ def find_mm_token_positions(input_ids,
     return start_positions
 
 
-def validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
-                       num_mm_tokens):
+def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],
+                                               np.ndarray],
+                       mm_hashes: List[List[int]], start_positions: List[int],
+                       num_mm_tokens: List[int]) -> None:
     """Validates multimodal inputs for consistency and correctness."""
     # Validate number of hashes matches number of chunks
     if len(mm_hashes) != len(num_mm_tokens):

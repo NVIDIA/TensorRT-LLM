@@ -1,4 +1,5 @@
-from typing import Any, Dict, List, Optional, Protocol, Tuple, Type, TypeVar
+from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
+                    TypeVar)
 
 from torch import nn
 
@@ -145,9 +146,10 @@ def create_input_processor(model_path_or_dir: str, tokenizer):
 
 
 def create_input_processor_with_hash(
-    input_processor,
+    input_processor: InputProcessor,
     hash_lib=default_hasher,
-):
+) -> Callable[[TextPrompt, SamplingParams], Tuple[
+        List[int], Optional[ExtraProcessedInputs]]]:
     """Creates a modified processor that applies additional logic like (hashing, find mm chunk positions) to the input processor
 
     Args:
@@ -158,35 +160,41 @@ def create_input_processor_with_hash(
         A wrapped processor that modifies prompts before processing.
     """
 
-    def input_processor_wrapper(inputs, sampling_params):
-        assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
-        mm_data = inputs['multi_modal_data']
-        num_mm_tokens = find_mm_token_lengths(mm_data, input_processor)
-        if len(num_mm_tokens) > 0:
-            mm_hashes = apply_mm_hashes(mm_data, hash_lib)
-            prompt_token_ids, extra_processed_inputs = input_processor(
-                inputs, sampling_params)
-            start_positions = find_mm_token_positions(
-                input_ids=prompt_token_ids,  # token sequence
-                num_mm_tokens=
-                num_mm_tokens,  # list of lengths of each chunk of visual tokens
-                vocab_size=input_processor.model_config.vocab_size,
-            )
-            # flatten the hashes from dict to a single list
-            mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
-            validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
-                               num_mm_tokens)
-            mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes
-                               ]  # nested list w/ multiple int32 per hash
+    def input_processor_wrapper(
+        inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        try:
+            assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
+            mm_data = inputs['multi_modal_data']
+            num_mm_tokens = find_mm_token_lengths(mm_data, input_processor)
+            if len(num_mm_tokens) > 0:
+                mm_hashes = apply_mm_hashes(mm_data, hash_lib)
+                prompt_token_ids, extra_processed_inputs = input_processor(
+                    inputs, sampling_params)
+                start_positions = find_mm_token_positions(
+                    input_ids=prompt_token_ids,  # token sequence
+                    num_mm_tokens=
+                    num_mm_tokens,  # list of lengths of each chunk of visual tokens
+                    vocab_size=input_processor.model_config.vocab_size,
+                )
+                # flatten the hashes from dict to a single list
+                mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
+                validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
+                                   num_mm_tokens)
+                mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes
+                                   ]  # nested list w/ multiple int32 per hash
 
-            extra_processed_inputs[
-                "multimodal_input"] = MultimodalInput.from_components(
-                    mm_hashes_int32, start_positions, num_mm_tokens)
-            return prompt_token_ids, extra_processed_inputs
-        else:
-            # disable hashing when output num_mm_tokens is empty, when
-            # (1) other modalities are found other than image
-            # (2) models that don't have get_num_tokens_per_image implemented
+                extra_processed_inputs[
+                    "multimodal_input"] = MultimodalInput.from_components(
+                        mm_hashes_int32, start_positions, num_mm_tokens)
+                return prompt_token_ids, extra_processed_inputs
+            else:
+                return input_processor(inputs, sampling_params)
+        except Exception as e:
+            # Fall back to basic input processor if multimodal processing fails
+            logger.warning(
+                f"Multimodal hashing failed: {e}. Falling back to basic input processor."
+            )
             return input_processor(inputs, sampling_params)
 
     return input_processor_wrapper
