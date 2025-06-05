@@ -200,6 +200,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         has_speculative_draft_tokens=has_draft_model_engine
         or has_ngram_drafter,
         chunk_unit_size=executor_config.tokens_per_block,
+        normal_chunk_size=executor_config.max_num_tokens,
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 

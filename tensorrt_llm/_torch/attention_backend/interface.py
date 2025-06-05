@@ -25,6 +25,7 @@ class AttentionRuntimeFeatures:
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
     chunk_unit_size: int = 0
+    normal_chunk_size: int = 0
 
 
 # The type of requests in qkv passed to attention
