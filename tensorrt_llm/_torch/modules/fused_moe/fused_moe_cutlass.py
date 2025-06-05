@@ -1,10 +1,12 @@
 import os
+from enum import IntEnum
 from typing import Dict, List, Optional, Union
 
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
-from tensorrt_llm._utils import logger
+from tensorrt_llm._utils import local_mpi_size, logger
+from tensorrt_llm.mapping import Mapping
 
 from ...distributed import allgather, reducescatter
 from ...expert_statistic import ExpertStatistic
@@ -12,8 +14,7 @@ from ...model_config import ModelConfig, MoeLoadBalancerConfig
 from ...utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                       reswizzle_sf, swizzle_sf, unswizzle_sf)
 from . import deep_ep_utils
-from .alltoall_method_types import (AlltoallMethodType,
-                                    select_alltoall_method_type)
+from .deep_ep_utils import deep_ep_installed
 from .interface import MoE
 from .moe_load_balancer import MoeLoadBalancer
 from .quantization import (FP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
@@ -22,6 +23,18 @@ from .quantization import (FP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
 from .routing import BaseMoeRoutingMethod
 
 _alltoall_method_type_logged = False
+
+
+# The type of alltoall method
+class AlltoallMethodType(IntEnum):
+    # Not available
+    NotAvailable = 0
+    # MNNVL
+    MNNVL = 1
+    # DeepEP intranode or internode: no CUDA Graphs support, IBGDA is required by internode
+    DeepEP = 2
+    # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
+    DeepEPLowLatency = 3
 
 
 class CutlassFusedMoE(MoE):
@@ -37,7 +50,6 @@ class CutlassFusedMoE(MoE):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
-        enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
 
     MoE torch custom op:
         In min-latency mode:
@@ -86,7 +98,6 @@ class CutlassFusedMoE(MoE):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
-        enable_alltoall: bool = False,
         moe_load_balancer: Optional[MoeLoadBalancer] = None,
         layer_idx: Optional[int] = None,
     ):
@@ -171,7 +182,9 @@ class CutlassFusedMoE(MoE):
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
 
-        self.enable_alltoall = enable_alltoall
+        self.alltoall_method_type = self.select_alltoall_method_type(
+            model_config.mapping, routing_method.experts_per_token, dtype,
+            model_config.pytorch_backend_config.use_cuda_graph)
         self.use_postquant_alltoall = False
         if self.enable_alltoall:
             assert self.use_dp and self.parallel_size > 1,\
@@ -180,13 +193,10 @@ class CutlassFusedMoE(MoE):
             self.use_postquant_alltoall = (os.environ.get(
                 "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
                                            == "1") and qm.has_nvfp4()
-            self.alltoall_method_type = select_alltoall_method_type(
-                model_config.mapping,
-                model_config.pytorch_backend_config.use_cuda_graph)
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 MnnvlMemory.initialize()
                 self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
-                    model_config.mapping) if enable_alltoall else None
+                    model_config.mapping)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 deep_ep_utils.get_buffer(
                     deep_ep_utils.get_comm(model_config.mapping),
@@ -202,16 +212,15 @@ class CutlassFusedMoE(MoE):
                     self.num_slots,
                 )
             else:
-                raise NotImplementedError("not available alltoall method type")
+                raise NotImplementedError(
+                    f"Not available alltoall method type: {alltoall_method_type!r}"
+                )
         # Log once
         global _alltoall_method_type_logged
         if not _alltoall_method_type_logged:
-            if self.enable_alltoall:
-                logger.info(
-                    f"CutlassFusedMoE selects alltoall_method_type {self.alltoall_method_type!r}"
-                )
-            else:
-                logger.info(f"CutlassFusedMoE alltoall not enabled")
+            logger.info(
+                f"CutlassFusedMoE selects alltoall_method_type {self.alltoall_method_type!r}"
+            )
             _alltoall_method_type_logged = True
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
@@ -241,11 +250,53 @@ class CutlassFusedMoE(MoE):
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
 
+    @staticmethod
+    def select_alltoall_method_type(mapping: Mapping, top_k: int,
+                                    dtype: torch.dtype,
+                                    use_cuda_graph: bool) -> AlltoallMethodType:
+        if not mapping.enable_attention_dp:
+            return AlltoallMethodType.NotAvailable
+
+        if mapping.tp_size == 1:
+            return AlltoallMethodType.NotAvailable
+
+        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
+            return AlltoallMethodType.NotAvailable
+
+        if mapping.moe_ep_size <= top_k:
+            return AlltoallMethodType.NotAvailable
+
+        if MnnvlMemory.supports_mnnvl():
+            return AlltoallMethodType.MNNVL
+
+        if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1":
+            if deep_ep_installed and dtype == torch.bfloat16:
+                intranode = mapping.moe_ep_size <= local_mpi_size()
+                ibgda = os.environ.get(
+                    "TRTLLM_CAN_USE_IBGDA",
+                    "0") == "1"  # TODO: Auto detect IBGDA support
+                if use_cuda_graph:
+                    # Here we can only choose DeepEPLowLatency since only this method supports CUDA Graphs.
+                    if ibgda:
+                        return AlltoallMethodType.DeepEPLowLatency
+                else:
+                    # Here we can choose DeepEP or DeepEPLowLatency if both are available. Now DeepEP is faster.
+                    if intranode or ibgda:
+                        return AlltoallMethodType.DeepEP
+
+        return AlltoallMethodType.NotAvailable
+
     @property
     def has_w4afp8(self):
         assert self._weights_created
         return self.quant_config and self.quant_config.quant_mode.is_int4_weight_only_per_group(
         )
+
+    @property
+    def enable_alltoall(self):
+        """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
+        """
+        return self.alltoall_method_type != AlltoallMethodType.NotAvailable
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -388,7 +439,9 @@ class CutlassFusedMoE(MoE):
                     token_final_scales = torch.ones_like(
                         token_selected_slots, dtype=token_final_scales.dtype)
             else:
-                raise NotImplementedError("not available alltoall method type")
+                raise NotImplementedError(
+                    f"Not available alltoall method type: {alltoall_method_type!r}"
+                )
 
         x_sf = None
         if self.has_any_quant:
@@ -475,10 +528,12 @@ class CutlassFusedMoE(MoE):
                                           self.scaling_vector_size)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 raise NotImplementedError(
-                    "not implemented postquant for DeepEPLowLatency, please set TRTLLM_MOE_POST_QUANT_ALLTOALLV=0"
+                    "Not implemented postquant for DeepEPLowLatency, please set TRTLLM_MOE_POST_QUANT_ALLTOALLV=0"
                 )
             else:
-                raise NotImplementedError("not available alltoall method type")
+                raise NotImplementedError(
+                    f"Not available alltoall method type: {alltoall_method_type!r}"
+                )
 
         if self.enable_alltoall:
             # Adapter between `torch.ops.trtllm.fused_moe` and DeepEP
@@ -554,7 +609,9 @@ class CutlassFusedMoE(MoE):
                     deep_ep_topk_weights, deep_ep_handle)
                 return combined_hidden_states
             else:
-                raise NotImplementedError("not available alltoall method type")
+                raise NotImplementedError(
+                    f"Not available alltoall method type: {alltoall_method_type!r}"
+                )
 
     def forward(
         self,

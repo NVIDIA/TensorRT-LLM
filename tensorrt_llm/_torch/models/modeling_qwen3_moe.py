@@ -12,10 +12,10 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (AlltoallMethodType, BaseMoeRoutingMethod,
-                                 CutlassFusedMoE, MoE, Qwen3MoeRoutingMethod,
+from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE, MoE,
+                                 Qwen3MoeRoutingMethod,
                                  RenormalizeMoeRoutingMethod, RoutingMethodType,
-                                 create_moe, select_alltoall_method_type)
+                                 create_moe)
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..utils import disable_fp4_allgather
@@ -88,8 +88,6 @@ class Qwen3MoE(nn.Module):
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.mapping = model_config.mapping
         self.allreduce = AllReduce(self.mapping)
-        self.enable_alltoall = Qwen3MoE.should_enable_alltoall(
-            model_config, self.top_k)
 
         self.gate = Qwen3Gate(
             hidden_size=self.hidden_dim,
@@ -112,27 +110,6 @@ class Qwen3MoE(nn.Module):
             model_config=model_config,
         )
 
-    @staticmethod
-    def should_enable_alltoall(model_config: ModelConfig, top_k: int) -> bool:
-        if not model_config.mapping.enable_attention_dp:
-            return False
-
-        if model_config.mapping.tp_size == 1:
-            return False
-
-        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
-            return False
-
-        if model_config.mapping.moe_ep_size <= top_k:
-            return False
-
-        if select_alltoall_method_type(
-                model_config.mapping, model_config.pytorch_backend_config.
-                use_cuda_graph) == AlltoallMethodType.NotAvailable:
-            return False
-
-        return True
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -148,7 +125,7 @@ class Qwen3MoE(nn.Module):
         if self.enable_attention_dp and self.mapping.tp_size > 1:
             # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
             # to reduce allreduce BW
-            if disable_fp4_allgather() and not self.enable_alltoall:
+            if disable_fp4_allgather() and not self.experts.enable_alltoall:
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,

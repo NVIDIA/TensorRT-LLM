@@ -23,7 +23,6 @@ class TRTLLMGenFusedMoE(MoE):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
-        enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
 
     MoE torch custom op:
         Only support min-latency mode now (SM100 Blackwell only).
