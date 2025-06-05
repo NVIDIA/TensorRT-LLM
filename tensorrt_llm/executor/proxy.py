@@ -394,6 +394,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         if enable_llm_debug():
             print_alive_threads()
 
+    def is_shutdown(self) -> bool:
+        return self.doing_pre_shutdown
+
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """
             Low-level API to the executor. Return a "future" GenerationResult
