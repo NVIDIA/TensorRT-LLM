@@ -59,9 +59,6 @@ class Qwen3Attention(Attention):
             config=model_config,
         )
 
-        # Record pos_embd_params for fused qk_norm_rope.
-        self.pos_embd_params = pos_embd_params
-
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=1e-6,
                               dtype=config.torch_dtype,
