@@ -4,8 +4,8 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import (AutoConfig, AutoModel, AutoProcessor, LlavaNextConfig,
-                          PretrainedConfig, PreTrainedModel)
+from transformers import (AutoConfig, AutoModel, AutoProcessor, AutoTokenizer,
+                          LlavaNextConfig, PretrainedConfig, PreTrainedModel)
 from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llava_next.modeling_llava_next import \
     LlavaNextMultiModalProjector
@@ -33,6 +33,11 @@ class LlavaNextInputProcessor(InputProcessor):
                  trust_remote_code: bool = True,
                  use_fast: bool = True):
         self.tokenizer = tokenizer
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                trust_remote_code=trust_remote_code,
+                use_fast=use_fast)
         self.processor = AutoProcessor.from_pretrained(
             model_path, trust_remote_code=trust_remote_code, use_fast=use_fast)
         self.model_config = model_config

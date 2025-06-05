@@ -414,6 +414,11 @@ class HCXVisionInputProcessor(InputProcessor):
 
         self.pretrained_config = model_config
         self.tokenizer = tokenizer
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                trust_remote_code=trust_remote_code,
+                use_fast=use_fast)
         self.processor = AutoProcessor.from_pretrained(
             model_path, trust_remote_code=trust_remote_code, use_fast=use_fast)
         self.tllm_image_token_id = self.pretrained_config.language_config[
