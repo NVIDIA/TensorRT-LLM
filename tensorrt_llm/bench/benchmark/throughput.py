@@ -356,10 +356,14 @@ def throughput_command(
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['backend'] = backend
 
-        if backend == "pytorch":
+        if backend == "pytorch" and iteration_log is not None:
             kwargs["enable_iter_perf_stats"] = True
 
         if runtime_config.backend == 'pytorch':
+            if kwargs.pop("extended_runtime_perf_knob_config", None):
+                logger.warning(
+                    "Ignore extended_runtime_perf_knob_config for pytorch backend."
+                )
             llm = PyTorchLLM(**kwargs)
         else:
             llm = LLM(**kwargs)

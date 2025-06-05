@@ -268,6 +268,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         return LlmResponse(response,
                            self.py_result) if response is not None else None
 
+    @property
+    def is_dummy(self):
+        return self.is_attention_dp_dummy or self.is_cuda_graph_dummy
+
 
 def convert_wordlist(word_list) -> List[List[int]]:
     """Converts a wordlist from format:

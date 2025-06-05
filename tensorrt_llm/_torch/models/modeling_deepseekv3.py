@@ -486,12 +486,14 @@ class Deepseekv3MoE(nn.Module):
 
         router_logits = self.gate(hidden_states)
 
-        routed_output = self.experts(hidden_states_fp4 or hidden_states,
-                                     router_logits,
-                                     cutlass_min_latency_mode,
-                                     output_dtype=hidden_states.dtype,
-                                     all_rank_num_tokens=all_rank_num_tokens,
-                                     use_dp_padding=use_dp_padding)
+        routed_output = self.experts(
+            hidden_states_fp4 or hidden_states,
+            router_logits,
+            cutlass_min_latency_mode=cutlass_min_latency_mode,
+            output_dtype=hidden_states.dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+        )
 
         return routed_output
 
