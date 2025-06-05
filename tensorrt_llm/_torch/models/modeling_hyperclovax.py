@@ -25,7 +25,7 @@ from .modeling_utils import register_auto_model
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
-# Copied from HyperCLOVA-SEED-Vision-Instruct-3B/modling_hyperclovax.py
+# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def select_best_resolution(original_size: tuple,
                            possible_resolutions: list) -> tuple:
     original_height, original_width = original_size
@@ -51,7 +51,7 @@ def select_best_resolution(original_size: tuple,
     return best_fit
 
 
-# Copied from HyperCLOVA-SEED-Vision-Instruct-3B/modling_hyperclovax.py
+# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def unpad_image(tensor: torch.Tensor,
                 original_size: Tuple[int, int]) -> torch.Tensor:
     original_width, original_height = original_size
@@ -74,7 +74,7 @@ def unpad_image(tensor: torch.Tensor,
     return unpadded_tensor
 
 
-# Copied from HyperCLOVA-SEED-Vision-Instruct-3B/modling_hyperclovax.py
+# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def get_anyres_image_grid_shape(
     image_size: Tuple[int, int],
     grid_pinpoints: Union[str, List[Tuple[int, int]]],
@@ -90,7 +90,7 @@ def get_anyres_image_grid_shape(
     return width // patch_size, height // patch_size
 
 
-# Copied from HyperCLOVA-SEED-Vision-Instruct-3B/modling_hyperclovax.py
+# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def reshape_and_unpad_image_features(
     image_feature: torch.Tensor,
     height: int,
@@ -134,7 +134,7 @@ def reshape_and_unpad_image_features(
     return image_feature
 
 
-# Copied from HyperCLOVA-SEED-Vision-Instruct-3B/modling_hyperclovax.py
+# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def anyres_postprocessing(
     image_forward_outs: torch.FloatTensor,
     split_sizes: List[int],
@@ -185,7 +185,7 @@ def anyres_postprocessing(
     return image_features
 
 
-# Copied from HyperCLOVA-SEED-Vision-Instruct-3B/modling_hyperclovax.py
+# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def adaptive_anyres_postprocessing(
     image_forward_outs: torch.FloatTensor,
     image_sizes: List[List[int]],
@@ -235,7 +235,7 @@ def adaptive_anyres_postprocessing(
     return image_features
 
 
-# Copied from HyperCLOVA-SEED-Vision-Instruct-3B/modling_hyperclovax.py
+# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def compute_adaptive_params(
     pixel_values: Optional[List[List[torch.FloatTensor]]] = None,
     num_queries_vis_abstractors: Optional[List[List[int]]] = None,
@@ -382,7 +382,7 @@ def compute_adaptive_params(
     return num_queries_vis_abstractors, num_grids, image_sizes, is_videos, group_ids
 
 
-# Copied from HyperCLOVA-SEED-Vision-Instruct-3B/modling_hyperclovax.py
+# Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def determine_non_vision_query_lengths(input_ids: torch.LongTensor, pad_id: int,
                                        img_start_id: int) -> List[int]:
     non_vision_query_lengths = []

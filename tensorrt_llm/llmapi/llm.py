@@ -354,8 +354,6 @@ class LLM:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
                 multimodal_embedding = extra_processed_inputs.get(
                     'mm_embedding')
-                # NOTE: We send multimodal_embedding to CPU here so that we can pin_memory on the worker process
-                multimodal_embedding = multimodal_embedding.to('cpu')
                 mrope_config = extra_processed_inputs.get('mrope_config')
         else:
             raise TypeError(
