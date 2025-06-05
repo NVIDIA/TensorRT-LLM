@@ -1,4 +1,4 @@
-# Scaling Expert Parallelism in TensorRT-LLM(Part 1: Design and Implementation of Large-scale EP)
+# Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)
 
 By NVIDIA TensorRT-LLM Team
 
