@@ -43,7 +43,7 @@ class OranginaModelConfig:
     num_experts_per_tok: int = 4
     # TODO: check what the real max_position_embeddings is
     max_position_embeddings: int = 8192
-    model_type: str = "orangina"
+    model_type: str = "mixtral"
     tie_word_embeddings: bool = False
 
 
@@ -66,12 +66,12 @@ class AttentionBlock(Attention):
             num_attention_heads=pretrained_config.num_attention_heads,
             num_key_value_heads=pretrained_config.num_key_value_heads,
             max_position_embeddings=pretrained_config.max_position_embeddings,
-            bias=False,
+            bias=True,
             pos_embd_params=pos_embd_params,
             qk_norm_type=QkNormType.none,
             layer_idx=layer_idx,
             dtype=pretrained_config.torch_dtype,
-            dense_bias=False,
+            dense_bias=True,
             config=config,
             q_scaling=1.0,
             attention_chunk_size=None,
@@ -131,6 +131,7 @@ class MLPBlock(torch.nn.Module):
         self.gate = Linear(
             in_features=pretrained_config.hidden_size,
             out_features=pretrained_config.num_experts,
+            bias=True,
             dtype=pretrained_config.torch_dtype,
             use_custom_cublas_mm=
             False,  # TODO: check perf & cublass mm can not support bias.
@@ -140,6 +141,7 @@ class MLPBlock(torch.nn.Module):
             top_k=pretrained_config.num_experts_per_tok)
 
         # TODO: route "block.x.mlp" weights to "block.x.mlp.experts" in weight loading
+        # TODO: add bias
         self.experts = create_moe(
             routing_method=self.routing_method,
             num_experts=pretrained_config.num_experts,
