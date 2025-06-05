@@ -302,7 +302,7 @@ class Mapping(object):
         # TODO(qijun): skip check for enable_attention_dp temporarily, will support attention_dp_size
         if not self.enable_attention_dp:
             if not isinstance(rank,
-                              int) or rank < 0 and rank >= self.world_size:
+                              int) or rank < 0 or rank >= self.world_size:
                 raise ValueError(
                     f"Rank should be an integer between 0 and {self.world_size-1}, but got {rank}."
                 )
