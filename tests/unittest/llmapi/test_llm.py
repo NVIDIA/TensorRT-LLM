@@ -1951,7 +1951,6 @@ def test_llm_get_queued_stats():
     llm = LLM_CLASS(model=llama_model_path,
                     kv_cache_config=global_kvcache_config,
                     tensor_parallel_size=tp_size,
-                    fast_build=True,
                     max_batch_size=1,
                     **llm_args_extra)
 
