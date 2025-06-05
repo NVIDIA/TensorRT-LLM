@@ -1,13 +1,10 @@
-import asyncio
 import copy
 import threading
-import time
 from unittest import mock
 
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
-from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest,
                                                 DisaggregatedParams)
@@ -24,10 +21,12 @@ class MockMetadataServer:
         self.lock = threading.Lock()
 
     def get(self, key):
+        print("***** get *****", key)
         with self.lock:
             return self.servers.get(key)
 
     def put(self, key, value):
+        print("***** put *****", key, value)
         with self.lock:
             self.servers[key] = value
             return True
@@ -40,6 +39,7 @@ class MockMetadataServer:
             return False
 
     def add_server(self, key, url):
+        print("***** add_server *****", key, url)
         with self.lock:
             self.servers[key] = url
             return True
@@ -139,7 +139,7 @@ def chat_gen_requests():
 
 @pytest.mark.asyncio
 async def test_round_robin_router(servers, context_requests):
-    router = RoundRobinRouter(servers)
+    router = RoundRobinRouter(server_role=None, servers=servers)
     server_sequence = [(await router.get_next_server(req))[0]
                        for req in context_requests]
     assert server_sequence == [
@@ -153,7 +153,9 @@ async def test_round_robin_router(servers, context_requests):
     "chat_gen_requests"
 ])
 async def test_request_balancing_router(servers, requests_fixture, request):
-    router = LoadBalancingRouter(servers, use_tokens=False)
+    router = LoadBalancingRouter(server_role=None,
+                                 servers=servers,
+                                 use_tokens=False)
     requests = request.getfixturevalue(requests_fixture)
 
     server, _ = await router.get_next_server(requests[0])
@@ -181,7 +183,9 @@ async def test_request_balancing_router(servers, requests_fixture, request):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("requests_fixture", ["context_requests"])
 async def test_tokens_balancing_router(servers, requests_fixture, request):
-    router = LoadBalancingRouter(servers, use_tokens=True)
+    router = LoadBalancingRouter(server_role=None,
+                                 servers=servers,
+                                 use_tokens=True)
     requests = request.getfixturevalue(requests_fixture)
 
     server_sequence = [(await router.get_next_server(req))[0]
@@ -237,7 +241,9 @@ async def test_tokens_balancing_router(servers, requests_fixture, request):
     "requests_fixture",
     ["chat_context_requests", "gen_requests", "chat_gen_requests"])
 async def test_gen_tokens_balancing_router(servers, requests_fixture, request):
-    router = LoadBalancingRouter(servers, use_tokens=True)
+    router = LoadBalancingRouter(server_role=None,
+                                 servers=servers,
+                                 use_tokens=True)
     requests = request.getfixturevalue(requests_fixture)
 
     # Should throw an error if trying to use tokens load balancing with gen-only requests or chat completion requests
@@ -255,7 +261,8 @@ async def test_kv_cache_aware_router(servers):
         CompletionRequest(model="TinyLlama", prompt=[[1002] * 300]),
     ]
 
-    router = KvCacheAwareRouter(servers,
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
                                 use_tokens=False,
                                 max_batch_size=32,
                                 tokens_per_block=32)
@@ -347,238 +354,76 @@ def mock_metadata_server():
     return MockMetadataServer()
 
 
-@pytest.mark.slow
-def test_fetch_live_servers_context(mock_metadata_server):
-    """Test fetching live context servers"""
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "router_class", [RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter])
+async def test_fetch_live_servers_context(mock_metadata_server, router_class):
     # Create router with mock metadata server
-    router = RoundRobinRouter(server_role="context",
-                              metadata_servers=[mock_metadata_server])
+    router = router_class(server_role="context",
+                          metadata_server=mock_metadata_server)
 
-    # Start server monitoring with a shorter poll interval for testing
-    # but still long enough to verify the actual behavior
-    poll_interval = 10  # seconds
-    asyncio.run(router.start_server_monitoring(poll_interval=poll_interval))
+    # Initial check - should be no servers
+    servers = await router.fetch_live_servers()
+    assert len(servers) == 0, "Should have no servers initially"
 
-    try:
-        # Initial check - should be no servers
-        servers = router.fetch_live_servers()
-        assert len(servers) == 0, "Should have no servers initially"
+    # Add a server
+    server_key = "trtllm/server1"
+    server_url = "http://localhost:8001"
+    mock_metadata_server.add_server(server_key, {"url": server_url})
 
-        # Add a server
-        server_key = "servers/context/server1"
-        server_url = "http://localhost:8001"
-        mock_metadata_server.add_server(server_key, {"url": server_url})
+    # Fetch servers again
+    servers = await router.fetch_live_servers()
+    assert len(servers) == 1, "Should have one server after adding and waiting"
+    assert server_key in servers, "Server key should be present"
+    assert servers[
+        server_key] == server_url, "Server URL should match what was added"
 
-        # Wait for the polling interval to pass (add 50% buffer)
-        wait_time = poll_interval * 1.5
-        logger.info(f"Waiting {wait_time} seconds for server to be detected...")
-        time.sleep(wait_time)
+    # Add another server
+    server_key2 = "trtllm/server2"
+    server_url2 = "http://localhost:8002"
+    mock_metadata_server.add_server(server_key2, {"url": server_url2})
 
-        # Fetch servers again
-        servers = router.fetch_live_servers()
-        assert len(
-            servers) == 1, "Should have one server after adding and waiting"
-        assert servers[
-            0] == server_url, "Server URL should match what was added"
+    # Fetch servers again
+    servers = await router.fetch_live_servers()
+    assert len(
+        servers
+    ) == 2, "Should have two servers after adding second one and waiting"
+    assert server_key in servers, "First server should still be present"
+    assert server_key2 in servers, "Second server should be present"
 
-        # Add another server
-        server_key2 = "servers/context/server2"
-        server_url2 = "http://localhost:8002"
-        mock_metadata_server.add_server(server_key2, {"url": server_url2})
+    # Remove a server
+    mock_metadata_server.remove(server_key)
 
-        # Wait for the polling interval again
-        logger.info(
-            f"Waiting {wait_time} seconds for second server to be detected...")
-        time.sleep(wait_time)
-
-        # Fetch servers again
-        servers = router.fetch_live_servers()
-        assert len(
-            servers
-        ) == 2, "Should have two servers after adding second one and waiting"
-        assert server_url in servers, "First server should still be present"
-        assert server_url2 in servers, "Second server should be present"
-
-        # Remove a server
-        mock_metadata_server.remove(server_key)
-
-        # Wait for the polling interval again
-        logger.info(
-            f"Waiting {wait_time} seconds for server removal to be detected...")
-        time.sleep(wait_time)
-
-        # Fetch servers again
-        servers = router.fetch_live_servers()
-        assert len(
-            servers
-        ) == 1, "Should have one server after removing one and waiting"
-        assert servers[
-            0] == server_url2, "Remaining server should be the second one"
-    finally:
-        # Clean up
-        asyncio.run(router.stop_server_monitoring())
+    # Fetch servers again
+    servers = await router.fetch_live_servers()
+    assert len(
+        servers) == 1, "Should have one server after removing one and waiting"
+    assert server_key2 in servers, "Second server should still be present"
 
 
-@pytest.mark.slow
-def test_fetch_live_servers_with_delay(mock_metadata_server):
-    """Test fetching live servers with the actual polling delay"""
-    # Create router with mock metadata server
-    poll_interval = 5  # seconds
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "router_class", [RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter])
+async def test_server_health_check(mock_metadata_server, router_class):
+    router = router_class(server_role="context",
+                          metadata_server=mock_metadata_server)
 
-    router = RoundRobinRouter(server_role="context",
-                              metadata_servers=[mock_metadata_server])
+    # Add two servers
+    server_key1 = "trtllm/server1"
+    server_url1 = "http://localhost:8001"
+    mock_metadata_server.add_server(server_key1, {"url": server_url1})
 
-    # Start server monitoring with shorter interval for testing
-    asyncio.run(router.start_server_monitoring(poll_interval=poll_interval))
+    server_key2 = "trtllm/server2"
+    server_url2 = "http://localhost:8002"
+    mock_metadata_server.add_server(server_key2, {"url": server_url2})
 
-    try:
-        # Initial check - should be no servers
-        servers = router.fetch_live_servers()
-        assert len(servers) == 0, "Should have no servers initially"
+    # Mock the is_server_healthy method to simulate one server being down
+    with mock.patch.object(router, '_check_server_health') as mock_is_healthy:
+        # Only the second server is "healthy"
+        mock_is_healthy.side_effect = lambda url, silent=False: url == server_url2
 
-        # Add a server
-        server_key = "servers/context/server1"
-        server_url = "http://localhost:8001"
-        mock_metadata_server.add_server(server_key, {"url": server_url})
-
-        # Wait for a bit less than the polling interval - should still have no servers
-        short_wait = poll_interval * 0.4
-        logger.info(
-            f"Waiting {short_wait} seconds (less than polling interval)...")
-        time.sleep(short_wait)
-
-        # Verify server isn't discovered yet
-        servers = router.fetch_live_servers()
-        assert len(
-            servers
-        ) == 0, "Should still have no servers before polling interval completes"
-
-        # Wait for the polling interval to pass
-        remaining_wait = poll_interval * 1.2
-        logger.info(
-            f"Waiting additional {remaining_wait} seconds for server to be detected..."
-        )
-        time.sleep(remaining_wait)
-
-        # Now should have the server
-        servers = router.fetch_live_servers()
-        assert len(
-            servers) == 1, "Should have one server after polling interval"
-        assert servers[
-            0] == server_url, "Server URL should match what was added"
-
-        # Remove the server
-        mock_metadata_server.remove(server_key)
-
-        # Wait for polling interval to pass
-        wait_time = poll_interval * 1.5
-        logger.info(
-            f"Waiting {wait_time} seconds for server removal to be detected...")
-        time.sleep(wait_time)
-
-        # Should now be empty again
-        servers = router.fetch_live_servers()
-        assert len(
-            servers) == 0, "Should have no servers after removal and waiting"
-    finally:
-        # Clean up
-        asyncio.run(router.stop_server_monitoring())
-
-
-@pytest.mark.slow
-def test_server_health_check(mock_metadata_server):
-    """Test that unhealthy servers are filtered out"""
-    # Create router with mock metadata server
-    poll_interval = 5  # seconds
-
-    router = RoundRobinRouter(server_role="context",
-                              metadata_servers=[mock_metadata_server])
-
-    # Start server monitoring
-    asyncio.run(router.start_server_monitoring(poll_interval=poll_interval))
-
-    try:
-        # Add two servers
-        server_key1 = "servers/context/server1"
-        server_url1 = "http://localhost:8001"
-        mock_metadata_server.add_server(server_key1, {"url": server_url1})
-
-        server_key2 = "servers/context/server2"
-        server_url2 = "http://localhost:8002"
-        mock_metadata_server.add_server(server_key2, {"url": server_url2})
-
-        # Wait for the polling interval to pass
-        wait_time = poll_interval * 1.5
-        logger.info(
-            f"Waiting {wait_time} seconds for servers to be detected...")
-        time.sleep(wait_time)
-
-        # Mock the is_server_healthy method to simulate one server being down
-        with mock.patch.object(router, 'is_server_healthy') as mock_is_healthy:
-            # Only the second server is "healthy"
-            mock_is_healthy.side_effect = lambda url: url == server_url2
-
-            # Fetch servers with health check
-            servers = router.fetch_live_servers(check_health=True)
-            assert len(servers) == 1, "Should have one healthy server"
-            assert servers[
-                0] == server_url2, "Only healthy server should be returned"
-    finally:
-        # Clean up
-        asyncio.run(router.stop_server_monitoring())
-
-
-@pytest.mark.slow
-def test_load_balancing_router_fetch_servers(mock_metadata_server):
-    """Test that LoadBalancingRouter fetches servers correctly"""
-    # Create router with mock metadata server
-    poll_interval = 10  # seconds
-
-    router = LoadBalancingRouter(server_role="context",
-                                 metadata_servers=[mock_metadata_server])
-
-    # Start server monitoring
-    asyncio.run(router.start_server_monitoring(poll_interval=poll_interval))
-
-    try:
-        # Add two servers
-        server_key1 = "servers/context/server1"
-        server_url1 = "http://localhost:8001"
-        mock_metadata_server.add_server(server_key1, {"url": server_url1})
-
-        server_key2 = "servers/context/server2"
-        server_url2 = "http://localhost:8002"
-        mock_metadata_server.add_server(server_key2, {"url": server_url2})
-
-        # Wait for the polling interval to pass
-        wait_time = poll_interval * 1.5
-        logger.info(
-            f"Waiting {wait_time} seconds for servers to be detected...")
-        time.sleep(wait_time)
-
-        # Fetch servers
-        servers = router.fetch_live_servers()
-        assert len(servers) == 2, "Should have two servers after waiting"
-
-        # Remove all servers
-        mock_metadata_server.remove(server_key1)
-        mock_metadata_server.remove(server_key2)
-
-        # Wait for the polling interval to pass
-        logger.info(
-            f"Waiting {wait_time} seconds for server removals to be detected..."
-        )
-        time.sleep(wait_time)
-
-        # Test handling of no servers
-        servers = router.fetch_live_servers()
-        assert len(
-            servers
-        ) == 0, "Should have no servers after removing all and waiting"
-
-        # Test get_next_server with no servers should raise ValueError
-        with pytest.raises(ValueError):
-            router.get_next_server()
-    finally:
-        # Clean up
-        asyncio.run(router.stop_server_monitoring())
+        # Fetch servers with health check
+        servers = await router.fetch_live_servers()
+        live_servers = await router.check_servers_health(servers)
+        assert len(live_servers) == 1, "Should have one healthy server"
+        assert server_url2 in live_servers, "Second server should still be present"

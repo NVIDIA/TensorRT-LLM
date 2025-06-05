@@ -86,7 +86,7 @@ class SequenceInfo:
     # then the maximum number of sequences possible in the batch is min (max_batch_size, max_num_tokens // ISL).
     # Similarly, if a batch is composed of generate-only requests,
     # then the maximum number of sequences possible in the batch is min (max_batch_size, max_num_tokens).
-    max_num_tokens: int = 0
+    max_num_tokens: Optional[int] = None
 
     ## [UPDATE WITH CARE] TENSOR FIELDS THAT WILL BE PASSED TO PREPARE_METADATA OP #################
     # input_ids MUST ALWAYS BE THE FIRST FIELD
@@ -112,7 +112,7 @@ class SequenceInfo:
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
         max_seq_len_adjusted = self.max_seq_len + 1
 
-        if self.max_num_tokens < 1:
+        if self.max_num_tokens is None or self.max_num_tokens < 1:
             self.max_num_tokens = self.max_batch_size * max_seq_len_adjusted
         # if the provided max_num_tokens is less than the max_batch_size * max_seq_len,
         # we use the provided max_num_tokens to calculate the number of pages

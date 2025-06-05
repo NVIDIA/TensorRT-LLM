@@ -286,11 +286,13 @@ class Llama4MoE(nn.Module):
                 (0, 0, 0,
                  max_num_token_across_dp_ranks - hidden_states.shape[0]))
         router_logits = self.router(hidden_states)
-        routed_output = self.experts(hidden_states,
-                                     router_logits,
-                                     cutlass_min_latency_mode,
-                                     all_rank_num_tokens=all_rank_num_tokens,
-                                     use_dp_padding=use_dp_padding)
+        routed_output = self.experts(
+            hidden_states,
+            router_logits,
+            cutlass_min_latency_mode=cutlass_min_latency_mode,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=use_dp_padding,
+        )
         return routed_output
 
     def forward(
