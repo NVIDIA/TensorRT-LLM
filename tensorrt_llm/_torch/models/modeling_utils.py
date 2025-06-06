@@ -7,6 +7,7 @@ from typing import (Dict, Generic, Iterable, List, Optional, Tuple, Type,
                     TypeVar, Union)
 
 import torch
+from mpi4py import MPI  # tmp for debug
 from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
@@ -151,6 +152,7 @@ def skip_forward(
     """Skip forward of a module."""
     if hasattr(module, 'skip_forward'):
         module.forward = module.skip_forward
+        module._is_skip_forward = True
         remove_weights(module, ignore_modules)
     else:
         logger.warning(
@@ -632,6 +634,11 @@ def filter_weights(prefix, weights: Dict):
             result[new_k] = v
     return result
 
+
+# TODO: to remove
+comm = MPI.COMM_WORLD
+
+
 class WeightsLoader:
 
     def __init__(self, model: Union[nn.Module,
@@ -764,6 +771,10 @@ class WeightsLoader:
 
         child_modules = dict(module.named_children())
         child_params = dict(module.named_parameters(recurse=False))
+
+        if getattr(module, '_is_skip_forward', False):
+            # Modules are not on this rank due to PP
+            return
 
         # traverse the incoming weights recursively
         for child_prefix, child_weights in self._groupby_prefix(weights):
