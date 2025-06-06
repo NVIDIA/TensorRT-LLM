@@ -76,7 +76,6 @@ def test_generate_with_return_logits(disable_overlap_scheduler: bool,
         model=os.path.join(llm_models_root(), "llama-models-v2",
                            "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
-        gather_context_logits=gather_context_logits,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits

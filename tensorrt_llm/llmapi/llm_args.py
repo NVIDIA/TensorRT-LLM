@@ -938,11 +938,6 @@ class BaseLlmArgs(BaseModel):
         default=None,
         description="The parser to separate reasoning content from output.")
 
-    auto_deploy_config: Optional[object] = Field(
-        default=None,
-        description="Auto deploy config.",
-        json_schema_extra={"type": f"Optional[AutoDeployConfig]"})
-
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
         default=None,
@@ -1036,7 +1031,7 @@ class BaseLlmArgs(BaseModel):
         model_obj = _ModelWrapper(self.model)
 
         if model_obj.is_local_model and self.backend not in [
-                'pytorch', 'autodeploy'
+                'pytorch', '_autodeploy'
         ]:
             # Load parallel_config from the engine.
             model_format = get_model_format(self.model)
@@ -1662,6 +1657,11 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "If true, enable min-latency mode. Currently only used for Llama4.",
     )
+
+    auto_deploy_config: Optional[object] = Field(
+        default=None,
+        description="Auto deploy config.",
+        json_schema_extra={"type": f"Optional[object]"})
 
     @field_validator('load_format', mode='before')
     @classmethod
