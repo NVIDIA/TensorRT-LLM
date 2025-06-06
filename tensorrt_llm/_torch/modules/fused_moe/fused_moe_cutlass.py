@@ -13,8 +13,7 @@ from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig, MoeLoadBalancerConfig
 from ...utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                       reswizzle_sf, swizzle_sf, unswizzle_sf)
-from . import deep_ep_utils
-from .deep_ep_utils import deep_ep_installed
+from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import MoE
 from .moe_load_balancer import MoeLoadBalancer
 from .quantization import (FP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
@@ -198,19 +197,16 @@ class CutlassFusedMoE(MoE):
                 self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
                     model_config.mapping)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
-                deep_ep_utils.get_buffer(
-                    deep_ep_utils.get_comm(model_config.mapping),
-                    deep_ep_utils.get_hidden_bytes(
-                        torch.empty(1, hidden_size, dtype=dtype)))
+                self.deep_ep_buffer = buffer_pool.get_buffer(
+                    model_config.mapping)
+                self.deep_ep_buffer.reserve(hidden_size, dtype)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 self.deep_ep_max_num_tokens = min(model_config.max_num_tokens,
                                                   self.moe_max_num_tokens)
-                deep_ep_utils.low_latency_get_buffer(
-                    deep_ep_utils.get_comm(model_config.mapping),
-                    self.deep_ep_max_num_tokens,
-                    hidden_size,
-                    self.num_slots,
-                )
+                self.deep_ep_buffer = buffer_pool.get_low_latency_buffer(
+                    model_config.mapping)
+                self.deep_ep_buffer.reserve(self.deep_ep_max_num_tokens,
+                                            hidden_size, self.num_slots)
             else:
                 raise NotImplementedError(
                     f"Not available alltoall method type: {alltoall_method_type!r}"
@@ -399,13 +395,13 @@ class CutlassFusedMoE(MoE):
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if not self.use_postquant_alltoall:
                     x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
-                        deep_ep_utils.dispatch_forward(x, token_selected_slots.to(torch.int64), token_final_scales, self.num_slots)
+                        self.deep_ep_buffer.dispatch(x, token_selected_slots.to(torch.int64), token_final_scales, self.num_slots)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 if not self.use_postquant_alltoall:
                     deep_ep_topk_idx = token_selected_slots.to(torch.int64)
                     deep_ep_topk_weights = token_final_scales
                     x, recv_expert_count, deep_ep_handle = \
-                        deep_ep_utils.low_latency_dispatch(x, deep_ep_topk_idx, self.deep_ep_max_num_tokens, self.num_slots)
+                        self.deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, self.deep_ep_max_num_tokens, self.num_slots)
                     # x shape: [#local experts, #max recv tokens, hidden_size]
                     # recv_expert_count shape: [#local experts]
 
@@ -514,7 +510,7 @@ class CutlassFusedMoE(MoE):
                     x_sf_dtype = x_sf.dtype
                     x_sf = x_sf.view(torch.float32)
                 (x, x_sf), recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
-                    deep_ep_utils.dispatch_forward((x, x_sf), token_selected_slots.to(torch.int64), token_final_scales, self.num_slots)
+                    self.deep_ep_buffer.dispatch((x, x_sf), token_selected_slots.to(torch.int64), token_final_scales, self.num_slots)
                 if x_sf is not None:
                     x_sf = x_sf.view(x_sf_dtype)
                     if self.has_nvfp4:
@@ -591,11 +587,11 @@ class CutlassFusedMoE(MoE):
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if num_recv_token_is_zero:
                     final_hidden_states = final_hidden_states[:0]
-                combined_x = deep_ep_utils.combine_forward(
+                combined_x = self.deep_ep_buffer.combine(
                     final_hidden_states, deep_ep_handle)
                 return combined_x
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-                combined_hidden_states = deep_ep_utils.low_latency_combine(
+                combined_hidden_states = self.deep_ep_buffer.low_latency_combine(
                     final_hidden_states.view(
                         self.expert_size_per_partition,
                         self.deep_ep_max_num_tokens * self.mapping.moe_ep_size,
