@@ -321,7 +321,7 @@ public:
             CUtensorMap tensorMap{};
             if (isGmmaKernel)
             {
-                tensorMap = makeTensorMapForKVCache(mDriver, xqaParams, kv_cache_buffer);
+                tensorMap = makeTensorMapForHopperXqaKVCache(mDriver, xqaParams, kv_cache_buffer);
                 appendParam(&tensorMap);
             }
             appendParam(&launchParams.semaphores);
