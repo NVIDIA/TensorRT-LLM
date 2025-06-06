@@ -382,7 +382,6 @@ examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoder] SKIP (http
 examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoderplus] SKIP (https://nvbugs/5144931)
 unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)" SKIP (https://nvbugs/5280806)
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/5244570)
-unittest/_torch/speculative/test_eagle3.py SKIP (https://nvbugs/5280806)
 triton_server/test_triton_rcca.py::test_mistral_beam_search[rcca_4714407-True-10---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-ensemble] SKIP (https://nvbugs/5240060)
 triton_server/test_triton.py::test_triton_extensive[triton-extensive] SKIP
 triton_server/test_triton.py::test_gpt_speculative_decoding[gpt-speculative-decoding] SKIP
