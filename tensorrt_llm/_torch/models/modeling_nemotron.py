@@ -138,7 +138,7 @@ class NemotronModel(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
-        )
+            allreduce_strategy=model_config.allreduce_strategy)
         self.layers = nn.ModuleList([
             NemotronDecoderLayer(
                 model_config,

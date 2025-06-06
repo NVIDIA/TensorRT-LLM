@@ -569,7 +569,7 @@ def _resize_embeds(old_embeddings: Embedding, new_num_tokens: int):
         mapping=old_embeddings.mapping,
         tensor_parallel_mode=old_embeddings.tp_mode,
         gather_output=old_embeddings.gather_output,
-    ).to("cuda")
+        allreduce_strategy=old_embeddings.allreduce_strategy).to("cuda")
 
     # copy weights
     num_tokens_to_copy = min(old_embeddings.num_embeddings, new_num_tokens)
@@ -594,7 +594,7 @@ def _resize_lm_head(old_lm_head: LMHead, new_num_tokens: int):
         mapping=old_lm_head.mapping,
         tensor_parallel_mode=old_lm_head.tp_mode,
         gather_output=old_lm_head.gather_output,
-    ).to("cuda")
+        allreduce_strategy=old_lm_head.allreduce_strategy).to("cuda")
 
     # copy weights
     num_tokens_to_copy = min(old_lm_head.num_embeddings, new_num_tokens)

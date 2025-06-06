@@ -267,10 +267,14 @@ class Llama4MoE(nn.Module):
                              num_experts,
                              bias=False,
                              dtype=config.torch_dtype,
-                             quant_config=None)
+                             quant_config=None,
+                             allreduce_strategy=model_config.allreduce_strategy)
 
         self.mapping = model_config.mapping
-        self.all_reduce = AllReduce(self.mapping)
+        self.all_reduce = AllReduce(
+            mapping=model_config.mapping,
+            strategy=model_config.allreduce_strategy,
+        )
         self.moe_event = [torch.cuda.Event(), torch.cuda.Event()]
         self.aux_stream = aux_stream
 
@@ -402,7 +406,8 @@ class Llama4DecoderLayer(DecoderLayer):
                                                 dtype=config.torch_dtype)
 
         self.mapping = model_config.mapping
-        self.all_reduce = AllReduce(self.mapping)
+        self.all_reduce = AllReduce(mapping=model_config.mapping,
+                                    strategy=model_config.allreduce_strategy)
         self.next_layer_layernorm: RMSNorm = None
         self.next_attn: LlamaAttention = None
 
@@ -613,7 +618,7 @@ class Eagle3LlamaAttention(LlamaAttention):
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
-        )
+            allreduce_strategy=model_config.allreduce_strategy)
 
 
 class Eagle3LlamaDecoderLayer(DecoderLayer):
@@ -706,7 +711,7 @@ class Llama4Model(DecoderModel):
                 config.vocab_size,
                 config.hidden_size,
                 dtype=config.torch_dtype,
-            )
+                allreduce_strategy=model_config.allreduce_strategy)
         else:
             self.embed_tokens = Embedding(
                 config.vocab_size,
@@ -715,7 +720,7 @@ class Llama4Model(DecoderModel):
                 mapping=model_config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
-            )
+                allreduce_strategy=model_config.allreduce_strategy)
 
         # If enable_min_latency is True, we will use min-latency mode.
         DecoderLayerClass = Llama4DecoderLayer
@@ -794,7 +799,7 @@ class LlamaModel(DecoderModel):
                 vocab_size,
                 config.hidden_size,
                 dtype=config.torch_dtype,
-            )
+                allreduce_strategy=model_config.allreduce_strategy)
         else:
             self.embed_tokens = Embedding(
                 vocab_size,
@@ -803,7 +808,7 @@ class LlamaModel(DecoderModel):
                 mapping=model_config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
-            )
+                allreduce_strategy=model_config.allreduce_strategy)
 
         if self.has_custom_embed_tokens:
             with torch.no_grad():
@@ -1183,7 +1188,8 @@ class Eagle3LlamaDraftModel(DecoderModel):
         self.fc = Linear(self.hidden_size_in * 3,
                          config.hidden_size,
                          bias=getattr(config, "bias", False),
-                         dtype=config.torch_dtype)
+                         dtype=config.torch_dtype,
+                         allreduce_strategy=model_config.allreduce_strategy)
 
         self.midlayer = Eagle3LlamaDecoderLayer(model_config, start_layer_idx)
 
@@ -1204,7 +1210,7 @@ class Eagle3LlamaDraftModel(DecoderModel):
                 mapping=model_config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
-            )
+                allreduce_strategy=model_config.allreduce_strategy)
         else:
             # Shared with target model.
             self.embed_tokens = None

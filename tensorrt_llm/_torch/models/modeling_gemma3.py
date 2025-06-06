@@ -116,25 +116,31 @@ class Gemma3Attention(Attention):
 
 class Gemma3MLP(nn.Module):
 
-    def __init__(self, config: Gemma3TextConfig):
+    def __init__(self, model_config: ModelConfig[Gemma3TextConfig]):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.dtype = config.torch_dtype
-        self.gate_proj = Linear(self.hidden_size,
-                                self.intermediate_size,
-                                bias=False,
-                                dtype=self.dtype)
-        self.up_proj = Linear(self.hidden_size,
-                              self.intermediate_size,
-                              bias=False,
-                              dtype=self.dtype)
-        self.down_proj = Linear(self.intermediate_size,
-                                self.hidden_size,
-                                bias=False,
-                                dtype=self.dtype)
-        self.act_fn = ACT2FN[config.hidden_activation]
+        self.config = model_config.pretrained_config
+        self.hidden_size = self.config.hidden_size
+        self.intermediate_size = self.config.intermediate_size
+        self.dtype = self.config.torch_dtype
+        self.gate_proj = Linear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=False,
+            dtype=self.dtype,
+            allreduce_strategy=model_config.allreduce_strategy)
+        self.up_proj = Linear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=False,
+            dtype=self.dtype,
+            allreduce_strategy=model_config.allreduce_strategy)
+        self.down_proj = Linear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=False,
+            dtype=self.dtype,
+            allreduce_strategy=model_config.allreduce_strategy)
+        self.act_fn = ACT2FN[self.config.hidden_activation]
 
     def forward(self, x):
         down_proj = self.down_proj(
@@ -159,7 +165,7 @@ class Gemma3DecoderLayer(DecoderLayer):
             is_sliding=is_sliding,
         )
 
-        self.mlp = Gemma3MLP(config)
+        self.mlp = Gemma3MLP(model_config)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -218,7 +224,7 @@ class Gemma3TextModel(DecoderModel):
             mapping=config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
-        )
+            allreduce_strategy=model_config.allreduce_strategy)
         self.layers = nn.ModuleList([
             Gemma3DecoderLayer(
                 model_config,

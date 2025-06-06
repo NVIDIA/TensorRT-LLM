@@ -401,7 +401,8 @@ class Deepseekv3MoE(nn.Module):
             overridden_tp_size=shared_tp_size,
             reduce_output=False)
 
-        self.allreduce = AllReduce(self.mapping)
+        self.allreduce = AllReduce(mapping=model_config.mapping,
+                                   strategy=model_config.allreduce_strategy)
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {
             key: torch.cuda.Event()
@@ -632,7 +633,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
-        self.allreduce = AllReduce(self.mapping, dtype=config.torch_dtype)
+        self.allreduce = AllReduce(mapping=model_config.mapping,
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
         self.moe_allreduce = MoEAllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
 
@@ -894,7 +897,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             dtype=config.torch_dtype,
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
-        )
+            allreduce_strategy=model_config.allreduce_strategy)
 
         self.shared_head = DeepseekV3MTPHead(model_config)
 
@@ -990,7 +993,7 @@ class DeepseekV3Model(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
-        )
+            allreduce_strategy=model_config.allreduce_strategy)
 
         self.moe_load_balancer = None
         if model_config.moe_load_balancer is not None:

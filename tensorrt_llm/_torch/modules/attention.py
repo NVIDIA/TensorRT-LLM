@@ -136,7 +136,7 @@ class Attention(nn.Module):
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-        )
+            allreduce_strategy=config.allreduce_strategy)
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
@@ -150,7 +150,7 @@ class Attention(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.o_lora,
-        )
+            allreduce_strategy=config.allreduce_strategy)
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -476,7 +476,8 @@ class MLA(nn.Module):
                 dtype=dtype,
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                use_custom_cublas_mm=True)
+                use_custom_cublas_mm=True,
+                allreduce_strategy=config.allreduce_strategy)
 
             self.q_a_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
                                          eps=rms_norm_eps,
@@ -490,7 +491,8 @@ class MLA(nn.Module):
                 mapping=mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=quant_config,
-                skip_create_weights_in_init=config.skip_create_weights_in_init)
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
+                allreduce_strategy=config.allreduce_strategy)
         else:
             self.fused_a = Linear(
                 hidden_size,
@@ -499,7 +501,8 @@ class MLA(nn.Module):
                 dtype=dtype,
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                use_custom_cublas_mm=True)
+                use_custom_cublas_mm=True,
+                allreduce_strategy=config.allreduce_strategy)
 
             self.q_proj = Linear(
                 self.q_lora_rank,
@@ -510,7 +513,7 @@ class MLA(nn.Module):
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-            )
+                allreduce_strategy=config.allreduce_strategy)
             self.q_b_proj = self.q_proj
 
         self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
@@ -526,7 +529,8 @@ class MLA(nn.Module):
             mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=quant_config,
-            skip_create_weights_in_init=config.skip_create_weights_in_init)
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
+            allreduce_strategy=config.allreduce_strategy)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
         # Used in forward_generation only
@@ -547,7 +551,7 @@ class MLA(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-        )
+            allreduce_strategy=config.allreduce_strategy)
 
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:

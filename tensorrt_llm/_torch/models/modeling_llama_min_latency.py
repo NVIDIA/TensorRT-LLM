@@ -6,7 +6,8 @@ import torch
 from torch.nn import functional as F
 from transformers import LlamaConfig
 
-from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams
+from tensorrt_llm._torch.distributed import (AllReduceFusionOp, AllReduceParams,
+                                             AllReduceStrategy)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a)
@@ -50,24 +51,24 @@ class Llama4MinLatencyLinear(Linear):
     """
 
     def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        dtype: torch.dtype = None,
-        mapping: Optional[Mapping] = None,
-        tensor_parallel_mode: Optional[TensorParallelMode] = None,
-        gather_output: bool = False,
-        quant_config: Optional[QuantConfig] = None,
-        weights_loading_config: Optional[WeightsLoadingConfig] = None,
-        reduce_output: bool = True,
-        skip_create_weights_in_init: bool = False,
-        use_custom_cublas_mm: bool = False,
-        enable_fused_gemm_swiglu: bool = False,
-        enable_fused_gemm_attn_scaling: bool = False,
-        enable_trtllm_gen: bool = False,
-        post_load_weights_hook: Optional[Callable] = None,
-    ):
+            self,
+            in_features: int,
+            out_features: int,
+            bias: bool = True,
+            dtype: torch.dtype = None,
+            mapping: Optional[Mapping] = None,
+            tensor_parallel_mode: Optional[TensorParallelMode] = None,
+            gather_output: bool = False,
+            quant_config: Optional[QuantConfig] = None,
+            weights_loading_config: Optional[WeightsLoadingConfig] = None,
+            reduce_output: bool = True,
+            skip_create_weights_in_init: bool = False,
+            use_custom_cublas_mm: bool = False,
+            enable_fused_gemm_swiglu: bool = False,
+            enable_fused_gemm_attn_scaling: bool = False,
+            enable_trtllm_gen: bool = False,
+            post_load_weights_hook: Optional[Callable] = None,
+            allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO):
         # First, initialize the base class.
         super().__init__(
             in_features,
@@ -293,7 +294,7 @@ class Llama4MinLatencyGatedMLP(GatedMLP):
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 enable_fused_gemm_swiglu=True,
                 enable_trtllm_gen=True,
-            )
+                allreduce_strategy=config.allreduce_strategy)
 
             # After loading both gate_up_proj and down_proj, we need to set the scales needed by the special kernels and by
             # the trtllm-gen gemm+swiglu kernel.
@@ -319,7 +320,7 @@ class Llama4MinLatencyGatedMLP(GatedMLP):
                 enable_trtllm_gen=True,
                 post_load_weights_hook=partial(post_load_weights_hook,
                                                self.gate_up_proj),
-            )
+                allreduce_strategy=config.allreduce_strategy)
 
     def forward(
         self,
@@ -405,7 +406,7 @@ class Llama4MinLatencyAttention(Llama4Attention):
                 enable_fused_gemm_attn_scaling=self.
                 enable_fused_gemm_attn_scaling,
                 enable_trtllm_gen=True,
-            )
+                allreduce_strategy=config.allreduce_strategy)
 
     def _forward_nope(
         self,
@@ -592,7 +593,8 @@ class Llama4MinLatencyMoE(Llama4MoE):
             num_experts,
             bias=False,
             dtype=model_config.pretrained_config.torch_dtype,
-            quant_config=None)
+            quant_config=None,
+            allreduce_strategy=model_config.allreduce_strategy)
 
     def compute_routed_output(
             self,
