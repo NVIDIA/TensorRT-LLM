@@ -1099,6 +1099,7 @@ class MLA(nn.Module):
             attn_metadata.kv_lens_runtime = host_chunked_seq_len[loop_idx]
             attn_metadata.kv_lens_cuda_runtime = chunked_seq_len[loop_idx]
             out_scale = None
+            # do not apply mask for attention within loop
             temp_attn_output = self.mha.forward(
                 q,
                 None,
@@ -1107,6 +1108,7 @@ class MLA(nn.Module):
                 attention_input_type=AttentionInputType.context_only,
                 latent_cache=None,
                 out_scale=out_scale,
+                attention_mask=PredefinedAttentionMask.FULL,
                 mla_context_paged_kv=full_kv,
                 mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
                 softmax_stats_tensor=temp_softmax_stats_tensor,
