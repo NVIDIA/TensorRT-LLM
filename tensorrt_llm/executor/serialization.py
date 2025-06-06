@@ -15,6 +15,7 @@ BASE_ZMQ_CLASSES = {
     "collections": ["OrderedDict"],
     "datetime": ["timedelta"],
     "pathlib": ["PosixPath"],
+    "PIL.Image": ["Image"],
     "llmapi.run_llm_with_postproc": ["perform_faked_oai_postprocess"
                                      ],  # only used in tests
     ### starting import of torch models classes. They are used in test_llm_multi_gpu.py.
@@ -70,6 +71,7 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm._torch.model_config": ["MoeLoadBalancerConfig"],
     "tensorrt_llm.builder": ["BuildConfig"],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
+    "tensorrt_llm.multimodal_params": ["MultimodalParams"],
     "tensorrt_llm.executor.postproc_worker": [
         "PostprocArgs", "PostprocParams", "PostprocWorkerConfig",
         "PostprocWorker.Input", "PostprocWorker.Output"
@@ -78,6 +80,10 @@ BASE_ZMQ_CLASSES = {
         "CancellingRequest", "GenerationRequest", "LoRARequest",
         "PromptAdapterRequest"
     ],
+    "tensorrt_llm.executor.multimodal.request": [
+        "MultimodalRequest", "MultimodalResponse", "MultimodalResult", "MultimodalItem"
+    ],
+    "tensorrt_llm._torch.multimodal.mm_utils": ["SharedTensorContainer"],
     "tensorrt_llm.executor.result": [
         "CompletionOutput", "DetokenizedGenerationResultBase",
         "GenerationResult", "GenerationResultBase", "IterationResult",
@@ -142,6 +148,7 @@ class Unpickler(pickle.Unpickler):
             # and class should be added to the approved_imports. If the class
             # is being used as part of a routine scenario, then it should be added
             # to the appropriate base classes above.
+            print(f'find class: super().find_class(module, name) = {super().find_class(module, name)}')
             raise ValueError(f"Import {module} | {name} is not allowed")
         return super().find_class(module, name)
 

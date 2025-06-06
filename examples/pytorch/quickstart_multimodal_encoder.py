@@ -5,8 +5,7 @@ from typing import Any, Dict, List
 
 from quickstart_advanced import add_llm_args
 
-from tensorrt_llm.inputs import (INPUT_FORMATTER_MAP, default_image_loader,
-                                 default_video_loader)
+from tensorrt_llm.inputs import ALL_SUPPORTED_MULTIMODAL_MODELS
 import asyncio
 
 example_images = [
@@ -29,32 +28,10 @@ example_video_prompts = [
 ]
 
 
-def prepare_multimodal_inputs(model_dir: str,
-                              model_type: str,
-                              modality: str,
-                              prompts: List[str],
-                              media: List[str],
-                              image_data_format: str = "pt",
-                              num_frames: int = 8) -> List[Dict[str, Any]]:
-
-    inputs = []
-    if modality == "image":
-        inputs = default_image_loader(prompts, media, image_data_format)
-    elif modality == "video":
-        inputs = default_video_loader(prompts, media, image_data_format,
-                                      num_frames)
-    else:
-        raise ValueError(f"Unsupported modality: {modality}")
-
-    inputs = INPUT_FORMATTER_MAP[model_type](model_dir, inputs)
-
-    return inputs
-
-
 def add_multimodal_args(parser):
     parser.add_argument("--model_type",
                         type=str,
-                        choices=INPUT_FORMATTER_MAP.keys(),
+                        choices=ALL_SUPPORTED_MULTIMODAL_MODELS,
                         help="Model type.")
     parser.add_argument("--modality",
                         type=str,
@@ -115,8 +92,6 @@ def main():
     )
 
     mm_requests = [mm_request] * 20
-    import torch
-    import gc
     outputs = encoder.generate_from_mm_request(mm_requests)
     for output in outputs:
         #print(f"output: {output.multimodal_params.embeddings.device}")
@@ -124,14 +99,14 @@ def main():
             sta = output.multimodal_params.item_offsets[i]
             end = sta + output.multimodal_params.item_token_length[i]
             mm_embedding_dict = output.multimodal_params.embeddings[0]
-            #mm_embedding = SharedTensorContainer.from_dict(mm_embedding_dict).to_local_view()
+            mm_embedding = SharedTensorContainer.from_dict(mm_embedding_dict).get_local_view()
 
-            #print(f"item {i} embedding: {mm_embedding[sta:end].reshape(1, -1)[:5]}")
-        del output.multimodal_params.embeddings
-        gc.collect()
+            print(f"item {i} embedding: {mm_embedding[sta:end].reshape(1, -1)[:5]}")
+        #del output.multimodal_params.embeddings
+        #gc.collect()
         print(f"deleting output embeddings")
-        torch.cuda.ipc_collect()
-        torch.cuda.empty_cache()
+        #torch.cuda.ipc_collect()
+        #torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

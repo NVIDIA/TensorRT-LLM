@@ -71,35 +71,13 @@ class SharedTensorContainer:
     This class provides a simple way to share tensors between processes
     using Python's multiprocessing mechanisms.
     """
-    def __init__(self, method_key: int, tensor_handle: Any):
+    def __init__(self, method_key: int, tensor_handle: Dict[str, Any]):
         self.method_key = method_key
         self.tensor_handle = tensor_handle
 
-    @classmethod
-    def from_tensor(cls, tensor: torch.Tensor) -> 'SharedTensorContainer':
-        """Create a SharedTensorContainer from a local tensor.
-
-        Args:
-            tensor: The tensor to share
-
-        Returns:
-            SharedTensorContainer instance that can be shared between processes
-        """
-        rebuild_method, tensor_handle = reduce_tensor(tensor)
-        method_key = _SharedTensorRebuildMethodRegistry.register(rebuild_method)
-        return cls(method_key, tensor_handle)
-
-    def to_local_view(self) -> torch.Tensor:
-        """Convert the shared tensor back to a local tensor.
-
-        Returns:
-            The reconstructed tensor
-        """
-        rebuild_method = _SharedTensorRebuildMethodRegistry.get_method(self.method_key)
-        return rebuild_method(*self.tensor_handle)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert the shared tensor to a dictionary that can be serialized.
+    @staticmethod
+    def handle_to_dict(tensor_handle) -> Dict[str, Any]:
+        """Convert the shared tensor handle to a dictionary that can be serialized.
 
         This method converts the tensor handle information into a format that can be
         safely serialized (e.g., to JSON). It handles binary data by encoding it in base64.
@@ -127,10 +105,10 @@ class SharedTensorContainer:
         """
         try:
             # tensor_handle is a tuple returned by reduce_tensor
-            tensor_info = self.tensor_handle
+            tensor_info = tensor_handle
             # Convert tensor info to a basic dict with only serializable values
             serializable_info = {
-                "method_key": self.method_key,
+                # tensor_info[0] is the type of the tensor, which is "torch.Tensor"
                 "tensor_size": list(tensor_info[1]),
                 "tensor_stride": list(tensor_info[2]),
                 "tensor_offset": tensor_info[3],
@@ -151,11 +129,11 @@ class SharedTensorContainer:
         except Exception as e:
             raise ValueError(f"Failed to serialize tensor information: {e}")
 
-    @classmethod
-    def from_dict(cls, tensor_info: Dict[str, Any]) -> 'SharedTensorContainer':
-        """Create a SharedTensorContainer from a serialized dictionary.
+    @staticmethod
+    def dict_to_handle(tensor_info: Dict[str, Any]) -> Tuple:
+        """Create a tensor handle from a serialized dictionary.
 
-        This method reconstructs a SharedTensorContainer from a previously serialized
+        This method reconstructs a tensor handle from a previously serialized
         dictionary. It handles base64 encoded binary data by decoding it back to bytes.
 
         Args:
@@ -192,9 +170,52 @@ class SharedTensorContainer:
                              event_handle,
                              tensor_info['event_sync_required'])
 
-            return cls(tensor_info['method_key'], tensor_handle)
+            return tensor_handle
         except KeyError as e:
             raise KeyError(f"Missing required tensor information: {e}")
         except Exception as e:
             raise ValueError(f"Failed to deserialize tensor information: {e}")
 
+
+    @classmethod
+    def from_tensor(cls, tensor: torch.Tensor) -> 'SharedTensorContainer':
+        """Create a SharedTensorContainer from a local tensor.
+
+        Args:
+            tensor: The tensor to share
+
+        Returns:
+            SharedTensorContainer instance that can be shared between processes
+        """
+        rebuild_method, tensor_handle = reduce_tensor(tensor)
+        method_key = _SharedTensorRebuildMethodRegistry.register(rebuild_method)
+        # hack to make it serializable
+        tensor_handle = SharedTensorContainer.handle_to_dict(tensor_handle)
+        return cls(method_key, tensor_handle)
+
+    @classmethod
+    def from_dict(cls, tensor_info: Dict[str, Any]) -> 'SharedTensorContainer':
+        """Create a SharedTensorContainer from a serialized dictionary.
+        """
+        method_key = tensor_info['method_key']
+        tensor_handle = SharedTensorContainer.dict_to_handle(tensor_info)
+        return cls(method_key, tensor_handle)
+
+    def get_local_view(self) -> torch.Tensor:
+        """Convert the shared tensor back to a local tensor.
+
+        Returns:
+            The reconstructed tensor
+        """
+        rebuild_method = _SharedTensorRebuildMethodRegistry.get_method(self.method_key)
+        return rebuild_method(*self.tensor_handle)
+
+    def dump_to_dict(self) -> Dict[str, Any]:
+        """Convert this class instance to a dictionary that can be JSON serialized.
+
+        Returns:
+            Dictionary containing the serialized tensor information
+        """
+        result = self.tensor_handle.copy()
+        result["method_key"] = self.method_key
+        return result

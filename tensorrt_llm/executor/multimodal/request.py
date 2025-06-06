@@ -277,7 +277,7 @@ class MultimodalResponse:
     num_items: int = 0
     item_offsets: List[int] = field(default_factory=list)
     item_token_length: List[int] = field(default_factory=list)
-    embeddings: torch.Tensor = None
+    embeddings: Optional[torch.Tensor] = None
     embedding_handle: Optional[bytes] = None
     mrope_config: Optional[dict] = None
     _is_final: bool = False
@@ -320,7 +320,7 @@ class MultimodalResponse:
             # Convert the serialized tensor info to a JSON-serializable format
             embeddings = []
             for tensor_info in self.embedding_handle:
-                embeddings.append(tensor_info.to_dict())
+                embeddings.append(tensor_info.dump_to_dict())
         else:
             embeddings = None
 

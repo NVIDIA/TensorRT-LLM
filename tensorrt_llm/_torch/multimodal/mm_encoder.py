@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Any, Optional, Union, List
 
 from tensorrt_llm.executor import GenerationExecutor
-from tensorrt_llm.llmapi.llm import LlmArgs
+from tensorrt_llm.llmapi.llm import TorchLlmArgs, TrtLlmArgs
 from tensorrt_llm.llmapi.utils import exception_handler, get_device_count, print_colored_debug
 from tensorrt_llm.llmapi.llm_utils import LlmBuildStats, CachedModelLoader, _ModelRuntimeContext
 from tensorrt_llm.logger import logger
@@ -33,7 +33,7 @@ class MultimodalEncoder:
         try:
             # Reuse the LLM arg parser for mm-encoder for now as some configs/args can be shared
             # e.g., max_batch_size, parallel_config, mpi_session, etc.
-            self.args = LlmArgs.from_kwargs(
+            self.args = TorchLlmArgs.from_kwargs(
                 model=model,
                 trust_remote_code=trust_remote_code,
                 tensor_parallel_size=tensor_parallel_size,
@@ -78,8 +78,11 @@ class MultimodalEncoder:
             # Due to the Executor can only accept a engine path, we need to save the engine to a directory
             self._engine_dir: Optional[Path] = None
             self._executor: Optional[GenerationExecutor] = None
-            self._workspace = tempfile.TemporaryDirectory(
-                suffix="-mm-encoder-workspace", dir=self.args.workspace)
+            if self._on_trt_backend:
+                self._workspace = tempfile.TemporaryDirectory(
+                    suffix="-mm-encoder-workspace", dir=self.args.workspace)
+            else:
+                self._workspace = None
 
             self._hf_model_dir: Optional[Path] = None
 
@@ -98,7 +101,7 @@ class MultimodalEncoder:
 
     @property
     def workspace(self) -> Path:
-        return Path(self._workspace.name)
+        return Path(self._workspace.name) if self._on_trt_backend else None
 
     def generate_from_mm_request(
         self,
@@ -184,6 +187,9 @@ class MultimodalEncoder:
                 self.args.parallel_config.world_size),
             is_llm_executor=False)
 
+    @property
+    def _on_trt_backend(self) -> bool:
+        return isinstance(self.args, TrtLlmArgs)
 
     def shutdown(self) -> None:
         if hasattr(self, "_executor") and self._executor is not None:

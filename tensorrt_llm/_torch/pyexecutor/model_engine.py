@@ -1149,7 +1149,7 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_embedding = torch.empty(tensor_shape, dtype=eval(tensor_dtype), device='cuda')
                 if self.mapping.rank == 0:
                     # Leading rank will rebuild the tensor in local device
-                    shared_tensor = SharedTensorContainer.from_dict(mm_tensor_handle).to_local_view()
+                    shared_tensor = SharedTensorContainer.from_dict(mm_tensor_handle).get_local_view()
                     # TODO: Add to tensor pool to prevent immediate cuda close ipc handle call, which will introduces cpu overhead
                     # TODO: Potential issue: in SharedTensorPool, we cannot spawn the new background process to handle the ipc close call
                     tensor_pool = get_tensor_pool(async_ipc_release=False)

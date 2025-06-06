@@ -23,9 +23,6 @@ from .modeling_clip import CLIPVisionModel
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 from .modeling_utils import ModelConfig, register_auto_model
-from transformers.models.llava_next.modeling_llava_next import (
-    get_anyres_image_grid_shape, unpad_image)
-from transformers import CLIPVisionConfig
 from ...executor.request import MultimodalParams
 
 class CLIPEncoderInfo:
@@ -95,73 +92,6 @@ class LlavaNextInputProcessor(InputProcessor):
         # Use HF multi-modal projector
         self.mm_projector = hf_mm_projector
         self.hf_model_config = hf_model_config
-
-
-    def _get_num_unpadded_features(
-        self,
-        *,
-        original_height: int,
-        original_width: int,
-        npatches: int,
-        num_patch_height: int,
-        num_patch_width: int,
-    ) -> tuple[int, int]:
-        current_height = npatches * num_patch_height
-        current_width = npatches * num_patch_width
-
-        aspect_ratio = original_width / original_height
-        current_aspect_ratio = current_width / current_height
-
-        if aspect_ratio > current_aspect_ratio:
-            new_height = int(
-                round(original_height * (current_width / original_width), 7))
-            padding = (current_height - new_height) // 2
-            current_height = current_height - (2 * padding)
-        else:
-            new_width = int(
-                round(original_width * (current_height / original_height), 7))
-            padding = (current_width - new_width) // 2
-            current_width = current_width - (2 * padding)
-
-        unpadded_features = current_height * current_width
-        newline_features = current_height
-
-        return (unpadded_features, newline_features)
-
-    # Based on: https://github.com/huggingface/text-generation-inference/blob/v3.0.1/server/text_generation_server/models/vlm_causal_lm.py#L113
-    def get_num_image_tokens(
-        self,
-        *,
-        image_width: int,
-        image_height: int,
-    ) -> int:
-        hf_config = self.hf_model_config
-        vision_encoder_info = CLIPEncoderInfo(hf_config)
-
-        base_feature_size = vision_encoder_info.get_num_image_tokens(
-            image_width=image_width,
-            image_height=image_height,
-        )
-        if hf_config.vision_feature_select_strategy == "default":
-            base_feature_size = base_feature_size - 1
-
-        num_patch_height, num_patch_width = get_anyres_image_grid_shape(
-            image_size=(image_height, image_width),
-            grid_pinpoints=hf_config.image_grid_pinpoints,
-            patch_size=vision_encoder_info.get_image_size(),
-        )
-
-        (
-            unpadded_feature_size,
-            newline_feature_size,
-        ) = self._get_num_unpadded_features(
-            original_height=image_height,
-            original_width=image_width,
-            npatches=vision_encoder_info.get_patch_grid_length(),
-            num_patch_height=num_patch_height,
-            num_patch_width=num_patch_width,
-        )
-        return unpadded_feature_size + newline_feature_size + base_feature_size
 
     def image_size_to_num_patches(self, image_size, grid_pinpoints = None, patch_size: int = None):
         """

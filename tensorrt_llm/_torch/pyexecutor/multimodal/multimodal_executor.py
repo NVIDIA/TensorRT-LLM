@@ -7,7 +7,7 @@ import asyncio
 from tensorrt_llm._utils import nvtx_range
 from ...distributed import Distributed, MPIDist
 
-from ..py_executor import PyExecutor, _get_from_request_queue, _is_cancel_request, _is_executor_request
+from ..py_executor import PyExecutor, _get_from_request_queue
 from ..model_engine import ModelEngine, PyTorchModelEngine
 
 from tensorrt_llm.inputs import create_input_processor
@@ -17,6 +17,7 @@ from tensorrt_llm.executor.multimodal import MultimodalRequest, MultimodalRespon
 from ..llm_request import ExecutorResponse
 from tensorrt_llm._torch.multimodal import SharedTensorContainer
 from torchvision.transforms import ToTensor
+from ..py_executor import RequestQueueItem
 logger = logging.getLogger(__name__)
 
 class MMExecutor(PyExecutor):
@@ -52,7 +53,7 @@ class MMExecutor(PyExecutor):
         self.response_lock = threading.Lock()
         self.response_cv = threading.Condition(self.response_lock)
         self.responses = {}
-
+        self.canceled_req_ids = set()
         # _executor_loop private data
         self.max_num_active_requests = max_num_active_requests # TODO: remove this should be the same as max_batch_size
         self.active_requests = []
@@ -96,16 +97,12 @@ class MMExecutor(PyExecutor):
             new_requests = self.dist.broadcast(new_requests, root=0)
         return new_requests
 
-    def _merge_tp_requests(self, new_requests: List[MultimodalRequest]):
+    def _merge_tp_requests(self, new_requests: List[RequestQueueItem]):
         for request in new_requests:
             if request is None:
                 return True
         for req_item in new_requests:
-            if _is_executor_request(req_item):
-                # tuple of (req_id, MultimodalRequest)
-                self.active_requests.append(req_item[1])
-            elif _is_cancel_request(req_item):
-                self.canceled_req_ids.insert(req_item)
+            self.active_requests.append(req_item.request)  # type: ignore
         return False
 
     def _executor_loop(self):
@@ -120,7 +117,7 @@ class MMExecutor(PyExecutor):
             # Get new requests
             new_requests = self._fetch_new_requests()
             # TODO: support DP across all requests in the batch
-            got_finish_signal = self._merge_tp_requests(new_requests) or got_finish_signal
+            got_finish_signal = (new_requests is not None and self._merge_tp_requests(new_requests)) or got_finish_signal
 
             # Exit if no more work to do
             if got_finish_signal and len(self.active_requests) == 0:
@@ -149,7 +146,7 @@ class MMExecutor(PyExecutor):
                 batch_outputs = self._forward(scheduled_batch)
 
                 # TODO: Handle canceled requests for multimodal executor
-                # self._handle_cancelled_requests()
+                self._handle_cancelled_requests()
                 finished_requests = self._handle_responses(scheduled_batch, batch_outputs)
 
                 # Free resources
@@ -200,12 +197,11 @@ class MMExecutor(PyExecutor):
         if self.dist.rank == 0:
             with self.response_cv:
                 for req_id, resp in responses.items():
-
                     if isinstance(resp, MultimodalResponse):
                         if resp.cp_event is not None:
+                            # if we need to cpy embedding to host, we can sync here
                             resp.cp_event.synchronize()
-                        #resp.embedding_handle = bytes(ForkingPickler.dumps(resp.embeddings))
-                        #resp.embedding_handle = SharedCUDATensorSerializer.serialize([("embeddings", resp.embeddings)]) # share this cuda tensor with other prcs
+                        # We only store/enqueue the handle here
                         resp.embedding_handle = [SharedTensorContainer.from_tensor(resp.embeddings)]
                         resp.embeddings = None
                         resp.cp_event = None
@@ -251,13 +247,9 @@ class MMExecutor(PyExecutor):
             if response:
                 # Extract this request's portion of embeddings
                 request_embedding = mm_embeddings[start_idx:end_idx]
-                #.to('cpu', non_blocking=True)
-                #cp_event = torch.cuda.Event()
-                #cp_event.record()
 
-                # Attach the fused embedding directly to the response (un-ready due to non_blocking D2H transfer)
-                #response.set_embeddings(request_embedding, cp_event)
-                response.set_embeddings(request_embedding)
+                # Attach the fused embedding directly to the response
+                response.set_embeddings(request_embedding, cp_event=None)
 
                 # Attach mrope config if available
                 if mrope_config is not None:
@@ -272,7 +264,35 @@ class MMExecutor(PyExecutor):
         return scheduled_requests # finished requests
 
     def _handle_cancelled_requests(self):
-        pass
+        #TODO: properly handle canceled ids in pp case
+        if self.dist.has_tp:
+            self.canceled_req_ids = self.dist.broadcast(self.canceled_req_ids,
+                                                        root=0)
+
+        if len(self.canceled_req_ids) == 0:
+            return
+
+        cancelled_responses = {}
+        left_requests = []
+        for request in self.active_requests:
+            req_id = request.id
+            if req_id in self.canceled_req_ids:
+                # TODO: As for now, all resources are on-the-fly, so we don't need to free resources here
+                # but in future, when we add embedding tensor pool, we need to evict and free resources here
+                # self._terminate_request(request)
+                cancelled_responses[req_id] = request.create_response()
+                self.canceled_req_ids.remove(req_id)
+            else:
+                left_requests.append(request)
+        self.active_requests = left_requests
+
+        # When enable attention dp, each rank does not have full copy of requests
+        # so we need to remove the cancel requests not in the local rank
+        self.canceled_req_ids.clear()
+
+        # enqueue the cancelled requests' responses as they are not
+        # active_requests and be discarded in the sampler loop.
+        self._enqueue_responses(cancelled_responses)
 
     def shutdown(self):
         """
@@ -296,11 +316,29 @@ class MMExecutor(PyExecutor):
             self.enqueue_lock.acquire()
             assert self.active, "PyExecutor has already been shutdown."
             req_id = self.next_req_id
-            self.request_queue.put((req_id, request))
+            self.request_queue.put(RequestQueueItem(req_id, request))
             self.next_req_id += 1
         finally:
             self.enqueue_lock.release()
         return req_id
+
+    def enqueue_requests(self, requests: List[MultimodalRequest]):
+        """
+        Enqueue new requests
+        """
+        req_ids = []
+        try:
+            self.enqueue_lock.acquire()
+            assert self.active, "MMPyExecutor has already been shutdown."
+            for request in requests:
+                self.request_queue.put(
+                    RequestQueueItem(self.next_req_id, request))
+                req_ids.append(self.next_req_id)
+                self.next_req_id += 1
+        finally:
+            self.enqueue_lock.release()
+        return req_ids
+
 
     def _handle_errors(self, error_msg: Optional[str] = None):
         error_responses = {}
@@ -313,7 +351,14 @@ class MMExecutor(PyExecutor):
         self.active_requests.clear()
         self._enqueue_responses(error_responses)
 
-    # TODO: improve this
+    def cancel_request(self, id: int):
+        """
+        Cancel the request with provided request id
+        Args:
+            id (int): The request id for which to cancel the response
+        """
+        self.canceled_req_ids.add(id)
+
     def get_latest_kv_cache_events(self):
         return []
 
@@ -348,31 +393,22 @@ class MultimodalModelEngine(PyTorchModelEngine):
         # 1. prefetch all the contents
         all_mm_items = []
         for request in scheduled_requests:
-            #await asyncio.gather(*[item.async_prefetch() for item in request.items])
             all_mm_items.extend(request.items)
-
         # 2. Process items and track their completion
         processed_items = {}  # Dict to track processed items by (req_id, item_id)
 
         # Process items asynchronously
-        #async for ready_item in MultimodalItem.process_items(all_mm_items):
         for ready_item in all_mm_items:
-            # ready_item.data = ForkingPickler.loads(ready_item.data_handle)
-
-            #if not ready_item.materialized:
-            #    continue
-
             # Calculate token length and preprocess
+            # TODO: Need to converge for all models on this, currently we don't have an uniform way to get the token length
             # https://github.com/vllm-project/vllm/blob/54631f826233dbd1c046f9a70e98bc2e25edff1a/vllm/model_executor/models/llava.py#L151
             #ready_item.length = self.model.get_num_image_tokens(image_width=ready_item.data.width, image_height=ready_item.data.height)
             # TODO: VLLM output lenght is not correct, need to fix it
             image_size = (ready_item.data.height, ready_item.data.width)
             ready_item.length = self.model.image_size_to_num_tokens(image_size)
-
-            ready_item.data =  ToTensor()(ready_item.data) # Q: do we need this? does the preprocess accept PIL image input?
-
+            # If not converted to tensor, the results will be off
+            ready_item.data =  ToTensor()(ready_item.data)
             ready_item.data = self.model._preprocess([ready_item.data])[0] # _preprocess involves H2D transfer
-            # Store processed item with its request and item IDs
             processed_items[(ready_item.req_id, ready_item.id)] = ready_item
 
         # 3. Reconstruct batch_mm_items in correct order and calculate offsets
@@ -407,8 +443,8 @@ class MultimodalModelEngine(PyTorchModelEngine):
             modality: [item.data for item in items]
             for modality, items in batch_mm_items.items()
         }
-        # stack all mm tensors and issue one encoder forward pass
-        # assume the shape after torch.cat is (total_patches, 3, pix_height, pix_width) for image only
+        # Stack all mm tensors and issue one encoder forward pass
+        # Shape after torch.cat (total_patches, 3, pix_height, pix_width) - image only
         for item in batch_mm_items['image']:
             batch_mm_input = torch.cat(batch_mm_data['image'])
         batch_mm_features = self.model._process(batch_mm_input) if len(batch_mm_data['image']) > 0 else None
