@@ -325,7 +325,7 @@ def convert_and_save(
                                     if hf_drafter_model is not None else ""),
         )
         weights.update(drafter_weights)
-
+        
     safetensors.torch.save_file(
         weights, os.path.join(output_dir, f"rank{rank}.safetensors"))
 

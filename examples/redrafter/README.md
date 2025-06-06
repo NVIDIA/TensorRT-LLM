@@ -68,11 +68,11 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_redrafter \
 
 Note that the `speculative_decoding_mode` is set to `explicit_draft_tokens` which is how we categorized ReDrafter.
 
-Similary we can use an fp8 quantised base model and an fp16 draft head. 
+Similary we can use an fp8 quantised base model and an bf16 draft head. 
 ```bash
 # From the `examples/models/core/qwen/` directory, run the below, to quantize model into FP8 and export trtllm checkpoint
 python ../../../quantization/quantize.py --model_dir ./Qwen2.5-7B-Instruct/ \
-                                   --dtype float16 \
+                                   --dtype bfloat16 \
                                    --qformat fp8 \
                                    --output_dir ./qwen_checkpoint_1gpu_fp8 \
                                    --calib_size 1024
@@ -81,7 +81,7 @@ python ../../../quantization/quantize.py --model_dir ./Qwen2.5-7B-Instruct/ \
 python convert_checkpoint.py --base_model_checkpoint_dir ./qwen_checkpoint_1gpu_fp8 \
                              --drafter_model_dir ./qwen-7b-drafter \
                              --output_dir ./tllm_checkpoint_1gpu_fp8 \
-                             --dtype float16 \
+                             --dtype bfloat16 \
                              --redrafter_num_beams 1 \
                              --redrafter_draft_len_per_beam 3
 
