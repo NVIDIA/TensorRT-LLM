@@ -19,6 +19,8 @@ import numpy as np
 import tensorrt as trt
 import torch
 
+from tensorrt_llm.logger import logger
+
 from .._common import default_net, precision
 from .._utils import (fp32_array, get_sm_version, int32_array, is_same_dtype,
                       set_obj_attrs, trt_dtype_to_np, trt_dtype_to_str)
@@ -1574,10 +1576,11 @@ class Attention(Module):
 
         if self.inner_layernorm is not None:
             context = self.inner_layernorm(context)
+        logger.info('[attention.py][forward] ---Invoking allreduce---')
         context = self.dense(context,
                              lora_runtime_params=dense_lora_params,
                              all_reduce_params=all_reduce_params)
-
+        logger.info('[attention.py][forward] ---Returning from allreduce---')
         if skip_attn is not None and not default_net(
         ).plugin_config.use_fp8_context_fmha:
             context = dense_conditional.add_output(skip_case, context)
