@@ -9,7 +9,8 @@ from tensorrt_llm.bindings.executor import FinishReason
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
+from ..pyexecutor.sampler import (SampleStateTensors, SampleStateTorch,
+                                  TorchSampler)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
@@ -20,8 +21,8 @@ class SampleStateTensorsMTP(SampleStateTensors):
     next_draft_tokens: torch.Tensor
 
 
-@dataclass(kw_only=True)
-class SampleStateMTP(SampleState):
+@dataclass(frozen=True, kw_only=True)
+class SampleStateMTP(SampleStateTorch):
     device: SampleStateTensorsMTP
     host: SampleStateTensorsMTP
 
@@ -223,12 +224,10 @@ class MTPSampler(TorchSampler):
 
     SampleState = SampleStateMTP
 
-    def __init__(self, max_seq_len: int, config: MTPConfig):
-        super().__init__(max_seq_len, False)
+    def __init__(self, args: TorchSampler.Args, *, nextn: int):
+        super().__init__(args)
         self.mapping = None
-        self.draft_len = 0
-        if config is not None:
-            self.draft_len = config.num_nextn_predict_layers
+        self.draft_len = nextn
 
     def _draft_meet_max_token_stop_criteria(self, request: LlmRequest,
                                             num_tokens: int, beam_idx: int):

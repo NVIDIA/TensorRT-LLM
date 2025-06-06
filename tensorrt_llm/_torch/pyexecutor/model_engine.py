@@ -289,6 +289,7 @@ def get_rank_model_storage(model):
 
 
 class PyTorchModelEngine(ModelEngine):
+    BEAM_WIDTH = 1
 
     def __init__(
         self,
@@ -1104,8 +1105,6 @@ class PyTorchModelEngine(ModelEngine):
         draft_lens = []
         mrope_config = defaultdict(list)
 
-        batch_idx = 0
-
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             all_prompt_tokens = request.get_tokens(0)
@@ -1130,26 +1129,24 @@ class PyTorchModelEngine(ModelEngine):
             if mrope_rotary_cos_sin is not None:
                 mrope_config['mrope_rotary_cos_sin'].append(
                     mrope_rotary_cos_sin)
-            request.py_batch_idx = batch_idx
-            batch_idx += 1
+            request.py_batch_idx = request.seq_slot
 
-        num_ctx_requests = batch_idx
+        num_ctx_requests = len(scheduled_requests.context_requests)
         num_ctx_tokens = len(input_ids)
         new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
-            if self.without_logits:
-                assert isinstance(new_tensors_device, SampleStateTensorsMTP)
-                new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
-                next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
+        is_mtp = isinstance(new_tensors_device, SampleStateTensorsMTP)
+        if is_mtp:
+            new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
+            next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
 
         # Requests with draft tokens are treated like extend requests.
         extend_requests = []
         generation_requests = []
         for request in scheduled_requests.generation_requests:
-            if len(request.py_draft_tokens
-                   ) > 0 or next_draft_tokens_device is not None:
+            if len(request.py_draft_tokens) > 0 or is_mtp:
                 extend_requests.append(request)
             else:
                 generation_requests.append(request)
@@ -1166,7 +1163,7 @@ class PyTorchModelEngine(ModelEngine):
             assert spec_dec_mode.support_overlap_scheduler(
             ), f"{self.spec_config.spec_dec_name} does not support overlap scheduler"
 
-        # will contain previous batch incices of generation requests
+        # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
         request_ids_with_previous_batch = []
@@ -1176,7 +1173,7 @@ class PyTorchModelEngine(ModelEngine):
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
             # (2) a dummy request; or
             # (3) the first step in the generation server of disaggregated serving
-            if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
+            if not is_mtp or request.is_dummy or request.py_batch_idx is None:
                 # get token ids, including input token ids and draft token ids
                 input_ids.append(request.get_last_tokens(0))
                 input_ids.extend(request.py_draft_tokens)
@@ -1198,14 +1195,12 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request_ids.append(request.py_request_id)
                 # update batch index
-                request.py_batch_idx = batch_idx
-                batch_idx += 1
+                request.py_batch_idx = request.seq_slot
                 num_extend_reqs_wo_previous_batch += 1
             else:
                 # update batch index
                 previous_batch_idx = request.py_batch_idx
-                request.py_batch_idx = batch_idx
-                batch_idx += 1
+                request.py_batch_idx = request.seq_slot
                 # inputs
                 # overlap scheduler can only support the speculative decoding
                 # methods with a fixed number of draft tokens
@@ -1259,12 +1254,21 @@ class PyTorchModelEngine(ModelEngine):
             prompt_lengths.append(request.py_prompt_len)
             draft_lens.append(0)
 
-            request.py_batch_idx = batch_idx
-            batch_idx += 1
+            request.py_batch_idx = request.seq_slot
+
+        previous_batch_len = len(previous_batch_indices)
+
+        def previous_seq_slots_device():
+            sorted_previous_batch_indices = sorted(previous_batch_indices)
+            previous_batch_indices_host = torch.tensor(
+                sorted_previous_batch_indices, dtype=torch.int, pin_memory=True)
+            previous_slots = self.previous_batch_indices_cuda[:
+                                                              previous_batch_len]
+            previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
+            return previous_slots
 
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
-        previous_batchs = len(previous_batch_indices)
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids,
@@ -1277,28 +1281,23 @@ class PyTorchModelEngine(ModelEngine):
                                         pin_memory=True)
             self.draft_tokens_cuda[:len(draft_tokens)].copy_(draft_tokens,
                                                              non_blocking=True)
-        if next_draft_tokens_device is not None:
-            if len(previous_batch_indices) > 0:
-                previous_batch_indices = torch.tensor(previous_batch_indices,
-                                                      dtype=torch.int,
-                                                      pin_memory=True)
-                self.previous_batch_indices_cuda[:previous_batchs].copy_(
-                    previous_batch_indices, non_blocking=True)
+        if is_mtp:
+            if previous_batch_len > 0:
+                previous_slots = previous_seq_slots_device()
                 # previous input ids
-                previous_batch_tokens = previous_batchs * (1 +
-                                                           self.max_draft_len)
-                self.input_ids_cuda[
-                    num_tokens:num_tokens +
-                    previous_batch_tokens].copy_(new_tokens_device[
-                        self.previous_batch_indices_cuda[:previous_batchs], :].
-                                                 flatten(),
-                                                 non_blocking=True)
+                previous_batch_tokens = previous_batch_len * (
+                    1 + self.max_draft_len)
+                new_tokens = new_tokens_device[previous_slots, :].flatten()
+                self.input_ids_cuda[num_tokens:num_tokens +
+                                    previous_batch_tokens].copy_(
+                                        new_tokens, non_blocking=True)
                 # previous draft tokens
-                previous_batch_draft_tokens = previous_batchs * self.max_draft_len
+                previous_batch_draft_tokens = previous_batch_len * self.max_draft_len
                 self.draft_tokens_cuda[
                     num_draft_tokens:num_draft_tokens +
                     previous_batch_draft_tokens].copy_(next_draft_tokens_device[
-                        self.previous_batch_indices_cuda[:previous_batchs], :].
+                        self.
+                        previous_batch_indices_cuda[:previous_batch_len], :].
                                                        flatten(),
                                                        non_blocking=True)
                 # prepare data for the preprocess inputs
@@ -1307,13 +1306,13 @@ class PyTorchModelEngine(ModelEngine):
                     1 + self.max_draft_len)
                 pre_tokens_end_idx = pre_tokens_start_idx + previous_batch_tokens
                 pre_batch_start_idx = num_extend_reqs_wo_previous_batch
-                pre_batch_end_idx = pre_batch_start_idx + previous_batchs
-                previous_pos_indices = torch.tensor(previous_pos_indices,
-                                                    dtype=torch.int,
-                                                    pin_memory=True)
+                pre_batch_end_idx = pre_batch_start_idx + previous_batch_len
+                previous_pos_indices_host = torch.tensor(previous_pos_indices,
+                                                         dtype=torch.int,
+                                                         pin_memory=True)
                 self.previous_pos_indices_cuda[
                     pre_tokens_start_idx:pre_tokens_end_idx].copy_(
-                        previous_pos_indices, non_blocking=True)
+                        previous_pos_indices_host, non_blocking=True)
                 self.previous_pos_id_offsets_cuda[
                     pre_tokens_start_idx:pre_tokens_end_idx].copy_(
                         new_tokens_lens_device[self.previous_pos_indices_cuda[
@@ -1322,7 +1321,8 @@ class PyTorchModelEngine(ModelEngine):
                 self.previous_kv_lens_offsets_cuda[
                     pre_batch_start_idx:pre_batch_end_idx].copy_(
                         kv_len_offsets_device[
-                            self.previous_batch_indices_cuda[:previous_batchs]],
+                            self.
+                            previous_batch_indices_cuda[:previous_batch_len]],
                         non_blocking=True)
                 # for the requests that do not have previous batch, set the previous_pos_id_offsets and
                 # previous_kv_lens_offsets to zeros to skip the value changes in _preprocess_inputs
@@ -1333,16 +1333,13 @@ class PyTorchModelEngine(ModelEngine):
                 self.previous_pos_id_offsets_cuda *= 0
                 self.previous_kv_lens_offsets_cuda *= 0
         elif new_tokens_device is not None:
-            previous_batch_tokens = len(previous_batch_indices)
-            previous_batch_indices = torch.tensor(previous_batch_indices,
-                                                  dtype=torch.int,
-                                                  pin_memory=True)
-            self.previous_batch_indices_cuda[:previous_batch_tokens].copy_(
-                previous_batch_indices, non_blocking=True)
-            self.input_ids_cuda[num_tokens:num_tokens + previous_batchs].copy_(
-                new_tokens_device[
-                    self.previous_batch_indices_cuda[:previous_batchs]],
-                non_blocking=True)
+            seq_slots_device = previous_seq_slots_device()
+            max_draft_len = max(draft_lens)
+            new_tokens = new_tokens_device[:max_draft_len + 1,
+                                           seq_slots_device, :self.BEAM_WIDTH]
+            self.input_ids_cuda[num_tokens:num_tokens +
+                                previous_batch_len].copy_(new_tokens.flatten(),
+                                                          non_blocking=True)
 
         total_num_tokens = len(position_ids)
         position_ids = torch.tensor(position_ids,

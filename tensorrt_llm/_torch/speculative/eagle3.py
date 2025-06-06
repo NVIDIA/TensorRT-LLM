@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -126,26 +127,6 @@ class Eagle3SpecMetadata(SpecMetadata):
                 dim=-1)
 
 
-class Eagle3Sampler(TorchSampler):
-
-    def _batch_sample(self, scheduled_requests, model_outputs) -> SampleState:
-        logits = model_outputs["logits"]
-        new_tokens_device = torch.argmax(logits, dim=-1)
-        if "d2t" in model_outputs:
-            d2t = model_outputs["d2t"]
-            new_tokens_device = d2t[new_tokens_device] + new_tokens_device
-        device = SampleStateTensors(new_tokens=new_tokens_device)
-        host = SampleStateTensors(
-            new_tokens=new_tokens_device.to('cpu', non_blocking=True))
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
-        return SampleState(scheduled_requests=scheduled_requests,
-                           logits=logits,
-                           device=device,
-                           host=host,
-                           sampler_event=sampler_event)
-
-
 @dataclass
 class Eagle3OneModelSpecMetadata(SpecMetadata):
     # The hidden states
@@ -213,31 +194,32 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 break
 
 
-class Eagle3Decoder(TorchSampler):
+class Eagle3Sampler(TorchSampler):
 
-    def _batch_sample(self, scheduled_requests, model_outputs) -> SampleState:
+    def sample_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs: dict[str, torch.Tensor]) -> SampleState:
+        # TODO: Make like TorchSampler
         logits = model_outputs["logits"]
         new_tokens_device = torch.argmax(logits, dim=-1)
         if "d2t" in model_outputs:
             d2t = model_outputs["d2t"]
             new_tokens_device = d2t[new_tokens_device] + new_tokens_device
-        new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
-        new_tensors_device = {"new_tokens_device": new_tokens_device}
-        new_tensors_host = {"new_tokens_host": new_tokens_host}
-        decoder_event = torch.cuda.Event()
-        decoder_event.record()
+        device = SampleStateTensors(new_tokens=new_tokens_device)
+        host = SampleStateTensors(
+            new_tokens=new_tokens_device.to('cpu', non_blocking=True))
+        sampler_event = torch.cuda.Event()
+        sampler_event.record()
         return SampleState(scheduled_requests=scheduled_requests,
                            logits=logits,
-                           new_tensors_device=new_tensors_device,
-                           new_tensors_host=new_tensors_host,
-                           decoder_event=decoder_event)
+                           device=device,
+                           host=host,
+                           sampler_event=sampler_event)
 
 
-class Eagle3OneModelDecoder(MTPSampler):
+class Eagle3OneModelSampler(MTPSampler):
 
-    def __init__(self, max_seq_len: int, config: Eagle3Config):
-        super().__init__(max_seq_len, None)
-        self.draft_len = config.max_draft_tokens
+    def __init__(self, args: TorchSampler.Args):
+        super().__init__(args, nextn=args.max_draft_tokens)
 
 
 class Eagle3OneModelWorker(nn.Module):
