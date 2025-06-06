@@ -41,7 +41,7 @@ def test_llm_eagle_1gpu(batch_size, data_type, use_dynamic_tree,
         merged_model_path = os.path.join(cmodel_dir, model_name,
                                          f"{data_type}_merged")
         quant_cmd = [
-            f"{eagle_example_root}/quantize.py",
+            f"{eagle_example_root}/../quantization/quantize.py",
             f"--model_dir={eagle_model_roots[0]}",
             f"--eagle_model_dir={eagle_model_roots[1]}",
             f"--output_dir={merged_model_path}",
@@ -49,6 +49,7 @@ def test_llm_eagle_1gpu(batch_size, data_type, use_dynamic_tree,
             f"--qformat=fp8",
             f"--kv_cache_dtype=fp8",
             f"--calib_size=512",
+            f"--eagle_num_layers=4",
         ]
         venv_check_call(llm_venv, quant_cmd)
         eagle_model_roots = merged_model_path
