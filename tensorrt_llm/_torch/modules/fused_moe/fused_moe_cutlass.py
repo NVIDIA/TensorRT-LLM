@@ -184,7 +184,7 @@ class CutlassFusedMoE(MoE):
 
         self.alltoall_method_type = self.select_alltoall_method_type(
             model_config.mapping, routing_method.experts_per_token, dtype,
-            model_config.pytorch_backend_config.use_cuda_graph)
+            model_config.use_cuda_graph)
         self.use_postquant_alltoall = False
         if self.enable_alltoall:
             assert self.use_dp and self.parallel_size > 1,\
