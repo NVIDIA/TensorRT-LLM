@@ -374,14 +374,6 @@ public:
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> const& getCacheBlockIds(SizeType32 windowSize) const
     {
-        {
-            auto result = mCacheBlockIds.at(windowSize)[0];
-            std::cout << "minwei getCacheBlockIds: ";
-            for (int i = 0; i < result.size(); i++) {
-                std::cout << result[i] << " ";
-            }
-            std::cout << std::endl;
-        }
         return mCacheBlockIds.at(windowSize);
     }
 
@@ -418,7 +410,6 @@ public:
 
     void removeFirstBlock(SizeType32 windowSize)
     {
-        printf("minwei first block removed\n");
         for (auto& beamBlockIds : mCacheBlockIds.at(windowSize))
         {
             // Do not actually remove from mCacheBlockIds; set to -1 instead.
