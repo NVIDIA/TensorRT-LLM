@@ -67,7 +67,7 @@ def get_wheel_from_package(arch, upload_path):
     build_dir = llm_root / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
 
-    benchmarks_dir = llm_root / "build" / "benchmarks"
+    benchmarks_dir = llm_root / "cpp" / "build" / "benchmarks"
     benchmarks_dir.mkdir(parents=True, exist_ok=True)
 
     wheel_files = glob.glob(str(tmp_dir / "tensorrt_llm*.whl"))
