@@ -64,13 +64,11 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
     RoutingMethodType routingMethodType, cudaStream_t stream)
 {
-    // Some restriction to be lifted by https://github.com/NVIDIA/TensorRT-LLM/pull/4063
-    TLLM_CHECK_WITH_INFO(topK == 1 || topK == 8, "top_k can only be 1 or 8.");
-
     if (routingMethodType == RoutingMethodType::DeepSeekV3)
     {
+        TLLM_CHECK_WITH_INFO(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
+        TLLM_CHECK_WITH_INFO(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
         moe::dev::routing::Data routingData;
-        routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
 
@@ -110,8 +108,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     }
     else if (routingMethodType == RoutingMethodType::Llama4)
     {
+        TLLM_CHECK_WITH_INFO(topK == 1, "For Llama routing method, must have topK == 1");
+        if (nGroup > 0 || topkGroup > 0)
+        {
+            TLLM_LOG_WARNING("For Llama routing method, nGroup/topkGroup is ignored, got %d/%d.", nGroup, topkGroup);
+        }
         moe::dev::routingLlama4::Data routingData;
-        // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
 
@@ -138,8 +140,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumTokens = numTokens;
         // routingData.mHiddenDim = args.mHiddenDim;
         routingData.mNumExperts = numExperts;
-        // routingData.mNumExpertGroups = n_group;
-        // routingData.mNumLimitedGroups = topk_group;
+        // routingData.mNumExpertGroups = nGroup;
+        // routingData.mNumLimitedGroups =topkGroup;
         routingData.mTopK = topK;
         routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
         routingData.mLocalExpertsStartIdx = localExpertOffset;
