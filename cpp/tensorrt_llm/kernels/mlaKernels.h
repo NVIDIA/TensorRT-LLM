@@ -101,20 +101,15 @@ void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_ca
     float const* kv_scale_quant_orig_ptr, cudaStream_t stream);
 
 template <typename T>
-void invokeMLASetPagedKV(T* output, T* const k_ptr, T* const v_ptr, T* const k_pe_ptr, int const num_requests,
+void invokeMLASetPagedKV(T* output, T const* k_ptr, T const* v_ptr, T const* k_pe_ptr, int const num_requests,
     int64_t const* cu_seq_lens, int const max_input_seq_len, int num_heads, int kv_dim, int rope_dim,
     int kv_cache_tokens_per_block, int64_t kv_token_stride, cudaStream_t stream);
 
-template <typename T>
-void invokeMLASetPagedKVV2(T* output, T* const chached_k_ptr, T* const chached_v_ptr, T* const chached_k_pe_ptr,
-    T* const new_k_ptr, T* const new_v_ptr, T* const new_k_pe_ptr, int const num_requests,
-    int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_seq_len, int num_heads,
-    int kv_dim, int rope_dim, int kv_cache_tokens_per_block, cudaStream_t stream);
-
 template <typename T, typename TCache>
-void invokeMLAAppendPagedKV(KVBlockArray& kv_cache, T* const compressed_kv_ptr, T* const k_pe_ptr,
+void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T const* latent_cache_ptr,
     int const num_requests, int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens,
-    int const max_input_uncached_seq_len, int head_dim, float const* kv_scale_orig_quant_ptr, cudaStream_t stream);
+    int const max_input_uncached_seq_len, float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size,
+    int lora_size, float const* kv_scale_orig_quant_ptr, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm
