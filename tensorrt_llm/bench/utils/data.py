@@ -7,35 +7,8 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
-
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs import default_multimodal_input_loader
-from tensorrt_llm.inputs import (INPUT_FORMATTER_MAP, default_image_loader,
-                                 default_video_loader)
-
-
-def prepare_multimodal_inputs(model_dir: str,
-                              model_type: str,
-                              modality: str,
-                              prompts: List[str],
-                              media: List[List[str]],
-                              image_data_format: str = "pt",
-                              num_frames: int = 8) -> List[Dict[str, Any]]:
-    assert model_type in INPUT_FORMATTER_MAP, f"Model type {model_type} not in supported list of models: {INPUT_FORMATTER_MAP.keys()}"
-    formatter = INPUT_FORMATTER_MAP[model_type]
-
-    inputs = []
-    if modality == "image":
-        inputs = default_image_loader(prompts, media, image_data_format)
-    elif modality == "video":
-        inputs = default_video_loader(prompts, media, image_data_format,
-                                      num_frames)
-    else:
-        raise ValueError(f"Unsupported modality: {modality}")
-
-    inputs = formatter(model_dir, inputs)
-
-    return inputs
 
 
 def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
