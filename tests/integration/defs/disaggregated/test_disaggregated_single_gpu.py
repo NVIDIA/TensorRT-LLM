@@ -227,18 +227,23 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
                                               generation_overlap):
     # Test the case where the context worker capacity is exceeded and
     # needs to wait for the generation worker to complete.
+    # TODO: Autotuner is disabled due to illegal CUDA instruction error on H100.
+    # H200 does not have this issue, possibly due to a larger GPU memory.
+    # This should be investigated further.
     worker_pytorch_configs = []
 
     # Context worker
     worker_pytorch_configs.append(
         dict(disable_overlap_scheduler=True,
              kv_cache_dtype="auto",
+             autotuner_enabled=False,
              use_cuda_graph=enable_cuda_graph))
 
     # Generation worker
     worker_pytorch_configs.append(
         dict(disable_overlap_scheduler=not generation_overlap,
              kv_cache_dtype="auto",
+             autotuner_enabled=False,
              use_cuda_graph=enable_cuda_graph))
 
     kv_cache_configs = [
