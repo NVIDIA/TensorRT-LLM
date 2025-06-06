@@ -405,10 +405,7 @@ int runTest(CapacityScheduler& capacityScheduler,
             else
             {
                 kvCacheManager->addToken(llmReq->mRequestId);
-                if (crossKvCacheManager)
-                {
-                    crossKvCacheManager->addToken(llmReq->mRequestId);
-                }
+                // Tokens are not added only to the kv cache but NOT to the cross kv cache
                 llmReq->addNewTokens({itCount});
             }
             if (llmReq->getNumTokens(0) == promptLen + llmReq->mMaxNewTokens)

@@ -51,6 +51,10 @@ static constexpr SizeType32 kPrimaryLevel = 0;
 
 static constexpr SizeType32 kSecondaryLevel = 1;
 
+// Extra buffer block for sequences exceeding attention window, allowing to detach previous blocks only
+// when we'll be left with enough tokens to fill the attention window
+static constexpr SizeType32 kExtraBlockBuffer = 1;
+
 class KVCacheBlock;
 class BlockManager;
 class KVCacheManager;
@@ -86,13 +90,15 @@ struct WindowSizeMetadata
     SizeType32 temporaryAttentionWindow; // Temporary kv cache length per sequence.
                                          // Only needed when chunked context + sliding window attention are used
                                          // together. And it should only be considered when allocating blocks.
+    SizeType32 numNonSinkTokensInWindow; // Number of non-sink tokens in the attention window
 
     std::string toString()
     {
         return tensorrt_llm::common::fmtstr(
             "WindowSizeMetadata{ .absolutePoolsOffset=%d, .numPools=%d, .maxTokenNum=%d, .maxBlocksPerSeq=%d, "
-            ".maxNumBlocks=%d, .temporaryAttentionWindow=%d }",
-            absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq, maxNumBlocks, temporaryAttentionWindow);
+            ".maxNumBlocks=%d, .temporaryAttentionWindow=%d, .numNonSinkTokensInWindow=%d }",
+            absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq, maxNumBlocks, temporaryAttentionWindow,
+            numNonSinkTokensInWindow);
     }
 };
 
@@ -325,7 +331,7 @@ public:
         // not for others, the state needs to remain identical for all window sizes. So
         // we currently resort to strictly disabling the reuse code path for all window
         // sizes at once or enable it for all window sizes at once.
-        , mCyclicThreshold(windowSizeToMetadata.cbegin()->second.maxTokenNum)
+        , mContextRequiresSlidingWindowKvCache(numTokens > windowSizeToMetadata.cbegin()->second.maxTokenNum)
     {
         auto const numWindowSizes = windowSizeToMetadata.size();
         mCacheBlockIds.reserve(numWindowSizes);
@@ -393,12 +399,6 @@ public:
         mCacheBlockIds.at(windowSize).at(beamIdx).push_back(blockId);
     }
 
-    void changeCacheBlock(
-        SizeType32 windowSize, SizeType32 beamIdx, SizeType32 pagedBlockIdx, KVCacheBlock::IdType blockId)
-    {
-        mCacheBlockIds.at(windowSize).at(beamIdx).at(pagedBlockIdx) = blockId;
-    }
-
     void clearCacheBlocks(SizeType32 windowSize)
     {
         for (auto& beamBlockIds : mCacheBlockIds.at(windowSize))
@@ -415,6 +415,14 @@ public:
         }
     }
 
+    void removeBlock(SizeType32 const blockIdx, SizeType32 windowSize)
+    {
+        for (auto& beamBlockIds : mCacheBlockIds.at(windowSize))
+        {
+            beamBlockIds.erase(beamBlockIds.begin() + blockIdx);
+        }
+    }
+
     [[nodiscard]] executor::RetentionPriority getDecodeRetentionPriority() const
     {
         return mKvCacheRetentionConfig.getDecodeRetentionPriority();
@@ -425,12 +433,9 @@ public:
         return mKvCacheRetentionConfig.getDecodeDurationMs();
     }
 
-    // @brief Check whether the sequence uses cyclic KV cache.
-    // @return `true` if we have begun overwriting the beginning of the sequence's KV cache.
-    // @details If `true`, we cannot store the sequence's KV cache for reuse.
-    [[nodiscard]] bool isCyclic() const
+    [[nodiscard]] bool getContextRequiresSlidingWindowKvCache() const
     {
-        return mNumTokens >= mCyclicThreshold;
+        return mContextRequiresSlidingWindowKvCache;
     }
 
 private:
@@ -447,8 +452,8 @@ private:
     // The retention priority to assign to decode blocks
     executor::KvCacheRetentionConfig mKvCacheRetentionConfig;
 
-    // Number of tokens at which the KV Cache begins sliding [for the minimum attention window]
-    SizeType32 mCyclicThreshold;
+    // A value indicating whether or not the context is long enough to warrant the use of sliding window kv-cache.
+    bool mContextRequiresSlidingWindowKvCache{false};
 };
 
 // attach metadata to a pool pointer
@@ -535,27 +540,40 @@ public:
         GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
-    void addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx);
+    void addSequence(GenerationRequest& sequence, SizeType32 numBlocks, bool shareLastContextBlock);
 
     //! \brief Allocate new block for each beam of the sequence.
     //! \details Might free cached blocks if no free blocks are available.
     void allocateBlock(GenerationRequest& sequence, bool shareAmongBeams);
 
-    void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
-
     //! \brief Get the ids of all newly allocated (not reused) blocks for the sequence.
     std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(GenerationRequest const& sequence) const;
 
-    void storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
-
     //! \brief Release blocks of the sequence.
-    void releaseBlocks(GenerationRequest& sequence);
+    void releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt);
 
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
     //! \brief Release last block in the sequence
     void releaseLastBlock(GenerationRequest& sequence);
+
+    //! \brief Cache block offsets for the sequence
+    void cacheBlockOffsets(GenerationRequest& sequence) const;
+
+    //! \brief Detach block from the sequence
+    void detachBlock(GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength, bool const enableBlockReuse);
+
+    //! \brief Cache new block offsets for the sequence
+    void cacheNewBlockOffsets(GenerationRequest& sequence) const;
+
+    //! \brief Add a new block to the sequence if needed
+    void addSequenceBlockIfNeeded(GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength,
+        bool const enableBlockReuse, SizeType32 const numNonSinkTokensInWindow);
+
+    //! \brief Remove a block from the sequence if needed
+    void removeSequenceBlockIfNeeded(GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength,
+        bool const enableBlockReuse, SizeType32 const maxTokenNum);
 
     [[nodiscard]] SizeType32 getWindowSize() const noexcept
     {
@@ -567,7 +585,7 @@ public:
         return mLogPrefix;
     }
 
-    [[nodiscard]] SizeType32 getNumFreeBlocks() const noexcept;
+    [[nodiscard]] SizeType32 getNumFreeBlocks(SizeType32 cacheLevel = kPrimaryLevel) const noexcept;
 
     [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
     {
@@ -842,7 +860,8 @@ public:
         SizeType32 maxNumSequences, CudaStreamPtr stream, std::optional<SizeType32> maxSequenceLength,
         SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
         std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs, nvinfer1::DataType dtype,
-        SizeType32 sinkBubbleLength, bool onboardBlocks, CacheType cacheType = CacheType::kSELF,
+        SizeType32 sinkTokenLength, SizeType32 sinkBubbleLength, bool onboardBlocks,
+        CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true);
@@ -861,7 +880,7 @@ public:
         LlmRequest& llmRequest, SizeType32 windowSize);
 
     void addSequence(
-        GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx, SizeType32 windowSize);
+        GenerationRequest& sequence, SizeType32 numBlocks, bool shareLastContextBlock, SizeType32 windowSize);
 
     void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -874,10 +893,13 @@ public:
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
-    void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
+    void cacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize) const;
 
-    void setOffsets(kernels::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 beamIdx,
-        SizeType32 blockIdx, KVCacheBlock::IdType blockId, SizeType32 windowSize) const;
+    void addSequenceBlockIfNeeded(
+        GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength, bool const enableBlockReuse);
+
+    void removeSequenceBlockIfNeeded(
+        GenerationRequest& sequence, SizeType32 const sinkBlockTokenLength, bool const enableBlockReuse);
 
     // WILL NOT WORK FOR VARIABLE WINDOW ATTENTION
     [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
@@ -903,19 +925,20 @@ public:
 
     void startScheduling();
 
-    [[nodiscard]] std::map<SizeType32, SizeType32> getNumFreeBlocksPerWindowSize() const
+    [[nodiscard]] std::map<SizeType32, SizeType32> getNumFreeBlocksPerWindowSize(
+        SizeType32 cacheLevel = kPrimaryLevel) const
     {
         std::map<SizeType32, SizeType32> numFreeBlocksPerWindowSize;
         for (auto const& [windowSize, manager] : mWindowBlockManagers)
         {
-            numFreeBlocksPerWindowSize[windowSize] = manager.getNumFreeBlocks();
+            numFreeBlocksPerWindowSize[windowSize] = manager.getNumFreeBlocks(cacheLevel);
         }
         return numFreeBlocksPerWindowSize;
     }
 
-    [[nodiscard]] SizeType32 getNumFreeBlocks() const
+    [[nodiscard]] SizeType32 getNumFreeBlocks(SizeType32 cacheLevel = kPrimaryLevel) const
     {
-        return sumWindows([](auto const& manager) { return manager.getNumFreeBlocks(); });
+        return sumWindows([cacheLevel](auto const& manager) { return manager.getNumFreeBlocks(cacheLevel); });
     }
 
     [[nodiscard]] bool schedulingHasFreeBlocks(SizeType32 numRequired, SizeType32 windowSize) const
@@ -1086,12 +1109,10 @@ public:
     //! \brief Store context blocks
     void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
-    [[nodiscard]] static bool isUseOneMoreBlock(
-        SizeType32 windowSize, std::optional<SizeType32> maxSequenceLength, SizeType32 maxBeamWidth)
+    [[nodiscard]] static bool isUseOneMoreBlock()
     {
-        bool const isCyclicWindowSize = maxSequenceLength.has_value() && maxSequenceLength.value() > windowSize;
-        bool const isBeamSearch = maxBeamWidth > 1;
-        return isCyclicWindowSize && isBeamSearch;
+        // With sliding window kv cache, we don't need to use one more block even for beam search
+        return false;
     }
 
     //! \brief Perform per-request bookkeeping
@@ -1593,12 +1614,6 @@ public:
     /// @return SizeType32 A maximum attention window in number of tokens.
     [[nodiscard]] static SizeType32 calculateMaxAttentionWindow(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
-
-private:
-    void cacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
-    void cacheNewBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
-    void updateNewBlockPointer(GenerationRequest& seq, SizeType32 windowSize, SizeType32 blockIdx);
-    void updateToken(GenerationRequest& sequence, bool addToken);
 
 private:
     // Maximum number of sequences
