@@ -1843,17 +1843,25 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     multiGpuJobs = parallelJobs.findAll{(it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && !it.key.contains("Post-Merge")}
     println multiGpuJobs.keySet()
 
+    tritonJobs = parallelJobs.findAll {it.key.contains("-Triton-") && !it.key.contains("Post-Merge")}
+    println tritonJobs.keySet()
+
     parallelJobs += docBuildJobs
     parallelJobs += sanityCheckJobs
 
     postMergeJobs = parallelJobs.findAll {it.key.contains("Post-Merge")}
 
     // Start as a normal pre-merge job
-    parallelJobsFiltered = parallelJobs - multiGpuJobs - postMergeJobs
+    parallelJobsFiltered = parallelJobs - multiGpuJobs - tritonJobs - postMergeJobs
 
     // Check if the multi GPU related file has changed or not. If changed, add multi GPU test stages.
     if (testFilter[(MULTI_GPU_FILE_CHANGED)]) {
         parallelJobsFiltered += multiGpuJobs
+    }
+
+    // Check if the Triton related file has changed or not. If changed, add Triton test stages.
+    if (testFilter[(TRITON_FILE_CHANGED)]) {
+        parallelJobsFiltered += tritonJobs
     }
 
     if (testFilter[(AUTO_TRIGGER_TAG_LIST)] != null) {
