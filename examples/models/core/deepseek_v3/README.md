@@ -307,7 +307,7 @@ trtllm-serve \
   --extra_llm_api_options ./ctx-extra-llm-api-config.yml &> output_ctx &
 ```
 
-And you can launch a single generation server on port 8002 with:
+And you can launch two generation servers on port 8002 and 8003 with:
 
 ```bash
 export TRTLLM_USE_UCX_KVCACHE=1
