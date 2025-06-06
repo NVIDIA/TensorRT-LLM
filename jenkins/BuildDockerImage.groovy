@@ -27,6 +27,7 @@ LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefi
 LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
 RUN_SANITY_CHECK = params.runSanityCheck ?: false
+TRIGGER_TYPE = env.triggerType ?: "manual"
 
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
@@ -190,6 +191,11 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 
 
 def prepareWheelFromBuildStage(makefileStage, arch) {
+    if (TRIGGER_TYPE == "manual") {
+        echo "Trigger type is manual, skip preparing wheel from build stage"
+        return ""
+    }
+
     if (!makefileStage || !arch) {
         echo "Error: makefileStage and arch are required parameters"
         return ""
@@ -226,11 +232,15 @@ def buildImage(config, imageKeyToTag)
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.dockerfileStage}:${dependentTag}"
     def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
 
-    if (target == "ngc-release" && params.triggerType == "post-merge") {
-        echo "Use NGC artifacts for post merge build"
-        dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
-        imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
-        customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
+    if (target == "ngc-release") {
+        if (TRIGGER_TYPE == "post-merge") {
+            echo "Use NGC artifacts for post merge build"
+            dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
+            imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
+            customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
+        }
+        imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
+        imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
     }
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
