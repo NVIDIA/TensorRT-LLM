@@ -829,7 +829,7 @@ def test_trtllm_bench_mgmn(llm_root, llm_venv):
                                      delete_on_close=True) as running_log:
         check_call(benchmark_cmd,
                    shell=True,
-                   running_log=running_log,
+                   stdout=running_log,
                    env=llm_venv._new_env)
         _check_mem_usage(running_log, [30, 0, 0, 0])
 
