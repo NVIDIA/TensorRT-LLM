@@ -254,9 +254,9 @@ def buildImage(config, imageKeyToTag)
         if (dependent) {
             stage ("make ${dependent.target}_${action} (${arch})") {
                 retry(3) {
-                    retry(3) {
-                        sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
-                    }
+                    sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
+                }
+                retry(3) {
                     sh """
                     cd ${LLM_ROOT} && make -C docker ${dependent.target}_${action} \
                     TORCH_INSTALL_TYPE=${torchInstallType} \
@@ -279,10 +279,9 @@ def buildImage(config, imageKeyToTag)
         }
         stage ("make ${target}_${action} (${arch})") {
             retry(3) {
-                retry(3) {
-                    sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
-                }
-
+                sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
+            }
+            retry(3) {
                 sh """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
