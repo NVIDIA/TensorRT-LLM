@@ -71,7 +71,7 @@ std::string getMacroFlag(std::string const& name, std::string const& value)
 std::string getSMFlag(int SM)
 {
     std::string smStr = std::to_string(SM);
-    if (SM == 90)
+    if (SM == 90 || SM == 120)
     {
         smStr += "a";
     }
@@ -123,9 +123,15 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
         macros["INPUT_FP16"] = "0";
         macros["DTYPE"] = "__nv_bfloat16";
     }
+    else if (context->data_type == tensorrt_llm::kernels::DATA_TYPE_E4M3)
+    {
+        TLLM_CHECK(context->kernel_type == TLLM_XQA_JIT_MLA);
+    }
     else
     {
-        setErrorString("data_type is neither DATA_TYPE_FP16 nor DATA_TYPE_BF16");
+        setErrorString(
+            "data_type must be DATA_TYPE_FP16 or DATA_TYPE_BF16 for non-MLA kernels and DATA_TYPE_E4M3 for the MLA "
+            "kernel");
         return TLLM_XQA_JIT_INVALID_INPUT;
     }
 
@@ -224,8 +230,10 @@ tllmXqaJitStatus createProgram(tllmXqaJitProgram* prog, tllmXqaJitContext const*
     *prog = new _tllmXqaJitProgram;
     (*prog)->context = context;
 
-    char const* src_content = context->kernel_type == TLLM_XQA_JIT_QGMMA ? tensorrt_llm::kernels::mha_sm90_cu_content
-                                                                         : tensorrt_llm::kernels::mha_cu_content;
+    char const* src_content = context->kernel_type == TLLM_XQA_JIT_MLA
+        ? tensorrt_llm::kernels::mla_sm120_cu_content
+        : (context->kernel_type == TLLM_XQA_JIT_QGMMA ? tensorrt_llm::kernels::mha_sm90_cu_content
+                                                      : tensorrt_llm::kernels::mha_cu_content);
 
     std::vector<char const*> headers_content, headers_name;
     for (auto x : tensorrt_llm::kernels::xqa_headers_content)

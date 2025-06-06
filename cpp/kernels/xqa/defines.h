@@ -23,6 +23,18 @@
 #define HEAD_ELEMS 128
 #endif
 
+// nbQHeads / nbKHeads for MQA/GQA
+#ifndef HEAD_GRP_SIZE
+#define HEAD_GRP_SIZE 8
+#endif
+
+#define IS_MLA (HEAD_GRP_SIZE == 128 && HEAD_ELEMS == 576)
+
+#if IS_MLA
+#define INPUT_ELEM __nv_fp8_e4m3
+#define INPUT_ELEM2 __nv_fp8x2_e4m3
+#define HEAD_ELEMS_V 512
+#else
 // 1 means fp16 and 0 means bf16 input/output
 #ifndef INPUT_FP16
 #define INPUT_FP16 1
@@ -36,15 +48,11 @@
 #define INPUT_ELEM __nv_bfloat16
 #define INPUT_ELEM2 __nv_bfloat162
 #endif
+#endif
 
 // For beam search. Allowed values: 1, 4
 #ifndef BEAM_WIDTH
 #define BEAM_WIDTH 1
-#endif
-
-// nbQHeads / nbKHeads for MQA/GQA
-#ifndef HEAD_GRP_SIZE
-#define HEAD_GRP_SIZE 8
 #endif
 
 #ifndef SPEC_DEC
