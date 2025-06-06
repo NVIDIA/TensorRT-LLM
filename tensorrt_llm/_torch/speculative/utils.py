@@ -26,7 +26,8 @@ def get_spec_metadata(spec_config,
                                   hidden_size=spec_config.hidden_size,
                                   max_num_tokens=max_num_tokens,
                                   dtype=spec_config.dtype,
-                                  is_draft_model=is_draft_model)
+                                  is_draft_model=is_draft_model,
+                                  eagle3_resource_manager=spec_resource_manager)
     elif spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSpecMetadata(
             max_draft_tokens=spec_config.max_draft_tokens,
@@ -39,8 +40,13 @@ def get_spec_metadata(spec_config,
         return None
 
 
-def get_spec_resource_manager(spec_config, model_config, max_num_requests,
-                              max_seq_len):
+def get_spec_resource_manager(spec_config,
+                              model_engine,
+                              draft_model_engine=None):
+    model_config = model_engine.model.config
+    max_num_requests = model_engine.batch_size
+    max_seq_len = model_engine.max_seq_len
+    max_num_tokens = model_engine.max_num_tokens
     if spec_config.spec_dec_mode.is_mtp_eagle():
         if spec_config.use_relaxed_acceptance_for_thinking:
             return MTPHiddenStatesManager(spec_config, model_config.torch_dtype,
@@ -55,9 +61,12 @@ def get_spec_resource_manager(spec_config, model_config, max_num_requests,
     elif spec_config.spec_dec_mode.is_ngram():
         return NGramPoolManager(spec_config, max_num_requests)
     elif spec_config.spec_dec_mode.is_eagle3():
-        return Eagle3ResourceManager(spec_config, model_config.torch_dtype,
+        assert draft_model_engine is not None, "Draft model engine is required for Eagle3 two model flow."
+        draft_model_config = draft_model_engine.model.config
+        return Eagle3ResourceManager(spec_config,
+                                     draft_model_config.torch_dtype,
                                      model_config.hidden_size, max_num_requests,
-                                     max_seq_len)
+                                     max_seq_len, max_num_tokens)
     else:
         return None
 

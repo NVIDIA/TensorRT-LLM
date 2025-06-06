@@ -52,7 +52,8 @@ class Eagle3Config(SpecConfig):
 class Eagle3ResourceManager(BaseResourceManager):
 
     def __init__(self, config: Eagle3Config, dtype: torch.dtype,
-                 hidden_size: int, max_num_requests: int, max_seq_len: int):
+                 hidden_size: int, max_num_requests: int, max_seq_len: int,
+                 max_num_tokens: int):
         self.dtype = dtype
         self.max_draft_tokens = config.max_draft_tokens
         self.hidden_size = hidden_size
@@ -61,21 +62,26 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.slot_manager = SlotManager(max_num_requests)
 
         # empty hidden states tensor
-        self.hidden_states = torch.empty(
-            (max_num_requests * self.max_seq_len, self.hidden_size * 3),
-            dtype=self.dtype,
-            device='cuda')
+        max_num_tokens = min(max_num_tokens,
+                             max_num_requests * self.max_seq_len)
+        self.hidden_states = torch.empty((max_num_tokens, self.hidden_size * 3),
+                                         dtype=self.dtype,
+                                         device='cuda')
         # sequence length, only used for metadata preparation
         self.seq_lens = {i: 0 for i in range(max_num_requests)}
+        # start indices of each slot
+        self.start_indices = {i: 0 for i in range(max_num_requests)}
         # whether the next draft forward is the first
         self.is_first_draft = True
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_batch = scheduled_batch.context_requests
-        # allocate hidden state tensors
+        # allocate hidden state tensors and update slot ids
+        self.slot_ids = []
         for req in context_batch:
             if req.is_first_context_chunk():
-                self.slot_manager.add_slot(req.request_id)
+                slot_id = self.slot_manager.add_slot(req.request_id)
+                self.slot_ids.append(slot_id)
         # reset the flag before model forward
         self.is_first_draft = True
 
@@ -123,39 +129,60 @@ class Eagle3SpecMetadata(SpecMetadata):
                                       self.num_layers - 4)
 
         # Initialize to 0 to avoid reading uninitialized memory during warmup
-        self.hidden_states_gather_ids = torch.zeros([self.max_num_tokens],
-                                                    dtype=torch.int,
-                                                    device='cuda')
-        self.hidden_states_write_gather_ids = torch.empty(
-            [self.max_num_requests], dtype=torch.int, device='cuda')
-        self.hidden_states_gather_ids_host = None
+        self.hidden_states_read_indices = torch.zeros([self.max_num_tokens],
+                                                      dtype=torch.long,
+                                                      device='cuda')
+        self.hidden_states_write_indices = torch.zeros([self.max_num_tokens],
+                                                       dtype=torch.long,
+                                                       device='cuda')
+        self.hidden_states_read_indices_host = None
+        self.hidden_states_write_indices_host = None
 
     def prepare(self):
         is_first_draft = self.eagle3_resource_manager.is_first_draft
+        # Update start indices
+        # Here, we assume the sequence lengths (seq_lens) during the draft model
+        # forward will not exceed those of the target model. So pre-allocate
+        # hidden state space before the target model forward.
+        start_idx = 0
+        if not self.is_draft_model:
+            for req_id, seq_len in zip(self.request_ids, self.seq_lens):
+                slot_id = self.eagle3_resource_manager.slot_manager.get_slot(
+                    req_id)
+                self.eagle3_resource_manager.start_indices[slot_id] = start_idx
+                start_idx += seq_len
         # Prepare hidden states gather ids
-        hidden_states_gather_ids = []
-        max_seq_len = self.eagle3_resource_manager.max_seq_len
+        hidden_states_read_indices = []
+        hidden_states_write_indices = []
         for req_id, seq_len in zip(self.request_ids, self.seq_lens):
             slot_id = self.eagle3_resource_manager.slot_manager.get_slot(req_id)
-            old_seq_len = self.eagle3_resource_manager.seq_lens[slot_id]
-            start_idx = slot_id * max_seq_len
-            # If this is the first draft, we need to read all of the accepted
-            # hidden states, otherwise, we only need to read the last token
-            if is_first_draft or self.is_draft_model:
-                hidden_states_gather_ids.extend(
-                    list(range(start_idx, start_idx + old_seq_len)))
+            start_idx = self.eagle3_resource_manager.start_indices[slot_id]
+            # If this is the first draft or the target model forward, we need to
+            # read/write all of the hidden states, otherwise, only read the last token
+            if is_first_draft or not self.is_draft_model:
+                hidden_states_read_indices.extend(
+                    list(range(start_idx, start_idx + seq_len)))
+                hidden_states_write_indices.extend(
+                    list(range(start_idx, start_idx + seq_len)))
             else:
-                hidden_states_gather_ids.append(start_idx + old_seq_len - 1)
+                old_seq_len = self.eagle3_resource_manager.seq_lens[slot_id]
+                hidden_states_read_indices.append(start_idx + old_seq_len - 1)
+                hidden_states_write_indices.append(start_idx + seq_len - 1)
             self.eagle3_resource_manager.seq_lens[slot_id] = seq_len
-        self.hidden_states_gather_ids_host = torch.tensor(
-            hidden_states_gather_ids, dtype=torch.int, pin_memory=True)
+        # Prepare hidden states gather ids
+        self.hidden_states_read_indices_host = torch.tensor(
+            hidden_states_read_indices, dtype=torch.long, pin_memory=True)
+        self.hidden_states_write_indices_host = torch.tensor(
+            hidden_states_write_indices, dtype=torch.long, pin_memory=True)
         self.apply_eagle3_fc = True if is_first_draft and self.is_draft_model else False
         if self.is_draft_model:
             self.eagle3_resource_manager.is_first_draft = False
 
     def prepare_device(self):
-        self.hidden_states_gather_ids[:self.num_tokens].copy_(
-            self.hidden_states_gather_ids_host, non_blocking=True)
+        self.hidden_states_read_indices[:self.num_tokens].copy_(
+            self.hidden_states_read_indices_host, non_blocking=True)
+        self.hidden_states_write_indices[:self.num_tokens].copy_(
+            self.hidden_states_write_indices_host, non_blocking=True)
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
@@ -165,11 +192,12 @@ class Eagle3SpecMetadata(SpecMetadata):
             layer_id: int,
             hidden_states: torch.Tensor,
             residual: Optional[torch.Tensor] = None) -> None:
-        token_idx = self.hidden_states_gather_ids[:self.num_tokens]
+        token_idx = self.hidden_states_write_indices[:self.num_tokens]
         eagle3_hidden_states = self.eagle3_resource_manager.hidden_states
         for i, captured_layer_id in enumerate(self.layers_to_capture):
             if captured_layer_id == layer_id:
                 to_save = hidden_states + residual if residual is not None else hidden_states
+                to_save = to_save.to(dtype=eagle3_hidden_states.dtype)
                 eagle3_hidden_states[:, i * self.hidden_size:(i + 1) *
                                      self.hidden_size].index_copy_(
                                          0, token_idx, to_save)
@@ -180,7 +208,7 @@ class Eagle3SpecMetadata(SpecMetadata):
         preprocess_func: Optional[callable] = None,
     ):
         hidden_states = self.eagle3_resource_manager.hidden_states[
-            self.hidden_states_gather_ids[:self.num_tokens], :]
+            self.hidden_states_read_indices[:self.num_tokens], :]
         if self.apply_eagle3_fc and preprocess_func is not None:
             hidden_states = preprocess_func(hidden_states)
         else:
