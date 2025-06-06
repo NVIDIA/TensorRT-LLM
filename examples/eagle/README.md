@@ -193,9 +193,10 @@ mpirun -np 1 --allow-run-as-root --oversubscribe \
 ### FP8 Post-training Quantization
 To get fp8 quantized model with eagle head quantized, run the following command:
 ```bash
-python quantize.py --model_dir ./vicuna-7b-v1.3 \
+python ../quantization/quantize.py --model_dir ./vicuna-7b-v1.3 \
                     --eagle_model_dir ./EAGLE-Vicuna-7B-v1.3 \
                     --output_dir ./hf_eagle_fp8_merged \
+                    --eagle_num_layers 4 \
                     --qformat fp8 \
                     --kv_cache_dtype fp8 \
                     --calib_size 512
