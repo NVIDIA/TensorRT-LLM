@@ -132,9 +132,7 @@ RUN mkdir -p /root/.cache/pip
 
 WORKDIR /app/tensorrt_llm
 
-ARG SRC_DIR=/src/tensorrt_llm
-
-COPY --from=wheel ${SRC_DIR}/build/tensorrt_llm*.whl .
+COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install tensorrt_llm*.whl && \
@@ -153,13 +151,14 @@ RUN ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensor
     ldconfig && \
     ! ( ldd -v bin/executorWorker | grep tensorrt_llm | grep -q "not found" )
 
-COPY benchmarks benchmarks
+ARG SRC_DIR=/src/tensorrt_llm
+COPY --from=wheel ${SRC_DIR}/benchmarks benchmarks
 ARG CPP_BUILD_DIR=${SRC_DIR}/cpp/build
 COPY --from=wheel \
-    ${SRC_DIR}/build/benchmarks/bertBenchmark \
-    ${SRC_DIR}/build/benchmarks/gptManagerBenchmark \
-    ${SRC_DIR}/build/benchmarks/disaggServerBenchmark \
-    benchmarks/cpp/
+     ${CPP_BUILD_DIR}/benchmarks/bertBenchmark \
+     ${CPP_BUILD_DIR}/benchmarks/gptManagerBenchmark \
+     ${CPP_BUILD_DIR}/benchmarks/disaggServerBenchmark \
+     benchmarks/cpp/
 
 COPY examples examples
 RUN chmod -R a+w examples && \
