@@ -185,18 +185,28 @@ void DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
     }
     auto counterParts = mFormatter->getCounterparts(
         mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx(), destCacheState);
+
+    auto connections = mManager->getConnections(commState);
+    std::vector<executor::kv_cache::Connection const*> counterPartConnections;
     for (auto index : counterParts)
     {
-        auto const* connection = mManager->getConnections(commState).at(index);
+        auto const* connection = connections.at(index);
+        counterPartConnections.emplace_back(connection);
+    }
+    auto pickUpConnections = mFormatter->pickRecvConnections(counterPartConnections, mSelfState.getCacheState().value(),
+        mSelfState.getCommState().value().getSelfIdx(), destCacheState);
+    for (auto connection : counterPartConnections)
+    {
         // if Manager is agentConnectionManager, then send request info to agent
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         if (agentConnectionManager != nullptr)
         {
             // TODO: index -> validConnectionIdx conversion
+            auto valideConnectionIdx
+                = std::find(pickUpConnections.begin(), pickUpConnections.end(), connection) - pickUpConnections.begin();
             auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
             TLLM_CHECK(agentConnection != nullptr);
             TLLM_CHECK(cacheBufferId.has_value());
-            int valideConnectionIdx = std::find(counterParts.begin(), counterParts.end(), index) - counterParts.begin();
             const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
                 ->sendRequestAndBufferInfo(requestInfo, cacheBufferId, valideConnectionIdx);
         }
