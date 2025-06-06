@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -800,28 +801,21 @@ void initRequestBindings(pybind11::module_& m)
 
     m.def(
         "serialize_responses",
-        [&responseGetstate](std::vector<tle::Response> const& responses)
+        [](std::vector<tle::Response> const& responses)
         {
             NVTX3_SCOPED_RANGE(serialize_responses);
-            py::list serialized_list;
-            for (auto const& response : responses)
-            {
-                serialized_list.append(responseGetstate(response));
-            }
-            return serialized_list;
+            return tle::Serialization::serialize(responses);
         },
         py::arg("responses"), "Serializes a list of Response objects.");
 
     m.def(
         "deserialize_responses",
-        [&responseSetstate](py::list const& serialized_list)
+        [](std::vector<char>& data)
         {
-            std::vector<tle::Response> responses;
-            for (auto const& item : serialized_list)
-            {
-                responses.push_back(*responseSetstate(item.cast<py::tuple>()));
-            }
-            return responses;
+            NVTX3_SCOPED_RANGE(deserialize_responses);
+            // std::string s = data.cast<std::string>();
+            // std::vector<char> char_vector(s.begin(), s.end());
+            return tle::Serialization::deserializeResponses(data);
         },
         py::arg("serialized_list"), "Deserializes a list into Response objects.");
 }
