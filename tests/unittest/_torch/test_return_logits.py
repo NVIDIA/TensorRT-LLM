@@ -75,17 +75,12 @@ def test_generate_with_return_logits(enable_trtllm_sampler: bool,
     elif not enable_trtllm_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
-    build_config = BuildConfig()
-    build_config.gather_context_logits = gather_context_logits
-
     pytorch_config = PyTorchConfig(enable_trtllm_sampler=enable_trtllm_sampler)
 
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
                            "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
-        build_config=build_config,
-        gather_context_logits=gather_context_logits,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
