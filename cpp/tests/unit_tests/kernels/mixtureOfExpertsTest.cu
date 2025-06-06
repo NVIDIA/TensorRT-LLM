@@ -323,7 +323,8 @@ protected:
         return ptr;
     }
 
-    bool checkSufficientTestMemory(int64_t num_tokens, int64_t hidden_size, int64_t num_experts, int64_t k)
+    bool checkSufficientTestMemory(
+        int64_t num_tokens, int64_t hidden_size, int64_t num_experts, int64_t k, bool parallel = false)
     {
         this->managed_buffers.clear();             // Make sure all the previous buffers are freed
         check_cuda_error(cudaDeviceSynchronize()); // Sync to make sure all previous operations are resolved
@@ -343,7 +344,13 @@ protected:
         size_t const in_out_size = 2 * num_tokens * hidden_size * sizeof(DataType);
 
         // This should be correct to within 100MiB (on tests with 30GiB total)
-        size_t const total_size = workspace_size + weight_size + in_out_size;
+        size_t total_size = workspace_size + weight_size + in_out_size;
+
+        // We allocate an extra shard of the weights for the parallel case, divide by 2 for when TP2
+        if (parallel)
+        {
+            total_size += weight_size / 2;
+        }
 
         size_t const memory_pool_free_mem_size = mBufferManager->memoryPoolFree();
         auto const [freeMem, totalMem] = tensorrt_llm::common::getDeviceMemoryInfo(false);
@@ -1686,12 +1693,12 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
         size_t inter_size = 2048;                                                                                      \
         this->mInterSizeFraction = float(inter_size) / hidden_size;                                                    \
                                                                                                                        \
-        if (!this->checkSufficientTestMemory(100, hidden_size, 256, 8))                                                \
+        if (!this->checkSufficientTestMemory(75, hidden_size, 256, 8, true))                                           \
         {                                                                                                              \
             GTEST_SKIP() << "Insufficient free memory for test";                                                       \
         }                                                                                                              \
                                                                                                                        \
-        this->ParallelismType##Test(8, hidden_size, 256, 100, this->mInterSizeFraction);                               \
+        this->ParallelismType##Test(8, hidden_size, 256, 75, this->mInterSizeFraction);                                \
     }                                                                                                                  \
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwo)                                                   \
@@ -1862,7 +1869,8 @@ TYPED_TEST(LargeMixtureOfExpertsTest, RunProfiler)
             this->FP8 ? nvinfer1::DataType::kFP8 : nvinfer1::DataType::kHALF,
             this->FP8 ? nvinfer1::DataType::kFP8 : nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k,
             this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4, this->mGroupSize,
-            tensorrt_llm::ActivationType::Geglu, false, this->mUseLora, false, MOEParallelismConfig{});
+            tensorrt_llm::ActivationType::Geglu, false, this->mUseLora, /*min_latency_mode=*/false,
+            /*need_weights=*/true, MOEParallelismConfig{});
 
         auto ws_size = backend.getWorkspaceSize(128);
 
@@ -1870,12 +1878,12 @@ TYPED_TEST(LargeMixtureOfExpertsTest, RunProfiler)
 
         for (int64_t num_tokens : {1, 128})
         {
-            backend.prepare(num_tokens, workspace, this->mStream->get());
+            backend.prepare(num_tokens, workspace, /*expert_weights=*/nullptr, this->mStream->get());
             for (auto const& tactic : this->getAllTileConfigsToTest())
             {
                 backend.runProfiler(num_tokens,
                     gemm_to_profile == GemmProfilerBackend::GemmToProfile::GEMM_1 ? tactic.first : tactic.second,
-                    workspace, this->mStream->get());
+                    workspace, /*expert_weights=*/nullptr, this->mStream->get());
             }
         }
         ASSERT_EQ(cudaStreamSynchronize(this->mStream->get()), cudaSuccess);
@@ -1903,13 +1911,13 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         {
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
                 nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, false, MOEParallelismConfig{1, 0, ep, ep - 1});
+                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, ep - 1});
 
             auto ws_size = backend.getWorkspaceSize(num_tokens);
             auto workspace = this->allocBuffer<char>(ws_size);
             int64_t num_experts_per_node = num_experts / ep;
 
-            backend.prepare(num_tokens, workspace, mStream->get());
+            backend.prepare(num_tokens, workspace, /*expert_weights=*/nullptr, mStream->get());
 
             auto workspaces = backend.getProfilerWorkspaces(num_tokens, getSMVersion() >= 90 && getSMVersion() < 120);
 #define GET_WS_PTR(type, name) auto* name = reinterpret_cast<type>(workspace + workspaces.at(#name).second)

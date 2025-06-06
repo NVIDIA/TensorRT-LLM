@@ -1,11 +1,9 @@
-from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Tuple, final
 
 import torch
 import torch.nn as nn
 from torch._prims_common import DeviceLikeType
 
-from ...pyexecutor.config import PyTorchConfig
 from ..custom_ops.attention_interface import GetCacheCallable, SequenceInfo
 from ..utils.logger import ad_logger
 
@@ -28,19 +26,9 @@ class CachedSequenceInterface:
         return (*self.info.args, *self._caches.values())
 
     @property
-    def args_original(self) -> Tuple[torch.Tensor, ...]:
-        """Return the original graph arguments expected by the model."""
-        return self.info.args_original
-
-    @property
     def dynamic_shapes(self) -> Tuple[Dict[int, Any], ...]:
         """Return the dynamic shapes of all graph arguments owned by this interface (all static)."""
         return self.info.dynamic_shapes + ({},) * len(self._caches)
-
-    @property
-    def original_dynamic_shapes(self) -> Tuple[Dict[int, Any], ...]:
-        """Return the dynamic shapes of the original graph arguments."""
-        return self.info.original_dynamic_shapes
 
     def to(self, *args, **kwargs) -> None:
         self.info.to(*args, **kwargs)
@@ -55,11 +43,11 @@ class CachedSequenceInterface:
     def initialize_caches(self) -> None:
         """Initialize caches using the cache initializers."""
         assert not self._caches, "Caches already initialized."
-        ad_logger.info("Setting up caches + moving info args to device")
         self.info.to(self.device)
         self._caches = {
             name: get_cache(self.info) for name, get_cache in self._cache_initializers.items()
         }
+        ad_logger.info(f"Initialized {len(self._caches)} caches for cached attention")
 
     def current_cache_size_bytes(self) -> int:
         """Calculate and return the total size of all caches in bytes."""
@@ -83,46 +71,3 @@ class CachedSequenceInterface:
 
 
 GetInferenceModel = Callable[[CachedSequenceInterface], nn.Module]
-
-
-@dataclass
-class AutoDeployConfig(PyTorchConfig):
-    # model factory to choose from
-    model_factory: str = "AutoModelForCausalLM"
-
-    ### MODEL EXTRA KWARGS ###
-    # Extra kwargs for the model config class to customize the model config. Those arguments will
-    # take precedence over the default values or config values in the model config file in the HF
-    # directory. Arguments are resolved in the following order:
-    # 1. Default values in the model config class
-    # 2. Values in the model config file in the HF directory
-    # 3. Values in the model_kwargs
-    # Note that that if the kwarg does not exist in the model config class, it will be ignored.
-    # An example model config class can be found [here](https://github.com/huggingface/transformers/blob/c409cd81777fb27aadc043ed3d8339dbc020fb3b/src/transformers/models/llama/configuration_llama.py#L26).
-    model_kwargs: Dict = field(
-        default_factory=lambda: {
-            "use_cache": False,  # to avoid using built-in cache
-        }
-    )
-
-    # attention backend to choose from
-    attn_backend: str = "TritonWithFlattenedInputs"
-    mla_backend: str = "MultiHeadLatentAttention"
-
-    # check if we should skip loading weights
-    skip_loading_weights: bool = False
-
-    # specifies the fraction of available memory to occupy for cache
-    free_mem_ratio: float = 0.8
-
-    def __post_init__(self):
-        super().__post_init__()
-
-        # we don't want to loose the default values for model_kwargs unless explicitly set by the
-        # user. They are not preserved by the standard initialization process since they whole dict
-        # gets replaced by the user provided one. We don't want that though.
-        f_default = self.__dataclass_fields__["model_kwargs"].default_factory()
-        setattr(self, "model_kwargs", {**f_default, **getattr(self, "model_kwargs")})
-
-        # TODO (https://github.com/NVIDIA/TensorRT-LLM/issues/4364) support overlap scheduler
-        self.disable_overlap_scheduler = True

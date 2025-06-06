@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 import asyncio
 import copy
-import json
 import logging
 import os
 import signal
@@ -18,7 +17,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.llmapi.disagg_utils import (ConditionalDisaggConfig,
+                                              MetadataServerConfig,
                                               RouterConfig)
+from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
@@ -42,13 +43,16 @@ class OpenAIDisaggServer:
                  server_start_timeout_secs: int = 180,
                  ctx_router_config: Optional[RouterConfig] = None,
                  gen_router_config: Optional[RouterConfig] = None,
-                 conditional_disagg_config: Optional[ConditionalDisaggConfig] = None):
+                 conditional_disagg_config: Optional[ConditionalDisaggConfig] = None,
+                 metadata_server_cfg: MetadataServerConfig = None):
 
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
-        self.ctx_router = create_router(ctx_router_config, ctx_servers)
-        self.gen_router = create_router(gen_router_config, gen_servers)
+        self.metadata_server = create_metadata_server(metadata_server_cfg)
+        self.ctx_router = create_router(ctx_router_config, ctx_servers, self.metadata_server)
+        self.gen_router = create_router(gen_router_config, gen_servers, self.metadata_server)
         self.conditional_disagg_config = conditional_disagg_config
+
 
         if (len(self.gen_servers) == 0):
             raise ValueError("At least one generation server must be provided")
@@ -71,7 +75,19 @@ class OpenAIDisaggServer:
 
             logging.info("Waiting for context and generation servers to be ready")
             await self.wait_for_servers_ready(server_start_timeout_secs)
+
+            if self.metadata_server:
+                logging.info("Starting server monitoring via metadata service")
+                await self.ctx_router.start_server_monitoring()
+                await self.gen_router.start_server_monitoring()
+
             yield
+
+            if self.metadata_server:
+                logging.info("Stopping server monitoring via metadata service")
+                await self.ctx_router.stop_server_monitoring()
+                await self.gen_router.stop_server_monitoring()
+
             await self.session.close()  # Ensure session cleanup
 
         self.app = FastAPI(lifespan=lifespan)
@@ -109,24 +125,24 @@ class OpenAIDisaggServer:
                                         gen_server: str,
                                         gen_req: Union[CompletionRequest, ChatCompletionRequest]):
         try:
-            # First yield the context response if it's not None
-            if ctx_response is not None:
-                # Remove the disaggregated params from the context response
-                data = ctx_response.model_dump()
-                del data['choices'][0]['disaggregated_params']
-                data = json.dumps(data)
-                yield f"data: {data}\n\n".encode('utf-8')
 
-            # Then yield the generation responses
-            if isinstance(gen_req, CompletionRequest):
-                gen_response = await self.send_completion_request(gen_server, gen_req)
-            elif isinstance(gen_req, ChatCompletionRequest):
-                gen_response = await self.send_chat_request(gen_server, gen_req)
+            if ctx_response is not None and len(ctx_response.choices) != 1:
+                raise ValueError("Context server did not return a single choice. This is not expected")
+
+            #If request finished after first token not due to length, return right away and skip gen
+            if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
+                yield f"data: [DONE]\n\n".encode('utf-8')
             else:
-                raise TypeError("Invalid request type: {type(gen_req).__name__}")
+                # Then yield the generation responses
+                if isinstance(gen_req, CompletionRequest):
+                    gen_response = await self.send_completion_request(gen_server, gen_req)
+                elif isinstance(gen_req, ChatCompletionRequest):
+                    gen_response = await self.send_chat_request(gen_server, gen_req)
+                else:
+                    raise TypeError("Invalid request type: {type(gen_req).__name__}")
 
-            async for chunk in gen_response.body_iterator:
-                yield chunk
+                async for chunk in gen_response.body_iterator:
+                    yield chunk
 
         finally:
             await self.gen_router.finish_request(gen_req)
@@ -163,10 +179,6 @@ class OpenAIDisaggServer:
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
     async def _send_context_request(self, ctx_server: str, ctx_req: Union[CompletionRequest, ChatCompletionRequest]):
-        if isinstance(ctx_req, ChatCompletionRequest):
-            ctx_req.max_completion_tokens = 1
-        elif isinstance(ctx_req, CompletionRequest):
-            ctx_req.max_tokens = 1
 
         ctx_req.disaggregated_params = DisaggregatedParams(request_type="context_only")
         ctx_req.stream = False
@@ -223,9 +235,21 @@ class OpenAIDisaggServer:
                 ctx_server, _ = await self.ctx_router.get_next_server(ctx_req)
                 # TODO: add ctx_server info into generation request for pre-registration
                 ctx_response = await self._send_context_request(ctx_server, ctx_req)
+
+                if ctx_response is not None and len(ctx_response.choices) != 1:
+                    raise ValueError("Context server did not return a single choice. This is not expected")
+
                 # Append disaggregates parameters to generation request
                 req.disaggregated_params = ctx_response.choices[0].disaggregated_params
                 req.disaggregated_params.request_type = "generation_only"
+
+                # Replace the string prompt with prompt_tokens_ids
+                if isinstance(req, CompletionRequest):
+                    req.prompt = ctx_response.prompt_token_ids
+                elif isinstance(req, ChatCompletionRequest):
+                    req.prompt_token_ids = ctx_response.prompt_token_ids
+                else:
+                    raise ValueError("Invalid request type: {type(req).__name__}")
             else:
                 ctx_response = None
 
@@ -235,13 +259,22 @@ class OpenAIDisaggServer:
             logging.info("Sending request to gen server: %s", gen_server)
 
             if not req.stream:
-                if isinstance(req, CompletionRequest):
-                    gen_response = await self.send_completion_request(gen_server, req)
-                else:
-                    assert isinstance(req, ChatCompletionRequest)
-                    gen_response = await self.send_chat_request(gen_server, req)
-                await self.gen_router.finish_request(req)
-                return gen_response
+                try:
+                    #If request finished after first token for reason other than length, return right away and skip gen
+                    if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length","not_finished"]:
+                        del ctx_response.choices[0].disaggregated_params
+                        return ctx_response
+                    else:
+                        if isinstance(req, CompletionRequest):
+                            gen_response = await self.send_completion_request(gen_server, req)
+                        else:
+                            assert isinstance(req, ChatCompletionRequest)
+                            gen_response = await self.send_chat_request(gen_server, req)
+                        return gen_response
+                finally:
+                    if gen_server is not None:
+                        await self.gen_router.finish_request(req)
+
             else:
                 # Return a streaming response that combines both context and generation responses
                 return StreamingResponse(

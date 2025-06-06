@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -53,6 +53,18 @@ def _register_fake():
             return [norm_out, quant_fp4, scale_fp4, residual_out]
         else:
             return [torch.empty_like(input)]
+
+    #MNNVL Allreduce
+    @torch.library.register_fake("trtllm::mnnvl_twoshot_allreduce")
+    def _(input, buffer, buffer_flags, wait_for_results):
+        output = input.new_empty(input.shape)
+        return output
+
+    @torch.library.register_fake("trtllm::mnnvl_twoshot_rmsnorm")
+    def _(comm_buf, gamma, eps, residual, buffer_flags):
+        output = residual.new_empty(residual.shape)
+        residual_out = residual.new_empty(residual.shape)
+        return [output, residual_out]
 
     @torch.library.register_fake("trtllm::moe_allreduce")
     def _(residual, norm_weight, device_num_experts, scale_input,
@@ -241,7 +253,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::moe_load_balance_routing")
     def _(single_layer_load_balancer_ptr: int,
-          token_selected_experts: torch.Tensor):
+          token_selected_experts: torch.Tensor, offset_by_ep_rank: bool):
         return torch.empty_like(token_selected_experts)
 
     @torch.library.custom_op("trtllm::group_rms_norm_base",
@@ -328,3 +340,30 @@ def _register_fake():
         return torch.empty_like(input,
                                 dtype=torch.float8_e4m3fn), input.new_empty(
                                     sz, dtype=torch.float)
+
+    @torch.library.register_fake("trtllm::causal_conv1d_fwd")
+    def _(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias_: Optional[torch.Tensor],
+        conv_states: Optional[torch.Tensor],
+        query_start_loc: Optional[torch.Tensor],
+        cache_indices: Optional[torch.Tensor],
+        has_initial_state: Optional[torch.Tensor],
+        silu_activation: bool,
+        pad_slot_id: int,
+    ) -> None:
+        pass
+
+    @torch.library.register_fake("trtllm::causal_conv1d_update")
+    def _(
+        x: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias_: Optional[torch.Tensor],
+        silu_activation: bool,
+        cache_seqlens_: Optional[torch.Tensor],
+        conv_state_indices_: Optional[torch.Tensor],
+        pad_slot_id: int,
+    ) -> None:
+        pass
