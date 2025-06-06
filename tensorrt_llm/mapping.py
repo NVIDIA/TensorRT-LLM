@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from typing import List
 
 import torch
@@ -372,6 +373,10 @@ class Mapping(object):
     @property
     def local_rank(self):
         return self.rank % self.gpus_per_node
+
+    @property
+    def node_num(self):
+        return math.ceil(self.world_size / self.gpus_per_node)
 
     def has_cp(self):
         return self.cp_size > 1

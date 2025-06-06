@@ -536,7 +536,7 @@ class VanillaMoE(nn.ModuleList):
 
         final_hidden_states = self.reducescatter_or_allreduce(
             final_hidden_states,
-            all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=use_dp_padding,
+            all_rank_num_tokens,
+            use_dp_padding,
         )
         return final_hidden_states

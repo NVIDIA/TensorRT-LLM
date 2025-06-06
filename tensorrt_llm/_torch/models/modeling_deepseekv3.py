@@ -53,7 +53,7 @@ from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (CutlassFusedMoE, DeepSeekV3MoeRoutingMethod,
-                                 MoeLoadBalancer, create_moe)
+                                 FluxFusedMoE, MoeLoadBalancer, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -476,8 +476,10 @@ class Deepseekv3MoE(nn.Module):
                                           dim=0,
                                           sizes=all_rank_num_tokens)
             elif not isinstance(self.experts, CutlassFusedMoE) or (
-                    not self.experts.has_fp8_qdq and self.experts.has_nvfp4):
-                # Use padding when not using the cutlass path or when x_sf in self.experts is not None
+                    not self.experts.has_fp8_qdq
+                    and self.experts.has_nvfp4) or isinstance(
+                        self.experts, FluxFusedMoE):
+                # Use padding when not using the cutlass path or when x_sf in self.experts is not None or when using flux
                 use_dp_padding = True
                 max_num_token = max(all_rank_num_tokens)
                 hidden_states = torch.nn.functional.pad(
@@ -532,7 +534,9 @@ class Deepseekv3MoE(nn.Module):
             assert shared_output.size() == routed_output.size(
             ), f'unmatched tensor shape'
             final_hidden_states = shared_output + routed_output
-            if not self.use_dp and self.mapping.tp_size > 1:
+            # flux will do allreduce for routed_output itself
+            if not self.use_dp and self.mapping.tp_size > 1 and not isinstance(
+                    self.experts, FluxFusedMoE):
                 final_hidden_states = self.allreduce(
                     final_hidden_states,
                     all_reduce_params=final_all_reduce_params)
