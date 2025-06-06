@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
-from tensorrt_llm._utils import local_mpi_size, logger
+from tensorrt_llm._utils import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...distributed import allgather, reducescatter
@@ -28,7 +28,7 @@ _alltoall_method_type_logged = False
 # The type of alltoall method
 class AlltoallMethodType(IntEnum):
     # Not available
-    NotAvailable = 0
+    NotEnabled = 0
     # MNNVL
     MNNVL = 1
     # DeepEP intranode or internode: no CUDA Graphs support, IBGDA is required by internode
@@ -255,36 +255,30 @@ class CutlassFusedMoE(MoE):
                                     dtype: torch.dtype,
                                     use_cuda_graph: bool) -> AlltoallMethodType:
         if not mapping.enable_attention_dp:
-            return AlltoallMethodType.NotAvailable
+            return AlltoallMethodType.NotEnabled
 
         if mapping.tp_size == 1:
-            return AlltoallMethodType.NotAvailable
+            return AlltoallMethodType.NotEnabled
 
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
-            return AlltoallMethodType.NotAvailable
+            return AlltoallMethodType.NotEnabled
 
         if mapping.moe_ep_size <= top_k:
-            return AlltoallMethodType.NotAvailable
+            return AlltoallMethodType.NotEnabled
 
         if MnnvlMemory.supports_mnnvl():
             return AlltoallMethodType.MNNVL
 
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1":
             if deep_ep_installed and dtype == torch.bfloat16:
-                intranode = mapping.moe_ep_size <= local_mpi_size()
-                ibgda = os.environ.get(
-                    "TRTLLM_CAN_USE_IBGDA",
-                    "0") == "1"  # TODO: Auto detect IBGDA support
                 if use_cuda_graph:
                     # Here we can only choose DeepEPLowLatency since only this method supports CUDA Graphs.
-                    if ibgda:
-                        return AlltoallMethodType.DeepEPLowLatency
+                    return AlltoallMethodType.DeepEPLowLatency
                 else:
                     # Here we can choose DeepEP or DeepEPLowLatency if both are available. Now DeepEP is faster.
-                    if intranode or ibgda:
-                        return AlltoallMethodType.DeepEP
+                    return AlltoallMethodType.DeepEP
 
-        return AlltoallMethodType.NotAvailable
+        return AlltoallMethodType.NotEnabled
 
     @property
     def has_w4afp8(self):
@@ -296,7 +290,7 @@ class CutlassFusedMoE(MoE):
     def enable_alltoall(self):
         """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
         """
-        return self.alltoall_method_type != AlltoallMethodType.NotAvailable
+        return self.alltoall_method_type != AlltoallMethodType.NotEnabled
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
