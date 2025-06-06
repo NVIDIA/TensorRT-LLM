@@ -83,6 +83,7 @@ def get_llm_args(model: str,
                  num_postprocess_workers: int = 0,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
+                 kv_cache_reuse: bool = True,
                  **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -94,7 +95,8 @@ def get_llm_args(model: str,
                                max_beam_width=max_beam_width,
                                max_seq_len=max_seq_len)
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction)
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        enable_block_reuse=kv_cache_reuse)
 
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
@@ -248,6 +250,11 @@ def launch_server(host: str,
     default=None,
     help="Server role. Specify this value only if running in disaggregated mode."
 )
+@click.option(
+    "--kv_cache_reuse/--no_kv_cache_reuse",
+    default=True,
+    help="Enable KV Cache Reuse. Set to False for benchmarking purposes. "
+    "Default is True.")
 def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           log_level: str, backend: str, max_beam_width: int,
           max_batch_size: int, max_num_tokens: int, max_seq_len: int,
@@ -257,7 +264,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           num_postprocess_workers: int, trust_remote_code: bool,
           extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
           metadata_server_config_file: Optional[str],
-          server_role: Optional[str]):
+          server_role: Optional[str], kv_cache_reuse: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -280,7 +287,8 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
-        reasoning_parser=reasoning_parser)
+        reasoning_parser=reasoning_parser,
+        kv_cache_reuse=kv_cache_reuse)
 
     llm_args_extra_dict = {}
     if extra_llm_api_options is not None:
