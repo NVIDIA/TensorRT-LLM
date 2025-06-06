@@ -16,6 +16,7 @@
 
 import os
 import platform
+import re
 import sys
 import sysconfig
 import warnings
@@ -288,7 +289,7 @@ def main(*,
          trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
          nixl_root: str = None,
-         internal_cutlass_kernels_root: str = None,
+         internal_cutlass_kernels_root: str = "",
          clean: bool = False,
          clean_wheel: bool = False,
          configure_cmake: bool = False,
@@ -437,18 +438,43 @@ def main(*,
     elif not fmha_v2_cu_dir.exists():
         generate_fmha_cu(project_dir, venv_python)
 
+    # Build the internal cutlass kernels if the source directory exists
+    if internal_cutlass_kernels_root != "" and Path(
+            internal_cutlass_kernels_root).exists():
+        print(
+            f"Building the internal cutlass kernels from source in {internal_cutlass_kernels_root}"
+        )
+        conan_data = Path(source_dir, "conandata.yml").read_text()
+        internal_cutlass_kernels_version = re.search(
+            r'internal_cutlass_version:\s*(\S+)', conan_data).group(1)
+        build_run(
+            f"'{venv_conan}' editable add {internal_cutlass_kernels_root}/conan/internal_cutlass --version {internal_cutlass_kernels_version}"
+        )
+        internal_cutlass_args = f"--job_count {job_count} -a '{cuda_architectures}' -D 'BUILD_INTERNAL_CUTLASS_KERNELS=1'"
+        if clean:
+            internal_cutlass_args += " -c"
+        if configure_cmake:
+            internal_cutlass_args += " --configure_cmake"
+        if use_ccache:
+            internal_cutlass_args += " --use_ccache"
+        build_run(
+            f"'{venv_python}' {internal_cutlass_kernels_root}/scripts/build_wheel.py {internal_cutlass_args}"
+        )
+    else:
+        # If the internal cutlass kernels source directory is not present, remove the editable internal cutlass kernels from the conan cache
+        build_run(
+            f"'{venv_conan}' editable remove -r 'tensorrt_llm_internal_cutlass/*'",
+            stdout=DEVNULL,
+            stderr=DEVNULL)
+
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
             build_run(
-                f"\"{venv_conan}\" install --build=missing --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f"'{venv_conan}' install --build=missing --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
             )
-            if internal_cutlass_kernels_root:
-                cmake_def_args.append(
-                    f"-DINTERNAL_CUTLASS_KERNELS_PATH={internal_cutlass_kernels_root}"
-                )
             cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
