@@ -183,6 +183,23 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 }
 
 
+def prepareWheelFromBuildStage(makefileStage, arch) {
+    if (!makefileStage || !arch) {
+        echo "Error: makefileStage and arch are required parameters"
+        return ""
+    }
+
+    if (makefileStage != "release") {
+        echo "prepareWheelFromBuildStage: ${makefileStage} is not release"
+        return ""
+    }
+
+    def wheelScript = 'scripts/get_wheel_from_package.py'
+    def wheelArgs = "--arch ${arch} --upload_path " + env.uploadPath
+    // def wheelArgs = "--arch ${arch} --upload_path " + "sw-tensorrt-generic/llm-artifacts/LLM/PipelineMonitor/L0_MergeRequest_PR/89"
+    return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
+}
+
 def buildImage(config, imageKeyToTag)
 {
     def target = config.target
@@ -269,6 +286,7 @@ def buildImage(config, imageKeyToTag)
             }
         }
 
+        args += prepareWheelFromBuildStage(makefileStage, arch)
         // Avoid the frequency of OOM issue when building the wheel
         if (target == "trtllm") {
             if (arch == "x86_64") {
@@ -412,8 +430,8 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        echo "Build ${key} failed."
                         catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            echo "Build ${key} failed."
                             throw e
                         }
                     }
