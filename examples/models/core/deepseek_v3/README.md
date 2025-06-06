@@ -279,27 +279,6 @@ curl http://localhost:8000/v1/completions \
 
 For DeepSeek-R1, use the model name `deepseek-ai/DeepSeek-R1`.
 
-
-### Use tensorrtllm_backend for triton inference server (Experimental)
-To serve the model using [tensorrtllm_backend](https://github.com/triton-inference-server/tensorrtllm_backend.git), make sure the version is v0.19+ in which the pytorch path is added as an experimental feature.
-
-The model configuration file is located at https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/llmapi/tensorrt_llm/1/model.yaml
-
-```bash
-model: <replace with the deepseek model or path to the checkpoints>
-backend: "pytorch"
-```
-Additional configs similar to `extra-llm-api-config.yml` can be added to the yaml file and will be used to configure the LLM model. At the minimum, `tensor_parallel_size` needs to be set to 8 on H200 and B200 machines and 16 on H100.
-
-The initial loading of the model can take around one hour and the following runs will take advantage of the weight caching.
-
-To send requests to the server, try:
-```bash
-curl -X POST localhost:8000/v2/models/tensorrt_llm/generate -d '{"text_input": "Hello, my name is", "sampling_param_temperature":0.8, "sampling_param_top_p":0.95}' | sed 's/^data: //' | jq
-```
-Available parameters for the requests are listed in https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/llmapi/tensorrt_llm/config.pbtxt.
-
-
 ### Disaggregated Serving
 
 To serve the model in disaggregated mode, you should launch context and generation servers using `trtllm-serve`.
@@ -351,10 +330,11 @@ print_iter_log: true
 enable_attention_dp: true
 EOF
 
+for port in {8002..8003}; do \
 trtllm-serve \
   deepseek-ai/DeepSeek-V3 \
   --host localhost \
-  --port 8002 \
+  --port ${port} \
   --backend pytorch \
   --max_batch_size 161 \
   --max_num_tokens 1160 \
@@ -362,7 +342,9 @@ trtllm-serve \
   --ep_size 8 \
   --pp_size 1 \
   --kv_cache_free_gpu_memory_fraction 0.95 \
-  --extra_llm_api_options ./gen-extra-llm-api-config.yml &> output_gen &
+  --extra_llm_api_options ./gen-extra-llm-api-config.yml \
+  &> output_gen_${port} & \
+done
 ```
 
 Finally, you can launch the disaggregated server which will accept requests from the client and do
@@ -403,6 +385,27 @@ For DeepSeek-R1, use the model name `deepseek-ai/DeepSeek-R1`.
 Note that the optimal disaggregated serving configuration (i.e. tp/pp/ep mappings, number of ctx/gen instances, etc.) will depend
 on the request parameters, the number of concurrent requests and the GPU type. It is recommended to experiment to identify optimal
 settings for your specific use case.
+
+
+
+### Use tensorrtllm_backend for triton inference server (Experimental)
+To serve the model using [tensorrtllm_backend](https://github.com/triton-inference-server/tensorrtllm_backend.git), make sure the version is v0.19+ in which the pytorch path is added as an experimental feature.
+
+The model configuration file is located at https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/llmapi/tensorrt_llm/1/model.yaml
+
+```bash
+model: <replace with the deepseek model or path to the checkpoints>
+backend: "pytorch"
+```
+Additional configs similar to `extra-llm-api-config.yml` can be added to the yaml file and will be used to configure the LLM model. At the minimum, `tensor_parallel_size` needs to be set to 8 on H200 and B200 machines and 16 on H100.
+
+The initial loading of the model can take around one hour and the following runs will take advantage of the weight caching.
+
+To send requests to the server, try:
+```bash
+curl -X POST localhost:8000/v2/models/tensorrt_llm/generate -d '{"text_input": "Hello, my name is", "sampling_param_temperature":0.8, "sampling_param_top_p":0.95}' | sed 's/^data: //' | jq
+```
+Available parameters for the requests are listed in https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/llmapi/tensorrt_llm/config.pbtxt.
 
 
 ## Advanced Usages
