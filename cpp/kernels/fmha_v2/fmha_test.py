@@ -157,7 +157,7 @@ def test_trtllm_context_mla_attention_fmha(dtype, s):
         epsilon += ' -epsilon 0.03'
 
     sm_version = getSMVersion()
-    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version != 89:
+    if sm_version != 89:
         pytest.skip("FP8 MLAs only supported on sm89 currently.")
 
     # Context phase kernels.

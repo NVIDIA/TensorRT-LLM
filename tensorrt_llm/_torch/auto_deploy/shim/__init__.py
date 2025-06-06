@@ -2,4 +2,4 @@
 
 from .ad_executor import create_autodeploy_executor
 from .demollm import DemoLLM
-from .interface import AutoDeployConfig, CachedSequenceInterface, GetInferenceModel
+from .interface import CachedSequenceInterface, GetInferenceModel

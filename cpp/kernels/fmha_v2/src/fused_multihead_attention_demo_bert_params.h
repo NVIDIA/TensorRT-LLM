@@ -111,6 +111,7 @@ struct Fused_multihead_attention_params_v2
     // Contiguous kv layout: [B, 2, H, S, D].
     // Paged kv layout: [UINT32_MAX, H, Tokens_per_block, D].
     fmha::cudaTmaDesc tma_desc_kv;
+    fmha::cudaTmaDesc tma_desc_v;
     // Tma descriptor for o
     fmha::cudaTmaDesc tma_desc_o;
 

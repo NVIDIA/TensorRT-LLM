@@ -1,3 +1,7 @@
+import os
+import signal
+import subprocess
+import time
 import unittest
 
 import etcd3
@@ -5,9 +9,38 @@ import etcd3
 from tensorrt_llm.serve.metadata_server import EtcdDictionary
 
 
+def start_etcd_server():
+    # Command to start etcd
+    etcd_cmd = ["etcd"]
+
+    # Start etcd in background
+    process = subprocess.Popen(
+        etcd_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        preexec_fn=os.setsid)  # This makes it run in a new process group
+
+    # Wait a bit for etcd to start
+    time.sleep(5)
+
+    return process
+
+
+def stop_etcd_server(process):
+    # Kill the process group
+    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    process.wait()
+
+
 class TestEtcdDictionary(unittest.TestCase):
 
     def setUp(self):
+        # Set the protocol buffers implementation to python
+        os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
+        # Start etcd server
+        self.etcd_process = start_etcd_server()
+
         # Setup etcd connection parameters
         self.host = "localhost"
         self.port = 2379
@@ -24,6 +57,12 @@ class TestEtcdDictionary(unittest.TestCase):
     def tearDown(self):
         # Clean up test keys after each test
         self._cleanup_test_keys()
+
+        # Stop etcd server
+        stop_etcd_server(self.etcd_process)
+
+        # Unset the protocol buffers implementation
+        del os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"]
 
     def _cleanup_test_keys(self):
         # Helper method to remove test keys
@@ -47,6 +86,8 @@ class TestEtcdDictionary(unittest.TestCase):
         # Assert
         self.assertEqual(value.decode('utf-8'), test_value)
 
+        self._cleanup_test_keys()
+
     def test_remove(self):
         # Test removing a key
         test_key = "trtllm/1/test_key2"
@@ -62,6 +103,8 @@ class TestEtcdDictionary(unittest.TestCase):
         result = self.cleanup_client.get(test_key)
         self.assertIsNone(
             result[0])  # etcd3 returns (None, None) when key doesn't exist
+
+        self._cleanup_test_keys()
 
     def test_keys(self):
         # Test listing all keys
@@ -85,6 +128,8 @@ class TestEtcdDictionary(unittest.TestCase):
         extract_keys = set(keys)
         self.assertEqual(prefix_keys, extract_keys)
 
+        self._cleanup_test_keys()
+
     def test_get_nonexistent_key(self):
         # Test getting a key that doesn't exist
         result, _ = self.etcd_dict.get("nonexistent_key")
@@ -107,6 +152,8 @@ class TestEtcdDictionary(unittest.TestCase):
 
         # Assert
         self.assertEqual(value.decode('utf-8'), updated_value)
+
+        self._cleanup_test_keys()
 
 
 if __name__ == '__main__':
