@@ -5,7 +5,7 @@ By NVIDIA TensorRT-LLM Team
 ## Table of Contents
 - [Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)](#scaling-expert-parallelism-in-tensorrt-llmpart-1-design-and-implementation-of-large-scale-ep)
   - [Table of Contents](#table-of-contents)
-  - [Motivation of large-scale EP](#motivation-of-large-scale-ep)
+  - [Motivation for large-scale EP](#motivation-for-large-scale-ep)
     - [Observations over one machine translation dataset](#observations-over-one-machine-translation-dataset)
     - [Observation over GSM8K dataset](#observation-over-gsm8k-dataset)
   - [High-level design introduction](#high-level-design-introduction)
@@ -33,11 +33,11 @@ By NVIDIA TensorRT-LLM Team
   - [Expanded thoughts](#expanded-thoughts)
   - [Acknowledgement](#acknowledgement)
 
-The growing popularity of models like DeepSeek-V3/R1, which use large-scale fine-grained Mixture-of-Experts (MoE) designs, has significantly advanced open-source model quality. Newly released open-source models such as LLaMA4 and Qwen3 also adopt the similar large-scale fine-grained MoE design principle. However, large-scale MoE models introduce new challenges for inference systems, including high memory demands and inherent expert-level workload imbalance.
+The development of model like DeepSeek-V3/R1, which use large-scale fine-grained Mixture-of-Experts (MoE) designs, has significantly advanced open-source model quality. Newly released open-source models such as LLaMA4 and Qwen3 also adopt the similar large-scale fine-grained MoE design principle. However, large-scale MoE models introduce new challenges for inference systems, including high memory demands and inherent expert-level workload imbalance.
 
 In the past, we have shared TensorRT-LLM’s optimization experience to [push the latency boundary](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) of DeepSeek R1 model, [the implementation and optimization of MTP](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md)(Multi-Token Prediction) and [the optimizations for DeepSeek R1 throughput oriented performance](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md).
 
-The DeepSeek team has also shared their valuable experience and practice as to how to optimize this kind of large-scale Expert Parallelism (EP) model, including [DeepEP](https://github.com/deepseek-ai/DeepEP) and [EPLB](https://github.com/deepseek-ai/EPLB). Also the DeepSeek team is so nice to share their concrete design considerations in [this](https://arxiv.org/abs/2412.19437) tech report. On top of these great sharings, there are also nice community efforts to implement large-scale EP in the inference engine, such as [this](https://lmsys.org/blog/2025-05-05-large-scale-ep/) effort from the SGLang team. And there are also other inference engines actively working to add large-scale EP support.
+The DeepSeek team has also shared their valuable experience and practice as to how to optimize this kind of large-scale Expert Parallelism (EP) model, including [DeepEP](https://github.com/deepseek-ai/DeepEP) and [EPLB](https://github.com/deepseek-ai/EPLB). Also, the DeepSeek team has hared their concrete design considerations in [this](https://arxiv.org/abs/2412.19437) tech report. On top of these great sharings, there are also nice community efforts to implement large-scale EP in the inference engine, such as [this](https://lmsys.org/blog/2025-05-05-large-scale-ep/) effort from the SGLang team.
 
 In this tech blog, we will introduce the details of design and implementation of supporting E2E large-scale EP in TensorRT-LLM, with mainly covering the following parts:
 
@@ -48,27 +48,28 @@ In this tech blog, we will introduce the details of design and implementation of
   * The design and implementation of replication/placement strategy solver.
   * The MoE weight load/re-distributer to balance the online workload  across multiple GPUs.
   * The changes needed as to the MoE routers and computation module to adapt with the expert load balancer needs.
-* Some preliminary data demonstrating the effectiveness of the current implementation in TensorRT-LLM.
+  * Some preliminary data demonstrating the effectiveness of the current implementation in TensorRT-LLM.
 
 In the future tech blogs, we will also cover the following topics:
 * The introduction of performance tuning and optimization for TensorRT-LLM large-scale EP GB200 implementation.
 * How to implement efficient large-scale EP support for B200/Hopper and other NVIDIA GPUs without MNNVL.
 * The best practices of leveraging large-scale EP to get performance gain.
-* How to combine large-scale EP with other system optimization techniques to show the combination of multiple system optimization techniques.
+* How to combine large-scale EP with other system optimization techniques.
 
 
-Though in this tech blog, we focus on the introduction based on TensorRT-LLM, we believe the core ideas and implementation inside TensorRT-LLM can also be applied for other inference engines, thus to help lift the inference performance boat on NVIDIA GPUs. Also we plan to figure out how to modularize the current TensorRT-LLM large-scale EP implementation to make them easier to be reused by the community.
+Though in this tech blog, we focus on the introduction based on TensorRT-LLM, we believe the core ideas and implementation inside TensorRT-LLM can also be applied for other inference engines, thus to the inference performance on NVIDIA GPUs. Also, with the help of the community, we would like to figure out how to better modularize the current TensorRT-LLM large-scale EP implementation to make it more easily reusable by the community.
 
-In this tech blog, there are implementation details which are more favorable to GB200 system, such as the communication components leveraging the GB200 MNNVL inter-GPU connection, and the MoE weight load/re-distributer module leveraging the high bandwidth C2C connection between Grace CPU and Blackwell GPU, while the overall design principle and software architecture can still apply to non-GB200 NVIDIA GPU systems. Actually when we are working with the implementation, we on purpose pay attention to the generalization of the design and implementation to make sure later when non-GB200 supports are added, these changes can be easily composable with other existing components.
+In this tech blog, there are implementation details which are targeted towards the GB200 system, such as the communication components leveraging the GB200 MNNVL inter-GPU connection, and the MoE weight load/re-distributer module leveraging the high bandwidth C2C connection between Grace CPU and Blackwell GPU. Nevertheless, the overall design principle and software architecture can still apply to non-GB200 NVIDIA GPU systems. To facilitate the extension to other non-GB200 system, we have, on purpose, paid attention to the generalization of the design and implementation. These changes should be easily composable with other existing components.
 
-## Motivation of large-scale EP
+## Motivation for large-scale EP
 
 
 The main motivation of introducing large-scale EP (here means EP \> 8\) is due to the following system observation:
 
 * The reduction of execution latency due to the increased aggregated memory bandwidth to load the expert weights.
 * More possibility to increase the effective batch size to saturate the GPU computing power.
-* **When the E2E execution time is dominated by the MoE GroupGEMM computation, by introducing large-scale EP, it is expected to see clear performance benefits. But if the E2E execution time is not dominated by the MoE GroupGEMM computation, then large-scale EP may bring limited performance benefit.**
+
+Note that **when the E2E execution time is dominated by the MoE GroupGEMM computation, by introducing large-scale EP, it is expected to see clear performance benefits. But if the E2E execution time is not dominated by the MoE GroupGEMM computation, then large-scale EP may bring limited performance benefit.**
 
 
 Also there isn't free lunch in the system design. When the EP size increases up to greater than 8(sometimes even less than 8), due to the sparsity execution nature of MoE models, it can inherently trigger the EP-level workload imbalance issue.
