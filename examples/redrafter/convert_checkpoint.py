@@ -40,9 +40,18 @@ from tensorrt_llm.models.llama.convert import (dup_kv_weight,
 BASE_MODEL_TLLM_WEIGHT_PREFIX = "base_model."
 DRAFTER_TLLM_WEIGHT_PREFIX = "drafter."
 
-# Add new models here as needed
+# To add support for a new base model in ReDrafter:
+# 1. Add the base model's tensorrt_llm class name mapping in `REDRAFTER_MAP` below
+# 2. Create a new ReDrafter class in `tensorrt_llm/redrafter/models.py` by inheriting from `ReDrafterMixin`
+# 3. Add the new ReDrafter class to the model registry in `tensorrt_llm/models/__init__.py`
+#
+# Example:
+# REDRAFTER_MAP = {
+#     "QWenForCausalLM": "ReDrafterForQWenLM",
+#     "LlamaForCausalLM": "ReDrafterForLLaMALM"
+# }
+
 REDRAFTER_MAP = {"QWenForCausalLM": "ReDrafterForQWenLM",
-                 "Qwen2ForCausalLM": "ReDrafterForQWenLM",
                  "LlamaForCausalLM": "ReDrafterForLLaMALM"}
 
 def parse_arguments():

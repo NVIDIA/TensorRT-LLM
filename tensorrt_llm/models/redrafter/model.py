@@ -297,11 +297,20 @@ class ReDrafterMixin:
         inputs['position_ids_base'] = position_ids_base
         return inputs
 
-class ReDrafterForCausalLM(ReDrafterMixin, LLaMAForCausalLM):
-    pass  # Same logic, different base model
+class ReDrafterForQWenLM(ReDrafterMixin, QWenForCausalLM):
+    """ReDrafter implementation for QWen models.
+    
+    Combines:
+    - Base QWen model functionality from QWenForCausalLM
+    - Drafting/speculative decoding logic from ReDrafterMixin
+    """
+    pass
 
 class ReDrafterForLLaMALM(ReDrafterMixin, LLaMAForCausalLM):
-    pass  # Same logic, different base model
-
-class ReDrafterForQWenLM(ReDrafterMixin, QWenForCausalLM):
-    pass  # Inherits drafting logic from mixin + QWen backbone
+    """ReDrafter implementation for LLaMA models.
+    
+    Combines: 
+    - Base LLaMA model functionality from LLaMAForCausalLM
+    - Drafting/speculative decoding logic from ReDrafterMixin
+    """
+    pass
