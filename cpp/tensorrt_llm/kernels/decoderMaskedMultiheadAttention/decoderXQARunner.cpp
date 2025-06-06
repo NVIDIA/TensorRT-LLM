@@ -94,8 +94,7 @@ DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParam
     }
     else
     {
-        // If no env var set, default to precompiled impl for sm120, otherwise default to JIT.
-        return tensorrt_llm::common::getSMVersion() == 120 ? mPrecompiledImpl.get() : mJITImpl.get();
+        return mJITImpl.get();
     }
 }
 
