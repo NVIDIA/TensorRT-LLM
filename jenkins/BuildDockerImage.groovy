@@ -204,7 +204,7 @@ def buildImage(config, imageKeyToTag)
     def customImageWithTag = "${IMAGE_NAME}/${makefileStage}:${customTag}"
 
     if (target == "ngc-release") {
-        if (env.triggerByPostMerge == true) {
+        if (params.triggerByPostMerge == true) {
             echo "Use NGC artifacts for post merge build"
             dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
             imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
@@ -422,8 +422,8 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         }]
     }
 
-    echo "enableFailFast is: ${env.enableFailFast}, but we currently don't use it due to random ucxx issue"
-    //pipeline.failFast = env.enableFailFast
+    echo "enableFailFast is: ${params.enableFailFast}, but we currently don't use it due to random ucxx issue"
+    //pipeline.failFast = params.enableFailFast
     pipeline.parallel buildJobs
 
 }
