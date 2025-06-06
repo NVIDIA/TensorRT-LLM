@@ -21,8 +21,6 @@ from .quantization import (FP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
                            UnquantizedFusedMoEMethod, WInt4AFP8FusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
-_alltoall_method_type_logged = False
-
 
 # The type of alltoall method
 class AlltoallMethodType(IntEnum):
@@ -211,13 +209,9 @@ class CutlassFusedMoE(MoE):
                 raise NotImplementedError(
                     f"Not available alltoall method type: {alltoall_method_type!r}"
                 )
-        # Log once
-        global _alltoall_method_type_logged
-        if not _alltoall_method_type_logged:
-            logger.info(
-                f"CutlassFusedMoE selects alltoall_method_type {self.alltoall_method_type!r}"
-            )
-            _alltoall_method_type_logged = True
+        logger.info_once(
+            f"CutlassFusedMoE selects alltoall_method_type {self.alltoall_method_type!r}",
+            key="alltoall_method_type")
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
