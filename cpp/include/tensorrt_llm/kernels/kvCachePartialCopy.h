@@ -23,6 +23,7 @@ namespace tensorrt_llm
 namespace kernels
 {
 void kvCacheBlockPartialCopy(IBuffer& dst, IBuffer const& src, unsigned int numLayers, unsigned int numHeads,
-    unsigned int tokensPerBlock, unsigned int numHidden, unsigned int numTokensToCopy, cudaStream_t stream);
+    unsigned int tokensPerBlock, unsigned int numHidden, unsigned int numTokensToCopy, int kvFactor,
+    cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm

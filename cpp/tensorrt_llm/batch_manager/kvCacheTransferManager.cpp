@@ -90,8 +90,8 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                     "Block shape is incorrect");
                 TLLM_CHECK_WITH_INFO(numTokensToCopy <= tokensPerBlock,
                     "numTokensToCopy (%d) must be <= tokensPerBlock (%d)", numTokensToCopy, tokensPerBlock);
-                tk::kvCacheBlockPartialCopy(
-                    *dstPtr, *srcPtr, numLayers, numHeads, tokensPerBlock, sizePerHead, numTokensToCopy, stream);
+                tk::kvCacheBlockPartialCopy(*dstPtr, *srcPtr, numLayers, numHeads, tokensPerBlock, sizePerHead,
+                    numTokensToCopy, kvFactor, stream);
             }
         }
     }
