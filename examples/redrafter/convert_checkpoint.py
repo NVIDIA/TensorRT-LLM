@@ -291,10 +291,6 @@ def hf_redrafter_config(
                 redrafter_exclude_modules += [f'drafter.layers.{lyrnum}', f'drafter.layers.{lyrnum}.linear']
             tllm_config.quantization.exclude_modules += redrafter_exclude_modules
 
-    # Align type to drafter type for gemm plugin
-    if tllm_config.dtype == 'bfloat16':
-        tllm_config.dtype = 'float16'
-
     return tllm_config
 
 
@@ -319,15 +315,6 @@ def convert_and_save(
     stade_dict_path = os.path.join(base_model_checkpoint_dir, f'rank{rank}.safetensors')
     weights_safe = safetensors.safe_open(stade_dict_path, framework="pt")
     weights = {k: weights_safe.get_tensor(k) for k in weights_safe.keys()}
-
-    # Convert bfloat16 tensors to float16
-    # TODO: Support ReDrafter for bfloat16.
-    if any([v.dtype == torch.bfloat16 for k, v in weights.items()]):
-        print(f"Warning: converting bf16 layers to fp16.")
-        weights = {
-            k: v.to(torch.float16) if v.dtype == torch.bfloat16 else v
-            for k, v in weights.items()
-        }
 
     if hf_drafter_model is not None:
         drafter_weights = hf_drafter(
