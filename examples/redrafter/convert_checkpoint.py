@@ -48,10 +48,12 @@ DRAFTER_TLLM_WEIGHT_PREFIX = "drafter."
 # Example:
 # REDRAFTER_MAP = {
 #     "QWenForCausalLM": "ReDrafterForQWenLM",
+#     "Qwen2ForCausalLM": "ReDrafterForQWenLM",
 #     "LlamaForCausalLM": "ReDrafterForLLaMALM"
 # }
 
 REDRAFTER_MAP = {"QWenForCausalLM": "ReDrafterForQWenLM",
+                 "Qwen2ForCausalLM": "ReDrafterForQWenLM",
                  "LlamaForCausalLM": "ReDrafterForLLaMALM"}
 
 def parse_arguments():
