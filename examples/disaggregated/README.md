@@ -50,7 +50,7 @@ Clients can then send requests to the disaggregated server at `localhost:8000`, 
 One can also launch all context and generation servers using MPI. This can be done by issuing the following command:
 ```
 export TRTLLM_USE_MPI_KVCACHE=1
-mpirun -n <total_num_ranks> trtllm-serve disaggregated_mpi_worker -c disagg_config.yaml
+mpirun --allow-run-as-root -n <total_num_ranks> trtllm-serve disaggregated_mpi_worker -c disagg_config.yaml
 ```
 where `<total_num_ranks>` is the sum of `TP*PP` for all context and generation servers. For the example above, `total_num_ranks` is 3
 since `TP` and `PP` is 1 for the two context and one generation server.
