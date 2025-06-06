@@ -121,8 +121,9 @@ RUN mkdir -p /root/.cache/pip /root/.cache/ccache
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel
 ARG BUILD_WHEEL_ARGS="--clean --python_bindings --benchmarks"
+ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
-    python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
+    python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} AS release
 
@@ -130,7 +131,11 @@ FROM ${DEVEL_IMAGE} AS release
 RUN mkdir -p /root/.cache/pip
 
 WORKDIR /app/tensorrt_llm
-COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
+
+ARG SRC_DIR=/src/tensorrt_llm
+
+COPY --from=wheel ${SRC_DIR}/build/tensorrt_llm*.whl .
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install tensorrt_llm*.whl && \
     rm tensorrt_llm*.whl && \
@@ -148,14 +153,13 @@ RUN ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensor
     ldconfig && \
     ! ( ldd -v bin/executorWorker | grep tensorrt_llm | grep -q "not found" )
 
-ARG SRC_DIR=/src/tensorrt_llm
-COPY --from=wheel ${SRC_DIR}/benchmarks benchmarks
+COPY benchmarks benchmarks
 ARG CPP_BUILD_DIR=${SRC_DIR}/cpp/build
 COPY --from=wheel \
-     ${CPP_BUILD_DIR}/benchmarks/bertBenchmark \
-     ${CPP_BUILD_DIR}/benchmarks/gptManagerBenchmark \
-     ${CPP_BUILD_DIR}/benchmarks/disaggServerBenchmark \
-     benchmarks/cpp/
+    ${SRC_DIR}/build/benchmarks/bertBenchmark \
+    ${SRC_DIR}/build/benchmarks/gptManagerBenchmark \
+    ${SRC_DIR}/build/benchmarks/disaggServerBenchmark \
+    benchmarks/cpp/
 
 COPY examples examples
 RUN chmod -R a+w examples && \
