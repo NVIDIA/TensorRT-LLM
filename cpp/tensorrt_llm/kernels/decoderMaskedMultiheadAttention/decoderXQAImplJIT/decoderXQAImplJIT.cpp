@@ -68,6 +68,7 @@ bool DecoderXQAImplJIT::mayHavePerfGain(XQAParams const& xqaParams) const
     {
         return true;
     }
+    // Always prefer XQA-based MLA over FMHA-base MLA for now.
     if (xqaParams.isMLA())
     {
         return true;

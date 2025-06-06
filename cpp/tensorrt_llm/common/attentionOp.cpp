@@ -204,6 +204,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     }
     else if (mKVCacheQuantMode.hasFp8KvCache())
     {
+        // Inputs to MLA is FP8 instead of BF16/FP16 when using FP8 KV cache.
         if (xqaParams.isMLA())
         {
             xqaParams.data_type = DATA_TYPE_E4M3;
