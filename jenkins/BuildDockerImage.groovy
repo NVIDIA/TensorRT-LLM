@@ -25,6 +25,8 @@ LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefi
 
 LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
+TRIGGER_TYPE = env.triggerType ?: "manual"
+
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
@@ -184,6 +186,11 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 
 
 def prepareWheelFromBuildStage(makefileStage, arch) {
+    if (TRIGGER_TYPE == "manual") {
+        echo "Trigger type is manual, skip preparing wheel from build stage"
+        return ""
+    }
+
     if (!makefileStage || !arch) {
         echo "Error: makefileStage and arch are required parameters"
         return ""
@@ -221,7 +228,7 @@ def buildImage(config, imageKeyToTag)
     def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
 
     if (target == "ngc-release") {
-        if (params.triggerType == "post-merge") {
+        if (TRIGGER_TYPE == "post-merge") {
             echo "Use NGC artifacts for post merge build"
             dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
             imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
