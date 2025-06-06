@@ -929,9 +929,6 @@ class PyResultsList:
     def __init__(self, py_results):
         self._py_results = py_results
 
-    def __getstate__(self):
-        return self._py_results
-
 
 class PackedResponses:
 

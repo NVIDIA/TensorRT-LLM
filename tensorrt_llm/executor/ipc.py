@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import os
+import pickle
 import time
 import traceback
 from queue import Queue
@@ -120,7 +121,8 @@ class ZeroMqQueue:
                               color="blue",
                               category="IPC"):
             if not serialized:
-                data = serialization.dumps(obj)
+                data = serialization.dumps(obj,
+                                           protocol=pickle.HIGHEST_PROTOCOL)
             else:
                 data = obj
             if self.use_hmac_encryption:
