@@ -502,6 +502,17 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         - SYS_ADMIN"""
         break
     }
+
+    def expressions = ""
+    if (type == "a100-80gb-pcie") {
+        expressions = """
+                              - key: "tensorrt/test_type"
+                                operator: NotIn
+                                values:
+                                - "perf"
+        """
+    }
+
     def nodeLabel = trtllm_utils.appendRandomPostfix("${nodeLabelPrefix}---tensorrt-${jobName}-${buildID}")
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
@@ -537,6 +548,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 operator: NotIn
                                 values:
                                 - "core"
+                              ${expressions}
                 nodeSelector: ${selectors}
                 containers:
                   ${containerConfig}
@@ -1538,8 +1550,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A30-TensorRT-3": ["a30", "l0_a30", 3, 4],
         "A30-TensorRT-4": ["a30", "l0_a30", 4, 4],
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
-        "A100X-TensorRT-1": ["a100x", "l0_a100", 1, 4],
-        "A100X-TensorRT-2": ["a100x", "l0_a100", 2, 4],
+        "A100X-TensorRT-1": ["a100-80gb-pcie", "l0_a100", 1, 4],
+        "A100X-TensorRT-2": ["a100-80gb-pcie", "l0_a100", 2, 4],
         "A100X-TensorRT-3": ["a100x", "l0_a100", 3, 4],
         "A100X-TensorRT-4": ["a100x", "l0_a100", 4, 4],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 1],
@@ -1571,9 +1583,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A30-CPP-[Post-Merge]-1": ["a30", "l0_a30", 1, 1],
         "A30-Triton-Python-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
         "A30-Triton-Python-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
-        "A100X-TensorRT-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
+        "A100X-TensorRT-[Post-Merge]-1": ["a100-80gb-pcie", "l0_a100", 1, 2],
         "A100X-TensorRT-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
-        "A100X-Triton-Python-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
+        "A100X-Triton-Python-[Post-Merge]-1": ["a100-80gb-pcie", "l0_a100", 1, 2],
         "A100X-Triton-Python-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
         "L40S-TensorRT-[Post-Merge]-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-TensorRT-[Post-Merge]-2": ["l40s", "l0_l40s", 2, 2],
