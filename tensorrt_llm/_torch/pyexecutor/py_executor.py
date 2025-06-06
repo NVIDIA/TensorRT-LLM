@@ -986,6 +986,18 @@ class PyExecutor:
 
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
+
+        # Debugging gen-only
+        if self.dist.rank == 0 and not self.is_warmup:
+            benchmark_req_queue_size = int(
+                os.getenv("TRTLLM_BENCHMARK_REQ_QUEUE_SIZE", "0"))
+            if benchmark_req_queue_size > 0:
+                while self.request_queue.qsize() < benchmark_req_queue_size:
+                    time.sleep(5)
+                    logger.info(
+                        f"sleep 5 seconds, num_request_queue: {self.request_queue.qsize()}"
+                    )
+
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
@@ -1983,7 +1995,9 @@ class PyExecutor:
         logger.debug(
             f'before gather, rank = {self.dist.rank}, responses = {responses}')
         if self.enable_attention_dp:
-            if not self.gather_all_responses:
+            if self.dist.world_size == 1:
+                responses_list = [responses]
+            elif not self.gather_all_responses:
                 responses_list = self.dist.tp_gather(responses)
             else:
                 responses_list = self.dist.allgather(responses)

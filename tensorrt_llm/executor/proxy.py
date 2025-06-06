@@ -1,5 +1,6 @@
 import atexit
 import concurrent.futures
+import itertools
 import threading
 import time
 import weakref
@@ -151,6 +152,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.request_queue.put(CancellingRequest(request_id))
 
     def dispatch_result_task(self) -> bool:
+        from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse
+
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
         if (res := self.result_queue.get()) is None:
@@ -177,7 +180,13 @@ class GenerationExecutorProxy(GenerationExecutor):
                     res, ErrorResponse):
                 self._results.pop(client_id)
 
-        res = res if isinstance(res, list) else [res]
+        unpacked_res = []
+        for response, py_result in itertools.zip_longest(
+                res[0]._response_list._responses,
+                res[0]._py_result_list._py_results):
+            unpacked_res.append(LlmResponse(response, py_result))
+        res = unpacked_res
+        # res = res if isinstance(res, list) else [res]
 
         for i in res:
             global_tracer().log_instant("IPC.get")
