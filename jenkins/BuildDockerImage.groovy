@@ -406,9 +406,16 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             script {
                 stage(key) {
                     config.stageName = key
-                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    try {
                         trtllm_utils.launchKubernetesPod(pipeline, config.podConfig, "docker") {
                             buildImage(config, imageKeyToTag)
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        echo "Build ${key} failed."
+                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            throw e
                         }
                     }
                 }
