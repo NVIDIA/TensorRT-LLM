@@ -506,8 +506,8 @@ def create_py_executor_instance(
 
 
 def create_torch_sampler_args(engine: PyTorchModelEngine,
-                              executor_config: ExecutorConfig,
-                              pytorch_backend_config: PyTorchConfig):
+                              executor_config: ExecutorConfig, *,
+                              mixed_sampler: bool):
     pretrained_config = engine.model.model_config.pretrained_config
     vocab_size = pretrained_config.vocab_size
     assert vocab_size is not None
@@ -520,7 +520,7 @@ def create_torch_sampler_args(engine: PyTorchModelEngine,
         max_batch_size=executor_config.max_batch_size,
         max_beam_width=executor_config.max_beam_width,
         vocab_size=vocab_size,
-        mixed_sampler=pytorch_backend_config.mixed_sampler,
+        mixed_sampler=mixed_sampler,
     )
 
 
@@ -547,8 +547,10 @@ def instantiate_sampler(engine: PyTorchModelEngine,
     if early_stop:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
-    sampler_args = create_torch_sampler_args(engine, executor_config,
-                                             pytorch_backend_config)
+    sampler_args = create_torch_sampler_args(
+        engine,
+        executor_config,
+        mixed_sampler=pytorch_backend_config.mixed_sampler)
     if has_spec_dec:
         return get_spec_decoder(engine.spec_config, sampler_args)
     else:
