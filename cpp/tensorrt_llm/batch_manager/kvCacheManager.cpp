@@ -1643,7 +1643,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
     {
         // Assumes shared among beam = True
         auto const promptCacheLen
-            = std::min((isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + numDraftTokensPerStep, windowSize)
+            = (isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + numDraftTokensPerStep
             + mSinkBubbleLength;
         auto const numSharedBlocks = promptCacheLen / getTokensPerBlock();
         auto const numUnSharedTokens = promptCacheLen % getTokensPerBlock();
@@ -1667,8 +1667,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
         auto const numNextBlocks = tc::ceilDiv(numNextTokens, getTokensPerBlock());
 
         auto const maxTokenNum = mBlockManager.getWindowSizeMetadata(windowSize).maxTokenNum;
-        auto const numNewBlocks = (numNextTokens > maxTokenNum) ? std::min(numNextBlocks - numPastBlocks, 1)
-                                                                : (numNextBlocks - numPastBlocks);
+        auto const numNewBlocks = numNextBlocks - numPastBlocks;
         numRequiredBlocks = numNewBlocks * req.mSamplingConfig.beamWidth;
     }
     return numRequiredBlocks;
@@ -1689,10 +1688,10 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
     auto const temporaryAttentionWindow = mBlockManager.getWindowSizeMetadata(windowSize).temporaryAttentionWindow;
 
     SizeType32 const numContextBlocks
-        = (std::min(req.mPromptLen, windowSize + temporaryAttentionWindow) + mSinkBubbleLength) / getTokensPerBlock();
+        = req.mPromptLen / getTokensPerBlock();
 
     SizeType32 const numTotalBlocksPerBeam = tc::ceilDiv(
-        std::min(req.mPromptLen + req.mMaxNewTokens, windowSize + temporaryAttentionWindow) + mSinkBubbleLength,
+        req.mPromptLen + req.mMaxNewTokens + mSinkBubbleLength,
         getTokensPerBlock());
 
     SizeType32 const numGenBlocksPerBeam = numTotalBlocksPerBeam - numContextBlocks;
