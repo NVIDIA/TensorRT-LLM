@@ -705,7 +705,7 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.Qwen3
             },
-            id="Qwen3"),
+            id="RoutingQwen3"),
     ],
 )
 def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
