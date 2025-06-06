@@ -3,6 +3,8 @@ from typing import List, Optional
 
 import torch
 
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+
 from ..attention_backend.interface import AttentionInputType
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
@@ -315,7 +317,7 @@ def nvfp4_gemm(
     _, best_tactic = tuner.choose_one(
         "trtllm::fp4_gemm::gemm",
         [nvfp4_gemm_runner],
-        NVFP4GemmRunner.tuning_config,
+        FP4GemmRunner.tuning_config,
         [act_fp4, weight, act_sf, weight_scale, alpha],
     )
 
@@ -358,7 +360,7 @@ def w4a8_mxfp4_fp8_gemm(
     _, best_tactic = tuner.choose_one(
         "trtllm::w4a8_mxfp4_fp8_gemm::gemm",
         [w4a8_mxfp4_fp8_gemm_runner],
-        tuning_config,
+        FP4GemmRunner.tuning_config,
         [act_fp8, weight, act_sf, weight_scale, alpha],
     )
 
