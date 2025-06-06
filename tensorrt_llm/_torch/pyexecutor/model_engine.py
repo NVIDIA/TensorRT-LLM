@@ -313,7 +313,8 @@ class PyTorchModelEngine(ModelEngine):
         if mapping.has_pp():
             init_pp_comm(mapping)
         self.dist = dist
-        ExpertStatistic.create(self.dist.rank)
+        if dist is not None:
+            ExpertStatistic.create(self.dist.rank)
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
