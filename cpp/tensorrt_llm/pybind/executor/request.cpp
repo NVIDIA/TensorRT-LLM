@@ -18,6 +18,7 @@
 #include "request.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
@@ -752,7 +753,10 @@ void initRequestBindings(pybind11::module_& m)
         .def(py::pickle(resultGetstate, resultSetstate));
 
     auto responseGetstate = [](tle::Response const& self)
-    { return py::make_tuple(self.getRequestId(), self.getResult(), self.getClientId()); };
+    {
+        NVTX3_SCOPED_RANGE(responseGetstate);
+        return py::make_tuple(self.getRequestId(), self.getResult(), self.getClientId());
+    };
 
     auto responseSetstate = [](py::tuple const& state)
     {
@@ -793,6 +797,33 @@ void initRequestBindings(pybind11::module_& m)
                 }
             })
         .def(py::pickle(responseGetstate, responseSetstate));
+
+    m.def(
+        "serialize_responses",
+        [&responseGetstate](std::vector<tle::Response> const& responses)
+        {
+            NVTX3_SCOPED_RANGE(serialize_responses);
+            py::list serialized_list;
+            for (auto const& response : responses)
+            {
+                serialized_list.append(responseGetstate(response));
+            }
+            return serialized_list;
+        },
+        py::arg("responses"), "Serializes a list of Response objects.");
+
+    m.def(
+        "deserialize_responses",
+        [&responseSetstate](py::list const& serialized_list)
+        {
+            std::vector<tle::Response> responses;
+            for (auto const& item : serialized_list)
+            {
+                responses.push_back(*responseSetstate(item.cast<py::tuple>()));
+            }
+            return responses;
+        },
+        py::arg("serialized_list"), "Deserializes a list into Response objects.");
 }
 
 } // namespace tensorrt_llm::pybind::executor

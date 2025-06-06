@@ -3,6 +3,7 @@ from typing import List, Optional
 import torch
 
 import tensorrt_llm.bindings
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
 
@@ -260,6 +261,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   return_log_probs, return_context_logits,
                                   return_generation_logits)
 
+    @nvtx_range("LlmRequest.create_response")
     def create_response(
             self,
             use_fast_logits=False,

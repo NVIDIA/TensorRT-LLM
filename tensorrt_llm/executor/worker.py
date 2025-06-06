@@ -865,11 +865,19 @@ class AwaitResponseHelper:
 
     def handle_for_ipc_batched(self, responses: List[tllm.Response]) -> None:
         ''' Perform the IPC in batch explicitly. '''
-        postproc_batches = [
-            []
-            for _ in range(self.worker.postproc_config.num_postprocess_workers)
-        ] if self.enable_postprocprocess_parallel else None
-        rsp_batch = [] if not self.enable_postprocprocess_parallel else None
+        postproc_batches = None
+        rsp_batch = None
+        if self.enable_postprocprocess_parallel:
+            postproc_batches = [[] for _ in range(
+                self.worker.postproc_config.num_postprocess_workers)]
+        else:
+            rsp_batch = []
+
+        # postproc_batches = [
+        #     []
+        #     for _ in range(self.worker.postproc_config.num_postprocess_workers)
+        # ] if self.enable_postprocprocess_parallel else None
+        # rsp_batch = [] if not self.enable_postprocprocess_parallel else None
 
         for response in responses:
 
@@ -897,7 +905,45 @@ class AwaitResponseHelper:
                     self.worker.postproc_queues[wid].put(batch)
 
         if rsp_batch:
-            self.worker.result_queue.put(rsp_batch)
+            response_list = ResponseList([r._response for r in rsp_batch])
+            py_result_list = PyResultsList([r._py_result for r in rsp_batch])
+            packed_responses = PackedResponses(response_list, py_result_list)
+            self.worker.result_queue.put(packed_responses)
+            # self.worker.result_queue.put(rsp_batch)
+
+
+class ResponseList:
+
+    def __init__(self, responses):
+        self._responses = responses
+
+    def __getstate__(self):
+        return tllm.serialize_responses(self._responses)
+
+    def __setstate__(self, state):
+        self._responses = tllm.deserialize_responses(state)
+
+
+class PyResultsList:
+
+    def __init__(self, py_results):
+        self._py_results = py_results
+
+    def __getstate__(self):
+        return self._py_results
+
+
+class PackedResponses:
+
+    def __init__(self, response_list, py_result_list):
+        self._response_list = response_list
+        self._py_result_list = py_result_list
+
+    def __getstate__(self):
+        return self._response_list, self._py_result_list
+
+    def __setstate__(self, state):
+        self._response_list, self._py_result_list = state
 
 
 def _get_params_for_first_rsp(
@@ -947,6 +993,7 @@ def _get_logprobs(worker,
     return logprobs_result
 
 
+@nvtx_range_debug("send_rsp")
 def _send_rsp(
         worker,
         response: Union[tllm.Response, ResponseWrapper, ErrorResponse],

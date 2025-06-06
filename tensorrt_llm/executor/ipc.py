@@ -114,22 +114,38 @@ class ZeroMqQueue:
         else:
             return False
 
-    def put(self, obj: Any):
+    def put(self, obj: Any, serialized: bool = False):
         self.setup_lazily()
-        with nvtx_range_debug("send", color="blue", category="IPC"):
-            data = serialization.dumps(obj)
+        with nvtx_range_debug("serialization.dumps",
+                              color="blue",
+                              category="IPC"):
+            if not serialized:
+                data = serialization.dumps(obj)
+            else:
+                data = obj
             if self.use_hmac_encryption:
                 # Send pickled data with HMAC appended
-                data = self._sign_data(data)
-            self.socket.send(data)
+                with nvtx_range_debug("_sign_data",
+                                      color="blue",
+                                      category="IPC"):
+                    data = self._sign_data(data)
+            with nvtx_range_debug("send", color="blue", category="IPC"):
+                self.socket.send(data)
 
     def put_noblock(self, obj: Any):
         self.setup_lazily()
-        with nvtx_range_debug("send", color="blue", category="IPC"):
+        with nvtx_range_debug("serialization.dumps",
+                              color="blue",
+                              category="IPC"):
             data = serialization.dumps(obj)
             if self.use_hmac_encryption:
-                data = self._sign_data(data)
-            self.socket.send(data, flags=zmq.NOBLOCK)
+                with nvtx_range_debug("_sign_data",
+                                      color="blue",
+                                      category="IPC"):
+                    data = self._sign_data(data)
+            with nvtx_range_debug("send(noblock)", color="blue",
+                                  category="IPC"):
+                self.socket.send(data, flags=zmq.NOBLOCK)
 
     async def put_async(self, obj: Any):
         self.setup_lazily()
@@ -271,13 +287,13 @@ class FusedIpcQueue:
                                           error_queue=self.error_queue)
         self._send_thread.start()
 
-    def put(self, obj: Any):
+    def put(self, obj: Any, serialized: bool = False):
         self.setup_sender()
         if self.fuse_message:
             self.sending_queue.put_nowait(obj)
         else:
             batch = obj if isinstance(obj, list) else [obj]
-            self.queue.put(batch)
+            self.queue.put(batch, serialized=serialized)
 
     def get(self) -> Any:
         return self.queue.get()

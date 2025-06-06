@@ -1800,17 +1800,7 @@ class TorchLlmArgs(BaseLlmArgs):
         """
         if self.cuda_graph_batch_sizes is not None:
             self.cuda_graph_batch_sizes = sorted(self.cuda_graph_batch_sizes)
-            if self.cuda_graph_max_batch_size != 0:
-                if self.cuda_graph_batch_sizes != self._generate_cuda_graph_batch_sizes(
-                        self.cuda_graph_max_batch_size,
-                        self.cuda_graph_padding_enabled):
-                    raise ValueError(
-                        "Please don't set both cuda_graph_batch_sizes "
-                        "and cuda_graph_max_batch_size.\n"
-                        f"cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}, "
-                        f"cuda_graph_max_batch_size: {self.cuda_graph_max_batch_size}"
-                    )
-            else:
+            if self.cuda_graph_max_batch_size == 0:
                 self.cuda_graph_max_batch_size = max(
                     self.cuda_graph_batch_sizes)
         else:
