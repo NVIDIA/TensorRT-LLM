@@ -21,9 +21,14 @@ LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefi
 
 LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
+RUN_SANITY_CHECK = env.runSanityCheck ?: false
+
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
+
+UPLOAD_PATH = env.uploadPath ?: "sw-tensorrt-artifacts"
+ARTIFACT_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/2052"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 
@@ -33,10 +38,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
+    (IMAGE_KEY_TO_TAG): [:],
 ]
 
 @Field
@@ -187,14 +195,18 @@ def buildImage(config, imageKeyToTag)
     def dependentTarget = config.dependentTarget
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
 
-    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
+    def tmpTag = "8166649-main-108" // TODO: remove this
+    // def tmpTag = LLM_DEFAULT_TAG
+
+    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${tmpTag}"
 
     def dependentTargetTag = tag.replace("${arch}-${target}-", "${arch}-${dependentTarget}-")
 
     if (target == "ngc-release") {
-        imageKeyToTag["NGC Devel Image ${config.arch}"] = "${IMAGE_NAME}/${dependentTarget}:${dependentTargetTag}"
-        imageKeyToTag["NGC Release Image ${config.arch}"] = "${IMAGE_NAME}/${target}:${tag}"
+        imageKeyToTag["NGC Devel Image ${config.arch}"] = "${IMAGE_NAME}/devel:${dependentTargetTag}"
+        imageKeyToTag["NGC Release Image ${config.arch}"] = "${IMAGE_NAME}/release:${tag}"
     }
+    return // TODO: remove this
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
 
@@ -391,6 +403,17 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
 }
 
 
+def getCommonParameters()
+{
+    return [
+        'gitlabSourceRepoHttpUrl': LLM_REPO,
+        'gitlabCommit': '8166649d033109319d7d08cf9541d8996848018f',
+        'artifactPath': ARTIFACT_PATH,
+        'uploadPath': UPLOAD_PATH,
+    ]
+}
+
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("agent")
@@ -451,6 +474,120 @@ pipeline {
                     echo "imageKeyToTag is: ${imageKeyToTagJson}"
                     writeFile file: "imageKeyToTag.json", text: imageKeyToTagJson
                     archiveArtifacts artifacts: 'imageKeyToTag.json', fingerprint: true
+                }
+            }
+        }
+        stage("Wait for build jobs finish") {
+            when {
+                expression {
+                    RUN_SANITY_CHECK
+                }
+            }
+            steps {
+                script {
+                    return
+                    collectResultPodSpec = createKubernetesPodConfig("agent")
+                    trtllm_utils.launchKubernetesPod(this, collectResultPodSpec, "alpine", {
+                        // 安装wget工具
+                        trtllm_utils.llmExecStepWithRetry(this, script: "apk add --no-cache wget")
+                        // 轮询检查构建产物文件是否存在
+                        def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
+                        def requiredFiles = [
+                            "TensorRT-LLM-GH200.tar.gz",
+                            "tensorrt-llm-release-src-",
+                            "tensorrt-llm-sbsa-release-src-",
+                            "TensorRT-LLM.tar.gz"
+                        ]
+                        def maxWaitMinutes = 180
+                        def pollIntervalSeconds = 60
+
+                        echo "开始等待构建产物文件..."
+                        echo "需要等待的文件: ${requiredFiles}"
+                        echo "检查路径: ${artifactBaseUrl}"
+
+                        def startTime = System.currentTimeMillis()
+                        def maxWaitMs = maxWaitMinutes * 60 * 1000
+
+                        while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
+                            def missingFiles = []
+
+                            try {
+                                // 只下载一次目录索引
+                                trtllm_utils.llmExecStepWithRetry(this, script: "wget ${artifactBaseUrl} -O index.html", allowStepFailed: true)
+                                def indexContent = sh(script: "cat index.html 2>/dev/null || echo ''", returnStdout: true).trim()
+
+                                // 检查所有需要的文件
+                                for (file in requiredFiles) {
+                                    if (!indexContent.contains(file)) {
+                                        missingFiles.add(file)
+                                    }
+                                }
+
+                                // 删除index文件
+                                sh(script: "rm -f index.html", returnStdout: false)
+
+                            } catch (Exception e) {
+                                echo "检查构建产物时出错: ${e.message}"
+                                // 如果出错，假设所有文件都缺失
+                                missingFiles = requiredFiles.clone()
+                                // 确保删除可能存在的index文件
+                                sh(script: "rm -f index.html", returnStdout: false)
+                            }
+
+                            if (missingFiles.isEmpty()) {
+                                echo "所有构建产物文件都已就绪!"
+                                return
+                            }
+
+                            def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                            echo "等待中... (已等待 ${elapsedMinutes.intValue()} 分钟)"
+                            echo "缺失的文件: ${missingFiles}"
+                            sleep(pollIntervalSeconds)
+                        }
+
+                        def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                        error "等待构建产物超时 (${elapsedMinutes.intValue()} 分钟)，部分文件仍未就绪"
+                    })
+                }
+            }
+        }
+        stage("Sanity Check") {
+            when {
+                expression {
+                    RUN_SANITY_CHECK
+                }
+            }
+            steps {
+                script {
+                    globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
+                    def parameters = getCommonParameters()
+                    parameters += [
+                        'enableFailFast': false,
+                        'branch': LLM_BRANCH,
+                        'globalVars': globalVarsJson,
+                        'targetArch': "aarch64-linux-gnu",
+                    ]
+
+                    echo "trigger BuildDockerImageSanityTest job, params: ${parameters}"
+
+                    def status = ""
+                    def jobName = "/LLM/helpers/BuildDockerImageSanityTest"
+                    def jobPath = trtllm_utils.resolveFullJobName(jobName).replace('/', '/job/').substring(1)
+                    def jenkinsUrl = env.JENKINS_URL
+                    def credentials = env.localJobCredentials
+                    def handle = triggerRemoteJob(
+                        job: "${jenkinsUrl}${jobPath}/",
+                        auth: CredentialsAuth(credentials: credentials),
+                        parameters: trtllm_utils.toRemoteBuildParameters(parameters),
+                        pollInterval: 60,
+                        abortTriggeredJob: true,
+                    )
+                    status = handle.getBuildResult().toString()
+
+                    if (status != "SUCCESS") {
+                        error "Downstream job did not succeed"
+                    }
                 }
             }
         }
