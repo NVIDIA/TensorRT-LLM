@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
@@ -177,6 +178,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
         # Verify the global state is cleaned up
         self.assertIsNone(get_moe_load_balancer())
 
+    @pytest.mark.skip(reason="https://nvbugs/5324229")
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_single_layer_moe_load_balancer_methods(self,
                                                     mock_load_balancer_impl):

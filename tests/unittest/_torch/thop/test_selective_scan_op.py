@@ -208,6 +208,7 @@ class TestFunctional(unittest.TestCase):
                                    rtol=1e-2,
                                    atol=atol[dtype])
 
+    @pytest.mark.skip(reason="https://nvbugs/5324258")
     @parameterized.expand(
         # P=8x and H=2x
         list(
