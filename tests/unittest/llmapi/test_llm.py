@@ -1930,7 +1930,6 @@ def test_llm_get_stats(return_context_logits, enable_iter_req_stats):
 
 
 def test_llm_get_queued_stats():
-    pytest.skip("https://nvbugspro.nvidia.com/bug/5325642")
     enable_iter_req_stats = True
     use_overlap = False
     tp_size = 1
