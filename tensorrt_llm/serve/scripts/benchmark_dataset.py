@@ -222,11 +222,10 @@ class RandomDataset(BenchmarkDataset):
             inner_seq = ((offsets[i] + i + np.arange(input_lens[i])) %
                          vocab_size).tolist()
             token_sequence = prefix_token_ids + inner_seq
-            prompt = tokenizer.decode(token_sequence)
             total_input_len = prefix_len + int(input_lens[i])
             requests.append(
                 SampleRequest(
-                    prompt=prompt,
+                    prompt=token_sequence,
                     prompt_len=total_input_len,
                     expected_output_len=int(output_lens[i]),
                 ))
