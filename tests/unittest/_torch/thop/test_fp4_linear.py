@@ -70,8 +70,14 @@ def test_fp4_linear(dtype):
     with torch.inference_mode():
         x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
             x, x_sf_global, scaling_vector_size, False)
-        output_ref = torch.ops.trtllm.fp4_gemm(x_fp4, w_fp4, x_sf_block,
-                                               w_sf_block, alpha_ref, 0, dtype)
+        output_ref = torch.ops.trtllm.fp4_gemm(
+            x_fp4,
+            w_fp4,
+            x_sf_block,
+            w_sf_block,
+            alpha_ref,
+            0,  # FP4GemmType.W4A4_NVFP4_NVFP4
+            dtype)
 
     # compare
     torch.cuda.synchronize()
