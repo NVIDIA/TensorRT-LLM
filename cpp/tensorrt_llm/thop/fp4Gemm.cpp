@@ -202,7 +202,7 @@ at::Tensor fp4_bmm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor co
 class FP4GemmRunner : public torch::CustomClassHolder
 {
 public:
-    explicit FP4GemmRunner(at::ScalarType outputDtype, int8_t fp4GemmType)
+    explicit FP4GemmRunner(at::ScalarType outputDtype, int64_t fp4GemmType)
         : mOutputDtype(outputDtype)
         , mfp4GemmType(static_cast<FP4GemmType>(fp4GemmType))
     {
