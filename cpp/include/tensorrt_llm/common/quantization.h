@@ -207,11 +207,9 @@ public:
         return hasInt8KvCache() || hasFp8KvCache() || hasFp4KvCache();
     }
 
-    static constexpr QuantMode fromDescription(bool quantizeWeights = false, bool quantizeActivations = false,
-        bool perToken = false, bool perChannel = false, bool perGroup = false, bool useInt4Weights = false,
-        bool useInt8KvCache = false, bool useFp8KvCache = false, bool useFp8Qdq = false, bool useFp8RowWise = false,
-        bool useW4a8QServe = false, bool useFp4Quant = false, bool useFp8BlockScales = false,
-        bool useW4a8Mxfp4Fp8 = false)
+    static constexpr QuantMode fromDescription(bool quantizeWeights, bool quantizeActivations, bool perToken,
+        bool perChannel, bool perGroup, bool useInt4Weights, bool useInt8KvCache, bool useFp8KvCache, bool useFp8Qdq,
+        bool useFp8RowWise, bool useW4a8QServe, bool useFp4Quant, bool useFp8BlockScales, bool useW4a8Mxfp4Fp8)
     {
         QuantMode quantMode{};
         if (quantizeWeights)
@@ -285,17 +283,20 @@ public:
 
     static constexpr QuantMode useSmoothQuant(bool perToken = false, bool perChannel = false)
     {
-        return fromDescription(true, true, perToken, perChannel);
+        return fromDescription(
+            true, true, perToken, perChannel, false, false, false, false, false, false, false, false, false, false);
     }
 
     static constexpr QuantMode useQServe(bool perGroup)
     {
-        return fromDescription(true, true, false, false, perGroup, true, false, false, false, false, true);
+        return fromDescription(
+            true, true, false, false, perGroup, true, false, false, false, false, true, false, false, false);
     }
 
     static constexpr QuantMode useWeightOnly(bool useInt4Weights = false, bool perGroup = false)
     {
-        return fromDescription(true, false, false, false, perGroup, useInt4Weights);
+        return fromDescription(true, false, false, false, perGroup, useInt4Weights, false, false, false, false, false,
+            false, false, false);
     }
 
     static QuantMode const fromQuantAlgo(
@@ -352,21 +353,23 @@ public:
         }
         else if (quantAlgo == "FP8")
         {
-            quantMode = fromDescription(false, false, false, false, false, false, false, false, true);
+            quantMode = fromDescription(
+                false, false, false, false, false, false, false, false, true, false, false, false, false, false);
         }
         else if (quantAlgo == "FP8_ROWWISE")
         {
-            quantMode = fromDescription(false, false, true, true, false, false, false, false, false, true);
+            quantMode = fromDescription(
+                false, false, true, true, false, false, false, false, false, true, false, false, false, false);
         }
         else if (quantAlgo == "FP4")
         {
-            quantMode
-                = fromDescription(false, false, false, false, false, false, false, false, false, false, false, true);
+            quantMode = fromDescription(
+                false, false, false, false, false, false, false, false, false, false, false, true, false, false);
         }
         else if (quantAlgo == "FP8_BLOCK_SCALES")
         {
             quantMode = fromDescription(
-                false, false, false, false, false, false, false, false, false, false, false, false, true);
+                false, false, false, false, false, false, false, false, false, false, false, false, true, false);
         }
         else if (quantAlgo == "W4A8_MXFP4_FP8")
         {
