@@ -1154,7 +1154,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             extraInternalEnv,
             "pytest",
             "-v",
-            "-s",
             "--timeout-method=thread",
             "--apply-test-list-correction",
             "--splitting-algorithm least_duration",
