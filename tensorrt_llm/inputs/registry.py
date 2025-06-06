@@ -111,8 +111,7 @@ def register_input_processor(processor_cls: Type[InputProcessor],
 
 def create_input_processor(model_path_or_dir: str,
                            tokenizer,
-                           trust_remote_code: bool = True,
-                           use_fast: bool = True):
+                           trust_remote_code: bool = True):
     """
     Create an input processor for a specific model.
     """
@@ -137,6 +136,6 @@ def create_input_processor(model_path_or_dir: str,
             input_processor_cls = None
         if input_processor_cls is not None:
             return input_processor_cls(model_path_or_dir, model_config,
-                                       tokenizer, trust_remote_code, use_fast)
+                                       tokenizer, trust_remote_code)
 
     return DefaultInputProcessor(None, None, tokenizer)

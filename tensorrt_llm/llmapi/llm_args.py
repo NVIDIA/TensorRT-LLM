@@ -779,9 +779,6 @@ class BaseLlmArgs(BaseModel):
     trust_remote_code: bool = Field(
         default=False, description="Whether to trust the remote code.")
 
-    use_fast: bool = Field(default=True,
-                           description="Whether to use the fast processor.")
-
     tensor_parallel_size: int = Field(default=1,
                                       description="The tensor parallel size.")
 

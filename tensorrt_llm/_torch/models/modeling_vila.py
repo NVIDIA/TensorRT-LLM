@@ -868,8 +868,7 @@ class VilaInputProcessor(InputProcessor):
                  model_path,
                  model_config,
                  tokenizer,
-                 trust_remote_code: bool = True,
-                 use_fast: bool = True):
+                 trust_remote_code: bool = True):
         self.model_config = model_config
         llm_path, vision_tower_path, mm_projector_path = _get_model_paths(
             self.model_config)

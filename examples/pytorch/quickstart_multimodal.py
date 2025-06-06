@@ -50,10 +50,6 @@ def add_multimodal_args(parser):
                         choices=["pt", "pil"],
                         default="pt",
                         help="The format of the image.")
-    parser.add_argument("--use_fast",
-                        action="store_true",
-                        default=True,
-                        help="Whether to use the fast processor.")
     return parser
 
 
@@ -89,7 +85,7 @@ def main():
             open(os.path.join(llm._hf_model_dir, 'config.json')))['model_type']
     assert model_type in ALL_SUPPORTED_MULTIMODAL_MODELS, f"Unsupported model_type: {model_type}"
 
-    device = "cuda" if args.use_fast else "cpu"
+    device = "cuda"
     inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
                                              model_dir=llm._hf_model_dir,
                                              model_type=model_type,
