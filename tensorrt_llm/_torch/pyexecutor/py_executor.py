@@ -1846,8 +1846,10 @@ class PyExecutor:
                                  scheduled_requests.generation_requests)
             }
 
-            outputs = self.draft_model_engine.forward(draft_batch,
-                                                      self.resource_manager)
+            # Disable cuda graph for the 1st draft model forward
+            with self.draft_model_engine.no_cuda_graph():
+                outputs = self.draft_model_engine.forward(
+                    draft_batch, self.resource_manager)
             if hasattr(self.draft_model_engine.model.model, 'd2t'):
                 outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
