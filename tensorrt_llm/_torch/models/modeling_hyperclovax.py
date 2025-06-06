@@ -518,11 +518,10 @@ class HCXVisionInputProcessor(InputProcessor):
 
         images = mm_data.get("image", None)
         if images is not None:
-            if isinstance(images[0], Image.Image):
-                images = [torch.from_numpy(np.array(image)) for image in images]
-            elif isinstance(images[0], torch.Tensor):
-                # NOTE: HyperCLOVA-SEED-Vision-Instruct-3B uses the image data in the format of (H, W, C), otherwise gives an error.
-                images = [image.permute(1, 2, 0) for image in images]
+            if isinstance(images[0], torch.Tensor):
+                # NOTE: HyperCLOVA-SEED-Vision-Instruct-3B uses the image data in the format of (H, W, C) and not in the range of [0, 1], otherwise gives an error.
+                images = [(image.permute(1, 2, 0) * 255).to(torch.uint8)
+                          for image in images]
 
         input_ids, preprocessed_image = self._preprocess(
             text_prompt, images, mm_processor_kwargs)
@@ -538,6 +537,8 @@ class HCXVisionInputProcessor(InputProcessor):
         else:
             # NOTE: For now, I am using "mm_embeding" in tensor format to send the image data to the model.
             # CASE 1: Sending raw image data
+            if isinstance(images[0], Image.Image):
+                images = [torch.from_numpy(np.array(image)) for image in images]
             mm_embeds = torch.stack(images, dim=0)
 
             # NOTE: After refactoring the llmRequest, we can use preprocessed_image['pixel_values'] to send the image data to the model.

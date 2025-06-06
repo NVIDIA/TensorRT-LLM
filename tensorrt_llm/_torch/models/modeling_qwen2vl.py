@@ -236,10 +236,18 @@ class Qwen2VLInputProcessorBase(InputProcessor):
 
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
+        images = mm_data.get("image")
+        videos = mm_data.get("video")
+        do_rescale = True
+        if images and isinstance(images[0], torch.Tensor):
+            do_rescale = False
+        if videos and isinstance(videos[0][0], torch.Tensor):
+            do_rescale = False
         return self.processor(text=[text],
-                              images=mm_data.get("image", None),
-                              videos=mm_data.get("video", None),
+                              images=images,
+                              videos=videos,
                               padding=True,
+                              do_rescale=do_rescale,
                               return_tensors='pt',
                               **mm_processor_kwargs)
 

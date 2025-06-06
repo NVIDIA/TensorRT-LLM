@@ -13,7 +13,7 @@ import numpy as np
 import requests
 import torch
 from PIL import Image
-from torchvision.transforms import PILToTensor
+from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.utils import logging
 
@@ -58,7 +58,7 @@ def load_image(image: str,
         image = _load_and_convert_image(image)
 
     if format == "pt":
-        return PILToTensor()(image).to(device=device)
+        return ToTensor()(image).to(device=device)
     else:
         return image
 
@@ -82,7 +82,7 @@ async def async_load_image(
         image = _load_and_convert_image(Path(parsed_url.path))
 
     if format == "pt":
-        return PILToTensor()(image).to(device=device)
+        return ToTensor()(image).to(device=device)
     else:
         return image
 
@@ -130,7 +130,7 @@ def load_video(
         frames[index] = Image.fromarray(frame)
 
     return [
-        PILToTensor()(frames[index]).to(
+        ToTensor()(frames[index]).to(
             device=device) if format == "pt" else frames[index]
         for index in indices if index in frames
     ]

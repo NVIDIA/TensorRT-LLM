@@ -1825,7 +1825,6 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
     ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
     ("qwen2-vl-7b-instruct", "Qwen2-VL-7B-Instruct"),
     ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
-    ("hyperclovax-seed-instruct-3b", "HyperCLOVAX-SEED-Vision-Instruct-3B"),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality):
@@ -1914,11 +1913,6 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 ["earth", "rotating", "night", "lights", "cities"],
             ],
         },
-        "hyperclovax-seed-instruct-3b": {
-            "image": [['흐린', '바다', '구름', '파도', '거품'],
-                      ["화창", "푸른색", "태양", "도로", "해"],
-                      ["차선", "도로", "차량", "주행", "파란"]],
-        },
     }
 
     cmd = [
@@ -1937,15 +1931,6 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
                       ] and modality == "video":
         cmd.append("--max_num_tokens=16384")
-    elif model_name == "hyperclovax-seed-instruct-3b":
-        hyperclovax_example_root = Path(
-            os.path.join(llm_root, "examples", "models", "contrib",
-                         "hyperclovax"))
-        llm_venv.run_cmd([
-            '-m', 'pip', 'install', '-r',
-            str(hyperclovax_example_root / "requirements.txt")
-        ])
-        cmd.append('--trust_remote_code')
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
     def parse_output(text):

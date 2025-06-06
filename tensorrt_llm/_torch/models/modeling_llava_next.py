@@ -84,6 +84,7 @@ class LlavaNextInputProcessor(InputProcessor):
         return [
             self.processor(text="dummy",
                            images=image,
+                           do_rescale=not isinstance(images[0], torch.Tensor),
                            return_tensors="pt",
                            device=self.device)['pixel_values'][0].to(
                                self.device) for image in images
