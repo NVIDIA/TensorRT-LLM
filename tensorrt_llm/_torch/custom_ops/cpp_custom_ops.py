@@ -353,7 +353,7 @@ def _register_fake():
     @torch.library.register_fake(
         "trtllm::mtp_sampling_and_accepted_draft_tokens_op")
     def _(logits: torch.Tensor, draft_tokens: torch.Tensor,
-          target_tokens: torch.Tensor, num_mtp_modules: int, batch_size: int,
+          target_tokens: torch.Tensor, target_token_logprobs: torch.Tensor, num_mtp_modules: int, batch_size: int,
           num_context_request: int, vocab_size: int):
         return logits.new_empty((batch_size, num_mtp_modules + 1),
                                 dtype=torch.int32), logits.new_empty(

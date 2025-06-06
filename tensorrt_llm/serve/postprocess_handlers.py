@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional, Tuple, Union
 
+from tensorrt_llm.executor.result import TokenLogprobs
+
 from .._utils import nvtx_range_debug
 from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
                         GenerationResultBase)
@@ -16,7 +18,7 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               ChatCompletionResponseChoice,
                               ChatCompletionResponseStreamChoice,
                               ChatCompletionStreamResponse,
-                              ChatCompletionToolsParam, ChatMessage,
+                              ChatCompletionToolsParam, ChatMessage, CompletionLogProbs,
                               CompletionRequest, CompletionResponse,
                               CompletionResponseChoice,
                               CompletionResponseStreamChoice,
@@ -59,20 +61,37 @@ class ChatPostprocArgs(PostprocArgs):
 
 def create_logprobs(token_ids: List[int],
                     tokenizer: TransformersTokenizer,
-                    logprobs: List[float]) -> ChatCompletionLogProbs:
-    assert len(token_ids) == len(logprobs), \
-            "token_ids and logprobs have different lengths"
+                    logprobs: TokenLogprobs) -> ChatCompletionLogProbs:
+    # assert len(token_ids) == len(logprobs), \
+            # "token_ids and logprobs have different lengths"
     content: List[ChatCompletionLogProbsContent] = []
-    for token_id, logprob in zip(token_ids, logprobs):
+    for logprob in logprobs:
+        token_id, lp = list(logprob.items())[0]
         token = tokenizer.decode(token_id)
         # returning multiple logprobs is not supported
         first_logprob = ChatCompletionLogProbsContent(
             token=token,
-            logprob=max(logprob, -9999.0),
+            logprob=max(lp.logprob, -9999.0),
             bytes=list(token.encode("utf-8", errors="replace")))
         content.append(first_logprob)
     chat_logprobs = ChatCompletionLogProbs(content=content)
     return chat_logprobs
+
+def create_logprobs_completion(token_ids: List[int],
+                    tokenizer: TransformersTokenizer,
+                    logprobs: TokenLogprobs) -> CompletionLogProbs:
+    # assert len(token_ids) == len(logprobs), \
+            # "token_ids and logprobs have different lengths"
+    token_logprobs: List[Optional[float]] = []
+    tokens: List[str] = []
+    for logprob in logprobs:
+        token_id, lp = list(logprob.items())[0]
+        token = tokenizer.decode(token_id)
+        # returning multiple logprobs is not supported
+        token_logprobs.append(max(lp.logprob, -9999.0))
+        tokens.append(token)
+    completion_logprobs = CompletionLogProbs(token_logprobs=token_logprobs,tokens=tokens)
+    return completion_logprobs
 
 
 def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str, streaming: bool) -> Tuple[bool, str, str]:
@@ -261,6 +280,7 @@ class CompletionPostprocArgs(PostprocArgs):
     prompt_idx: int = 0
     prompt: Optional[str] = None
     stream_options: Optional[StreamOptions] = None
+    return_logprobs: bool = False
 
     @classmethod
     def from_request(cls, request: CompletionRequest):
@@ -269,6 +289,7 @@ class CompletionPostprocArgs(PostprocArgs):
             model=request.model,
             num_choices=request.n if request.n else 1,
             stream_options=request.stream_options,
+            return_logprobs=request.logprobs,
         )
 
 
@@ -295,6 +316,10 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase, args:
             finish_reason = output.finish_reason,
             stop_reason = output.stop_reason,
         )
+        if args.return_logprobs:
+            logprobs, args.last_logprobs_len = output.logprobs_diff_safe(args.last_logprobs_len)
+            token_ids, args.last_token_ids_len = output.token_ids_diff_safe(args.last_token_ids_len)
+            choice.logprobs = create_logprobs_completion(token_ids, args.tokenizer, logprobs)
         chunk = CompletionStreamResponse(model=args.model, choices=[choice])
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
@@ -338,7 +363,8 @@ def completion_response_post_processor(rsp: GenerationResult, args: CompletionPo
             stop_reason=output.stop_reason,
             finish_reason=output.finish_reason,
         )
-
+        if args.return_logprobs:
+            choice.logprobs = create_logprobs_completion(output.token_ids, args.tokenizer, output.logprobs)
         completion_tokens += output.length
         choices.append(choice)
 

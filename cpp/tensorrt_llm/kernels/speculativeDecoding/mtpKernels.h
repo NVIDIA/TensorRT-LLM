@@ -62,7 +62,9 @@ struct MTPSampleAndAcceptDraftTokensParam
     void* __restrict__ logits;
     int* draftTokens;
     int* targetTokens;
+    float* targetTokenLogprobs;
     int* acceptedTokens;
+    float* logprobs;
     int* numAcceptedTokens;
 };
 
