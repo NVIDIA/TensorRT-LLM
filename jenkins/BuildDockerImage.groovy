@@ -244,12 +244,12 @@ def buildImage(config, imageKeyToTag)
             sh "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}"
         }
     }
+    def containerGenFailure = null
     try {
         def build_jobs = BUILD_JOBS
         // Fix the triton image pull timeout issue
         def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
-        def containerGenFailure = null
 
         if (dependent) {
             stage ("make ${dependent.target}_${action} (${arch})") {
