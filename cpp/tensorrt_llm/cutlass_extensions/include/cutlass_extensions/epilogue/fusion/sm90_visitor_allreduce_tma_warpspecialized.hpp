@@ -42,8 +42,6 @@ struct Sm90AuxAllReduce
 
     static constexpr int kAlignment = 128 / sizeof_bits_v<ElementT>;
     constexpr static bool is_m_major = epilogue::collective::detail::is_m_major<StrideMNL>();
-    // Find the max contiguous layout usable by TMA (if EpilogueTile is a non-compact tiler)
-    // This should not be needed... {$nv-internal-release}
     using SmemShapeTma = decltype(make_shape(
         max_common_vector(make_layout(get<0>(EpilogueTile{})), make_layout(get<0>(EpilogueTile{}))),
         max_common_vector(make_layout(get<1>(EpilogueTile{})), make_layout(get<1>(EpilogueTile{})))));
