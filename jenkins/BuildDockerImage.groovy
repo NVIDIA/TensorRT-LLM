@@ -5,11 +5,15 @@ import groovy.transform.Field
 
 // Docker image registry
 IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging"
+NGC_IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/ngc"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
     LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
 }
+
+UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+
 LLM_ROOT = "llm"
 
 LLM_BRANCH = env.gitlabBranch ?: params.branch
@@ -20,6 +24,8 @@ LLM_COMMIT_OR_BRANCH = env.gitlabCommit ?: LLM_BRANCH
 LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefined"
 
 LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
+
+TRIGGER_TYPE = env.triggerType ?: "manual"
 
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
@@ -176,6 +182,28 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 }
 
 
+def prepareWheelFromBuildStage(makefileStage, arch) {
+    if (TRIGGER_TYPE == "manual") {
+        echo "Trigger type is manual, skip preparing wheel from build stage"
+        return ""
+    }
+
+    if (!makefileStage || !arch) {
+        echo "Error: makefileStage and arch are required parameters"
+        return ""
+    }
+
+    if (makefileStage != "release") {
+        echo "prepareWheelFromBuildStage: ${makefileStage} is not release"
+        return ""
+    }
+
+    def wheelScript = 'scripts/get_wheel_from_package.py'
+    def wheelArgs = "--arch ${arch} --upload_path " + env.uploadPath
+    // def wheelArgs = "--arch ${arch} --upload_path " + "sw-tensorrt-generic/llm-artifacts/LLM/PipelineMonitor/L0_MergeRequest_PR/89"
+    return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
+}
+
 def buildImage(config, imageKeyToTag)
 {
     def target = config.target
@@ -184,16 +212,27 @@ def buildImage(config, imageKeyToTag)
     def args = config.args ?: ""
     def customTag = config.customTag
     def postTag = config.postTag
-    def dependentTarget = config.dependentTarget
+    def dependent = config.dependent
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
+    def makefileStage = config.makefileStage
 
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
 
-    def dependentTargetTag = tag.replace("${arch}-${target}-", "${arch}-${dependentTarget}-")
+    def dependentTag = tag.replace("${arch}-${target}-", "${arch}-${dependent.target}-")
+
+    def imageWithTag = "${IMAGE_NAME}/${makefileStage}:${tag}"
+    def dependentImageWithTag = "${IMAGE_NAME}/${dependent.makefileStage}:${dependentTag}"
+    def customImageWithTag = "${IMAGE_NAME}/${makefileStage}:${customTag}"
 
     if (target == "ngc-release") {
-        imageKeyToTag["NGC Devel Image ${config.arch}"] = "${IMAGE_NAME}/${dependentTarget}:${dependentTargetTag}"
-        imageKeyToTag["NGC Release Image ${config.arch}"] = "${IMAGE_NAME}/${target}:${tag}"
+        if (TRIGGER_TYPE == "post-merge") {
+            echo "Use NGC artifacts for post merge build"
+            dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
+            imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
+            customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
+        }
+        imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
+        imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
     }
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
@@ -226,30 +265,32 @@ def buildImage(config, imageKeyToTag)
             sh "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}"
         }
     }
+    def containerGenFailure = null
     try {
         def build_jobs = BUILD_JOBS
         // Fix the triton image pull timeout issue
         def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
-        containerGenFailure = null
 
-        if (dependentTarget) {
-            stage ("make ${dependentTarget}_${action} (${arch})") {
+        if (dependent) {
+            stage ("make ${dependent.target}_${action} (${arch})") {
                 retry(3) {
                     retry(3) {
                         sh "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}"
                     }
                     sh """
-                    cd ${LLM_ROOT} && make -C docker ${dependentTarget}_${action} \
+                    cd ${LLM_ROOT} && make -C docker ${dependent.target}_${action} \
                     TORCH_INSTALL_TYPE=${torchInstallType} \
-                    IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${dependentTargetTag} \
+                    IMAGE_WITH_TAG=${dependentImageWithTag} \
+                    STAGE=${dependent.makefileStage} \
                     BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                     """
                 }
-                args += " DEVEL_IMAGE=${IMAGE_NAME}/${dependentTarget}:${dependentTargetTag}"
+                args += " DEVEL_IMAGE=${dependentImageWithTag}"
             }
         }
 
+        args += prepareWheelFromBuildStage(makefileStage, arch)
         // Avoid the frequency of OOM issue when building the wheel
         if (target == "trtllm") {
             if (arch == "x86_64") {
@@ -267,7 +308,8 @@ def buildImage(config, imageKeyToTag)
                 sh """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${tag} \
+                IMAGE_WITH_TAG=${imageWithTag} \
+                STAGE=${makefileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """
             }
@@ -278,7 +320,8 @@ def buildImage(config, imageKeyToTag)
                 sh """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_NAME=${IMAGE_NAME} IMAGE_TAG=${customTag} \
+                IMAGE_WITH_TAG=${customImageWithTag} \
+                STAGE=${makefileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """
             }
@@ -309,23 +352,26 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         torchInstallType: "skip",
         arch: "amd64",
         build_wheel: false,
-        dependentTarget: "",
+        dependent: [:],
+        makefileStage: "tritondevel",
     ]
 
-    def release_action = env.JOB_NAME ==~ /.*PostMerge.*/ ? "push" : params.action
+    def release_action = params.action
     def buildConfigs = [
         "Build trtllm release (x86_64)": [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
+            makefileStage: "release",
         ],
         "Build trtllm release (SBSA)": [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-sbsa",
             build_wheel: true,
-            arch: "arm64"
+            arch: "arm64",
+            makefileStage: "release",
         ],
         "Build CI image (x86_64 tritondevel)": [:],
         "Build CI image (SBSA tritondevel)": [
@@ -338,25 +384,31 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         ],
         "Build CI image(RockyLinux8 Python312)": [
             target: "rockylinux8",
-            args: "PYTHON_VERSION=3.12.3 STAGE=tritondevel",
+            args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
         "Build NGC devel and release (x86_64)": [
             target: "ngc-release",
             action: release_action,
-            customTag: "ngc-" + LLM_BRANCH_TAG + "-x86_64",
             args: "DOCKER_BUILD_OPTS='--load --platform linux/amd64'",
             build_wheel: true,
-            dependentTarget: "devel",
+            dependent: [
+                target: "ngc-devel",
+                makefileStage: "devel",
+            ],
+            makefileStage: "release",
         ],
         "Build NGC devel and release(SBSA)": [
             target: "ngc-release",
             action: release_action,
-            customTag: "ngc-" + LLM_BRANCH_TAG + "-sbsa",
             args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
             arch: "arm64",
             build_wheel: true,
-            dependentTarget: "devel",
+            dependent: [
+                target: "ngc-devel",
+                makefileStage: "devel",
+            ],
+            makefileStage: "release",
         ],
     ]
     // Override all fields in build config with default values
@@ -376,8 +428,17 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             script {
                 stage(key) {
                     config.stageName = key
-                    trtllm_utils.launchKubernetesPod(pipeline, config.podConfig, "docker") {
-                        buildImage(config, imageKeyToTag)
+                    try {
+                        trtllm_utils.launchKubernetesPod(pipeline, config.podConfig, "docker") {
+                            buildImage(config, imageKeyToTag)
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            echo "Build ${key} failed."
+                            throw e
+                        }
                     }
                 }
             }
@@ -432,6 +493,7 @@ pipeline {
                     echo "env.gitlabCommit is: ${env.gitlabCommit}"
                     echo "LLM_REPO is: ${LLM_REPO}"
                     echo "env.globalVars is: ${env.globalVars}"
+                    sh "env | sort"
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                 }
@@ -451,6 +513,9 @@ pipeline {
                     echo "imageKeyToTag is: ${imageKeyToTagJson}"
                     writeFile file: "imageKeyToTag.json", text: imageKeyToTagJson
                     archiveArtifacts artifacts: 'imageKeyToTag.json', fingerprint: true
+                    retry(3) {
+                        trtllm_utils.uploadArtifacts("imageKeyToTag.json", "${UPLOAD_PATH}/")
+                    }
                 }
             }
         }
