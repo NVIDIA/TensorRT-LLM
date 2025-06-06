@@ -466,6 +466,15 @@ class PyTorchModelEngine(ModelEngine):
             hidden_size=self.model.config.hidden_size,
             dtype=torch_dtype_to_str(self.model.config.torch_dtype))
 
+    @contextlib.contextmanager
+    def no_cuda_graph(self):
+        _run_cuda_graphs = self._run_cuda_graphs
+        self._run_cuda_graphs = False
+        try:
+            yield
+        finally:
+            self._run_cuda_graphs = _run_cuda_graphs
+
     def warmup(self, resource_manager: ResourceManager) -> None:
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -598,15 +607,6 @@ class PyTorchModelEngine(ModelEngine):
                         if spec_resource_manager is not None:
                             spec_resource_manager.free_resources(req)
 
-        @contextlib.contextmanager
-        def no_cuda_graph():
-            _run_cuda_graphs = self._run_cuda_graphs
-            self._run_cuda_graphs = False
-            try:
-                yield
-            finally:
-                self._run_cuda_graphs = _run_cuda_graphs
-
         # TODO: current warmup_request is not suitable for star attention
         cp_type = self.mapping.cp_config.get('cp_type', None)
         if cp_type == 'star_attention':
@@ -628,7 +628,7 @@ class PyTorchModelEngine(ModelEngine):
                 set_enable_piecewise_cuda_graph_capture_flag(True)
 
                 # Disable cuda graph capture here so that we can properly capture it later
-                with no_cuda_graph():
+                with self.no_cuda_graph():
                     available_tokens = kv_cache_manager.get_num_available_tokens(
                         self.max_draft_len)
                     warmup_batch_size = [1, self.batch_size // 2]
@@ -655,7 +655,7 @@ class PyTorchModelEngine(ModelEngine):
                                 torch.cuda.synchronize()
 
             if self.pytorch_backend_config.autotuner_enabled:
-                with no_cuda_graph(), autotune():
+                with self.no_cuda_graph(), autotune():
                     result = get_autotune_warmup_request()
                     with release_batch(result) as batch:
                         if batch is None:
@@ -699,7 +699,7 @@ class PyTorchModelEngine(ModelEngine):
                     torch.cuda.synchronize()
 
                 if self._torch_compile_piecewise_cuda_graph:
-                    with no_cuda_graph():
+                    with self.no_cuda_graph():
                         with release_batch(
                                 get_torch_compile_warmup_request(1,
                                                                  bs)) as batch:

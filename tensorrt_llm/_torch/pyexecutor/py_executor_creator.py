@@ -324,8 +324,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     # resource managers for speculative decoding
     if spec_config is not None:
         spec_resource_manager = get_spec_resource_manager(
-            spec_config, model_engine.model.config, model_engine.batch_size,
-            model_engine.max_seq_len)
+            spec_config, model_engine, draft_model_engine)
         if spec_resource_manager is not None:
             resources["spec_resource_manager"] = spec_resource_manager
 
