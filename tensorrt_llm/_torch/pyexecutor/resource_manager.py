@@ -578,7 +578,9 @@ class MambaCacheManager(BaseResourceManager):
         self.mamba_cache_index: Dict[int, int] = {}
 
         # mamba cache state indices
-        self.state_indices: torch.Tensor = torch.Tensor()
+        self.state_indices: torch.Tensor = torch.tensor([],
+                                                        device=device,
+                                                        dtype=torch.int32)
 
     def prepare_mamba_cache_blocks(self, request_ids: List[int]):
         state_indices = []
