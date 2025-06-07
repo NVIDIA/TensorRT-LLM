@@ -63,13 +63,13 @@ void groupRMSNormBase(torch::TensorList const& inputs, torch::TensorList const& 
         TORCH_CHECK(outputs[i].sizes()[0] == batch_size, "Outputs must have the same batch size.");
         TORCH_CHECK(
             outputs[i].sizes()[1] == inputs[i].sizes()[1], "Outputs and inputs must have the same last dimension.");
-        TORCH_CHECK(inputs[i].strides()[0] == outputs[i].strides()[0], "Inputs and outputs must have the same stride.");
         TORCH_CHECK(inputs[i].strides()[1] == 1, "Inputs must be contiguous along the last dimension.");
         TORCH_CHECK(outputs[i].strides()[1] == 1, "Outputs must be contiguous along the last dimension.");
         if (!weights.empty())
         {
             TORCH_CHECK(
                 inputs[i].sizes()[1] == weights[i].sizes()[0], "Inputs and weights must have the same last dimension.");
+            TORCH_CHECK(weights[i].strides()[0] == 1, "Weights must be contiguous.");
         }
     }
 
@@ -143,13 +143,13 @@ void groupRMSNormLargeBatch(torch::TensorList const& inputs, torch::TensorList c
         TORCH_CHECK(outputs[i].sizes()[0] == batch_size, "Outputs must have the same batch size.");
         TORCH_CHECK(
             outputs[i].sizes()[1] == inputs[i].sizes()[1], "Outputs and inputs must have the same last dimension.");
-        TORCH_CHECK(inputs[i].strides()[0] == outputs[i].strides()[0], "Inputs and outputs must have the same stride.");
         TORCH_CHECK(inputs[i].strides()[1] == 1, "Inputs must be contiguous along the last dimension.");
         TORCH_CHECK(outputs[i].strides()[1] == 1, "Outputs must be contiguous along the last dimension.");
         if (!weights.empty())
         {
             TORCH_CHECK(
                 inputs[i].sizes()[1] == weights[i].sizes()[0], "Inputs and weights must have the same last dimension.");
+            TORCH_CHECK(weights[i].strides()[0] == 1, "Weights must be contiguous.");
         }
     }
 
@@ -220,13 +220,13 @@ void groupRMSNormHeuristic(torch::TensorList const& inputs, torch::TensorList co
         TORCH_CHECK(outputs[i].sizes()[0] == batch_size, "Outputs must have the same batch size.");
         TORCH_CHECK(
             outputs[i].sizes()[1] == inputs[i].sizes()[1], "Outputs and inputs must have the same last dimension.");
-        TORCH_CHECK(inputs[i].strides()[0] == outputs[i].strides()[0], "Inputs and outputs must have the same stride.");
         TORCH_CHECK(inputs[i].strides()[1] == 1, "Inputs must be contiguous along the last dimension.");
         TORCH_CHECK(outputs[i].strides()[1] == 1, "Outputs must be contiguous along the last dimension.");
         if (!weights.empty())
         {
             TORCH_CHECK(
                 inputs[i].sizes()[1] == weights[i].sizes()[0], "Inputs and weights must have the same last dimension.");
+            TORCH_CHECK(weights[i].strides()[0] == 1, "Weights must be contiguous.");
         }
     }
 
