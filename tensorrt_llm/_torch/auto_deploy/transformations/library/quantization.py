@@ -112,6 +112,10 @@ def _insert_quantized_bmm(
         gm._register_load_state_dict_pre_hook(
             partial(quantization_impl.load_hook, weight_name=param_name)
         )
+        if quantization_impl.post_load_hook:
+            gm.register_load_state_dict_post_hook(
+                partial(quantization_impl.post_load_hook, weight_name=param_name)
+            )
 
         # Setup scale names and target module for parameter case
         def get_scale_name(scale_name):

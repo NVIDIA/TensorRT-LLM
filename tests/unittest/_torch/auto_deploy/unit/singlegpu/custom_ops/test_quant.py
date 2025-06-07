@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn.functional as F
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
@@ -61,3 +62,46 @@ def test_fp4_linear():
 
     assert output_fp4_gemm.shape == output_fp16_gemm.shape
     assert torch.allclose(output_fp4_gemm, output_fp16_gemm, rtol=1e-1, atol=1e-2)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("mat2_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+def test_fp8_bmm(input_dtype, mat2_dtype):
+    # Create test tensors: (B, M, K) and (B, K, N)
+    batch_size, M, K, N = 2, 32, 64, 80
+    input = torch.rand(batch_size, M, K, dtype=input_dtype, device="cuda")
+    mat2 = torch.rand(batch_size, K, N, dtype=mat2_dtype, device="cuda")
+
+    # Calculate scales similar to fp8_linear test
+    input_scale = (torch.max(torch.abs(input)) / 448).to("cuda")
+    mat2_scale = (torch.max(torch.abs(mat2)) / 448).to("cuda")
+    mat2_fp8 = (mat2 / mat2_scale).to(torch.float8_e4m3fn)
+
+    # Test fp8_bmm operation
+    output_fp8_bmm = torch.ops.quant.fp8_bmm(
+        input,
+        mat2_fp8,
+        input_scale=input_scale,
+        weight_scale=mat2_scale,
+    )
+
+    output_fp8_bmm_unquantized_inputs = torch.ops.quant.fp8_bmm(
+        input,
+        mat2,
+        input_scale=input_scale,
+        weight_scale=mat2_scale,
+    )
+
+    # Reference implementation using standard bmm
+    output_fp32_bmm = torch.bmm(input.float(), mat2.float()).to(torch.half)
+
+    assert output_fp8_bmm.shape == output_fp32_bmm.shape
+    assert output_fp8_bmm.shape == (batch_size, M, N)
+
+    cos_sim = F.cosine_similarity(output_fp32_bmm.reshape(-1), output_fp8_bmm.reshape(-1), dim=0)
+    cos_sim_unquantized = F.cosine_similarity(
+        output_fp32_bmm.reshape(-1), output_fp8_bmm_unquantized_inputs.reshape(-1), dim=0
+    )
+    assert cos_sim > 0.99
+    assert cos_sim_unquantized > 0.99

@@ -1,8 +1,10 @@
 """Definition of the quant module that can be used for PTQ."""
 
+import warnings
 from typing import Optional
 
 import torch
+from flashinfer import bmm_fp8
 from torch import nn
 
 from tensorrt_llm._torch.autotuner import autotune
@@ -218,11 +220,16 @@ def fp4_linear_fake(
     return torch.ops.aten.linear(input, weight_fp4.repeat(1, 2).to(input.dtype), bias)
 
 
+def is_column_major(tensor):
+    rows, _ = tensor.shape[-2:]
+    strides = tensor.stride()
+    return strides[-2] == 1 and strides[-1] == rows
+
+
 @torch.library.custom_op("quant::fp8_bmm", mutates_args=())
-@torch.compile(dynamic=True)
 def fp8_bmm(
     input: torch.Tensor,
-    weight: torch.Tensor,
+    mat2: torch.Tensor,
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
 ) -> torch.Tensor:
@@ -230,58 +237,50 @@ def fp8_bmm(
 
     Args:
         input: unquantized input tensor with shape (B, M, K)
-        weight: pre-quantized weight tensor with shape (B, K, N), with dtype torch.float8_e4m3fn,
+        mat2: weight tensor with shape (B, K, N), with dtype torch.float8_e4m3fn,
             or torch.float16, or torch.bfloat16
-        input_scale: a scalar tensor defined as amax / max value (448.0)
-        weight_scale: a scalar tensor defined as amax / max value (448.0)
+        input_scale: a scalar tensor - the inverse scale for input quantization
+        weight_scale: a scalar tensor - the inverse scale for weight quantization
 
     Returns:
         The BMM output with shape (B, M, N) and the original dtype as the input.
     """
     # Ensure input is contiguous
     input = input.contiguous()
+    original_input_dtype = input.dtype
+
+    # Convert input to fp8 using provided scale
     if input.dtype in [torch.float16, torch.bfloat16]:
         input_fp8 = _to_fp8(input, input_scale)
     else:
         assert input.dtype == torch.float8_e4m3fn
         input_fp8 = input
 
-    # for none fp8 case, we need to convert to fp8
-    if weight.dtype in [torch.float16, torch.bfloat16]:
-        weight_fp8 = _to_fp8(weight, weight_scale)
+    # Convert mat2 to fp8 using provided scale
+    if mat2.dtype in [torch.float16, torch.bfloat16]:
+        mat2_fp8 = _to_fp8(mat2, weight_scale)
     else:
-        assert weight.dtype == torch.float8_e4m3fn
-        weight_fp8 = weight
+        assert mat2.dtype == torch.float8_e4m3fn
+        mat2_fp8 = mat2
 
-    # Ensure weight is in the correct memory layout
-    # For cuBLASLt, we need one matrix in row-major and one in column-major format
-    # Since PyTorch uses row-major by default, we'll transpose the weight to get a different layout
-    weight_fp8 = weight_fp8.transpose(-2, -1).contiguous().transpose(-2, -1)
+    # Ensure mat2 is contiguous in column-major format only if needed
+    # Check if the tensor is already contiguous when transposed (i.e., already column-major)
+    if not is_column_major(mat2_fp8):
+        warnings.warn(
+            "mat2 is not in column-major format, transposing it, this will cause performance degradation."
+        )
+        mat2_fp8 = mat2_fp8.transpose(-2, -1).contiguous().transpose(-2, -1)
 
     # Get dimensions
     B, M, K = input.shape
-    B2, K2, N = weight_fp8.shape
+    B2, K2, N = mat2_fp8.shape
     assert B == B2, f"Batch dimensions must match: {B} vs {B2}"
     assert K == K2, f"Inner dimensions must match: {K} vs {K2}"
 
-    # Process each batch separately
-    output = torch.empty((B, M, N), dtype=input.dtype, device=input.device)
-    for b in range(B):
-        # Allocate output for this batch to avoid in-place issues
-        batch_output = output[b]
-
-        # Use _scaled_mm with explicit out parameter
-        torch._scaled_mm(
-            input_fp8[b],
-            weight_fp8[b],
-            scale_a=input_scale,
-            scale_b=weight_scale,
-            bias=None,
-            scale_result=None,
-            out_dtype=input.dtype,
-            use_fast_accum=True,
-            out=batch_output,
-        )
+    output = torch.empty((B, M, N), dtype=original_input_dtype, device=input.device)
+    bmm_fp8(
+        input_fp8, mat2_fp8, input_scale.float(), weight_scale.float(), original_input_dtype, output
+    )
 
     return output
 
@@ -289,13 +288,13 @@ def fp8_bmm(
 @fp8_bmm.register_fake
 def fp8_bmm_fake(
     input: torch.Tensor,
-    weight_fp8: torch.Tensor,
+    mat2: torch.Tensor,
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
 ) -> torch.Tensor:
     """Fake implementation of fp8_bmm for testing and tracing."""
     # Use standard bmm
-    return torch.bmm(input, weight_fp8.to(input.dtype))
+    return torch.bmm(input.to(torch.float), mat2.to(torch.float)).to(input.dtype)
 
 
 QUANT_LINEAR_OPS = [

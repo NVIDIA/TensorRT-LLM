@@ -4,7 +4,12 @@ import torch
 import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 
-from ..custom_ops.quant import FP4_GLOBAL_SCALE_MAX, FP8_MAX, TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+from ..custom_ops.quant import (
+    FP4_GLOBAL_SCALE_MAX,
+    FP8_MAX,
+    TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+    is_column_major,
+)
 from .logger import ad_logger
 from .node_utils import (
     get_quantization_params_from_linear_node,
@@ -113,6 +118,11 @@ class QuantizationImpl:
     @staticmethod
     def load_hook(state_dict, prefix, *args, weight_name: str):
         """Load hook for state_dict quantization pre-processing."""
+        pass
+
+    @staticmethod
+    def post_load_hook(state_dict, prefix, *args, weight_name: str):
+        """Load hook for state_dict quantization post-processing."""
         pass
 
     @staticmethod
@@ -416,14 +426,38 @@ class FP8BMMQuantizationImpl(QuantizationImpl):
 
     @staticmethod
     def load_hook(state_dict, prefix, *args, weight_name):
-        """Load hook for state_dict quantization pre-processing."""
+        """Pre-hook: Only handle quantization."""
         if weight_name in state_dict:
             weight = state_dict[weight_name]
+
             # If weight is not already quantized (not float8)
             if weight.dtype != torch.float8_e4m3fn:
                 # Compute weight scale
                 weight_scale = fp8_scale(weight)
-                state_dict[weight_name] = (state_dict[weight_name] / weight_scale).to(
-                    torch.float8_e4m3fn
-                )
+                weight = (weight / weight_scale).to(torch.float8_e4m3fn)
                 state_dict[weight_name + "_scale"] = weight_scale
+                state_dict[weight_name] = weight
+
+    @staticmethod
+    def post_load_hook(module, incompatible_keys, weight_name):
+        """Post-hook: Handle column-major conversion after parameter is loaded."""
+        # Navigate to the actual parameter
+        *path, attr_name = weight_name.split(".")
+        target_module = module
+        for p in path:
+            target_module = getattr(target_module, p)
+
+        if hasattr(target_module, attr_name):
+            param = getattr(target_module, attr_name)
+            if isinstance(param, torch.nn.Parameter):
+                # Convert to column-major format
+                if not is_column_major(param):
+                    with torch.no_grad():
+                        # Create column-major version
+                        param_cm = param.transpose(-2, -1).contiguous().transpose(-2, -1)
+                        # Replace the parameter
+                        setattr(
+                            target_module,
+                            attr_name,
+                            torch.nn.Parameter(param_cm, requires_grad=param.requires_grad),
+                        )
