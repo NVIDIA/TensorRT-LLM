@@ -19,6 +19,8 @@ from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
                                                    DefaultMoeRoutingMethod,
                                                    RenormalizeMoeRoutingMethod,
                                                    VanillaMoE)
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import \
+    AlltoallMethodType
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
@@ -119,6 +121,97 @@ def test_fused_moe_multi_gpu(moe_cls, ep_size):
                             moe_ep_size=ep_size,
                             moe_tp_size=world_size // ep_size))] * world_size),
         )
+        for r in results:
+            assert r is None
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4,
+                    reason="needs 4 GPUs to run this test")
+@pytest.mark.parametrize("alltoall_method_type", [
+    AlltoallMethodType.MNNVL, AlltoallMethodType.DeepEP,
+    AlltoallMethodType.DeepEPLowLatency
+])
+def test_fused_moe_alltoall(alltoall_method_type):
+    world_size = 4
+    dtype = torch.bfloat16
+    HIDDEN_SIZE = 2560
+    INTERMEDIATE_SIZE = 1536
+    NUM_EXPERTS = 72
+    TOP_K = 6
+
+    def per_rank_test_fused_moe_alltoall(job_id):
+        routing_method = DefaultMoeRoutingMethod(top_k=TOP_K)
+        mapping = Mapping(world_size=world_size,
+                          rank=mpi_rank(),
+                          tp_size=world_size,
+                          moe_ep_size=world_size,
+                          moe_tp_size=1,
+                          enable_attention_dp=True)
+        torch.cuda.set_device(mapping.rank)
+        torch.manual_seed(mapping.rank)
+
+        weights = {}
+        for expert_id in range(NUM_EXPERTS):
+            w1_weight = torch.empty((INTERMEDIATE_SIZE, HIDDEN_SIZE),
+                                    dtype=dtype).cuda()
+            w2_weight = torch.empty((HIDDEN_SIZE, INTERMEDIATE_SIZE),
+                                    dtype=dtype).cuda()
+            w3_weight = torch.empty((INTERMEDIATE_SIZE, HIDDEN_SIZE),
+                                    dtype=dtype).cuda()
+            torch.nn.init.xavier_uniform_(w1_weight)
+            torch.nn.init.xavier_uniform_(w2_weight)
+            torch.nn.init.xavier_uniform_(w3_weight)
+            weights[f"{expert_id}.w1.weight"] = w1_weight
+            weights[f"{expert_id}.w2.weight"] = w2_weight
+            weights[f"{expert_id}.w3.weight"] = w3_weight
+        models = []
+        for method_type in [
+                alltoall_method_type, AlltoallMethodType.NotEnabled
+        ]:
+            CutlassFusedMoE.select_alltoall_method_type = lambda *args: method_type
+            model = CutlassFusedMoE(
+                num_experts=NUM_EXPERTS,
+                routing_method=routing_method,
+                hidden_size=HIDDEN_SIZE,
+                intermediate_size=INTERMEDIATE_SIZE,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=ModelConfig(mapping=mapping),
+            )
+            model.load_weights([weights])
+            model.cuda()
+            models.append(model)
+        alltoall_model, ref_model = models
+
+        # Evaluate the outputs on a variant sequence length to cover all possible keys in Autotuner cache
+        m = 8
+        while m >= 1:
+            x = torch.randn((m, HIDDEN_SIZE), dtype=dtype).cuda()
+            router_logits = torch.randn((m, NUM_EXPERTS), dtype=dtype).cuda()
+            all_rank_num_tokens = [m] * mapping.world_size
+
+            with torch.inference_mode():
+                output = alltoall_model.forward(
+                    x,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    use_dp_padding=False)
+                ref_output = ref_model.forward(
+                    x,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    use_dp_padding=False)
+
+            # Evaluate outputs
+            torch.testing.assert_close(output,
+                                       ref_output,
+                                       rtol=0.05,
+                                       atol=0.002)
+            m //= 2
+
+    with MPIPoolExecutor(max_workers=world_size) as executor:
+        results = executor.map(per_rank_test_fused_moe_alltoall,
+                               range(world_size))
         for r in results:
             assert r is None
 
