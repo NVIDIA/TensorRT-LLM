@@ -66,7 +66,7 @@ class OpenAIMultiModalDisaggServer:
                 connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, keepalive_timeout=300),
                 timeout=aiohttp.ClientTimeout(total=req_timeout_secs))
 
-            logging.info("Waiting for context and generation servers to be ready")
+            logging.info("Waiting for multimodal and LLM decoder servers to be ready")
             await self.wait_for_servers_ready(server_start_timeout_secs)
             yield
             await self.session.close()  # Ensure session cleanup
@@ -325,4 +325,4 @@ class OpenAIMultiModalDisaggServer:
         try:
             await asyncio.wait_for(check_all_servers_ready(), timeout=server_start_timeout_secs)
         except asyncio.CancelledError:
-            raise TimeoutError("Timeout waiting for context and generation servers to be ready")
+            raise TimeoutError("Timeout waiting for multimodal and LLM decoder servers to be ready")

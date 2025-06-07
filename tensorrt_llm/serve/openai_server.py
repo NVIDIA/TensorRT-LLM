@@ -254,7 +254,7 @@ class OpenAIServer:
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
             skip_loading = True if request.mm_params is not None else False
-            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config, skip_loading=True)
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config, skip_loading)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids

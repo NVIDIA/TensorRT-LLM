@@ -108,7 +108,10 @@ class OpenAIEncoderServer:
             promise = await self.encoder.generate_async(mm_request)
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             response = await create_mm_embedding_response(promise)
-            return JSONResponse(content=asdict(response))
+            if isinstance(response, MultimodalParams):
+                return JSONResponse(content=asdict(response))
+            else:
+                return JSONResponse(content=response.model_dump())
 
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server

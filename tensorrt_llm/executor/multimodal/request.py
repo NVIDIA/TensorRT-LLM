@@ -5,7 +5,7 @@ from typing import (Any, List, Optional, AsyncIterator)
 import torch
 
 from typing import cast
-from tensorrt_llm.inputs.utils import load_image
+from tensorrt_llm.inputs.utils import load_image, async_load_image
 from tensorrt_llm.multimodal_params import MultimodalParams
 
 __all__ = [
@@ -13,53 +13,6 @@ __all__ = [
     "MultimodalResponse",
 ]
 
-# TODO: this should already be in the gh-main
-async def async_load_image(
-        image: str,
-        format: str = "pt",
-        device: str = "cuda"):
-    from PIL import Image
-    from io import BytesIO
-    from pathlib import Path
-    from urllib.parse import urlparse
-    import aiohttp
-    import base64
-    from torchvision.transforms import ToTensor
-
-    def _load_and_convert_image(image):
-        image = Image.open(image)
-        image.load()
-        return image.convert("RGB")
-
-    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
-
-    parsed_url = urlparse(image)
-
-    if parsed_url.scheme in ["http", "https"]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(image) as response:
-                content = await response.read()
-                image = _load_and_convert_image(BytesIO(content))
-    elif parsed_url.scheme == "data":
-        data_spec, data = parsed_url.path.split(",", 1)
-        media_type, data_type = data_spec.split(";", 1)
-
-        if data_type != "base64":
-            msg = "Only base64 data URLs are supported for now."
-            raise NotImplementedError(msg)
-
-        content = base64.b64decode(data)
-        image = _load_and_convert_image(BytesIO(content))
-    else:
-        image = _load_and_convert_image(Path(parsed_url.path))
-
-    if format == "pt":
-        return ToTensor()(image).to(device=device)
-    else:
-        return image
-
-
-# TODO: move to a separate file
 @dataclass(slots=True)
 class MultimodalItem:
     # request id for this item
