@@ -1038,10 +1038,10 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                 trust_remote_code=True,
                 attn_backend=model_config.attn_backend,
                 moe_backend=model_config.moe_backend,
-                mapping=model_config.mapping)
-            draft_config.spec_config = model_config.spec_config
-            draft_config.max_num_tokens = model_config.max_num_tokens
-            draft_config.moe_max_num_tokens = model_config.moe_max_num_tokens
+                mapping=model_config.mapping,
+                spec_config=model_config.spec_config,
+                max_num_tokens=model_config.max_num_tokens,
+                moe_max_num_tokens=model_config.moe_max_num_tokens)
             draft_config.quant_config.kv_cache_quant_algo = \
                 model_config.quant_config.kv_cache_quant_algo
             self.draft_model = Eagle3LlamaForCausalLM(
@@ -1242,8 +1242,6 @@ class Eagle3LlamaDraftModel(DecoderModel):
 
         hidden_states, hidden_states_to_save = self.norm(
             hidden_states, residual)
-        if self.spec_config.spec_dec_mode.is_eagle3():
-            spec_metadata.maybe_capture_hidden_states(1, hidden_states_to_save)
         return hidden_states, hidden_states_to_save
 
 
@@ -1273,6 +1271,9 @@ class Eagle3LlamaForCausalLM(DecoderModelForCausalLM[Eagle3LlamaDraftModel,
         hidden_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        if hidden_states is None:
+            hidden_states = spec_metadata.get_hidden_states(
+                preprocess_func=self.apply_eagle3_fc)
         output, _ = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,

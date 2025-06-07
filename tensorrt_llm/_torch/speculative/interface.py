@@ -1,14 +1,13 @@
 import copy
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Dict, List, Optional
+from typing import List, Optional, Type
 
 import torch
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
 from ..model_config import TConfig
-from ..pyexecutor.scheduler import ScheduledRequests
 
 
 class SpeculativeDecodingMode(IntEnum):
@@ -56,10 +55,13 @@ class SpeculativeDecodingMode(IntEnum):
         """
         return self.is_eagle3_one_model()
 
+    def has_draft_model_engine(self):
+        return self.is_eagle3()
+
     def has_spec_decoder(self):
         return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
 
-    def extend_ctx(self, attention_backend: AttentionBackend):
+    def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
         If true, treat generation requests with draft tokens as
         chunked context requests at the kernel level. Required for
@@ -68,7 +70,7 @@ class SpeculativeDecodingMode(IntEnum):
 
         # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
         return (self.is_eagle3()
-                and not (isinstance(attention_backend, TrtllmAttention)
+                and not (issubclass(attention_backend, TrtllmAttention)
                          and get_sm_version() == 100)) or self.is_ngram()
 
     @staticmethod
@@ -117,6 +119,8 @@ class SpecMetadata:
     max_num_requests: int
     # The max number of draft tokens.
     max_draft_tokens: int
+    # The number of context sequences in the batch.
+    num_context: int = 0
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
     # Whether CUDA graph is enabled.
@@ -146,9 +150,15 @@ class SpecMetadata:
     # same kv lengths for different layers. Add extra kv token in kv cache manager
     # to haddle this issue.
     num_extra_kv_tokens: Optional[int] = 0  # Number of layers in target model
+    # The number of layers
     num_layers: int = 0
 
     def prepare(self):
+        """
+        Hook to be called before the forward step of the model.
+        """
+
+    def prepare_device(self):
         """
         Hook to be called before the forward step of the model.
         """
@@ -173,21 +183,3 @@ class SpecMetadata:
         Some spec decode algorithms require hidden states from the target
         model. Use this method to record them. By default, does nothing.
         """
-
-    def get_hidden_states(
-            self,
-            scheduled_requests: ScheduledRequests,
-            num_rejected_tokens: Optional[Dict] = None) -> List[torch.Tensor]:
-        """
-        Return any captured hidden states. Should do any necessary
-        pre-processing.
-
-        num_rejected_tokens is a dictionary mapping request IDs to the
-        number of tokens rejected for that request. If a request ID isn't
-        in the dictionary, it means that the request is not needed for drafting.
-
-        If the dictionary is not given, this function assumes that the hidden
-        states are being prepared for running the draft model autoregressively,
-        and only the last hidden state vector for each sequence is returned.
-        """
-        return []
