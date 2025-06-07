@@ -1569,6 +1569,31 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
         _check_mem_usage(running_log, [54.50, 0, 0, 0])
 
 
+@pytest.mark.skip_less_device(4)
+def test_ptq_quickstart_advanced_bs1(llm_root, llm_venv):
+    model_name = "DeepSeek-V3-Lite-FP8"
+    model_path = "DeepSeek-V3-Lite/fp8"
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--use_cuda_graph",
+        "--cuda_graph_padding_enabled",
+        "--cuda_graph_batch_sizes",
+        "8",
+        "--disable_overlap_scheduler",
+        "--enable_attention_dp",
+        "--tp_size",
+        "4",
+        "--moe_ep_size",
+        "4",
+        "--prompt",
+        "\"NVIDIA is a great company because\"",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+    ])
+
+
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
 ])
