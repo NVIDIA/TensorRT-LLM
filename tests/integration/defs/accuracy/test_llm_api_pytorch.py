@@ -16,7 +16,9 @@ import pytest
 
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import MoeLoadBalancerConfig
-from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig, SamplingParams
+from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
+                                 MTPDecodingConfig, NGramDecodingConfig,
+                                 SamplingParams)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -196,7 +198,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5292517")
     @skip_pre_hopper
     def test_fp8_llm_sampler(self):
         model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
@@ -213,6 +214,54 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           sampling_params=sampling_params,
                           extra_acc_spec="temperature=0.8,top_p=0.95")
+
+    def test_eagle3(self):
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            use_cuda_graph=True,
+            cuda_graph_batch_sizes=[1],
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+        eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
+        target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+        draft_len = 4
+        spec_config = EagleDecodingConfig(
+            max_draft_len=draft_len, pytorch_eagle_weights_path=eagle_model_dir)
+
+        llm = LLM(model=target_model_dir,
+                  **pytorch_config,
+                  kv_cache_config=kv_cache_config,
+                  speculative_config=spec_config,
+                  build_config=None)
+
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_ngram(self):
+        pytorch_config = dict(disable_overlap_scheduler=True)
+
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+        draft_len = 4
+        spec_config = NGramDecodingConfig(
+            prompt_lookup_num_tokens=draft_len,
+            max_matching_ngram_size=draft_len,
+            is_keep_all=True,
+            is_use_oldest=True,
+            is_public_pool=True,
+        )
+
+        llm = LLM(model=self.MODEL_PATH,
+                  **pytorch_config,
+                  kv_cache_config=kv_cache_config,
+                  speculative_config=spec_config)
+
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestLlama3_2_1B(LlmapiAccuracyTestHarness):

@@ -223,7 +223,7 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        position_ids: Optional[torch.LongTensor],
+        position_ids: Optional[torch.IntTensor],
         hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
@@ -238,7 +238,7 @@ class Attention(nn.Module):
         Forward pass for the Attention module.
 
         Args:
-            position_ids (Optional[torch.LongTensor]): The position IDs.
+            position_ids (Optional[torch.IntTensor]): The position IDs.
             hidden_states (torch.Tensor): The hidden states.
             attn_metadata (AttentionMetadata): The attention metadata.
             attention_mask (PredefinedAttentionMask): The attention mask type.
@@ -692,7 +692,7 @@ class MLA(nn.Module):
         Forward pass for the MLA module.
 
         Args:
-            position_ids (Optional[torch.LongTensor]): The position IDs.
+            position_ids (Optional[torch.IntTensor]): The position IDs.
             hidden_states (torch.Tensor): The hidden states.
             attn_metadata (AttentionMetadata): The attention metadata.
             all_reduce_params (Optional[AllReduceParams]): The all reduce parameters.
@@ -846,7 +846,7 @@ class MLA(nn.Module):
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        position_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
     ) -> torch.Tensor:
         trtllm_attention = cast(TrtllmAttention, self.mha)
         # split current q into q_nope and q_pe
@@ -954,7 +954,7 @@ class MLA(nn.Module):
         k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
         latent_cache: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
     ) -> torch.Tensor:
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
