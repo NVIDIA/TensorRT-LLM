@@ -61,6 +61,9 @@ meta-llama/Llama-3.3-70B-Instruct:
     accuracy: 81.02
 meta-llama/Llama-4-Maverick-17B-128E-Instruct:
   - accuracy: 86.40
+  # - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
+  #   kv_cache_quant_algo: FP8
+  #   accuracy: 0.0
 meta-llama/Llama-4-Scout-17B-16E-Instruct:
   - accuracy: 80.00
 mistralai/Mistral-7B-v0.1:
