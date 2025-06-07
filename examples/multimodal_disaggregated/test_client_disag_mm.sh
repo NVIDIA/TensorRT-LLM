@@ -105,9 +105,9 @@ INPUT_FILE="./mm_data_oai.json"
 SERVER_URL="localhost:${PORT}"
 
 # Set append name based on port
-if [ "${PORT}" = "8003" ]; then
+if [ "${PORT}" = "8000" ]; then
     APPEND_NAME="disagg"
-elif [ "${PORT}" = "8001" ]; then
+elif [ "${PORT}" = "8002" ]; then
     APPEND_NAME="agg"
 else
     APPEND_NAME="port${PORT}"
