@@ -2030,7 +2030,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     int const max_distance = mMaxDistance;
     bool const* finished = nullptr;
 
-    auto const quant_option = tc::QuantMode::fromDescription();
+    auto const quant_option = tc::QuantMode{};
     float const* qkv_scale_out = nullptr;
 
     int const* ia3_tasks = nullptr;

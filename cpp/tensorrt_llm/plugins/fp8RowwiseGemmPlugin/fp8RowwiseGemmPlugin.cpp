@@ -389,7 +389,7 @@ IPluginV2* Fp8RowwiseGemmPluginCreator::createPlugin(char const* name, PluginFie
         // Fp8RowwiseGemmPluginCreator is unique and shared for an engine generation
         // Create plugin profiler with shared tactics map
         auto pluginProfiler = mGemmPluginProfileManager.createGemmPluginProfiler(/* inference */ false);
-        QuantMode quantMode = QuantMode::fromDescription();
+        QuantMode quantMode = QuantMode{};
         auto* obj = new Fp8RowwiseGemmPlugin(quantMode, type, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
