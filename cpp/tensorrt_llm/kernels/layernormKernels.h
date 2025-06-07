@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/quantization.h"
 #include <assert.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -26,10 +27,11 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-template <typename T>
+template <typename T, typename QuantT>
 void invokeGeneralLayerNorm(T* out, T const* input, T const* gamma, T const* beta, float const eps, int const tokens,
-    int const hidden_dim, cudaStream_t stream = 0, bool use_diff_of_squares = true, float const* scale = nullptr,
-    float* dynamic_scale = nullptr, int8_t* out_quant = nullptr);
+    int const hidden_dim, tensorrt_llm::common::QuantMode quant_mode, cudaStream_t stream = 0,
+    bool use_diff_of_squares = true, float const* clamp_val = nullptr, float const* scale = nullptr,
+    float* dynamic_scale = nullptr, float* sum_per_token = nullptr, QuantT* out_quant = nullptr);
 
 } // namespace kernels
 } // namespace tensorrt_llm

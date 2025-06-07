@@ -70,6 +70,7 @@ if __name__ == "__main__":
         choices=[
             "nvfp4",
             "fp8",
+            "fp8_pc_pt",
             "int8_sq",
             "int4_awq",
             "w4a8_awq",
