@@ -1569,6 +1569,34 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
         _check_mem_usage(running_log, [54.50, 0, 0, 0])
 
 
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
+])
+def test_ptq_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
+                                       model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--disable_overlap_scheduler",
+            "--spec_decode_nextn",
+            "4",
+            "--max_matching_ngram_size",
+            "2",
+            "--spec_decode_algo",
+            "NGRAM",
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+        ],
+                         stdout=running_log)
+        _check_mem_usage(running_log, [4.60, 0, 0, 0])
+
+
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(8)
 @skip_pre_hopper

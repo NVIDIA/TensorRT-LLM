@@ -12,6 +12,7 @@
 
 #pragma once
 
+#define EIGEN_STACK_ALLOCATION_LIMIT (1U << 20)
 #include "../mha.h"
 #include <Eigen/Dense>
 
@@ -84,7 +85,7 @@ template <typename MathElem, bool isPaged, bool useBeamSearch>
 #if SPEC_DEC
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, bool* hostMask, const uint32_t qSeqLen, const uint32_t q_len);
+    float kvScale, float xScale, uint32_t slidingWinSize, bool* hostMask, const uint32_t qSeqLen, const uint32_t q_len);
 #else
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,

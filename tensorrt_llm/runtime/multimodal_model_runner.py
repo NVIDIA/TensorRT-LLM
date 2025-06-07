@@ -1771,7 +1771,7 @@ class MultimodalModelRunner:
 
     def get_rope_index(
         self,
-        input_ids: torch.LongTensor,
+        input_ids: torch.IntTensor,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -1803,7 +1803,7 @@ class MultimodalModelRunner:
                 Here we calculate the text start position_ids as the max vision position_ids plus 1.
 
         Args:
-            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+            input_ids (`torch.IntTensor` of shape `(batch_size, sequence_length)`):
                 Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
                 it.
             image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
@@ -1817,7 +1817,7 @@ class MultimodalModelRunner:
                 - 0 for tokens that are **masked**.
 
         Returns:
-            position_ids (`torch.LongTensor` of shape `(3, batch_size, sequence_length)`)
+            position_ids (`torch.IntTensor` of shape `(3, batch_size, sequence_length)`)
             mrope_position_deltas (`torch.Tensor` of shape `(batch_size)`)
         """
         spatial_merge_size = self.spatial_merge_size

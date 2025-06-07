@@ -10,9 +10,10 @@
  * its affiliates is strictly prohibited.
  */
 
-#include "barriers.cuh"
 #include "cuda_hint.cuh"
 #include "defines.h"
+#if !(IS_MLA)
+#include "barriers.cuh"
 #include "utils.cuh"
 #include "utils.h"
 
@@ -29,6 +30,7 @@ inline constexpr bool swapAB = SWAP_AB;
 
 #ifndef GENERATE_CUBIN
 #include "hostUtils.h"
+#include "tensorMap.h"
 #include <cuda_runtime.h>
 #endif
 #include "gmma.cuh"
@@ -2986,89 +2988,6 @@ __device__ inline void storeRotatedPairsForQ(SharedMem::QBuffer& dst,
 }
 
 #ifndef GENERATE_CUBIN
-constexpr uint32_t getElemBytes(CUtensorMapDataType_enum dataType)
-{
-    switch (dataType)
-    {
-    case CU_TENSOR_MAP_DATA_TYPE_UINT8: return 1;
-    case CU_TENSOR_MAP_DATA_TYPE_UINT16: return 2;
-    case CU_TENSOR_MAP_DATA_TYPE_UINT32: return 4;
-    case CU_TENSOR_MAP_DATA_TYPE_INT32: return 4;
-    case CU_TENSOR_MAP_DATA_TYPE_UINT64: return 8;
-    case CU_TENSOR_MAP_DATA_TYPE_INT64: return 8;
-    case CU_TENSOR_MAP_DATA_TYPE_FLOAT16: return 2;
-    case CU_TENSOR_MAP_DATA_TYPE_FLOAT32: return 4;
-    case CU_TENSOR_MAP_DATA_TYPE_FLOAT64: return 8;
-    case CU_TENSOR_MAP_DATA_TYPE_BFLOAT16: return 2;
-    case CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ: return 4;
-    case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32: return 4;
-    case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ: return 4;
-    }
-    throw std::runtime_error("unsupported data type");
-}
-
-static CUtensorMap makeTensorMapForContiguousKVCache(void const* addr, CUtensorMapDataType_enum dataType,
-    uint32_t headElems, uint32_t nbKHeads, uint32_t maxCacheLen, uint32_t beamWidth, uint32_t batchSize,
-    uint32_t nbTokensPerTile)
-{
-    CUtensorMap tensorMap{};
-    uint64_t const globalDims[] = {headElems, maxCacheLen, nbKHeads, 2 * beamWidth * batchSize};
-    uint32_t elemBytes = getElemBytes(dataType);
-    uint32_t const headBytes = elemBytes * headElems;
-    uint64_t const globalStrides[] = {headBytes, headBytes * maxCacheLen, headBytes * maxCacheLen * nbKHeads};
-    assert(headElems <= 256);
-    uint32_t const paddedHeadElems = headElems <= 64 ? 64 : (headElems <= 128 ? 128 : 256);
-    uint32_t const partElems = mha::min(elemBytes * paddedHeadElems, 128U) / elemBytes;
-    uint32_t const boxDims[] = {partElems, nbTokensPerTile, 1, 1};
-    uint32_t const elemStrides[] = {1, 1, 1, 1};
-
-    auto const swizzle = [&]
-    {
-        switch (partElems)
-        {
-        case 128: return CU_TENSOR_MAP_SWIZZLE_128B;
-        case 64: return CU_TENSOR_MAP_SWIZZLE_64B;
-        default: throw std::runtime_error("unsupported cache head size");
-        }
-    }();
-
-    checkCu(cuTensorMapEncodeTiled(&tensorMap, dataType, 4, const_cast<void*>(addr), globalDims, globalStrides, boxDims,
-        elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-    return tensorMap;
-}
-
-static CUtensorMap makeTensorMapForPagedKVCache(void const* addr, CUtensorMapDataType_enum dataType, uint32_t headElems,
-    uint32_t nbKHeads, uint32_t tokensPerPage, uint32_t nbTokensPerTile)
-{
-    CUtensorMap tensorMap{};
-    uint32_t elemBytes = getElemBytes(dataType);
-    uint64_t const globalDims[] = {headElems, tokensPerPage, nbKHeads, 1U << 31};
-    uint32_t const headBytes = elemBytes * headElems;
-    uint64_t const globalStrides[] = {headBytes, headBytes * tokensPerPage, headBytes * tokensPerPage * nbKHeads};
-    assert(headElems <= 256);
-    uint32_t const paddedHeadElems = headElems <= 64 ? 64 : (headElems <= 128 ? 128 : 256);
-    uint32_t const partBytes = mha::min(elemBytes * paddedHeadElems, 128U);
-    uint32_t const partElems = partBytes / elemBytes;
-    uint32_t const boxDims[] = {partElems, mha::min(tokensPerPage, nbTokensPerTile), 1, 1};
-    uint32_t const elemStrides[] = {1, 1, 1, 1};
-
-    auto const swizzle = [&]
-    {
-        switch (partBytes)
-        {
-        case 128: return CU_TENSOR_MAP_SWIZZLE_128B;
-        case 64: return CU_TENSOR_MAP_SWIZZLE_64B;
-        default: throw std::runtime_error("unsupported cache head size");
-        }
-    }();
-
-    checkCu(cuTensorMapEncodeTiled(&tensorMap, dataType, 4, const_cast<void*>(addr), globalDims, globalStrides, boxDims,
-        elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-    return tensorMap;
-}
-
 void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
@@ -3163,8 +3082,8 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
         }
         throw std::runtime_error("unsupported cache element type");
     }();
-    auto const tensorMap
-        = makeTensorMapForPagedKVCache(pool, dtype, validElemsPerHead, nbKHeads, tokensPerPage, gemm0CtaTileNbTokens);
+    auto const tensorMap = makeTensorMapForPagedKVCache(
+        pool, dtype, validElemsPerHead, nbKHeads, tokensPerPage, cacheHeadPartElems, gemm0CtaTileNbTokens);
     cudaError_t const err = cudaLaunchKernelEx(&launchCfg, &kernel_mha, nbKHeads,
 #if SLIDING_WINDOW
         slidingWinSize,
@@ -3195,8 +3114,8 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     static_assert(!usePagedKVCache);
     assert(gemm0CtaTileNbTokens == gemm1CtaTileNbTokens);
     auto const tensorMap = makeTensorMapForContiguousKVCache(kvCacheData, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-        validElemsPerHead, nbKHeads, maxSeqLen, beamWidth, batchSize, gemm0CtaTileNbTokens);
-    cudaLaunchKernelEx(&launchCfg, kernel_mha, nbKHeads,
+        validElemsPerHead, nbKHeads, maxSeqLen, beamWidth, batchSize, cacheHeadPartElems, gemm0CtaTileNbTokens);
+    cudaError_t const err = cudaLaunchKernelEx(&launchCfg, kernel_mha, nbKHeads,
 #if SLIDING_WINDOW
         slidingWinSize,
 #endif
@@ -3220,4 +3139,6 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #endif
     checkCuda(err);
 }
+#endif
+
 #endif

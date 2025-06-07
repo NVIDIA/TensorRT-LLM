@@ -439,7 +439,7 @@ class MTPWorker(nn.Module):
 
     def update_mtp_hidden_states(
         self,
-        input_ids: torch.LongTensor,
+        input_ids: torch.IntTensor,
         target_model_hidden_states: torch.Tensor,
         num_accepted_tokens: torch.Tensor,
         accepted_tokens: torch.Tensor,
@@ -453,7 +453,7 @@ class MTPWorker(nn.Module):
         Also update the seq_len and kv_lens in attention metadata.
 
         Args:
-            input_ids: torch.LongTensor
+            input_ids: torch.IntTensor
                 [num_tokens]
                 The input ids of all requests. Flatten.
 
@@ -647,7 +647,7 @@ class MTPWorker(nn.Module):
 
     def sample_and_accept_draft_tokens(
         self,
-        input_ids: torch.LongTensor,
+        input_ids: torch.IntTensor,
         logits: torch.Tensor,
         spec_metadata: MTPSpecMetadata,
         attn_metadata: AttentionMetadata,
@@ -659,7 +659,7 @@ class MTPWorker(nn.Module):
         for acceptance.
 
         Args:
-            input_ids: torch.LongTensor
+            input_ids: torch.IntTensor
                 [num_tokens]
                 The input ids of all requests. Flatten.
 
@@ -849,8 +849,8 @@ class MTPWorker(nn.Module):
     def prepare_drafter_inputs(
         self,
         mtp_layer_idx: int,
-        input_ids: torch.LongTensor,
-        position_ids: torch.LongTensor,
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
         previous_layer_hidden_states: torch.Tensor,
         previous_layer_draft_tokens: torch.Tensor,
         num_accepted_tokens: torch.Tensor,
@@ -864,13 +864,13 @@ class MTPWorker(nn.Module):
             mtp_layer_idx: int
                 The index number of the current MTP layer.
 
-            input_ids: torch.LongTensor
+            input_ids: torch.IntTensor
                 [num_tokens]
                 The input ids of all requests. Flatten.
                 When mtp_layer_idx == 0: num_tokens = sum(all prompts) + num_generation * (mtp_num_modules + 1)
                 When mtp_layer_idx > 0: num_tokens = sum(all prompts) + num_generation * (mtp_num_modules)
 
-            position_ids: torch.LongTensor
+            position_ids: torch.IntTensor
                 [1][num_tokens]
                 The position id of all requests. Flatten.
 
@@ -1157,8 +1157,8 @@ class MTPEagleWorker(MTPWorker):
 
     def prepare_drafter_inputs(
         self,
-        input_ids: torch.LongTensor,
-        position_ids: torch.LongTensor,
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         accepted_tokens: torch.Tensor,
         num_accepted_tokens: torch.Tensor,
