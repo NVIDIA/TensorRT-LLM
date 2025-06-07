@@ -110,8 +110,15 @@ class TestFunctional(unittest.TestCase):
         b_pt_batched = e2m1_and_ufp8_scale_batches(b_fp4.cpu(), b_sf.cpu(),
                                                    1 / b_global_sf, sf_vec_size)
 
-        c = (torch.ops.trtllm.fp4_bmm(a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,
-                                      False).float().cpu())
+        c = (
+            torch.ops.trtllm.fp4_bmm(
+                a_fp4,
+                b_fp4,
+                a_sf,
+                b_sf,
+                ab_global_sf,
+                0  # FP4GemmType.W4A4_NVFP4_NVFP4
+            ).float().cpu())
 
         torch.cuda.synchronize()
 
