@@ -120,7 +120,7 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
         c = c ^ (c >> 31);
         seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
     }
-
+    // TODO: support external hashes for multimodal
     return seed;
 }
 
