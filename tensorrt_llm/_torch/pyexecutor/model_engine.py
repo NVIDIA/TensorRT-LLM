@@ -479,6 +479,10 @@ class PyTorchModelEngine(ModelEngine):
             logger.info("Skipping warm up as no KV Cache manager allocated.")
             return
 
+        # The lifetime of model engine and kv cache manager can be different.
+        # Reset the global cuda graph dummy request to None in warmup.
+        self.cuda_graph_dummy_request = None
+
         def get_cuda_graph_warmup_request(batch_size):
             available_blocks = kv_cache_manager.get_num_free_blocks()
             if available_blocks >= batch_size:

@@ -78,6 +78,13 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--use_cuda_graph', default=False, action='store_true')
+    parser.add_argument('--cuda_graph_padding_enabled',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--cuda_graph_batch_sizes',
+                        nargs='+',
+                        type=int,
+                        default=None)
     parser.add_argument('--print_iter_log',
                         default=False,
                         action='store_true',
@@ -160,6 +167,8 @@ def setup_llm(args):
               kv_cache_config=kv_cache_config,
               attn_backend=args.attention_backend,
               use_cuda_graph=args.use_cuda_graph,
+              cuda_graph_padding_enabled=args.cuda_graph_padding_enabled,
+              cuda_graph_batch_sizes=args.cuda_graph_batch_sizes,
               load_format=args.load_format,
               print_iter_log=args.print_iter_log,
               enable_iter_perf_stats=args.print_iter_log,
