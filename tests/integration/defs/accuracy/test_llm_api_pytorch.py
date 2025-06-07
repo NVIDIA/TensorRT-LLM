@@ -445,6 +445,15 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_auto_dtype_vswa(self):
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True,
+            free_gpu_memory_fraction=None,
+            max_attention_window=[512, 512, 512, 512, 512, 32768])
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestMixtral8x7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
