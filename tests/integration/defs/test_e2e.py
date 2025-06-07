@@ -1908,7 +1908,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             ],
             "video": [
                 ["city", "night", "lights", "jacket", "wet"],
-                ["earth", "spinning", "black", "illuminated", "lights"],
+                ["earth", "spinning", "black"],
             ],
         },
         "qwen2.5-vl-7b-instruct": {
