@@ -49,7 +49,9 @@ XqaDispatcher::XqaDispatcher(XqaFixedParams fixedParams)
     if (mUseTllmGen)
     {
         // The preprocessing kernel will convert Q from inputDataType to fp8 if the kv cache dtype is also e4m3.
-        mQDataType = (mFixedParams.kvDataType == DATA_TYPE_E4M3) ? DATA_TYPE_E4M3 : mFixedParams.inputDataType;
+        mQDataType = (mFixedParams.kvDataType == DATA_TYPE_E4M3 || mFixedParams.kvDataType == DATA_TYPE_E2M1)
+            ? DATA_TYPE_E4M3
+            : mFixedParams.inputDataType;
         mTllmGenFMHARunner.reset(
             new TllmGenFmhaRunner(mQDataType, mFixedParams.kvDataType, mFixedParams.outputDataType));
     }
@@ -167,7 +169,7 @@ bool XqaDispatcher::isSupported()
     if (mUseTllmGen)
     {
         // TODO (perkzz): add the support of fp8-kv fp16/bf16-mma fmha.
-        if ((mFixedParams.kvDataType != mFixedParams.mathDataType) || (mQDataType != mFixedParams.mathDataType))
+        if (mQDataType != mFixedParams.mathDataType)
         {
             TLLM_LOG_WARNING("Unsupported data type combination.");
             return false;
@@ -225,7 +227,8 @@ bool XqaDispatcher::isSupported()
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T, typename KVCacheBuffer>
-void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buffer)
+void XqaDispatcher::runImpl(
+    XQAParams params, KVCacheBuffer const& kv_cache_buffer, KVCacheBuffer const& kv_cache_block_scales_buffer)
 {
     if (mUseTllmGen)
     {
@@ -239,9 +242,19 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         unsigned int beam_width = params.beam_width;
         unsigned int batch_beam_size = params.batch_size * beam_width;
 
-        const KvCacheDataType cache_type = params.kv_cache_quant_mode.hasInt8KvCache()
-            ? KvCacheDataType::INT8
-            : (params.kv_cache_quant_mode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
+        KvCacheDataType cache_type{KvCacheDataType::BASE};
+        if (params.kv_cache_quant_mode.hasInt8KvCache())
+        {
+            cache_type = KvCacheDataType::INT8;
+        }
+        else if (params.kv_cache_quant_mode.hasFp8KvCache())
+        {
+            cache_type = KvCacheDataType::FP8;
+        }
+        else if (params.kv_cache_quant_mode.hasFp4KvCache())
+        {
+            cache_type = KvCacheDataType::NVFP4;
+        }
 
         XQALaunchParam<KVCacheBuffer> launchParams;
         void* inputScratch = nullptr;
@@ -291,16 +304,17 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         preprocessingParms.qkv_input = static_cast<T*>(const_cast<void*>(params.qkv));
         preprocessingParms.q_output = static_cast<T*>(xqa_q_input_ptr);
         preprocessingParms.kv_cache_buffer = kv_cache_buffer;
-        preprocessingParms.kv_cache_block_scales_buffer = {};
+        preprocessingParms.kv_cache_block_scales_buffer = kv_cache_block_scales_buffer;
         preprocessingParms.qkv_bias = static_cast<T const*>(params.qkv_bias);
         // Prepare values for fmha.
         preprocessingParms.fmha_bmm1_scale = launchParams.bmm1_scale_ptr;
         preprocessingParms.fmha_bmm2_scale = launchParams.bmm2_scale_ptr;
         bool const is_fp8_q_input = (mQDataType == DATA_TYPE_E4M3);
-        if (params.kv_cache_quant_mode.hasFp8KvCache())
+        if (params.kv_cache_quant_mode.hasFp8KvCache() || params.kv_cache_quant_mode.hasFp4KvCache())
         {
             preprocessingParms.q_scale_quant_orig = params.kv_scale_quant_orig;
             preprocessingParms.kv_scale_quant_orig = params.kv_scale_quant_orig;
+            preprocessingParms.kv_scale_orig_quant = params.kv_scale_orig_quant;
         }
         if (params.is_fp8_output)
         {
@@ -313,7 +327,8 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         preprocessingParms.cu_seq_lens = cu_seqlens;
         preprocessingParms.rotary_embedding_inv_freq = rotary_inv_freq_buf;
         preprocessingParms.rotary_coef_cache_buffer = params.rotary_cos_sin;
-        preprocessingParms.kvScaleOrigQuant = params.kv_scale_orig_quant;
+        // The second level scale for NVFP4 KV cache. It points to an array of 2 float, separate scales for K and V.
+        // If set to nullptr, kv_scale_orig_quant will be used instead for both K and V.
         preprocessingParms.kv_cache_scale_factors = nullptr;
         preprocessingParms.spec_decoding_position_offsets = params.spec_decoding_position_offsets;
         preprocessingParms.mrope_position_deltas = params.mrope_position_deltas;
@@ -369,6 +384,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
             // Paged KV
             tllmRunnerParams.mQkvLayout = QkvLayout::PagedKv;
             tllmRunnerParams.kvPtr = kv_cache_buffer.mPrimaryPoolPtr;
+            tllmRunnerParams.kvSfPtr = kv_cache_block_scales_buffer.mPrimaryPoolPtr;
             tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(kv_cache_buffer.data);
             tllmRunnerParams.mMaxNumPagesPerSeqKv = kv_cache_buffer.mMaxBlocksPerSeq;
             tllmRunnerParams.mNumTokensPerPage = kv_cache_buffer.mTokensPerBlock;
@@ -430,31 +446,33 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
     }
 }
 
-void XqaDispatcher::run(XQAParams const& params, KVLinearBuffer const& kv_cache_buffer)
+void XqaDispatcher::run(
+    XQAParams const& params, KVLinearBuffer const& kv_cache_buffer, KVLinearBuffer const& kv_cache_block_scales_buffer)
 {
     TLLM_CHECK_WITH_INFO((mFixedParams.inputDataType == DATA_TYPE_FP16 || mFixedParams.inputDataType == DATA_TYPE_BF16),
         "The input Qkv tensor must be fp16/bf16.");
     if (mFixedParams.inputDataType == DATA_TYPE_FP16)
     {
-        this->runImpl<__half, KVLinearBuffer>(params, kv_cache_buffer);
+        this->runImpl<__half, KVLinearBuffer>(params, kv_cache_buffer, kv_cache_block_scales_buffer);
     }
     else
     {
-        this->runImpl<__nv_bfloat16, KVLinearBuffer>(params, kv_cache_buffer);
+        this->runImpl<__nv_bfloat16, KVLinearBuffer>(params, kv_cache_buffer, kv_cache_block_scales_buffer);
     }
 }
 
-void XqaDispatcher::run(XQAParams const& params, KVBlockArray const& kv_cache_buffer)
+void XqaDispatcher::run(
+    XQAParams const& params, KVBlockArray const& kv_cache_buffer, KVBlockArray const& kv_cache_block_scales_buffer)
 {
     TLLM_CHECK_WITH_INFO((mFixedParams.inputDataType == DATA_TYPE_FP16 || mFixedParams.inputDataType == DATA_TYPE_BF16),
         "The input Qkv tensor must be fp16/bf16.");
     if (mFixedParams.inputDataType == DATA_TYPE_FP16)
     {
-        this->runImpl<__half, KVBlockArray>(params, kv_cache_buffer);
+        this->runImpl<__half, KVBlockArray>(params, kv_cache_buffer, kv_cache_block_scales_buffer);
     }
     else
     {
-        this->runImpl<__nv_bfloat16, KVBlockArray>(params, kv_cache_buffer);
+        this->runImpl<__nv_bfloat16, KVBlockArray>(params, kv_cache_buffer, kv_cache_block_scales_buffer);
     }
 }
 

@@ -496,7 +496,7 @@ public:
         , sizePerHead(sizePerHead)
         , tokensPerBlock(tokensPerBlock)
         , quantSize(quantSize)
-        , blockSize((numKvHeads * sizePerHead * tokensPerBlock) / quantSize)
+        , blockSize(numKvHeads * sizePerHead * tokensPerBlock)
         , primaryPtr(std::move(primaryPtr))
         , secondaryPtr(std::move(secondaryPtr))
         , containsBlockScales(containsBlockScales)
@@ -1251,6 +1251,8 @@ public:
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getBlockPoolPointers() const = 0;
 
+    [[nodiscard]] virtual runtime::ITensor::SharedPtr getBlockScalePoolPointers() const = 0;
+
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getLayerToPoolMapping() const = 0;
 
     virtual void getBlockOffsetsOfBatch(
@@ -1555,7 +1557,7 @@ public:
         return mLayerToPoolMapping;
     }
 
-    [[nodiscard]] runtime::ITensor::SharedPtr getBlockScalePoolPointers() const
+    [[nodiscard]] runtime::ITensor::SharedPtr getBlockScalePoolPointers() const override
     {
         // TODO: add a new optional model input so the attention plugin can access these
         return mBlockScalePoolPointers;
