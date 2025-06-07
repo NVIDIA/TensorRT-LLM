@@ -8,7 +8,6 @@ from utils.util import force_ampere
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, PyResult
 from tensorrt_llm.bindings.executor import Response, Result
 from tensorrt_llm.executor.result import Logprob
@@ -68,17 +67,13 @@ def test_generate_with_return_logits(enable_trtllm_sampler: bool,
             or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
 
-    if enable_trtllm_sampler and (gather_generation_logits or return_log_probs):
-        pytest.skip(
-            "TRTLLMSampler does not support gather_generation_logits or return_log_probs"
-        )
+    if enable_trtllm_sampler and gather_generation_logits:
+        pytest.skip("TRTLLMSampler does not support gather_generation_logits")
     elif not enable_trtllm_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
     build_config = BuildConfig()
     build_config.gather_context_logits = gather_context_logits
-
-    pytorch_config = PyTorchConfig(enable_trtllm_sampler=enable_trtllm_sampler)
 
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
@@ -89,7 +84,7 @@ def test_generate_with_return_logits(enable_trtllm_sampler: bool,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
-        pytorch_backend_config=pytorch_config,
+        enable_trtllm_sampler=enable_trtllm_sampler,
     )
 
     sampling_params = SamplingParams(
@@ -132,17 +127,13 @@ def test_generate_async_with_return_logits(enable_trtllm_sampler: bool,
             or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
 
-    if enable_trtllm_sampler and (gather_generation_logits or return_log_probs):
-        pytest.skip(
-            "TRTLLMSampler does not support gather_generation_logits or return_log_probs"
-        )
+    if enable_trtllm_sampler and gather_generation_logits:
+        pytest.skip("TRTLLMSampler does not support gather_generation_logits")
     elif not enable_trtllm_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
     build_config = BuildConfig()
     build_config.gather_context_logits = gather_context_logits
-
-    pytorch_config = PyTorchConfig(enable_trtllm_sampler=enable_trtllm_sampler)
 
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
@@ -153,7 +144,7 @@ def test_generate_async_with_return_logits(enable_trtllm_sampler: bool,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
-        pytorch_backend_config=pytorch_config,
+        enable_trtllm_sampler=enable_trtllm_sampler,
     )
     sampling_params = SamplingParams(
         max_tokens=8,
