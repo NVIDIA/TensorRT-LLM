@@ -238,7 +238,8 @@ class TestMoeLoadBalancer(unittest.TestCase):
             mock_route.return_value = torch.tensor([[0, 1], [2, 3]])
             result = layer.route(mock_selected_experts)
             mock_route.assert_called_once_with(
-                mock_selected_experts, mock_single_layer_impl.get_pointer())
+                mock_selected_experts, False,
+                mock_single_layer_impl.get_pointer())
             assert torch.equal(result, mock_route.return_value)
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
