@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple, Type, TypeVar
 
 from torch import nn
 
+from ..logger import logger
 from ..sampling_params import SamplingParams
 from .data import TextPrompt
 from .utils import ALL_SUPPORTED_MULTIMODAL_MODELS
@@ -36,7 +37,11 @@ class InputProcessor(Protocol):
 class DefaultInputProcessor(InputProcessor):
     """Preprocess the inputs to the model."""
 
-    def __init__(self, model_path, model_config, tokenizer) -> None:
+    def __init__(self,
+                 model_path,
+                 model_config,
+                 tokenizer,
+                 trust_remote_code: bool = True) -> None:
         self.tokenizer = tokenizer
         self.model_config = model_config
         self.model_path = model_path
@@ -125,9 +130,12 @@ def create_input_processor(model_path_or_dir: str, tokenizer):
             input_processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type \
                 .get(model_cls)
         except RuntimeError:  # unregistered model
+            logger.info("Unregistered model, using DefaultInputProcessor")
             input_processor_cls = None
         if input_processor_cls is not None:
-            return input_processor_cls(model_path_or_dir, model_config,
-                                       tokenizer)
+            return input_processor_cls(model_path_or_dir,
+                                       model_config,
+                                       tokenizer,
+                                       trust_remote_code=True)
 
     return DefaultInputProcessor(None, None, tokenizer)
