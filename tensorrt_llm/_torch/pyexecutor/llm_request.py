@@ -37,11 +37,18 @@ REQUEST_TYPE_MAPPING = {
 
 class LogitsStorage:
 
-    def __init__(self, seq_length: int, use_device_memory=True):
+    def __init__(self,
+                 seq_length: int,
+                 use_device_memory=True,
+                 should_exclude_last=False):
+        if should_exclude_last:
+            # Exclude last logits is used when overlap scheduler is used, that generates one extra token,
+            # so we should make sure there's memory for that extra +1.
+            seq_length += 1
         self.seq_length = seq_length
         self.use_device_memory = use_device_memory
-        self.position = 0
-        self.last_position = 0
+        self._should_exclude_last = should_exclude_last
+        self._logits_indices = []
 
         # Lazily initialized by _init() upon first append()
         self._storage: torch.Tensor | None = None
@@ -75,21 +82,30 @@ class LogitsStorage:
 
         assert logits.size(1) == self.beam_width, "Beam width mismatch"
 
-        new_position = logits.size(0) + self.position
+        position = 0 if not self._logits_indices else self._logits_indices[-1][1]
+        new_position = logits.size(0) + position
         if new_position > self.seq_length:
             raise ValueError(
                 f"LogitsStorage overflow. This storage can only hold {self.seq_length} logits "
-                f"({self.position} already filled) but trying to append {logits.size(0)} more logits"
+                f"({position} already filled) but trying to append {logits.size(0)} more logits"
             )
 
-        self._storage[self.position:new_position].copy_(logits,
-                                                        non_blocking=True)
-        self.last_position, self.position = self.position, new_position
+        self._storage[position:new_position].copy_(logits, non_blocking=True)
+        self._logits_indices.append((position, new_position))
 
-    def get(self, all_logits=False):
-        start = 0 if all_logits else self.last_position
-        return self._storage[start:self.
-                             position] if self._storage is not None else None
+    def get(self, all_logits: bool) -> torch.Tensor | None:
+        """Returns the used logits storage if there are any, otherwise, returns None.
+        When all_logits is True then all set logits are returned, otherwise, only the last logits are returned."""
+        try:
+            last = -2 if self._should_exclude_last else -1
+            start = 0 if all_logits else self._logits_indices[last][0]
+            end = self._logits_indices[last][1]
+            return self._storage[start:end]
+        except IndexError:
+            return None
+
+    def set_exclude_last(self, should_exclude_last: bool) -> None:
+        self._should_exclude_last = should_exclude_last
 
 
 class LogProbStorage:
@@ -123,13 +139,14 @@ class PyResult:
                  streaming=False,
                  return_log_probs: bool = False,
                  return_context_logits: bool = False,
-                 return_generation_logits: bool = False):
+                 return_generation_logits: bool = False,
+                 exclude_last_generation_logits: bool = False):
         self._streaming = streaming
         self._context_logits = LogitsStorage(
             prompt_len, use_device_memory) if return_context_logits else None
         self._generation_logits = LogitsStorage(
-            max_new_tokens,
-            use_device_memory) if return_generation_logits else None
+            max_new_tokens, use_device_memory, exclude_last_generation_logits
+        ) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
 
     def append_context_logits(self, context_logits: torch.Tensor):
@@ -146,15 +163,22 @@ class PyResult:
 
     @property
     def context_logits(self) -> torch.Tensor | None:
-        return self._context_logits and self._context_logits.get(
-            True)[:, 0]  # remove beam_width axis for context
+        if self._context_logits is None or (storage := self._context_logits.get(
+                all_logits=True)) is None:
+            return None
+        return storage[:, 0]  # remove beam_width axis for context
 
     @property
     def generation_logits(self) -> torch.Tensor | None:
         # Internal storage: [seq_length, beam_width, vocab_size]
         # API expect: [beam_width, seq_length, vocab_size]
-        return self._generation_logits and self._generation_logits.get(
-            not self._streaming).transpose(0, 1)
+        if not self._generation_logits:
+            return None
+
+        storage = self._generation_logits.get(all_logits=not self._streaming)
+        if storage is None:
+            return None
+        return storage.transpose(0, 1)
 
     @property
     def log_probs(self) -> list[TokenLogprobs] | None:
@@ -218,6 +242,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_context_logits: bool = False,
             return_generation_logits: bool = False,
             return_logits_device_memory: bool = True,
+            exclude_last_generation_logits: bool = False,
             stop_words_list: list[list[int]] | None = None,
             **kwargs):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
@@ -258,7 +283,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_result = PyResult(self.py_prompt_len, self.py_max_new_tokens,
                                   return_logits_device_memory, self.streaming,
                                   return_log_probs, return_context_logits,
-                                  return_generation_logits)
+                                  return_generation_logits,
+                                  exclude_last_generation_logits)
 
     def create_response(
             self,
@@ -313,6 +339,7 @@ def convert_wordlist(word_list) -> List[List[int]]:
 def executor_request_to_llm_request(
         req_id: int,
         executor_request: ExecutorRequest,
+        exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None) -> LlmRequest:
     executor_sampling_config = executor_request.sampling_config
     sampling_config = SamplingConfig(executor_sampling_config)
@@ -360,6 +387,7 @@ def executor_request_to_llm_request(
         return_context_logits,
         return_generation_logits=executor_request.output_config.
         return_generation_logits,
+        exclude_last_generation_logits=exclude_last_generation_logits,
         draft_tokens=getattr(executor_request, "draft_tokens", None),
         draft_logits=None,
         exclude_input_from_output=executor_request.output_config.

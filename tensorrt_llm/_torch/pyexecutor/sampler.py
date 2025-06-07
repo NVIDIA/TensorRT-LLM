@@ -6,14 +6,15 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.handle_context_logits import \
     HandleContextLogits
+from tensorrt_llm._torch.pyexecutor.handle_generation_logits import \
+    HandleGenerationLogits
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import (
-    CreateNewDecoderRequests, HandleGenerationLogits,
-    MakeDecodingBatchInputOutput)
+    CreateNewDecoderRequests, MakeDecodingBatchInputOutput)
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers)
 from tensorrt_llm.bindings.internal.runtime import (BufferManager, DecoderState,
@@ -614,8 +615,7 @@ class TRTLLMSampler(Sampler):
 
         self.algs.handle_generation_logits(
             logits_index, scheduled_requests.generation_requests,
-            self.store["decoder_buffers"], self.model_config,
-            self.store["buffer_manager"], model_outputs["logits"])
+            self.store["decoder_buffers"], model_outputs["logits"])
 
         decoding_input, self.decoding_output = self.algs.make_decoding_batch_input_output(
             scheduled_requests.context_requests,
