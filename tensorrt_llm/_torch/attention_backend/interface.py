@@ -49,6 +49,7 @@ class AttentionMetadata:
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False
+    enable_paged_context_mla: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
 
@@ -143,9 +144,9 @@ class AttentionMetadata:
             ).item()
             self._num_generations = self._seq_lens.shape[0] - self.num_contexts
         if self._seq_lens_kv is not None:
-            self._num_tokens = int(self._seq_lens_kv.sum())
+            self._num_tokens = self._seq_lens_kv.sum().item()
         elif self._seq_lens is not None:
-            self._num_tokens = int(self._seq_lens.sum())
+            self._num_tokens = self._seq_lens.sum().item()
 
     @property
     def seq_lens(self) -> Optional[torch.Tensor]:
@@ -295,9 +296,6 @@ class AttentionMetadata:
                 )
 
         cuda_graph_metadata.num_contexts = 0
-        cuda_graph_metadata.max_num_requests = max_batch_size
-        cuda_graph_metadata.max_num_tokens = max_batch_size * (1 +
-                                                               max_draft_tokens)
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
@@ -393,7 +391,7 @@ class RopeParams:
 
         if self.scale_type == RotaryScalingType.yarn:
             rope_inv_freq = None
-            rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+            _, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
                 self.max_positions,
                 self.dim,
                 self.theta,
@@ -556,6 +554,10 @@ class AttentionBackend(Generic[TMetadata]):
 
     @classmethod
     def support_mla(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_nvfp4_output(cls) -> bool:
         return False
 
 

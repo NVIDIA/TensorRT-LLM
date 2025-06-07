@@ -69,19 +69,11 @@ Before KV cache blocks are allocated, some amount of GPU memory are pre-allocate
 
 ##### C++ runtime
 
-* When paged KV cache is enabled
-
-   TensorRT-LLM runtime pre-allocates KV cache tensors during initialization for a configured number of blocks and distributes them at runtime.
+   TensorRT-LLM runtime pre-allocates paged KV cache pools during initialization for a configured number of blocks and distributes them at runtime.
 
    KV cache tensors are allocated based on the `KVCacheConfig` object when creating the `Executor`. If neither `maxTokens` nor `freeGpuMemoryFraction` is specified, KV cache will by default allocate 90% of the remaining free GPU memory. When either `maxTokens` or `freeGpuMemoryFraction` is specified, the specified value will be used to compute the KV cache memory size. And if both are specified, firstly the `freeGpuMemoryFraction` is used to compute the number of tokens in KV cache, and then the minimum between this computed number of tokens and `maxTokens` is used.
 
    In in-flight batching the scheduler can automatically schedule requests as long as enough KV cache space is available (exact behavior depends on the scheduler policy).
-
-   If paged KV cache is used in `GptSession` (already deprecated) without in-flight batching, TensorRT-LLM may report OOM errors with message "Can't allocate new blocks. No free blocks left", if the paged KV cache is not large enough for the whole batch.
-
-* When paged KV cache is disabled (Not recommended and only allowed for deprecated `GptSession`)
-
-   C++ runtime allocates the KV cache tensors for each layer with shape `[batch size, 2, heads,  max seq length, hidden dimension per head]`, where `max seq length` is specified by `GptSession::Config::maxSequenceLength` when creating `GptSession`.
 
 ##### Python runtime (Not recommended to be used)
 
@@ -89,7 +81,7 @@ The Python runtime allocates KV cache tensors based on the parameters of the `Ge
 
 ## Memory pool
 
-TensorRT-LLM C++ runtime is using stream-ordered memory allocator to allocate and free buffers, see [BufferManager::initMemoryPool](source:cpp/tensorrt_llm/runtime/bufferManager.cpp), which uses the default memory pool managed by the CUDA driver. When a `GptSession` object is destroyed, memory is returned to the memory pool and can be reused by the next instance of a `GptSession` object. Memory will be released from the pool if it is required for other memory allocations.
+TensorRT-LLM C++ runtime is using stream-ordered memory allocator to allocate and free buffers, see [BufferManager::initMemoryPool](source:cpp/tensorrt_llm/runtime/bufferManager.cpp), which uses the default memory pool managed by the CUDA driver. When a `TrtGptModel` object is destroyed, memory is returned to the memory pool and can be reused by the next instance of a `TrtGptModel` object. Memory will be released from the pool if it is required for other memory allocations.
 
 However, `nvidia-smi` may still show high memory occupation after memory is returned to the CUDA driver's memory pool. This should not be a concern and is intended behavior. The amount of reserved and free memory in the pool can be inspected by [BufferManager::memoryPoolReserved())](source:cpp/tensorrt_llm/runtime/bufferManager.cpp) and [BufferManager::memoryPoolFree())](source:cpp/tensorrt_llm/runtime/bufferManager.cpp), respectively.
 

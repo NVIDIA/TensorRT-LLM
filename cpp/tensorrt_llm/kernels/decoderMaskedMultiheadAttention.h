@@ -102,6 +102,10 @@ struct Multihead_attention_params_base
     int batch_size = 0;
     // The beam width
     int beam_width = 0;
+    // The chunked attention size.
+    int chunked_attention_size = INT_MAX;
+    // The chunked attention size in log2.
+    int chunked_attention_size_log2 = 0;
     // By default, max_attention_window_size == cyclic_attention_window_size
     // unless each layer has different cyclic kv cache length.
     // Max cache capacity (used to allocate KV cache)
@@ -269,15 +273,14 @@ DECLARE_MMHA_NORMAL_AND_PAGED(__nv_bfloat16);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename T>
-inline int estimate_min_multi_block_count(int max_timesteps, int max_dynamic_shmem_per_block)
+inline int estimate_min_multi_block_count(int max_timesteps, int max_dynamic_shmem_per_block, int num_bytes_per_elt)
 {
     auto const qk_elts = static_cast<int>((max_timesteps + 1 + 4 - 1) / 4);
     int size_per_elts = 16;
 #ifndef MMHA_USE_FP32_ACUM_FOR_LOGITS
-    if (sizeof(T) != 4)
+    if (num_bytes_per_elt != 4)
     {
-        size_per_elts += 4 * sizeof(T);
+        size_per_elts += 4 * num_bytes_per_elt;
     }
 #endif
     int elts_per_block = max_dynamic_shmem_per_block / size_per_elts;

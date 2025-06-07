@@ -1614,6 +1614,7 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     case 192: kernelV2DispatchHeadSize<192, 192, T, TCache, KVCacheBuffer>(params, stream); break;
     case 224: kernelV2DispatchHeadSize<224, 224, T, TCache, KVCacheBuffer>(params, stream); break;
     case 256: kernelV2DispatchHeadSize<256, 256, T, TCache, KVCacheBuffer>(params, stream); break;
+    case 576: kernelV2DispatchHeadSize<576, 576, T, TCache, KVCacheBuffer>(params, stream); break;
     default:
         // Fall back to v1 kernel.
         // GPTJ Rotary embedding needs at least two elements per thread.

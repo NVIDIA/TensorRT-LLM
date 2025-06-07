@@ -16,8 +16,10 @@
  */
 
 #include "bindings.h"
+#include "moeBindings.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
+#include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/delayStream.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
@@ -33,6 +35,7 @@
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/loraCache.h"
+#include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 #include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
@@ -46,8 +49,6 @@
 #include <torch/extension.h>
 
 namespace tr = tensorrt_llm::runtime;
-namespace tle = tensorrt_llm::executor;
-using CudaStreamPtr = std::shared_ptr<tr::CudaStream>;
 
 class PyITensor : public tensorrt_llm::runtime::ITensor
 {
@@ -198,39 +199,22 @@ void initBindings(pybind11::module_& m)
     py::classh<tr::ITensor, PyITensor>(m, "ITensor").def(py::init());
     py::class_<tr::LoraCache::TaskLayerModuleConfig>(m, "TaskLayerModuleConfig")
         .def(py::init<>())
-        .def_readwrite("pageId", &tr::LoraCache::TaskLayerModuleConfig::pageId)
-        .def_readwrite("slotIdx", &tr::LoraCache::TaskLayerModuleConfig::slotIdx)
-        .def_readwrite("inSize", &tr::LoraCache::TaskLayerModuleConfig::inSize)
-        .def_readwrite("outSize", &tr::LoraCache::TaskLayerModuleConfig::outSize)
-        .def_readwrite("moduleId", &tr::LoraCache::TaskLayerModuleConfig::moduleId)
-        .def_readwrite("layerId", &tr::LoraCache::TaskLayerModuleConfig::layerId)
-        .def_readwrite("adapterSize", &tr::LoraCache::TaskLayerModuleConfig::adapterSize)
-        .def_readwrite("numSlots", &tr::LoraCache::TaskLayerModuleConfig::numSlots)
-        .def_readwrite("weightsInPointer", &tr::LoraCache::TaskLayerModuleConfig::weightsInPointer)
-        .def_readwrite("weightsOutPointer", &tr::LoraCache::TaskLayerModuleConfig::weightsOutPointer)
-        .def_readwrite("scalingVecPointer", &tr::LoraCache::TaskLayerModuleConfig::scalingVecPointer)
+        .def_readwrite("page_id", &tr::LoraCache::TaskLayerModuleConfig::pageId)
+        .def_readwrite("slot_idx", &tr::LoraCache::TaskLayerModuleConfig::slotIdx)
+        .def_readwrite("in_size", &tr::LoraCache::TaskLayerModuleConfig::inSize)
+        .def_readwrite("out_size", &tr::LoraCache::TaskLayerModuleConfig::outSize)
+        .def_readwrite("module_id", &tr::LoraCache::TaskLayerModuleConfig::moduleId)
+        .def_readwrite("layer_id", &tr::LoraCache::TaskLayerModuleConfig::layerId)
+        .def_readwrite("adapter_size", &tr::LoraCache::TaskLayerModuleConfig::adapterSize)
+        .def_readwrite("num_slots", &tr::LoraCache::TaskLayerModuleConfig::numSlots)
+        .def_readwrite("weights_in_pointer", &tr::LoraCache::TaskLayerModuleConfig::weightsInPointer)
+        .def_readwrite("weights_out_pointer", &tr::LoraCache::TaskLayerModuleConfig::weightsOutPointer)
+        .def_readwrite("scaling_vec_pointer", &tr::LoraCache::TaskLayerModuleConfig::scalingVecPointer)
         .def(py::self == py::self);
 
     py::classh<tr::BufferManager>(m, "BufferManager")
         .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false)
         .def_property_readonly("stream", &tr::BufferManager::getStream);
-
-    py::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
-        .def(py::init<tr::SpeculativeDecodingMode::UnderlyingType>(), py::arg("state"))
-        .def_static("NoneType", &tr::SpeculativeDecodingMode::None)
-        .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal)
-        .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa)
-        .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding)
-        .def_static("ExplicitDraftTokens", &tr::SpeculativeDecodingMode::ExplicitDraftTokens)
-        .def_property_readonly("is_none", &tr::SpeculativeDecodingMode::isNone)
-        .def_property_readonly("is_draft_tokens_external", &tr::SpeculativeDecodingMode::isDraftTokensExternal)
-        .def_property_readonly("is_medusa", &tr::SpeculativeDecodingMode::isMedusa)
-        .def_property_readonly("is_lookahead_decoding", &tr::SpeculativeDecodingMode::isLookaheadDecoding)
-        .def_property_readonly("is_explicit_draft_tokens", &tr::SpeculativeDecodingMode::isExplicitDraftTokens)
-        .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind)
-        .def_property_readonly("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue)
-        .def_property_readonly("predicts_draft_tokens", &tr::SpeculativeDecodingMode::predictsDraftTokens)
-        .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind);
 
     py::classh<tr::TllmRuntime>(m, "TllmRuntime")
         .def(py::init(
@@ -281,7 +265,6 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("medusa_paths", &tr::decoder_batch::Request::medusaPaths)
         .def_readwrite("medusa_tree_ids", &tr::decoder_batch::Request::medusaTreeIds)
         .def_readwrite("lookahead_runtime_config", &tr::decoder_batch::Request::lookaheadRuntimeConfig);
-    py::bind_vector<std::vector<tr::decoder_batch::Request>>(m, "VectorRequest");
 
     py::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
         .def(py::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), py::arg("logits"),
@@ -296,11 +279,6 @@ void initBindings(pybind11::module_& m)
     py::class_<tr::decoder_batch::Output>(m, "DecoderBatchOutput")
         .def(py::init())
         .def_readwrite("cache_indirection", &tr::decoder_batch::Output::cacheIndirection);
-
-    py::class_<tr::decoder::Input>(m, "Input")
-        .def(py::init<tr::ITensor::SharedPtr>(), py::arg("logits"))
-        .def_readwrite("logits", &tr::decoder::Input::logits)
-        .def_readwrite("cache_indirection", &tr::decoder::Input::cacheIndirection);
 
     py::class_<tr::LookaheadDecodingBuffers>(m, "LookaheadDecodingBuffers")
         .def(py::init<tr::SizeType32, tr::SizeType32, tr::BufferManager const&>(), py::arg("max_num_sequences"),
@@ -363,17 +341,17 @@ void initBindings(pybind11::module_& m)
             [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getFinishReasons()); });
 
     py::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
-        .def(py::init<tr::GptDecoderBatched::CudaStreamPtr, tr::SpeculativeDecodingMode const&, nvinfer1::DataType>(),
-            py::arg("stream"), py::arg("speculative_decoding_mode"), py::arg("dtype"))
+        .def(py::init<tr::GptDecoderBatched::CudaStreamPtr>(), py::arg("stream"))
         .def("setup", &tr::GptDecoderBatched::setup, py::arg("mode"), py::arg("max_batch_size"),
-            py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("sink_token_length"),
-            py::arg("max_sequence_length"), py::arg("max_tokens_per_step"), py::arg("dtype"), py::arg("model_config"),
+            py::arg("max_beam_width"), py::arg("max_sequence_length"), py::arg("dtype"), py::arg("model_config"),
             py::arg("world_config"))
-        .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("output"), py::arg("input"))
+        .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("decoder_state"), py::arg("output"),
+            py::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
-        .def_property_readonly("stream_ptr", &tr::GptDecoderBatched::getDecoderStream)
         .def_property_readonly(
-            "decoder_state", py::overload_cast<>(&tr::GptDecoderBatched::getDecoderState, py::const_));
+            "decoder_stream",
+            [](tr::GptDecoderBatched& self) -> tr::CudaStream const& { return *self.getDecoderStream(); },
+            py::return_value_policy::reference);
 
     m.def(
         "lamport_initialize_all",
@@ -398,6 +376,15 @@ void initBindings(pybind11::module_& m)
             tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, stream);
         },
         "Delay kernel launch on the default stream");
+    m.def(
+        "max_workspace_size_lowprecision",
+        [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
+        "Calculate the maximum workspace size needed for low precision all-reduce operations");
+
+    py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
+        .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>())
+        .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer)
+        .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer);
 
     py::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
@@ -418,6 +405,30 @@ void initBindings(pybind11::module_& m)
         .value("UB", tensorrt_llm::kernels::AllReduceStrategyType::UB)
         .value("ONESHOT", tensorrt_llm::kernels::AllReduceStrategyType::ONESHOT)
         .value("TWOSHOT", tensorrt_llm::kernels::AllReduceStrategyType::TWOSHOT);
+
+    // Initialize MoeLoadBalancer bindings
+    initMoeBindings(m);
 }
 
+void initBindingsEarly(py::module_& m)
+{
+    py::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
+        .def(py::init<tr::SpeculativeDecodingMode::UnderlyingType>(), py::arg("state"))
+        .def_static("NoneType", &tr::SpeculativeDecodingMode::None)
+        .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal)
+        .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa)
+        .def_static("Eagle", &tr::SpeculativeDecodingMode::Eagle)
+        .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding)
+        .def_static("ExplicitDraftTokens", &tr::SpeculativeDecodingMode::ExplicitDraftTokens)
+        .def_property_readonly("is_none", &tr::SpeculativeDecodingMode::isNone)
+        .def_property_readonly("is_draft_tokens_external", &tr::SpeculativeDecodingMode::isDraftTokensExternal)
+        .def_property_readonly("is_medusa", &tr::SpeculativeDecodingMode::isMedusa)
+        .def_property_readonly("is_eagle", &tr::SpeculativeDecodingMode::isEagle)
+        .def_property_readonly("is_lookahead_decoding", &tr::SpeculativeDecodingMode::isLookaheadDecoding)
+        .def_property_readonly("is_explicit_draft_tokens", &tr::SpeculativeDecodingMode::isExplicitDraftTokens)
+        .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind)
+        .def_property_readonly("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue)
+        .def_property_readonly("predicts_draft_tokens", &tr::SpeculativeDecodingMode::predictsDraftTokens)
+        .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind);
+}
 } // namespace tensorrt_llm::pybind::runtime

@@ -266,6 +266,8 @@ private:
     CtaInfo computeNumCtas(
         RunnerParams const& params, KernelMeta const& kernelMeta, SelectKernelParams& selectKernelParams) const
     {
+        bool isDsv3MinLatencyMode = params.mBatchSize == 1 && params.mMaxSeqLenQ >= 1 && params.mMaxSeqLenQ <= 16
+            && params.mHeadDimQk == 576 && params.mHeadDimV == 512;
         // Do we need to select a new kernel ?
         selectKernelParams.mSelectNewKernel = false;
 
@@ -311,8 +313,25 @@ private:
         // Consider the multiCtasKvMode for better GPU utilization.
         if (isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode))
         {
+            // The maximum attention window (the maximum number of tokensKv that will be attended to).
+            int maxAttentionWindow{params.mMaxSeqLenKv};
+            // Some of the tilesKv will be skipped if the sliding window attention or chunked attention is used.
+            if (isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType))
+            {
+                if (params.mMaxSeqLenKv > params.mAttentionWindowSize)
+                {
+                    // Consider that the first tileKv might contain tokensKv that is out of the attention window.
+                    maxAttentionWindow
+                        = std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mStepKv - 1);
+                }
+                else
+                {
+                    maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mChunkedAttentionSize);
+                }
+            }
+
             // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
-            int const maxNumCtasPerSeqKv = (params.mMaxSeqLenKv + kernelMeta.mStepKv - 1) / kernelMeta.mStepKv;
+            int const maxNumCtasPerSeqKv = (maxAttentionWindow + kernelMeta.mStepKv - 1) / kernelMeta.mStepKv;
             // Compute numCtasPerSeqKv.
             numCtasPerSeqKv = std::min(maxNumCtasPerSeqKv,
                 std::max(1, int32_t(params.mMultiProcessorCount / (numCtasPerSeqQ * numCtasY * numCtasZ))));
@@ -338,7 +357,7 @@ private:
 
             // Enable the CgaSmemReduction if the numCtasPerSeqKv <= 16 as the maximum cluster dimension is 16.
             // Only the swapsMmaAbForGeneration kernel supports the CgaSmemReduction for now.
-            if (numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16
+            if (!isDsv3MinLatencyMode && numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16
                 && isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType)
                 && isGmemReduction(selectKernelParams.mMultiCtasKvMode) && !selectKernelParams.mForceGmemReduction)
             {
@@ -372,31 +391,21 @@ private:
         int totalNumCtas = numCtasX * numCtasZ * numCtasY;
 
         // Then split the headDimV into multiple CTAs if there are still unused SMs.
-        if (isMlaGenKernel(params) && isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType)
-            && !selectKernelParams.mReuseSmemKForV && !selectKernelParams.mSelectNewKernel)
+        if (isMlaGenKernel(params) && !selectKernelParams.mReuseSmemKForV && !selectKernelParams.mSelectNewKernel
+            && !selectKernelParams.mUses2CtaMma)
         {
             // Split the headDimV into multiple CTAs if the utilization is not full.
             // It doesn't work with reuseSmemKForV currently.
             // TODO: find better heuristic of splitting headDimV across multiple CTAs.
-            if (selectKernelParams.mHeadDimPerCtaV == 512 && totalNumCtas * 2 <= params.mMultiProcessorCount)
+
+            int corrFactor = isDsv3MinLatencyMode ? 1 : 2;
+            if (selectKernelParams.mHeadDimPerCtaV == 512 && totalNumCtas * corrFactor <= params.mMultiProcessorCount)
             {
                 // Use smaller headDimPerCtaV to fully utilize the SMs.
-                selectKernelParams.mHeadDimPerCtaV = totalNumCtas * 4 <= params.mMultiProcessorCount ? 128 : 256;
+                selectKernelParams.mHeadDimPerCtaV
+                    = totalNumCtas * 2 * corrFactor <= params.mMultiProcessorCount ? 128 : 256;
                 // Need to select a different kernel.
                 selectKernelParams.mSelectNewKernel = true;
-            }
-            // TODO: find better heuristic of enabling reuseSmemKForV.
-            else if (selectKernelParams.mHeadDimPerCtaV == 512 && numCtasForAllHeadsQ == 1)
-            {
-                // It seems that enabling reuseSmemKForV has worse perf when there are multiple CTAs for different
-                // headsQ.
-                // Fp16/bf16 MLA generation kernels don't support 128 tileSizeKv + reuseSmemKForV.
-                if (!(mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16) || selectKernelParams.mTileSizeKv == 64)
-                {
-                    selectKernelParams.mReuseSmemKForV = true;
-                    // Need to select a different kernel.
-                    selectKernelParams.mSelectNewKernel = true;
-                }
             }
         }
 
@@ -415,19 +424,25 @@ private:
             // We use the low-latency kernel (SwapsMmaAbForGeneration with tileSizeQ = 16) when any of the following
             // conditions are met:
             // 1. The number of headsQPerKv is <= 32.
-            // 2. BatchSize x seqLenQ (numMtpTokens) x ceil(headsQPerKv, 16) <= the number of multiprocessors.
+            // 2. BatchSize x seqLenQ (numMtpTokens) x ceil(headsQPerKv, 16) * 2 <= the number of multiprocessors.
+            //    The "2" is the factor that is used to finetune the heuristic based on the benchmark results.
             if (params.mNumHeadsQPerKv <= 32
                 || static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ * tc::divUp(params.mNumHeadsQPerKv, 16))
+                        * 2
                     <= params.mMultiProcessorCount)
             {
                 kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
             }
             else
             {
-                // Otherwise, we use the high-throughput kernel (KeepsMmaAbForGeneration with tileSizeQ = 64).
+                // Otherwise, we use the high-throughput kernel.
                 kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-                // Uses 2 CTA MMA if numHeadsQPerKv is 128.
-                if (params.mNumHeadsQPerKv == 128)
+                // The 2CTA keepsMmaAbForGeneration kernel is used when the following conditions (based on the benchmark
+                // results) are met:
+                if (params.mNumHeadsQPerKv == 128
+                    && (mDtypeQ != DATA_TYPE_E4M3
+                        || (static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ * 2) * 2
+                            > params.mMultiProcessorCount)))
                 {
                     selectKernelParams.mUses2CtaMma = true;
                     // Each Cta only handles 256 headDimV.
@@ -471,18 +486,24 @@ private:
         }
 
         // The mask type.
-        TrtllmGenAttentionMaskType maskType = params.mMaskType;
-        // Enable sliding window causal if the max kv sequence length exceeds attention window size.
-        if (params.mAttentionWindowSize < params.mMaxSeqLenKv && maskType == TrtllmGenAttentionMaskType::Causal)
+        selectKernelParams.mMaskType = params.mMaskType;
+        // Enable sliding window or chunked causal if the max kv sequence length exceeds attention window size or
+        // chunked attention size.
+        // This is supported by causal-mask context kernels and generation-phase kernels.
+        if ((selectKernelParams.mMaskType == TrtllmGenAttentionMaskType::Causal || !isContextKernel(params.mKernelType))
+            && (params.mMaxSeqLenKv > params.mAttentionWindowSize || params.mChunkedAttentionSize != INT_MAX))
         {
-            maskType = TrtllmGenAttentionMaskType::SlidingWindowCausal;
+            TLLM_CHECK_WITH_INFO(params.mMaxSeqLenKv <= params.mAttentionWindowSize
+                    || params.mMaxSeqLenKv <= params.mChunkedAttentionSize,
+                "Sliding window attention and chunked attention should not be used together");
+            selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
         }
         // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
         int numTokensPerPage = (!isPagedKv(params.mQkvLayout)) ? 0 : params.mNumTokensPerPage;
 
         // Debug info.
         std::string info = "qkvLayout=" + std::to_string(static_cast<int>(params.mQkvLayout))
-            + ", maskType=" + std::to_string(static_cast<int>(maskType))
+            + ", maskType=" + std::to_string(static_cast<int>(selectKernelParams.mMaskType))
             + ", kernelType=" + std::to_string(static_cast<int>(kernelType))
             + ", tileScheduler=" + std::to_string(static_cast<int>(selectKernelParams.mTileScheduler))
             + ", multiCtasKvMode=" + std::to_string(static_cast<int>(selectKernelParams.mMultiCtasKvMode))
@@ -495,8 +516,8 @@ private:
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
 
         return std::make_pair(
-            hashID(static_cast<int>(params.mQkvLayout), static_cast<int>(maskType), static_cast<int>(kernelType),
-                static_cast<int>(selectKernelParams.mTileScheduler),
+            hashID(static_cast<int>(params.mQkvLayout), static_cast<int>(selectKernelParams.mMaskType),
+                static_cast<int>(kernelType), static_cast<int>(selectKernelParams.mTileScheduler),
                 static_cast<int>(selectKernelParams.mMultiCtasKvMode), selectKernelParams.mHeadDimPerCtaV,
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeKv, numTokensPerPage,
                 maxNumHeadsQPerKvInCta, selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma),

@@ -209,10 +209,6 @@ class GenerationResultBase:
         else:
             output.token_ids.extend(response_tensors.output_token_ids[src_idx])
 
-        # In PD, the first token should be ignored in streaming mode, since it's already been returned by the context server
-        if self.disaggregated_params is not None and self.disaggregated_params.request_type == "generation_only" and self._streaming and self.decoding_iter == 2:
-            output._last_token_ids_len = 1
-
         if response_tensors.cum_log_probs is not None:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
 
@@ -252,6 +248,10 @@ class GenerationResultBase:
                 output.finish_reason = 'length'
             elif finish_reasons[src_idx] == tllm.FinishReason.TIMED_OUT:
                 output.finish_reason = 'timeout'
+            # For disaggregated serving, finish reason might be NOT_FINISHED which is ok
+            elif finish_reasons[
+                    src_idx] == tllm.FinishReason.NOT_FINISHED and self.disaggregated_params is not None and self.disaggregated_params.request_type == "context_only":
+                output.finish_reason = 'not_finished'
             elif finish_reasons[src_idx] == tllm.FinishReason.CANCELLED:
                 pass
             else:

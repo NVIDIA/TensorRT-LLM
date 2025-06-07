@@ -144,9 +144,6 @@ function(process_target target_name enable_hopper enable_blackwell)
 
   if(${enable_blackwell} AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
                               OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG))
-    target_compile_options(
-      ${target_name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcicc --uumn -Xptxas
-                             -uumn>)
 
     if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       # No kernels should be parsed, unless blackwell is specified. This is a

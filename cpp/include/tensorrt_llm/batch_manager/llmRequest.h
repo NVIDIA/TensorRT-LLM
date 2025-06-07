@@ -44,21 +44,25 @@ namespace tensorrt_llm::batch_manager
  */
 enum class LlmRequestState : int32_t
 {
-    kUNKNOWN = 0,                              ///< Unknown state
-    kENCODER_INIT = 1,                         ///< Encoder phase starts (for encoder-decoder models)
-    kCONTEXT_INIT = 2,                         ///< Context phase starts
-    kDISAGG_GENERATION_TRANS_COMPLETE = 3,     ///< For disaggrgated
-    kGENERATION_IN_PROGRESS = 4,               ///< Generation phase is in progress
-    kGENERATION_TO_COMPLETE = 5,               ///< Generation phase is to be completed
-    kGENERATION_COMPLETE = 6,                  ///< Generation phase completed
-    kDISAGG_GENERATION_INIT = 7,               ///< For disaggregated serving only:
-                                               /// new Generation request arrived at generation model
-    kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 8,     ///< For disaggregated serving only:
-                                               /// Waiting context-only request transmitting the kv cache
-    kDISAGG_CONTEXT_COMPLETE = 9,              ///< Context-only request finished kv cache transmission.
-    kDISAGG_GENERATION_TRANS_IN_PROGRESS = 10, ///< For disaggregated serving only: transmitting the kv cache
-    kDISAGG_CONTEXT_INIT_AND_TRANS = 11,       ///< For disaggregated serving only:
-                                               /// Context phase starts and cache transmission is in progress
+    kUNKNOWN = 0,                             ///< Unknown state
+    kENCODER_INIT = 1,                        ///< Encoder phase starts (for encoder-decoder models)
+
+    kDISAGG_GENERATION_INIT = 8,              ///< New Generation request arrived at generation model
+    kDISAGG_GENERATION_TRANS_IN_PROGRESS = 9, ///< Transmitting the kv cache
+
+    // schedulable states starts
+    kCONTEXT_INIT = 10,                     ///< Context phase starts
+    kDISAGG_CONTEXT_INIT_AND_TRANS = 11,    ///< Context phase starts and cache transmission is in progress,
+                                            /// used in layer-wise transmission
+    kDISAGG_GENERATION_TRANS_COMPLETE = 12, ///< Kv cache transmission are finished
+    kGENERATION_IN_PROGRESS = 13,           ///< Generation phase is in progress
+    kGENERATION_TO_COMPLETE = 14,           ///< Generation phase is to be completed
+
+    // schedulable states ends
+    kGENERATION_COMPLETE = 20,              ///< Generation phase completed
+    kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 21, ///< Waiting context-only request transmitting the kv cache,
+                                            /// after computation finished
+    kDISAGG_CONTEXT_COMPLETE = 22,          ///< Context-only request finished kv cache transmission.
 };
 
 enum LlmRequestType
@@ -1586,9 +1590,45 @@ public:
         return static_cast<float>(getMaxNumGeneratedTokens()) / mDecodingIter;
     }
 
+    /// @brief Get the beam width of the current decoding step.
+    /// @details Return `mSamplingConfig.beamWidth` in decoding modes beside Variable-Beam-Width-Search (VBWS).
+    /// Or returns a scalar value from `mSamplingConfig.beamWidthArray` indexing by `mDecodingIter` in VBWS.
+    ///
+    /// Calling in context phase, it returns the beam width of the first generation step, which is used for copying
+    /// logits (function `copyGenerationLogits` as example).
+    ///
+    /// Calling in generation phase, it returns the beam width of the input tokens in the current generation step, which
+    /// is used for computing I/O tensor shapes for TRT engine (function `RuntimeBuffers::setBufferSizes` as example).
+    ///
+    /// For example, we have a request with beamWidthArray = [2,3,4], the generation process can be:
+    ///
+    /// input_ids[1,inputLength] --->
+    /// ---> [Forward, step == 0] ---> logits[1, 1, vocabSize] ---> [BeamSearchDecoder] ---> tokens[1, 2]
+    ///     Context Phase, getBeamWidthByIter() returns 2 for copying logits
+    ///     Decoder uses beamWidthIn=2, beamWidthOut=2 to get top 2 tokens
+    /// ---> [Forward, step == 1] ---> logits[1, 2, vocabSize] ---> [BeamSearchDecoder] ---> tokens[1, 3]
+    ///     Generation phase, getBeamWidthByIter() returns 2 for computing tensor shapes
+    ///     Decoder uses beamWidthIn=2, beamWidthOut=3 to get top 3 tokens
+    /// ---> [Forward, step == 2] ---> logits[1, 3, vocabSize] ---> [BeamSearchDecoder] ---> tokens[1, 4]
+    ///     Generation phase, getBeamWidthByIter() returns 3 for computing tensor shapes
+    ///     Decoder uses beamWidthIn=3, beamWidthOut=4 to get top 4 tokens
+    /// ---> [Forward, step == 3] ---> logits[1, 4, vocabSize] ---> [BeamSearchDecoder] ---> tokens[1, 4]
+    ///     Generation phase, getBeamWidthByIter() returns 4 for computing tensor shapes
+    ///     Decoder uses beamWidthIn=4, beamWidthOut=4 to get top 4 tokens
+    ///     i.e. the same as normal Beam Search of `beamWidth==4`
+    /// @param: forNextIteration: get beam width for next step rather than current beam width.
+    [[nodiscard]] SizeType32 getBeamWidthByIter(bool forNextIteration = false);
+
     [[nodiscard]] bool isFinished() const noexcept
     {
         return isGenerationCompleteState() || mState == LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS;
+    }
+
+    /// Returns true if finished_reason is length for all beams
+    [[nodiscard]] bool isFinishedDueToLength() const noexcept
+    {
+        return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
+            [](auto reason) { return reason == executor::FinishReason::kLENGTH; });
     }
 
     [[nodiscard]] bool isTimedOut() const
@@ -1796,15 +1836,15 @@ public:
 protected:
     bool mIsStreaming;
 
-    // List of tokens generated at the current step, used as the input to the next step.
-    // `mLastTokens[beam] != mTokens.back()[beam]` in streaming + beam search
-    // as `mTokens` will be overwritten by the gathered tokens.
-    VecTokens mLastTokens; // [beamSize]
+    // List of tokens generated at the current step, used as the input tokens to the next step, [beamSize]
+    // `mLastTokens[beam]` is not equal to `mTokens.back()[beam]` in "Streaming + Beam Search" mode
+    // since `mTokens` will be overwritten by the gathered tokens.
+    VecTokens mLastTokens;
 
-    // List of tokens including input prompt and generated part.
-    BeamTokens mTokens; // [beamSize, mPromptLen + getMaxNumGeneratedTokens()]
+    // List of tokens including input prompt and generated part, [beamSize, mPromptLen + getMaxNumGeneratedTokens()]
+    BeamTokens mTokens;
 
-                        // Length of input prompt tokens, never changes during generation process.
+    // Length of input prompt tokens, never changes during generation process.
     SizeType32 mOrigPromptLen;
 
     // List of numbers of pre-deocded tokens on the last PP rank when using pipeline parallelism.

@@ -322,6 +322,12 @@ public:
         return mSM;
     }
 
+    [[nodiscard]] bool supportsNvFp4Output() const
+    {
+        bool needsUlyssesPostprocess = mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1;
+        return mEnableContextFMHA && mEnableXQA && !needsUlyssesPostprocess;
+    }
+
     [[nodiscard]] int32_t* multiBlockSemaphores() const
     {
         return mMultiBlockSemaphores.get();
@@ -412,6 +418,9 @@ public:
     // a plugin field or a constructor parameter
     int32_t mNbMultiBlockSemaphores = 0;
 
+    // See [Chunked Attention] in _torch/modules/attention.py
+    std::optional<int64_t> mAttentionChunkSize = std::nullopt;
+
     [[nodiscard]] auto data() const
     {
         return std::make_tuple(mLayerIdx, mNumHeads, mVisionStart, mVisionLength, mNumKVHeads, mHeadSize,
@@ -426,7 +435,8 @@ public:
             mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mMLAParams.data(),
             mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank,
             mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode,
-            mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores);
+            mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores,
+            mAttentionChunkSize.value_or(-1));
     };
 
 private:

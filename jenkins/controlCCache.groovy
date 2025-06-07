@@ -1,7 +1,7 @@
 
 import java.lang.InterruptedException
 
-DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-x86_64-ubuntu24.04-trt10.9.0.34-skip-devel-202505081324-9379"
+DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505211401-4539"
 
 def createKubernetesPodConfig(image)
 {
@@ -39,7 +39,7 @@ def createKubernetesPodConfig(image)
                         ephemeral-storage: 25Gi
                     imagePullPolicy: Always
                   - name: jnlp
-                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11
+                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.13.3-1
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:

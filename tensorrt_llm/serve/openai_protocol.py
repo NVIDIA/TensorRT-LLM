@@ -12,13 +12,22 @@ from openai.types.chat import \
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated, Required, TypedDict
 
+from tensorrt_llm.executor.serialization import register_approved_ipc_class
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import SamplingParams
+from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 
 
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    def __init_subclass__(cls, **kwargs):
+        """
+        This method is called when a class inherits from OpenAIBaseModel.
+        """
+        # Register subclass as an approved class for deserialization across IPC boundaries.
+        super().__init_subclass__(**kwargs)
+        register_approved_ipc_class(cls)
 
 
 class StreamOptions(OpenAIBaseModel):
@@ -44,9 +53,17 @@ class ModelList(OpenAIBaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
+class StructuralTag(OpenAIBaseModel):
+    begin: str
+    schema_: Optional[dict[str, Any]] = Field(alias="schema")
+    end: str
+
+
 class ResponseFormat(OpenAIBaseModel):
-    # type must be "json_object" or "text"
-    type: Literal["text", "json_object"]
+    # type must be "json_object" or "text" or "structural_tag"
+    type: Literal["text", "json_object", "structural_tag"]
+    structures: Optional[List[StructuralTag]] = None
+    triggers: Optional[List[str]] = None
 
 
 class DisaggregatedParams(OpenAIBaseModel):
@@ -96,6 +113,9 @@ class CompletionResponse(OpenAIBaseModel):
     model: str
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
+    # Add prompt_tokens_ids to the response to remove the tokenization
+    # in the generation server in disaggreated serving
+    prompt_token_ids: Optional[List[List[int]]] = None
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
@@ -121,6 +141,23 @@ class CompletionStreamResponse(OpenAIBaseModel):
     usage: Optional[UsageInfo] = Field(default=None)
 
 
+def _response_format_to_guided_decoding_params(
+    response_format: Optional[ResponseFormat]
+) -> Optional[GuidedDecodingParams]:
+    if response_format is None:
+        return None
+    elif response_format.type == "text":
+        return None
+    elif response_format.type == "json_object":
+        return GuidedDecodingParams(json_object=True)
+    elif response_format.type == "structural_tag":
+        return GuidedDecodingParams(
+            structural_tag=response_format.model_dump_json(by_alias=True,
+                                                           exclude_none=True))
+    else:
+        raise ValueError(f"Unsupported response format: {response_format.type}")
+
+
 class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
@@ -131,7 +168,7 @@ class CompletionRequest(OpenAIBaseModel):
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
-    max_tokens: Optional[int] = 16
+    max_tokens: Optional[int] = None
     n: int = 1
     presence_penalty: Optional[float] = 0.0
     seed: Optional[int] = Field(default=None)
@@ -170,10 +207,10 @@ class CompletionRequest(OpenAIBaseModel):
     )
     response_format: Optional[ResponseFormat] = Field(
         default=None,
-        description=(
-            "Similar to chat completion, this parameter specifies the format of "
-            "output. Only {'type': 'json_object'} or {'type': 'text' } is "
-            "supported."),
+        description=
+        ("Similar to chat completion, this parameter specifies the format of "
+         "output. {'type': 'json_object'}, {'type': 'text' }, {'type': 'structural_tag'} are "
+         "supported."),
     )
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(
@@ -211,6 +248,8 @@ class CompletionRequest(OpenAIBaseModel):
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             return_context_logits=self.return_context_logits,
+            guided_decoding=_response_format_to_guided_decoding_params(
+                self.response_format),
 
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
@@ -219,17 +258,6 @@ class CompletionRequest(OpenAIBaseModel):
             _return_log_probs=self.logprobs,
         )
         return sampling_params
-
-    def model_post_init(self, __context: Any) -> None:
-        if self.best_of is None:
-            self.best_of = self.n
-
-    @model_validator(mode="after")
-    def check_beam_search(self):
-        if (self.n > 1 or self.best_of > 1) and not self.use_beam_search:
-            raise ValueError(
-                "Only support one response per prompt without beam search")
-        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -244,22 +272,6 @@ class CompletionRequest(OpenAIBaseModel):
         if data.get("stream_options") and not data.get("stream"):
             raise ValueError(
                 "Stream options can only be defined when stream is true.")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def verify_multi_responses(cls, data):
-        best_of = data.get("best_of")
-        n = data.get("n")
-        if best_of and n and best_of < n:
-            raise ValueError("best_of should not be smaller than n")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def check_response_format(cls, data):
-        if data.get("response_format"):
-            raise ValueError("response_format is not supported")
         return data
 
     @model_validator(mode="before")
@@ -351,6 +363,9 @@ class ChatCompletionResponse(OpenAIBaseModel):
     model: str
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
+    # Add prompt_tokens_ids to the response to remove the tokenization
+    # in the generation server in disaggreated serving
+    prompt_token_ids: Optional[List[int]] = None
 
 
 class DeltaMessage(OpenAIBaseModel):
@@ -401,14 +416,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
+    # Add prompt_tokens_ids to the request to remove the tokenization
+    # in the generation server in disaggreated serving
+    prompt_token_ids: Optional[List[int]] = None
     model: str
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
     top_logprobs: Optional[int] = 0
-    max_completion_tokens: int = Field(default=16,
+    max_completion_tokens: int = Field(default=None,
                                        validation_alias='max_tokens')
-    n: Optional[int] = 1
+    n: int = 1
     presence_penalty: Optional[float] = 0.0
     response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = Field(None)
@@ -520,6 +538,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
+            guided_decoding=_response_format_to_guided_decoding_params(
+                self.response_format),
 
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
@@ -528,17 +548,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             _return_log_probs=self.logprobs,
         )
         return sampling_params
-
-    def model_post_init(self, __context: Any) -> None:
-        if self.best_of is None:
-            self.best_of = self.n
-
-    @model_validator(mode="after")
-    def check_beam_search(self):
-        if (self.n > 1 or self.best_of > 1) and not self.use_beam_search:
-            raise ValueError(
-                "Only support one response per prompt without beam search")
-        return self
 
     @model_validator(mode='before')
     @classmethod
@@ -569,24 +578,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def verify_multi_responses(cls, data):
-        best_of, n = data.get("best_of"), data.get("n")
-        if best_of and n and best_of < n:
-            raise ValueError("best_of should not be smaller than n")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
     def verify_logit_processor(cls, data):
         if data.get("logit_bias"):
             raise ValueError("logit bias is not supported")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def check_response_format(cls, data):
-        if data.get("response_format"):
-            raise ValueError("response_format is not supported")
         return data
 
     @model_validator(mode="before")

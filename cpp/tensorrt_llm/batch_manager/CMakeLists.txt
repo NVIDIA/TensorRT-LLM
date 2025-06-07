@@ -27,7 +27,6 @@ set(SRCS
     dataTransceiverImpl.cpp
     decoderBuffers.cpp
     encoderBuffers.cpp
-    generateRequestOptions.cpp
     guidedDecoder.cpp
     handleContextLogits.cpp
     handleGenerationLogits.cpp
@@ -50,7 +49,6 @@ set(SRCS
     transformerBuffers.cpp
     trtEncoderModel.cpp
     trtGptModelInflightBatching.cpp
-    trtGptModelV1.cpp
     updateDecoderBuffers.cpp
     utils/debugUtils.cpp
     utils/inflightBatchingUtils.cpp
@@ -97,6 +95,19 @@ set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 target_compile_definitions(${BATCH_MANAGER_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
+# Find and link cuFile library for kvCacheTransferManager (GDS).
+if(ENABLE_CUFILE)
+  find_library(
+    CUFILE_LIBRARY
+    NAMES cufile
+    HINTS /usr/local/cuda-12.6/targets/x86_64-linux/lib
+          /usr/lib/x86_64-linux-gnu /usr/local/lib)
+  if(NOT CUFILE_LIBRARY)
+    message(FATAL_ERROR "Could not find cufile library inside container.")
+  endif()
+  target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${CUFILE_LIBRARY})
+endif()
+
 if(ENABLE_UCX)
   find_package(ucx REQUIRED)
   find_package(ucxx REQUIRED)
@@ -104,4 +115,5 @@ if(ENABLE_UCX)
     ${BATCH_MANAGER_STATIC_TARGET}
     PRIVATE $<TARGET_PROPERTY:ucxx::ucxx,INTERFACE_INCLUDE_DIRECTORIES>)
   target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC)
+
 endif()

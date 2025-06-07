@@ -138,8 +138,8 @@ __global__ void acceptDraftTokensByIdsWithPaths(TokenIdType* outputIds, TokenIdT
     TokenIdType const* targetIds, SizeType32* sequenceLengths, SizeType32* acceptedLengths,
     FinishedState* finishedFinal, SizeType32 const* batchSlots, SizeType32 const* paths, TokenIdType const* endIds,
     T const** medusaLogits, T const** logitsPtrs, SizeType32* curTokensPerStep, SizeType32 const* targetTokensPerStep,
-    SizeType32* bestPathIds, SizeType32 batchSize, SizeType32 vocabSize, SizeType32 maxBatchSize, SizeType32 maxSeqLen,
-    SizeType32 maxDraftPathLen, SizeType32 maxDecodingTokens)
+    SizeType32* bestPathIds, SizeType32 vocabSize, SizeType32 maxSeqLen, SizeType32 maxDraftPathLen,
+    SizeType32 maxDecodingTokens)
 {
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
     auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
@@ -276,8 +276,8 @@ void acceptDraftTokensByIdsWithPaths(AcceptDraftTokensByIdsWithPathsParams<T> co
     acceptDraftTokensByIdsWithPaths<T, BLOCK_SIZE><<<grid, block, 0, params.stream>>>(params.outputIds, params.draftIds,
         params.targetIds, params.sequenceLengths, params.acceptedLengths, params.finishedFinal, params.batchSlots,
         params.paths, params.endIds, params.medusaLogits, params.logitsPtrs, params.curTokensPerStep,
-        params.targetTokensPerStep, params.bestPathIds, params.batchSize, params.vocabSize, params.maxBatchSize,
-        params.maxSeqLen, params.maxDraftPathLen, params.maxDecodingTokens);
+        params.targetTokensPerStep, params.bestPathIds, params.vocabSize, params.maxSeqLen, params.maxDraftPathLen,
+        params.maxDecodingTokens);
 }
 
 template void acceptDraftTokensByIdsWithPaths(AcceptDraftTokensByIdsWithPathsParams<float> const& params);

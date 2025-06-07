@@ -22,14 +22,16 @@
 namespace torch_ext
 {
 
-namespace tg = trtllm::gen;
+namespace btg = batchedGemm::trtllm::gen;
+using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 
 torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logits, torch::Tensor const& routing_bias,
     torch::Tensor const& hidden_states, torch::Tensor const& gemm1_weights, torch::Tensor const& output1_scales_scalar,
     torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& gemm2_weights,
     torch::Tensor const& output2_scales_scalar, int64_t const num_experts, int64_t const top_k, int64_t const n_group,
     int64_t const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
-    int64_t const local_num_experts, double const routed_scaling_factor, bool const use_routing_scales_on_input)
+    int64_t const local_num_experts, double const routed_scaling_factor, bool const use_routing_scales_on_input,
+    int64_t const tile_tokens_dim, int64_t const routing_method_type)
 {
 
     auto const sm = tensorrt_llm::common::getSMVersion();
@@ -60,7 +62,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
 
     // setup args
-    args.mDtypeElt = tg::Dtype::E4m3;
+    args.mDtypeElt = btg::Dtype::E4m3;
     args.routing_logits = routing_logits.data_ptr();
     args.routing_bias = routing_bias.data_ptr();
     args.hidden_states = hidden_states.data_ptr();
@@ -84,10 +86,9 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
     // allocate workspace for routing kernel
     at::Tensor num_tokens_per_expert
         = at::detail::empty_cuda({num_experts}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
-    const int32_t tileN = 8; // hard code to mProjUp->mTileN=padding=8
     int32_t max_num_padded_tokens
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxPermutedPaddedCount(
-            args.num_tokens, top_k, num_experts, tileN);
+            args.num_tokens, top_k, num_experts, tile_tokens_dim);
     at::Tensor total_num_padded_tokens
         = at::empty({}, at::TensorOptions().device(routing_logits.device()).dtype(at::ScalarType::Int));
     at::Tensor expanded_idx_to_permuted_idx = at::detail::empty_cuda(
@@ -114,7 +115,8 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
     at::Tensor gemm2_output = at::detail::empty_cuda(
         {max_num_padded_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
 
-    int32_t max_num_ctas = (args.num_tokens + tileN - 1) / tileN * args.num_experts;
+    int32_t max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
+        args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
     at::Tensor cta_idx_xy_to_batch_idx
         = at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     at::Tensor cta_idx_xy_to_mn_limit
@@ -122,7 +124,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
     at::Tensor num_non_exiting_ctas
         = at::empty({}, at::TensorOptions().device(routing_logits.device()).dtype(at::ScalarType::Int));
 
-    tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner;
+    tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
     auto const& stream = at::cuda::getCurrentCUDAStream(routing_logits.get_device());
     routing_runner.run(routing_logits.data_ptr(), routing_bias.data_ptr(), args.num_tokens, args.num_experts,
         args.top_k, args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
@@ -131,7 +133,8 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
         nullptr /*permuted_idx_to_expanded_idx.data_ptr<int>()*/, permuted_idx_to_token_idx.data_ptr<int>(),
         expert_weights.data_ptr(), num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
         cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt,
-        use_routing_scales_on_input, false /* use_deep_seek_fp8 */, stream);
+        use_routing_scales_on_input, false /* use_deep_seek_fp8 */, static_cast<RoutingMethodType>(routing_method_type),
+        stream);
 
     // MoE kernel except routing
     TORCH_CHECK(hidden_states.scalar_type() == at::ScalarType::Float8_e4m3fn, "hidden_states must be fp8.");
@@ -168,7 +171,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
     // setup workspace
     workspace.total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
     workspace.total_max_padded_tokens = max_num_padded_tokens;
-    workspace.ProjUpTileN = tileN;
+    workspace.ProjUpTileN = tile_tokens_dim;
     workspace.routing_expert_indexes = expert_indexes.data_ptr<int>();
     workspace.permuted_idx_size = total_num_padded_tokens.data_ptr<int>();
     workspace.expanded_idx_to_permuted_idx
@@ -192,9 +195,17 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
     args.output = output.data_ptr();
     args.output_scale = nullptr;
 
-    tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner;
+    tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(
+        args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim);
+    auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args);
+    at::Tensor workspace_fc1 = at::detail::empty_cuda(
+        {std::get<0>(workspace_sizes)}, at::ScalarType::Char, hidden_states.device(), std::nullopt);
+    at::Tensor workspace_fc2 = at::detail::empty_cuda(
+        {std::get<1>(workspace_sizes)}, at::ScalarType::Char, hidden_states.device(), std::nullopt);
+    workspace.bmm1_workspace = workspace_fc1.data_ptr();
+    workspace.bmm2_workspace = workspace_fc2.data_ptr();
     auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
-    moe_runner.run(args, workspace, moe_stream);
+    moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream);
     return output;
 }
 } // namespace torch_ext
@@ -219,7 +230,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int local_expert_offset,"
         "int local_num_experts,"
         "float routed_scaling_factor,"
-        "bool use_routing_scales_on_input) -> Tensor");
+        "bool use_routing_scales_on_input,"
+        "int tile_tokens_dim,"
+        "int routing_method_type) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

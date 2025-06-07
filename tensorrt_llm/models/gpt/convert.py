@@ -459,9 +459,9 @@ def load_weights_from_hf_model(hf_model,
                                            f'{prefix}.self_attn.k_proj', dtype)
             v_w, v_b = get_weight_and_bias(model_params,
                                            f'{prefix}.self_attn.v_proj', dtype)
-            qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
-            qkv_b = torch.cat([q_b, k_b, v_b],
-                              dim=0) if q_b is not None else None
+            qkv_w = torch.cat([q_w.cuda(), k_w.cuda(), v_w.cuda()], dim=0)
+            qkv_b = torch.cat([q_b.cuda(), k_b.cuda(),
+                               v_b.cuda()], dim=0) if q_b is not None else None
         elif gpt_variant == 'persimmon':
             qkv_w, qkv_b = get_weight_and_bias(
                 model_params, f'{prefix}.self_attn.query_key_value', dtype)

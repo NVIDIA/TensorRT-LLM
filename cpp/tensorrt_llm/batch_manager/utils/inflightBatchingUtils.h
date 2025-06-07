@@ -35,7 +35,13 @@ using OptionalRef = common::OptionalRef<T>;
 
 TensorPtr collectRequestIds(RequestVector const& contextRequests, RequestVector const& generationRequests);
 
-void sortByLoraId(ScheduledRequests& scheduledRequests);
+//! @brief Sort requests for functional correctness and performance.
+//! @details Sort context requests for moveFinishedContextRequestsToGeneration.
+//!          Sort requests by lora task id for performance.
+//! @param contextRequests The context requests.
+//! @param generationRequests The generation requests.
+//! @param chunksPresent Whether context chunks are present.
+void sortRequests(RequestVector& contextRequests, RequestVector& generationRequests, bool chunksPresent);
 
 //! @brief Move finished context requests to generation requests.
 //! @details This function assumes that the context requests are sorted so that requests with isLastContextChunk() are
@@ -60,6 +66,9 @@ void terminateRequest(SequenceSlotManager& seqSlotManager, LlmRequest& llmReques
     OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager = std::nullopt,
     OptionalRef<BasePeftCacheManager> peftCacheManager = std::nullopt, bool pause = false);
 
+std::vector<SizeType32> getRequestBeamWidths(
+    RequestVector const& contextRequests, RequestVector const& generationRequests);
+
 class CudaGraphExecutor
 {
 public:
@@ -83,7 +92,7 @@ public:
     }
 
     void clear();
-    void prepareNextGraph(std::shared_ptr<runtime::TllmRuntime>& runtime, SizeType32 nextContextId);
+    void prepareNextGraph(std::unique_ptr<runtime::TllmRuntime>& runtime, SizeType32 nextContextId);
     void launch(runtime::CudaStream const& stream);
 
 private:

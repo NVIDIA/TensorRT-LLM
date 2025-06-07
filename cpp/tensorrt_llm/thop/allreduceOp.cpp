@@ -18,13 +18,17 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/mnnvlTwoShotAllreduceKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
+#include "tensorrt_llm/runtime/mcastDeviceMemory.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/fp4Quantize.h"
@@ -61,7 +65,7 @@ class NvmlManager
 public:
     NvmlManager()
     {
-        NVML_CHECK(nvmlInit());
+        NVML_CHECK_THROW(nvmlInit());
     }
 
     ~NvmlManager()
@@ -155,7 +159,7 @@ public:
 
     std::vector<torch::Tensor> run(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
         torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
-        torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> workspace) noexcept
+        torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> workspace)
     {
         size_t size = input.numel();
         size_t seq_len = input.size(0);
@@ -177,11 +181,13 @@ public:
         case AllReduceStrategyType::ONESHOT:
         case AllReduceStrategyType::TWOSHOT:
             return runFusionAllReduce(input, residual, norm_weight, scale, bias, workspace, runtime_strategy);
+        case AllReduceStrategyType::LOWPRECISION:
+            return runLowPrecisionAllReduce(input, residual, norm_weight, scale, bias);
         default: TORCH_CHECK(false, "Invalid runtime strategy"); return {};
         }
     }
 
-    int initialize() noexcept
+    int initialize()
     {
         TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
         mNcclComm = getComm(mGroup);
@@ -197,7 +203,7 @@ public:
 private:
     std::vector<torch::Tensor> runUBAllReduce(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
-        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
+        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
@@ -277,14 +283,14 @@ private:
 
     std::vector<torch::Tensor> runNCCLAllReduce(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
-        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
+        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
 
         torch::Tensor reduce_output = torch::empty_like(input);
-        NCCLCHECK(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
+        NCCLCHECK_THROW(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
             ncclSum, *mNcclComm, stream));
 
         if (mOp == AllReduceFusionOp::NONE)
@@ -296,10 +302,77 @@ private:
         return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduce_output);
     }
 
+    std::vector<torch::Tensor> runLowPrecisionAllReduce(torch::Tensor const& input,
+        torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
+        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
+    {
+#ifdef ENABLE_FP8
+        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+        int size = input.numel();
+        int hidden_size = input.size(-1);
+
+        auto const tp_size = mGroup.size();
+        auto const cur_rank = COMM_SESSION.getRank();
+        int tp_rank = 0;
+
+        for (auto const& currentRank : mGroup)
+        {
+            if (cur_rank == currentRank)
+                break;
+            ++tp_rank;
+        }
+
+        int bytes_per_element = input.element_size();
+
+        int token_num = size / hidden_size;
+
+        auto parts = tensorrt_llm::kernels::splitNumber(size);
+
+        torch::Tensor reduce_output = torch::empty_like(input);
+
+        size_t global_offset = 0;
+        for (size_t i = 0; i < parts.size(); ++i)
+        {
+            size_t tmp_size = parts[i];
+            tensorrt_llm::kernels::LowPrecisionAllReduceParams tmp_param;
+            if (tp_size <= 4)
+            {
+                tmp_param = tensorrt_llm::kernels::LowPrecisionAllReduceParams::deserialize(
+                    tp_size, tp_rank, mType, token_num, hidden_size);
+            }
+            else
+            {
+                tmp_param = tensorrt_llm::kernels::LowPrecisionAllReduceParams::deserialize_hier(
+                    tp_size, tp_rank, mType, token_num, hidden_size);
+            }
+
+            tmp_param.local_input_buffer_ptr = reinterpret_cast<void const*>(
+                reinterpret_cast<char const*>(input.data_ptr()) + global_offset * bytes_per_element);
+            tmp_param.local_output_buffer_ptr = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(reduce_output.mutable_data_ptr()) + global_offset * bytes_per_element);
+            tmp_param.elts_total = tmp_size;
+            tensorrt_llm::kernels::customLowPrecisionAllReduce(tmp_param, mType, stream);
+
+            global_offset += tmp_size;
+        }
+
+        if (mOp == AllReduceFusionOp::NONE)
+        {
+            return {reduce_output};
+        }
+
+        // Treat any other patterns as fallback cases.
+        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduce_output);
+
+#else
+        C10_THROW_ERROR(NotImplementedError, "Can't use LOWPRECISION without compile with ENABLE FP8.");
+#endif
+    }
+
     std::vector<torch::Tensor> runFusionAllReduce(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
-        torch::optional<torch::Tensor> workspace, AllReduceStrategyType strategy) noexcept
+        torch::optional<torch::Tensor> workspace, AllReduceStrategyType strategy)
     {
         // Should handle only Lamport implementation
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -481,7 +554,7 @@ private:
     std::vector<torch::Tensor> fallbackRunSubsequentOps(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
-        torch::Tensor& reduce_output) noexcept
+        torch::Tensor& reduce_output)
     {
         // If we reach here, it means the extra fallback operations are required.
         // All patterns are broken into ALlReduce + residual_rms_norm + following operations (quantization, etc.)
@@ -546,7 +619,7 @@ private:
         return {};
     }
 
-    AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t size) noexcept
+    AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t size)
     {
         static char* force_nccl_all_reduce_strategy_char = std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY");
         bool force_nccl_all_reduce_strategy = (force_nccl_all_reduce_strategy_char != nullptr);
@@ -575,7 +648,7 @@ private:
         return runtime_strategy;
     }
 
-    void logRunTimeStrategy(AllReduceStrategyType strategy, int rank) noexcept
+    void logRunTimeStrategy(AllReduceStrategyType strategy, int rank)
     {
         switch (strategy)
         {
@@ -594,16 +667,16 @@ private:
             TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UB", rank);
             break;
         }
+        case AllReduceStrategyType::LOWPRECISION:
+        {
+            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: LOWPRECISION", rank);
+            break;
+        }
         default: break;
         }
     }
 
-    bool Fusable() noexcept
-    {
-        return mOp != AllReduceFusionOp::NONE;
-    }
-
-    void initGroupTopology() noexcept
+    void initGroupTopology()
     {
         static std::map<std::set<int>, std::tuple<bool, bool>> cache;
         if (cache.find(mGroup) != cache.end())
@@ -617,7 +690,7 @@ private:
         cache[mGroup] = {mIsNVLINKSupported, mIsP2PSupported};
     }
 
-    void setGroupTopology() noexcept
+    void setGroupTopology()
     {
         auto const rank = COMM_SESSION.getRank();
         TLLM_LOG_INFO("Detecting local TP group for rank %d", rank);
@@ -660,7 +733,7 @@ private:
                 }
 
                 nvmlDevice_t first_device;
-                NVML_CHECK(nvmlDeviceGetHandleByIndex(first_device_id, &first_device));
+                NVML_CHECK_THROW(nvmlDeviceGetHandleByIndex(first_device_id, &first_device));
 
                 bool is_NVLINK = false;
 
@@ -679,7 +752,7 @@ private:
                     {
                         // Two GPUs are connected directly through nvlink
                         unsigned int remote_device_id;
-                        NVML_CHECK(nvmlDeviceGetIndex(remote_device, &remote_device_id));
+                        NVML_CHECK_THROW(nvmlDeviceGetIndex(remote_device, &remote_device_id));
 
                         if (remote_device_id == static_cast<unsigned int>(second_device_id))
                         {
@@ -693,7 +766,7 @@ private:
                         // determine whether nvlink is supported by whether two GPUs are connected to the same
                         // nvswitch.
                         nvmlDevice_t second_device;
-                        NVML_CHECK(nvmlDeviceGetHandleByIndex(second_device_id, &second_device));
+                        NVML_CHECK_THROW(nvmlDeviceGetHandleByIndex(second_device_id, &second_device));
 
                         for (unsigned int second_link = 0; second_link < NVML_NVLINK_MAX_LINKS; second_link++)
                         {
@@ -713,7 +786,7 @@ private:
                     }
                     else
                     {
-                        NVML_CHECK(result);
+                        NVML_CHECK_THROW(result);
                     }
 
                     if (is_NVLINK)
@@ -728,7 +801,7 @@ private:
         }
     }
 
-    bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size, bool is_auto) noexcept
+    bool ifFallbackToNCCL(size_t seq_len, size_t message_size_bytes, size_t max_workspace_size, bool is_auto)
     {
         // If messageSize is less than maxWorkspaceSize, use NCCL, regardless of the fusion type.
         if (message_size_bytes > max_workspace_size)
@@ -764,9 +837,23 @@ private:
     }
 
     AllReduceStrategyType selectImplementation(
-        size_t seq_len, size_t message_size, int world_size, nvinfer1::DataType type) noexcept
+        size_t seq_len, size_t message_size, int world_size, nvinfer1::DataType type)
     {
+
+        if (isUsingLowPrecision(message_size))
+        {
+            return AllReduceStrategyType::LOWPRECISION;
+        }
+        else
+        {
+            if (mStrategy == AllReduceStrategyType::LOWPRECISION)
+            {
+                mStrategy = AllReduceStrategyType::AUTO;
+            }
+        }
+
         // Check that heuristic is only applied when AUTO is set.
+        // Use Auto select
         bool const is_auto = (mStrategy == AllReduceStrategyType::AUTO);
         auto const message_size_bytes = message_size * tensorrt_llm::common::getDTypeSize(type);
         auto const max_workspace_size
@@ -845,6 +932,24 @@ private:
             }
         }
         return strategy;
+    }
+
+    bool isUsingLowPrecision(size_t message_size) const noexcept
+    {
+        static char* force_low_precision_allreduce_strategy_char
+            = std::getenv("FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY");
+        bool force_low_precision = (force_low_precision_allreduce_strategy_char != nullptr)
+            || (mStrategy == AllReduceStrategyType::LOWPRECISION);
+
+#ifdef ENABLE_FP8
+        // Use LowPrecision if PCIe and p2p support and message size is larger than 2MB
+        constexpr int LowPrecisionMinMessageSize = 2 * 1024 * 1024;
+        return force_low_precision && !mIsNVLINKSupported && mIsP2PSupported
+            && message_size >= LowPrecisionMinMessageSize;
+#else
+        // Low precision is not available when FP8 is not enabled
+        return false;
+#endif
     }
 
 private:
@@ -938,10 +1043,71 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
     return {norm_out, residual_out};
 }
 
+at::Tensor mnnvlTwoShotAllReduce(
+    at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
+{
+    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    TORCH_CHECK(mcast_mem != nullptr, "two_shot_all_reduce: comm_buffer must be obtained from a mcastBuffer instance.");
+
+    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    at::Tensor output = torch::empty_like(input);
+
+    auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceParams();
+    allreduce_params.dtype = dtype;
+    allreduce_params.output = output.data_ptr();
+    allreduce_params.input = input.data_ptr();
+    allreduce_params.buffer_flags = buffer_flags.data_ptr();
+    allreduce_params.wait_for_results = wait_for_results;
+    allreduce_params.stream = at::cuda::getCurrentCUDAStream(output.get_device());
+    allreduce_params.nranks = mcast_mem->getWorldSize();
+    allreduce_params.rank = mcast_mem->getRank();
+    allreduce_params.buffer_M = comm_buffer.size(2);
+    allreduce_params.num_tokens = input.size(0);
+    allreduce_params.token_dim = input.size(1);
+    allreduce_params.buffer_ptrs_dev = reinterpret_cast<void**>(mcast_mem->getBufferPtrsDev());
+    allreduce_params.multicast_ptr = mcast_mem->getMulticastPtr();
+
+    tensorrt_llm::kernels::mnnvl::twoshot_allreduce_op(allreduce_params);
+
+    return output;
+}
+
+std::vector<torch::Tensor> twoShotRMSNorm(torch::Tensor const& comm_buf, torch::Tensor const& gamma, double epsilon,
+    torch::Tensor const& residual, torch::Tensor& buffer_flags)
+{
+    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(comm_buf.scalar_type());
+    auto rmsnorm_params = tensorrt_llm::kernels::mnnvl::RMSNormParams();
+
+    // Input is the communication buffer so we need to get the shape from residual
+    torch::Tensor normed_output = torch::empty_like(residual);
+    torch::Tensor prenorm_output = torch::empty_like(residual);
+
+    rmsnorm_params.dtype = dtype;
+    rmsnorm_params.residual_output = prenorm_output.data_ptr();
+    rmsnorm_params.output = normed_output.data_ptr();
+    rmsnorm_params.input = comm_buf.data_ptr();
+    rmsnorm_params.gamma = gamma.data_ptr();
+    rmsnorm_params.epsilon = epsilon;
+    rmsnorm_params.residual = residual.data_ptr();
+    rmsnorm_params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
+    rmsnorm_params.batch = normed_output.size(0);
+    rmsnorm_params.hidden_dim = normed_output.size(1);
+    rmsnorm_params.stream = at::cuda::getCurrentCUDAStream(comm_buf.get_device());
+
+    tensorrt_llm::kernels::mnnvl::twoshot_rmsnorm_op(rmsnorm_params);
+
+    return {normed_output, prenorm_output};
+}
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def(
+        "mnnvl_twoshot_allreduce(Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
+        "Tensor(buffer_flags!) buffer_flags, bool wait_for_result) -> Tensor");
+    m.def(
+        "mnnvl_twoshot_rmsnorm(Tensor comm_buf, Tensor gamma, "
+        "float epsilon, Tensor residual, Tensor buffer_flags) -> Tensor[]");
     m.def(
         "allreduce("
         "Tensor input,"
@@ -966,10 +1132,24 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int rank,"
         "int nranks,"
         "float eps) -> Tensor[]");
+    m.def("initialize_static_lowprecision_buffers(Tensor workspace, int tp_size) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("mnnvl_twoshot_allreduce", &torch_ext::mnnvlTwoShotAllReduce);
+    m.impl("mnnvl_twoshot_rmsnorm", &torch_ext::twoShotRMSNorm);
     m.impl("allreduce", &torch_ext::allreduce);
     m.impl("moe_allreduce", &torch_ext::moe_allreduce);
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CPU, m)
+{
+    m.impl("initialize_static_lowprecision_buffers",
+        [](at::Tensor const& workspace, int64_t tp_size)
+        {
+            tensorrt_llm::kernels::initialize_static_lowprecision_buffers(
+                reinterpret_cast<int64_t*>(workspace.data_ptr()), (int) tp_size);
+            return std::vector<at::Tensor>{};
+        });
 }

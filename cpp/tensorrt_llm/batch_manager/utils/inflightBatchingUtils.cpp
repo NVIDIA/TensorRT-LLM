@@ -39,17 +39,32 @@ TensorPtr collectRequestIds(RequestVector const& contextRequests, RequestVector 
     return requestIds;
 }
 
-void sortByLoraId(ScheduledRequests& scheduledRequests)
+void sortRequests(RequestVector& contextRequests, RequestVector& generationRequests, bool chunksPresent)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto sortRequests = [](RequestVector& requests)
+    auto sortByLoraId = [](RequestVector::iterator begin, RequestVector::iterator end)
     {
-        std::sort(requests.begin(), requests.end(),
-            [](auto const& lhs, auto const& rhs) { return lhs->getLoraTaskId() < rhs->getLoraTaskId(); });
+        std::sort(
+            begin, end, [](auto const& lhs, auto const& rhs) { return lhs->getLoraTaskId() < rhs->getLoraTaskId(); });
     };
-    sortRequests(scheduledRequests.contextRequests);
-    sortRequests(scheduledRequests.generationRequests);
+
+    if (chunksPresent)
+    {
+        // Move context requests that reached the last context chunk to the end of the vector.
+        // This order is required for moveFinishedContextRequestsToGeneration.
+        auto firstFinished = std::partition(contextRequests.begin(), contextRequests.end(),
+            [](auto const& llmReq) { return !llmReq->isLastContextChunk(); });
+
+        // Sort context requests by lora task id, but keep finished requests separate.
+        sortByLoraId(contextRequests.begin(), firstFinished);
+        sortByLoraId(firstFinished, contextRequests.end());
+    }
+    else
+    {
+        sortByLoraId(contextRequests.begin(), contextRequests.end());
+    }
+    sortByLoraId(generationRequests.begin(), generationRequests.end());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -63,7 +78,9 @@ void moveFinishedContextRequestsToGeneration(ScheduledRequests& scheduledRequest
     auto firstFinished = std::find_if(
         contextRequests.begin(), contextRequests.end(), [](auto const& llmReq) { return llmReq->isContextFinished(); });
     TLLM_LOG_DEBUG(
-        "Moving %ld finished context requests to generation.", std::distance(firstFinished, contextRequests.end()));
+        "Found %ld unfinished chunked context requests. Found %ld finished context requests, moving them to "
+        "generation.",
+        std::distance(contextRequests.begin(), firstFinished), std::distance(firstFinished, contextRequests.end()));
     generationRequests.insert(generationRequests.begin(), std::make_move_iterator(firstFinished),
         std::make_move_iterator(contextRequests.end()));
     contextRequests.erase(firstFinished, contextRequests.end());
@@ -80,7 +97,7 @@ void copyGenerationLogits(RuntimeBuffers::GenerationLogitsCache& generationLogit
     TLLM_CHECK_WITH_INFO(
         !beforeDecoder || numDroppedTokens.empty(), "numDroppedTokens are only possible after decoder.");
 
-    auto const reqBeamWidth = llmReq.mSamplingConfig.beamWidth;
+    auto const reqBeamWidth = llmReq.getBeamWidthByIter();
     TLLM_CHECK_WITH_INFO(numDroppedTokens.empty() || numDroppedTokens.size() == static_cast<size_t>(reqBeamWidth),
         "Dropped tokens have to be defined for all beams.");
 
@@ -182,7 +199,7 @@ void copyAdditionalOutputs(std::vector<executor::AdditionalModelOutput> const& a
 
                 auto const srcTensorIndex = gatherContext ? srcTensorIndexWithContext : srcTensorIndexWithoutContext;
                 auto srcView = ITensor::slice(tensor, srcTensorIndex - 1, 1);
-                for (SizeType32 beam = 0; beam < llmReq->mSamplingConfig.beamWidth; beam++)
+                for (SizeType32 beam = 0; beam < llmReq->getBeamWidthByIter(); beam++)
                 {
                     auto dstView = ITensor::slice(outputTensor.second, {beam, 0}, 1);
                     manager.copy(*srcView, *dstView);
@@ -193,7 +210,7 @@ void copyAdditionalOutputs(std::vector<executor::AdditionalModelOutput> const& a
 
     for (auto const& llmReq : generationRequests)
     {
-        auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
+        auto const reqBeamWidth = llmReq->getBeamWidthByIter();
         for (auto const& outputTensor : llmReq->getAdditionalGenerationOutputs())
         {
             auto const& [tensor, gatherContext]
@@ -268,6 +285,20 @@ void terminateRequest(SequenceSlotManager& seqSlotManager, LlmRequest& llmReq, S
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+std::vector<SizeType32> getRequestBeamWidths(
+    RequestVector const& contextRequests, RequestVector const& generationRequests)
+{
+    std::vector<SizeType32> beamWidths{};
+    for (auto const& requests : {contextRequests, generationRequests})
+    {
+        for (auto const& llmReq : requests)
+        {
+            beamWidths.push_back(llmReq->getBeamWidthByIter());
+        }
+    }
+    return beamWidths;
+}
+
 void CudaGraphExecutor::create(cudaGraph_t const& graph)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -308,7 +339,7 @@ void CudaGraphExecutor::clear()
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void CudaGraphExecutor::prepareNextGraph(std::shared_ptr<runtime::TllmRuntime>& runtime, SizeType32 nextContextId)
+void CudaGraphExecutor::prepareNextGraph(std::unique_ptr<runtime::TllmRuntime>& runtime, SizeType32 nextContextId)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& stream = runtime->getStream();
@@ -354,7 +385,7 @@ void CudaGraphExecutorCache::put(BatchState const& state, std::shared_ptr<CudaGr
     {
         mCache.erase(it->second);
     }
-    mCache.emplace_front(BatchStateGraphExecutorPair{state, value});
+    mCache.emplace_front(state, value);
     mMap[state] = mCache.begin();
 
     if (static_cast<runtime::SizeType32>(mMap.size()) > mCapacity)

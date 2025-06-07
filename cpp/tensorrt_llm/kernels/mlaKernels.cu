@@ -61,50 +61,86 @@ template <typename T>
 struct VecType
 {
     using Type = T;
+    using GPTJEltType = T;
 };
 
 template <>
 struct VecType<float>
 {
     using Type = float4;
+    using GPTJEltType = float2;
 };
 
 template <>
 struct VecType<half>
 {
     using Type = uint4;
+    using GPTJEltType = uint32_t;
 };
 
 template <>
 struct VecType<__nv_bfloat16>
 {
     using Type = mmha::bf16_8_t;
+    using GPTJEltType = __nv_bfloat162;
 };
 
-namespace mla
+struct __align__(16) fp8_16_t
 {
+    __nv_fp8x4_e4m3 x;
+    __nv_fp8x4_e4m3 y;
+    __nv_fp8x4_e4m3 z;
+    __nv_fp8x4_e4m3 w;
+};
+
+template <>
+struct VecType<__nv_fp8_e4m3>
+{
+    using Type = fp8_16_t;
+    using GPTJEltType = __nv_fp8x2_e4m3;
+};
 
 template <typename T>
-inline __device__ void apply_rotary_embedding_mla(
-    T& q, T q_pair_left, T q_pair_right, T& k, T k_pair_left, T k_pair_right, float2 const& coef)
+struct loadPagedKVKernelTraits
 {
-    T cos = cuda_cast<T>(coef.x);
-    T sin = cuda_cast<T>(coef.y);
-
-    q = cuda_cast<T>(cuda_cast<float>(cos * q_pair_left)) + cuda_cast<T>(cuda_cast<float>(sin * q_pair_right));
-    k = cuda_cast<T>(cuda_cast<float>(cos * k_pair_left)) + cuda_cast<T>(cuda_cast<float>(sin * k_pair_right));
-}
+    static constexpr int kLoraSize = 512;
+    static constexpr int kRopeSize = 64;
+    static constexpr int kHeadSize = kLoraSize + kRopeSize;
+    using VecT = typename VecType<T>::Type;
+    static constexpr int kBytesPerElem = sizeof(T);
+    static constexpr int kBytesPerLoad = 16;
+    static constexpr int kElemPerLoad = kBytesPerLoad / kBytesPerElem;
+    static_assert((kHeadSize * kBytesPerElem) % kBytesPerLoad == 0,
+        "kHeadSize * kBytesPerElem must be multiple of kBytesPerLoad (16Bytes)");
+    static constexpr int kVecPerHead = (kHeadSize * kBytesPerElem) / kBytesPerLoad;
+    static constexpr int kThreadPerHead = kVecPerHead; // for each head, we use kThreadPerHead threads to fetch all the
+                                                       // kv cache data, each thread read kv cache only once.
+    static constexpr int kTokenPerBlock
+        = std::is_same_v<T, float> ? 4 : 8; // for each block, we fetch 4 tokens for fp32, 8 tokens for other types.
+    static constexpr int kBlockSize = kThreadPerHead * kTokenPerBlock;
+    static constexpr int kKVThreadPerHead = (kLoraSize * kBytesPerElem) / kBytesPerLoad;
+};
 
 template <typename T>
-inline __device__ void apply_rotary_embedding_mla(T& q, T q_left, T q_right, float2 const& coef)
+struct setPagedKVKernelTraits
 {
-    T cos = cuda_cast<T>(coef.x);
-    T sin = cuda_cast<T>(coef.y);
-
-    q = cuda_cast<T>(cuda_cast<float>(cos * q_left)) + cuda_cast<T>(cuda_cast<float>(sin * q_right));
-}
-
-} // namespace mla
+    static constexpr int kQKNopeSize = 128;
+    static constexpr int kVHeadSize = 128;
+    static_assert(kQKNopeSize == kVHeadSize);
+    static constexpr int kRopeSize = 64;
+    static constexpr int kHeadSize = kQKNopeSize + kRopeSize;
+    using VecT = typename VecType<T>::Type;
+    static constexpr int kBytesPerElem = sizeof(T);
+    static constexpr int kBytesPerLoad = 16;
+    static constexpr int kElemPerLoad = kBytesPerLoad / kBytesPerElem;
+    static_assert((kHeadSize * kBytesPerElem) % kBytesPerLoad == 0,
+        "kHeadSize * kBytesPerElem must be multiple of kBytesPerLoad (16Bytes)");
+    static constexpr int kNumHeads = 128;
+    static constexpr int kThreadPerHead = (kHeadSize * kBytesPerElem) / kBytesPerLoad;
+    static constexpr int kKVThreadPerHead = (kQKNopeSize * kBytesPerElem) / kBytesPerLoad;
+    static constexpr int kCpTokenPerBlock = 16;
+    static constexpr int kBlockSize = kThreadPerHead * kCpTokenPerBlock;
+};
 
 template <typename SrcType, int NUM>
 inline __device__ void quantCopy(
@@ -120,18 +156,51 @@ inline __device__ void quantCopy(
     static constexpr int CVT_NUM = COPY_SIZE / sizeof(__nv_fp8_e4m3) / 2;
     static_assert(COPY_SIZE % (sizeof(__nv_fp8_e4m3) * 2) == 0);
     DstVecType fragment;
+    int offset = 0;
 #pragma unroll
     for (int i = 0; i < LOOP_NUM; ++i)
     {
 #pragma unroll
         for (int j = 0; j < CVT_NUM; ++j)
         {
-            float2 val2 = cuda_cast<float2>(reinterpret_cast<SrcType2 const*>(src_fragment_ptr)[j]);
+            float2 val2 = cuda_cast<float2>(reinterpret_cast<SrcType2 const*>(src_fragment_ptr)[j + offset]);
             val2.x *= scale_val;
             val2.y *= scale_val;
             reinterpret_cast<__nv_fp8x2_e4m3*>(&fragment)[j] = __nv_fp8x2_e4m3(val2);
         }
         reinterpret_cast<DstVecType*>(dst_global_ptr)[i] = fragment;
+        offset += CVT_NUM;
+    }
+}
+
+template <typename DstType, int NUM>
+inline __device__ void dequantCopy(
+    DstType* dst_global_ptr, __nv_fp8_e4m3 const* src_fragment_ptr, float const scale_val = 1.f)
+{
+    using DstVecType = typename VecType<DstType>::Type;
+    using DstType2 =
+        typename std::conditional<sizeof(DstType) == 2, typename TypeConverter<DstType>::Type, float2>::type;
+    static constexpr int COPY_SIZE = sizeof(DstVecType);
+    static constexpr int TOTAL_COPY_SIZE = NUM * sizeof(DstType);
+    static constexpr int LOOP_NUM = TOTAL_COPY_SIZE / COPY_SIZE;
+    static_assert(TOTAL_COPY_SIZE % COPY_SIZE == 0);
+    static constexpr int CVT_NUM = COPY_SIZE / sizeof(DstType) / 2;
+    static_assert(COPY_SIZE % (sizeof(DstType) * 2) == 0);
+    DstVecType fragment;
+    int offset = 0;
+#pragma unroll
+    for (int i = 0; i < LOOP_NUM; ++i)
+    {
+#pragma unroll
+        for (int j = 0; j < CVT_NUM; ++j)
+        {
+            float2 val2 = cuda_cast<float2>(reinterpret_cast<__nv_fp8x2_e4m3 const*>(src_fragment_ptr)[j + offset]);
+            val2.x *= scale_val;
+            val2.y *= scale_val;
+            reinterpret_cast<DstType2*>(&fragment)[j] = cuda_cast<DstType2>(val2);
+        }
+        reinterpret_cast<DstVecType*>(dst_global_ptr)[i] = fragment;
+        offset += CVT_NUM;
     }
 }
 
@@ -144,9 +213,9 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
 
     // Constants.
     using VecT = typename VecType<T>::Type;
+    using GPTJEltT = typename VecType<T>::GPTJEltType;
     constexpr auto HEAD_SIZE = ROPE_DIM;
     constexpr auto K_HEAD_SIZE = K_DIM;
-    constexpr auto HALF_ROTATARY_DIM = ROPE_DIM / 2;
     constexpr auto BYTES_PER_ELT = sizeof(T);
     constexpr auto BYTES_PER_LOAD = 16;
     constexpr auto ELTS_PER_VEC = BYTES_PER_LOAD / BYTES_PER_ELT;
@@ -166,7 +235,6 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
     {
         size_t const head_dim_vec_idx = (threadIdx.x % VECS_PER_HEAD);
         size_t const head_dim_idx = head_dim_vec_idx * ELTS_PER_VEC;
-        bool const first_half = head_dim_idx < HALF_ROTATARY_DIM;
 
         size_t const seq_len_loop_end
             = size_t((max_input_seq_len + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK;
@@ -187,60 +255,32 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
             int const global_token_idx = local_token_idx + global_token_offset;
 
             auto const position_id = local_token_idx;
-            auto const src_bias = first_half ? head_dim_idx * 2 : (head_dim_idx - HALF_ROTATARY_DIM) * 2;
             float2 const* rotary_coef_cache_buffer
-                = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx);
+                = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
             VecT q, k;
-            VecT q_ref[2], k_ref[2];
             auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM) + c_k;
             auto const src_q_global_offset
                 = static_cast<size_t>(global_token_idx) * head_num * ((head_size + ROPE_DIM) * 2 + head_size)
                 + (head_size + ROPE_DIM) * head_idx + head_size;
 
-            for (int i = 0; i < 2; ++i)
-            {
-                q_ref[i]
-                    = *reinterpret_cast<VecT const*>(&qkv_output[src_q_global_offset + src_bias + i * ELTS_PER_VEC]);
-                k_ref[i] = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + src_bias + i * ELTS_PER_VEC]);
-            }
+            q = *reinterpret_cast<VecT const*>(&qkv_output[src_q_global_offset + head_dim_idx]);
+            k = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + head_dim_idx]);
 
-            for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
+            // Pack two elements into one for gptj rotary embedding.
+#pragma unroll
+            for (int elt_id = 0; elt_id < ELTS_PER_VEC / 2; elt_id++)
             {
+                GPTJEltT& q_ = reinterpret_cast<GPTJEltT*>(&q)[elt_id];
+                GPTJEltT& k_ = reinterpret_cast<GPTJEltT*>(&k)[elt_id];
+
                 float2 rotary_coef_cache = rotary_coef_cache_buffer[elt_id];
-                rotary_coef_cache.y = first_half ? -rotary_coef_cache.y : rotary_coef_cache.y;
-                auto& q_ = reinterpret_cast<T*>(&q)[elt_id];
-                auto& k_ = reinterpret_cast<T*>(&k)[elt_id];
-                auto q_left = first_half ? reinterpret_cast<T*>(&q_ref)[elt_id * 2]
-                                         : reinterpret_cast<T*>(&q_ref)[elt_id * 2 + 1];
-                auto q_right = first_half ? reinterpret_cast<T*>(&q_ref)[elt_id * 2 + 1]
-                                          : reinterpret_cast<T*>(&q_ref)[elt_id * 2];
-                auto k_left = first_half ? reinterpret_cast<T*>(&k_ref)[elt_id * 2]
-                                         : reinterpret_cast<T*>(&k_ref)[elt_id * 2 + 1];
-                auto k_right = first_half ? reinterpret_cast<T*>(&k_ref)[elt_id * 2 + 1]
-                                          : reinterpret_cast<T*>(&k_ref)[elt_id * 2];
-                // float2 rotary_coef_cache;
-                // T q_left, q_right, k_left, k_right;
-                mla::apply_rotary_embedding_mla(q_, q_left, q_right, k_, k_left, k_right, rotary_coef_cache);
+                mmha::apply_rotary_embedding_gptj(q_, k_, rotary_coef_cache);
             }
             // do sync
             __syncwarp();
             if (valid_token)
             {
-                if (head_idx == 0)
-                {
-                    auto kDst = reinterpret_cast<T*>(kv_cache.getVBlockPtr(batch_idx, token_idx_in_kv_cache));
-                    auto inBlockIdx = kv_cache.getKVLocalIdx(
-                        token_idx_in_kv_cache, 0, TOTAL_VECS_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
-                    if (cache_type == KvCacheDataType::FP8)
-                    {
-
-                        quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * 8,
-                            reinterpret_cast<T const*>(&k), quant_scale_kv_val);
-                    }
-                    else
-                        reinterpret_cast<VecT*>(kDst)[inBlockIdx] = k;
-                }
                 if (head_idx == 0)
                 {
                     auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
@@ -249,7 +289,7 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
                     if (cache_type == KvCacheDataType::FP8)
                     {
 
-                        quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * 8,
+                        quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
                             reinterpret_cast<T const*>(&k), quant_scale_kv_val);
                     }
                     else
@@ -296,30 +336,13 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
             {
                 auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
 
-                auto kDst = reinterpret_cast<T*>(kv_cache.getVBlockPtr(batch_idx, token_idx_in_kv_cache));
-                auto inBlockIdx
-                    = kv_cache.getKVLocalIdx(token_idx_in_kv_cache, 0, TOTAL_VECS_PER_HEAD, head_dim_vec_idx);
-                if (cache_type == KvCacheDataType::FP8)
-                {
-
-                    quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * 8,
-                        fuse_buf + src_k_global_offset + head_dim_idx, quant_scale_kv_val);
-                }
-                else
-                    reinterpret_cast<VecT*>(kDst)[inBlockIdx]
-                        = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + head_dim_idx]);
-            }
-            if (valid_token)
-            {
-                auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
-
                 auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
                 auto inBlockIdx
                     = kv_cache.getKVLocalIdx(token_idx_in_kv_cache, 0, TOTAL_VECS_PER_HEAD, head_dim_vec_idx);
                 if (cache_type == KvCacheDataType::FP8)
                 {
 
-                    quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * 8,
+                    quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
                         fuse_buf + src_k_global_offset + head_dim_idx, quant_scale_kv_val);
                 }
                 else
@@ -341,9 +364,9 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
     // Constants.
     using VecT = typename VecType<T>::Type;
+    using GPTJEltT = typename VecType<T>::GPTJEltType;
     constexpr auto HEAD_SIZE = ROPE_DIM;
     constexpr auto K_HEAD_SIZE = K_DIM;
-    constexpr auto HALF_ROTATARY_DIM = ROPE_DIM / 2;
     constexpr auto BYTES_PER_ELT = sizeof(T);
     constexpr auto BYTES_PER_LOAD = 16;
     constexpr auto ELTS_PER_VEC = BYTES_PER_LOAD / BYTES_PER_ELT;
@@ -393,7 +416,6 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     {
         size_t const head_dim_vec_idx = (threadIdx.x % VECS_PER_HEAD);
         size_t const head_dim_idx = head_dim_vec_idx * ELTS_PER_VEC;
-        bool const first_half = head_dim_idx < HALF_ROTATARY_DIM;
 
         int const seq_len_loop_end = size_t((total_s_len + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK;
         float const quant_scale_q_val = quant_scale_q ? quant_scale_q[0] : 1.0f;
@@ -410,45 +432,33 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
             if (valid_token)
             {
-                VecT ref[2];
 
                 auto const position_id = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
-                auto const src_bias = first_half ? head_dim_idx * 2 : (head_dim_idx - HALF_ROTATARY_DIM) * 2;
                 float2 const* rotary_coef_cache_buffer
-                    = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx);
+                    = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
                 if (head_idx == head_num)
                 {
                     auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM) + c_k;
 
-                    for (int i = 0; i < 2; ++i)
-                    {
-                        ref[i] = *reinterpret_cast<VecT const*>(
-                            &fuse_buf[src_k_global_offset + src_bias + i * ELTS_PER_VEC]);
-                    }
+                    data = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + head_dim_idx]);
                 }
                 else
                 {
                     auto const src_q_global_offset
                         = static_cast<size_t>(global_token_idx) * q_pe_stride + q_pe_ld * head_idx;
 
-                    for (int i = 0; i < 2; ++i)
-                    {
-                        ref[i]
-                            = *reinterpret_cast<VecT const*>(&q_pe[src_q_global_offset + src_bias + i * ELTS_PER_VEC]);
-                    }
+                    data = *reinterpret_cast<VecT const*>(&q_pe[src_q_global_offset + head_dim_idx]);
                 }
 
-                for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
+                // Pack two elements into one for gptj rotary embedding.
+#pragma unroll
+                for (int elt_id = 0; elt_id < ELTS_PER_VEC / 2; elt_id++)
                 {
+                    GPTJEltT& data_ = reinterpret_cast<GPTJEltT*>(&data)[elt_id];
+
                     float2 rotary_coef_cache = rotary_coef_cache_buffer[elt_id];
-                    rotary_coef_cache.y = first_half ? -rotary_coef_cache.y : rotary_coef_cache.y;
-                    auto& data_ = reinterpret_cast<T*>(&data)[elt_id];
-                    auto data_left = first_half ? reinterpret_cast<T*>(&ref)[elt_id * 2]
-                                                : reinterpret_cast<T*>(&ref)[elt_id * 2 + 1];
-                    auto data_right = first_half ? reinterpret_cast<T*>(&ref)[elt_id * 2 + 1]
-                                                 : reinterpret_cast<T*>(&ref)[elt_id * 2];
-                    mla::apply_rotary_embedding_mla(data_, data_left, data_right, rotary_coef_cache);
+                    data_ = mmha::rotary_embedding_transform(data_, rotary_coef_cache);
                 }
             }
 
@@ -467,7 +477,8 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                         if (cache_type == KvCacheDataType::FP8)
                         {
 
-                            quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * 8,
+                            quantCopy<T, ELTS_PER_VEC>(
+                                reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
                                 reinterpret_cast<T const*>(&data), quant_scale_kv_val);
                         }
                         else
@@ -525,7 +536,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
                     if (cache_type == KvCacheDataType::FP8)
                     {
-                        quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * 8,
+                        quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
                             fuse_buf + src_kv_global_offset + head_dim_idx, quant_scale_kv_val);
                     }
                     else
@@ -599,6 +610,298 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     }
 }
 
+template <typename T, typename TCache>
+__global__ void loadPagedKVCacheForMLAKernel(T* compressed_kv_ptr, T* k_pe_ptr,
+    tensorrt_llm::kernels::KVBlockArray const kv_cache, int64_t const* cu_ctx_cached_kv_lens, int max_input_seq_len,
+    float const* kv_scale_quant_orig_ptr)
+{
+    static_assert(std::is_same_v<T, TCache> || std::is_same_v<TCache, __nv_fp8_e4m3>,
+        "TCache must be either the same type as T or __nv_fp8_e4m3");
+    using KT = typename tensorrt_llm::kernels::loadPagedKVKernelTraits<TCache>;
+
+    int const batch_idx = static_cast<int>(blockIdx.y);
+    float const kv_scale_quant_orig = kv_scale_quant_orig_ptr ? kv_scale_quant_orig_ptr[0] : 1.0f;
+
+    size_t const head_dim_vec_idx = (threadIdx.x % KT::kVecPerHead);
+    size_t const head_dim_idx = head_dim_vec_idx * KT::kElemPerLoad;
+    bool const is_valid_kv = head_dim_vec_idx < KT::kKVThreadPerHead;
+
+    size_t const seq_len_loop_end
+        = (max_input_seq_len + KT::kTokenPerBlock - 1) / KT::kTokenPerBlock * KT::kTokenPerBlock;
+
+    int64_t const global_token_offset = cu_ctx_cached_kv_lens[batch_idx];
+    int64_t const cache_kv_len = cu_ctx_cached_kv_lens[batch_idx + 1] - cu_ctx_cached_kv_lens[batch_idx];
+
+    for (int local_token_idx = (threadIdx.x / KT::kThreadPerHead) + blockIdx.x * KT::kTokenPerBlock;
+         local_token_idx < seq_len_loop_end; local_token_idx += KT::kTokenPerBlock * gridDim.x)
+    {
+        int token_idx_in_kv_cache = local_token_idx;
+        bool const valid_token = token_idx_in_kv_cache < cache_kv_len;
+
+        if (valid_token)
+        {
+            auto* kvSrc = reinterpret_cast<TCache*>(kv_cache.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
+            // head_idx === 0
+            auto kvBlockIdx
+                = kv_cache.getKVLocalIdx(token_idx_in_kv_cache, 0, KT::kVecPerHead, static_cast<int>(head_dim_vec_idx));
+
+            auto src_data = reinterpret_cast<typename KT::VecT*>(kvSrc)[kvBlockIdx];
+
+            int const global_token_idx = local_token_idx + global_token_offset;
+
+            if (is_valid_kv)
+            {
+                // compressed_kv {total_token, lora_size}
+                int const dstIdx = global_token_idx * KT::kLoraSize + head_dim_idx;
+
+                // copy back to compressed_kv
+                if constexpr (std::is_same_v<TCache, T>)
+                {
+                    *reinterpret_cast<typename KT::VecT*>(compressed_kv_ptr + dstIdx) = src_data;
+                }
+                else if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
+                {
+                    dequantCopy<T, KT::kElemPerLoad>(compressed_kv_ptr + dstIdx,
+                        reinterpret_cast<__nv_fp8_e4m3 const*>(&src_data), kv_scale_quant_orig);
+                }
+            }
+            else
+            {
+                // k_pe {total_token, rope_size}
+                int const dstIdx = global_token_idx * KT::kRopeSize + (head_dim_idx - KT::kLoraSize);
+
+                // copy back to k_pe
+                if constexpr (std::is_same_v<TCache, T>)
+                {
+                    *reinterpret_cast<typename KT::VecT*>(k_pe_ptr + dstIdx) = src_data;
+                }
+                else if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
+                {
+                    dequantCopy<T, KT::kElemPerLoad>(
+                        k_pe_ptr + dstIdx, reinterpret_cast<__nv_fp8_e4m3 const*>(&src_data), kv_scale_quant_orig);
+                }
+            }
+        }
+    }
+}
+
+// k {total_token, h, d}, v {total_token, h, d}, k_pe {total_token, h=1, d_rope}
+// output {b, 2, ceil(max_seq / kv_cache_tokens_per_block), h, kv_cache_tokens_per_block, d}
+template <typename T>
+__global__ void setPagedKVCacheForMLAKernel(T* output, T* const k_ptr, T* const v_ptr, T* const k_pe_ptr,
+    int64_t const* cu_seq_lens, int const max_input_seq_len, int num_heads, int kv_dim, int rope_dim,
+    int kv_cache_tokens_per_block, int64_t kv_token_stride)
+{
+    using KT = typename tensorrt_llm::kernels::setPagedKVKernelTraits<T>;
+    int const batch_idx = static_cast<int>(blockIdx.y);
+    int const head_idx = static_cast<int>(blockIdx.z);
+    int const head_dim_vec_idx = (threadIdx.x % KT::kThreadPerHead);
+    int const head_dim_idx = head_dim_vec_idx * KT::kElemPerLoad;
+    bool const is_valid_v = head_dim_idx < KT::kVHeadSize;
+
+    size_t const seq_len_loop_end
+        = (max_input_seq_len + KT::kCpTokenPerBlock - 1) / KT::kCpTokenPerBlock * KT::kCpTokenPerBlock;
+    size_t const kv_cache_block_size = num_heads * kv_cache_tokens_per_block * (kv_dim + rope_dim);
+    size_t const kv_cache_block_num = (max_input_seq_len + kv_cache_tokens_per_block - 1) / kv_cache_tokens_per_block;
+    int64_t const global_token_offset = cu_seq_lens[batch_idx];
+    int64_t const cache_kv_len = cu_seq_lens[batch_idx + 1] - cu_seq_lens[batch_idx];
+
+    for (int local_token_idx = (threadIdx.x / KT::kThreadPerHead) + blockIdx.x * KT::kCpTokenPerBlock;
+         local_token_idx < seq_len_loop_end; local_token_idx += KT::kCpTokenPerBlock * gridDim.x)
+    {
+        int token_idx_in_kv_cache = local_token_idx;
+        bool const valid_token = token_idx_in_kv_cache < cache_kv_len;
+        if (valid_token)
+        {
+            // copy k and v
+            if (is_valid_v)
+            {
+                int ld_kv_global_offset = (global_token_offset + local_token_idx) * kv_token_stride + head_idx * kv_dim;
+                int ld_kv_local_offset = head_dim_vec_idx;
+                auto k_data = (reinterpret_cast<typename KT::VecT*>(k_ptr + ld_kv_global_offset))[ld_kv_local_offset];
+                auto v_data = (reinterpret_cast<typename KT::VecT*>(v_ptr + ld_kv_global_offset))[ld_kv_local_offset];
+                // {b, 0, token / kv_cache_tokens_per_block, h, token % kv_cache_tokens_per_block, ...}
+                int st_k_global_offset = batch_idx * 2 * kv_cache_block_num * kv_cache_block_size
+                    + local_token_idx / kv_cache_tokens_per_block * kv_cache_block_size
+                    + head_idx * kv_cache_tokens_per_block * (kv_dim + rope_dim)
+                    + (local_token_idx % kv_cache_tokens_per_block) * (kv_dim + rope_dim);
+                // {b, 1, token / kv_cache_tokens_per_block, h, token % kv_cache_tokens_per_block, ...}
+                int st_v_global_offset = st_k_global_offset + kv_cache_block_num * kv_cache_block_size;
+                int st_k_local_offset = head_dim_vec_idx;
+                int st_v_local_offset = head_dim_vec_idx;
+                (reinterpret_cast<typename KT::VecT*>(output + st_k_global_offset))[st_k_local_offset] = k_data;
+                (reinterpret_cast<typename KT::VecT*>(output + st_v_global_offset))[st_v_local_offset] = v_data;
+            }
+            // copy k_pe, only 1 head
+            else
+            {
+                int ld_rope_global_offset = (global_token_offset + local_token_idx) * rope_dim;
+                int ld_rope_local_offset = head_dim_vec_idx - KT::kKVThreadPerHead;
+                auto rope_data
+                    = (reinterpret_cast<typename KT::VecT*>(k_pe_ptr + ld_rope_global_offset))[ld_rope_local_offset];
+                // {b, 0, token / kv_cache_tokens_per_block, h, token % kv_cache_tokens_per_block, ...}
+                int st_rope_global_offset = batch_idx * 2 * kv_cache_block_num * kv_cache_block_size
+                    + local_token_idx / kv_cache_tokens_per_block * kv_cache_block_size
+                    + head_idx * kv_cache_tokens_per_block * (kv_dim + rope_dim)
+                    + (local_token_idx % kv_cache_tokens_per_block) * (kv_dim + rope_dim);
+                int st_rope_local_offset = head_dim_vec_idx;
+                (reinterpret_cast<typename KT::VecT*>(output + st_rope_global_offset))[st_rope_local_offset]
+                    = rope_data;
+            }
+        }
+        else
+        {
+            break;
+        }
+    }
+}
+
+// ck {total_cached_token, h, d}, cv {total_cached_token, h, d}, ck_pe {total_cached_token, d_rope}
+// nk {total_new_token, h, d}, nv {total_new_token, h, d}, nk_pe {total_new_token, d_rope}
+// output {b, 2, ceil(max_seq / kv_cache_tokens_per_block), h, kv_cache_tokens_per_block, d}
+template <typename T>
+__global__ void setPagedKVCacheForMLAKernelV2(T* output, T* const cached_k_ptr, T* const cached_v_ptr,
+    T* const cached_k_pe_ptr, T* const new_k_ptr, T* const new_v_ptr, T* const new_k_pe_ptr,
+    int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_seq_len, int num_heads,
+    int kv_dim, int rope_dim, int kv_cache_tokens_per_block)
+{
+    using KT = typename tensorrt_llm::kernels::setPagedKVKernelTraits<T>;
+    int const batch_idx = static_cast<int>(blockIdx.y);
+    int const head_idx = static_cast<int>(blockIdx.z);
+    int const head_dim_vec_idx = (threadIdx.x % KT::kThreadPerHead);
+    int const head_dim_idx = head_dim_vec_idx * KT::kElemPerLoad;
+    bool const is_valid_v = head_dim_idx < KT::kVHeadSize;
+
+    size_t const seq_len_loop_end
+        = (max_input_seq_len + KT::kCpTokenPerBlock - 1) / KT::kCpTokenPerBlock * KT::kCpTokenPerBlock;
+    size_t const kv_cache_block_size = num_heads * kv_cache_tokens_per_block * (kv_dim + rope_dim);
+    size_t const kv_cache_block_num = (max_input_seq_len + kv_cache_tokens_per_block - 1) / kv_cache_tokens_per_block;
+    int64_t const cached_global_token_offset = cu_ctx_cached_kv_lens[batch_idx];
+    int64_t const uncached_global_token_offset = cu_seq_lens[batch_idx] - cu_ctx_cached_kv_lens[batch_idx];
+    int64_t const total_kv_len = cu_seq_lens[batch_idx + 1] - cu_seq_lens[batch_idx];
+    int64_t const cached_kv_len = cu_ctx_cached_kv_lens[batch_idx + 1] - cu_ctx_cached_kv_lens[batch_idx];
+
+    for (int local_token_idx = (threadIdx.x / KT::kThreadPerHead) + blockIdx.x * KT::kCpTokenPerBlock;
+         local_token_idx < seq_len_loop_end; local_token_idx += KT::kCpTokenPerBlock * gridDim.x)
+    {
+        int token_idx_in_kv_cache = local_token_idx;
+        bool const valid_token = token_idx_in_kv_cache < total_kv_len;
+        if (valid_token)
+        {
+            // copy k and v
+            if (is_valid_v)
+            {
+                int ld_kv_global_offset = local_token_idx < cached_kv_len
+                    ? ((cached_global_token_offset + local_token_idx) * num_heads * kv_dim + head_idx * kv_dim)
+                    : ((uncached_global_token_offset + local_token_idx - cached_kv_len) * num_heads * kv_dim
+                        + head_idx * kv_dim);
+                int ld_kv_local_offset = head_dim_vec_idx;
+                auto k_ptr = local_token_idx < cached_kv_len ? cached_k_ptr : new_k_ptr;
+                auto v_ptr = local_token_idx < cached_kv_len ? cached_v_ptr : new_v_ptr;
+                auto k_data = (reinterpret_cast<typename KT::VecT*>(k_ptr + ld_kv_global_offset))[ld_kv_local_offset];
+                auto v_data = (reinterpret_cast<typename KT::VecT*>(v_ptr + ld_kv_global_offset))[ld_kv_local_offset];
+                // {b, 0, token / kv_cache_tokens_per_block, h, token % kv_cache_tokens_per_block, ...}
+                int st_k_global_offset = batch_idx * 2 * kv_cache_block_num * kv_cache_block_size
+                    + local_token_idx / kv_cache_tokens_per_block * kv_cache_block_size
+                    + head_idx * kv_cache_tokens_per_block * (kv_dim + rope_dim)
+                    + (local_token_idx % kv_cache_tokens_per_block) * (kv_dim + rope_dim);
+                // {b, 1, token / kv_cache_tokens_per_block, h, token % kv_cache_tokens_per_block, ...}
+                int st_v_global_offset = st_k_global_offset + kv_cache_block_num * kv_cache_block_size;
+                int st_k_local_offset = head_dim_vec_idx;
+                int st_v_local_offset = head_dim_vec_idx;
+                (reinterpret_cast<typename KT::VecT*>(output + st_k_global_offset))[st_k_local_offset] = k_data;
+                (reinterpret_cast<typename KT::VecT*>(output + st_v_global_offset))[st_v_local_offset] = v_data;
+            }
+            // copy k_pe, only 1 head
+            else
+            {
+                int ld_rope_global_offset = local_token_idx < cached_kv_len
+                    ? ((cached_global_token_offset + local_token_idx) * rope_dim)
+                    : ((uncached_global_token_offset + local_token_idx - cached_kv_len) * rope_dim);
+                int ld_rope_local_offset = head_dim_vec_idx - KT::kKVThreadPerHead;
+                auto k_pe_ptr = local_token_idx < cached_kv_len ? cached_k_pe_ptr : new_k_pe_ptr;
+                auto rope_data
+                    = (reinterpret_cast<typename KT::VecT*>(k_pe_ptr + ld_rope_global_offset))[ld_rope_local_offset];
+                // {b, 0, token / kv_cache_tokens_per_block, h, token % kv_cache_tokens_per_block, ...}
+                int st_rope_global_offset = batch_idx * 2 * kv_cache_block_num * kv_cache_block_size
+                    + local_token_idx / kv_cache_tokens_per_block * kv_cache_block_size
+                    + head_idx * kv_cache_tokens_per_block * (kv_dim + rope_dim)
+                    + (local_token_idx % kv_cache_tokens_per_block) * (kv_dim + rope_dim);
+                int st_rope_local_offset = head_dim_vec_idx;
+                (reinterpret_cast<typename KT::VecT*>(output + st_rope_global_offset))[st_rope_local_offset]
+                    = rope_data;
+            }
+        }
+        else
+        {
+            break;
+        }
+    }
+}
+
+// compressed_kv_ptr {total_uncached_tokens, d}, k_pe_ptr {total_uncached_tokens, d_rope}
+template <typename T, typename TCache>
+__global__ void appendPagedKVForMLAKernel(KVBlockArray kv_cache, T* const compressed_kv_ptr, T* const k_pe_ptr,
+    int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
+    int head_dim, float const* kv_scale_orig_quant_ptr)
+{
+    static_assert(std::is_same_v<T, TCache> || std::is_same_v<TCache, __nv_fp8_e4m3>,
+        "TCache must be either the same type as T or __nv_fp8_e4m3");
+    using KT = typename tensorrt_llm::kernels::loadPagedKVKernelTraits<T>;
+    float const kv_scale_orig_quant = kv_scale_orig_quant_ptr ? kv_scale_orig_quant_ptr[0] : 1.0f;
+
+    int const batch_idx = static_cast<int>(blockIdx.y);
+
+    size_t const head_dim_vec_idx = (threadIdx.x % KT::kVecPerHead);
+    size_t const head_dim_idx = head_dim_vec_idx * KT::kElemPerLoad;
+    bool const is_valid_kv = head_dim_vec_idx < KT::kKVThreadPerHead;
+
+    size_t const seq_len_loop_end
+        = (max_input_uncached_seq_len + KT::kTokenPerBlock - 1) / KT::kTokenPerBlock * KT::kTokenPerBlock;
+
+    int64_t const global_token_offset = cu_seq_lens[batch_idx] - cu_ctx_cached_kv_lens[batch_idx];
+    int64_t const cached_kv_len = cu_ctx_cached_kv_lens[batch_idx + 1] - cu_ctx_cached_kv_lens[batch_idx];
+    int64_t const uncached_kv_len = cu_seq_lens[batch_idx + 1] - cu_seq_lens[batch_idx] - cached_kv_len;
+
+    for (int local_token_idx = (threadIdx.x / KT::kThreadPerHead) + blockIdx.x * KT::kTokenPerBlock;
+         local_token_idx < seq_len_loop_end; local_token_idx += KT::kTokenPerBlock * gridDim.x)
+    {
+        int token_idx_in_kv_cache = local_token_idx + cached_kv_len;
+        bool valid_token = local_token_idx < uncached_kv_len;
+        if (valid_token)
+        {
+            typename KT::VecT src_data;
+            if (is_valid_kv)
+            {
+                int ld_kv_global_offset = (global_token_offset + local_token_idx) * KT::kLoraSize;
+                int ld_kv_local_offset = head_dim_vec_idx;
+                src_data = (reinterpret_cast<typename KT::VecT*>(
+                    compressed_kv_ptr + ld_kv_global_offset))[ld_kv_local_offset];
+            }
+            else
+            {
+                int ld_rope_global_offset = (global_token_offset + local_token_idx) * KT::kRopeSize;
+                int ld_rope_local_offset = head_dim_vec_idx - KT::kKVThreadPerHead;
+                src_data
+                    = (reinterpret_cast<typename KT::VecT*>(k_pe_ptr + ld_rope_global_offset))[ld_rope_local_offset];
+            }
+            auto* kvCacheDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
+            auto kvBlockIdx
+                = kv_cache.getKVLocalIdx(token_idx_in_kv_cache, 0, KT::kVecPerHead, static_cast<int>(head_dim_vec_idx));
+            if constexpr (std::is_same_v<TCache, T>)
+            {
+                reinterpret_cast<typename KT::VecT*>(kvCacheDst)[kvBlockIdx] = src_data;
+            }
+            else if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
+            {
+                quantCopy<T, KT::kElemPerLoad>(
+                    reinterpret_cast<__nv_fp8_e4m3*>(kvCacheDst) + kvBlockIdx * KT::kElemPerLoad,
+                    reinterpret_cast<T const*>(&src_data), kv_scale_orig_quant);
+            }
+        }
+    }
+}
+
 template <typename T, typename KVCacheBuffer>
 void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream)
 {
@@ -639,6 +942,65 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
         params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
 }
 
+template <typename T, typename TCache>
+void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_cache, int const num_contexts,
+    int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len, int const lora_size, int const rope_size,
+    float const* kv_scale_quant_orig_ptr, cudaStream_t stream)
+{
+    using KT = typename tensorrt_llm::kernels::loadPagedKVKernelTraits<TCache>;
+    // {seq_len / token_per_block, batch_size, head_num}
+    TLLM_CHECK_WITH_INFO(lora_size == KT::kLoraSize, "lora_size should be equal to %d", KT::kLoraSize);
+    TLLM_CHECK_WITH_INFO(rope_size == KT::kRopeSize, "rope_size should be equal to %d", KT::kRopeSize);
+    TLLM_CHECK_WITH_INFO(lora_size + rope_size == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
+    dim3 grid(static_cast<int>(tensorrt_llm::common::divUp(max_input_seq_len, KT::kTokenPerBlock)), num_contexts, 1);
+    loadPagedKVCacheForMLAKernel<T, TCache><<<grid, KT::kBlockSize, 0, stream>>>(
+        compressed_kv_ptr, k_pe_ptr, kv_cache, cu_ctx_cached_kv_lens, max_input_seq_len, kv_scale_quant_orig_ptr);
+}
+
+template <typename T>
+void invokeMLASetPagedKV(T* output, T* const k_ptr, T* const v_ptr, T* const k_pe_ptr, int const num_requests,
+    int64_t const* cu_seq_lens, int const max_input_seq_len, int num_heads, int kv_dim, int rope_dim,
+    int kv_cache_tokens_per_block, int64_t kv_token_stride, cudaStream_t stream)
+{
+    using KT = typename tensorrt_llm::kernels::setPagedKVKernelTraits<T>;
+    TLLM_CHECK_WITH_INFO(kv_dim + rope_dim == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
+    TLLM_CHECK_WITH_INFO(kv_cache_tokens_per_block % KT::kCpTokenPerBlock == 0,
+        "kv_cache_tokens_per_block should be multiple of %d", KT::kCpTokenPerBlock);
+    dim3 grid(tensorrt_llm::common::divUp(max_input_seq_len, KT::kCpTokenPerBlock), num_requests, num_heads);
+    setPagedKVCacheForMLAKernel<T><<<grid, KT::kBlockSize, 0, stream>>>(output, k_ptr, v_ptr, k_pe_ptr, cu_seq_lens,
+        max_input_seq_len, num_heads, kv_dim, rope_dim, kv_cache_tokens_per_block, kv_token_stride);
+}
+
+template <typename T>
+void invokeMLASetPagedKVV2(T* output, T* const cached_k_ptr, T* const cached_v_ptr, T* const cached_k_pe_ptr,
+    T* const new_k_ptr, T* const new_v_ptr, T* const new_k_pe_ptr, int const num_requests,
+    int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_seq_len, int num_heads,
+    int kv_dim, int rope_dim, int kv_cache_tokens_per_block, cudaStream_t stream)
+{
+    using KT = typename tensorrt_llm::kernels::setPagedKVKernelTraits<T>;
+    TLLM_CHECK_WITH_INFO(kv_dim + rope_dim == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
+    TLLM_CHECK_WITH_INFO(kv_cache_tokens_per_block % KT::kCpTokenPerBlock == 0,
+        "kv_cache_tokens_per_block should be multiple of %d", KT::kCpTokenPerBlock);
+    dim3 grid(tensorrt_llm::common::divUp(max_input_seq_len, KT::kCpTokenPerBlock), num_requests, num_heads);
+    setPagedKVCacheForMLAKernelV2<T><<<grid, KT::kBlockSize, 0, stream>>>(output, cached_k_ptr, cached_v_ptr,
+        cached_k_pe_ptr, new_k_ptr, new_v_ptr, new_k_pe_ptr, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_seq_len,
+        num_heads, kv_dim, rope_dim, kv_cache_tokens_per_block);
+}
+
+template <typename T, typename TCache>
+void invokeMLAAppendPagedKV(KVBlockArray& kv_cache, T* const compressed_kv_ptr, T* const k_pe_ptr,
+    int const num_requests, int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens,
+    int const max_input_uncached_seq_len, int head_dim, float const* kv_scale_orig_quant_ptr, cudaStream_t stream)
+{
+    // just reuse the same traits as loadPagedKVKernel.
+    using KT = typename tensorrt_llm::kernels::loadPagedKVKernelTraits<T>;
+    TLLM_CHECK_WITH_INFO(head_dim == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
+    dim3 grid(
+        static_cast<int>(tensorrt_llm::common::divUp(max_input_uncached_seq_len, KT::kTokenPerBlock)), num_requests, 1);
+    appendPagedKVForMLAKernel<T, TCache><<<grid, KT::kBlockSize, 0, stream>>>(kv_cache, compressed_kv_ptr, k_pe_ptr,
+        cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, head_dim, kv_scale_orig_quant_ptr);
+}
+
 #define INSTANTIATE_MLA_ROPE(T, KVCacheBuffer)                                                                         \
     template void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);      \
     template void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
@@ -652,6 +1014,36 @@ INSTANTIATE_MLA_ROPE(half, KVLinearBuffer);
 INSTANTIATE_MLA_ROPE(__nv_bfloat16, KVBlockArray);
 INSTANTIATE_MLA_ROPE(__nv_bfloat16, KVLinearBuffer);
 #endif
+
+#define INSTANTIATE_RW_KVCACHE_MLA(T, TCache)                                                                          \
+    template void invokeMLALoadPagedKV<T, TCache>(T * compressed_kv_ptr, T * k_pe_ptr, KVBlockArray & kv_cache,        \
+        int const num_contexts, int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len,                     \
+        int const lora_size, int const rope_size, float const* kv_scale_quant_orig_ptr, cudaStream_t stream);          \
+    template void invokeMLAAppendPagedKV<T, TCache>(KVBlockArray & kv_cache, T* const compressed_kv_ptr,               \
+        T* const k_pe_ptr, int const num_requests, int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens,   \
+        int const max_input_uncached_seq_len, int head_dim, float const* kv_scale_orig_quant_ptr,                      \
+        cudaStream_t stream);
+
+INSTANTIATE_RW_KVCACHE_MLA(float, float);
+INSTANTIATE_RW_KVCACHE_MLA(float, __nv_fp8_e4m3);
+INSTANTIATE_RW_KVCACHE_MLA(half, half);
+INSTANTIATE_RW_KVCACHE_MLA(half, __nv_fp8_e4m3);
+INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_bfloat16);
+INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_fp8_e4m3);
+
+#define INSTANTIATE_SET_KVCACHE_MLA(T)                                                                                 \
+    template void invokeMLASetPagedKV(T* output, T* const k_ptr, T* const v_ptr, T* const k_pe_ptr,                    \
+        int const num_requests, int64_t const* cu_seq_lens, int const max_input_seq_len, int num_heads, int kv_dim,    \
+        int rope_dim, int kv_cache_tokens_per_block, int64_t kv_token_stride, cudaStream_t stream);                    \
+    template void invokeMLASetPagedKVV2(T* output, T* const cached_k_ptr, T* const cached_v_ptr,                       \
+        T* const cached_k_pe_ptr, T* const new_k_ptr, T* const new_v_ptr, T* const new_k_pe_ptr,                       \
+        int const num_requests, int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens,                      \
+        int const max_input_seq_len, int num_heads, int kv_dim, int rope_dim, int kv_cache_tokens_per_block,           \
+        cudaStream_t stream);
+
+INSTANTIATE_SET_KVCACHE_MLA(float);
+INSTANTIATE_SET_KVCACHE_MLA(half);
+INSTANTIATE_SET_KVCACHE_MLA(__nv_bfloat16);
 
 } // namespace kernels
 

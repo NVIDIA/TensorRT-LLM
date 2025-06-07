@@ -52,7 +52,7 @@ async def stream_generation_handler(worker,
             task.end_flag = True
 
     sampling_params = worker.combine_sampling_params_with_generation_task(task)
-    if task.request_handle == None:
+    if task.request_handle is None:
         task.request_handle = worker.llm.generate_async(
             task.input_str, sampling_params=sampling_params, streaming=True)
     await get_step_or_more_tokens(task)

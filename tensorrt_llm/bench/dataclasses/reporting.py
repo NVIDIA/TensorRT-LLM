@@ -236,7 +236,7 @@ class ReportUtility:
         }
 
         # Engine/Backend details
-        if self.rt_cfg.backend not in ('pytorch', 'autodeploy'):
+        if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
             config_path = self.rt_cfg.engine_dir / "config.json"
             with open(config_path, "r") as config:
                 engine_config = json.load(config)
@@ -264,9 +264,8 @@ class ReportUtility:
             model = self.rt_cfg.model_path or self.rt_cfg.model
             model_config = ModelConfig.from_pretrained(model,
                                                        trust_remote_code=True)
-            validate_and_set_kv_cache_quant(
-                model_config,
-                self.kwargs["pytorch_backend_config"].kv_cache_dtype)
+            validate_and_set_kv_cache_quant(model_config,
+                                            self.kwargs["kv_cache_dtype"])
 
             stats_dict["engine"] |= {
                 "backend":
@@ -420,7 +419,7 @@ class ReportUtility:
         decoding = stats_dict.get("decoding_stats", None)
 
         backend_info = ""
-        if self.rt_cfg.backend not in ('pytorch', 'autodeploy'):
+        if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
             config_path = self.rt_cfg.engine_dir / "config.json"
             with open(config_path, "r") as config:
                 engine_config = json.load(config)
@@ -520,9 +519,9 @@ class ReportUtility:
                 ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
 
             perf_stats += (
-                f"Average time-to-first-token [TTFT] (ms):   {streaming['avg_ttft_ms']:.4f}\n"
-                f"Average time-per-output-token [TPOT] (ms): {streaming['avg_tpot_ms']:.4f}\n"
-                f"Per User Output Speed (tps/user):          {streaming['token_output_speed_tok_s']:.4f}\n"
+                f"Average time-to-first-token [TTFT] (ms):          {streaming['avg_ttft_ms']:.4f}\n"
+                f"Average time-per-output-token [TPOT] (ms):        {streaming['avg_tpot_ms']:.4f}\n"
+                f"Per User Output Speed (tps/user):                 {streaming['token_output_speed_tok_s']:.4f}\n"
                 "\n-- Per-Request Time-per-Output-Token [TPOT] Breakdown (ms)\n\n"
                 f"{tpot_stats}\n"
                 "\n-- Per-Request Time-to-First-Token [TTFT] Breakdown (ms) \n\n"

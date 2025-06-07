@@ -139,8 +139,8 @@ private:
     static std::optional<SizeType32> const& checkNumReturnSequences(
         std::optional<SizeType32> const& numReturnSequences, SizeType32 beamWidth);
     static std::optional<FloatType> const& checkMinP(std::optional<FloatType> const& minP);
-    static std::optional<std::vector<SizeType32>> const& checkBeamWidthArray(
-        std::optional<std::vector<SizeType32>> const& beamWidthArray, std::optional<SizeType32> const beamWidth);
+    static std::pair<std::optional<std::vector<SizeType32>> const&, SizeType32 const> const checkBeamWidthArray(
+        std::optional<std::vector<SizeType32>> const& beamWidthArray, SizeType32 const beamWidth);
     void updateNumReturnBeams();
 
     friend class Serialization;
@@ -483,6 +483,9 @@ public:
         /// @brief The generated text is amenable to the user-specified extended Backus-Naur form (EBNF) grammar.
         /// EBNF grammar is widely-used to express context-free grammars.
         kEBNF_GRAMMAR = 3,
+
+        /// @brief The generated text is amenable to the XGrammar structural tag.
+        kSTRUCTURAL_TAG = 4,
     };
 
     explicit GuidedDecodingParams(GuideType guideType, std::optional<std::string> guide = std::nullopt);
@@ -557,11 +560,15 @@ public:
 
     explicit KvCacheRetentionConfig(std::vector<TokenRangeRetentionConfig> const& tokenRangeRetentionPriorities,
         RetentionPriority decodeRetentionPriority = kDefaultRetentionPriority,
-        std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt);
+        std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt,
+        KvCacheTransferMode transferMode = KvCacheTransferMode::DRAM,
+        std::optional<std::string> directory = std::nullopt);
 
     [[nodiscard]] std::vector<TokenRangeRetentionConfig> getTokenRangeRetentionConfigs() const;
     [[nodiscard]] RetentionPriority getDecodeRetentionPriority() const;
     [[nodiscard]] std::optional<std::chrono::milliseconds> getDecodeDurationMs() const;
+    [[nodiscard]] KvCacheTransferMode getTransferMode() const;
+    [[nodiscard]] std::optional<std::string> getDirectory() const;
 
     /// @brief Convert the token range data into an entry per kv block. Returns a tuple of vectors corresponding to the
     /// priorities and durations for each block.
@@ -572,7 +579,8 @@ public:
     {
         return mTokenRangeRetentionConfigs == other.mTokenRangeRetentionConfigs
             && mDecodeRetentionPriority == other.mDecodeRetentionPriority
-            && mDecodeDurationMs == other.mDecodeDurationMs;
+            && mDecodeDurationMs == other.mDecodeDurationMs && mTransferMode == other.mTransferMode
+            && mDirectory == other.mDirectory;
     }
 
 private:
@@ -584,6 +592,10 @@ private:
     RetentionPriority mDecodeRetentionPriority;
     /// @brief The duration in ms that decode blocks should remain at their assigned priority level.
     std::optional<std::chrono::milliseconds> mDecodeDurationMs;
+    /// @brief The transfer mode for the block.
+    KvCacheTransferMode mTransferMode;
+    /// @brief Name of the directory if transfer mode is GDS or POSIX_DEBUG_FALLBACK.
+    std::optional<std::string> mDirectory;
 };
 
 /// @brief A class that holds information about the request
@@ -1426,8 +1438,7 @@ public:
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
         std::optional<CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
-        bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false,
-        bool promptTableOffloading = false, bool enableTrtOverlap = false);
+        bool gatherGenerationLogits = false, bool promptTableOffloading = false, bool enableTrtOverlap = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1459,7 +1470,6 @@ public:
     [[nodiscard]] std::optional<GuidedDecodingConfig> getGuidedDecodingConfig() const;
     [[nodiscard]] std::optional<std::vector<AdditionalModelOutput>> getAdditionalModelOutputs() const;
     [[nodiscard]] bool getGatherGenerationLogits() const;
-    [[nodiscard]] bool getUseVariableBeamWidthSearch() const;
     [[nodiscard]] bool getPromptTableOffloading() const;
     [[nodiscard]] std::optional<CacheTransceiverConfig> getCacheTransceiverConfig() const;
     [[nodiscard]] bool getEnableTrtOverlap() const;
@@ -1489,7 +1499,6 @@ public:
     void setGuidedDecodingConfig(GuidedDecodingConfig const& guidedDecodingConfig);
     void setAdditionalModelOutputs(std::vector<AdditionalModelOutput> const& additionalModelOutputs);
     void setGatherGenerationLogits(bool gatherGenerationLogits);
-    void setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch);
     void setPromptTableOffloading(bool promptTableOffloading);
     void setCacheTransceiverConfig(CacheTransceiverConfig const& cacheTransceiverConfig);
     void setEnableTrtOverlap(bool enableTrtOverlap);
@@ -1573,9 +1582,6 @@ private:
 
     /// @brief Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
     bool mGatherGenerationLogits{false};
-
-    /// @brief Controls if Variable-Beam-Width-Search is enabled.
-    bool mUseVariableBeamWidthSearch{false};
 
     /// @brief Controls if prompt table offloading is enabled.
     bool mPromptTableOffloading{false};
