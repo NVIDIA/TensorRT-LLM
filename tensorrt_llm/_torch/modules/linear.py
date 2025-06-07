@@ -327,7 +327,12 @@ class FP8QDQLinearMethod(LinearMethodBase):
         module.inv_input_scale = Parameter(torch.tensor(1.,
                                                         dtype=torch.float32),
                                            requires_grad=False)
-
+        # K, V scales for NVFP4 KV cache
+        module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                     requires_grad=False)
+        # K, V scales for NVFP4 KV cache
+        module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
                                     requires_grad=False)
@@ -375,6 +380,15 @@ class FP8QDQLinearMethod(LinearMethodBase):
             output = output + bias
         return output
 
+    def load_kv_scales(self, weights: List[Dict]):
+        k_scale, v_scale = [], []
+        for w in weights:
+            if "k_scale" in w:
+                k_scale.append(w["k_scale"][...].reshape([]))
+            if "v_scale" in w:
+                v_scale.append(w["v_scale"][...].reshape([]))
+        return k_scale, v_scale
+
     def load_weight_scales(self, weights: List[Dict]):
         input_scale, weight_scale = [], []
         for w in weights:
@@ -409,6 +423,20 @@ class FP8QDQLinearMethod(LinearMethodBase):
         else:
             # Dynamic quantization
             module.input_scale = None
+
+        # Load k and v scales, used for NVFP4 KV cache
+        k_scale, v_scale = self.load_kv_scales(weights)
+        if len(k_scale) != 0:
+            assert len(v_scale) != 0
+            # The calibrated KV scales are amax / (6 * 448), but the requested KV scales are amax / 448,
+            # to avoid overflow when dequantizing NVFP4 in attention kernels.
+            copy_weight(
+                module.kv_scales,
+                torch.tensor([1.0, max(k_scale) * 6.0,
+                              max(v_scale) * 6.0],
+                             dtype=torch.float32))
+            module.inv_kv_scales.data = 1.0 / module.kv_scales
+
         copy_weight(module.weight_scale, max(weight_scale))
 
         q_weight = q_weight.to(module.dtype) * weight_scale[0]
@@ -687,6 +715,13 @@ class NVFP4LinearMethod(LinearMethodBase):
         module.alpha = Parameter(torch.empty([1], dtype=torch.float32),
                                  requires_grad=False)
 
+        # K, V scales for NVFP4 KV cache
+        module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                     requires_grad=False)
+        # K, V scales for NVFP4 KV cache
+        module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
+
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
                                     requires_grad=False)
@@ -707,6 +742,15 @@ class NVFP4LinearMethod(LinearMethodBase):
         if bias is not None:
             output = output + bias
         return output
+
+    def load_kv_scales(self, weights: List[Dict]):
+        k_scale, v_scale = [], []
+        for w in weights:
+            if "k_scale" in w:
+                k_scale.append(w["k_scale"][...].reshape([]))
+            if "v_scale" in w:
+                v_scale.append(w["v_scale"][...].reshape([]))
+        return k_scale, v_scale
 
     def load_weight_scales(self,
                            weights: List[Dict],
@@ -786,6 +830,19 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.alpha, alpha)
+
+        # Load k and v scales, used for NVFP4 KV cache
+        k_scale, v_scale = self.load_kv_scales(weights)
+        if len(k_scale) != 0:
+            assert len(v_scale) != 0
+            # The calibrated KV scales are amax / (6 * 448), but the requested KV scales are amax / 448,
+            # to avoid overflow when dequantizing NVFP4 in attention kernels using FP8 math.
+            copy_weight(
+                module.kv_scales,
+                torch.tensor([1.0, max(k_scale) * 6.0,
+                              max(v_scale) * 6.0],
+                             dtype=torch.float32))
+            module.inv_kv_scales.data = 1.0 / module.kv_scales
 
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
         copy_weight(module.weight, fused_weight)

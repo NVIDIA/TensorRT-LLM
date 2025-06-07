@@ -257,6 +257,8 @@ struct MHARunnerParams
     void const* kvPtr;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
+    // The paged kv cache array for scaling factor.
+    KVBlockArray pagedKvSfCache;
     // The output buffer ptr.
     void* outputPtr;
     // The output scaling factor buffer ptr. (only used for FP4 output)
