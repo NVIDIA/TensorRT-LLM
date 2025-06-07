@@ -130,9 +130,18 @@ class KVCacheManager(BaseResourceManager):
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
     ) -> None:
-        assert isinstance(
-            kv_cache_config, KvCacheConfigCpp
-        ), "kv_cache_config should be tensorrt_llm.bindings.KvCacheConfig"
+        if not isinstance(kv_cache_config, KvCacheConfigCpp):
+            # NOTE: There is a difference between
+            # tensorrt_llm.bindings.KvCacheConfig(KvCacheConfigCpp) and
+            # tensorrt_llm.bindings.executor.KvCacheConfig
+            # TODO: Remove this conversion in the future.
+            assert isinstance(kv_cache_config, ExecutorKvCacheConfig), (
+                "Only ExecutorKvCacheConfig can be converted to KvCacheConfigCpp"
+            )
+            kv_cache_config = KvCacheConfigCpp(kv_cache_config)
+            logger.warning(
+                "kv_cache_config is not a tensorrt_llm.bindings.KvCacheConfig, "
+                "converting it to a tensorrt_llm.bindings.KvCacheConfig")
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
@@ -210,7 +219,7 @@ class KVCacheManager(BaseResourceManager):
             )
         else:
             # Standard case: use original Python implementation
-            blocks_in_primary_pool, blocks_in_secondary_pool = self.calculate_max_num_blocks(
+            self.blocks_in_primary_pool, self.blocks_in_secondary_pool = self.calculate_max_num_blocks(
                 kv_cache_config=kv_cache_config,
                 head_dim=head_dim,
                 tokens_per_block=tokens_per_block,
@@ -220,7 +229,7 @@ class KVCacheManager(BaseResourceManager):
             )
             blocks_per_window = {
                 self.max_attention_window_vec[0]:
-                (blocks_in_primary_pool, blocks_in_secondary_pool)
+                (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
             }
 
         # Validate and adjust attention windows against their upper bounds if needed
@@ -495,8 +504,11 @@ class KVCacheManager(BaseResourceManager):
         return max_atten_window_upper_bound
 
     def get_cache_indices(self, request: LlmRequest) -> List[int]:
+        assert len(self.max_attention_window_vec
+                   ) == 1, "Only support one attention window for now"
+        max_attention_window = max(self.max_attention_window_vec)
         result = self.impl.get_cache_block_ids(request.py_request_id,
-                                               self.max_attention_window)
+                                               max_attention_window)
         assert len(result) == 1
         return result[0]
 
@@ -504,8 +516,11 @@ class KVCacheManager(BaseResourceManager):
         self,
         request_ids: List[int],
     ) -> Dict[int, List[int]]:
+        assert len(self.max_attention_window_vec
+                   ) == 1, "Only support one attention window for now"
+        max_attention_window = max(self.max_attention_window_vec)
         result = self.impl.get_batch_cache_block_ids(request_ids,
-                                                     self.max_attention_window)
+                                                     max_attention_window)
         for i in range(len(result)):
             assert (len(result[i])) == 1
             result[i] = result[i][0]
