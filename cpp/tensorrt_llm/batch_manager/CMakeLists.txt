@@ -45,6 +45,7 @@ set(SRCS
     rnnStateBuffers.cpp
     rnnStateManager.cpp
     runtimeBuffers.cpp
+    scheduledBlocksManager.cpp
     sequenceSlotManager.cpp
     transformerBuffers.cpp
     trtEncoderModel.cpp
