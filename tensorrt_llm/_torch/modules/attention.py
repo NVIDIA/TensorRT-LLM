@@ -348,6 +348,13 @@ class Attention(nn.Module):
         if self.o_proj.has_nvfp4 and self.support_nvfp4_output and enable_attn_nvfp4_output:
             out_scale_sf = self.o_proj.input_scale
 
+        kv_scales_sf = None
+        kv_scales_sf_inv = None
+        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp4_kv_cache(
+        ):
+            kv_scales_sf = self.qkv_proj.kv_scales
+            kv_scales_sf_inv = self.qkv_proj.inv_kv_scales
+
         mrope_config = None
         if mrope_rotary_cos_sin is not None or mrope_position_deltas is not None:
             mrope_config = dict()
@@ -363,6 +370,8 @@ class Attention(nn.Module):
             attn_metadata,
             out_scale=out_scale,
             out_scale_sf=out_scale_sf,
+            kv_scales_sf=kv_scales_sf,
+            kv_scales_sf_inv=kv_scales_sf_inv,
             attention_mask=attention_mask,
             mrope_config=mrope_config,
             attention_window_size=attention_window_size,

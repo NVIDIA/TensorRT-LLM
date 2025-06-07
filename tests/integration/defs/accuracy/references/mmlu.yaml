@@ -32,6 +32,9 @@ meta-llama/Llama-3.1-8B-Instruct:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 67.87
+  - quant_algo: FP8
+    kv_cache_quant_algo: NVFP4
+    accuracy: 66.45
 meta-llama/Llama-3.2-1B:
   - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
     accuracy: 32.72

@@ -166,6 +166,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("FP8", nvinfer1::DataType::kFP8)
         .value("BF16", nvinfer1::DataType::kBF16)
         .value("INT64", nvinfer1::DataType::kINT64)
+        .value("NVFP4", nvinfer1::DataType::kFP4)
         .export_values();
 
     nb::enum_<tr::ModelConfig::ModelVariant>(m, "GptModelVariant")
