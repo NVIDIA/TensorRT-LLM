@@ -1043,6 +1043,74 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
     return {norm_out, residual_out};
 }
 
+// Pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
+// expert_reduction = finalize(input, expanded_idx_to_permuted_idx, expert_scale_factor)
+// output_add = expert_reduction + shared_expert_output
+// output_residual = output_add + residual
+// output_hidden_states = rms_norm(output_residual, norm_weight, eps)
+//
+// Note:
+//     input is the output of MoE FC2
+//     input [maxPermutedPaddedCount, hidden_dim]
+//     residual [m, hidden_dim]
+//     norm_weight [hidden_dim]
+//     expanded_idx_to_permuted_idx [m, top_k]
+//     expert_scale_factor [m, top_k]
+//     shared_expert_output [m, hidden_dim]
+std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, torch::Tensor const& residual,
+    torch::Tensor const& norm_weight, torch::Tensor const& expanded_idx_to_permuted_idx,
+    torch::optional<torch::Tensor> const& shared_expert_output,
+    torch::optional<torch::Tensor> const& expert_scale_factor, torch::Tensor workspace, int64_t const rank,
+    int64_t const nranks, double const eps)
+{
+    auto allreduce_fusion_params = tensorrt_llm::kernels::ar_fusion::moe::MoeFinalizeAllReduceFusionParams();
+
+    int hidden_dim = residual.size(-1);
+    int top_k = expanded_idx_to_permuted_idx.size(-1);
+
+    allreduce_fusion_params.quant_out = nullptr;
+    allreduce_fusion_params.scale_out = nullptr;
+
+    allreduce_fusion_params.nranks = static_cast<int>(nranks);
+    allreduce_fusion_params.rank = static_cast<int>(rank);
+    allreduce_fusion_params.dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    // size: num_token * hidden_dim
+    allreduce_fusion_params.size = residual.numel();
+    allreduce_fusion_params.hidden_dim = hidden_dim;
+
+    // workspace: AR scratch space
+    allreduce_fusion_params.workspace = reinterpret_cast<void**>(workspace.mutable_data_ptr());
+    allreduce_fusion_params.rms_gamma = norm_weight.data_ptr();
+    allreduce_fusion_params.rms_eps = static_cast<float>(eps);
+    allreduce_fusion_params.residual_in = residual.data_ptr();
+    allreduce_fusion_params.stream = at::cuda::getCurrentCUDAStream(norm_weight.get_device());
+
+    // MOE Reduction specific params
+    allreduce_fusion_params.top_k = top_k;
+    allreduce_fusion_params.allreduce_in = input.data_ptr();
+    allreduce_fusion_params.expert_scale_factor
+        = expert_scale_factor.has_value() ? expert_scale_factor.value().data_ptr() : nullptr;
+    allreduce_fusion_params.scale_dtype = tensorrt_llm::runtime::TorchUtils::dataType(
+        expert_scale_factor.has_value() ? expert_scale_factor.value().scalar_type() : input.scalar_type());
+    TORCH_CHECK(
+        expanded_idx_to_permuted_idx.scalar_type() == torch::kInt32, "expanded_idx_to_permuted_idx must be int32");
+    allreduce_fusion_params.expanded_idx_to_permuted_idx
+        = static_cast<int32_t*>(expanded_idx_to_permuted_idx.data_ptr());
+    allreduce_fusion_params.shared_expert_output
+        = shared_expert_output.has_value() ? shared_expert_output.value().data_ptr() : nullptr;
+
+    // output tensors
+    torch::Tensor norm_out = torch::empty_like(residual);
+    torch::Tensor residual_out = torch::empty_like(residual);
+
+    allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
+    allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+
+    tensorrt_llm::kernels::ar_fusion::moe::moefinalize_allreduce_fusion_op(allreduce_fusion_params);
+
+    return {norm_out, residual_out};
+}
+
 at::Tensor mnnvlTwoShotAllReduce(
     at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
 {
@@ -1133,6 +1201,18 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int nranks,"
         "float eps) -> Tensor[]");
     m.def("initialize_static_lowprecision_buffers(Tensor workspace, int tp_size) -> Tensor[]");
+    m.def(
+        "moe_finalize_allreduce("
+        "Tensor input,"
+        "Tensor residual,"
+        "Tensor norm_weight,"
+        "Tensor expanded_idx_to_permuted_idx,"
+        "Tensor? shared_expert_output,"
+        "Tensor? expert_scale_factor,"
+        "Tensor workspace,"
+        "int rank,"
+        "int nranks,"
+        "float eps) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -1141,6 +1221,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("mnnvl_twoshot_rmsnorm", &torch_ext::twoShotRMSNorm);
     m.impl("allreduce", &torch_ext::allreduce);
     m.impl("moe_allreduce", &torch_ext::moe_allreduce);
+    m.impl("moe_finalize_allreduce", &torch_ext::moe_finalize_allreduce);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)

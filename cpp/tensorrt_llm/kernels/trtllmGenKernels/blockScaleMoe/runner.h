@@ -211,6 +211,9 @@ struct MoERunnerArgs
     // Output:
     void* output = nullptr;
     float* output_scale = nullptr;
+
+    // finalize
+    bool do_finalize{true};
 };
 
 struct MoEWorkspace

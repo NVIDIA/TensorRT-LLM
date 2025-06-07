@@ -26,7 +26,7 @@ namespace torch_ext
 namespace btg = batchedGemm::trtllm::gen;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 
-torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
+std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
     torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
     torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
     torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm2_weights,
@@ -35,7 +35,7 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
     int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
     std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
     int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
-    int64_t const routing_method_type)
+    int64_t const routing_method_type, bool const do_finalize)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 100, "Only SM100 is supported by FP4 block scale MOE");
@@ -101,7 +101,7 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
     at::Tensor total_num_padded_tokens
         = at::empty({}, at::TensorOptions().device(routing_logits.device()).dtype(at::ScalarType::Int));
     at::Tensor expanded_idx_to_permuted_idx = at::detail::empty_cuda(
-        {args.num_tokens * args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
+        {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
 
     at::Tensor permuted_idx_to_token_idx
         = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
@@ -244,6 +244,7 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
     args.output1_scales_scalar = output1_scales_scalar.data_ptr<float>();
     args.output1_scales_gate_scalar = output1_scales_gate_scalar.data_ptr<float>();
     args.output2_scales_scalar = output2_scales_scalar.data_ptr<float>();
+    args.do_finalize = do_finalize;
 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(
         args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim);
@@ -256,7 +257,12 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits,
     workspace.bmm2_workspace = workspace_fc2.data_ptr();
     auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
     moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream);
-    return output;
+
+    if (!do_finalize)
+    {
+        return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
+    }
+    return {output};
 }
 
 torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
@@ -290,7 +296,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int local_num_experts,"
         "float? routed_scaling_factor,"
         "int tile_tokens_dim,"
-        "int routing_method_type) -> Tensor");
+        "int routing_method_type,"
+        "bool do_finalize) -> Tensor[]");
 }
 
 // Accepts CUDA tensor only

@@ -10,7 +10,7 @@ from torch import nn
 from tensorrt_llm._utils import mpi_barrier
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
-                                     AllReduceStrategy)
+                                     AllReduceStrategy, MoEAllReduceParams)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
@@ -505,6 +505,8 @@ class MoEAllReduce(nn.Module):
             mapping (Mapping):  The parallel mapping config.
 
         Notes:
+            * min latency mode:
+
             Support pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
             expert_reduction = torch.sum(active_experts_token_input *
                                         scale.unsqueeze(-1),
@@ -512,23 +514,33 @@ class MoEAllReduce(nn.Module):
             output_add = expert_reduction + shared_expert_output
             output_residual = output_add + residual
             output_hidden_states = rms_norm(output_residual, norm_weight, eps)
+
+            * regular mode:
+
+            Support pattern: MoE Reduction + Add + AR + ADD_RMS, see this torch reference implementation:
+            expert_reduction = local_reduction(input, expanded_idx_to_permuted_idx, expert_scale_factor)
+            output_add = expert_reduction + shared_expert_output
+            output_residual = output_add + residual
+            output_hidden_states = rms_norm(output_residual, norm_weight, eps)
         """
         super().__init__()
         self.mapping = mapping
         self.workspace = get_allreduce_workspace(self.mapping)
+        # Pls keep this value in sync with the kOneShotMaxToken in moeAllReduceFusionKernels.h
+        self.max_token = 128
 
     def forward(
         self,
-        residual: torch.Tensor,
-        norm_weight: torch.Tensor,
-        device_num_experts: torch.Tensor,
-        scale_input: torch.Tensor,
-        active_experts_token_input: torch.Tensor,
-        token_input: torch.Tensor,
-        eps: float,
+        input: torch.Tensor,
+        *,
+        all_reduce_params: MoEAllReduceParams,
     ) -> torch.Tensor:
-        """
-        Args:
+
+        assert all_reduce_params.is_valid(), "MoEAllReduceParams is not valid"
+
+        if all_reduce_params.is_cutlass_min_latency:
+            """
+            Args:
             residual: residual tensor
             norm_weight: RMS norm weight
             device_num_experts: number of experts per device
@@ -537,19 +549,37 @@ class MoEAllReduce(nn.Module):
             token_input: per token input, shared expert output
             eps: epsilon for RMSNorm
 
-        Output:
-            hidden_states: hidden_states of the model
-            residual: residual tensor
-        """
-        return torch.ops.trtllm.moe_allreduce(
-            residual=residual,
-            norm_weight=norm_weight,
-            device_num_experts=device_num_experts,
-            scale_input=scale_input,
-            active_experts_token_input=active_experts_token_input,
-            token_input=token_input,
-            workspace=self.workspace,
-            rank=self.mapping.tp_rank,
-            nranks=self.mapping.tp_size,
-            eps=eps,
-        )
+            Output:
+                hidden_states: hidden_states of the model
+                residual: residual tensor
+            """
+
+            return torch.ops.trtllm.moe_allreduce(
+                active_experts_token_input=input,
+                residual=all_reduce_params.residual,
+                norm_weight=all_reduce_params.norm_weight,
+                device_num_experts=all_reduce_params.device_num_experts,
+                scale_input=all_reduce_params.expert_scale_factor,
+                token_input=all_reduce_params.shared_expert_output,
+                workspace=self.workspace,
+                rank=self.mapping.tp_rank,
+                nranks=self.mapping.tp_size,
+                eps=all_reduce_params.eps,
+            )
+        else:
+            assert all_reduce_params.residual.shape[
+                0] <= self.max_token, "Num tokens must be less than or equal to max_token"
+
+            return torch.ops.trtllm.moe_finalize_allreduce(
+                input=input,
+                residual=all_reduce_params.residual,
+                norm_weight=all_reduce_params.norm_weight,
+                expanded_idx_to_permuted_idx=all_reduce_params.
+                expanded_idx_to_permuted_idx,
+                shared_expert_output=all_reduce_params.shared_expert_output,
+                expert_scale_factor=all_reduce_params.expert_scale_factor,
+                workspace=self.workspace,
+                rank=self.mapping.tp_rank,
+                nranks=self.mapping.tp_size,
+                eps=all_reduce_params.eps,
+            )
