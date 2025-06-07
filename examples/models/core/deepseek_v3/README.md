@@ -29,6 +29,7 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
   - [Serving](#serving)
     - [Use trtllm-serve](#use-trtllm-serve)
     - [Use tensorrtllm_backend for triton inference server (Experimental)](#use-tensorrtllm_backend-for-triton-inference-server-experimental)
+    - [Disaggregated Serving](#disaggregated-serving)
   - [Advanced Usages](#advanced-usages)
     - [Multi-node](#multi-node)
       - [mpirun](#mpirun)
@@ -277,6 +278,114 @@ curl http://localhost:8000/v1/completions \
 ```
 
 For DeepSeek-R1, use the model name `deepseek-ai/DeepSeek-R1`.
+
+### Disaggregated Serving
+
+To serve the model in disaggregated mode, you should launch context and generation servers using `trtllm-serve`.
+
+For example, you can launch a single context server on port 8001 with:
+
+```bash
+export TRTLLM_USE_UCX_KVCACHE=1
+
+cat >./ctx-extra-llm-api-config.yml <<EOF
+print_iter_log: true
+enable_attention_dp: true
+EOF
+
+trtllm-serve \
+  deepseek-ai/DeepSeek-V3 \
+  --host localhost \
+  --port 8001 \
+  --backend pytorch \
+  --max_batch_size 161 \
+  --max_num_tokens 1160 \
+  --tp_size 8 \
+  --ep_size 8 \
+  --pp_size 1 \
+  --kv_cache_free_gpu_memory_fraction 0.95 \
+  --extra_llm_api_options ./ctx-extra-llm-api-config.yml &> output_ctx &
+```
+
+And you can launch two generation servers on port 8002 and 8003 with:
+
+```bash
+export TRTLLM_USE_UCX_KVCACHE=1
+
+cat >./gen-extra-llm-api-config.yml <<EOF
+use_cuda_graph: true
+cuda_graph_padding_enabled: true
+cuda_graph_batch_sizes:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  - 64
+  - 128
+  - 256
+  - 384
+print_iter_log: true
+enable_attention_dp: true
+EOF
+
+for port in {8002..8003}; do \
+trtllm-serve \
+  deepseek-ai/DeepSeek-V3 \
+  --host localhost \
+  --port ${port} \
+  --backend pytorch \
+  --max_batch_size 161 \
+  --max_num_tokens 1160 \
+  --tp_size 8 \
+  --ep_size 8 \
+  --pp_size 1 \
+  --kv_cache_free_gpu_memory_fraction 0.95 \
+  --extra_llm_api_options ./gen-extra-llm-api-config.yml \
+  &> output_gen_${port} & \
+done
+```
+
+Finally, you can launch the disaggregated server which will accept requests from the client and do
+the orchestration between the context and generation servers with:
+
+```bash
+cat >./disagg-config.yml <<EOF
+hostname: localhost
+port: 8000
+backend: pytorch
+context_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8002"
+EOF
+
+trtllm-serve disaggregated -c disagg-config.yaml
+```
+
+To query the server, you can start with a `curl` command:
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+      "model": "deepseek-ai/DeepSeek-V3",
+      "prompt": "Where is New York?",
+      "max_tokens": 16,
+      "temperature": 0
+  }'
+```
+
+For DeepSeek-R1, use the model name `deepseek-ai/DeepSeek-R1`.
+
+Note that the optimal disaggregated serving configuration (i.e. tp/pp/ep mappings, number of ctx/gen instances, etc.) will depend
+on the request parameters, the number of concurrent requests and the GPU type. It is recommended to experiment to identify optimal
+settings for your specific use case.
+
 
 
 ### Use tensorrtllm_backend for triton inference server (Experimental)
