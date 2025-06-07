@@ -12,6 +12,7 @@
 add_gtest(bufferManagerTest bufferManagerTest.cpp)
 add_gtest(cudaMemPoolTest cudaMemPoolTest.cpp)
 add_gtest(decodingLayerWorkspaceTest decodingLayerWorkspaceTest.cpp)
+add_gtest(gdrcopyTest gdrcopyTest.cpp)
 add_gtest(iBufferTest iBufferTest.cpp)
 add_gtest(iTensorTest iTensorTest.cpp)
 add_gtest(loraCacheTest loraCacheTest.cpp)
