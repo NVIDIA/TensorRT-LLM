@@ -76,6 +76,8 @@ l0_b200:
   - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_auto_dtype
   - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_fp8
   - accuracy/test_cli_flow.py::TestMixtral8x7B::test_nvfp4_prequantized
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[kv_cache_dtype=nvfp4-attn_backend=TRTLLM-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[kv_cache_dtype=nvfp4-attn_backend=TRTLLM-torch_compile=True]
   - unittest/trt/attention/test_gpt_attention.py -k "trtllm_gen"
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
   - unittest/trt/functional/test_fp4_gemm.py # 3 mins on B200

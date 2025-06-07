@@ -25,6 +25,7 @@ class TrtllmAttentionWrapper:
     host_request_types: torch.Tensor
     kv_cache_block_offsets: torch.Tensor
     host_kv_cache_block_offsets: torch.Tensor
+    host_kv_cache_block_scale_pool_pointers: torch.Tensor
     host_kv_cache_pool_pointers: torch.Tensor
     host_kv_cache_pool_mapping: torch.Tensor
     workspace: Optional[torch.Tensor]
@@ -150,6 +151,7 @@ class TrtllmAttentionWrapper:
         host_request_types: torch.Tensor = ...,
         kv_cache_block_offsets: Optional[torch.Tensor] = None,
         host_kv_cache_block_offsets: Optional[torch.Tensor] = None,
+        host_kv_cache_block_scale_pool_pointers: Optional[torch.Tensor] = None,
         host_kv_cache_pool_pointers: Optional[torch.Tensor] = None,
         host_kv_cache_pool_mapping: Optional[torch.Tensor] = None,
         block_ids_per_seq: Optional[torch.Tensor] = None,
@@ -189,6 +191,7 @@ class TrtllmAttentionWrapper:
             host_request_types (torch.Tensor): The tensor that indicates whether a request is in context or generation phase, with shape (batch_size) on CPU.
             kv_cache_block_offsets (torch.Tensor): The offsets to the blocks inside KV cache pools on GPU, its shape is (num_pools, max_batch_size * max_beam_width, 2, max_blocks_per_sequence), one for each block. If kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
             host_kv_cache_block_offsets (torch.Tensor): Same as kv_cache_block_offsets, but on CPU.
+            host_kv_cache_block_scale_pool_pointers (torch.Tensor): The pointers to the KV cache block scale pools on CPU, its shape is (num_pools, 2). It is only used for NVFP4 KV cache.
             host_kv_cache_pool_pointers (torch.Tensor): The pointers to the KV cache pools on CPU, its shape is (num_pools, 2), one for primary pool in GPU memory, one for secondary pool in CPU memory.
             host_kv_cache_pool_mapping (torch.Tensor): The index of the pool used by each attention layer on CPU, its shape is (num_local_attention_layers). The local attention layers mean all attention layers in the current PP stage in the pipeline parallelism case.
             workspace (torch.Tensor): An optional workspace tensor on GPU.
@@ -216,6 +219,7 @@ class TrtllmAttentionWrapper:
         self.host_request_types = host_request_types
         self.kv_cache_block_offsets = kv_cache_block_offsets
         self.host_kv_cache_block_offsets = host_kv_cache_block_offsets
+        self.host_kv_cache_block_scale_pool_pointers = host_kv_cache_block_scale_pool_pointers
         self.host_kv_cache_pool_pointers = host_kv_cache_pool_pointers
         self.host_kv_cache_pool_mapping = host_kv_cache_pool_mapping
         self.workspace = workspace
@@ -351,6 +355,7 @@ class TrtllmAttentionWrapper:
             self.host_request_types,
             self.kv_cache_block_offsets,
             self.host_kv_cache_block_offsets,
+            self.host_kv_cache_block_scale_pool_pointers,
             self.host_kv_cache_pool_pointers,
             self.host_kv_cache_pool_mapping,
             self.cache_indirection,
@@ -488,6 +493,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Returns the host KV cache pool pointers from the KV cache manager if KV cache manager is not None.
         """
         return self.kv_cache_manager.kv_cache_pool_pointers if self.kv_cache_manager is not None else None
+
+    @property
+    def host_kv_cache_block_scale_pool_pointers(self) -> Optional[torch.Tensor]:
+        """
+        Returns the host KV cache block scale pool pointers from the KV cache manager if KV cache manager is not None.
+        """
+        return self.kv_cache_manager.kv_cache_block_scale_pool_pointers if self.kv_cache_manager is not None else None
 
     @property
     def host_kv_cache_pool_mapping(self) -> Optional[torch.Tensor]:
@@ -770,6 +782,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if self.quant_config is not None:
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
+            self.has_fp4_kv_cache = self.quant_config.layer_quant_mode.has_fp4_kv_cache(
+            )
 
             self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()
             self.has_fp8_block_wise = self.quant_config.layer_quant_mode.has_fp8_block_scales(
@@ -845,6 +859,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             host_request_types=metadata.host_request_types_runtime,
             kv_cache_block_offsets=metadata.kv_cache_block_offsets,
             host_kv_cache_block_offsets=metadata.host_kv_cache_block_offsets,
+            host_kv_cache_block_scale_pool_pointers=metadata.
+            host_kv_cache_block_scale_pool_pointers,
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
             block_ids_per_seq=metadata.block_ids_per_seq,
@@ -870,7 +886,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 # Use UINT8 as the container dtype for NVFP4.
                 out_dtype = torch.uint8
             elif (self.has_fp8_qdq or self.has_nvfp4
-                  or self.has_fp8_block_wise) and self.has_fp8_kv_cache:
+                  or self.has_fp8_block_wise) and (self.has_fp8_kv_cache
+                                                   or self.has_fp4_kv_cache):
                 # TODO(qijun): revisit fp8_context_fmha logic
                 out_dtype = torch.float8_e4m3fn
 

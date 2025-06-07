@@ -395,10 +395,10 @@ class ModelLoader:
                     )
             else:
                 if quant_config.kv_cache_quant_algo not in [
-                        None, QuantAlgo.FP8
+                        None, QuantAlgo.FP8, QuantAlgo.NVFP4
                 ]:
                     raise ValueError(
-                        f"Only kv_cache_quant_algo={QuantAlgo.FP8} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
+                        f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
                     )
 
             for key, value in hf_quant_config.items():

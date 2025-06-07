@@ -129,8 +129,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         "torch_compile",
         [False, pytest.param(True, marks=skip_device_contain_gb200)])
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
-    @parametrize_with_ids("fp8kv", [False, True])
-    def test_fp8(self, fp8kv, attn_backend, torch_compile):
+    @parametrize_with_ids("kv_cache_dtype", ["auto", "fp8", "nvfp4"])
+    def test_fp8(self, kv_cache_dtype, attn_backend, torch_compile):
         quant_config = QuantConfig(QuantAlgo.FP8)
         pytorch_config = dict(
             torch_compile_enabled=torch_compile,
@@ -140,16 +140,21 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             attn_backend=attn_backend,
             disable_overlap_scheduler=torch_compile,
         )
-        if fp8kv:
+        if kv_cache_dtype == 'fp8':
             quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_config["kv_cache_dtype"] = "fp8"
+        elif kv_cache_dtype == 'nvfp4':
+            quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+            pytorch_config["kv_cache_dtype"] = "nvfp4"
         llm = LLM(
             f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
             quant_config=quant_config,
             **pytorch_config)
         assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-        if fp8kv:
+        if kv_cache_dtype == 'fp8':
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+        elif kv_cache_dtype == 'nvfp4':
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
         with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)

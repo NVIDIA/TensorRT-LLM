@@ -581,7 +581,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                 if constexpr (FP8_OUTPUT || ENABLE_8BITS_CACHE)
                 {
                     mmha::convert_from_float(
-                        &scaleOrigQuant, params.kvScaleOrigQuant ? params.kvScaleOrigQuant[0] : 1.0f);
+                        &scaleOrigQuant, params.kv_scale_orig_quant ? params.kv_scale_orig_quant[0] : 1.0f);
                 }
 
                 if constexpr (FP8_OUTPUT)
@@ -633,8 +633,10 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                                 params.kv_cache_block_scales_buffer.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
                             auto* vBlockScales = reinterpret_cast<uint8_t*>(
                                 params.kv_cache_block_scales_buffer.getVBlockPtr(batch_idx, token_idx_in_kv_cache));
-                            float kSecondLevelSF = params.kv_cache_scale_factors[0];
-                            float vSecondLevelSF = params.kv_cache_scale_factors[1];
+                            float kSecondLevelSF = params.kv_cache_scale_factors ? params.kv_cache_scale_factors[0]
+                                                                                 : params.kv_scale_orig_quant[0];
+                            float vSecondLevelSF = params.kv_cache_scale_factors ? params.kv_cache_scale_factors[1]
+                                                                                 : params.kv_scale_orig_quant[0];
 
                             auto& kPacked = reinterpret_cast<PackedVec<T>&>(k_to_cache);
                             auto& vPacked = reinterpret_cast<PackedVec<T>&>(v);
@@ -997,7 +999,8 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             [[maybe_unused]] TScale scaleOrigQuant;
             if constexpr (FP8_OUTPUT || ENABLE_8BITS_CACHE)
             {
-                mmha::convert_from_float(&scaleOrigQuant, params.kvScaleOrigQuant ? params.kvScaleOrigQuant[0] : 1.0f);
+                mmha::convert_from_float(
+                    &scaleOrigQuant, params.kv_scale_orig_quant ? params.kv_scale_orig_quant[0] : 1.0f);
             }
 
             if constexpr (FP8_OUTPUT)
@@ -1042,7 +1045,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                         // Cast float scale to dst data type.
                         using TScale = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
                         TScale scaleOrigQuant;
-                        mmha::convert_from_float(&scaleOrigQuant, params.kvScaleOrigQuant[0]);
+                        mmha::convert_from_float(&scaleOrigQuant, params.kv_scale_orig_quant[0]);
                         // Store 8bits kv cache.
                         mmha::store_8bits_vec(kDst, k, inBlockIdx, scaleOrigQuant);
                         mmha::store_8bits_vec(vDst, v, inBlockIdx, scaleOrigQuant);
@@ -1053,8 +1056,10 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                             params.kv_cache_block_scales_buffer.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
                         auto* vBlockScales = reinterpret_cast<uint8_t*>(
                             params.kv_cache_block_scales_buffer.getVBlockPtr(batch_idx, token_idx_in_kv_cache));
-                        float kSecondLevelSF = params.kv_cache_scale_factors[0];
-                        float vSecondLevelSF = params.kv_cache_scale_factors[1];
+                        float kSecondLevelSF = params.kv_cache_scale_factors ? params.kv_cache_scale_factors[0]
+                                                                             : params.kv_scale_orig_quant[0];
+                        float vSecondLevelSF = params.kv_cache_scale_factors ? params.kv_cache_scale_factors[1]
+                                                                             : params.kv_scale_orig_quant[0];
 
                         auto& kPacked = reinterpret_cast<PackedVec<T>&>(k);
                         auto& vPacked = reinterpret_cast<PackedVec<T>&>(v);
@@ -1420,7 +1425,7 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
     [[maybe_unused]] TScale scale_orig_quant;
     if constexpr (sizeof(TCache) == 1 || FP8_OUTPUT)
     {
-        mmha::convert_from_float(&scale_orig_quant, params.kvScaleOrigQuant ? params.kvScaleOrigQuant[0] : 1.0f);
+        mmha::convert_from_float(&scale_orig_quant, params.kv_scale_orig_quant ? params.kv_scale_orig_quant[0] : 1.0f);
     }
 
     // For loop in the sequence length dimension.

@@ -134,6 +134,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         // Convert from MHAFixedParams + MHARunnerParams to TllmGenFmhaRunnerParams
         void const* kvPoolPtr = nullptr;
+        void const* kvSfPoolPtr = nullptr;
         void const* kvPageIdxPtr = nullptr;
         auto qkvLayout = kernels::QkvLayout::PackedQkv;
         int32_t maxBlocksPerSeq = 0;
@@ -143,6 +144,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             qkvLayout = kernels::QkvLayout::PagedKv;
             auto pagedKvCache = runnerParams.pagedKvCache.copyKVBlockArrayForContextFMHA();
             kvPoolPtr = pagedKvCache.mPrimaryPoolPtr;
+            kvSfPoolPtr = runnerParams.pagedKvSfCache.mPrimaryPoolPtr;
             kvPageIdxPtr = reinterpret_cast<int const*>(pagedKvCache.data);
             maxBlocksPerSeq = pagedKvCache.mMaxBlocksPerSeq;
             numTokensPerBlock = pagedKvCache.mTokensPerBlock;
@@ -163,6 +165,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.kPtr = nullptr;
         tllmRunnerParams.vPtr = nullptr;
         tllmRunnerParams.kvPtr = kvPoolPtr;
+        tllmRunnerParams.kvSfPtr = kvSfPoolPtr;
         tllmRunnerParams.qkvPtr = runnerParams.qkvPtr;
         tllmRunnerParams.cumSeqLensQPtr = reinterpret_cast<int const*>(runnerParams.cuQSeqLenPtr);
         tllmRunnerParams.cumSeqLensKvPtr = reinterpret_cast<int const*>(runnerParams.cuKvSeqLenPtr);

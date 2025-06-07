@@ -69,6 +69,7 @@ public:
         torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths, torch::Tensor context_lengths,
         torch::Tensor host_context_lengths, torch::optional<torch::Tensor> kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_block_offsets,
+        torch::optional<torch::Tensor> host_kv_cache_block_scale_pool_pointers,
         torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
         torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
         torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
@@ -119,6 +120,7 @@ public:
         torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths, torch::Tensor context_lengths,
         torch::Tensor host_context_lengths, torch::optional<torch::Tensor> kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_block_offsets,
+        torch::optional<torch::Tensor> host_kv_cache_block_scale_pool_pointers,
         torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
         torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
         torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
@@ -216,9 +218,22 @@ public:
         KVBlockArray::DataType* host_block_offsets = static_cast<KVBlockArray::DataType*>(
             op.useKVCache() ? host_kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr() : nullptr);
 
-        auto const cache_elem_size = (op.mKVCacheQuantMode.hasKvCacheQuant() ? 1 : sizeof(T));
+        // The cache element size in bits.
+        int cache_elem_bits;
+        if (op.mKVCacheQuantMode.hasInt8KvCache() || op.mKVCacheQuantMode.hasFp8KvCache())
+        {
+            cache_elem_bits = 8;
+        }
+        else if (op.mKVCacheQuantMode.hasFp4KvCache())
+        {
+            cache_elem_bits = 4;
+        }
+        else
+        {
+            cache_elem_bits = sizeof(T) * 8;
+        }
         auto const block_size = op.mTokensPerBlock * op.mNumKVHeads * op.mHeadSize;
-        auto const bytes_per_block = block_size * cache_elem_size;
+        auto const bytes_per_block = block_size * cache_elem_bits / 8 /*bits*/;
         int32_t const kv_factor = op.isMLAEnabled() ? 1 : 2;
         auto const intra_pool_offset = layer_idx_in_cache_pool * kv_factor * bytes_per_block;
 
@@ -232,6 +247,31 @@ public:
                 reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1}).item<int64_t>())
                 + intra_pool_offset)
             : nullptr;
+
+        // Prepare block scale pool pointers for NVFP4 KV cache.
+        void* host_primary_block_scale_pool_pointer{nullptr};
+        void* host_secondary_block_scale_pool_pointer{nullptr};
+        // Whether NVFP4 KV cache is used.
+        bool const use_nvfp4_kv_cache = op.useKVCache() && op.mKVCacheQuantMode.hasFp4KvCache();
+        if (use_nvfp4_kv_cache)
+        {
+            // Make sure the block scale pool pointers are not empty.
+            TLLM_CHECK(host_kv_cache_block_scale_pool_pointers.has_value()
+                && host_kv_cache_block_scale_pool_pointers.value().size(0) > 0);
+
+            // Calculate the intra-pool offset for scaling factors.
+            auto constexpr vector_size = 16;
+            auto const bytes_per_block_sf = block_size / vector_size * 1 /*bytes per E4M3 sf*/;
+            auto const intra_pool_offset_sf = layer_idx_in_cache_pool * kv_factor * bytes_per_block_sf;
+            host_primary_block_scale_pool_pointer = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(
+                    host_kv_cache_block_scale_pool_pointers.value().index({pool_index, 0}).item<int64_t>())
+                + intra_pool_offset_sf);
+            host_secondary_block_scale_pool_pointer = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(
+                    host_kv_cache_block_scale_pool_pointers.value().index({pool_index, 1}).item<int64_t>())
+                + intra_pool_offset_sf);
+        }
 
         float const* kv_scale_orig_quant_ptr = nullptr;
         float const* kv_scale_quant_orig_ptr = nullptr;
@@ -265,6 +305,8 @@ public:
         common_enqueue_params.block_offsets = block_offsets;
         common_enqueue_params.host_primary_pool_pointer = host_primary_pool_pointer;
         common_enqueue_params.host_secondary_pool_pointer = host_secondary_pool_pointer;
+        common_enqueue_params.host_primary_block_scale_pool_pointer = host_primary_block_scale_pool_pointer;
+        common_enqueue_params.host_secondary_block_scale_pool_pointer = host_secondary_block_scale_pool_pointer;
         common_enqueue_params.num_tokens = num_tokens;
         common_enqueue_params.max_blocks_per_sequence = max_blocks_per_sequence;
         common_enqueue_params.sequence_lengths = sequence_lengths_ptr;
@@ -364,6 +406,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     torch::optional<torch::Tensor> workspace_, torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths,
     torch::Tensor context_lengths, torch::Tensor host_context_lengths, torch::Tensor host_request_types,
     torch::optional<torch::Tensor> kv_cache_block_offsets, torch::optional<torch::Tensor> host_kv_cache_block_offsets,
+    torch::optional<torch::Tensor> host_kv_cache_block_scale_pool_pointers,
     torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
     torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
     torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
@@ -599,10 +642,10 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             /*num_seqs=*/num_contexts, token_offset,
             /*num_tokens=*/num_ctx_tokens, predicted_tokens_per_seq, workspace, output, output_sf, qkv, sequence_length,
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
-            host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
-            kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets);
+            host_kv_cache_block_offsets, host_kv_cache_block_scale_pool_pointers, host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping, cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
+            rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
+            mrope_position_deltas, mla_context_paged_kv, mla_context_kv_cache_block_offsets);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -615,10 +658,10 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             /*num_seqs=*/num_generations, token_offset,
             /*num_tokens=*/num_gen_tokens, predicted_tokens_per_seq, workspace, output, output_sf, qkv, sequence_length,
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
-            host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
-            kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets);
+            host_kv_cache_block_offsets, host_kv_cache_block_scale_pool_pointers, host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping, cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
+            rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
+            mrope_position_deltas, mla_context_paged_kv, mla_context_kv_cache_block_offsets);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
@@ -647,7 +690,7 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     op->mHeadSize = head_size;
     op->mMaskType = static_cast<tensorrt_llm::kernels::AttentionMaskType>(int32_t(mask_type));
     op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
-    op->mFP8ContextFMHA = op->mKVCacheQuantMode.hasFp8KvCache();
+    op->mFP8ContextFMHA = op->mKVCacheQuantMode.hasFp8KvCache() || op->mKVCacheQuantMode.hasFp4KvCache();
     op->mUseKVCache = true;
     op->mPagedKVCache = true;
     op->mTokensPerBlock = tokens_per_block.value_or(0);
@@ -692,6 +735,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor host_request_types"
         ", Tensor? kv_cache_block_offsets"
         ", Tensor? host_kv_cache_block_offsets"
+        ", Tensor? host_kv_cache_block_scale_pool_pointers"
         ", Tensor? host_kv_cache_pool_pointers"
         ", Tensor? host_kv_cache_pool_mapping"
         ", Tensor? cache_indirection"

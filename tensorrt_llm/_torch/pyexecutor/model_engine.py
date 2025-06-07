@@ -95,7 +95,7 @@ _KV_CACHE_MAP = {
     "nvfp4": QuantAlgo.NVFP4.value,
     "auto": "auto"
 }
-_VALID_KV_CACHE_DTYPES = ("fp8", "auto")
+_VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 
 
 def validate_and_set_kv_cache_quant(model_config: ModelConfig,

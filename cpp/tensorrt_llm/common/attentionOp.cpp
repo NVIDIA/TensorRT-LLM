@@ -211,6 +211,10 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
         }
         xqaParams.kv_cache_data_type = DATA_TYPE_E4M3;
     }
+    else if (mKVCacheQuantMode.hasFp4KvCache())
+    {
+        xqaParams.kv_cache_data_type = DATA_TYPE_E2M1;
+    }
     else
     {
         xqaParams.kv_cache_data_type = xqaParams.data_type;
@@ -913,6 +917,9 @@ int AttentionOp::mlaGeneration(
         generation_params.can_use_one_more_block, generation_params.host_primary_pool_pointer,
         generation_params.host_secondary_pool_pointer, generation_params.block_offsets);
 
+    // Currently NVFP4 KV cache is not supported for MLA. An empty placeholder is provided.
+    auto kv_scale_cache_buffer = KVBlockArray();
+
     // Workspace pointer shift
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
     size_t offset = 0;
@@ -1189,7 +1196,7 @@ int AttentionOp::mlaGeneration(
             {
                 TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");
                 xqaParams.stream = stream;
-                mXqaDispatcher->run(xqaParams, kv_cache_buffer);
+                mXqaDispatcher->run(xqaParams, kv_cache_buffer, kv_scale_cache_buffer);
                 return 0;
             }
             else if (mIsSpecDecodingEnabled && mUseSpecDecoding)
@@ -1263,8 +1270,23 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     float const q_scaling = mQScaling;
 
     KVCacheBuffer kv_cache_buffer;
-    auto const elemSize = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
-    auto sizePerToken = mNumAttnKVHeads * headSize * elemSize;
+    KVCacheBuffer kv_scale_cache_buffer;
+
+    int elemBits;
+    if (mKVCacheQuantMode.hasInt8KvCache() || mKVCacheQuantMode.hasFp8KvCache())
+    {
+        elemBits = 8;
+    }
+    else if (mKVCacheQuantMode.hasFp4KvCache())
+    {
+        elemBits = 4;
+    }
+    else
+    {
+        elemBits = sizeof(T) * 8;
+    }
+    auto sizePerToken = mNumKVHeads * headSize * elemBits / 8 /*bits*/;
+
     if (useKVCache())
     {
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
@@ -1273,6 +1295,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 sizePerToken, params.cyclic_attention_window_size, params.max_cyclic_attention_window_size,
                 params.sink_token_length, params.can_use_one_more_block, params.host_primary_pool_pointer,
                 params.host_secondary_pool_pointer, params.block_offsets);
+            if (mKVCacheQuantMode.hasFp4KvCache())
+            {
+                kv_scale_cache_buffer = KVBlockArray(params.batch_size, params.max_blocks_per_sequence, mTokensPerBlock,
+                    sizePerToken / 8, params.cyclic_attention_window_size, params.max_cyclic_attention_window_size,
+                    params.sink_token_length, params.can_use_one_more_block,
+                    params.host_primary_block_scale_pool_pointer, params.host_secondary_block_scale_pool_pointer,
+                    params.block_offsets);
+            }
         }
         else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
         {
@@ -1281,6 +1311,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 isCrossAttention() ? params.cross_kv_length : params.max_attention_window_size, sizePerToken,
                 params.cyclic_attention_window_size, params.sink_token_length, false,
                 reinterpret_cast<BufferDataType*>(params.key_value_cache));
+            TLLM_CHECK_WITH_INFO(!(mKVCacheQuantMode.hasFp4KvCache()), "FP4 KV cache only supports paged KV.");
         }
     }
 
@@ -1478,9 +1509,19 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         sync_check_cuda_error(stream);
     }
 
-    KvCacheDataType const cache_type = mKVCacheQuantMode.hasInt8KvCache()
-        ? KvCacheDataType::INT8
-        : (mKVCacheQuantMode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
+    KvCacheDataType cache_type{KvCacheDataType::BASE};
+    if (mKVCacheQuantMode.hasInt8KvCache())
+    {
+        cache_type = KvCacheDataType::INT8;
+    }
+    else if (mKVCacheQuantMode.hasFp8KvCache())
+    {
+        cache_type = KvCacheDataType::FP8;
+    }
+    else if (mKVCacheQuantMode.hasFp4KvCache())
+    {
+        cache_type = KvCacheDataType::NVFP4;
+    }
 
     cudaDataType_t const gemm_data_type = tc::CudaDataType<T>::value;
     int const attention_seq_len_1 = params.input_seq_length;                                               // q length
@@ -1529,6 +1570,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.quantized_qkv_output = fp8_qkv_buffer;
         preprocessingParams.q_output = q_buf_2_;
         preprocessingParams.kv_cache_buffer = kv_cache_buffer;
+        preprocessingParams.kv_cache_block_scales_buffer = kv_scale_cache_buffer;
         preprocessingParams.qkv_bias = params.qkv_bias;
         preprocessingParams.tokens_info = decoder_params.tokensInfo;
         preprocessingParams.seq_lens = params.context_lengths;
@@ -1541,7 +1583,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
         preprocessingParams.rotary_coef_cache_buffer = params.rotary_cos_sin;
         preprocessingParams.mrope_rotary_cos_sin = params.mrope_rotary_cos_sin;
-        preprocessingParams.kvScaleOrigQuant = params.kv_scale_orig_quant;
+        preprocessingParams.kv_scale_orig_quant = params.kv_scale_orig_quant;
+        // The second level scale for NVFP4 KV cache. It points to an array of 2 float, separate scales for K and V.
+        // If set to nullptr, kv_scale_orig_quant will be used instead for both K and V.
+        preprocessingParams.kv_cache_scale_factors = nullptr;
         preprocessingParams.spec_decoding_position_offsets = nullptr;
         preprocessingParams.logn_scaling = params.logn_scaling_ptr;
 
@@ -1691,6 +1736,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             else
             {
                 fmhaParams.pagedKvCache = kv_cache_buffer;
+                fmhaParams.pagedKvSfCache = kv_scale_cache_buffer;
             }
         }
         fmhaParams.cuQSeqLenPtr = cu_q_seqlens;
@@ -2040,8 +2086,24 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     int32_t const batch_beam = params.beam_width * params.num_requests;
 
     KVCacheBuffer kv_cache_buffer;
-    auto const elemSize = mKVCacheQuantMode.hasKvCacheQuant() ? sizeof(int8_t) : sizeof(T);
-    auto const sizePerToken = mNumAttnKVHeads * headSize * elemSize;
+    KVCacheBuffer kv_scale_cache_buffer;
+
+    int elemBits;
+    if (mKVCacheQuantMode.hasInt8KvCache() || mKVCacheQuantMode.hasFp8KvCache())
+    {
+        elemBits = 8;
+    }
+    else if (mKVCacheQuantMode.hasFp4KvCache())
+    {
+        elemBits = 4;
+    }
+    else
+    {
+        elemBits = sizeof(T) * 8;
+    }
+
+    auto const sizePerToken = mNumKVHeads * headSize * elemBits / 8 /*bits*/;
+
     if (useKVCache())
     {
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
@@ -2051,6 +2113,14 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
                 params.cyclic_attention_window_size, params.max_cyclic_attention_window_size, params.sink_token_length,
                 params.can_use_one_more_block, params.host_primary_pool_pointer, params.host_secondary_pool_pointer,
                 reinterpret_cast<BufferDataType*>(params.block_offsets));
+            if (mKVCacheQuantMode.hasFp4KvCache())
+            {
+                kv_scale_cache_buffer = KVBlockArray(batch_beam, params.max_blocks_per_sequence, mTokensPerBlock,
+                    sizePerToken / 8, params.cyclic_attention_window_size, params.max_cyclic_attention_window_size,
+                    params.sink_token_length, params.can_use_one_more_block,
+                    params.host_primary_block_scale_pool_pointer, params.host_secondary_block_scale_pool_pointer,
+                    reinterpret_cast<BufferDataType*>(params.block_offsets));
+            }
         }
         else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
         {
@@ -2058,6 +2128,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
             kv_cache_buffer = KVLinearBuffer(batch_beam, params.max_attention_window_size, sizePerToken,
                 params.cyclic_attention_window_size, params.sink_token_length, false,
                 reinterpret_cast<BufferDataType*>(params.key_value_cache));
+            TLLM_CHECK_WITH_INFO(!(mKVCacheQuantMode.hasFp4KvCache()), "FP4 KV cache only supports paged KV.");
         }
     }
     sync_check_cuda_error(stream);
@@ -2133,7 +2204,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
                 xqaParams.output = mhaOutput;
                 xqaParams.qkv = attention_input;
             }
-            mXqaDispatcher->run(xqaParams, kv_cache_buffer);
+            mXqaDispatcher->run(xqaParams, kv_cache_buffer, kv_scale_cache_buffer);
             if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
             {
                 this->template ulyssesGenerationPostprocess<T>(
@@ -2149,6 +2220,10 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         else if (mFuseFp4Quant)
         {
             TLLM_CHECK_WITH_INFO(false, "No available kernels are found for FP4 output.");
+        }
+        else if (mKVCacheQuantMode.hasFp4KvCache())
+        {
+            TLLM_CHECK_WITH_INFO(false, "No available kernels are found for FP4 KV cache.");
         }
     }
 
@@ -2414,6 +2489,10 @@ int AttentionOp::initialize() noexcept
     TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mEnableContextFMHA, "Context FMHA must enable if fuse_fp4_quant is enabled");
     TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mSM == 100, "fuse_fp4_quant only supports SM100 devices.");
 
+    // Check requirements for FP4 KV cache.
+    TLLM_CHECK_WITH_INFO(!mKVCacheQuantMode.hasFp4KvCache() || mFP8ContextFMHA,
+        "mFP8ContextFMHA must enable if FP4 KV cache is enabled");
+
     TLLM_CHECK(isRoPE() == (mRotaryEmbeddingDim != 0));
     TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != nvinfer1::DataType::kBF16),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
@@ -2490,7 +2569,10 @@ int AttentionOp::initialize() noexcept
             {
                 fmhaParams.dataTypeKv = DATA_TYPE_E4M3;
             }
-            // TODO: add FP4 KV cache support.
+            else if (mKVCacheQuantMode.hasFp4KvCache())
+            {
+                fmhaParams.dataTypeKv = DATA_TYPE_E2M1;
+            }
         }
         // The output dtype.
         fmhaParams.dataTypeOut = data_type;
@@ -2690,6 +2772,11 @@ int AttentionOp::initialize() noexcept
         else if (mKVCacheQuantMode.hasFp8KvCache())
         {
             fixedParams.kvDataType = DATA_TYPE_E4M3;
+            fixedParams.mathDataType = DATA_TYPE_E4M3;
+        }
+        else if (mKVCacheQuantMode.hasFp4KvCache())
+        {
+            fixedParams.kvDataType = DATA_TYPE_E2M1;
             fixedParams.mathDataType = DATA_TYPE_E4M3;
         }
         else

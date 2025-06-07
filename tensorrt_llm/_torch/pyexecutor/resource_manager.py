@@ -231,6 +231,8 @@ class KVCacheManager(BaseResourceManager):
         self.impl = KVCacheManagerCpp(**kwargs)
 
         self.impl.allocate_pools(False)
+        self.kv_cache_block_scale_pool_pointers = self.impl.get_block_scale_pool_pointers(
+        )
         self.kv_cache_pool_pointers = self.impl.get_block_pool_pointers()
         self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
         self.num_pools = self.impl.num_pools
@@ -386,15 +388,21 @@ class KVCacheManager(BaseResourceManager):
             self.num_kv_heads_per_layer) * head_dim
 
         if dtype == DataType.FP8:
-            kv_cache_dtype_bytes = 1
+            kv_cache_dtype_bits = 8
         elif dtype in (DataType.HALF, DataType.BF16):
-            kv_cache_dtype_bytes = 2
+            kv_cache_dtype_bits = 16
         elif dtype == DataType.FLOAT:
-            kv_cache_dtype_bytes = 4
+            kv_cache_dtype_bits = 32
+        elif dtype == DataType.NVFP4:
+            kv_cache_dtype_bits = 4
         else:
             raise ValueError(f'Cannot support {dtype} KV cache.')
 
-        cache_size_bytes_per_token = cache_size_per_token * kv_cache_dtype_bytes
+        cache_size_bytes_per_token = cache_size_per_token * kv_cache_dtype_bits / 8
+        if dtype == DataType.NVFP4:
+            # NVFP4 needs additional block scales. Vector Size is 16. Each scaling factor is 1 byte.
+            cache_size_bytes_per_token += cache_size_per_token / 16
+
         free_mem, total_mem = torch.cuda.mem_get_info()
 
         assert free_mem_fraction < 1.0, f"Invalid freeMemFraction, freeMemFraction {free_mem_fraction} must be smaller than 1.0"
