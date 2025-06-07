@@ -38,7 +38,10 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
 
     draft_len = 4
     spec_config = EagleDecodingConfig(
-        max_draft_len=draft_len, pytorch_eagle_weights_path=eagle_model_dir)
+        max_draft_len=draft_len,
+        pytorch_eagle_weights_path=eagle_model_dir,
+        # Llama 3 does not support one model eagle.
+        eagle3_one_model=False)
 
     build_config = None
     if attn_backend == "FLASHINFER":

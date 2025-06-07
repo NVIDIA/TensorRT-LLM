@@ -96,17 +96,20 @@ class Eagle3SpecMetadata(SpecMetadata):
     def get_hidden_states(
             self,
             scheduled_requests,
-            num_rejected_tokens: Optional[Dict] = None) -> torch.Tensor:
+            is_context: bool = False,
+            num_padding_tokens: Optional[Dict] = None) -> torch.Tensor:
         req_id_to_gather_ids = {}
         seq_start = 0
         for req_id, seqlen in zip(self.request_ids, self.seq_lens):
-            if num_rejected_tokens is not None:
-                if req_id in num_rejected_tokens:
-                    req_id_to_gather_ids[req_id] = list(
-                        range(seq_start,
-                              seq_start + seqlen - num_rejected_tokens[req_id]))
+            if is_context:
+                req_id_to_gather_ids[req_id] = list(
+                    range(seq_start, seq_start + seqlen))
             else:
-                req_id_to_gather_ids[req_id] = [seq_start + seqlen - 1]
+                if num_padding_tokens:
+                    offset = num_padding_tokens.get(req_id, 0)
+                else:
+                    offset = 0
+                req_id_to_gather_ids[req_id] = [seq_start + seqlen - 1 - offset]
 
             seq_start += seqlen
 
