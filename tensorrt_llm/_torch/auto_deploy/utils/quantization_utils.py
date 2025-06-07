@@ -4,7 +4,12 @@ import torch
 import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 
-from ..custom_ops.quant import FP4_GLOBAL_SCALE_MAX, FP8_MAX, TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+from ..custom_ops.quant import (
+    FP4_GLOBAL_SCALE_MAX,
+    FP8_MAX,
+    TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+    is_column_major,
+)
 from .logger import ad_logger
 from .node_utils import (
     get_quantization_params_from_linear_node,
@@ -61,17 +66,31 @@ class QuantizationImpl:
     """An abstracted static class for node quantization."""
 
     @staticmethod
-    def create(quant_type_or_node: Union[str, Node]):
-        """Returns the QuantizationImpl based on quantization type or quantized linear node."""
+    def create(quant_type_or_node: Union[str, Node], is_bmm: bool = False):
+        """Returns the QuantizationImpl based on quantization type or quantized node.
+
+        Args:
+            quant_type_or_node: Quantization type string or quantized node
+            is_bmm: Whether the operation is BMM (batch matrix multiplication)
+        """
         if isinstance(quant_type_or_node, str):
-            quantization_impl_map = {
-                "": None,
-                "FP8": FP8QuantizationImpl,
-                "NVFP4": FP4QuantizationImpl,
-            }
+            if is_bmm:
+                quantization_impl_map = {
+                    "": None,
+                    "FP8": FP8BMMQuantizationImpl,
+                }
+            else:
+                quantization_impl_map = {
+                    "": None,
+                    "FP8": FP8QuantizationImpl,
+                }
             return quantization_impl_map[quant_type_or_node]
 
-        for q in [FP4QuantizationImpl, FP8QuantizationImpl]:
+        for q in [
+            FP4QuantizationImpl,
+            FP8QuantizationImpl,
+            FP8BMMQuantizationImpl,
+        ]:
             if is_op(quant_type_or_node, q.target_op()):
                 return q
         return None
@@ -99,6 +118,11 @@ class QuantizationImpl:
     @staticmethod
     def load_hook(state_dict, prefix, *args, weight_name: str):
         """Load hook for state_dict quantization pre-processing."""
+        pass
+
+    @staticmethod
+    def post_load_hook(state_dict, prefix, *args, weight_name: str):
+        """Load hook for state_dict quantization post-processing."""
         pass
 
     @staticmethod
@@ -377,3 +401,63 @@ def get_quantization_from_linear_node(node: torch.fx.node.Node):
             print(input_params, weight_params)
 
     return ""
+
+
+class FP8BMMQuantizationImpl(QuantizationImpl):
+    """Implementation of FP8 quantization for BMM operations."""
+
+    @staticmethod
+    def target_op():
+        return torch.ops.quant.fp8_bmm
+
+    @staticmethod
+    def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(
+            original_weight, dtype=torch.float8_e4m3fn, device=original_weight.device
+        )
+
+    @staticmethod
+    def scale_names() -> List[str]:
+        return ["input_scale", "weight_scale"]
+
+    @staticmethod
+    def default_scales(original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
+        return {"input_scale": torch.tensor(1.0), "weight_scale": torch.tensor(1.0)}
+
+    @staticmethod
+    def load_hook(state_dict, prefix, *args, weight_name):
+        """Pre-hook: Only handle quantization."""
+        if weight_name in state_dict:
+            weight = state_dict[weight_name]
+
+            # If weight is not already quantized (not float8)
+            if weight.dtype != torch.float8_e4m3fn:
+                # Compute weight scale
+                weight_scale = fp8_scale(weight)
+                weight = (weight / weight_scale).to(torch.float8_e4m3fn)
+                state_dict[weight_name + "_scale"] = weight_scale
+                state_dict[weight_name] = weight
+
+    @staticmethod
+    def post_load_hook(module, incompatible_keys, weight_name):
+        """Post-hook: Handle column-major conversion after parameter is loaded."""
+        # Navigate to the actual parameter
+        *path, attr_name = weight_name.split(".")
+        target_module = module
+        for p in path:
+            target_module = getattr(target_module, p)
+
+        if hasattr(target_module, attr_name):
+            param = getattr(target_module, attr_name)
+            if isinstance(param, torch.nn.Parameter):
+                # Convert to column-major format
+                if not is_column_major(param):
+                    with torch.no_grad():
+                        # Create column-major version
+                        param_cm = param.transpose(-2, -1).contiguous().transpose(-2, -1)
+                        # Replace the parameter
+                        setattr(
+                            target_module,
+                            attr_name,
+                            torch.nn.Parameter(param_cm, requires_grad=param.requires_grad),
+                        )

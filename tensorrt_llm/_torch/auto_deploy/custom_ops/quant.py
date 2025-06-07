@@ -1,8 +1,10 @@
 """Definition of the quant module that can be used for PTQ."""
 
+import warnings
 from typing import Optional
 
 import torch
+from flashinfer import bmm_fp8
 from torch import nn
 
 from tensorrt_llm._torch.autotuner import autotune
@@ -218,4 +220,90 @@ def fp4_linear_fake(
     return torch.ops.aten.linear(input, weight_fp4.repeat(1, 2).to(input.dtype), bias)
 
 
-QUANT_OPS = [torch.ops.quant.fp8_linear, torch.ops.quant.fp4_linear]
+def is_column_major(tensor):
+    rows, _ = tensor.shape[-2:]
+    strides = tensor.stride()
+    return strides[-2] == 1 and strides[-1] == rows
+
+
+@torch.library.custom_op("quant::fp8_bmm", mutates_args=())
+def fp8_bmm(
+    input: torch.Tensor,
+    mat2: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """FP8 BMM op similar to torch.bmm.
+
+    Args:
+        input: unquantized input tensor with shape (B, M, K)
+        mat2: weight tensor with shape (B, K, N), with dtype torch.float8_e4m3fn,
+            or torch.float16, or torch.bfloat16
+        input_scale: a scalar tensor - the inverse scale for input quantization
+        weight_scale: a scalar tensor - the inverse scale for weight quantization
+
+    Returns:
+        The BMM output with shape (B, M, N) and the original dtype as the input.
+    """
+    # Ensure input is contiguous
+    input = input.contiguous()
+    original_input_dtype = input.dtype
+
+    # Convert input to fp8 using provided scale
+    if input.dtype in [torch.float16, torch.bfloat16]:
+        input_fp8 = _to_fp8(input, input_scale)
+    else:
+        assert input.dtype == torch.float8_e4m3fn
+        input_fp8 = input
+
+    # Convert mat2 to fp8 using provided scale
+    if mat2.dtype in [torch.float16, torch.bfloat16]:
+        mat2_fp8 = _to_fp8(mat2, weight_scale)
+    else:
+        assert mat2.dtype == torch.float8_e4m3fn
+        mat2_fp8 = mat2
+
+    # Ensure mat2 is contiguous in column-major format only if needed
+    # Check if the tensor is already contiguous when transposed (i.e., already column-major)
+    if not is_column_major(mat2_fp8):
+        warnings.warn(
+            "mat2 is not in column-major format, transposing it, this will cause performance degradation."
+        )
+        mat2_fp8 = mat2_fp8.transpose(-2, -1).contiguous().transpose(-2, -1)
+
+    # Get dimensions
+    B, M, K = input.shape
+    B2, K2, N = mat2_fp8.shape
+    assert B == B2, f"Batch dimensions must match: {B} vs {B2}"
+    assert K == K2, f"Inner dimensions must match: {K} vs {K2}"
+
+    output = torch.empty((B, M, N), dtype=original_input_dtype, device=input.device)
+    bmm_fp8(
+        input_fp8, mat2_fp8, input_scale.float(), weight_scale.float(), original_input_dtype, output
+    )
+
+    return output
+
+
+@fp8_bmm.register_fake
+def fp8_bmm_fake(
+    input: torch.Tensor,
+    mat2: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Fake implementation of fp8_bmm for testing and tracing."""
+    # Use standard bmm
+    return torch.bmm(input.to(torch.float), mat2.to(torch.float)).to(input.dtype)
+
+
+QUANT_LINEAR_OPS = [
+    torch.ops.quant.fp8_linear,
+    torch.ops.quant.fp4_linear,
+]
+
+QUANT_BMM_OPS = [
+    torch.ops.quant.fp8_bmm,
+]
+
+QUANT_OPS = QUANT_LINEAR_OPS + QUANT_BMM_OPS
