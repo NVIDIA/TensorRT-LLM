@@ -41,6 +41,9 @@ from utils.util import getSMVersion
     [torch.bfloat16],
 )
 def test_fp8_block_scale_gemm(dtype, m, k, n):
+    if getSMVersion() == 89 and k == 7168 and n == 2112:
+        pytest.skip("https://nvbugs/5328184")
+
     torch.random.manual_seed(0)
     a = torch.randn((m, k), device='cuda', dtype=dtype) / k
     b = torch.randn((n, k), device='cuda', dtype=dtype) / k
