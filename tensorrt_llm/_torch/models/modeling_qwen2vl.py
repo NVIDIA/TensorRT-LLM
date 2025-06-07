@@ -27,7 +27,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                  trust_remote_code: bool = True):
         self.model_config = model_config
         self.tokenizer = tokenizer
-        self.use_fast = True
+        self.use_fast = False
         self.processor = AutoProcessor.from_pretrained(
             model_path,
             use_fast=self.use_fast,
