@@ -71,7 +71,7 @@ class Gemma3Attention(Attention):
 
     def forward(
         self,
-        position_ids: Optional[torch.LongTensor],
+        position_ids: Optional[torch.IntTensor],
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
@@ -177,7 +177,7 @@ class Gemma3DecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
@@ -232,8 +232,8 @@ class Gemma3TextModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -273,8 +273,8 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.IntTensor = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         **kwargs,
