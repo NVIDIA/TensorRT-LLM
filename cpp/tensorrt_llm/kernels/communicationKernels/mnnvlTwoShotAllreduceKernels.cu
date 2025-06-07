@@ -80,6 +80,15 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
     uint32_t input_offset = buffer_flags[0] * buffer_size;
     uint32_t clear_offset = buffer_flags[1] * buffer_size;
 
+    if (wait_for_results)
+    {
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            atomicAdd(offset_access_ptr, 1);
+        }
+    }
+
     if (elt < token_dim)
     {
         // Scatter token
@@ -312,13 +321,14 @@ __global__ void __launch_bounds__(128, 1)
 
     int offsets[NUM_INPUTS][DIM / (1 * ELTS_PER_THREAD * NUM_THREADS)];
 
-    cudaTriggerProgrammaticLaunchCompletion();
-
     uint32_t* offset_access_ptr = &buffer_flags[3];
     // Buffer size is M * N, and we need two buffers for reduce-scatter and allgather
     uint32_t buffer_size = buffer_flags[2];
     uint32_t buffer_offset = buffer_flags[0] * (buffer_size << 1);
     T_IN const* input = &buffer_input[buffer_offset + buffer_size];
+
+    cudaTriggerProgrammaticLaunchCompletion();
+
     __syncthreads();
     if (threadIdx.x == 0)
     {

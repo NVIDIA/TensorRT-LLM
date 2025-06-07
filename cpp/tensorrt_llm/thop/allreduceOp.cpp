@@ -1044,12 +1044,13 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
 }
 
 at::Tensor mnnvlTwoShotAllReduce(
-    at::Tensor& output, at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
+    at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(mcast_mem != nullptr, "two_shot_all_reduce: comm_buffer must be obtained from a mcastBuffer instance.");
 
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    at::Tensor output = torch::empty_like(input);
 
     auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceParams();
     allreduce_params.dtype = dtype;
@@ -1071,35 +1072,42 @@ at::Tensor mnnvlTwoShotAllReduce(
     return output;
 }
 
-void twoShotRMSNorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch::Tensor const& input,
-    torch::Tensor const& gamma, double epsilon, torch::Tensor const& residual, torch::Tensor& buffer_flags)
+std::vector<torch::Tensor> twoShotRMSNorm(torch::Tensor const& comm_buf, torch::Tensor const& gamma, double epsilon,
+    torch::Tensor const& residual, torch::Tensor& buffer_flags)
 {
-    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(comm_buf.scalar_type());
     auto rmsnorm_params = tensorrt_llm::kernels::mnnvl::RMSNormParams();
+
+    // Input is the communication buffer so we need to get the shape from residual
+    torch::Tensor normed_output = torch::empty_like(residual);
+    torch::Tensor prenorm_output = torch::empty_like(residual);
+
     rmsnorm_params.dtype = dtype;
     rmsnorm_params.residual_output = prenorm_output.data_ptr();
     rmsnorm_params.output = normed_output.data_ptr();
-    rmsnorm_params.input = input.data_ptr();
+    rmsnorm_params.input = comm_buf.data_ptr();
     rmsnorm_params.gamma = gamma.data_ptr();
     rmsnorm_params.epsilon = epsilon;
     rmsnorm_params.residual = residual.data_ptr();
     rmsnorm_params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
     rmsnorm_params.batch = normed_output.size(0);
     rmsnorm_params.hidden_dim = normed_output.size(1);
-    rmsnorm_params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    rmsnorm_params.stream = at::cuda::getCurrentCUDAStream(comm_buf.get_device());
 
     tensorrt_llm::kernels::mnnvl::twoshot_rmsnorm_op(rmsnorm_params);
+
+    return {normed_output, prenorm_output};
 }
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "mnnvl_twoshot_allreduce(Tensor(output!) output, Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
+        "mnnvl_twoshot_allreduce(Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
         "Tensor(buffer_flags!) buffer_flags, bool wait_for_result) -> Tensor");
     m.def(
-        "mnnvl_twoshot_rmsnorm(Tensor prenorm_output, Tensor normed_output, Tensor input, Tensor gamma, "
-        "float epsilon, Tensor residual, Tensor buffer_flags) -> ()");
+        "mnnvl_twoshot_rmsnorm(Tensor comm_buf, Tensor gamma, "
+        "float epsilon, Tensor residual, Tensor buffer_flags) -> Tensor[]");
     m.def(
         "allreduce("
         "Tensor input,"
