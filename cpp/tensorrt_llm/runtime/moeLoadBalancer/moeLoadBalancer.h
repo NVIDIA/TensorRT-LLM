@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -81,7 +82,7 @@ public:
     void addSingleWeightSlot(int localSlotId, std::string const& name, MoeWeight weightSlot);
     virtual void addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight) = 0;
     virtual void finalizeWeights();
-    virtual void updateWeights(MoePlacementCpuInfo const* placementCpuInfo) = 0;
+    virtual void updateWeights(MoePlacementCpuInfo const* placementCpuInfo, int rank = 0, int size = 1) = 0;
 
 protected:
     void finalizeWeightSlot();
@@ -102,10 +103,11 @@ public:
     void addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight) override;
     void finalizeWeights() override;
 
-    void updateWeights(MoePlacementCpuInfo const* placementCpuInfo) override;
+    void updateWeights(MoePlacementCpuInfo const* placementCpuInfo, int rank = 0, int size = 1) override;
 
 private:
     static void copyWeights(MoeWeight const& src, MoeWeight const& dst, cudaStream_t stream);
+    static void copyWeightsCpu(MoeWeight const& src, MoeWeight const& dst, int rank, int size);
     void finalizeHostWeight();
     bool mHostWeightsFinalized = false;
     std::map<std::string, std::vector<MoeWeight>> mHostWeights;
@@ -166,6 +168,7 @@ public:
 
 private:
     friend class MoeLoadBalancer;
+    friend class HostMemoryMoeWeightUpdater;
 
     void createResources();
     void destroyResources();
@@ -187,7 +190,11 @@ private:
     bool mUpdateWeightsEnabled = true;
 
     void copyPlacementInfoToGpu();
+    void copyPlacementInfoToGpuByCpu();
     void updateWeightsRoutine();
+    void updateWeightsRoutineByCpu();
+
+    int64_t mLastUpdateTaskId = -1;
 
     cudaEvent_t mUpdateWeightsDoneEvent = nullptr;
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo mMetaInfo;
@@ -201,6 +208,42 @@ private:
     bool mUpdateWeightsDone = false;
 
     int mLayerId = -1;
+};
+
+class MultiThreadWorker
+{
+public:
+    explicit MultiThreadWorker(int numThreads);
+    ~MultiThreadWorker();
+
+    void start();
+    int64_t addTask(std::function<void(int, int)> func);
+    void waitTaskDone(int64_t taskId);
+    void stop();
+
+private:
+    struct Task
+    {
+        int64_t id;
+        std::function<void(int, int)> func;
+        int remaining;
+        std::condition_variable cv;
+    };
+
+    void workerLoop(int rank);
+
+    int mNumThreads;
+    std::vector<std::thread> mThreads;
+    std::mutex mMutex;
+    std::condition_variable mCondition;
+
+    std::deque<std::shared_ptr<Task>> mTasks;
+
+    std::unordered_map<int64_t, std::shared_ptr<Task>> mTaskMap;
+    std::unordered_map<int64_t, std::shared_ptr<Task>> mDoneTaskMap;
+
+    bool mRunning;
+    int64_t mNextTaskId;
 };
 
 class MoeLoadBalancer
@@ -227,8 +270,15 @@ public:
     // should bind to python
     void shutdown();
 
+    // Test interface to use GPU to do memcpy test functionality
+    void setUseGpuMemcpy(bool useGpuMemcpy = false)
+    {
+        mUseGpuMemcpy = useGpuMemcpy;
+    }
+
 private:
     friend class SingleLayerMoeLoadBalancer;
+    friend class HostMemoryMoeWeightUpdater;
 
     void startThreads();
 
@@ -247,6 +297,8 @@ private:
     std::condition_variable mUpdateQueueCondition;
     std::queue<std::function<void()>> mUpdateTaskQueue;
     void addUpdateTask(std::function<void()> task);
+    int64_t addCopyTask(std::function<void(int, int)> task);
+    void waitCopyTaskDone(int64_t taskId);
 
     std::vector<std::shared_ptr<SingleLayerMoeLoadBalancer>> mLayers;
 
@@ -272,10 +324,14 @@ private:
     std::unique_ptr<std::thread> mWorkerThread;
     std::unique_ptr<std::thread> mComputeAndUpdateThread;
 
+    std::unique_ptr<MultiThreadWorker> mMultiThreadWorker;
+
     // update plan member and function
     int mLayerUpdatesPerIter = 1;
     std::deque<std::set<int>> mUpdateLayerQueue;
     void generateUpdatePlan();
+
+    bool mUseGpuMemcpy = false;
 };
 
 // functions exposed for testing

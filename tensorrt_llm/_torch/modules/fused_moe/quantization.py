@@ -61,6 +61,14 @@ class FusedMoEMethodBase(ABC):
     Base class for all fused MoE methods.
     """
 
+    def need_load_shared_weights(self, module):
+        if hasattr(
+                module, "layer_load_balancer"
+        ) and module.layer_load_balancer and module.layer_load_balancer.need_load_shared_weights(
+        ):
+            return True
+        return False
+
     def create_weights(self, module: torch.nn.Module, weight_dtype: torch.dtype,
                        w3_w1_weight_shape: tuple[int, int, int],
                        w2_weight_shape: tuple[int, int, int]):
@@ -76,12 +84,15 @@ class FusedMoEMethodBase(ABC):
                                  requires_grad=False)
         module.register_parameter("w2_weight", w2_weight)
 
-    def load_weights(self, module: torch.nn.Module, weights: List[Dict],
-                     weight_loading_mode: MoEWeightLoadingMode):
+    def load_expert_weights_to_dst(self, module: torch.nn.Module,
+                                   weights: List[Dict],
+                                   weight_loading_mode: MoEWeightLoadingMode,
+                                   load_expert_ids: List[int],
+                                   dst_w3_w1_weights_tensor: torch.Tensor,
+                                   dst_w2_weights_tensor: torch.Tensor):
         # Multithread weight load is superseded by prefetch_files() in model_engine.py
         # Also, threading adds overhead in order to protect shuffle index cache with critical section.
-        for local_slot_id, expert_id in enumerate(
-                module.initial_local_expert_ids):
+        for local_slot_id, expert_id in enumerate(load_expert_ids):
             # expert_idx is the local slot index of current rank
             expert_idx = local_slot_id
 
@@ -101,14 +112,54 @@ class FusedMoEMethodBase(ABC):
                 )
 
             self.load_expert_w3_w1_weight(module, w1_weight, w3_weight,
-                                          module.w3_w1_weight.data[expert_idx])
+                                          dst_w3_w1_weights_tensor[expert_idx])
 
             self.load_expert_w2_weight(module, w2_weight,
-                                       module.w2_weight.data[expert_idx])
+                                       dst_w2_weights_tensor[expert_idx])
+
+    def load_weights(self, module: torch.nn.Module, weights: List[Dict],
+                     weight_loading_mode: MoEWeightLoadingMode):
+
+        self.load_expert_weights_to_dst(module, weights, weight_loading_mode,
+                                        module.initial_local_expert_ids,
+                                        module.w3_w1_weight.data,
+                                        module.w2_weight.data)
 
         self.load_quant_scales(module, weights)
         # Re-setup quant scales after loading weights as the tensors may have been modified.
         self.setup_quant_scales(module)
+
+        if self.need_load_shared_weights(module):
+            local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
+            )
+            local_shared_w3_w1_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                module.w3_w1_weight.data.shape[1:],
+                dtype=module.w3_w1_weight.data.dtype,
+                device='cpu')
+            local_shared_w2_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                module.w2_weight.data.shape[1:],
+                dtype=module.w2_weight.data.dtype,
+                device='cpu')
+            self.load_expert_weights_to_dst(module, weights,
+                                            weight_loading_mode,
+                                            local_shared_load_expert_ids,
+                                            local_shared_w3_w1_tensors,
+                                            local_shared_w2_tensors)
+            module.register_all_parameter_slot_and_to_fix_weight_fns({
+                'w3_w1_weight':
+                local_shared_w3_w1_tensors,
+                'w2_weight':
+                local_shared_w2_tensors
+            })
+            module.layer_load_balancer.host_tensor_sharer.finalize_layer_weights(
+            )
+
+        if hasattr(module,
+                   "layer_load_balancer") and module.layer_load_balancer:
+            module.layer_load_balancer.set_initial_weight_assignments(
+                module.initial_global_assignments)
 
     def load_quant_scales(self, module: torch.nn.Module, weights: List[Dict]):
         pass
@@ -828,6 +879,50 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         w2_weight_scale_2 = 1.0 / w2_weight_scale_2[...].reshape([])
         dst_w2_alpha.copy_(1.0 / (final_fc2_input_scale * w2_weight_scale_2))
 
+    def load_all_fp4_weight_scales_and_alphas(
+            self, module: torch.nn.Module, weights: Dict,
+            load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
+            dst_w2_weight_scale: torch.Tensor, dst_fc31_alpha: torch.Tensor,
+            dst_fc2_alpha: torch.Tensor):
+        for local_slot_id, expert_id in enumerate(load_expert_ids):
+            if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
+                w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
+                w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+                w1_weight_scale_2 = weights[f"{expert_id}.w1.weight_scale_2"]
+                w3_weight_scale_2 = weights[f"{expert_id}.w3.weight_scale_2"]
+                w2_weight_scale_2 = weights[f"{expert_id}.w2.weight_scale_2"]
+            elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_w3_weight_scale = weights["gate_up_proj_weight_scale"][
+                    expert_id].transpose(0, 1).contiguous()
+                w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(
+                    2, dim=0)
+                w2_weight_scale = weights["down_proj_weight_scale"][
+                    expert_id].transpose(0, 1).contiguous()
+                w1_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
+                w3_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
+                w2_weight_scale_2 = weights["down_proj_weight_scale_2"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
+                )
+
+            expert_idx = local_slot_id
+
+            self.load_expert_w3_w1_weight_scale_nvfp4(
+                module, w1_weight_scale, w3_weight_scale,
+                dst_w3_w1_weight_scale[expert_idx])
+            self.load_expert_w2_weight_scale_nvfp4(
+                module, w2_weight_scale, dst_w2_weight_scale[expert_idx])
+
+            self.load_expert_fc31_alpha_nvfp4(w1_weight_scale_2,
+                                              w3_weight_scale_2,
+                                              module.fc31_input_scale.data,
+                                              dst_fc31_alpha[expert_idx])
+            self.load_expert_fc2_alpha_nvfp4(w2_weight_scale_2,
+                                             module.fc2_input_scale.data,
+                                             dst_fc2_alpha[expert_idx])
+
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         # Step1: Load input scales.
         tmp_fc31_input_scale = torch.empty(module.num_experts,
@@ -862,46 +957,50 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             tmp_fc2_input_scale.max().reciprocal())
 
         # Step2: Load weight block scales and alphas.
-        for local_slot_id, expert_id in enumerate(
-                module.initial_local_expert_ids):
-            if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-                w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
-                w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
-                w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
-                w1_weight_scale_2 = weights[f"{expert_id}.w1.weight_scale_2"]
-                w3_weight_scale_2 = weights[f"{expert_id}.w3.weight_scale_2"]
-                w2_weight_scale_2 = weights[f"{expert_id}.w2.weight_scale_2"]
-            elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_w3_weight_scale = weights["gate_up_proj_weight_scale"][
-                    expert_id].transpose(0, 1).contiguous()
-                w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(
-                    2, dim=0)
-                w2_weight_scale = weights["down_proj_weight_scale"][
-                    expert_id].transpose(0, 1).contiguous()
-                w1_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
-                w3_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
-                w2_weight_scale_2 = weights["down_proj_weight_scale_2"]
-            else:
-                raise NotImplementedError(
-                    f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
-                )
+        self.load_all_fp4_weight_scales_and_alphas(
+            module, weights, module.initial_local_expert_ids,
+            module.w3_w1_weight_scale.data, module.w2_weight_scale.data,
+            module.fc31_alpha.data, module.fc2_alpha.data)
 
-            expert_idx = local_slot_id
+        # Step 3: if need load into shared
+        if self.need_load_shared_weights(module):
+            local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
+            )
+            local_shared_w3_w1_scale_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                module.w3_w1_weight_scale.data.shape[1:],
+                dtype=module.w3_w1_weight_scale.data.dtype,
+                device='cpu')
+            local_shared_w2_scale_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                module.w2_weight_scale.data.shape[1:],
+                dtype=module.w2_weight_scale.data.dtype,
+                device='cpu')
+            local_shared_fc31_alpha_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                module.fc31_alpha.data.shape[1:],
+                dtype=module.fc31_alpha.data.dtype,
+                device='cpu')
+            local_shared_fc2_alpha_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                module.fc2_alpha.data.shape[1:],
+                dtype=module.fc2_alpha.data.dtype,
+                device='cpu')
+            self.load_all_fp4_weight_scales_and_alphas(
+                module, weights, local_shared_load_expert_ids,
+                local_shared_w3_w1_scale_tensors, local_shared_w2_scale_tensors,
+                local_shared_fc31_alpha_tensors, local_shared_fc2_alpha_tensors)
 
-            self.load_expert_w3_w1_weight_scale_nvfp4(
-                module, w1_weight_scale, w3_weight_scale,
-                module.w3_w1_weight_scale.data[expert_idx])
-            self.load_expert_w2_weight_scale_nvfp4(
-                module, w2_weight_scale,
-                module.w2_weight_scale.data[expert_idx])
-
-            self.load_expert_fc31_alpha_nvfp4(
-                w1_weight_scale_2, w3_weight_scale_2,
-                module.fc31_input_scale.data,
-                module.fc31_alpha.data[expert_idx])
-            self.load_expert_fc2_alpha_nvfp4(w2_weight_scale_2,
-                                             module.fc2_input_scale.data,
-                                             module.fc2_alpha.data[expert_idx])
+            module.register_all_parameter_slot_and_to_fix_weight_fns({
+                'w3_w1_weight_scale':
+                local_shared_w3_w1_scale_tensors,
+                'w2_weight_scale':
+                local_shared_w2_scale_tensors,
+                'fc31_alpha':
+                local_shared_fc31_alpha_tensors,
+                'fc2_alpha':
+                local_shared_fc2_alpha_tensors,
+            })
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = FusedMoEQuantScalesNVFP4(

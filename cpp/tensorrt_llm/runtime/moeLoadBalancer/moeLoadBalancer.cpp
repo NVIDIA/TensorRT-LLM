@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/moeLoadBalancer.h"
+#include "moeLoadBalancer.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.h"
+#include "topologyDetector.h"
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -33,7 +34,6 @@
 
 namespace tensorrt_llm::runtime
 {
-
 // Helper structure to hold replica information
 struct ReplicaInfo
 {
@@ -271,6 +271,7 @@ void allocateStatisticInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& 
     tensorrt_llm::kernels::MoeLoadBalanceStatisticInfo* statisticInfo)
 {
     TLLM_CUDA_CHECK(cudaMallocHost(&statisticInfo->expertLoadFactor, sizeof(float) * metaInfo.expertCount));
+    std::fill_n(statisticInfo->expertLoadFactor, metaInfo.expertCount, 0.0f);
     TLLM_CHECK_WITH_INFO(statisticInfo->rawDataWindowSize > 0, "statisticInfo->rawDataWindowSize should > 0.");
     TLLM_CUDA_CHECK(cudaMalloc(
         &statisticInfo->expertTokenCount, sizeof(int) * metaInfo.expertCount * statisticInfo->rawDataWindowSize));
@@ -288,9 +289,9 @@ void freeStatisticInfo(tensorrt_llm::kernels::MoeLoadBalanceStatisticInfo* stati
 }
 
 void allocatePlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& metaInfo,
-    tensorrt_llm::kernels::MoePlacementInfo* placementInfo, bool isCpu = false)
+    tensorrt_llm::kernels::MoePlacementInfo* placementInfo, bool isCpu = false, bool useManaged = false)
 {
-    auto allocFn = [isCpu](void** ptr, size_t size)
+    auto allocFn = [isCpu, useManaged](void** ptr, size_t size)
     {
         if (isCpu)
         {
@@ -298,7 +299,21 @@ void allocatePlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& 
         }
         else
         {
-            return cudaMalloc(ptr, size);
+            if (useManaged)
+            {
+                TLLM_CUDA_CHECK(cudaMallocManaged(ptr, size));
+                int cur_dev;
+                TLLM_CUDA_CHECK(cudaGetDevice(&cur_dev));
+                TLLM_CUDA_CHECK(cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, cur_dev));
+                TLLM_CUDA_CHECK(cudaMemAdvise(*ptr, size, cudaMemAdviseSetAccessedBy, cur_dev));
+                TLLM_CUDA_CHECK(cudaMemAdvise(*ptr, size, cudaMemAdviseSetAccessedBy, cudaCpuDeviceId));
+                TLLM_CUDA_CHECK(cudaMemset(*ptr, 0, size));
+                return cudaSuccess;
+            }
+            else
+            {
+                return cudaMalloc(ptr, size);
+            }
         }
     };
     TLLM_CUDA_CHECK(
@@ -405,7 +420,7 @@ void SingleLayerMoeLoadBalancer::createResources()
     }
 
     allocatePlacementInfo(mMetaInfo, &mCpuPlacementInfo.placementInfoForGPU, true);
-    allocatePlacementInfo(mMetaInfo, &mGpuPlacement, false);
+    allocatePlacementInfo(mMetaInfo, &mGpuPlacement, false, true);
 
     mSingleLayerSignal = allocateSingleLayerSignal();
     TLLM_CUDA_CHECK(cudaEventCreate(&mUpdateWeightsDoneEvent));
@@ -451,7 +466,18 @@ void SingleLayerMoeLoadBalancer::maybeStartUpdateWeights()
 {
     if (mIterId >= 0 && mUpdateWeightsEnabled)
     {
-        mMoeLoadBalancer->addUpdateTask([this] { updateWeightsRoutine(); });
+        mMoeLoadBalancer->addUpdateTask(
+            [this]
+            {
+                if (mMoeLoadBalancer->mUseGpuMemcpy)
+                {
+                    updateWeightsRoutine();
+                }
+                else
+                {
+                    updateWeightsRoutineByCpu();
+                }
+            });
     }
 }
 
@@ -461,6 +487,7 @@ void SingleLayerMoeLoadBalancer::waitLastUpdateDone()
     {
         std::unique_lock<std::mutex> lock(mUpdateWeightsMutex);
         mUpdateWeightsCondition.wait(lock, [this] { return mUpdateWeightsDone; });
+        lock.unlock();
     }
 }
 
@@ -485,6 +512,25 @@ void SingleLayerMoeLoadBalancer::copyPlacementInfoToGpu()
     {
         std::fill_n(mCpuPlacementInfo.rankExpertIds[i].begin(), mMetaInfo.slotCountPerRank, -1);
     }
+    // clear expert load factor for next statistic
+    std::fill_n(mStatisticInfo.expertLoadFactor, mMetaInfo.expertCount, 0.0f);
+}
+
+void SingleLayerMoeLoadBalancer::copyPlacementInfoToGpuByCpu()
+{
+    memcpy(mGpuPlacement.expertReplicaCount, mCpuPlacementInfo.placementInfoForGPU.expertReplicaCount,
+        sizeof(int) * mMetaInfo.expertCount);
+    memcpy(mGpuPlacement.expertReplicaStartOffset, mCpuPlacementInfo.placementInfoForGPU.expertReplicaStartOffset,
+        sizeof(int) * mMetaInfo.expertCount);
+    memcpy(mGpuPlacement.globalSlotIds, mCpuPlacementInfo.placementInfoForGPU.globalSlotIds,
+        sizeof(int) * mMetaInfo.epSize * mMetaInfo.slotCountPerRank);
+    mCpuPlacementInfo.rankExpertIds.swap(mCpuPlacementInfo.oldRankExpertIds);
+    for (int i = 0; i < mMetaInfo.epSize; ++i)
+    {
+        std::fill_n(mCpuPlacementInfo.rankExpertIds[i].begin(), mMetaInfo.slotCountPerRank, -1);
+    }
+    // clear expert load factor for next statistic
+    std::fill_n(mStatisticInfo.expertLoadFactor, mMetaInfo.expertCount, 0.0f);
 }
 
 void SingleLayerMoeLoadBalancer::updateWeightsRoutine()
@@ -496,6 +542,21 @@ void SingleLayerMoeLoadBalancer::updateWeightsRoutine()
     copyPlacementInfoToGpu();
     TLLM_CUDA_CHECK(cudaEventRecord(mUpdateWeightsDoneEvent, mMoeLoadBalancer->mStream));
     TLLM_CUDA_CHECK(cudaEventSynchronize(mUpdateWeightsDoneEvent));
+    std::unique_lock<std::mutex> lock(mUpdateWeightsMutex);
+    mUpdateWeightsDone = true;
+    mUpdateWeightsCondition.notify_one();
+}
+
+void SingleLayerMoeLoadBalancer::updateWeightsRoutineByCpu()
+{
+    doReplication(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo);
+    doPlacement(mMetaInfo, mStatisticInfo.expertLoadFactor, &mCpuPlacementInfo);
+    prepareGpuPlacementInfo(mMetaInfo, &mCpuPlacementInfo);
+    mLastUpdateTaskId = mMoeLoadBalancer->addCopyTask(
+        [this](int rank, int size) { mWeightUpdater->updateWeights(&mCpuPlacementInfo, rank, size); });
+    mMoeLoadBalancer->waitCopyTaskDone(mLastUpdateTaskId);
+    mLastUpdateTaskId = -1;
+    copyPlacementInfoToGpuByCpu();
     std::unique_lock<std::mutex> lock(mUpdateWeightsMutex);
     mUpdateWeightsDone = true;
     mUpdateWeightsCondition.notify_one();
@@ -646,8 +707,61 @@ void HostMemoryMoeWeightUpdater::copyWeights(MoeWeight const& src, MoeWeight con
     }
 }
 
-void HostMemoryMoeWeightUpdater::updateWeights(tensorrt_llm::runtime::MoePlacementCpuInfo const* placementCpuInfo)
+void HostMemoryMoeWeightUpdater::copyWeightsCpu(MoeWeight const& src, MoeWeight const& dst, int rank, int size)
 {
+    TLLM_CHECK(src.mWeightPtr != nullptr && dst.mWeightPtr != nullptr);
+    TLLM_CHECK(src.mHeight == dst.mHeight && src.mWidth == dst.mWidth);
+    char* srcPtr = static_cast<char*>(src.mWeightPtr);
+    char* dstPtr = static_cast<char*>(dst.mWeightPtr);
+    size_t singleCopySize, copyCount, srcPitch, dstPitch;
+    if (src.mPitch == src.mWidth && dst.mPitch == dst.mWidth)
+    {
+        singleCopySize = src.mWidth * src.mHeight;
+        copyCount = 1;
+        srcPitch = singleCopySize;
+        dstPitch = singleCopySize;
+    }
+    else
+    {
+        singleCopySize = src.mWidth;
+        copyCount = src.mHeight;
+        srcPitch = src.mPitch;
+        dstPitch = dst.mPitch;
+    }
+    size_t fullCopyCount = copyCount / size * size;
+    size_t threadCopyCount = fullCopyCount / size;
+    for (size_t i = rank * threadCopyCount; i < (rank + 1) * threadCopyCount; i++)
+    {
+        memcpy(dstPtr + i * dstPitch, srcPtr + i * srcPitch, singleCopySize);
+    }
+    size_t threadStartOffset = rank * singleCopySize / size;
+    size_t threadEndOffset = (rank + 1) * singleCopySize / size;
+    size_t threadCopySize = threadEndOffset - threadStartOffset;
+    for (size_t i = fullCopyCount; i < copyCount && threadCopySize > 0; i++)
+    {
+        memcpy(dstPtr + i * dstPitch + threadStartOffset, srcPtr + i * srcPitch + threadStartOffset, threadCopySize);
+    }
+}
+
+void PrintUpdateInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo,
+    tensorrt_llm::runtime::MoePlacementCpuInfo const* placementCpuInfo)
+{
+    std::stringstream ss;
+    ss << "[UpdateInfo] rank=" << metaInfo.epRank << ", expert weights=\n    [";
+    for (int slotId = 0; slotId < metaInfo.slotCountPerRank * metaInfo.epSize; slotId++)
+    {
+        ss << placementCpuInfo->rankExpertIds[slotId / metaInfo.slotCountPerRank][slotId % metaInfo.slotCountPerRank]
+           << ", ";
+    }
+    ss << "\n";
+    fprintf(stderr, "%s\n", ss.str().c_str());
+}
+
+void HostMemoryMoeWeightUpdater::updateWeights(
+    tensorrt_llm::runtime::MoePlacementCpuInfo const* placementCpuInfo, int rank, int size)
+{
+    // PrintUpdateInfo(mMetaInfo, placementCpuInfo);
+    bool useGpu = mLayerLoadBalancer->mMoeLoadBalancer->mUseGpuMemcpy;
     for (int slotId = 0; slotId < mMetaInfo.slotCountPerRank; ++slotId)
     {
         int oldExpertId = placementCpuInfo->oldRankExpertIds[mMetaInfo.epRank][slotId];
@@ -665,7 +779,14 @@ void HostMemoryMoeWeightUpdater::updateWeights(tensorrt_llm::runtime::MoePlaceme
             auto& name = slotIt->first;
             auto& slotWeight = slotIt->second[slotId];
             auto& hostWeight = mHostWeights[name][newExpertId];
-            copyWeights(hostWeight, slotWeight, mLayerLoadBalancer->getStream());
+            if (useGpu)
+            {
+                copyWeights(hostWeight, slotWeight, mLayerLoadBalancer->getStream());
+            }
+            else
+            {
+                copyWeightsCpu(hostWeight, slotWeight, rank, size);
+            }
         }
     }
 }
@@ -680,8 +801,40 @@ MoeLoadBalancer::MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter
     , mLayerUpdatesPerIter{layerUpdatesPerIter}
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mCudaDeviceId));
-    // create a non-blocking stream for compute and update
+    // create a non-blocking stream for compute and update, not needed anymore for CPU copy engine.
     TLLM_CUDA_CHECK(cudaStreamCreateWithFlags(&mStream, cudaStreamNonBlocking));
+
+    auto& topologyDetector = TopologyDetector::getInstance();
+    int currentGpuNumaId = topologyDetector.getCurrentGpuNumaId();
+    int numaCpuCount = topologyDetector.getCurrentGpuNumaCpuCount();
+    int numaGpuCount = topologyDetector.getGpuCountUnderNuma(currentGpuNumaId);
+    TLLM_CHECK_WITH_INFO(
+        numaCpuCount > 0 && numaGpuCount > 0, "numaCpuCount=%d, numaGpuCount=%d", numaCpuCount, numaGpuCount);
+    int cpuCountPerGpu = std::max(1, numaCpuCount / numaGpuCount);
+    std::string cpuArch = topologyDetector.getCpuArchitecture();
+
+    int numCopyThreads = 8;
+    if (getenv("TLLM_LOAD_BALANCE_NUM_COPY_THREADS"))
+    {
+        int numCopyThreadsFromEnv = atoi(getenv("TLLM_LOAD_BALANCE_NUM_COPY_THREADS"));
+        if (numCopyThreadsFromEnv > 0)
+        {
+            TLLM_LOG_INFO(
+                "Setting TLLM_LOAD_BALANCE_NUM_COPY_THREADS to %d by environment variable", numCopyThreadsFromEnv);
+            numCopyThreads = numCopyThreadsFromEnv;
+        }
+    }
+    else
+    {
+        if (cpuCountPerGpu > 0)
+        {
+            numCopyThreads = std::min(16, std::max(4, cpuCountPerGpu / 2));
+            TLLM_LOG_INFO("Auto-setting copy threads to %d based on NUMA topology (NUMA node %d, %d CPUs, arch: %s)",
+                numCopyThreads, currentGpuNumaId, numaCpuCount, cpuArch.c_str());
+        }
+    }
+
+    mMultiThreadWorker.reset(new MultiThreadWorker(numCopyThreads));
 }
 
 MoeLoadBalancer::~MoeLoadBalancer() {}
@@ -730,6 +883,7 @@ void MoeLoadBalancer::finalizeModel()
     }
     if (mLayerUpdatesPerIter > 0)
     {
+        mMultiThreadWorker->start();
         generateUpdatePlan();
         startThreads();
     }
@@ -783,6 +937,7 @@ void MoeLoadBalancer::shutdown()
 
         mWorkerThread->join();
         TLLM_LOG_INFO("MoeLoadBalancer shutdown.");
+        mMultiThreadWorker->stop();
     }
 }
 
@@ -831,7 +986,6 @@ void MoeLoadBalancer::workerThread()
     }
     addUpdateTask(nullptr);
     mComputeAndUpdateThread->join();
-    TLLM_LOG_INFO("MoeLoadBalancer worker thread stopped");
 }
 
 void MoeLoadBalancer::computeAndUpdateThread()
@@ -850,7 +1004,6 @@ void MoeLoadBalancer::computeAndUpdateThread()
         }
         task();
     }
-    TLLM_LOG_INFO("MoeLoadBalancer compute and update thread stopped");
 }
 
 void MoeLoadBalancer::addUpdateTask(std::function<void()> task)
@@ -858,6 +1011,129 @@ void MoeLoadBalancer::addUpdateTask(std::function<void()> task)
     std::unique_lock<std::mutex> lock(mUpdateQueueMutex);
     mUpdateTaskQueue.push(task);
     mUpdateQueueCondition.notify_one();
+}
+
+int64_t MoeLoadBalancer::addCopyTask(std::function<void(int, int)> task)
+{
+    return mMultiThreadWorker->addTask(task);
+}
+
+void MoeLoadBalancer::waitCopyTaskDone(int64_t taskId)
+{
+    if (!mUseGpuMemcpy)
+    {
+        mMultiThreadWorker->waitTaskDone(taskId);
+    }
+}
+
+MultiThreadWorker::MultiThreadWorker(int numThreads)
+    : mNumThreads(numThreads)
+    , mRunning(false)
+    , mNextTaskId(0)
+{
+}
+
+MultiThreadWorker::~MultiThreadWorker()
+{
+    stop();
+}
+
+void MultiThreadWorker::start()
+{
+    std::lock_guard<std::mutex> lk(mMutex);
+    if (mRunning)
+        return;
+    mRunning = true;
+    mThreads.reserve(mNumThreads);
+    for (int i = 0; i < mNumThreads; ++i)
+    {
+        mThreads.emplace_back(&MultiThreadWorker::workerLoop, this, i);
+    }
+}
+
+int64_t MultiThreadWorker::addTask(std::function<void(int, int)> func)
+{
+    auto task = std::make_shared<Task>();
+    {
+        std::lock_guard<std::mutex> lk(mMutex);
+        task->id = mNextTaskId++;
+        task->func = std::move(func);
+        task->remaining = mNumThreads;
+        mTasks.push_back(task);
+        mTaskMap[task->id] = task;
+    }
+    mCondition.notify_all();
+    return task->id;
+}
+
+void MultiThreadWorker::waitTaskDone(int64_t taskId)
+{
+    std::unique_lock<std::mutex> lk(mMutex);
+    auto it = mTaskMap.find(taskId);
+    if (it == mTaskMap.end())
+    {
+        TLLM_CHECK_WITH_INFO(mDoneTaskMap.count(taskId) > 0, "Task %ld not found", taskId);
+        mDoneTaskMap.erase(taskId);
+        return;
+    }
+    auto task = it->second;
+    task->cv.wait(lk, [task] { return task->remaining == 0; });
+    TLLM_CHECK_WITH_INFO(mDoneTaskMap.count(taskId) > 0, "Task %ld not found", taskId);
+    mDoneTaskMap.erase(taskId);
+}
+
+void MultiThreadWorker::stop()
+{
+    {
+        std::lock_guard<std::mutex> lk(mMutex);
+        if (!mRunning)
+            return;
+        mRunning = false;
+    }
+    mCondition.notify_all();
+    for (auto& t : mThreads)
+    {
+        if (t.joinable())
+            t.join();
+    }
+    mThreads.clear();
+}
+
+void MultiThreadWorker::workerLoop(int rank)
+{
+    auto& topologyDetector = TopologyDetector::getInstance();
+    topologyDetector.bindThreadByCurrentGpu(); // use relaxed mode
+    while (true)
+    {
+        std::shared_ptr<Task> task;
+        {
+            std::unique_lock<std::mutex> lk(mMutex);
+
+            mCondition.wait(lk, [this] { return !mRunning || !mTasks.empty(); });
+
+            if (!mRunning && mTasks.empty())
+                return;
+
+            task = mTasks.front();
+        }
+
+        task->func(rank, mNumThreads);
+
+        {
+            std::unique_lock<std::mutex> lk(mMutex);
+            if (--task->remaining == 0)
+            {
+                mTasks.pop_front();
+                mTaskMap.erase(task->id);
+                mDoneTaskMap[task->id] = task;
+                task->cv.notify_all();
+            }
+            else
+            {
+                task->cv.wait(lk, [task] { return task->remaining == 0; });
+            }
+        }
+    }
 }
 
 } // namespace tensorrt_llm::runtime
