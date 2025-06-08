@@ -89,7 +89,7 @@ Firstly let’s have an overview of the overall imbalance issues across layers:
 
 In Figure 1, it can be seen clearly that for the MoE in layer 36, many more tokens are sent from **rank 0** to **rank 13\.**
 
-If we zoom on the MoE in the layer 36 and record its activated expert rank distribution, there clearly is a rank that is more heavily activated: 
+If we zoom on the MoE in the layer 36 and record its activated expert rank distribution, there clearly is a rank that is more heavily activated:
 
 <div align="center">
 <figure>
