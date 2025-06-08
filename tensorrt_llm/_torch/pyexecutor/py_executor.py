@@ -1422,8 +1422,8 @@ class PyExecutor:
                                      self.dist.cp_config['cp_anchor_size'])
 
             req = executor_request_to_llm_request(
-                req_id, exe_req, ctx_blocks_list,
-                self._should_exclude_last_generation_logits())
+                req_id, exe_req, self._should_exclude_last_generation_logits(),
+                ctx_blocks_list)
             req.gen_iters = 0
             req.ctx_iters = 0
             req.ctx_blocks = ctx_blocks
