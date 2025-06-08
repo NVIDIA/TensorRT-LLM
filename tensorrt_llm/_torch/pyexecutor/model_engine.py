@@ -1229,7 +1229,15 @@ class PyTorchModelEngine(ModelEngine):
                 num_draft_tokens = len(request.py_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
                 draft_lens.append(num_draft_tokens)
-                prompt_lengths.append(request.py_prompt_len)
+
+                if self.is_spec_decode and self.spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend):
+                    # We're treating the prompt lengths as context requests here, so
+                    # the the prompt lens should not include the cached tokens.
+                    prompt_lengths.append(1 + num_draft_tokens)
+                else:
+                    prompt_lengths.append(request.py_prompt_len)
+
                 sequence_lengths.append(1 + num_draft_tokens)
                 gather_ids.extend(
                     list(

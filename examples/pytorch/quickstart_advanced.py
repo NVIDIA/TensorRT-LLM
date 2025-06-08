@@ -110,6 +110,7 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_nextn', type=int, default=1)
     parser.add_argument('--eagle_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
+    parser.add_argument('--use_one_model', default=False, action='store_true')
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
@@ -139,6 +140,11 @@ def setup_llm(args):
     ) if args.spec_decode_algo is not None else None
 
     if spec_decode_algo == 'MTP':
+        if not args.use_one_model:
+            print(
+                "MTP only supports one model style spec decode; ignoring default use_one_model=False"
+            )
+
         spec_config = MTPDecodingConfig(
             num_nextn_predict_layers=args.spec_decode_nextn,
             use_relaxed_acceptance_for_thinking=args.
@@ -148,7 +154,8 @@ def setup_llm(args):
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_nextn,
-            pytorch_eagle_weights_path=args.eagle_model_dir)
+            pytorch_eagle_weights_path=args.eagle_model_dir,
+            eagle3_one_model=args.use_one_model)
     elif spec_decode_algo == "NGRAM":
         spec_config = NGramDecodingConfig(
             prompt_lookup_num_tokens=args.spec_decode_nextn,
