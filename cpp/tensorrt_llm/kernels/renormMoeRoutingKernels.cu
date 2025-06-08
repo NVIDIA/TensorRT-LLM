@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
-#include "cutlass/numeric_types.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/renormMoeRoutingKernels.h"
+#include <climits> // For INT_MAX
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cub/cub.cuh>
+#include <cuda/std/limits> // For numeric_limits
 #include <math.h>
 
 namespace cg = cooperative_groups;
@@ -34,61 +36,54 @@ static constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;
 
 namespace reduce_topk
 {
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
+#define TLLM_GEN_ENABLE_FAST_REDUX
+#endif
+
 template <typename T_>
 struct TopKRedType
 {
     using T = T_;
-    static_assert(std::is_same_v<T, float> || std::is_same_v<T, cutlass::bfloat16_t>,
-        "Top K reduction only implemented for float and Bf16");
-    using TypeCmp = std::conditional_t<sizeof(T) >= 4, double, float>;
-    static constexpr int64_t Mask64 = 0x000000000000FFFF;
-    static constexpr int32_t Mask32 = 0x0000FFFF;
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>,
+        "Top K reduction only implemented for float, float16 and bfloat16");
 
-    TypeCmp compVal;
+    using TypeCmp = std::conditional_t<sizeof(T) == 4, uint64_t, uint32_t>;
+    using IdxT = std::conditional_t<sizeof(T) == 4, int32_t, int16_t>;
+    static constexpr int moveBits = (sizeof(T) == 4) ? 32 : 16;
+
+    TypeCmp compValIdx;
 
     static __host__ __device__ inline TypeCmp makeCmpVal(T val, int32_t idx = 0)
     {
-        auto cmpVal = TypeCmp{val};
-        TypeCmp cmpValWithIdx;
-        if constexpr (sizeof(T) >= 4)
-        {
-            auto cmpValIdx64 = reinterpret_cast<int64_t&>(cmpVal) | (Mask64& int64_t{idx});
-            cmpValWithIdx = reinterpret_cast<TypeCmp&>(cmpValIdx64);
-        }
-        else
-        {
-            auto cmpValIdx32 = reinterpret_cast<int32_t&>(cmpVal) | (Mask32 & idx);
-            cmpValWithIdx = reinterpret_cast<TypeCmp&>(cmpValIdx32);
-        }
-        return cmpValWithIdx;
+        auto valueBits = cub::Traits<T>::TwiddleIn(reinterpret_cast<typename cub::Traits<T>::UnsignedBits&>(val));
+        TypeCmp compactTmp = reinterpret_cast<TypeCmp&>(valueBits);
+        compactTmp = (compactTmp << moveBits) | idx;
+        // Since idx is always smaller than 65536 and positive, we can directly use it as the lower 16 bits
+        return compactTmp;
     }
 
-    static __host__ __device__ inline void unpack(T& val, int32_t& idx, TypeCmp cmp)
+    static __host__ __device__ void unpack(T& value, int32_t& index, TypeCmp cmp)
     {
-        if constexpr (sizeof(T) >= 4)
-        {
-            idx = static_cast<int32_t>(reinterpret_cast<int64_t&>(cmp) & Mask64);
-            auto val64 = reinterpret_cast<int64_t&>(cmp) & ~Mask64;
-            val = static_cast<float>(reinterpret_cast<double&>(val64));
-        }
-        else
-        {
-            idx = reinterpret_cast<int32_t&>(cmp) & Mask32;
-            auto val32 = reinterpret_cast<int32_t&>(cmp) >> 16;
-            val = T::bitcast(reinterpret_cast<uint16_t&>(val32));
-        }
+        // Since idx is always smaller than 65536 and positive, we can directly use it as the lower 16 bits
+        index = static_cast<int32_t>(cmp & 0xFFFF);
+
+        auto compactTmp = cmp >> moveBits;
+        auto valueBits
+            = cub::Traits<T>::TwiddleOut(reinterpret_cast<typename cub::Traits<T>::UnsignedBits&>(compactTmp));
+        value = reinterpret_cast<T&>(valueBits);
     }
 
     __host__ __device__ TopKRedType() = default;
 
     __host__ __device__ TopKRedType(T val, int32_t idx)
-        : compVal(makeCmpVal(val, idx))
+        : compValIdx(makeCmpVal(val, idx))
     {
     }
 
     __host__ __device__ operator TypeCmp() const noexcept
     {
-        return compVal;
+        return compValIdx;
     }
 
     __device__ inline TypeCmp reduce(cg::thread_block_tile<WARP_SIZE> const& warp)
@@ -98,14 +93,14 @@ struct TopKRedType
 #else
         static constexpr bool UseCg = true;
 #endif
-        if constexpr (UseCg || sizeof(T) >= 4)
+        if constexpr (UseCg || sizeof(TypeCmp) == 8)
         {
-            return cg::reduce(warp, compVal, cg::greater<TypeCmp>{});
+            return cg::reduce(warp, compValIdx, cg::greater<TypeCmp>{});
         }
         else
         {
-            float result;
-            asm("redux.sync.max.f32 %0, %1, 0xffffffff;\n" : "=f"(result) : "f"(compVal));
+            TypeCmp result;
+            asm("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(result) : "r"(compValIdx));
             return result;
         }
     }
@@ -128,34 +123,55 @@ struct TopKIdx<K_, true>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int K, typename Type>
-__device__ void reduceTopK(cg::thread_block_tile<WARP_SIZE> const& warp, Type (&out)[K], int32_t (&outIdx)[K],
-    Type value, int32_t idx, Type minValue)
+#define TOPK_SWAP(I, J)                                                                                                \
+    {                                                                                                                  \
+        auto pairMin = min(topK[I].compValIdx, topK[J].compValIdx);                                                    \
+        auto pairMax = max(topK[I].compValIdx, topK[J].compValIdx);                                                    \
+        topK[I].compValIdx = pairMax;                                                                                  \
+        topK[J].compValIdx = pairMin;                                                                                  \
+    }
+
+template <int N, typename RedType>
+struct Sort;
+
+template <typename RedType>
+struct Sort<1, RedType>
 {
-    static_assert(K > 0, "Top K must have K > 0");
-    static_assert(K < WARP_SIZE, "Top K must have K < WARP_SIZE");
-    using RedType = TopKRedType<Type>;
-    RedType topK{value, idx};
-    typename RedType::TypeCmp packedMax{};
-#pragma unroll
-    for (int kk = 0; kk < K; ++kk)
+    static __device__ void run(RedType* topK) {}
+};
+
+template <typename RedType>
+struct Sort<2, RedType>
+{
+    static __device__ void run(RedType* topK)
     {
-        topK = kk > 0 && packedMax == topK.compVal ? RedType{minValue, idx} : topK;
-        // get the next largest value
-        packedMax = topK.reduce(warp);
-        RedType::unpack(out[kk], outIdx[kk], packedMax);
+        TOPK_SWAP(0, 1);
     }
 };
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#define TOPK_SWAP(I, J)                                                                                                \
-    {                                                                                                                  \
-        auto pairMin = min(topK[I].compVal, topK[J].compVal);                                                          \
-        auto pairMax = max(topK[I].compVal, topK[J].compVal);                                                          \
-        topK[I].compVal = pairMax;                                                                                     \
-        topK[J].compVal = pairMin;                                                                                     \
+template <typename RedType>
+struct Sort<3, RedType>
+{
+    static __device__ void run(RedType* topK)
+    {
+        TOPK_SWAP(0, 1);
+        TOPK_SWAP(1, 2);
+        TOPK_SWAP(0, 1);
     }
+};
+
+template <typename RedType>
+struct Sort<4, RedType>
+{
+    static __device__ void run(RedType* topK)
+    {
+        TOPK_SWAP(0, 2);
+        TOPK_SWAP(1, 3);
+        TOPK_SWAP(0, 1);
+        TOPK_SWAP(2, 3);
+        TOPK_SWAP(1, 2);
+    }
+};
 
 template <int K, typename Type, int N, bool IsSorted = false>
 __device__ void reduceTopK(cg::thread_block_tile<WARP_SIZE> const& warp, Type (&out)[K], int32_t (&outIdx)[K],
@@ -163,8 +179,8 @@ __device__ void reduceTopK(cg::thread_block_tile<WARP_SIZE> const& warp, Type (&
 {
     static_assert(K > 0, "Top K must have K > 0");
     static_assert(K < WARP_SIZE, "Top K must have K < WARP_SIZE");
-    static_assert(N > 0, "Top K must have N > 1");
-    // static_assert(N <= K, "Top K must have N < K");
+    static_assert(N > 0, "Top K must have N > 0");
+    static_assert(N < 5, "Only support candidates number less than or equal to 128");
     using RedType = TopKRedType<Type>;
     RedType topK[N];
 #pragma unroll
@@ -175,19 +191,13 @@ __device__ void reduceTopK(cg::thread_block_tile<WARP_SIZE> const& warp, Type (&
 
     if constexpr (!IsSorted)
     {
-        TOPK_SWAP(0, 2);
-        TOPK_SWAP(1, 3);
-
-        TOPK_SWAP(0, 1);
-        TOPK_SWAP(2, 3);
-
-        TOPK_SWAP(1, 2);
+        Sort<N, RedType>::run(topK);
     }
     typename RedType::TypeCmp packedMax{};
 #pragma unroll
     for (int kk = 0; kk < K; ++kk)
     {
-        bool update = kk > 0 && packedMax == topK[0].compVal;
+        bool update = kk > 0 && packedMax == topK[0].compValIdx;
 #pragma unroll
         for (int nn = 0; nn < N; ++nn)
         {
@@ -283,6 +293,37 @@ __global__ void renormMoeRoutingKernel(InputT* routerLogits, OutputT* topkValues
     } // end for tokenId
 }
 
+int nextPowerOfTwo(int num)
+{
+    if (num <= 0)
+    {
+        return 1; // Handle invalid input
+    }
+    int power = 1;
+    while (power < num)
+    {
+        // Check for overflow before shifting
+        if (power > INT_MAX / 2)
+        {
+            return power;
+        }
+        power <<= 1;
+    }
+    return power;
+}
+
+#define CASE(MAX_NUM_EXPERTS)                                                                                          \
+    case MAX_NUM_EXPERTS:                                                                                              \
+        switch (maxNumTopExperts)                                                                                      \
+        {                                                                                                              \
+        case 1: kernelInstance = &renormMoeRoutingKernel<InputT, OutputT, IdxT, MAX_NUM_EXPERTS, 1>; break;            \
+        case 2: kernelInstance = &renormMoeRoutingKernel<InputT, OutputT, IdxT, MAX_NUM_EXPERTS, 2>; break;            \
+        case 4: kernelInstance = &renormMoeRoutingKernel<InputT, OutputT, IdxT, MAX_NUM_EXPERTS, 4>; break;            \
+        case 8: kernelInstance = &renormMoeRoutingKernel<InputT, OutputT, IdxT, MAX_NUM_EXPERTS, 8>; break;            \
+        default: kernelInstance = nullptr; break;                                                                      \
+        }                                                                                                              \
+        break;
+
 template <typename InputT, typename OutputT, typename IdxT>
 void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
     int64_t const numExperts, int64_t const topK, cudaStream_t const stream)
@@ -291,18 +332,25 @@ void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* top
     const uint32_t maxNumBlocks = 1024;
     const uint32_t numBlocks = std::min(static_cast<uint32_t>((numTokens - 1) / WARPS_PER_BLOCK + 1), maxNumBlocks);
 
-    constexpr uint32_t maxNumExperts = 128;
-    constexpr uint32_t maxNumTopExperts = 8;
-    auto* kernelInstance = &renormMoeRoutingKernel<InputT, OutputT, IdxT, maxNumExperts, maxNumTopExperts>;
+    uint32_t maxNumExperts = nextPowerOfTwo(numExperts) < 32 ? 32 : nextPowerOfTwo(numExperts);
+    uint32_t maxNumTopExperts = nextPowerOfTwo(topK);
 
-    if (topK <= 4)
+    auto* kernelInstance = &renormMoeRoutingKernel<InputT, OutputT, IdxT, 128, 8>;
+
+    switch (maxNumExperts)
     {
-        kernelInstance = &renormMoeRoutingKernel<InputT, OutputT, IdxT, maxNumExperts, 4>;
+        CASE(32)
+        CASE(64)
+        CASE(96)
+        CASE(128)
+    default: kernelInstance = nullptr; break;
     }
-    else if (topK <= 2)
+
+    if (kernelInstance == nullptr)
     {
-        kernelInstance = &renormMoeRoutingKernel<InputT, OutputT, IdxT, maxNumExperts, 2>;
+        TLLM_CHECK_WITH_INFO(kernelInstance != nullptr, "Can not find corresponding kernel instance.");
     }
+
     dim3 renormMoeRoutingGridDim(numBlocks);
     dim3 renormMoeRoutingBlockDim(BLOCK_SIZE);
     cudaLaunchConfig_t config;
@@ -326,8 +374,9 @@ void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* top
         cudaStream_t const stream);
 
 INSTANTIATE_RENORM_MOE_ROUTING(float, float, int32_t);
+INSTANTIATE_RENORM_MOE_ROUTING(half, float, int32_t);
 #ifdef ENABLE_BF16
-INSTANTIATE_RENORM_MOE_ROUTING(cutlass::bfloat16_t, float, int32_t);
+INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, float, int32_t);
 #endif
 
 } // namespace tensorrt_llm::kernels

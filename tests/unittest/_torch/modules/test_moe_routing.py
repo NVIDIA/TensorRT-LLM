@@ -78,10 +78,12 @@ def gen_unique_logits(num_tokens, num_experts, dtype):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 30, 2000])
-@pytest.mark.parametrize("top_k", [1, 4, 8])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_customized_renormalize_moe_routing(num_tokens, top_k, dtype):
-    num_experts = 128
+@pytest.mark.parametrize("top_k", [2, 8])
+@pytest.mark.parametrize("dtype",
+                         [torch.bfloat16, torch.float32, torch.float16])
+@pytest.mark.parametrize("num_experts", [8, 67, 128])
+def test_customized_renormalize_moe_routing(num_tokens, top_k, num_experts,
+                                            dtype):
 
     #Because the order of equal elements is unpredictable, we use unique data to prevent any ambiguity.
     router_logits = gen_unique_logits(num_tokens, num_experts, dtype)

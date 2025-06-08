@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "cutlass/numeric_types.h"
+
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/renormMoeRoutingKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
@@ -50,14 +50,20 @@ std::tuple<at::Tensor, at::Tensor> renorm_moe_routing_op(th::Tensor const& route
         break;
     case torch::kBFloat16:
         // Handle BFloat16
-        tk::invokeRenormMoeRouting<cutlass::bfloat16_t, float, int32_t>(
-            reinterpret_cast<cutlass::bfloat16_t*>(router_logits.mutable_data_ptr()),
+        tk::invokeRenormMoeRouting<__nv_bfloat16, float, int32_t>(
+            reinterpret_cast<__nv_bfloat16*>(router_logits.mutable_data_ptr()),
+            reinterpret_cast<float*>(topk_values.mutable_data_ptr()),
+            reinterpret_cast<int32_t*>(topk_indices.mutable_data_ptr()), num_tokens, num_experts, topk, stream);
+        break;
+    case torch::kHalf:
+        // Handle Half
+        tk::invokeRenormMoeRouting<half, float, int32_t>(reinterpret_cast<half*>(router_logits.mutable_data_ptr()),
             reinterpret_cast<float*>(topk_values.mutable_data_ptr()),
             reinterpret_cast<int32_t*>(topk_indices.mutable_data_ptr()), num_tokens, num_experts, topk, stream);
         break;
     default:
         // Handle other data types
-        throw std::invalid_argument("Invalid dtype, only supports float32 and bfloat16");
+        throw std::invalid_argument("Invalid dtype, only supports float32, float16 and bfloat16");
         break;
     }
     return {topk_indices, topk_values};
