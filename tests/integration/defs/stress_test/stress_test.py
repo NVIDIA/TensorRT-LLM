@@ -502,9 +502,6 @@ def stress_test(config,
             "capacity_scheduler_policy":
             test_server_config.capacity_scheduler_policy
         },
-        "pytorch_backend_config": {
-            "enable_overlap_scheduler": True,
-        },
     }
 
     # Add DeepSeek-V3 specific configuration
@@ -513,14 +510,16 @@ def stress_test(config,
         extra_llm_options["enable_attention_dp"] = True
 
         if config.backend == "pytorch":
-            extra_llm_options["pytorch_backend_config"] = {
-                "use_cuda_graph": True,
-                "cuda_graph_padding_enabled": True,
+            extra_llm_options.update({
+                "use_cuda_graph":
+                True,
+                "cuda_graph_padding_enabled":
+                True,
                 "cuda_graph_batch_sizes":
                 [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
-                "print_iter_log": True,
-                "enable_overlap_scheduler": True
-            }
+                "print_iter_log":
+                True,
+            })
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
                                      delete=False) as temp_file:
@@ -705,8 +704,6 @@ def create_genai_perf_command(model_name,
         model_name,
         "--tokenizer",
         model_path,
-        "--service-kind",
-        "openai",
         "--endpoint-type",
         "completions",
         "--random-seed",
@@ -1054,8 +1051,9 @@ def extract_stress_test_metrics(artifacts_dir="./artifacts",
                                             {}).get("avg", 0)
                 tokThroughput = results.get("output_token_throughput",
                                             {}).get("avg", 0)
-                conCurrency = results.get("input_config",
-                                          {}).get("concurrency", 0)
+                conCurrency = results.get("input_config", {}).get(
+                    "perf_analyzer", {}).get("stimulus",
+                                             {}).get("concurrency", 0)
 
                 # Try to determine model name from directory structure first
                 if first_dir in model_name_map:

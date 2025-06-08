@@ -9,9 +9,10 @@ import torch
 import zmq
 import zmq.asyncio
 
+import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
-from .._utils import mpi_rank
+from .._utils import mpi_rank, nvtx_range_debug
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
@@ -25,14 +26,14 @@ from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
                     create_mpi_comm_session, get_spawn_proxy_process_env,
                     is_llm_response)
-from .worker import ExecutorBindingsWorker, worker_main
+from .worker import GenerationExecutorWorker, worker_main
 
 __all__ = [
-    "ExecutorBindingsProxy",
+    "GenerationExecutorProxy",
 ]
 
 
-class ExecutorBindingsProxy(GenerationExecutor):
+class GenerationExecutorProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
 
     def __init__(
@@ -41,7 +42,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         model_world_size: int = 1,
         mpi_session: Optional[MpiSession] = None,
         *,
-        worker_cls: type = ExecutorBindingsWorker,
+        worker_cls: type = GenerationExecutorWorker,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
     ) -> None:
@@ -112,8 +113,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.request_queue = IpcQueue(is_server=True,
                                       name="proxy_request_queue")
-        self.request_error_queue = IpcQueue(is_server=True,
-                                            name="proxy_request_error_queue")
+        self.worker_init_status_queue = IpcQueue(
+            is_server=True, name="worker_init_status_queue")
         # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
         # Use PULL mode when enable_postprocess_parallel as there are
         # multiple senders from multiple processes.
@@ -132,7 +133,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
             name="proxy_kv_cache_events_queue")
         return WorkerCommIpcAddrs(
             request_queue_addr=self.request_queue.address,
-            request_error_queue_addr=self.request_error_queue.address,
+            worker_init_status_queue_addr=self.worker_init_status_queue.address,
             result_queue_addr=self.result_queue.address,
             stats_queue_addr=self.mp_stats_queue.address,
             kv_cache_events_queue_addr=self.kv_cache_events_queue.address,
@@ -296,16 +297,16 @@ class ExecutorBindingsProxy(GenerationExecutor):
             worker_cls=self.worker_cls,
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
-            ready_signal=ExecutorBindingsProxy.READY_SIGNAL,
-        )
+            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+            BASE_ZMQ_CLASSES=serialization.BASE_ZMQ_CLASSES)
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)
 
         self.workers_started = True
 
         while True:
-            if self.request_error_queue.poll(1):
-                ready_signal = self.request_error_queue.get()
+            if self.worker_init_status_queue.poll(1):
+                ready_signal = self.worker_init_status_queue.get()
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
@@ -314,12 +315,13 @@ class ExecutorBindingsProxy(GenerationExecutor):
                 break
             self._handle_background_error()
 
-        if ready_signal != ExecutorBindingsProxy.READY_SIGNAL:
+        if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
             self.mpi_session.shutdown_abort(reason=ready_signal)
             raise ready_signal
 
     def _abort_all_requests(self):
-        for result in self._results.values():
+        # The results can be finished during this loop, so self._results may be changed.
+        for result in list(self._results.values()):
             result.abort()
 
     def pre_shutdown(self):
@@ -336,7 +338,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         # notify the workers to quit
         if all(not f.done() for f in self.mpi_futures):
-            self.request_queue.put(None)
+            self.request_queue.put_noblock(None)
 
     def shutdown(self):
         if not self.workers_started:
@@ -373,7 +375,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         # close all the sockets
         self.request_queue.close()
-        self.request_error_queue.close()
+        self.worker_init_status_queue.close()
         self.result_queue.close()
         self.mp_stats_queue.close()
         self.kv_cache_events_queue.close()
@@ -404,11 +406,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
             logprob_params=logprob_params)
         self._results[request.id] = result
 
-        self.request_queue.put(request)
-
-        error = self.request_error_queue.get()
-        if isinstance(error, Exception):
-            raise error
+        with nvtx_range_debug("request_queue.put"):
+            self.request_queue.put(request)
 
         self._handle_background_error()
 

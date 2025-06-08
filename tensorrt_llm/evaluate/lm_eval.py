@@ -96,7 +96,7 @@ class LmEvalWrapper(TemplateLM):
 
     def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
         profiler.start("trtllm exec")
-        outputs = []
+        results = []
         for request in tqdm(requests,
                             desc="Submitting requests",
                             disable=disable_tqdm):
@@ -104,12 +104,14 @@ class LmEvalWrapper(TemplateLM):
             sampling_params = self._get_sampling_params(gen_kwargs)
             output = self.llm.generate_async(prompt,
                                              sampling_params=sampling_params)
-            outputs.append(output)
+            results.append(output)
 
-        for output in tqdm(outputs,
+        outputs = []
+        for output in tqdm(results,
                            desc="Fetching responses",
                            disable=disable_tqdm):
-            output.result()
+            outputs.append(output.result())
+
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")

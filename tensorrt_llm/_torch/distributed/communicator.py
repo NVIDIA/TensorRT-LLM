@@ -1,15 +1,15 @@
-import atexit
 import os
 from abc import ABC, abstractmethod
-from typing import Optional, ValuesView
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_broadcast,
-                                 mpi_comm, mpi_isend, mpi_recv, mpi_send,
-                                 torch_dtype_to_np)
+                                 mpi_comm, mpi_isend, mpi_isend_object,
+                                 mpi_recv, mpi_recv_object, mpi_send,
+                                 mpi_send_object)
 from tensorrt_llm.mapping import Mapping
 
 
@@ -122,48 +122,14 @@ class MPIDist(Distributed):
         # in-place recv numpy buffer
         return mpi_recv(buf, src, tag)
 
-    def isend_tensor(self, tensor: torch.Tensor, dest, tag=0):
-        return self.isend(tensor.numpy(), dest, tag)
+    def send_object(self, obj, dest, tag=0):
+        mpi_send_object(obj, dest, tag)
 
-    def recv_tensor(self, tensor: torch.Tensor, src, tag=0):
-        return self.recv(tensor.numpy(), src, tag)
+    def isend_object(self, obj, dest, tag=0):
+        return mpi_isend_object(obj, dest, tag)
 
-    def isend_tensor_list(self,
-                          tensor_list: ValuesView[torch.Tensor],
-                          dest,
-                          tag=0):
-        if len(tensor_list) == 0:
-            return None
-        elif len(tensor_list) == 1:
-            return self.isend_tensor(next(iter(tensor_list)), dest, tag)
-
-        return self.isend(
-            np.concatenate([t.numpy().ravel() for t in tensor_list]), dest, tag)
-
-    def recv_tensor_list(self,
-                         tensor_list: ValuesView[torch.Tensor],
-                         src,
-                         tag=0):
-        if len(tensor_list) == 0:
-            return None
-        elif len(tensor_list) == 1:
-            return self.recv_tensor(next(iter(tensor_list)), src, tag)
-
-        # Use the first tensor's dtype to infer the buffer dtype
-        numpy_dtype = torch_dtype_to_np(next(iter(tensor_list)).dtype)
-        # Prepare buffer to receive tensor_list
-        recv_buffer = np.empty(sum([t.numel() for t in tensor_list]),
-                               dtype=numpy_dtype)
-        # Receive tensors
-        self.recv(recv_buffer, src, tag)
-        # Assign to tensor_list
-        offset = 0
-        for t in tensor_list:
-            t.copy_(
-                torch.from_numpy(recv_buffer[offset:offset +
-                                             t.numel()]).reshape(t.shape))
-            offset += t.numel()
-        return None
+    def recv_object(self, src, tag=0):
+        return mpi_recv_object(src, tag)
 
     def create_tp_comm(self):
         new_group = mpi_comm().group.Incl(self.mapping.tp_group)
@@ -239,43 +205,39 @@ class TorchDist(Distributed):
 
 
 class PPComm:
-    # PP communication using torch.distributed with nccl backend
+
     def __init__(self, global_mapping: Mapping):
         self.mapping = global_mapping
-        self.send_event = torch.cuda.Event()
-        if not dist.is_initialized():
-            master_ip = os.getenv("MASTER_ADDR", "localhost")
-            master_port = os.getenv("MASTER_PORT", "6000")
-            init_method = f"tcp://{master_ip}:{master_port}"
-            dist.init_process_group(backend="nccl",
-                                    init_method=init_method,
-                                    world_size=global_mapping.world_size,
-                                    rank=global_mapping.rank)
-            atexit.register(self._cleanup)
+        self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
+            self.mapping.world_size,
+            self.mapping.rank,
+        )
 
-        # Force NCCL initialization and rank population via PyTorch distributed barrier.
-        # This is necessary for NOW if using pp + tp because our custom nccl allreduce
-        # op for tp groups can interfere with PyTorch's NCCL initialization when PyTorch
-        # distributed performs the first comm. op and kick off nccl init. The barrier here
-        # ensures proper NCCL setup and GPU-procs binding at beginning.
-        dist.barrier(device_ids=[torch.cuda.current_device()])
-
-    def _cleanup(self):
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-    def send(self,
-             tensor: torch.Tensor,
-             dest: Optional[int] = None,
-             tag: Optional[int] = None):
+    def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
         if dest is None:
             dest = self.mapping.next_pp_rank()
-        dist.send(tensor, dest, tag=tag)
+        self.nccl_comm.send(tensor, dest)
 
-    def recv(self,
-             tensor: torch.Tensor,
-             src: Optional[int] = None,
-             tag: Optional[int] = None):
+    def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
             src = self.mapping.prev_pp_rank()
-        dist.recv(tensor, src, tag=tag)
+        self.nccl_comm.recv(tensor, src)
+
+
+_pp_comm = None
+
+
+def init_pp_comm(mapping):
+    """Initialize PPComm once at startup"""
+    global _pp_comm
+    _pp_comm = PPComm(mapping)
+
+
+def pp_recv(tensor):
+    """Receive tensors from previous pp rank."""
+    _pp_comm.recv(tensor)
+
+
+def pp_send(tensor):
+    """Send tensors to next pp rank."""
+    _pp_comm.send(tensor)

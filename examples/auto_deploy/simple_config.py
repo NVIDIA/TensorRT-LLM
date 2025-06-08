@@ -4,9 +4,10 @@ Modify directly if you want to change settings.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 
+# TODO: remove and unify with _AutoDeployLlmArgs
 @dataclass
 class SimpleConfig:
     """Experiment Configuration."""
@@ -18,10 +19,12 @@ class SimpleConfig:
     # 1. Sharded checkpoint (multiple files) in the safetensors format
     # 2. Single, unsharded checkpoint in the safetensors format
     # 3. Single, unsharded checkpoint in the pytorch format (.pt/.pth) file ending.
-    # If no `model` argument is provided, the checkpoint directory is used to infer the model
-    # architecture.
-    model: Optional[str] = None
-    model_factory: str = "hf"  # choose from 'hf' or 'llama4' (only 'hf' supported for "trtllm"!)
+    model: str
+    # same as model. None defaults to model. Only used if customize_tokenizer is True
+    tokenizer: Optional[str] = None
+    model_factory: Literal["AutoModelForCausalLM", "AutoModelForImageTextToText"] = (
+        "AutoModelForCausalLM"
+    )
     skip_loading_weights: bool = False  # only load the architecture, not the weights
     customize_tokenizer: bool = False  # True: tokenizer from the model factory, False: from LLM api
 
@@ -34,12 +37,7 @@ class SimpleConfig:
     # 3. Values in the model_kwargs
     # Note that that if the kwarg does not exist in the model config class, it will be ignored.
     # An example model config class can be found [here](https://github.com/huggingface/transformers/blob/c409cd81777fb27aadc043ed3d8339dbc020fb3b/src/transformers/models/llama/configuration_llama.py#L26).
-    model_kwargs: Dict = field(
-        default_factory=lambda: {
-            "max_position_embeddings": 4096,  # to save on memory
-            "use_cache": False,
-        }
-    )
+    model_kwargs: Dict = field(default_factory=dict)
 
     ### TOKENIZER EXTRA KWARGS #####################################################################
     # Extra kwargs for the tokenizer class to customize the tokenizer. Same as model_kwargs.
@@ -50,13 +48,17 @@ class SimpleConfig:
 
     ### CONFIGURE BACKEND, RUNTIME, AND WORLD SIZE ##################################
     world_size: int = 1  # choose from number of GPUs for TP (0--> no TP, no spawned processes)
-    runtime: str = "demollm"  # chose from "demollm" or "trtllm" (production-grade runtime)
-    compile_backend: str = "torch-opt"  # choose from "torch-simple", "torch-opt"
-    attn_backend: str = "TritonWithFlattenedInputs"  # "TritonWithFlattenedInputs" or "FlashInfer"
-    mla_backend: str = "MultiHeadLatentAttention"  # only option for now
+    runtime: Literal["demollm", "trtllm"] = "trtllm"
+    compile_backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = (
+        "torch-compile"
+    )
+    attn_backend: Literal["TritonWithFlattenedInputs", "FlashInfer"] = "FlashInfer"
+    mla_backend: Literal["MultiHeadLatentAttention"] = "MultiHeadLatentAttention"
     max_seq_len: int = 512  # max sequence length for inference/cache
     max_batch_size: int = 8  # max dimension for statically allocated kv cache
-    page_size: int = 64  # page size for attention
+    attn_page_size: int = 64  # page size for attention
+    simple_shard_only: bool = False  # if True, force simple sharding(all_gather) in TP;
+    # otherwise auto-detect and use column+row (all_reduce) sharding
 
     ### SOME SIMPLE PROMPTING CONFIG ###############################################################
     batch_size: int = 2  # example input shape
@@ -79,23 +81,22 @@ class SimpleConfig:
     visualize: bool = False
 
     ### BENCHMARKING CONFIG ########################################################################
+    free_mem_ratio: float = 0.0  # specifies the fraction of available memory to occupy for cache
     benchmark: bool = False  # If true, set ISO to 2048 random int and OSL to 128
     benchmark_num: int = 10  # By default run 10 times and get average
     benchmark_isl: int = 2048  # input seq length for benchmarking
     benchmark_osl: int = 128  # output seq length for benchmarking
     benchmark_bs: int = 1  # batch size for benchmarking
     benchmark_results_path: Optional[str] = "./benchmark_results.json"
+    benchmark_store_results: bool = False  # if True, store benchmark res in benchmark_results_path
 
     ### POST INITIALIZATION ########################################################################
     def __post_init__(self):
         # check if model was supplied
         assert self.model, "model must be supplied!"
 
-        # we don't want to loose the default values for model_kwargs unless explicitly set by the
-        # user. They are not preserved by the standard initialization process since they whole dict
-        # gets replaced by the user provided one. We don't want that though.
-        f_default = self.__dataclass_fields__["model_kwargs"].default_factory()
-        setattr(self, "model_kwargs", {**f_default, **getattr(self, "model_kwargs")})
+        # NEVER use cache
+        self.model_kwargs["use_cache"] = False
 
         # special handling for torch_dtype in model_kwargs since HF does not correctly update
         # torch_dtype string to an actual torch.dtype object (only with default)
@@ -117,12 +118,12 @@ class SimpleConfig:
 
         # No paging allowed in TritonWithFlattenedInputs
         if self.attn_backend in ["TritonWithFlattenedInputs"]:
-            self.page_size = self.max_seq_len
+            self.attn_page_size = self.max_seq_len
 
         # use min instead of max to avoid OOM for large batch size
         self.model_kwargs["max_position_embeddings"] = min(
             self.max_seq_len,
-            self.model_kwargs["max_position_embeddings"],
+            self.model_kwargs.get("max_position_embeddings", self.max_seq_len),
         )
 
         if isinstance(self.prompt, str):

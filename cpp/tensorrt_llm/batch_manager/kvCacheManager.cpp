@@ -557,7 +557,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
                 mLayerToPoolIndex[layerIdx] = poolIndex;
             }
         }
-        mPools.emplace_back(numLayers, numKvHeads, sizePerHead, tokensPerBlock, 1);
+        mPools.emplace_back(numLayers, mKVFactor, numKvHeads, sizePerHead, tokensPerBlock, 1);
         ++poolIndex;
     }
 
@@ -649,8 +649,8 @@ void WindowBlockManager::createBlockScalePools(SizeType32 quantBlockSize)
         TLLM_CHECK_WITH_INFO(kv_pool.blockSize % quantBlockSize == 0,
             "Cannot use FP4 quantization since kv_pool.blockSize is not divisible by FP4 quantBlockSize.");
 
-        mPools.emplace_back(kv_pool.numLayers, kv_pool.numKvHeads, kv_pool.sizePerHead, kv_pool.tokensPerBlock,
-            quantBlockSize,
+        mPools.emplace_back(kv_pool.numLayers, kv_pool.kvFactor, kv_pool.numKvHeads, kv_pool.sizePerHead,
+            kv_pool.tokensPerBlock, quantBlockSize,
             /*primaryPool=*/nullptr,
             /*secondaryPool=*/nullptr,
             /*containsBlockScales=*/true);
@@ -766,6 +766,25 @@ void WindowBlockManager::claimLeafBlock(BlockPtr const& block, std::optional<exe
     block->freeLeafBlock();
 }
 
+void WindowBlockManager::freeChildren(
+    BlockPtr const& block, executor::RetentionPriority priority, std::optional<std::chrono::milliseconds> durationMs)
+{
+    // Free all descendants of block
+    for (auto const& p : block->getNextBlocks())
+    {
+        auto childBlock = p.second;
+        freeChildren(childBlock, priority, durationMs);
+    }
+
+    // Free block
+    if (mEventManager && blockInRadixTree(block))
+    {
+        mEventManager->enqueueRemovedEvent(block);
+    }
+
+    claimLeafBlock(block, priority, durationMs);
+}
+
 BlockPtr WindowBlockManager::getFreeBlock(
     executor::RetentionPriority priority, std::optional<std::chrono::milliseconds> durationMs)
 {
@@ -776,7 +795,13 @@ BlockPtr WindowBlockManager::getFreeBlock(
         ++mAllocNewBlocks;
     }
     ++mAllocTotalBlocks;
-    if (!block->getUniqueTokens().empty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
+    // Offloading is an option only when these conditions are met:
+    // 1. Block contains state (evidenced by presence of tokens)
+    // 2. Eviction policy indicated block can be offloaded
+    // 3. At least one free block in secondary memory
+    // 4. Onboarding is enabled (allowing block to be brought back into primary)
+    if (!block->getUniqueTokens().empty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0
+        && mOnboardBlocks)
     {
         // If we're swapping a block to secondary memory, maintain the prior priority values.
         mEvictionPolicy->claimBlock(block);
@@ -795,12 +820,12 @@ BlockPtr WindowBlockManager::getFreeBlock(
         block = offloadBlock;
     }
 
-    if (mEventManager && blockInRadixTree(block))
-    {
-        mEventManager->enqueueRemovedEvent(block);
-    }
-
-    claimLeafBlock(block, priority, durationMs);
+    // Ensure that returned block is a leaf block by freeing all it's children.
+    // Most blocks returned by mEvictionPolicy->getFreeBlock will be leaf blocks,
+    // but there are situations where they are not. One example is when a primary
+    // block has children in secondary memory and offloading is not possible
+    // because there are no free secondary blocks.
+    freeChildren(block, priority, durationMs);
 
     return block;
 }
@@ -2174,7 +2199,7 @@ std::vector<std::vector<std::vector<SizeType32>>> KVCacheManager::getBatchCacheB
 std::vector<SizeType32> KVCacheManager::getNewlyAllocatedBlockIds(
     LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
 {
-    return mBlockManager.getNewlyAllocatedBlockIds(mSequences.at(requestId), windowSize);
+    return mBlockManager.getNewlyAllocatedBlockIds(getSequence(requestId), windowSize);
 }
 
 runtime::ITensor::SharedPtr KVCacheManager::getPrimaryPool(SizeType32 layer_idx) const

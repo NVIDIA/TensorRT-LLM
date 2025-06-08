@@ -36,9 +36,11 @@ target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
 
 add_library(
   th_common SHARED
+  mlaPreprocessOp.cpp
   allgatherOp.cpp
   allreduceOp.cpp
   attentionOp.cpp
+  causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
@@ -54,13 +56,16 @@ add_library(
   fp4BatchedQuantize.cpp
   fp8BlockScalingGemm.cpp
   fp8Quantize.cpp
+  fusedQKNormRopeOp.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
+  llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
   moeCommOp.cpp
+  moeLoadBalanceOp.cpp
   fp8BlockScaleMoe.cpp
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp

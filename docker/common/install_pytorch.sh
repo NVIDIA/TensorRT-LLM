@@ -4,8 +4,8 @@ set -ex
 
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-03.html#rel-25-03
-TORCH_VERSION="2.6.0"
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-04.html#rel-25-04
+TORCH_VERSION="2.7.0"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {
@@ -32,17 +32,14 @@ install_from_source() {
     if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
     if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
 
-    if [ "$ARCH" = "sbsa" ] && [ "$TORCH_VERSION" = "2.6.0" ]; then
-      echo "Due to a known issue https://github.com/pytorch/pytorch/issues/141083, PyTorch v2.6.0 installation from source codes cannot be supported..."
-      exit 1
-    fi
     prepare_environment $1
 
     export _GLIBCXX_USE_CXX11_ABI=$1
 
-    export TORCH_CUDA_ARCH_LIST="8.0;9.0"
+    export TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;10.0;12.0"
     export PYTORCH_BUILD_VERSION=${TORCH_VERSION}
     export PYTORCH_BUILD_NUMBER=0
+    export MAX_JOBS=12
     pip3 uninstall -y torch
     cd /tmp
     git clone --depth 1 --branch v${TORCH_VERSION} https://github.com/pytorch/pytorch
@@ -58,6 +55,7 @@ install_from_source() {
     export PYTORCH_VERSION=${PYTORCH_BUILD_VERSION}
     export FORCE_CUDA=1
     export BUILD_VERSION=${TORCHVISION_VERSION}
+    export MAX_JOBS=12
     pip3 uninstall -y torchvision
     cd /tmp
     git clone --depth 1 --branch v${TORCHVISION_VERSION} https://github.com/pytorch/vision
@@ -71,12 +69,8 @@ install_from_pypi() {
     if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
     if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
 
-    pip3 uninstall -y torch torchvision
-    if [ "$ARCH" = "sbsa" ]; then
-      pip3 install torch==${TORCH_VERSION} torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-    else
-      pip3 install torch==${TORCH_VERSION} torchvision
-    fi
+    pip3 uninstall -y torch torchvision torchaudio
+    pip3 install torch==${TORCH_VERSION} torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 }
 
 case "$1" in

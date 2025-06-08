@@ -15,7 +15,8 @@
  */
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
-#include "tensorrt_llm/kernels/trtllmGenKernels/blockscaleGemm/kernelRunner.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/gemm/KernelRunner.h"
+
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/EmptyTensor.h>
@@ -77,6 +78,39 @@ Fp8BlockScaleGemmRunnerPtr get_gemm_runner(at::ScalarType dtype_a, at::ScalarTyp
 }
 
 } // namespace
+
+torch::Tensor fp8_block_scaling_gemm_ada(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale)
+{
+    check_input_dtypes(mat1, mat1Scale);
+    check_input_dtypes(mat2, mat2Scale);
+
+    TORCH_CHECK(mat1.dim() == 2, "mat1 must be a matrix");
+    TORCH_CHECK(mat2.dim() == 2, "mat2 must be a matrix");
+    TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[1], "mat1 and mat2 shapes cannot be multiplied (", mat1.sizes()[0], "x",
+        mat1.sizes()[1], " and ", mat2.sizes()[0], "x", mat2.sizes()[1], ")");
+
+    auto const m = mat1.sizes()[0];
+    auto const n = mat2.sizes()[0];
+    auto const k = mat1.sizes()[1];
+    TORCH_CHECK(k % 128 == 0, "K must be a multiple of 128, (K=", k, ")");
+    TORCH_CHECK(n % 16 == 0, "N must be a multiple of 16, (N=", n, ")");
+
+    at::Tensor out = at::detail::empty_cuda({m, n}, at::ScalarType::BFloat16, mat1.device(), std::nullopt);
+
+    auto gemm_runner = get_gemm_runner(mat1.scalar_type(), mat2.scalar_type());
+
+    auto stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
+
+    float const* mat1ScalePtr = mat1Scale.data_ptr<float>();
+    float const* mat2ScalePtr = mat2Scale.data_ptr<float>();
+
+    gemm_runner->gemm(reinterpret_cast<__nv_fp8_e4m3*>(mat1.data_ptr()), k,
+        reinterpret_cast<__nv_fp8_e4m3*>(mat2.data_ptr()), k, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), n, m, n,
+        k, mat1ScalePtr, mat2ScalePtr, stream);
+
+    return out;
+}
 
 torch::Tensor fp8_block_scaling_gemm_hopper(torch::Tensor const& mat1, torch::Tensor const& mat2,
     torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale)
@@ -147,9 +181,20 @@ torch::Tensor fp8_block_scale_gemm_blackwell(torch::Tensor const& mat1, torch::T
     */
     float* outScalePtr = nullptr;
 
-    tensorrt_llm::kernels::TrtllmGenBlockScaleGemmRunner runner(Data_type::DATA_TYPE_BF16);
-    runner.run(
-        m, n, k, mat1.data_ptr(), mat1ScalePtr, mat2.data_ptr(), mat2ScalePtr, out.data_ptr(), outScalePtr, stream);
+    // transposeMmaOutput is hardcoded for now
+    tensorrt_llm::kernels::TrtllmGenGemmRunnerOptions options = {.eltType = gemm::trtllm::gen::Dtype::E4m3,
+        .outputType = gemm::trtllm::gen::Dtype::Bfloat16,
+        .deepSeekFp8 = true,
+        .transposeMmaOutput = true};
+
+    tensorrt_llm::kernels::TrtllmGenGemmRunner runner(options);
+
+    int64_t const numBytesWorkspace = runner.getWorkspaceSizeInBytes(m, n, k);
+    at::Tensor workspace
+        = at::detail::empty_cuda({numBytesWorkspace}, at::ScalarType::Char, torch::kCUDA, std::nullopt);
+
+    runner.run(m, n, k, mat1.const_data_ptr(), mat1ScalePtr, mat2.const_data_ptr(), mat2ScalePtr, out.data_ptr(),
+        /* scaleC */ nullptr, outScalePtr, workspace.data_ptr(), stream.stream(), mat1.get_device());
 
     return out;
 }
@@ -162,6 +207,7 @@ extern torch::Tensor fp8_block_scaling_gemm(torch::Tensor const& mat1, torch::Te
     {
     case 100: return fp8_block_scale_gemm_blackwell(mat1, mat2, mat1Scale, mat2Scale);
     case 90: return fp8_block_scaling_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale);
+    case 89: return fp8_block_scaling_gemm_ada(mat1, mat2, mat1Scale, mat2Scale);
     default: TORCH_CHECK(false, "Unsupported SM version for FP8 block scaling GEMM");
     }
 }

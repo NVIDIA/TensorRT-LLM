@@ -130,6 +130,18 @@ def test_single_chat_session(client: openai.OpenAI, model_name: str):
     )
     assert legacy.choices[0].message.content \
         == chat_completion.choices[0].message.content
+    # test deduced max_tokens
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        temperature=0.0,
+        logprobs=False,
+    )
+    assert chat_completion.id is not None
+    assert len(chat_completion.choices) == 1
+    message = chat_completion.choices[0].message
+    assert message.content is not None
+    assert message.role == "assistant"
 
 
 def test_single_chat_session_with_logprobs(client: openai.OpenAI,
@@ -193,7 +205,8 @@ def test_multi_turn_dialogue(client: openai.OpenAI, model_name: str):
     assert message.content is not None and len(message.content) >= 0
 
 
-def test_beam_search(client: openai.OpenAI, model_name: str, backend: str):
+def test_multiple_response(client: openai.OpenAI, model_name: str,
+                           backend: str):
     if backend == "pytorch":
         pytest.skip("Beam search is not supported in PyTorch backend yet")
 
@@ -204,6 +217,7 @@ def test_beam_search(client: openai.OpenAI, model_name: str, backend: str):
         "role": "user",
         "content": "what is 1+1?"
     }]
+    # test beam search
     chat_completion = client.chat.completions.create(
         model=model_name,
         messages=messages,
@@ -216,6 +230,16 @@ def test_beam_search(client: openai.OpenAI, model_name: str, backend: str):
     assert chat_completion.choices[
         0].message.content != chat_completion.choices[
             1].message.content, "beam search should be different"
+    # test n and best_of
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=10,
+        n=2,
+        temperature=0.0,
+        extra_body=dict(best_of=4),
+    )
+    assert len(chat_completion.choices) == 2
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -458,6 +482,7 @@ def test_custom_role(client: openai.OpenAI, model_name: str):
             "content": "what is 1+1?",
         }],  # type: ignore
         temperature=0.0,
+        max_completion_tokens=16,
         seed=0)
 
     resp2 = client.chat.completions.create(
@@ -470,6 +495,7 @@ def test_custom_role(client: openai.OpenAI, model_name: str):
             }]
         }],  # type: ignore
         temperature=0.0,
+        max_completion_tokens=16,
         seed=0)
 
     content1 = resp1.choices[0].message.content

@@ -1,21 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Dict, Optional
 
 import torch
 from torch import nn
 from torch.nn import functional as F
-
-try:
-    from transformer_engine.pytorch import RMSNorm
-except ImportError:
-    RMSNorm = None
 from transformers import AutoConfig, PretrainedConfig
 
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
+from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.mamba.mixer import MambaMixer
+from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
+from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -93,7 +105,7 @@ class TransformerLayer(Attention):
                                attn_metadata=attn_metadata)
 
 
-class NemotronHLayer(nn.Module):
+class NemotronHLayer(DecoderLayer):
 
     def __init__(
         self,
@@ -111,8 +123,6 @@ class NemotronHLayer(nn.Module):
         self.layer_idx = layer_idx
         self.layer_type = layer_type
 
-        assert RMSNorm is not None, "RMSNorm from transformer_engine is not installed, install it with `pip3 install transformer_engine[pytorch]`"
-
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -120,17 +130,17 @@ class NemotronHLayer(nn.Module):
         )
 
         if layer_type == "M":
-            self.mixer = MambaMixer(d_model=config.hidden_size,
-                                    d_state=config.ssm_state_size,
-                                    d_conv=config.conv_kernel,
-                                    expand=config.expand,
-                                    n_groups=config.n_groups,
-                                    head_dim=config.mamba_head_dim,
-                                    chunk_size=config.chunk_size,
-                                    layer_idx=layer_idx,
-                                    rms_norm_eps=config.rms_norm_eps,
-                                    dtype=config.torch_dtype,
-                                    config=model_config)
+            self.mixer = Mamba2Mixer(d_model=config.hidden_size,
+                                     d_state=config.ssm_state_size,
+                                     d_conv=config.conv_kernel,
+                                     expand=config.expand,
+                                     n_groups=config.n_groups,
+                                     head_dim=config.mamba_head_dim,
+                                     chunk_size=config.chunk_size,
+                                     layer_idx=layer_idx,
+                                     rms_norm_eps=config.rms_norm_eps,
+                                     dtype=config.torch_dtype,
+                                     config=model_config)
         elif layer_type == "-":
             self.mixer = MLPLayer(model_config, layer_idx)
         elif layer_type == "*":
@@ -140,6 +150,7 @@ class NemotronHLayer(nn.Module):
 
     def forward(
         self,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
@@ -167,27 +178,10 @@ class NemotronHModel(DecoderModel):
         )
 
         # create layers
-        mlp_idx = 0
-        mamba_idx = 0
-        transformer_idx = 0
         layers = []
-        for layer_type in config.hybrid_override_pattern:
-            # calculate layer index based on type
-            if layer_type == "M":
-                layer_idx = mamba_idx
-                mamba_idx += 1
-            elif layer_type == "-":
-                layer_idx = mlp_idx
-                mlp_idx += 1
-            elif layer_type == "*":
-                layer_idx = transformer_idx
-                transformer_idx += 1
-            else:
-                ValueError(f"{layer_type} is not supported")
+        for layer_idx, layer_type in enumerate(config.hybrid_override_pattern):
             layers.append(NemotronHLayer(model_config, layer_idx, layer_type))
         self.layers = nn.ModuleList(layers)
-
-        assert RMSNorm is not None, "RMSNorm from transformer_engine is not installed, install it with `pip3 install transformer_engine[pytorch]`"
 
         # final norm
         self.norm_f = RMSNorm(
@@ -199,8 +193,8 @@ class NemotronHModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -215,7 +209,7 @@ class NemotronHModel(DecoderModel):
         hidden_states = inputs_embeds
 
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attn_metadata)
+            hidden_states = layer(position_ids, hidden_states, attn_metadata)
 
         hidden_states = self.norm_f(hidden_states)
 

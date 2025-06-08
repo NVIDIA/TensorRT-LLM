@@ -17,7 +17,7 @@ include(FetchContent)
 set(SRCS
     utils/mpiUtils.cpp
     utils/numpyUtils.cpp
-    utils/sessionUtils.cpp
+    utils/runtimeUtils.cpp
     utils/debugUtils.cu
     utils/speculativeChoicesUtils.cpp
     bufferManager.cpp
@@ -33,29 +33,25 @@ set(SRCS
     loraCache.cpp
     decodingOutput.cpp
     decoderState.cpp
-    generationConfig.cpp
     gptDecoder.cpp
     gptDecoderBatched.cpp
     gptJsonConfig.cpp
-    gptSession.cpp
     iBuffer.cpp
     iTensor.cpp
     ipcUtils.cpp
     ipcSocket.cpp
     ipcNvlsMemory.cpp
+    mcastDeviceMemory.cpp
     memoryCounters.cpp
+    moeLoadBalancer/moeLoadBalancer.cpp
+    moeLoadBalancer/topologyDetector.cpp
     ncclCommunicator.cpp
     promptTuningParams.cpp
-    runtimeBuffers.cpp
     runtimeKernels.cu
-    rnnStateBuffers.cpp
-    statefulGptDecoder.cpp
-    statefulGptDecoderBatched.cpp
     tllmBuffers.cpp
     tllmRuntime.cpp
     tllmStreamReaders.cpp
     tllmLogger.cpp
-    transformerBuffers.cpp
     workerPool.cpp
     worldConfig.cpp)
 
@@ -84,4 +80,28 @@ target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 
 if(ENABLE_MULTI_DEVICE)
   target_link_libraries(runtime_src PUBLIC ${NCCL_LIB})
+endif()
+
+if(NOT WIN32)
+  find_package(libnuma QUIET CONFIG)
+
+  if(NOT libnuma_FOUND)
+    message(
+      STATUS "libnuma not found via Conan, falling back to system libnuma")
+    find_path(NUMA_INCLUDE_DIR numa.h)
+    find_library(NUMA_LIBRARY numa)
+
+    if(NUMA_INCLUDE_DIR AND NUMA_LIBRARY)
+      add_library(libnuma::libnuma UNKNOWN IMPORTED)
+      set_target_properties(
+        libnuma::libnuma
+        PROPERTIES IMPORTED_LOCATION "${NUMA_LIBRARY}"
+                   INTERFACE_INCLUDE_DIRECTORIES "${NUMA_INCLUDE_DIR}")
+    else()
+      message(FATAL_ERROR "NUMA library not found, please install libnuma-dev")
+    endif()
+  else()
+    message(STATUS "libnuma found.")
+  endif()
+  target_link_libraries(runtime_src PUBLIC libnuma::libnuma)
 endif()

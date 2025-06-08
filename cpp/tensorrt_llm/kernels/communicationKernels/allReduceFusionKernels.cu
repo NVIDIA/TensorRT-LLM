@@ -456,10 +456,10 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams pa
 
     for (int idx = access_id; idx < tot_access; idx += access_stride)
     {
-        float val[4];
+        alignas(16) float val[4];
         *reinterpret_cast<float4*>(val) = reinterpret_cast<float4*>(params.allreduce_in)[idx];
 #pragma unroll
-        for (int i = 0; i < kElemsPerAccess<DType> / sizeof(float); ++i)
+        for (int i = 0; i < 4; ++i)
         {
             if (is_neg_zero(val[i]))
             {
