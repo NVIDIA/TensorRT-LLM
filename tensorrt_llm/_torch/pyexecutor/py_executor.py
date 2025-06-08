@@ -268,6 +268,11 @@ class PyExecutor:
                 "Drafting is not supported for selected executor loop. "
                 "Please disable disagg/pipeline parallelism/overlap scheduler.")
 
+        self.is_ngram = hasattr(
+            model_engine, "spec_config"
+        ) and model_engine.spec_config is not None and model_engine.spec_config.spec_dec_mode.is_ngram(
+        )
+
         self.worker_started = False
         self.worker_lock = threading.Lock()
         if start_worker:
@@ -525,7 +530,7 @@ class PyExecutor:
         stats.static_batching_stats = StaticBatchingStats()
         spec_resource_manager = self.resource_manager.resource_managers.get(
             "spec_resource_manager")
-        if spec_resource_manager is not None:
+        if spec_resource_manager is not None or self.is_ngram:
             stats.specdec_stats = SpecDecodingStats()
         return stats
 
@@ -838,11 +843,8 @@ class PyExecutor:
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
-        is_ngram = hasattr(
-            self.model_engine, "spec_config"
-        ) and self.model_engine.spec_config is not None and self.model_engine.spec_config.spec_dec_mode.is_ngram(
-        )
         with self._profiler() as profile_step:
+            sample_state = None
             iter_start_time = time.time()
             iter_stats = None
             while not self.is_shutdown or len(self.active_requests) > 0:
@@ -863,7 +865,7 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
-                if self.draft_model_engine is not None or is_ngram:
+                if self.draft_model_engine is not None or self.is_ngram:
                     self._prepare_draft_requests()
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -901,20 +903,13 @@ class PyExecutor:
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
-                    has_ngram_iter_stats = is_ngram and self.model_engine.spec_config.spec_dec_mode.is_ngram(
-                    ) and iter_stats is not None
-                    if has_ngram_iter_stats:
-                        before = time.time()
-
                     self.resource_manager.prepare_resources(scheduled_batch)
                     if self.draft_model_engine is not None:
                         self._prepare_draft_tokens(scheduled_batch)
 
-                    if has_ngram_iter_stats:
-                        self._insert_ngram_iter_stats(scheduled_batch,
-                                                      iter_stats)
-                        iter_stats.specdec_stats.iter_latency_ms = (
-                            time.time() - before) * 1e3
+                    if self.is_ngram:
+                        self.sampler.prepare_forward(scheduled_batch,
+                                                     sample_state, iter_stats)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1007,6 +1002,9 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
+                if self.is_ngram:
+                    self._prepare_draft_requests()
+
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
                 )
 
@@ -1064,6 +1062,11 @@ class PyExecutor:
 
                     previous_tensors_device = self.previous_batch and self.previous_batch.sample_state.device
 
+                    if self.is_ngram and self.previous_batch is not None:
+                        self.sampler.prepare_forward(
+                            scheduled_batch, self.previous_batch.sample_state,
+                            iter_stats)
+
                     batch_outputs = self._forward_step(scheduled_batch,
                                                        previous_tensors_device)
 
@@ -1076,8 +1079,7 @@ class PyExecutor:
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                    has_previous_batch = self.previous_batch is not None
-                    if has_previous_batch:
+                    if self.previous_batch is not None:
                         previous_batch_size = self.previous_batch.sample_state.scheduled_requests.batch_size
                         if previous_batch_size > 0:  # first previous batch size is 0
                             self._process_previous_batch()
@@ -1696,43 +1698,6 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
-
-    def _insert_ngram_iter_stats(
-        self, scheduled_requests: ScheduledRequests, iter_stats: IterationStats
-    ) -> Tuple[ScheduledRequests, Dict[int, LlmRequest]]:
-        """
-        Get statistic information from the draft tokens in NGram drafter
-        """
-        assert iter_stats is not None
-
-        total_num_draft_tokens = 0
-        total_num_accepted_tokens = 0
-        num_requests_with_draft_tokens = 0
-        for request in chain(scheduled_requests.context_requests,
-                             scheduled_requests.generation_requests):
-            num_draft_tokens = 0 if request.py_last_draft_tokens is None else len(
-                request.py_last_draft_tokens)
-            num_accepted_tokens = getattr(request,
-                                          "py_num_accepted_draft_tokens", 0)
-            if num_draft_tokens > 0:
-                total_num_draft_tokens = total_num_draft_tokens + num_draft_tokens
-                total_num_accepted_tokens = total_num_accepted_tokens + num_accepted_tokens
-                num_requests_with_draft_tokens = num_requests_with_draft_tokens + 1
-
-        if num_requests_with_draft_tokens > 0:
-            iter_stats.specdec_stats.iter_latency_ms = 0.0  # We do not coutn time in this method
-            iter_stats.specdec_stats.num_draft_tokens = total_num_draft_tokens
-            iter_stats.specdec_stats.num_accepted_tokens = total_num_accepted_tokens
-            iter_stats.specdec_stats.num_requests_with_draft_tokens = num_requests_with_draft_tokens
-            iter_stats.specdec_stats.acceptance_length = float(
-                (total_num_accepted_tokens + num_requests_with_draft_tokens
-                 )) / float(num_requests_with_draft_tokens)
-        else:
-            iter_stats.specdec_stats.iter_latency_ms = 0.0
-            iter_stats.specdec_stats.num_draft_tokens = 0
-            iter_stats.specdec_stats.num_accepted_tokens = 0
-            iter_stats.specdec_stats.num_requests_with_draft_tokens = 0
-            iter_stats.specdec_stats.acceptance_length = 1.0
 
     @nvtx_range("_prepare_draft_batch")
     def _prepare_draft_batch(

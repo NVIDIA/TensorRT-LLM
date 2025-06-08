@@ -488,9 +488,11 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             )
             self.max_draft_len = spec_config.max_draft_tokens
+            self.is_ngram = self.spec_config.spec_dec_mode.is_ngram()
         else:
             self.without_logits = False
             self.max_draft_len = 0
+            self.is_ngram = False
         self.iter_counter = 0
 
         # We look up this key in resource_manager during forward to find the
@@ -1207,6 +1209,8 @@ class PyTorchModelEngine(ModelEngine):
         new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
+            if self.is_ngram:
+                replace_dict = new_tensors_device.replace_dict
             new_tokens_device = new_tensors_device.new_tokens
             if self.without_logits:
                 assert isinstance(new_tensors_device, SampleStateTensorsMTP)
@@ -1255,11 +1259,25 @@ class PyTorchModelEngine(ModelEngine):
                 # no need to copy the token ids.
                 if not request.is_dummy:
                     input_ids.append(request.get_last_tokens(0))
+                    if self.is_ngram and not self._disable_overlap_scheduler and new_tensors_device is not None:
+                        # In NGram + overlap-scheduler mode, the generated tokens (as well as the accepted tokens) in the
+                        # last forward computation has not been updated into `request` yet.
+                        # So `input_ids`, later `past_seen_token_num` and `prompt_lengths` need to be fixed.
+                        # Here the index of the tokens are noted and assigned from `new_tokens_device` to `self.input_ids_cuda` later.
+                        # In NGram + non-overlap-scheduler mode, the generated tokens (as well as the accepted tokens) in the
+                        # last forward computation has been updated into `request`, so only `prompt_lengths` needs to be fixed.
+                        replace_dict[request.py_batch_idx] = [
+                            replace_dict[request.py_batch_idx],
+                            len(input_ids) - 1,
+                            request.py_num_accepted_draft_tokens,
+                        ]
                     input_ids.extend(request.py_draft_tokens)
                     draft_tokens.extend(request.py_draft_tokens)
                 # get other ids and lengths
                 num_draft_tokens = len(request.py_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
+                if self.is_ngram and not self._disable_overlap_scheduler and new_tensors_device is not None:
+                    past_seen_token_num += request.py_num_accepted_draft_tokens + 1
                 draft_lens.append(num_draft_tokens)
 
                 if self.is_spec_decode and self.spec_config.spec_dec_mode.extend_ctx(
@@ -1269,7 +1287,6 @@ class PyTorchModelEngine(ModelEngine):
                     prompt_lengths.append(1 + num_draft_tokens)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
-
                 sequence_lengths.append(1 + num_draft_tokens)
                 gather_ids.extend(
                     list(
@@ -1410,6 +1427,13 @@ class PyTorchModelEngine(ModelEngine):
                 self.previous_pos_id_offsets_cuda *= 0
                 self.previous_kv_lens_offsets_cuda *= 0
         elif new_tokens_device is not None:
+            if self.is_ngram and not self._disable_overlap_scheduler:
+                for py_batch_id, value in replace_dict.items():
+                    if not isinstance(value, list):
+                        continue
+                    src_index, tgt_index, offset = value
+                    self.input_ids_cuda[tgt_index] = \
+                        new_tokens_device[src_index + offset]
             previous_batch_tokens = len(previous_batch_indices)
             previous_batch_indices = torch.tensor(previous_batch_indices,
                                                   dtype=torch.int,
