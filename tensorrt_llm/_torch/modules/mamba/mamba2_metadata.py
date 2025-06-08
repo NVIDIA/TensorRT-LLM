@@ -33,8 +33,9 @@ class Mamba2Metadata:
 
     def prepare(self, attn_metadata: AttentionMetadata):
         num_contexts = attn_metadata.num_contexts
+        context_lens = attn_metadata.seq_lens_cuda[:num_contexts]
         if num_contexts > 0:
-            torch.cumsum(attn_metadata.seq_lens_cuda,
+            torch.cumsum(context_lens,
                          dim=0,
                          dtype=torch.int,
                          out=self.cu_seqlens[1:num_contexts + 1])
@@ -42,5 +43,5 @@ class Mamba2Metadata:
                 torch.arange(num_contexts,
                              dtype=torch.int,
                              device=self.cu_seqlens.device),
-                attn_metadata.seq_lens_cuda,
+                repeats=context_lens,
                 output_size=self.cu_seqlens[num_contexts]).unsqueeze(0)
