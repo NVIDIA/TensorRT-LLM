@@ -84,7 +84,7 @@ def add_llm_args(parser):
     parser.add_argument('--cuda_graph_batch_sizes',
                         nargs='+',
                         type=int,
-                        default=[])
+                        default=None)
     parser.add_argument('--print_iter_log',
                         default=False,
                         action='store_true',
