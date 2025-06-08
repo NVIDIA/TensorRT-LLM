@@ -198,19 +198,24 @@ class Eagle3Sampler(TorchSampler):
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs: dict[str, torch.Tensor]) -> SampleState:
-        # TODO: Make like TorchSampler
-        logits = model_outputs["logits"]
-        new_tokens_device = torch.argmax(logits, dim=-1)
-        if "d2t" in model_outputs:
-            d2t = model_outputs["d2t"]
-            new_tokens_device = d2t[new_tokens_device] + new_tokens_device
+        if "d2t" not in model_outputs:
+            return super().sample_async(scheduled_requests, model_outputs)
+        d2t = model_outputs["d2t"]
+        raw_logits = model_outputs["logits"]
+        requests = scheduled_requests.all_requests()
+        new_tokens_device = self.store.new_tokens_device
+        self._process_requests(requests,
+                               raw_logits,
+                               new_tokens=new_tokens_device)
+        d2t = d2t.reshape(new_tokens_device.shape)
+        new_tokens_device = d2t[new_tokens_device] + new_tokens_device
         device = SampleStateTensors(new_tokens=new_tokens_device)
         host = SampleStateTensors(
             new_tokens=new_tokens_device.to('cpu', non_blocking=True))
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         return SampleState(scheduled_requests=scheduled_requests,
-                           logits=logits,
+                           logits=None,
                            device=device,
                            host=host,
                            sampler_event=sampler_event)

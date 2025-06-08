@@ -38,7 +38,7 @@ class SampleStateTensors:
 class SampleState:
     scheduled_requests: ScheduledRequests
 
-    logits: torch.Tensor = None
+    logits: torch.Tensor | None = None
 
     device: SampleStateTensors = None
     host: SampleStateTensors = None
