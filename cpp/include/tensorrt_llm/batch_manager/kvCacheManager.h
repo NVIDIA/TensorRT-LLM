@@ -1285,10 +1285,10 @@ public:
 
     // Sum of numLayers * kvFactor * numKvHeads * sizePerHead for each pool
     [[nodiscard]] static SizeType32 calculateCacheSizePerTokenForSingleWindowSize(
-        tensorrt_llm::runtime::ModelConfig const& modelConfig, tensorrt_llm::runtime::WorldConfig const& worldConfig,
-        std::vector<SizeType32> const& windowSizeLayers, bool isCrossAttention, SizeType32 kvFactor = 2)
+        tensorrt_llm::runtime::ModelConfig const& modelConfig, std::vector<SizeType32> const& windowSizeLayers,
+        bool isCrossAttention, SizeType32 kvFactor)
     {
-        auto const nkvh = modelConfig.getNumKvHeadsForGivenLayers(windowSizeLayers);
+        auto const nkvh = modelConfig.getNumKvHeadsForGivenLayers(windowSizeLayers, isCrossAttention);
         auto const sumLocalHeads = std::reduce(nkvh.cbegin(), nkvh.cend());
         // NOTE: We expect the initialization of modelConfig to have already taken the tp size into account and do not
         // address it here
