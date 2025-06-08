@@ -152,7 +152,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
                 containers:
                   ${containerConfig}
                   - name: jnlp
-                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.13.3-1
+                    image: urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_amd_linux:jdk17
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
