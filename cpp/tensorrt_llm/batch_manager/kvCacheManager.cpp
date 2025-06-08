@@ -2139,7 +2139,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
     for (auto const& [windowSize, managedLayers] : windowSizeToLayers)
     {
         auto const cacheSizePerToken = BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize(
-            modelConfig, worldConfig, managedLayers, isCrossAttention, kvFactor);
+            modelConfig, managedLayers, isCrossAttention, kvFactor);
         auto const cacheSizeBytesPerToken = cacheSizePerToken * BufferDataType(dtype).getSize();
         cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
     }

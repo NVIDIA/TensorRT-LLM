@@ -799,12 +799,15 @@ public:
         return mNumKvHeadsPerAttentionLayer;
     }
 
-    [[nodiscard]] std::vector<SizeType32> getNumKvHeadsForGivenLayers(std::vector<SizeType32> const& layers) const
+    [[nodiscard]] std::vector<SizeType32> getNumKvHeadsForGivenLayers(
+        std::vector<SizeType32> const& layers, bool isCrossAttention) const
     {
         std::vector<SizeType32> numKvHeads;
         numKvHeads.reserve(layers.size());
+        auto const numKvHeadsAllLayers
+            = isCrossAttention ? mNumKvHeadsPerCrossAttentionLayer : mNumKvHeadsPerAttentionLayer;
         std::transform(layers.begin(), layers.end(), std::back_inserter(numKvHeads),
-            [this](SizeType32 layer) { return mNumKvHeadsPerAttentionLayer.at(layer); });
+            [&numKvHeadsAllLayers](SizeType32 layer) { return numKvHeadsAllLayers.at(layer); });
         return numKvHeads;
     }
 
