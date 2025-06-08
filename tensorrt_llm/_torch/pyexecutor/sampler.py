@@ -315,17 +315,38 @@ class TorchSampler(Sampler):
             model_outputs: dict[str, torch.Tensor]) -> SampleStateTorch:
         requests = scheduled_requests.all_requests()
         raw_logits = model_outputs["logits"]
-        beam = self.BEAM
-
-        new_tokens_host = torch.zeros_like(self.store.new_tokens_device,
-                                           device="cpu")
-        logits_shape = (*new_tokens_host.shape, self.vocab_size)
+        new_tokens_device = self.store.new_tokens_device
+        logits_shape = (*new_tokens_device.shape, self.vocab_size)
         gen_logits = None
         log_probs = None
         if any(req.py_return_generation_logits for req in requests):
             gen_logits = torch.empty(logits_shape, device="cpu")
         if any(req.py_return_log_probs for req in requests):
             log_probs = torch.empty(logits_shape, device="cpu")
+        self._process_requests(requests,
+                               raw_logits,
+                               new_tokens=new_tokens_device,
+                               gen_logits=gen_logits,
+                               log_probs=log_probs)
+        new_tokens_host = new_tokens_device.to(device="cpu", non_blocking=True)
+        sampler_event = torch.cuda.Event()
+        sampler_event.record()
+        return SampleStateTorch(
+            scheduled_requests=scheduled_requests,
+            device=SampleStateTensors(new_tokens=new_tokens_device),
+            host=SampleStateTensors(new_tokens=new_tokens_host),
+            sampler_event=sampler_event,
+            log_probs=log_probs,
+            logits=gen_logits)
+
+    def _process_requests(self,
+                          requests: list[LlmRequest],
+                          raw_logits: torch.Tensor,
+                          *,
+                          new_tokens: torch.Tensor,
+                          gen_logits: torch.Tensor | None = None,
+                          log_probs: torch.Tensor | None = None):
+        beam = self.BEAM
         offset = 0
         for request in requests:
             steps = 1
@@ -340,7 +361,7 @@ class TorchSampler(Sampler):
                 next_tokens, softmax = greedy_search_sampling_batch(logits)
 
             current_slice = seq_slice(request, beam, size=steps)
-            new_tokens_host[current_slice] = next_tokens
+            new_tokens[current_slice] = next_tokens
             if gen_logits:
                 gen_logits[current_slice] = logits
             if log_probs:
@@ -350,17 +371,6 @@ class TorchSampler(Sampler):
                 probs = torch.log(token_probs)
                 log_probs[current_slice] = probs.unsqueeze(0)
             offset += steps
-        new_tokens_device = self.store.new_tokens_device.copy_(
-            new_tokens_host, non_blocking=True)
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
-        return SampleStateTorch(
-            scheduled_requests=scheduled_requests,
-            device=SampleStateTensors(new_tokens=new_tokens_device),
-            host=SampleStateTensors(new_tokens=new_tokens_host),
-            sampler_event=sampler_event,
-            log_probs=log_probs,
-            logits=gen_logits)
 
 
 class TorchStarAttentionSampler(TorchSampler):
