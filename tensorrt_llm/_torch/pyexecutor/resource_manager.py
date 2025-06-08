@@ -620,12 +620,6 @@ class MambaCacheManager(BaseResourceManager):
     def get_state_indices(self) -> torch.Tensor:
         return self.state_indices
 
-    def get_cu_seqlens(self) -> torch.Tensor:
-        return self.cu_seqlens
-
-    def get_seq_idx(self) -> torch.Tensor:
-        return self.seq_idx
-
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         layer_offset = self.mamba_layer_offsets[layer_idx]
         return self.conv_states[layer_offset]
