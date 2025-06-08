@@ -1,5 +1,6 @@
 import bisect
 import contextlib
+import functools
 import gc
 import glob
 import inspect
@@ -11,6 +12,7 @@ import traceback
 import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 import psutil
@@ -47,6 +49,8 @@ from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
+from ..modules.fused_moe.moe_load_balancer import (
+    MoeLoadBalancer, MoeLoadBalancerIterContext, maybe_create_moe_load_balancer)
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
 from ..utils import (get_model_extra_attrs, set_torch_compiling,
                      with_model_extra_attrs)
@@ -313,7 +317,8 @@ class PyTorchModelEngine(ModelEngine):
         if mapping.has_pp():
             init_pp_comm(mapping)
         self.dist = dist
-        ExpertStatistic.create(self.dist.rank)
+        if dist is not None:
+            ExpertStatistic.create(self.dist.rank)
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
@@ -321,6 +326,8 @@ class PyTorchModelEngine(ModelEngine):
         # accommodate certain target/draft model use cases. See
         # py_executor.py for how this is used.
         self.last_spec_metadata = None
+
+        self.in_warmup = False
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
@@ -469,6 +476,25 @@ class PyTorchModelEngine(ModelEngine):
             hidden_size=self.model.config.hidden_size,
             dtype=torch_dtype_to_str(self.model.config.torch_dtype))
 
+    @contextmanager
+    def set_warmup_flag(self):
+        self.in_warmup = True
+        try:
+            yield
+        finally:
+            self.in_warmup = False
+
+    @staticmethod
+    def with_warmup_flag(method):
+
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            with self.set_warmup_flag():
+                return method(self, *args, **kwargs)
+
+        return wrapper
+
+    @with_warmup_flag
     def warmup(self, resource_manager: ResourceManager) -> None:
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -477,6 +503,10 @@ class PyTorchModelEngine(ModelEngine):
         if kv_cache_manager is None:
             logger.info("Skipping warm up as no KV Cache manager allocated.")
             return
+
+        # The lifetime of model engine and kv cache manager can be different.
+        # Reset the global cuda graph dummy request to None in warmup.
+        self.cuda_graph_dummy_request = None
 
         def get_cuda_graph_warmup_request(batch_size):
             available_blocks = kv_cache_manager.get_num_free_blocks()
@@ -957,7 +987,8 @@ class PyTorchModelEngine(ModelEngine):
                     getattr(config.pretrained_config,
                             sub_config).num_hidden_layers = num_layers
 
-        with timing("Model init total"):
+        with timing("Model init total"), maybe_create_moe_load_balancer(
+                config, self.mapping) as moe_load_balancer:
             try:
                 with MetaInitMode():
                     model = AutoModelForCausalLM.from_config(config)
@@ -1011,6 +1042,13 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
+
+            if isinstance(moe_load_balancer, MoeLoadBalancer):
+                setattr(self, "moe_load_balancer", moe_load_balancer)
+                moe_load_balancer.register_weight_slots_after_to_cuda()
+                logger.info("moe_load_balancer finalizing model...")
+                moe_load_balancer.finalize_model()
+                logger.info("moe_load_balancer finalize model done")
 
             torch.cuda.current_stream().synchronize()
         return model
@@ -1144,13 +1182,18 @@ class PyTorchModelEngine(ModelEngine):
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
 
-        # Requests with draft tokens are treated like extend requests.
+        # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
+        # at the end of extend_requests.
         extend_requests = []
+        extend_dummy_requests = []
         generation_requests = []
         for request in scheduled_requests.generation_requests:
             if len(request.py_draft_tokens
                    ) > 0 or next_draft_tokens_device is not None:
-                extend_requests.append(request)
+                if request.is_dummy:
+                    extend_dummy_requests.append(request)
+                else:
+                    extend_requests.append(request)
             else:
                 generation_requests.append(request)
 
@@ -1160,6 +1203,7 @@ class PyTorchModelEngine(ModelEngine):
                     torch.tensor([mrope_position_deltas],
                                  dtype=torch.int32).to('cuda',
                                                        non_blocking=True))
+        extend_requests += extend_dummy_requests
 
         if not self._disable_overlap_scheduler and self.is_spec_decode:
             spec_dec_mode = self.spec_config.spec_dec_mode
@@ -1169,18 +1213,18 @@ class PyTorchModelEngine(ModelEngine):
         # will contain previous batch incices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
-        request_ids_with_previous_batch = []
-        num_extend_reqs_wo_previous_batch = 0
         for request in extend_requests:
             # the request has no previous tensor:
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
             # (2) a dummy request; or
             # (3) the first step in the generation server of disaggregated serving
             if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
-                # get token ids, including input token ids and draft token ids
-                input_ids.append(request.get_last_tokens(0))
-                input_ids.extend(request.py_draft_tokens)
-                draft_tokens.extend(request.py_draft_tokens)
+                # get token ids, including input token ids and draft token ids. For these dummy requests,
+                # no need to copy the token ids.
+                if not request.is_dummy:
+                    input_ids.append(request.get_last_tokens(0))
+                    input_ids.extend(request.py_draft_tokens)
+                    draft_tokens.extend(request.py_draft_tokens)
                 # get other ids and lengths
                 num_draft_tokens = len(request.py_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
@@ -1200,7 +1244,6 @@ class PyTorchModelEngine(ModelEngine):
                 # update batch index
                 request.py_batch_idx = batch_idx
                 batch_idx += 1
-                num_extend_reqs_wo_previous_batch += 1
             else:
                 # update batch index
                 previous_batch_idx = request.py_batch_idx
@@ -1227,10 +1270,7 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(past_seen_token_num +
                                                  self.max_draft_len + 1)
                 prompt_lengths.append(request.py_prompt_len)
-                request_ids_with_previous_batch.append(request.py_request_id)
-
-        # move requests with previous batch to the end of the list
-        request_ids.extend(request_ids_with_previous_batch)
+                request_ids.append(request.py_request_id)
 
         sequence_lengths.extend([1] * len(generation_requests))
         gather_ids.extend(
@@ -1265,6 +1305,7 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
         previous_batchs = len(previous_batch_indices)
+        num_requests = len(request_ids)
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids,
@@ -1303,31 +1344,27 @@ class PyTorchModelEngine(ModelEngine):
                                                        non_blocking=True)
                 # prepare data for the preprocess inputs
                 kv_len_offsets_device = new_tokens_lens_device - self.max_draft_len - 1
-                pre_tokens_start_idx = num_extend_reqs_wo_previous_batch * (
-                    1 + self.max_draft_len)
-                pre_tokens_end_idx = pre_tokens_start_idx + previous_batch_tokens
-                pre_batch_start_idx = num_extend_reqs_wo_previous_batch
-                pre_batch_end_idx = pre_batch_start_idx + previous_batchs
                 previous_pos_indices = torch.tensor(previous_pos_indices,
                                                     dtype=torch.int,
                                                     pin_memory=True)
-                self.previous_pos_indices_cuda[
-                    pre_tokens_start_idx:pre_tokens_end_idx].copy_(
-                        previous_pos_indices, non_blocking=True)
+                self.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
+                    previous_pos_indices, non_blocking=True)
                 self.previous_pos_id_offsets_cuda[
-                    pre_tokens_start_idx:pre_tokens_end_idx].copy_(
+                    0:previous_batch_tokens].copy_(
                         new_tokens_lens_device[self.previous_pos_indices_cuda[
-                            pre_tokens_start_idx:pre_tokens_end_idx]],
+                            0:previous_batch_tokens]],
                         non_blocking=True)
-                self.previous_kv_lens_offsets_cuda[
-                    pre_batch_start_idx:pre_batch_end_idx].copy_(
-                        kv_len_offsets_device[
-                            self.previous_batch_indices_cuda[:previous_batchs]],
-                        non_blocking=True)
+                self.previous_kv_lens_offsets_cuda[0:previous_batchs].copy_(
+                    kv_len_offsets_device[
+                        self.previous_batch_indices_cuda[:previous_batchs]],
+                    non_blocking=True)
                 # for the requests that do not have previous batch, set the previous_pos_id_offsets and
                 # previous_kv_lens_offsets to zeros to skip the value changes in _preprocess_inputs
-                self.previous_pos_id_offsets_cuda[:pre_tokens_start_idx] *= 0
-                self.previous_kv_lens_offsets_cuda[:pre_batch_start_idx] *= 0
+                self.previous_pos_id_offsets_cuda[
+                    previous_batch_tokens:num_requests *
+                    (1 + self.max_draft_len)] *= 0
+                self.previous_kv_lens_offsets_cuda[
+                    previous_batchs:num_requests] *= 0
             else:
                 # change the data to zeros to skip the value changes in _preprocess_inputs
                 self.previous_pos_id_offsets_cuda *= 0
@@ -1946,6 +1983,15 @@ class PyTorchModelEngine(ModelEngine):
         else:
             spec_metadata = None
 
+        moe_load_balancer = None
+        if hasattr(self, 'moe_load_balancer'):
+            moe_load_balancer = getattr(self, 'moe_load_balancer')
+            if not self.in_warmup:
+                moe_enable_statistic = True
+                moe_enable_update = True
+                moe_load_balancer.set_next_iter_info(moe_enable_statistic,
+                                                     moe_enable_update)
+
         if kv_cache_manager is None:
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
                 scheduled_requests, attn_metadata, spec_metadata)
@@ -1953,7 +1999,9 @@ class PyTorchModelEngine(ModelEngine):
                 inputs.update(extra_model_inputs)
             self.last_spec_metadata = spec_metadata
 
-            return self._forward_step(inputs, gather_ids, gather_context_logits)
+            with MoeLoadBalancerIterContext(moe_load_balancer):
+                return self._forward_step(inputs, gather_ids,
+                                          gather_context_logits)
 
         with self._maybe_pad_batch(scheduled_requests,
                                    kv_cache_manager) as scheduled_requests:
@@ -1980,21 +2028,32 @@ class PyTorchModelEngine(ModelEngine):
             self.iter_counter += 1
 
             if maybe_graph is None:
-                outputs = self._forward_step(inputs, gather_ids,
-                                             gather_context_logits)
+                with MoeLoadBalancerIterContext(moe_load_balancer):
+                    outputs = self._forward_step(inputs, gather_ids,
+                                                 gather_context_logits)
             else:
                 if maybe_graph.needs_capture():
+
+                    def capture_forward_fn(inputs: Dict[str, Any]):
+                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                            return self._forward_step(
+                                inputs,
+                                gather_ids=gather_ids,
+                                gather_context_logits=gather_context_logits)
+
                     pool = maybe_graph.capture(
-                        lambda inputs: self._forward_step(
-                            inputs,
-                            gather_ids=gather_ids,
-                            gather_context_logits=gather_context_logits),
+                        capture_forward_fn,
                         self._cuda_graph_mem_pool,
                         extra_model_inputs,
                     )
                     self._cuda_graph_mem_pool = pool
 
-                outputs = maybe_graph.run(inputs, extra_model_inputs)
+                    # here we don't need to use context since cuda graph capture didn't run kernel.
+                    # maybe we need a cleaner way to do this.
+                    outputs = maybe_graph.run(inputs, extra_model_inputs)
+                else:
+                    with MoeLoadBalancerIterContext(moe_load_balancer):
+                        outputs = maybe_graph.run(inputs, extra_model_inputs)
 
             # Note: To overlap the CPU and GPU computation as much as possible,
             # guided_decoder.build should be called immediately after the launch of the single step;
