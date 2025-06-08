@@ -212,7 +212,7 @@ Based on the detailed analysis and study in section [Motivation of large-scale E
 * The hot EP rank will consume more memory (for activations) which can limit the effective max batch size scheduled during the inference process.
 * More data will be sent to/received from the hot EP rank.
 
-Those isses can clearly result into a system-level congestion effect in which the hot EP rank will delay the overall E2E execution.
+Those issues can clearly result into a system-level congestion effect in which the hot EP rank will delay the overall E2E execution.
 
 To make sure large-scale EP can run well, careful considerations are needed to minimize the EP imbalance issue. The overall design is as follows:
 
@@ -317,7 +317,7 @@ Now let’s talk a little bit more about the optimizations introduced into the c
 In the Decoding Phase with Prefill-Decoding (PD) separation, we observed that the batch size may not be very large, such that latency is a significant concern. In this context, compatibility with CUDA Graph is a strong requirement.
 [NCCL](https://github.com/NVIDIA/nccl) is a great GPU communication library which provides highly efficient communication kernels and primitives.
 For now, its Send and Recv operations require the data size to be explicitly specified when invoking with `ncclSend`/`ncclRecv`.
-However, in large expert parallel (large-EP) scenarios, the data size to be transfered is determined dynamically based on the model's output at each iteration.
+However, in large expert parallel (large-EP) scenarios, the data size to be transferred is determined dynamically based on the model's output at each iteration.
 With the current NCCL's communication interface, an explicit synchronization is required to send the communication size back to the CPU and launch NCCL calls from the CPU with the corresponding data size. This would break CUDA Graph compatibility.
 This limitation has forced us to develop high performance communication kernels compatible with CUDA graph and that can accept communication sizes directly from GPU memory.
 We also wanted those kernels, for GB200, to take of advantage of the MNNVL's memory bandwidth.
