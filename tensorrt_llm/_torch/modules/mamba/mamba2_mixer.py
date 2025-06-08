@@ -157,11 +157,6 @@ class Mamba2Mixer(nn.Module):
         mamba_metadata: Mamba2Metadata,
     ) -> torch.Tensor:
 
-        # warm up does not prepare resources, there are two warmup requests
-        is_warmup = attn_metadata.kv_cache_manager is None or attn_metadata.request_ids == [
-            0
-        ]
-
         # calculate split size
         num_prefills = attn_metadata.num_contexts
         num_decodes = attn_metadata.seq_lens.shape[0] - num_prefills
@@ -170,20 +165,22 @@ class Mamba2Mixer(nn.Module):
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         batch_split_size = [num_prefills, num_decodes]
 
-        # handle warm up request
-        if not is_warmup:
-            state_indices_p, state_indices_d = torch.split(
-                attn_metadata.kv_cache_manager.get_state_indices(),
-                batch_split_size)
-            conv_states = attn_metadata.kv_cache_manager.get_conv_states(
-                self.layer_idx)
-            ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
-                self.layer_idx)
-        else:
-            state_indices_p = None
-            state_indices_d = None
-            conv_states = None
-            ssm_states = None
+        state_indices = attn_metadata.kv_cache_manager.get_state_indices()
+
+        # warm up does not prepare resources, so no relevant state indices
+        is_warmup = state_indices.numel() == 0
+        if is_warmup:
+            # in this case, assume batch takes first indices in mamba cache
+            state_indices = torch.arange(num_prefills + num_decodes,
+                                         device=state_indices.device,
+                                         dtype=state_indices.dtype)
+
+        state_indices_p, state_indices_d = torch.split(state_indices,
+                                                       batch_split_size)
+        conv_states = attn_metadata.kv_cache_manager.get_conv_states(
+            self.layer_idx)
+        ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
+            self.layer_idx)
 
         # in_proj
         zxbcdt = self.in_proj(hidden_states)
@@ -247,8 +244,7 @@ class Mamba2Mixer(nn.Module):
             out.append(rearrange(y, "b l h p -> (b l) (h p)"))
 
             # copy new ssm state
-            if not is_warmup:
-                ssm_states[state_indices_p] = current_ssm_states
+            ssm_states[state_indices_p] = current_ssm_states
 
         if num_decodes > 0:
             xbc_d = causal_conv1d_update(xbc_d,
