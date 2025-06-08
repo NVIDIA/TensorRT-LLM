@@ -1,5 +1,6 @@
 import bisect
 import contextlib
+import functools
 import gc
 import glob
 import inspect
@@ -11,6 +12,7 @@ import traceback
 import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 import psutil
@@ -47,6 +49,8 @@ from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
+from ..modules.fused_moe.moe_load_balancer import (
+    MoeLoadBalancer, MoeLoadBalancerIterContext, maybe_create_moe_load_balancer)
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
 from ..utils import (get_model_extra_attrs, set_torch_compiling,
                      with_model_extra_attrs)
@@ -323,6 +327,8 @@ class PyTorchModelEngine(ModelEngine):
         # py_executor.py for how this is used.
         self.last_spec_metadata = None
 
+        self.in_warmup = False
+
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
 
@@ -470,6 +476,25 @@ class PyTorchModelEngine(ModelEngine):
             hidden_size=self.model.config.hidden_size,
             dtype=torch_dtype_to_str(self.model.config.torch_dtype))
 
+    @contextmanager
+    def set_warmup_flag(self):
+        self.in_warmup = True
+        try:
+            yield
+        finally:
+            self.in_warmup = False
+
+    @staticmethod
+    def with_warmup_flag(method):
+
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            with self.set_warmup_flag():
+                return method(self, *args, **kwargs)
+
+        return wrapper
+
+    @with_warmup_flag
     def warmup(self, resource_manager: ResourceManager) -> None:
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -962,7 +987,8 @@ class PyTorchModelEngine(ModelEngine):
                     getattr(config.pretrained_config,
                             sub_config).num_hidden_layers = num_layers
 
-        with timing("Model init total"):
+        with timing("Model init total"), maybe_create_moe_load_balancer(
+                config, self.mapping) as moe_load_balancer:
             try:
                 with MetaInitMode():
                     model = AutoModelForCausalLM.from_config(config)
@@ -1016,6 +1042,13 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
+
+            if isinstance(moe_load_balancer, MoeLoadBalancer):
+                setattr(self, "moe_load_balancer", moe_load_balancer)
+                moe_load_balancer.register_weight_slots_after_to_cuda()
+                logger.info("moe_load_balancer finalizing model...")
+                moe_load_balancer.finalize_model()
+                logger.info("moe_load_balancer finalize model done")
 
             torch.cuda.current_stream().synchronize()
         return model
@@ -1950,6 +1983,15 @@ class PyTorchModelEngine(ModelEngine):
         else:
             spec_metadata = None
 
+        moe_load_balancer = None
+        if hasattr(self, 'moe_load_balancer'):
+            moe_load_balancer = getattr(self, 'moe_load_balancer')
+            if not self.in_warmup:
+                moe_enable_statistic = True
+                moe_enable_update = True
+                moe_load_balancer.set_next_iter_info(moe_enable_statistic,
+                                                     moe_enable_update)
+
         if kv_cache_manager is None:
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
                 scheduled_requests, attn_metadata, spec_metadata)
@@ -1957,7 +1999,9 @@ class PyTorchModelEngine(ModelEngine):
                 inputs.update(extra_model_inputs)
             self.last_spec_metadata = spec_metadata
 
-            return self._forward_step(inputs, gather_ids, gather_context_logits)
+            with MoeLoadBalancerIterContext(moe_load_balancer):
+                return self._forward_step(inputs, gather_ids,
+                                          gather_context_logits)
 
         with self._maybe_pad_batch(scheduled_requests,
                                    kv_cache_manager) as scheduled_requests:
@@ -1984,21 +2028,32 @@ class PyTorchModelEngine(ModelEngine):
             self.iter_counter += 1
 
             if maybe_graph is None:
-                outputs = self._forward_step(inputs, gather_ids,
-                                             gather_context_logits)
+                with MoeLoadBalancerIterContext(moe_load_balancer):
+                    outputs = self._forward_step(inputs, gather_ids,
+                                                 gather_context_logits)
             else:
                 if maybe_graph.needs_capture():
+
+                    def capture_forward_fn(inputs: Dict[str, Any]):
+                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                            return self._forward_step(
+                                inputs,
+                                gather_ids=gather_ids,
+                                gather_context_logits=gather_context_logits)
+
                     pool = maybe_graph.capture(
-                        lambda inputs: self._forward_step(
-                            inputs,
-                            gather_ids=gather_ids,
-                            gather_context_logits=gather_context_logits),
+                        capture_forward_fn,
                         self._cuda_graph_mem_pool,
                         extra_model_inputs,
                     )
                     self._cuda_graph_mem_pool = pool
 
-                outputs = maybe_graph.run(inputs, extra_model_inputs)
+                    # here we don't need to use context since cuda graph capture didn't run kernel.
+                    # maybe we need a cleaner way to do this.
+                    outputs = maybe_graph.run(inputs, extra_model_inputs)
+                else:
+                    with MoeLoadBalancerIterContext(moe_load_balancer):
+                        outputs = maybe_graph.run(inputs, extra_model_inputs)
 
             # Note: To overlap the CPU and GPU computation as much as possible,
             # guided_decoder.build should be called immediately after the launch of the single step;

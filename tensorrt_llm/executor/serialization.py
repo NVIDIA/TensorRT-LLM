@@ -18,6 +18,7 @@ BASE_ZMQ_CLASSES = {
     "llmapi.run_llm_with_postproc": ["perform_faked_oai_postprocess"
                                      ],  # only used in tests
     ### starting import of torch models classes. They are used in test_llm_multi_gpu.py.
+    "tensorrt_llm._torch.model_config": ["MoeLoadBalancerConfig"],
     "tensorrt_llm._torch.models.modeling_bert":
     ["BertForSequenceClassification"],
     "tensorrt_llm._torch.models.modeling_clip": ["CLIPVisionModel"],
@@ -48,6 +49,7 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm._torch.models.modeling_siglip": ["SiglipVisionModel"],
     "tensorrt_llm._torch.models.modeling_vila": ["VilaModel"],
     ### ending import of torch models classes
+    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm._torch.pyexecutor.llm_request":
     ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
     "tensorrt_llm._torch.speculative.mtp": ["MTPConfig"],
@@ -58,13 +60,13 @@ BASE_ZMQ_CLASSES = {
     ["ClusterInfo", "MathThroughput"],
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm.bindings.executor": [
-        "BatchingType", "CapacitySchedulerPolicy", "ContextPhaseParams",
+        "BatchingType", "CacheTransceiverConfig", "CapacitySchedulerPolicy",
+        "ContextPhaseParams", "ContextChunkingPolicy", "DynamicBatchConfig",
         "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
         "FinishReason", "KvCacheConfig", "KvCacheTransferMode",
         "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
-        "SchedulerConfig", "DynamicBatchConfig", "ContextChunkingPolicy",
-        "CacheTransceiverConfig"
+        "SchedulerConfig"
     ],
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig"],
     "tensorrt_llm._torch.model_config": ["MoeLoadBalancerConfig"],
