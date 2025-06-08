@@ -16,10 +16,10 @@
  */
 
 #include "tensorrt_llm/batch_manager/guidedDecoder.h"
+#include "tensorrt_llm/batch_manager/llguidanceFactory.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/xgrammarFactory.h"
 #include "tensorrt_llm/kernels/logitsBitmask.h"
-
-#include <xgrammar/xgrammar.h>
 
 using namespace tensorrt_llm::runtime;
 
@@ -35,35 +35,30 @@ GuidedDecoder::GuidedDecoder(executor::GuidedDecodingConfig const& guidedDecodin
     , mLogitsDtype{logitsDtype}
     , mCopyBufferManager{std::make_shared<CudaStream>()}
 {
-    if (mGuidedDecodingBackend == executor::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR)
+    switch (mGuidedDecodingBackend)
     {
-        mXGrammarMatchers.resize(mMaxNumSequences);
-        auto const& tokenizerStr = guidedDecodingConfig.getTokenizerStr();
-        if (tokenizerStr)
-        {
-            auto const& tokenizerInfo = xgrammar::TokenizerInfo::FromHuggingFace(
-                guidedDecodingConfig.getEncodedVocab().value(), guidedDecodingConfig.getTokenizerStr().value(),
-                mVocabSizePadded, guidedDecodingConfig.getStopTokenIds());
-            mXGrammarCompiler = std::make_shared<xgrammar::GrammarCompiler>(tokenizerInfo);
-        }
-        else
-        {
-            auto const& tokenizerInfo = xgrammar::TokenizerInfo(guidedDecodingConfig.getEncodedVocab().value(),
-                xgrammar::VocabType::RAW, mVocabSizePadded, guidedDecodingConfig.getStopTokenIds());
-            mXGrammarCompiler = std::make_shared<xgrammar::GrammarCompiler>(tokenizerInfo);
-        }
-
-        auto const logitsPtrDtype = BufferDataType{mLogitsDtype, false, true};
-        auto constexpr bitmaskDtype = TRTDataType<BitmaskT>::value;
-        auto constexpr bitmaskPtrDtype = TRTDataType<BitmaskT*>::value;
-
-        mLogitsBitmask = runtimeBufferManager.gpu(ITensor::makeShape({mMaxNumSequences, mBitmaskSize}), bitmaskDtype);
-        mLogitsBitmaskHost = BufferManager::pinned(ITensor::makeShape({mMaxNumSequences, mBitmaskSize}), bitmaskDtype);
-        mLogitsBitmaskPtrVec = runtimeBufferManager.gpu(ITensor::makeShape({mMaxNumSequences}), bitmaskPtrDtype);
-        mLogitsBitmaskPtrVecHost = BufferManager::pinned(ITensor::makeShape({mMaxNumSequences}), bitmaskPtrDtype);
-        mLogitsPtrVec = runtimeBufferManager.gpu(ITensor::makeShape({mMaxNumSequences}), logitsPtrDtype);
-        mLogitsPtrVecHost = BufferManager::pinned(ITensor::makeShape({mMaxNumSequences}), logitsPtrDtype);
+    case executor::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR:
+    {
+        mGrammarMatcherFactory = std::make_shared<XGrammarMatcherFactory>(guidedDecodingConfig, mVocabSizePadded);
+        break;
     }
+    case executor::GuidedDecodingConfig::GuidedDecodingBackend::kLLGUIDANCE:
+    {
+        mGrammarMatcherFactory = std::make_shared<LLGuidanceMatcherFactory>(guidedDecodingConfig, mVocabSizePadded);
+        break;
+    }
+    }
+
+    auto const logitsPtrDtype = BufferDataType{mLogitsDtype, false, true};
+    auto constexpr bitmaskDtype = TRTDataType<BitmaskT>::value;
+    auto constexpr bitmaskPtrDtype = TRTDataType<BitmaskT*>::value;
+
+    mLogitsBitmask = runtimeBufferManager.gpu(ITensor::makeShape({mMaxNumSequences, mBitmaskSize}), bitmaskDtype);
+    mLogitsBitmaskHost = BufferManager::pinned(ITensor::makeShape({mMaxNumSequences, mBitmaskSize}), bitmaskDtype);
+    mLogitsBitmaskPtrVec = runtimeBufferManager.gpu(ITensor::makeShape({mMaxNumSequences}), bitmaskPtrDtype);
+    mLogitsBitmaskPtrVecHost = BufferManager::pinned(ITensor::makeShape({mMaxNumSequences}), bitmaskPtrDtype);
+    mLogitsPtrVec = runtimeBufferManager.gpu(ITensor::makeShape({mMaxNumSequences}), logitsPtrDtype);
+    mLogitsPtrVecHost = BufferManager::pinned(ITensor::makeShape({mMaxNumSequences}), logitsPtrDtype);
 }
 
 void GuidedDecoder::build(ScheduledRequests const& scheduledRequests)
@@ -84,36 +79,13 @@ void GuidedDecoder::build(ScheduledRequests const& scheduledRequests)
                     && llmReq->getContextCurrentPosition() == llmReq->getPrepopulatedPromptLen())
                 {
                     // The request is in the first context forward step (considering kv cache reuse).
-                    auto const& guideType = guidedDecodingParams->getGuideType();
-                    auto const& guide = guidedDecodingParams->getGuide();
-                    if (guideType == executor::GuidedDecodingParams::GuideType::kJSON)
-                    {
-                        mXGrammarMatchers.at(seqSlot) = std::make_shared<xgrammar::GrammarMatcher>(
-                            mXGrammarCompiler->CompileBuiltinJSONGrammar());
-                    }
-                    else if (guideType == executor::GuidedDecodingParams::GuideType::kJSON_SCHEMA)
-                    {
-                        mXGrammarMatchers.at(seqSlot) = std::make_shared<xgrammar::GrammarMatcher>(
-                            mXGrammarCompiler->CompileJSONSchema(guide.value()));
-                    }
-                    else if (guideType == executor::GuidedDecodingParams::GuideType::kREGEX)
-                    {
-                        auto const& grammar = xgrammar::Grammar::FromRegex(guide.value());
-                        mXGrammarMatchers.at(seqSlot)
-                            = std::make_shared<xgrammar::GrammarMatcher>(mXGrammarCompiler->CompileGrammar(grammar));
-                    }
-                    else if (guideType == executor::GuidedDecodingParams::GuideType::kEBNF_GRAMMAR)
-                    {
-                        auto const& grammar = xgrammar::Grammar::FromEBNF(guide.value());
-                        mXGrammarMatchers.at(seqSlot)
-                            = std::make_shared<xgrammar::GrammarMatcher>(mXGrammarCompiler->CompileGrammar(grammar));
-                    }
+                    mGrammarMatchers.at(seqSlot) = mGrammarMatcherFactory->Create(*guidedDecodingParams);
                 }
                 else if (llmReq->isGenerationInProgressState())
                 {
                     // The request is in a generation forward step.
                     // Currently, guided decoding does not support with beam search.
-                    mXGrammarMatchers.at(seqSlot)->AcceptToken(llmReq->getLastTokens(0));
+                    mGrammarMatchers.at(seqSlot)->AcceptToken(llmReq->getLastTokens(0));
                 }
                 else
                 {
@@ -127,7 +99,7 @@ void GuidedDecoder::build(ScheduledRequests const& scheduledRequests)
                 std::array<int64_t, 1> bitmaskShape{mBitmaskSize};
                 DLTensor logitsBitmaskDlt{logitsBitmaskHost->data(), DLDevice{kDLCPU, 0}, 1, DLDataType{kDLInt, 32, 1},
                     bitmaskShape.data(), nullptr, 0};
-                mXGrammarMatchers.at(seqSlot)->FillNextTokenBitmask(&logitsBitmaskDlt);
+                mGrammarMatchers.at(seqSlot)->FillNextTokenBitmask(&logitsBitmaskDlt);
                 mCopyBufferManager.copy(*logitsBitmaskHost, *logitsBitmask);
             }
         }
