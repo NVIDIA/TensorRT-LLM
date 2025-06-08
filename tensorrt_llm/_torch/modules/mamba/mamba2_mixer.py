@@ -19,6 +19,8 @@ import torch
 from einops import rearrange, repeat
 from torch import nn
 
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+
 from ...attention_backend import AttentionMetadata
 from ...model_config import ModelConfig
 from ..linear import Linear, TensorParallelMode
@@ -152,6 +154,7 @@ class Mamba2Mixer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        mamba_metadata: Mamba2Metadata,
     ) -> torch.Tensor:
 
         # warm up does not prepare resources, there are two warmup requests
@@ -197,10 +200,8 @@ class Mamba2Mixer(nn.Module):
 
         if num_prefills > 0:
 
-            cu_seqlens = attn_metadata.kv_cache_manager.get_cu_seqlens(
-            )[:num_prefills + 1]
-            seq_idx = attn_metadata.kv_cache_manager.get_seq_idx(
-            ) if not is_warmup else None
+            cu_seqlens = mamba_metadata.cu_seqlens[:num_prefills + 1]
+            seq_idx = mamba_metadata.seq_idx
 
             xbc_p = causal_conv1d_fn(xbc_p.transpose(0, 1),
                                      self.conv1d.weight,
