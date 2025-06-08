@@ -2200,35 +2200,43 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         blocksSecondary.push_back(blocksInSecondaryPool);
     }
 
-    std::vector<SizeType32> localWindowSizes;
-    localWindowSizes.reserve(windowSizeToLayers.size());
+    std::vector<SizeType32> windowSizes;
+    windowSizes.reserve(windowSizeToLayers.size());
     for (auto const& [k, _] : windowSizeToLayers)
     {
-        localWindowSizes.push_back(k);
+        windowSizes.push_back(k);
     }
     if (worldConfig.getSize() > 1)
     {
         TLLM_CHECK(worldConfig.validMpiConfig());
+        auto const rank = worldConfig.getRank();
+        using tensorrt_llm::common::vec2str;
         TLLM_CHECK_WITH_INFO(isSortedVectorIdenticalAcrossAllRanks(
-                                 worldConfig, localWindowSizes), // sorted thanks to windowSizeToLayers being a std::map
+                                 worldConfig, windowSizes), // sorted thanks to windowSizeToLayers being a std::map
             "[RANK %d] Asymmetrical pipeline parallelism detected: Ranks either have a different number of window "
             "sizes, or differing values. This is not supported with Variable Sliding Window Attention. Local window "
             "sizes for reference: %s",
-            worldConfig.getRank(), tensorrt_llm::common::vec2str(localWindowSizes).c_str());
-
+            rank, vec2str(windowSizes).c_str());
+        TLLM_LOG_INFO(
+            "[RANK %d] Before mpi::MpiOp::MIN reduction: window sizes %s / primary blocks %s / secondary blocks %s",
+            rank, vec2str(windowSizes).c_str(), vec2str(blocksPrimary).c_str(), vec2str(blocksSecondary).c_str());
         // make sure all ranks use same value for max blocks
-        auto const numBlocks = blocksPrimary.size();
-        std::vector<int64_t> blocksWorld(numBlocks, 0);
+        auto blocksWorld = blocksPrimary;
         COMM_SESSION.allreduce(
-            blocksPrimary.data(), blocksWorld.data(), numBlocks, mpi::MpiType::kINT64, mpi::MpiOp::MIN);
+            blocksPrimary.data(), blocksWorld.data(), windowSizes.size(), mpi::MpiType::kINT32, mpi::MpiOp::MIN);
+        blocksPrimary = blocksWorld;
         COMM_SESSION.allreduce(
-            blocksSecondary.data(), blocksWorld.data(), numBlocks, mpi::MpiType::kINT64, mpi::MpiOp::MIN);
+            blocksSecondary.data(), blocksWorld.data(), windowSizes.size(), mpi::MpiType::kINT32, mpi::MpiOp::MIN);
+        blocksSecondary = blocksWorld;
+        TLLM_LOG_INFO(
+            "[RANK %d] After mpi::MpiOp::MIN reduction: window sizes %s / primary blocks %s / secondary blocks %s",
+            rank, vec2str(windowSizes).c_str(), vec2str(blocksPrimary).c_str(), vec2str(blocksSecondary).c_str());
     }
 
     BlocksPerWindow windowSizeToBlocks;
-    for (size_t i = 0; i < localWindowSizes.size(); ++i)
+    for (size_t i = 0; i < windowSizes.size(); ++i)
     {
-        auto const windowSize = localWindowSizes.at(i);
+        auto const windowSize = windowSizes.at(i);
         windowSizeToBlocks[windowSize] = {blocksPrimary.at(i), blocksSecondary.at(i)};
     }
     return windowSizeToBlocks;
