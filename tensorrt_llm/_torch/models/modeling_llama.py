@@ -1242,8 +1242,6 @@ class Eagle3LlamaDraftModel(DecoderModel):
 
         hidden_states, hidden_states_to_save = self.norm(
             hidden_states, residual)
-        if self.spec_config.spec_dec_mode.is_eagle3():
-            spec_metadata.maybe_capture_hidden_states(1, hidden_states_to_save)
         return hidden_states, hidden_states_to_save
 
 
