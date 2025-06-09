@@ -23,6 +23,7 @@ import torch.nn.functional as F
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import getSMVersion
 
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
@@ -574,7 +575,11 @@ def quant_dequant_per_tensor_fp8(a):
                                          (72, 1, 1, 6), (256, 8, 4, 8)])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
-def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
+@pytest.mark.parametrize("use_autotune", [True, False],
+                         ids=["autotune", "no_autotune"])
+def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
+                 use_autotune):
+
     torch.random.manual_seed(0)
 
     #
@@ -625,11 +630,12 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
                     scores, gemm1_weights, gemm1_scales, None, gemm2_weights,
                     gemm2_scales, None, permute_info, False)
 
-    output = torch.ops.trtllm.fp8_block_scale_moe_runner(
-        expert_logits, routing_bias, hidden_states, hidden_states_scale,
-        gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales, num_experts,
-        top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
-        routed_scaling, tile_tokens_dim, routing_method_type)
+    with autotune(use_autotune):
+        output = torch.ops.trtllm.fp8_block_scale_moe_runner(
+            expert_logits, routing_bias, hidden_states, hidden_states_scale,
+            gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales,
+            num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
+            num_experts, routed_scaling, tile_tokens_dim, routing_method_type)
 
     output_dequant_actual = output.to(torch.float)
     #
