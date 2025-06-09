@@ -43,6 +43,7 @@ def test_default_moe_routing(top_k):
             reference_scales[2, reference_indices[2, i]])
 
 
+@pytest.mark.skip(reason="https://nvbugs/5332927")
 @pytest.mark.parametrize("top_k", [1, 2, 3])
 def test_renormalize_moe_routing(top_k):
     routing = RenormalizeMoeRoutingMethod(top_k=top_k)

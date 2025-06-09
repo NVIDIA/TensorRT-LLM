@@ -369,6 +369,12 @@ def executor_request_to_llm_request(
         is None else executor_request.prompt_tuning_config.embedding_table,
         prompt_vocab_size=None if executor_request.prompt_tuning_config is None
         else executor_request.prompt_tuning_config.embedding_table.shape[0],
+        multimodal_hashes=None if executor_request.multimodal_input is None else
+        executor_request.multimodal_input.multimodal_hashes,
+        multimodal_positions=None if executor_request.multimodal_input is None
+        else executor_request.multimodal_input.multimodal_positions,
+        multimodal_lengths=None if executor_request.multimodal_input is None
+        else executor_request.multimodal_input.multimodal_lengths,
         multimodal_embedding=None if executor_request.multimodal_embedding
         is None else executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
