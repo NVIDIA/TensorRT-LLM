@@ -705,7 +705,7 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
             torch.ones_like(module.fc31_act_scale) *
             (1 / all_w3_w1_input_scales_max))
         module.fc31_alpha.data.copy_((torch.ones_like(module.fc31_alpha) *
-                                    all_w3_w1_input_scales_max).float())
+                                      all_w3_w1_input_scales_max).float())
 
         all_w3_scales = [
             load_weight_shard(weights[f"{expert_id}.w3.weight_scale_inv"],
@@ -746,9 +746,10 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         all_w2_input_scales_max = torch.stack(all_w2_input_scales).to(
             module.dtype).max()
         module.fc2_act_scale.data.copy_(
-            torch.ones_like(module.fc2_act_scale) * (1 / all_w2_input_scales_max))
-        module.fc2_alpha.data.copy_(
-            (torch.ones_like(module.fc2_alpha) * all_w2_input_scales_max).float())
+            torch.ones_like(module.fc2_act_scale) *
+            (1 / all_w2_input_scales_max))
+        module.fc2_alpha.data.copy_((torch.ones_like(module.fc2_alpha) *
+                                     all_w2_input_scales_max).float())
 
         all_w2_scales = [
             load_weight_shard(weights[f"{expert_id}.w2.weight_scale_inv"],
