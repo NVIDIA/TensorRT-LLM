@@ -25,7 +25,7 @@ namespace kernels
 namespace cuda_core_gemm
 {
 template <typename InputType, typename OutputType, SizeType32 TILE_M, SizeType32 TILE_N, SizeType32 BLOCK_SIZE>
-__global__ void cudaCoreGemm(InputType const* __restrict__ act, InputType const* __restrict__ weight, float alpha,
+__device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType const* __restrict__ weight, float alpha,
     OutputType* __restrict__ output, SizeType32 m, SizeType32 n, SizeType32 k)
 {
     using VecType = int4;
@@ -130,6 +130,24 @@ __global__ void cudaCoreGemm(InputType const* __restrict__ act, InputType const*
 }
 
 template <typename InputType, typename OutputType, SizeType32 TILE_M, SizeType32 TILE_N, SizeType32 BLOCK_SIZE>
+__global__ void cudaCoreGemmV2(InputType const* __restrict__ act, InputType const* __restrict__ weight,
+    float const* __restrict__ scale_a, float const* __restrict__ scale_b, OutputType* __restrict__ output, SizeType32 m,
+    SizeType32 n, SizeType32 k)
+{
+    float alpha = scale_a[0] * scale_b[0];
+    cudaCoreGemmImpl<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE>(reinterpret_cast<InputType const*>(act),
+        reinterpret_cast<InputType const*>(weight), alpha, reinterpret_cast<OutputType*>(output), m, n, k);
+}
+
+template <typename InputType, typename OutputType, SizeType32 TILE_M, SizeType32 TILE_N, SizeType32 BLOCK_SIZE>
+__global__ void cudaCoreGemm(InputType const* __restrict__ act, InputType const* __restrict__ weight, float alpha,
+    OutputType* __restrict__ output, SizeType32 m, SizeType32 n, SizeType32 k)
+{
+    cudaCoreGemmImpl<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE>(reinterpret_cast<InputType const*>(act),
+        reinterpret_cast<InputType const*>(weight), alpha, reinterpret_cast<OutputType*>(output), m, n, k);
+}
+
+template <typename InputType, typename OutputType, SizeType32 TILE_M, SizeType32 TILE_N, SizeType32 BLOCK_SIZE>
 void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
 {
     dim3 block(BLOCK_SIZE);
@@ -150,16 +168,37 @@ void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
         kernelConfig.attrs = attribute;
         kernelConfig.numAttrs = 1;
 
-        TLLM_CUDA_CHECK(
-            cudaLaunchKernelEx(&kernelConfig, cudaCoreGemm<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE>,
-                reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
-                params.alpha, reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k));
+        if (params.scale_a && params.scale_b)
+        {
+            TLLM_CUDA_CHECK(
+                cudaLaunchKernelEx(&kernelConfig, cudaCoreGemmV2<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE>,
+                    reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
+                    params.scale_a, params.scale_b, reinterpret_cast<OutputType*>(params.output), params.m, params.n,
+                    params.k));
+        }
+        else
+        {
+            TLLM_CUDA_CHECK(
+                cudaLaunchKernelEx(&kernelConfig, cudaCoreGemm<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE>,
+                    reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
+                    params.alpha, reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k));
+        }
     }
     else
     {
-        cudaCoreGemm<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE><<<grid, block, 0, stream>>>(
-            reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
-            params.alpha, reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k);
+        if (params.scale_a && params.scale_b)
+        {
+            cudaCoreGemmV2<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE>
+                <<<grid, block, 0, stream>>>(reinterpret_cast<InputType const*>(params.act),
+                    reinterpret_cast<InputType const*>(params.weight), params.scale_a, params.scale_b,
+                    reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k);
+        }
+        else
+        {
+            cudaCoreGemm<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE><<<grid, block, 0, stream>>>(
+                reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
+                params.alpha, reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k);
+        }
     }
 }
 
@@ -191,6 +230,24 @@ bool cudaCoreGemmDispatcher(Params const& params, cudaStream_t stream)
     if (params.n % 2 != 0)
     {
         dispatched = false;
+    }
+    else if (params.use_torch_flow)
+    {
+        if (params.torchInputType == CUDA_R_8F_E4M3)
+        {
+            if (params.torchOutputType == CUDA_R_32F)
+            {
+                dispatched = cudaCoreGemmLauncher<__nv_fp8_e4m3, float>(params, stream);
+            }
+            else if (params.torchOutputType == CUDA_R_16F)
+            {
+                dispatched = cudaCoreGemmLauncher<__nv_fp8_e4m3, half>(params, stream);
+            }
+            else if (params.torchOutputType == CUDA_R_16BF)
+            {
+                dispatched = cudaCoreGemmLauncher<__nv_fp8_e4m3, __nv_bfloat16>(params, stream);
+            }
+        }
     }
     else if (params.inputType == nvinfer1::DataType::kFP8)
     {

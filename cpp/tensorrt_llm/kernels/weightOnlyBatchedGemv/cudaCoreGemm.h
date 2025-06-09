@@ -47,26 +47,53 @@ struct Params
 {
     void const* act;
     void const* weight;
-    float alpha;
     void* output;
     SizeType32 m, n, k;
-    tensorrt_llm::common::QuantMode quantMode;
+    // gemmPlugin
+    float alpha;
     nvinfer1::DataType inputType;
     nvinfer1::DataType outputType;
+    // torch flow
+    bool use_torch_flow;
+    float const* scale_a;
+    float const* scale_b;
+    cudaDataType_t torchInputType;
+    cudaDataType_t torchOutputType;
 
+    // used by gemmPlugin
     Params(void const* _act, void const* _weight, float _alpha, void* _output, SizeType32 _m, SizeType32 _n,
-        SizeType32 _k, tensorrt_llm::common::QuantMode _quant_mode, nvinfer1::DataType _inputType,
-        nvinfer1::DataType _outputType)
+        SizeType32 _k, nvinfer1::DataType _inputType, nvinfer1::DataType _outputType)
         : act(_act)
         , weight(_weight)
-        , alpha(_alpha)
         , output(_output)
         , m(_m)
         , n(_n)
         , k(_k)
-        , quantMode(_quant_mode)
+        , alpha(_alpha)
         , inputType(_inputType)
         , outputType(_outputType)
+        , scale_a(nullptr)
+        , scale_b(nullptr)
+    {
+    }
+
+    // used by torch flow
+    Params(void const* _act, void const* _weight, void* _output, SizeType32 _m, SizeType32 _n, SizeType32 _k,
+        float const* _scale_a, float const* _scale_b, cudaDataType_t _torchInputType, cudaDataType_t _torchOutputType)
+        : act(_act)
+        , weight(_weight)
+        , output(_output)
+        , m(_m)
+        , n(_n)
+        , k(_k)
+        , alpha(1.f)
+        , inputType(nvinfer1::DataType::kFLOAT)
+        , outputType(nvinfer1::DataType::kFLOAT)
+        , use_torch_flow(true)
+        , scale_a(_scale_a)
+        , scale_b(_scale_b)
+        , torchInputType(_torchInputType)
+        , torchOutputType(_torchOutputType)
     {
     }
 };

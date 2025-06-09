@@ -393,19 +393,17 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     // TODO: sub tensor matmul is not supported in fp8 gemm cuda kernel
     if (!isArch90or100 && M <= 4 && N <= 128000 && mUseFp8 && noPadDim && cudaKernelSupportType)
     {
-        tensorrt_llm::common::QuantMode quantMode = tensorrt_llm::common::QuantMode::fromQuantAlgo("FP8");
         tensorrt_llm::kernels::cuda_core_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
-            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K, quantMode,
+            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K,
             nvinfer1::DataType::kFP8, mOutputType);
         cudaKernelFinished = tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher(params, stream);
     }
     else if (!isArch90or100 && ((mArch < 90 && M <= 6) || (isArch90or100 && M <= 2)) && N <= 128000 && !mUseFp8
         && noPadDim && cudaKernelSupportType)
     {
-        tensorrt_llm::common::QuantMode quantMode;
         tensorrt_llm::kernels::cuda_core_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
-            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K, quantMode,
-            mType, mOutputType);
+            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K, mType,
+            mOutputType);
         cudaKernelFinished = tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher(params, stream);
     }
 

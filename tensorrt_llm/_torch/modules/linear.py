@@ -300,14 +300,25 @@ class FP8QDQLinearMethod(LinearMethodBase):
             qinput = input
 
         # This op does not support bias now.
-        output = torch.ops.trtllm.cublas_scaled_mm(
-            qinput,
-            module.weight.t(),
-            scale_a=cur_input_scale,
-            scale_b=module.weight_scale,
-            bias=None,
-            out_dtype=module.dtype or input.dtype,
-        )
+        if qinput.shape[0] < 8 and self.enable_cuda_core:
+            # use cuda core for small batch size
+            output = torch.ops.trtllm.cuda_scaled_mm(
+                qinput,
+                module.weight.t(),
+                scale_a=cur_input_scale,
+                scale_b=module.weight_scale,
+                bias=None,
+                out_dtype=module.dtype or input.dtype,
+            )
+        else:
+            output = torch.ops.trtllm.cublas_scaled_mm(
+                qinput,
+                module.weight.t(),
+                scale_a=cur_input_scale,
+                scale_b=module.weight_scale,
+                bias=None,
+                out_dtype=module.dtype or input.dtype,
+            )
         if bias is not None:
             output = output + bias
         return output
@@ -820,6 +831,13 @@ class Linear(nn.Module):
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.lora = lora
+
+        self.enable_cuda_core = False
+        if torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability(
+                torch.device('cuda:0'))
+            # enable cuda core for sm89
+            self.enable_cuda_core = capability[0] == 8 and capability[1] == 9
 
         if not skip_create_weights_in_init:
             self.create_weights()
