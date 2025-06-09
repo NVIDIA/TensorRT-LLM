@@ -107,7 +107,7 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         bias = bias.contiguous() if has_bias else None
         cuda_q_weight = cuda_q_weight.cuda().contiguous()
 
-        output = torch.ops.trtllm.w4a16_gemm(
+        output = torch.ops.trtllm.finegrained_mixed_dtype_gemm(
             input=activation.to(activation_type).contiguous()
             if use_w4a8_awq else activation.contiguous(),
             weight=cuda_q_weight,

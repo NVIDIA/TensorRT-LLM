@@ -160,11 +160,15 @@ def load_weight_scales_w4a8(weights: List[Dict],
                 assert weight_scale_2 == w["weight_scale_2"][
                     ...], "The weight_scale_2 should be same for all the weights"
 
+    # Convert ModelOpt format to TensorRT-LLM format
+    # ModelOpt stores: amax/(448*6), TensorRT-LLM expects: amax/448
+    input_scale = input_scale
+
     # Compute scaling factor and alpha required by GEMM kernels
     # TODO: ModelOpt's o_proj.weight_scale_2 is bfloat16, which should be float32
     alpha = input_scale.float() * weight_scale_2.float()
     # modelopt ckpt stores amax/(448*6), convert to (448*6)/amax
-    input_scale = 1.0 / input_scale
+    # input_scale = 1.0 / input_scale # todo changed it
 
     return input_scale, weight_scale, alpha
 
@@ -520,8 +524,8 @@ class Linear(nn.Module):
                 # print(f"{torch.equal(p_input, qinput)}")
 
                 output = torch.ops.trtllm.finegrained_mixed_dtype_gemm(
-                    input=qinput,
-                    weight=self.weight,
+                    input=qinput.contiguous(),
+                    weight=self.weight.contiguous(),
                     scales=self.weight_scale.T.contiguous(),
                     group_size=qc.group_size,
                     has_zero_point=qc.has_zero_point,
