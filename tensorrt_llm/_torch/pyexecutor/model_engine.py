@@ -138,20 +138,18 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
 
 
-def _prefetch_one_file(file_name, rank):
+def _prefetch_one_file(file_name):
     if os.path.exists(file_name):
-        logger.info(f"Rank {rank} prefetching {file_name} to memory...")
+        logger.info(f"Prefetching {file_name} to memory...")
         with open(file_name, 'rb') as f:
             f.read()
-        logger.info(f"Rank {rank} finished prefetching {file_name}.")
+        logger.info(f"Finished prefetching {file_name}.")
 
 
-def prefetch_files(file_names: List[str], mapping: Mapping):
+def prefetch_files(file_names: List[str]):
     """
     Prefetch safetensors files to memory so that the weight loading will be much faster.
     When multiple ranks run in parallel, each rank will prefetch some files.
-    TODO: On systems with small memory, prefetching may cause file cache thrashing, so we may want to add some
-    heuristics about when to prefetch and when not to.
     """
 
     # Find out the files to prefetch for the current rank.
@@ -160,29 +158,26 @@ def prefetch_files(file_names: List[str], mapping: Mapping):
 
     max_processes = min(multiprocessing.cpu_count() * 2, 16)
     with multiprocessing.Pool(processes=max_processes) as pool:
-        pool.starmap(
-            _prefetch_one_file,
-            [(file_name, mapping.rank) for file_name in local_file_names],
-        )
+        pool.map(_prefetch_one_file, local_file_names)
 
 
-def load_weights(
-    checkpoint_dir: str,
-    mapping: Mapping,
-):
+def load_weights(checkpoint_dir: str):
     weights = {}
     weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
     if weight_files:
         # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
         # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
         prefetch_size = sum(os.path.getsize(file) for file in weight_files)
+        # If the layer number is overridden, it indicates that only a subset of layers are loaded.
+        # Prefetching all layers is unnecessary.
+        num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
         enable_prefetch = prefetch_size < psutil.virtual_memory(
-        ).available * 0.9
+        ).available * 0.9 and num_layers == 0
         if enable_prefetch:
             logger.info(
                 f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
             )
-            prefetch_files(weight_files, mapping)
+            prefetch_files(weight_files)
         for file in weight_files:
             logger.info(f"Loading {file}")
             part_weights = safetensors.torch.load_file(file)
@@ -1048,27 +1043,20 @@ class PyTorchModelEngine(ModelEngine):
             model.to("cuda")
             rank_model_storage = get_rank_model_storage(model)
             logger.info(
-                f"Rank {self.mapping.rank} uses {rank_model_storage / (1024**3):.2f} GB for model weights."
+                f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
 
             if load_format == LoadFormat.AUTO:
                 if hasattr(model, 'llm_checkpoint_dir'):
-                    weights = load_weights(
-                        model.llm_checkpoint_dir,
-                        self.mapping,
-                    )
+                    weights = load_weights(model.llm_checkpoint_dir)
                 else:
-                    weights = load_weights(
-                        checkpoint_dir,
-                        self.mapping,
-                    )
+                    weights = load_weights(checkpoint_dir)
 
                 model.load_weights(weights)
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
-                    weights = load_weights(self.spec_config.draft_model_path,
-                                           self.mapping)
+                    weights = load_weights(self.spec_config.draft_model_path)
                     model.load_draft_weights(weights)
 
             elif load_format == LoadFormat.DUMMY:
