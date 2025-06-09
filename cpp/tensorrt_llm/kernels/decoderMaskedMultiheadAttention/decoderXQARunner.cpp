@@ -96,8 +96,7 @@ DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParam
     }
     else
     {
-        // If no env var set, default to precompiled impl for non-MLA on sm120, otherwise default to JIT.
-        return (smVersion == 120 && !xqaParams.isMLA()) ? mPrecompiledImpl.get() : mJITImpl.get();
+        return mJITImpl.get();
     }
 }
 
