@@ -191,6 +191,9 @@ class CutlassFusedMoE(MoE):
         self.alltoall_method_type = self.select_alltoall_method_type(
             model_config.mapping, routing_method.experts_per_token, dtype,
             model_config.use_cuda_graph)
+        logger.info_once(
+            f"CutlassFusedMoE selects alltoall_method_type {self.alltoall_method_type!r}",
+            key="alltoall_method_type")
         self.use_postquant_alltoall = False
         if self.enable_alltoall:
             assert self.use_dp and self.parallel_size > 1,\
@@ -218,9 +221,6 @@ class CutlassFusedMoE(MoE):
                 raise NotImplementedError(
                     f"Not available alltoall method type: {alltoall_method_type!r}"
                 )
-        logger.info_once(
-            f"CutlassFusedMoE selects alltoall_method_type {self.alltoall_method_type!r}",
-            key="alltoall_method_type")
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
