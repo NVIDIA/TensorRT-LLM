@@ -1,7 +1,6 @@
 # Feature Matrix
 
-
-## Feature Combination
+## Feature Combination Matrix
 
 | Feature                    | Overlap Scheduler | CUDA Graph | Attention Data Parallelism | Disaggregated Serving | Chunked Prefill | MTP | EAGLE-3(One Model Engine) | EAGLE-3(Two Model Engine) | Torch Sampler | TLLM C++ Sampler |
 | -------------------------- | ----------------- | ---------- | -------------------------- | --------------------- | --------------- | --- | ------------------------- | ------------------------- | ------------- | ---------------- |
