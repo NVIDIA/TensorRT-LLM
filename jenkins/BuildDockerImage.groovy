@@ -12,7 +12,8 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
     LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
 }
 
-UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+// UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+UPLOAD_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/PipelineMonitor/L0_MergeRequest_PR/102"
 
 LLM_ROOT = "llm"
 
@@ -225,7 +226,7 @@ def buildImage(config, imageKeyToTag)
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
     def makefileStage = config.makefileStage
 
-    def tmpTag = "8166649-main-108" // TODO: remove this
+    def tmpTag = "a1db409-github-pr-4939-169" // TODO: remove this
     // def tmpTag = LLM_DEFAULT_TAG
 
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${tmpTag}"
