@@ -150,7 +150,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         moe::dev::routingLlama4::run(routingData, stream);
     }
     else if (routingMethodType == RoutingMethodType::Renormalize /* default */
-        || routingMethodType == RoutingMethodType::Qwen3 /* Softmax -> TopK */)
+        || routingMethodType == RoutingMethodType::RenormalizeNaive /* Softmax -> TopK */)
     {
         moe::dev::routingQwen3::Data routingData;
 
@@ -161,8 +161,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
         routingData.mUsePdl = true;
-        routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::Qwen3;
-        routingData.mNormTopkProb = routingMethodType == RoutingMethodType::Qwen3;
+        routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
+        routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
+
         routingData.mPtrScores = routingLogits;
 
         //
