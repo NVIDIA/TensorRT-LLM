@@ -166,12 +166,14 @@ void TopologyDetector::detectGpuTopology()
     {
         return;
     }
-    mGpuToNumaMap.clear(); // Clear before re-populating
-    mNumaToGpuMap.clear(); // Clear before re-populating
+    mGpuToNumaMap.clear();       // Clear before re-populating
+    mGpuMemoryToNumaMap.clear(); // Clear before re-populating
+    mNumaToGpuMap.clear();       // Clear before re-populating
 
     for (int deviceId = 0; deviceId < deviceCount; ++deviceId)
     {
-        int numaNode = 0; // Default NUMA node
+        int numaNode = 0;        // Default NUMA node
+        int numaMemoryNode = -1; // Default Memory NUMA node
 
 #ifdef __linux__
         if (numa_available() != -1)
@@ -214,9 +216,16 @@ void TopologyDetector::detectGpuTopology()
             // libnuma not available, default GPU to NUMA node 0
             numaNode = 0;
         }
+        int hasMemoryNumaConfig = 0;
+        TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&hasMemoryNumaConfig, cudaDevAttrNumaConfig, deviceId));
+        if (hasMemoryNumaConfig == cudaDeviceNumaConfigNumaNode)
+        {
+            TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&numaMemoryNode, cudaDevAttrNumaId, deviceId));
+        }
 #endif
 
         mGpuToNumaMap[deviceId] = numaNode;
+        mGpuMemoryToNumaMap[deviceId] = numaMemoryNode;
         mNumaToGpuMap[numaNode].push_back(deviceId);
     }
 }
@@ -392,10 +401,7 @@ int TopologyDetector::getCurrentGpuNumaCpuCount()
 int TopologyDetector::getCurrentGpuNumaId()
 {
     int currentDevice = -1;
-    if (cudaGetDevice(&currentDevice) != cudaSuccess)
-    {
-        return -1; // Indicate error or no CUDA device context
-    }
+    TLLM_CUDA_CHECK(cudaGetDevice(&currentDevice));
 
     auto it = mGpuToNumaMap.find(currentDevice);
     if (it != mGpuToNumaMap.end())
@@ -404,6 +410,21 @@ int TopologyDetector::getCurrentGpuNumaId()
     }
     TLLM_LOG_WARNING("NUMA node for current GPU %d not found in map. Defaulting to node 0.", currentDevice);
     return 0;
+}
+
+int TopologyDetector::getCurrentGpuMemoryNumaId()
+{
+    int currentDevice = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&currentDevice));
+
+    auto it = mGpuMemoryToNumaMap.find(currentDevice);
+    if (it != mGpuMemoryToNumaMap.end())
+    {
+        return it->second;
+    }
+    TLLM_LOG_WARNING(
+        "NUMA node for current GPU Memory %d not found in map. Defaulting to node -1 (No Memory Node).", currentDevice);
+    return -1;
 }
 
 int TopologyDetector::getGpuCountUnderNuma(int numaId)
@@ -419,28 +440,6 @@ int TopologyDetector::getGpuCountUnderNuma(int numaId)
 std::string TopologyDetector::getCpuArchitecture()
 {
     return mCpuArchitecture;
-}
-
-bool TopologyDetector::canSupportHostNativeAtomics()
-{
-    int currentDevice = -1;
-    if (cudaGetDevice(&currentDevice) != cudaSuccess)
-    {
-        TLLM_LOG_WARNING("Failed to get current CUDA device for atomic support check.");
-        return false;
-    }
-
-    int hostNativeAtomicSupported = 0;
-    cudaError_t err
-        = cudaDeviceGetAttribute(&hostNativeAtomicSupported, cudaDevAttrHostNativeAtomicSupported, currentDevice);
-
-    if (err != cudaSuccess)
-    {
-        TLLM_LOG_WARNING("Failed to get cudaDevAttrHostNativeAtomicSupported for device %d. Error: %s", currentDevice,
-            cudaGetErrorString(err));
-        return false;
-    }
-    return static_cast<bool>(hostNativeAtomicSupported);
 }
 
 } // namespace tensorrt_llm::runtime
