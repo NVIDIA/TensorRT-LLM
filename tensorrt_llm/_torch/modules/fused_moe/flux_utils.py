@@ -16,8 +16,8 @@ class DistEnv:
     def init_global_group(self) -> None:
         if not dist.is_initialized():
             master_ip = os.getenv("MASTER_ADDR", "localhost")
-            master_port = os.getenv("MASTER_PORT", "6000")
-            init_method = f"tcp://{master_ip}:{master_port}"
+            master_port = int(os.getenv("MASTER_PORT", "6000"))
+            init_method = f"tcp://{master_ip}:{str(master_port + self.mapping.pp_rank)}"
             dist.init_process_group(backend="nccl",
                                     init_method=init_method,
                                     world_size=self.mapping.tp_size,
@@ -57,6 +57,9 @@ def get_ep_group(mapping: Mapping):
         EP_GROUP_DICT = {}
     if mapping not in EP_GROUP_DICT:
         assert DIST_ENV is not None, f"DIST_ENV should be initialized first. Current rank is {mapping.rank}"
-        new_ep_group = DIST_ENV.new_group(mapping.moe_ep_group)
+        flux_ep_group = [
+            rank % DIST_ENV.world_size for rank in mapping.moe_ep_group
+        ]
+        new_ep_group = DIST_ENV.new_group(flux_ep_group)
         EP_GROUP_DICT[mapping] = new_ep_group
     return EP_GROUP_DICT[mapping]
