@@ -910,26 +910,23 @@ private:
         {
             strategy = AllReduceStrategyType::MIN_LATENCY;
         }
-        else if (world_size <= 4)
-        {
-            if (message_size_bytes < 1 * 1000 * 1000)
-            {
-                strategy = AllReduceStrategyType::MIN_LATENCY;
-            }
-            else
-            {
-                strategy = AllReduceStrategyType::NCCL;
-            }
-        }
         else
         {
-            if (message_size_bytes < 500 * 1000)
+            static char* threshold_ptr = std::getenv("ALLREDUCE_AUTO_HEURISTIC_MIN_LATENCY_THRESHOLD_TOKEN_NUM");
+            int threshold = 128;
+            if (threshold_ptr)
             {
-                strategy = AllReduceStrategyType::MIN_LATENCY;
+                threshold = std::atoi(threshold_ptr);
+            }
+            // Generally, NCCL is faster than MIN_LATENCY when the token number is greater than 256. I conservatively
+            // set the threshold here to 128 tokens.
+            if (seq_len > threshold)
+            {
+                strategy = AllReduceStrategyType::NCCL;
             }
             else
             {
-                strategy = AllReduceStrategyType::NCCL;
+                strategy = AllReduceStrategyType::MIN_LATENCY;
             }
         }
         return strategy;
