@@ -1294,8 +1294,6 @@ class PyTorchModelEngine(ModelEngine):
                     # We're treating the prompt lengths as context requests here, so
                     # the the prompt lens should not include the cached tokens.
                     prompt_lengths.append(1 + num_draft_tokens)
-                elif self.is_ngram:
-                    prompt_lengths.append(num_draft_tokens + 1)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
                 sequence_lengths.append(1 + num_draft_tokens)
