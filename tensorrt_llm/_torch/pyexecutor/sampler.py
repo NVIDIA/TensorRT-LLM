@@ -15,8 +15,7 @@ from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
-from tensorrt_llm.bindings.internal.algorithms import (
-    CreateNewDecoderRequests)
+from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers)
 from tensorrt_llm.bindings.internal.runtime import (BufferManager, DecoderState,
