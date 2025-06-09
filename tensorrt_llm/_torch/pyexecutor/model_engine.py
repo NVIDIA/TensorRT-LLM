@@ -292,6 +292,37 @@ def get_rank_model_storage(model):
     return total_bytes
 
 
+def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
+                                   max_batch_size: int, max_num_tokens: int,
+                                   padding_enabled: bool) -> list[int]:
+    # This is the largest possible batch size for a pure decoding batch.
+    max_cuda_graph_bs = min(max_batch_size, max_num_tokens)
+
+    result = []
+    # This function assumes cuda_graph_batch_sizes is sorted
+    for i, bs in enumerate(cuda_graph_batch_sizes):
+        if bs <= max_cuda_graph_bs:
+            result.append(bs)
+        else:
+            # One extra special case for padding. The user gave us at least
+            # one batch size to pad to which is larger than the executor's max
+            # batch size. In this case, padding to max_cuda_graph_bs is acceptable. The logic
+            # is that if the user is OK padding to a batch size B, they should also
+            # be OK with padding to some size B' < B since the performance will generally
+            # just be better in the smaller case.
+            if padding_enabled and (i == 0
+                                    or result[i - 1] != max_cuda_graph_bs):
+                logger.warning(
+                    "CUDA graph padding is enabled, but one of the given CUDA graph "
+                    f"batch sizes ({bs}) is larger than the executor's max batch size "
+                    f"({max_cuda_graph_bs}). We will pad batches to {max_cuda_graph_bs}."
+                )
+                result.append(max_cuda_graph_bs)
+            break
+
+    return result
+
+
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -421,11 +452,14 @@ class PyTorchModelEngine(ModelEngine):
         self._run_cuda_graphs = pytorch_backend_config.use_cuda_graph
 
         self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
-        self._cuda_graph_batch_sizes = [
-            bs for bs in pytorch_backend_config.cuda_graph_batch_sizes
-            if bs <= self.max_num_tokens and bs <= self.batch_size
-        ]
-        self._max_cuda_graph_batch_size = self._cuda_graph_batch_sizes[-1]
+
+        self._cuda_graph_batch_sizes = _filter_cuda_graph_batch_sizes(
+            pytorch_backend_config.cuda_graph_batch_sizes, self.batch_size,
+            self.max_num_tokens, self._cuda_graph_padding_enabled
+        ) if pytorch_backend_config.cuda_graph_batch_sizes else []
+
+        self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
+                                           self._cuda_graph_batch_sizes else 0)
 
         self.previous_batch_indices_cuda = torch.empty((self.max_num_tokens, ),
                                                        dtype=torch.int,
