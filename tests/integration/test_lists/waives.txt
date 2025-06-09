@@ -438,7 +438,6 @@ triton_server/test_triton.py::test_gpt_ib_speculative_decoding_bls[gpt-ib-specul
 triton_server/test_triton_llm.py::test_mistral_v1_multi_models[False-1-False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap-max_utilization-4096-1-1-1-False-ensemble] SKIP
 examples/test_gpt.py::test_llm_gpt2_starcoder_weight_only[starcoder2-int4-float16] SKIP (https://nvbugs/5289523)
 examples/test_gpt.py::test_llm_gpt2_starcoder_weight_only[starcoder2-int8-float16] SKIP (https://nvbugs/5289523)
-examples/test_qwen.py::test_llm_qwen_7b_int8_kv_1node_1gpus[qwen2_vl_7b_instruct-enable_gemm_plugin-enable_weight_only] SKIP (https://nvbugs/5289904)
 accuracy/test_llm_api.py::TestMixtral8x7BInstruct::test_awq_tp2 SKIP (https://nvbugs/5289907)
 accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_auto_dtype[tp8-cuda_graph=False] SKIP (https://nvbugs/5289908)
 accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_auto_dtype[tp8ep4-cuda_graph=True] SKIP (https://nvbugs/5289908)
