@@ -19,7 +19,7 @@ import pytest
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.pyexecutor.config import MoeLoadBalancerConfig
 from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
-                                 KvCacheConfig, MTPDecodingConfig,
+                                 KvCacheConfig, MoeConfig, MTPDecodingConfig,
                                  NGramDecodingConfig, SamplingParams,
                                  TorchCompileConfig)
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -729,7 +729,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
             torch_compile_config=torch_compile_config,
-            moe_backend="CUTEDSL",
+            moe_config=MoeConfig(backend="CUTEDSL"),
         )
 
         quant_config = QuantConfig()
@@ -913,7 +913,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
             torch_compile_config=torch_compile_config,
-            moe_backend="CUTEDSL",
+            moe_config=MoeConfig(backend="CUTEDSL"),
         )
 
         quant_config = QuantConfig()
@@ -964,8 +964,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             initial_global_assignments=initial_global_assignments,
             layer_updates_per_iter=0)
         pytorch_backend_options = dict(cuda_graph_config=CudaGraphConfig(),
-                                       moe_backend="WIDEEP",
-                                       moe_load_balancer=eplb_config)
+                                       moe_config=MoeConfig(
+                                           backend="WIDEEP",
+                                           load_balancer=eplb_config))
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
                   tensor_parallel_size=4,
                   moe_expert_parallel_size=4,
@@ -985,8 +986,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
                                             layer_updates_per_iter=2)
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig(),
-                              moe_backend="WIDEEP",
-                              moe_load_balancer=eplb_config)
+                              moe_config=MoeConfig(backend="WIDEEP",
+                                                   load_balancer=eplb_config))
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
@@ -1010,8 +1011,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
                                             layer_updates_per_iter=2)
         pytorch_backend_options = dict(cuda_graph_config=CudaGraphConfig(),
-                                       moe_backend="WIDEEP",
-                                       moe_load_balancer=eplb_config)
+                                       moe_config=MoeConfig(
+                                           backend="WIDEEP",
+                                           load_balancer=eplb_config))
         quant_config = QuantConfig()
         quant_config.quant_algo = QuantAlgo.NVFP4
         if fp8kv:
@@ -1054,8 +1056,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
-            moe_backend=moe_backend,
-        )
+            moe_config=MoeConfig(backend=moe_backend))
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
@@ -1117,7 +1118,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
-            moe_backend=moe_backend,
+            moe_config=MoeConfig(backend=moe_backend),
         )
 
         mtp_config = None
@@ -1359,7 +1360,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            moe_backend=moe_backend)
+            moe_config=MoeConfig(backend=moe_backend))
 
         quant_config = QuantConfig()
         quant_config.quant_algo = QuantAlgo.NVFP4
@@ -1755,7 +1756,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            moe_backend=moe_backend,
+            moe_config=MoeConfig(backend=moe_backend),
         )
 
         llm = LLM(
@@ -1840,7 +1841,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            moe_backend=moe_backend)
+            moe_config=MoeConfig(backend=moe_backend))
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         llm = LLM(
