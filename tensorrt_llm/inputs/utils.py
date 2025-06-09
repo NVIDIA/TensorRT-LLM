@@ -183,10 +183,12 @@ SUPPORTED_QWEN_MODEL_GROUP = ["qwen2_vl", "qwen2_5_vl"]
 SUPPORTED_LLAMA_MODEL_GROUP = ["mllama", "llama4"]
 SUPPORTED_LLAVA_IMAGE_MODEL_GROUP = ["llava_llama", "llava_next"]
 SUPPORTED_LLAVA_VIDEO_MODEL_GROUP = ["llava_llama"]
+SUPPORTED_HYPERCLOVAX_MODEL_GROUP = ["hyperclovax_vlm"]
 
 ALL_SUPPORTED_IMAGE_MODELS = SUPPORTED_QWEN_MODEL_GROUP \
     + SUPPORTED_LLAMA_MODEL_GROUP \
-    + SUPPORTED_LLAVA_IMAGE_MODEL_GROUP
+    + SUPPORTED_LLAVA_IMAGE_MODEL_GROUP \
+    + SUPPORTED_HYPERCLOVAX_MODEL_GROUP
 
 ALL_SUPPORTED_VIDEO_MODELS = SUPPORTED_QWEN_MODEL_GROUP \
     + SUPPORTED_LLAVA_VIDEO_MODEL_GROUP
@@ -211,6 +213,7 @@ PLACEHOLDER_PLACEMENT_MAP = {
     "llava_next": MultimodalPlaceholderPlacement.BEFORE_TEXT,
     "llama4": MultimodalPlaceholderPlacement.BEFORE_TEXT,
     "mllama": MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    "hyperclovax_vlm": MultimodalPlaceholderPlacement.AFTER_TEXT,
 }
 assert len(PLACEHOLDER_PLACEMENT_MAP) == len(ALL_SUPPORTED_MULTIMODAL_MODELS)
 
@@ -234,6 +237,11 @@ def retrieve_multimodal_placeholder(model_type: str, modality: str,
             return "<|image|>"
         elif model_type in SUPPORTED_LLAVA_IMAGE_MODEL_GROUP:
             return "<image>"
+        elif model_type in SUPPORTED_HYPERCLOVAX_MODEL_GROUP:
+            return '<im_end>\n<|im_start|>user (mime) \n{"type": "image/jpeg", "filename": ""}<|im_end|>\n' + \
+                    '<|im_start|>user (vector)\n<|dummy3|><|im_end|>\n' + \
+                    '<|im_start|>image/aux\n다음 중 ocr은 사진에서 검출된 글자이고, lens_keyword는 사진에서 추출된 keyword와 bbox 위치입니다.' + \
+                    'bbox는 0~1 사이로 정규화된 [x1, y1, x2, y2]의 형태입니다. 참고하여 답변하세요. {"ocr": "", "lens_keywords": "", "lens_local_keywords": ""}'
         raise TypeError(
             f"For image modality, only {ALL_SUPPORTED_IMAGE_MODELS} are supported but got {model_type}"
         )
@@ -412,7 +420,8 @@ def default_multimodal_input_loader(
         prompts: List[str],
         media: Union[List[str], List[List[str]]],
         image_data_format: str = "pt",
-        num_frames: int = 8) -> List[dict[str, Union[str, torch.Tensor]]]:
+        num_frames: int = 8,
+        device: str = "cuda") -> List[dict[str, Union[str, torch.Tensor]]]:
 
     def convert_to_conversation_message(prompt: str, media: Union[str,
                                                                   List[str]],
@@ -424,7 +433,7 @@ def default_multimodal_input_loader(
                 MultimodalData(modality=modality,
                                data=load_image(i,
                                                format=image_data_format,
-                                               device="cuda")) for i in media
+                                               device=device)) for i in media
             ]
         elif modality == "video":
             mm_data = [
@@ -432,7 +441,7 @@ def default_multimodal_input_loader(
                                data=load_video(i,
                                                num_frames,
                                                format=image_data_format,
-                                               device="cuda")) for i in media
+                                               device=device)) for i in media
             ]
         else:
             raise ValueError(f"Unknown modality: {modality}")
@@ -450,7 +459,9 @@ def default_multimodal_input_loader(
 
     processor = None
     if model_type not in HF_CHAT_TEMPLATE_EXCEPTIONS:
-        processor = AutoProcessor.from_pretrained(model_dir, use_fast=True)
+        processor = AutoProcessor.from_pretrained(model_dir,
+                                                  use_fast=True,
+                                                  trust_remote_code=True)
 
     inputs = []
     for prompt, media in zip(prompts, media):

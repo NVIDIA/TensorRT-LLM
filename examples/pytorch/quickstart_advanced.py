@@ -119,6 +119,10 @@ def add_llm_args(parser):
     parser.add_argument('--relaxed_topk', type=int, default=1)
     parser.add_argument('--relaxed_delta', type=float, default=0.)
 
+    # HF
+    parser.add_argument('--trust_remote_code',
+                        default=False,
+                        action='store_true')
     return parser
 
 
@@ -193,7 +197,8 @@ def setup_llm(args):
               moe_tensor_parallel_size=args.moe_tp_size,
               moe_cluster_parallel_size=args.moe_cluster_size,
               enable_chunked_prefill=args.enable_chunked_prefill,
-              speculative_config=spec_config)
+              speculative_config=spec_config,
+              trust_remote_code=args.trust_remote_code)
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,

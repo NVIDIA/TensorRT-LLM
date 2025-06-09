@@ -2008,8 +2008,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         *accuracy_inputs[modality]["media"],
         "--disable_kv_cache_reuse",
     ]
-    # NOTE
-    # Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens.
+    # NOTE: Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens for video.
     if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
                       ] and modality == "video":
         cmd.append("--max_num_tokens=16384")
