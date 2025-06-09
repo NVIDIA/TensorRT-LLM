@@ -377,7 +377,7 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
             {
                 continue;
             }
-            else if (BenchClass::FP4 && !hasDtype("fp4"))
+            else if (BenchClass::NVFP4 && !hasDtype("fp4"))
             {
                 continue;
             }
@@ -400,6 +400,10 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
             }
             else if (std::is_same_v<typename BenchClass::WeightType, __nv_bfloat16> && !hasDtype("bfloat16")
                 && !hasDtype("bf16"))
+            {
+                continue;
+            }
+            else if (BenchClass::WFP4AFP8 && !hasDtype("wfp4afp8"))
             {
                 continue;
             }
@@ -559,6 +563,7 @@ BENCHMARK_BASIC(SafeFP8, SafeFP8, half)
 #endif
 #ifdef ENABLE_FP4
 BENCHMARK_BASIC(SafeFP4, SafeFP4, half)
+BENCHMARK_BASIC(SafeFP8, SafeFP4, half)
 #endif
 
 void delayedRegisterBenchmark()
@@ -578,6 +583,7 @@ void delayedRegisterBenchmark()
 #endif
 #ifdef ENABLE_FP4
         BENCHMARK_BASIC_DO_REGISTER(SafeFP4, SafeFP4, half);
+        BENCHMARK_BASIC_DO_REGISTER(SafeFP8, SafeFP4, half);
 #endif
     }
 }
@@ -657,7 +663,7 @@ void help()
            "Useful for quick perf tests, prefer a full sweep and manually setting the tactic for more accurate "
            "results"
            "- dtypes - A list of dtypes to run this config through.\n"
-           "Allowed values are: fp8, int4, int8, float, half, bfloat16\n"
+           "Allowed values are: fp8, fp4, wfp4afp8, int4, int8, float, half, bfloat16\n"
            "If this argument is omitted all dtypes will be run. Note, not all tactics are supported for all "
            "dtypes,\n"
            "unsupported tactics will be skipped with a warning.\n"
