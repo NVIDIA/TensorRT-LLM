@@ -56,7 +56,7 @@ llm.generate(["Hello, my name is",
             "Hello, my name is"], sampling_params)
 ```
 
-When using speculative decoders such as MTP or Eagle-3, the `enable_trtllm_sampler` option is not yet supported and therefore the subset of sampling options available is more restricted. 
+When using speculative decoders such as MTP or Eagle-3, the `enable_trtllm_sampler` option is not yet supported and therefore the subset of sampling options available is more restricted.
 
 ## Developer Guide
 
