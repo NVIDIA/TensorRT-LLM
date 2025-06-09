@@ -2,8 +2,9 @@ import argparse
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
-                                 MTPDecodingConfig, NGramDecodingConfig)
+from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
+                                 KvCacheConfig, MTPDecodingConfig,
+                                 NGramDecodingConfig)
 
 example_prompts = [
     "Hello, my name is",
@@ -178,15 +179,18 @@ def setup_llm(args):
     else:
         spec_config = None
 
+    cuda_graph_config = CudaGraphConfig(
+        cuda_graph_batch_sizes=args.cuda_graph_batch_sizes,
+        cuda_graph_padding_enabled=args.cuda_graph_padding_enabled,
+    ) if args.use_cuda_graph else None
+
     llm = LLM(model=args.model_dir,
               backend='pytorch',
               disable_overlap_scheduler=args.disable_overlap_scheduler,
               kv_cache_dtype=args.kv_cache_dtype,
               kv_cache_config=kv_cache_config,
               attn_backend=args.attention_backend,
-              use_cuda_graph=args.use_cuda_graph,
-              cuda_graph_padding_enabled=args.cuda_graph_padding_enabled,
-              cuda_graph_batch_sizes=args.cuda_graph_batch_sizes,
+              cuda_graph_config=cuda_graph_config,
               load_format=args.load_format,
               print_iter_log=args.print_iter_log,
               enable_iter_perf_stats=args.print_iter_log,
