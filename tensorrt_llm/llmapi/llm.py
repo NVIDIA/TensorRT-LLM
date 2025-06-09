@@ -690,9 +690,9 @@ class LLM:
             max_input_len=self.args.max_input_len,
             max_seq_len=max_seq_len)
         self._executor_config.llm_parallel_config = self.args.parallel_config
-        return_logits = self.args.gather_generation_logits or (
-            self._on_trt_backend and self.args.build_config
-            and self.args.build_config.gather_context_logits)
+        return_logits = (self.args.gather_generation_logits
+                         or (self.args.build_config
+                             and self.args.build_config.gather_context_logits))
 
         self._executor = self._executor_cls.create(
             self._engine_dir,
