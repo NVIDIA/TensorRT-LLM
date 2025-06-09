@@ -277,8 +277,9 @@ class MTPSampler(TorchSampler):
                 for i in range(num_new_tokens):
                     new_token = new_tokens[i]
                     num_tokens = request.add_new_token(new_token, beam_idx)
-                    should_stop = self._handle_stop_criteria(
-                        request, new_token, num_tokens, beam_idx)
+                    should_stop = self._handle_stop_criteria(request,
+                                                             new_token,
+                                                             beam=beam_idx)
                     if should_stop:
                         break
                 if self._draft_meet_max_token_stop_criteria(
