@@ -190,12 +190,14 @@ def gen_config_file(config_path: str,
             'max_seq_len': 8576,
             'free_gpu_memory_fraction': gen_gpu_memory_fraction,
             'cuda_graph_config': {
-                'padding_enabled': True,
+                'enable_padding': True,
                 'batch_sizes': gen_cuda_graph_batch_sizes,
             },
             'print_iter_log': True,
             'kv_cache_dtype': 'fp8',
-            'moe_backend': 'TRTLLM',
+            'moe_config': {
+                'backend': 'TRTLLM',
+            },
             'cache_transceiver_config': {
                 'max_num_tokens': 8320,
             },
