@@ -407,6 +407,10 @@ def test_nemotron_h_correctness():
 
     kv_cache_manager.shutdown()
 
+    # clear memory before next test
+    del nemotron_h
+    torch.cuda.empty_cache()
+
 
 # TODO: once LLM API supports context and generation logits, use it in above test and remove this one
 @skip_gpu_memory_less_than(
