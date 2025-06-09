@@ -23,7 +23,7 @@ from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention, QkNormType
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
@@ -60,6 +60,7 @@ class Llama4Attention(Attention):
             rope=RopeParams.from_config(config),
             is_neox=False,
         ) if self.use_rope else None
+        self.use_qk_norm = use_qk_norm
 
         if model_config.attn_backend != "TRTLLM":
             # TODO: support chunked attention for other backends.
@@ -74,15 +75,15 @@ class Llama4Attention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
             pos_embd_params=pos_embd_params,
-            qk_norm_type=QkNormType.post_rope
-            if use_qk_norm else QkNormType.none,
+            rope_fusion=not self.
+            use_qk_norm,  # Llama4 uses qk_norm after RoPE, so it is not possible to fuse RoPE into the attention OP with qk_norm.
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
             attention_chunk_size=attention_chunk_size,
         )
 
-        if self.use_rope and use_qk_norm:
+        if self.use_qk_norm:
             self.head_dim = config.hidden_size // config.num_attention_heads
             self.qk_norm = RMSNorm(hidden_size=self.head_dim,
                                    eps=1e-6,
@@ -114,6 +115,17 @@ class Llama4Attention(Attention):
         )
 
         return q, k
+
+    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                   v: Optional[torch.Tensor], position_ids: torch.Tensor):
+        q, k, v = self.split_qkv(q, k, v)
+        if position_ids is not None:
+            q, k, v = super().apply_rope(q, k, v, position_ids)
+        # Llama4 applies QK norm after RoPE.
+        if self.use_qk_norm:
+            q, k = self.apply_qk_norm(q, k)
+
+        return q, k, v
 
     def _attention_scaling(self, q, position_ids):
 
