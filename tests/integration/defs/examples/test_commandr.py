@@ -18,6 +18,7 @@ import os
 import pytest
 from defs.common import (convert_weights, generate_summary_cmd, venv_check_call,
                          venv_mpi_check_call)
+from defs.conftest import get_gpu_device_list
 from defs.trt_test_alternative import check_call
 
 
@@ -30,6 +31,9 @@ def test_llm_commandr_v01_single_gpu_summary(commandr_example_root,
                                              llm_venv, cmodel_dir, engine_dir,
                                              use_weight_only):
     "Build & run commandr_v01 on single gpu."
+    if "GH200" in get_gpu_device_list()[0] and not use_weight_only:
+        pytest.skip("OOM on GH200. https://nvbugs/5250460")
+
     print("Converting checkpoint...")
     dtype = 'float16'
     model_name = os.path.basename(llm_commandr_v01_model_root)
