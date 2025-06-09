@@ -125,14 +125,6 @@ class FusedMoEMethodBase(ABC):
                                         module.w3_w1_weight.data,
                                         module.w2_weight.data)
 
-    def load_weights(self, module: torch.nn.Module, weights: List[Dict],
-                     weight_loading_mode: MoEWeightLoadingMode):
-
-        self.load_expert_weights_to_dst(module, weights, weight_loading_mode,
-                                        module.initial_local_expert_ids,
-                                        module.w3_w1_weight.data,
-                                        module.w2_weight.data)
-
         self.load_quant_scales(module, weights)
         # Re-setup quant scales after loading weights as the tensors may have been modified.
         self.setup_quant_scales(module)
