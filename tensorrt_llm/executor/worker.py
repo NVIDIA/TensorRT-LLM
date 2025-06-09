@@ -917,11 +917,17 @@ class ResponseList:
     def __init__(self, responses):
         self._responses = responses
 
-    def __getstate__(self):
+    def __reduce__(self):
+        return (ResponseList.deserialize, (self.serialize(), ))
+
+    def serialize(self):
         return tllm.serialize_responses(self._responses)
 
-    def __setstate__(self, state):
-        self._responses = tllm.deserialize_responses(state)
+    @staticmethod
+    def deserialize(s):
+        # convert string back to list
+        responses = tllm.deserialize_responses(s)
+        return ResponseList(responses)
 
 
 class PyResultsList:
