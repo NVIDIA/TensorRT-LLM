@@ -96,6 +96,11 @@ public:
         return mCacheManager;
     }
 
+    static bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx);
+    std::vector<executor::kv_cache::Connection const*> pickRecvConnections(
+        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
+        SizeType32 selfIdx, CacheState const& destConfig) const override;
+
 private:
     BaseKVCacheManager* mCacheManager{};
 

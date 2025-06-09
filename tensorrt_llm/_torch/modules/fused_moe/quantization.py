@@ -28,7 +28,7 @@ class FusedMoEQuantScalesFP8(NamedTuple):
     fc1_input_dequant: torch.Tensor
 
 
-class FusedMoEQuantScalesFP8BlockScales(NamedTuple):
+class FusedMoEQuantScalesDeepSeekFP8BlockScales(NamedTuple):
     fc_weight_scales: torch.Tensor
     proj_weight_scales: torch.Tensor
 
@@ -427,7 +427,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
         module.fc31_input_dequant.data.copy_(max_fc31_input_scale)
 
 
-class FP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
+class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.float8_e4m3fn
@@ -464,7 +464,7 @@ class FP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         self.setup_quant_scales(module)
 
     def setup_quant_scales(self, module: torch.nn.Module):
-        module.quant_scales = FusedMoEQuantScalesFP8BlockScales(
+        module.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
             fc_weight_scales=module.w3_w1_weight_scaling_factor,
             proj_weight_scales=module.w2_weight_scaling_factor,
         )
@@ -472,7 +472,7 @@ class FP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
     def get_quant_scales(self, module: torch.nn.Module, slot_start,
                          slot_end) -> tuple[torch.Tensor, ...]:
         assert module.smart_router
-        return FusedMoEQuantScalesFP8BlockScales(
+        return FusedMoEQuantScalesDeepSeekFP8BlockScales(
             fc_weight_scales=module.w3_w1_weight_scaling_factor.narrow(
                 0, slot_start, slot_end - slot_start),
             proj_weight_scales=module.w2_weight_scaling_factor.narrow(
