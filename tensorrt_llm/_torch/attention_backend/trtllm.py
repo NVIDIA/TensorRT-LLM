@@ -374,6 +374,10 @@ class TrtllmAttentionWrapper:
             # output is provided, expect output_sf be provided as well if has NVFP4 output.
             assert out_dtype is None or out_dtype != torch.uint8 or output_sf is not None
 
+        if self.mrope_position_deltas is None and self.kv_scale_orig_quant is not None:
+            self.mrope_position_deltas = torch.zeros(batch_size,
+                                                     device='cuda',
+                                                     dtype=torch.int32)
         torch.ops.trtllm.attention_inplace(
             q,
             k,
