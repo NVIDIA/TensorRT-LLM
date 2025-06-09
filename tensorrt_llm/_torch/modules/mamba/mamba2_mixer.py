@@ -20,6 +20,7 @@ from einops import rearrange, repeat
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._utils import nvtx_range
 
 from ...attention_backend import AttentionMetadata
 from ...model_config import ModelConfig
@@ -150,6 +151,7 @@ class Mamba2Mixer(nn.Module):
             quant_config=config.get_quant_config(),
         )
 
+    @nvtx_range("Mamba2Mixer.forward", color="red")
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -165,18 +167,11 @@ class Mamba2Mixer(nn.Module):
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         batch_split_size = [num_prefills, num_decodes]
 
-        state_indices = attn_metadata.kv_cache_manager.get_state_indices()
-
-        # warm up does not prepare resources, so no relevant state indices
-        is_warmup = state_indices.numel() == 0
-        if is_warmup:
-            # in this case, assume batch takes first indices in mamba cache
-            state_indices = torch.arange(num_prefills + num_decodes,
-                                         device=state_indices.device,
-                                         dtype=state_indices.dtype)
-
+        state_indices = attn_metadata.kv_cache_manager.get_state_indices(
+        )[:num_prefills + num_decodes]
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)
+
         conv_states = attn_metadata.kv_cache_manager.get_conv_states(
             self.layer_idx)
         ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
