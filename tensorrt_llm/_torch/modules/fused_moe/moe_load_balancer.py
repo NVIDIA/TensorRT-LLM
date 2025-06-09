@@ -650,6 +650,7 @@ class MoeLoadBalancer:
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_finalize_model()
         self.load_balancer_impl.finalize_model()
+        torch.cuda.empty_cache()
 
     def set_warm_up_iter_count(self, iter_count: int):
         """

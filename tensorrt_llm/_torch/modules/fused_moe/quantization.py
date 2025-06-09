@@ -1,6 +1,5 @@
-import threading
 from abc import ABC, abstractmethod
-from typing import Dict, List, NamedTuple
+from typing import Dict, List, NamedTuple, Union
 
 import torch
 from torch import nn
@@ -8,8 +7,7 @@ from torch import nn
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.quantization.utils.fp4_utils import (
     float4_sf_dtype, get_reorder_rows_for_gated_act_gemm_row_indices,
-    get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices,
-    shuffle_matrix_a, shuffle_matrix_sf_a)
+    get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices)
 
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
@@ -30,7 +28,7 @@ class FusedMoEQuantScalesFP8(NamedTuple):
     fc1_input_dequant: torch.Tensor
 
 
-class FusedMoEQuantScalesFP8BlockScales(NamedTuple):
+class FusedMoEQuantScalesDeepSeekFP8BlockScales(NamedTuple):
     fc_weight_scales: torch.Tensor
     proj_weight_scales: torch.Tensor
 
@@ -92,12 +90,8 @@ class FusedMoEMethodBase(ABC):
                                    load_expert_ids: List[int],
                                    dst_w3_w1_weights_tensor: torch.Tensor,
                                    dst_w2_weights_tensor: torch.Tensor):
-        # Use multi-threading to load expert weights in parallel.
-        # Even though CPython has global interpreter lock (GIL),
-        # it's still faster to load weights in parallel because it can utilize
-        # CPU memory bandwidth better.
-        threads = []
-
+        # Multithread weight load is superseded by prefetch_files() in model_engine.py
+        # Also, threading adds overhead in order to protect shuffle index cache with critical section.
         for local_slot_id, expert_id in enumerate(load_expert_ids):
             # expert_idx is the local slot index of current rank
             expert_idx = local_slot_id
@@ -117,21 +111,19 @@ class FusedMoEMethodBase(ABC):
                     f"Unknown weight loading mode in MoE: {weight_loading_mode}"
                 )
 
-            thread = threading.Thread(
-                target=self.load_expert_w3_w1_weight,
-                args=(module, w1_weight, w3_weight,
-                      dst_w3_w1_weights_tensor[expert_idx]))
-            thread.start()
-            threads.append(thread)
+            self.load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                          dst_w3_w1_weights_tensor[expert_idx])
 
-            thread = threading.Thread(target=self.load_expert_w2_weight,
-                                      args=(module, w2_weight,
-                                            dst_w2_weights_tensor[expert_idx]))
-            thread.start()
-            threads.append(thread)
+            self.load_expert_w2_weight(module, w2_weight,
+                                       dst_w2_weights_tensor[expert_idx])
 
-        for thread in threads:
-            thread.join()
+    def load_weights(self, module: torch.nn.Module, weights: List[Dict],
+                     weight_loading_mode: MoEWeightLoadingMode):
+
+        self.load_expert_weights_to_dst(module, weights, weight_loading_mode,
+                                        module.initial_local_expert_ids,
+                                        module.w3_w1_weight.data,
+                                        module.w2_weight.data)
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode):
@@ -443,7 +435,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
         module.fc31_input_dequant.data.copy_(max_fc31_input_scale)
 
 
-class FP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
+class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.float8_e4m3fn
@@ -480,7 +472,7 @@ class FP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         self.setup_quant_scales(module)
 
     def setup_quant_scales(self, module: torch.nn.Module):
-        module.quant_scales = FusedMoEQuantScalesFP8BlockScales(
+        module.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
             fc_weight_scales=module.w3_w1_weight_scaling_factor,
             proj_weight_scales=module.w2_weight_scaling_factor,
         )
@@ -488,7 +480,7 @@ class FP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
     def get_quant_scales(self, module: torch.nn.Module, slot_start,
                          slot_end) -> tuple[torch.Tensor, ...]:
         assert module.smart_router
-        return FusedMoEQuantScalesFP8BlockScales(
+        return FusedMoEQuantScalesDeepSeekFP8BlockScales(
             fc_weight_scales=module.w3_w1_weight_scaling_factor.narrow(
                 0, slot_start, slot_end - slot_start),
             proj_weight_scales=module.w2_weight_scaling_factor.narrow(
@@ -565,13 +557,14 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
                            module.intermediate_size_per_partition // 2)
 
-        fc31_act_scale = nn.Parameter(torch.empty(
-            module.expert_size_per_partition, 1, dtype=module.dtype),
+        fc31_act_scale = nn.Parameter(torch.empty(1,
+                                                  self.hidden_size,
+                                                  dtype=self.dtype),
                                       requires_grad=False)
         module.register_parameter("fc31_act_scale", fc31_act_scale)
 
         fc2_act_scale = nn.Parameter(torch.empty(
-            module.expert_size_per_partition, 1, dtype=module.dtype),
+            1, self.intermediate_size_per_partition, 1, dtype=self.dtype),
                                      requires_grad=False)
         module.register_parameter("fc2_act_scale", fc2_act_scale)
 
@@ -713,12 +706,14 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
             load_weight_shard(weights[f"{expert_id}.w1.input_scale"])
             for expert_id in module.initial_local_expert_ids
         ]
-        all_w3_w1_input_scales = torch.max(torch.stack(all_w3_input_scales),
-                                           torch.stack(all_w1_input_scales))
-        all_w3_w1_input_scales = torch.ones_like(
-            all_w3_w1_input_scales) * all_w3_w1_input_scales.max()
-        module.fc31_act_scale.data.copy_(1 / all_w3_w1_input_scales)
-        module.fc31_alpha.data.copy_(all_w3_w1_input_scales.float())
+        all_w3_w1_input_scales_max = torch.max(
+            torch.stack(all_w3_input_scales),
+            torch.stack(all_w1_input_scales)).max()
+        self.fc31_act_scale.data.copy_(
+            torch.ones_like(self.fc31_act_scale) *
+            (1 / all_w3_w1_input_scales_max))
+        self.fc31_alpha.data.copy_((torch.ones_like(self.fc31_alpha) *
+                                    all_w3_w1_input_scales_max).float())
 
         all_w3_scales = [
             load_weight_shard(weights[f"{expert_id}.w3.weight_scale_inv"],
@@ -756,11 +751,12 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
             load_weight_shard(weights[f"{expert_id}.w2.input_scale"])
             for expert_id in module.initial_local_expert_ids
         ]
-        all_w2_input_scales = torch.stack(all_w2_input_scales).to(module.dtype)
-        all_w2_input_scales = torch.ones_like(
-            all_w2_input_scales) * all_w2_input_scales.max()
-        module.fc2_act_scale.data.copy_(1 / all_w2_input_scales)
-        module.fc2_alpha.data.copy_(all_w2_input_scales.float())
+        all_w2_input_scales_max = torch.stack(all_w2_input_scales).to(
+            self.dtype).max()
+        self.fc2_act_scale.data.copy_(
+            torch.ones_like(self.fc2_act_scale) * (1 / all_w2_input_scales_max))
+        self.fc2_alpha.data.copy_(
+            (torch.ones_like(self.fc2_alpha) * all_w2_input_scales_max).float())
 
         all_w2_scales = [
             load_weight_shard(weights[f"{expert_id}.w2.weight_scale_inv"],
@@ -1106,6 +1102,53 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
     weight_dtype = float4_sf_dtype
     block_scales_dtype = torch.float8_e4m3fn
 
+    # Cache the permute indices during weight loading to avoid recompute
+    # This assumes the same input shape always results in the same permute indices
+    _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
+
+    def _maybe_get_cached_w3_w1_permute_indices(
+            self,
+            dst_w3_w1_weight: torch.Tensor,
+            epilogue_tile_m: int,
+            num_elts_per_sf: Union[None, int] = None) -> torch.Tensor:
+        if dst_w3_w1_weight.shape not in self._cache_permute_indices:
+            # Get permute indices and chain them together
+            permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
+                dst_w3_w1_weight)
+            if num_elts_per_sf is None:
+                permute1 = get_shuffle_matrix_a_row_indices(
+                    dst_w3_w1_weight, epilogue_tile_m=epilogue_tile_m)
+            else:
+                permute1 = get_shuffle_matrix_sf_a_row_indices(
+                    dst_w3_w1_weight,
+                    epilogue_tile_m=epilogue_tile_m,
+                    num_elts_per_sf=num_elts_per_sf)
+            # Memoize permute indices as recompute is **very** costly
+            self._cache_permute_indices[
+                dst_w3_w1_weight.shape] = permute0[permute1].to(
+                    dst_w3_w1_weight.device)
+        permute_indices = self._cache_permute_indices[dst_w3_w1_weight.shape]
+        return permute_indices
+
+    def _maybe_get_cached_w2_permute_indices(
+            self,
+            dst_w2_weight: torch.Tensor,
+            epilogue_tile_m: int,
+            num_elts_per_sf: Union[None, int] = None) -> torch.Tensor:
+        if dst_w2_weight.shape not in self._cache_permute_indices:
+            if num_elts_per_sf is None:
+                permute_indices = (get_shuffle_matrix_a_row_indices(
+                    dst_w2_weight, epilogue_tile_m).to(dst_w2_weight.device))
+            else:
+                permute_indices = (get_shuffle_matrix_sf_a_row_indices(
+                    dst_w2_weight,
+                    epilogue_tile_m=epilogue_tile_m,
+                    num_elts_per_sf=num_elts_per_sf).to(dst_w2_weight.device))
+            # Memoize permute indices as recompute is **very** costly
+            self._cache_permute_indices[dst_w2_weight.shape] = permute_indices
+        permute_indices = self._cache_permute_indices[dst_w2_weight.shape]
+        return permute_indices
+
     def create_weights(self, module: torch.nn.Module):
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
         block_scales_vec_size = 1
@@ -1151,16 +1194,13 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
         dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
 
-        # Get permute indices and chain them together
-        permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
-            dst_w3_w1_weight)
-        permute1 = get_shuffle_matrix_a_row_indices(dst_w3_w1_weight,
-                                                    epilogue_tile_m)
-        permute = permute0[permute1]
+        # Get permute indices
+        permute_indices = self._maybe_get_cached_w3_w1_permute_indices(
+            dst_w3_w1_weight, epilogue_tile_m)
 
         # Shuffle the weight according to permute indices
         processed_w31_weight_shard = torch.ops.trtllm.shuffle_matrix(
-            dst_w3_w1_weight, permute.to(dst_w3_w1_weight.device))
+            dst_w3_w1_weight, permute_indices.to(dst_w3_w1_weight.device))
 
         # Copy the result into device buffer
         dst_w3_w1_weight.copy_(processed_w31_weight_shard.view(
@@ -1180,8 +1220,14 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         # Keep weights in device buffer
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
-        # Get permuted result
-        processed_w2_weight = shuffle_matrix_a(dst_w2_weight, epilogue_tile_m)
+        # Get permuted indices
+        permute_indices = self._maybe_get_cached_w2_permute_indices(
+            dst_w2_weight, epilogue_tile_m)
+
+        # Shuffle the weight according to permute indices
+        processed_w2_weight = torch.ops.trtllm.shuffle_matrix(
+            dst_w2_weight, permute_indices.to(dst_w2_weight.device))
+
         # Copy the result into device buffer
         dst_w2_weight.copy_(processed_w2_weight.view(dst_w2_weight.dtype),
                             non_blocking=True)
@@ -1216,16 +1262,16 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         # trtllm-gen specific block scales preprocessing logics
         epilogue_tile_m = 128  # FIXME
 
-        # Get permute indices and chain them together
-        permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(
-            dst_w3_w1_weight_scale)
-        permute1 = get_shuffle_matrix_sf_a_row_indices(
-            dst_w3_w1_weight_scale.view(float4_sf_dtype), epilogue_tile_m, 16)
-        permute = permute0[permute1]
+        # Get permute indices
+        permute_indices = self._maybe_get_cached_w3_w1_permute_indices(
+            dst_w3_w1_weight_scale.view(float4_sf_dtype),
+            epilogue_tile_m,
+            num_elts_per_sf=16)
 
         # Shuffle the weight according to permute indices
         w3_w1_weight_scale = torch.ops.trtllm.shuffle_matrix(
-            dst_w3_w1_weight_scale.view(float4_sf_dtype), permute.cuda())
+            dst_w3_w1_weight_scale.view(float4_sf_dtype), permute_indices)
+
         # Assert should only be removed during debugging
         assert w3_w1_weight_scale.is_cuda, "w3_w1_weight_scale.is_cuda should be true or suffer from slow speed"
         # Interleave the weight.
@@ -1250,13 +1296,26 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
 
         # trtllm-gen specific block scales preprocessing logics
         epilogue_tile_m = 128  # FIXME: read from kernel
+
         # Assert should only be removed during debugging
         assert dst_w2_weight_scale.is_cuda, "dst_w2_weight_scale.is_cuda should be true or suffer from slow speed"
-        # Interleave the weight and copy
+
+        # Get permute indices
+        permute_indices = self._maybe_get_cached_w2_permute_indices(
+            dst_w2_weight_scale.view(float4_sf_dtype),
+            epilogue_tile_m,
+            num_elts_per_sf=16)
+
+        # Shuffle the weight according to permute indices
+        w_shuffled = torch.ops.trtllm.shuffle_matrix(
+            dst_w2_weight_scale.view(dtype=float4_sf_dtype), permute_indices)
+        # Interleave the weight.
+        processed_w2_weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+            w_shuffled)
+        # Copy the result into device buffer
         dst_w2_weight_scale.copy_(
-            shuffle_matrix_sf_a(
-                dst_w2_weight_scale.view(float4_sf_dtype), epilogue_tile_m,
-                16).view(self.block_scales_dtype).reshape(orig_shape))
+            processed_w2_weight_scale.view(
+                self.block_scales_dtype).reshape(orig_shape))
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         super().load_quant_scales(module, weights)

@@ -864,7 +864,11 @@ def _apply_chat_template(text, conv, tokenizer):
 
 class VilaInputProcessor(InputProcessor):
 
-    def __init__(self, model_path, model_config, tokenizer):
+    def __init__(self,
+                 model_path,
+                 model_config,
+                 tokenizer,
+                 trust_remote_code: bool = True):
         self.model_config = model_config
         llm_path, vision_tower_path, mm_projector_path = _get_model_paths(
             self.model_config)
@@ -1146,8 +1150,8 @@ class VilaModel(PreTrainedModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
         **kwargs,

@@ -24,6 +24,7 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm._torch.models.modeling_clip": ["CLIPVisionModel"],
     "tensorrt_llm._torch.models.modeling_deepseekv3": ["DeepseekV3ForCausalLM"],
     "tensorrt_llm._torch.models.modeling_gemma3": ["Gemma3ForCausalLM"],
+    "tensorrt_llm._torch.models.modeling_hyperclovax": ["HCXVisionForCausalLM"],
     "tensorrt_llm._torch.models.modeling_llama": [
         "Eagle3LlamaForCausalLM",
         "LlamaForCausalLM",

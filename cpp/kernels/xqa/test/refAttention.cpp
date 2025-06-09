@@ -11,6 +11,7 @@
  */
 
 #include "refAttention.h"
+#include <cstdint>
 
 template <typename T>
 Vec<float, validElemsPerHead> toF32Head(Vec<T, validElemsPerHead> const& src)
@@ -114,7 +115,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
     }
     Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> out
         = gemm1Acc.array().colwise() * (xScale * kvScale / rowSum.array());
-    std::for_each(out.data(), out.data() + out.size(), [](float& e) { e = float(InputElem(e)); });
+    std::for_each(out.data(), out.data() + out.size(), [](float& e) { e = float(OutputElem(e)); });
     return out;
 }
 
@@ -137,7 +138,7 @@ template <typename MathElem, bool isPaged, bool useBeamSearch>
 #if SPEC_DEC
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, bool* hostMask, const uint32_t qSeqLen, const uint32_t q_len)
+    float kvScale, float xScale, uint32_t slidingWinSize, bool* hostMask, const uint32_t qSeqLen, const uint32_t q_len)
 {
 #else
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(IOHead const* q,
@@ -192,7 +193,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
     }
     Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> out
         = gemm1Acc.array().colwise() * (xScale * kvScale / rowSum.array());
-    std::for_each(out.data(), out.data() + out.size(), [](float& e) { e = float(InputElem(e)); });
+    std::for_each(out.data(), out.data() + out.size(), [](float& e) { e = float(OutputElem(e)); });
     return out;
 }
 
@@ -201,7 +202,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
     template Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor>                                     \
     refAttention<prec, isPaged, useBeamSearch>(IOHead const* q, CacheSeq<isPaged, useBeamSearch> const& k,             \
         CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale, float kvScale, float xScale,         \
-        bool* hostMask, const uint32_t qSeqLen, const uint32_t q_len)
+        uint32_t slidingWinSize, bool* hostMask, const uint32_t qSeqLen, const uint32_t q_len)
 #else
 #define INSTANTIATE_refAttention(prec, isPaged, useBeamSearch)                                                         \
     template Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor>                                     \
@@ -213,7 +214,7 @@ INSTANTIATE_refAttention(InputElem, false, false);
 INSTANTIATE_refAttention(InputElem, false, true);
 INSTANTIATE_refAttention(InputElem, true, false);
 INSTANTIATE_refAttention(InputElem, true, true);
-#if CACHE_ELEM_ENUM != 0
+#if CACHE_ELEM_ENUM != 0 && !(IS_MLA)
 INSTANTIATE_refAttention(CacheElem, false, false);
 INSTANTIATE_refAttention(CacheElem, false, true);
 INSTANTIATE_refAttention(CacheElem, true, false);

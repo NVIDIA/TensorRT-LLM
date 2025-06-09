@@ -175,7 +175,7 @@ String getShortenedJobName(String path)
     return parts.join('-').toLowerCase()
 }
 
-def createKubernetesPodConfig(image, type)
+def createKubernetesPodConfig(image, type, arch = "amd64")
 {
     def targetCould = "kubernetes-cpu"
     def selectors = """
@@ -185,6 +185,9 @@ def createKubernetesPodConfig(image, type)
     def nodeLabelPrefix = ""
     def jobName = getShortenedJobName(env.JOB_NAME)
     def buildID = env.BUILD_ID
+
+    def archSuffix = arch == "arm64" ? "arm" : "amd"
+    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     switch(type)
     {
@@ -277,7 +280,7 @@ def createKubernetesPodConfig(image, type)
                         fieldRef:
                           fieldPath: spec.nodeName
                   - name: jnlp
-                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11
+                    image: ${jnlpImage}
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
@@ -785,8 +788,8 @@ def collectTestResults(pipeline, testFilter)
 
                 sh "cd cov && coverage combine"
                 sh "cd cov && find . -type f"
-                sh "cd cov && coverage report"
-                sh "cd cov && coverage html -d test_coverage_html"
+                sh "cd cov && coverage report -i"   // -i: ignore errors. Ignore the error that the source code file cannot be found.
+                sh "cd cov && coverage html -d test_coverage_html -i"
                 trtllm_utils.uploadArtifacts("cov/test_coverage_html/*", "${UPLOAD_PATH}/test-results/coverage-report/")
                 echo "Test coverage report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/coverage-report/index.html"
             } // Test coverage
