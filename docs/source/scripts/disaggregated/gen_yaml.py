@@ -195,7 +195,9 @@ def gen_config_file(config_path: str,
             },
             'print_iter_log': True,
             'kv_cache_dtype': 'fp8',
-            'moe_backend': 'TRTLLM',
+            'moe_config': {
+                'backend': 'TRTLLM',
+            },
             'cache_transceiver_config': {
                 'max_num_tokens': 8320,
             },

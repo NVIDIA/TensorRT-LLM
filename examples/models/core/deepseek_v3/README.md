@@ -171,7 +171,8 @@ cat <<EOF > /tmp/extra-llm-api-config.yml
 cuda_graph_config:
   padding_enabled: true
   batch_sizes: [1, 2]
-moe_max_num_tokens: 16384
+moe_config:
+  max_num_tokens: 16384
 EOF
 
 trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} throughput \

@@ -2,7 +2,7 @@ import argparse
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (CudaGraphConfig, DraftTargetDecodingConfig,
-                                 EagleDecodingConfig, KvCacheConfig,
+                                 EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
 
@@ -207,7 +207,7 @@ def setup_llm(args):
             enable_piecewise_cuda_graph= \
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
-        moe_backend=args.moe_backend,
+        moe_config=MoeConfig(backend=args.moe_backend),
         enable_trtllm_sampler=args.enable_trtllm_sampler,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
