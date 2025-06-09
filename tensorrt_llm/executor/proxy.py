@@ -181,6 +181,9 @@ class GenerationExecutorProxy(GenerationExecutor):
                 self._results.pop(client_id)
 
         unpacked_res = []
+        assert len(res[0]._response_list._responses) == len(
+            res[0]._py_result_list._py_results), \
+            "Response list and PyResult list should have the same length"
         for response, py_result in itertools.zip_longest(
                 res[0]._response_list._responses,
                 res[0]._py_result_list._py_results):

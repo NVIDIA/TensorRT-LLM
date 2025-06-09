@@ -803,21 +803,21 @@ void initRequestBindings(pybind11::module_& m)
         "serialize_responses",
         [](std::vector<tle::Response> const& responses)
         {
+            py::gil_scoped_release release;
             NVTX3_SCOPED_RANGE(serialize_responses);
             return tle::Serialization::serialize(responses);
         },
-        py::arg("responses"), "Serializes a list of Response objects.");
+        py::arg("serialize_responses"), "Serializes a list of Response objects.");
 
     m.def(
         "deserialize_responses",
         [](std::vector<char>& data)
         {
+            py::gil_scoped_release release;
             NVTX3_SCOPED_RANGE(deserialize_responses);
-            // std::string s = data.cast<std::string>();
-            // std::vector<char> char_vector(s.begin(), s.end());
             return tle::Serialization::deserializeResponses(data);
         },
-        py::arg("serialized_list"), "Deserializes a list into Response objects.");
+        py::arg("deserialize_responses"), "Deserializes a list into Response objects.");
 }
 
 } // namespace tensorrt_llm::pybind::executor
