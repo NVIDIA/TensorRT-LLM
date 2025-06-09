@@ -5,7 +5,7 @@ import torch
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor
 from .interface import MoE, MoEWeightLoadingMode
-from .quantization import (FP8BlockScalesFusedMoEMethod,
+from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
@@ -90,12 +90,12 @@ class TRTLLMGenFusedMoE(MoE):
             self.create_weights()
 
     def _check_configs(self):
-        assert self.has_fp8_block_scales or self.has_nvfp4, "TRTLLMGenFusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
+        assert self.has_deepseek_fp8_block_scales or self.has_nvfp4, "TRTLLMGenFusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
 
     def _get_quant_method(self):
         if self.quant_config is not None:
             if self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return FP8BlockScalesFusedMoEMethod()
+                return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4TRTLLMGenFusedMoEMethod()
             else:
@@ -150,7 +150,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         # TODO: since routing kernel is integrated into moe_runner for fp8,
         #       here we just route the I/Os for moe_runner
-        if self.has_fp8_block_scales:
+        if self.has_deepseek_fp8_block_scales:
             x_val, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
 
             # FIXME: tile_tokens_dim is hardcoded for now

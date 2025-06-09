@@ -6,18 +6,6 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm.bindings.internal.batch_manager import DecoderBuffers
 from tensorrt_llm.logger import logger
 
-# TODO: Implement this once return generation logits is supported
-# def copy_last_context_logits(context_logits: torch.Tensor, llm_req: LlmRequest):
-#     """Copy logits from context phase to beginning of generation logits.
-
-#     Usually, this concerns logits of 1 token. In speculative decoding this concerns draftLen + 1 tokens.
-#     """
-#     num_logits = context_logits.shape[0]
-#     for beam in range(llm_req.get_beam_width_by_iter()):
-#         # [beamWidth, mMaxNewTokens, vocabSizePadded] -> [numLogits, vocabSizePadded]
-#         beam_host_tensor = llm_req.get_generation_logits_host()[beam, :num_logits]
-#         beam_host_tensor.copy_(context_logits, non_blocking=True)
-
 
 class HandleContextLogits:
 
@@ -67,11 +55,9 @@ class HandleContextLogits:
             decoder_buffer_logits[seq_slot] = logits_view.reshape(
                 logits_view.shape[0], 1, logits_view.shape[1])
 
-            # TODO: Implement this once return generation logits is supported
-            # # Save the last token logits of context into generation logits or
-            # # save the accepted token logits from target model
-            # if llm_req.get_return_generation_logits():
-            #     copy_last_context_logits(logits_view, llm_req)
+            # Save the last context token logits in generation logits storage
+            if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
+                llm_req.py_result.append_generation_logits(logits_view)
 
             # TODO: Implement this once we have beam width support
             # Scatter the output logits to the decoderLogits

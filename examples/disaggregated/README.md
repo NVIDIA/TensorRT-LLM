@@ -9,7 +9,7 @@ You can use multiple `trtllm-serve` commands to launch the context and generatio
 for disaggregated serving. For example, you could launch two context servers and one generation servers as follows:
 
 ```
-echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\nmax_num_tokens: 2048" > context_extra-llm-api-config.yml
+echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  max_num_tokens: 2048" > context_extra-llm-api-config.yml
 echo -e "cache_transceiver_config:\n  max_num_tokens: 2048" > gen_extra-llm-api-config.yml
 
 export TRTLLM_USE_UCX_KVCACHE=1
