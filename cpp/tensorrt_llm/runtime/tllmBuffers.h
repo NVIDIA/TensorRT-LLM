@@ -25,6 +25,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
+#include "tensorrt_llm/runtime/virtualMemory.h"
 
 #include <NvInferRuntime.h>
 #include <cuda_runtime_api.h>
@@ -500,6 +501,35 @@ protected:
 
 using PinnedPoolAllocator = PoolAllocator<PinnedAllocator>;
 
+class CudaVirtualAddressAllocator1
+    : public BaseAllocator<CudaVirtualAddressAllocator1, MemoryType::kGPU, /* count */ false>,
+      CudaVirtualAddressAllocator
+{
+    // Update to MemoryCounters is done in Creator to more precisely reflect the memory usage.
+    using Base = BaseAllocator<CudaVirtualAddressAllocator1, MemoryType::kGPU, false>;
+    friend Base;
+
+public:
+    CudaVirtualAddressAllocator1(CudaVirtualAddressAllocator const& allocator)
+        : CudaVirtualAddressAllocator(allocator)
+    {
+    }
+
+    using Base::allocate;
+    using Base::deallocate;
+
+protected:
+    void allocateImpl(PointerType* ptr, std::size_t n) const
+    {
+        this->CudaVirtualAddressAllocator::allocate(ptr, n, tensorrt_llm::common::getDevice());
+    }
+
+    void deallocateImpl(PointerType ptr, std::size_t n) const
+    {
+        this->CudaVirtualAddressAllocator::deallocate(ptr, n);
+    }
+};
+
 // Adopted from https://github.com/NVIDIA/TensorRT/blob/release/8.6/samples/common/buffers.h
 
 //!
@@ -834,6 +864,7 @@ using HostBuffer = GenericBuffer<HostAllocator>;
 using PinnedBuffer = GenericBuffer<PinnedAllocator>;
 using PinnedPoolBuffer = GenericBuffer<PinnedPoolAllocator>;
 using UVMBuffer = GenericBuffer<UVMAllocator>;
+using VirtualAddressDeviceBuffer = GenericBuffer<CudaVirtualAddressAllocator1>;
 
 template <typename T>
 std::make_unsigned_t<T> nonNegative(T value)
@@ -1069,5 +1100,6 @@ using HostTensor = GenericTensor<HostAllocator>;
 using PinnedTensor = GenericTensor<PinnedAllocator>;
 using PinnedPoolTensor = GenericTensor<PinnedPoolAllocator>;
 using UVMTensor = GenericTensor<UVMAllocator>;
+using VirtualAddressDeviceTensor = GenericTensor<CudaVirtualAddressAllocator1>;
 
 } // namespace tensorrt_llm::runtime

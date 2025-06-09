@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-#include "virtualMemory.h"
+#include "tensorrt_llm/runtime/virtualMemory.h"
+#include "bufferManager.h"
 
-#include <pybind11/pytypes.h>
+#include <forward_list>
 
 namespace tensorrt_llm::runtime
 {
@@ -109,6 +110,35 @@ void CUDAVirtualMemory::release()
         mState = INVALID_STATE;
         std::rethrow_exception(ePtr);
     }
+}
+
+void BackedConfigurator::setup(CUmemGenericAllocationHandle)
+{
+    if (mBackedStorage != nullptr)
+    {
+        TLLM_CU_CHECK(cuMemcpyHtoDAsync_v2(mAddress, mBackedStorage->data(), mSize, mStream));
+    }
+    if (mOndemand)
+    {
+        mBackedStorage.reset();
+    }
+}
+
+void BackedConfigurator::teardown(CUmemGenericAllocationHandle)
+{
+    if (mBackedStorage == nullptr)
+    {
+        switch (mBackType)
+        {
+        case MemoryType::kCPU: mBackedStorage = BufferManager::cpu(mSize, nvinfer1::DataType::kINT8); break;
+        case MemoryType::kPINNED: mBackedStorage = BufferManager::pinned(mSize, nvinfer1::DataType::kINT8); break;
+        default: TLLM_THROW("Unknown memory type: %d", static_cast<int32_t>(mBackType));
+        }
+    }
+    TLLM_CU_CHECK(cuMemcpyDtoHAsync_v2(mBackedStorage->data(), mAddress, mSize, mStream));
+    // We have to synchronize here, or the memory may be unmapped before the copy operation.
+    TLLM_CU_CHECK(cuEventRecord(mEvent.get(), mStream));
+    mEvent.synchronize();
 }
 
 void CudaVirtualMemoryManager::add(uintptr_t handle, std::string mark, CUDAVirtualMemory&& memory)
@@ -296,7 +326,7 @@ static void* deviceptr_cast(CUdeviceptr ptr)
     return ret;
 }
 
-void CudaVirtualAddressAllocator::allocateImpl(PointerType* ptr, std::size_t n) const
+void CudaVirtualAddressAllocator::allocate(Pointer* ptr, std::size_t n, int device) const
 {
     CUdeviceptr address{};
     std::size_t const pageAlignedSize = (n + mConfig->mPageSize - 1) & ~(mConfig->mPageSize - 1);
@@ -306,7 +336,7 @@ void CudaVirtualAddressAllocator::allocateImpl(PointerType* ptr, std::size_t n) 
     configurators.push_back(std::make_unique<UnicastConfigurator>(address, n,
         CUmemAccessDesc{{
                             CU_MEM_LOCATION_TYPE_DEVICE,
-                            mConfig->mDevice,
+                            device,
                         },
             CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
 
@@ -326,11 +356,11 @@ void CudaVirtualAddressAllocator::allocateImpl(PointerType* ptr, std::size_t n) 
         break;
     }
 
-    mConfig->mManager.add(address, mConfig->mMark,
+    mConfig->mManager->add(address, mConfig->mMark,
         std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
                                              {
                                                  CU_MEM_LOCATION_TYPE_DEVICE,
-                                                 mConfig->mDevice,
+                                                 device,
                                              }},
             n),
         std::move(configurators));
@@ -338,9 +368,58 @@ void CudaVirtualAddressAllocator::allocateImpl(PointerType* ptr, std::size_t n) 
     *ptr = deviceptr_cast(address);
 }
 
-void CudaVirtualAddressAllocator::deallocateImpl(PointerType ptr, [[maybe_unused]] std::size_t n) const
+void CudaVirtualAddressAllocator::deallocate(Pointer ptr, std::size_t n) const
 {
-    mConfig->mManager.remove(deviceptr_cast(ptr));
+    auto const address = deviceptr_cast(ptr);
+    mConfig->mManager->remove(address);
+
+    std::size_t const pageAlignedSize = (n + mConfig->mPageSize - 1) & ~(mConfig->mPageSize - 1);
+    TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(address, pageAlignedSize));
+}
+
+} // namespace tensorrt_llm::runtime
+
+namespace tensorrt_llm::runtime
+{
+
+CudaVirtualMemoryManager* getVirtualMemoryManager()
+{
+    static CudaVirtualMemoryManager manager;
+    return &manager;
+}
+
+void cudaVirtualAddressAllocatorDeallocate(void* ptr, std::size_t n)
+{
+    auto const address = deviceptr_cast(ptr);
+    getVirtualMemoryManager()->remove(address);
+
+    auto pageSize = getpagesize();
+    std::size_t const pageAlignedSize = (n + pageSize - 1) & ~(pageSize - 1);
+    TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(address, pageAlignedSize));
+}
+
+CudaVirtualAddressAllocator emptyVAAllocator{nullptr};
+std::forward_list<CudaVirtualAddressAllocator> vaAllocators{};
+
+CudaVirtualAddressAllocator const& getVirtualAddressAllocator()
+{
+    if (vaAllocators.empty())
+    {
+        return emptyVAAllocator;
+    }
+    return vaAllocators.front();
+}
+
+void pushVirtualAddressAllocator(
+    std::string const& mark, CudaVirtualAddressAllocator::BackedMode mode, std::shared_ptr<CudaStream> backStream)
+{
+    vaAllocators.emplace_front(std::make_shared<CudaVirtualAddressAllocator::Configuration>(
+        getVirtualMemoryManager(), mark, mode, backStream));
+}
+
+void popVirtualAddressAllocator()
+{
+    vaAllocators.pop_front();
 }
 
 } // namespace tensorrt_llm::runtime

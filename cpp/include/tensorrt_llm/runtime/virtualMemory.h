@@ -16,10 +16,14 @@
 
 #pragma once
 
-#include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/tllmBuffers.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/runtime/cudaEvent.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/memoryCounters.h"
 
 #include <cuda.h>
+#include <mutex>
 #include <unistd.h>
 
 class VirtualMemoryManagerTest;
@@ -207,7 +211,7 @@ struct LocalCreator : CUDAVirtualMemory::Creator
 
     void release(CUmemGenericAllocationHandle handle) override
     {
-        TLLM_CU_CHECK(cuMemRelease(handle));
+        TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(handle));
         if constexpr (count)
         {
             MemoryCounters::getInstance().deallocate(
@@ -239,7 +243,7 @@ struct UnicastConfigurator : CUDAVirtualMemory::Configurator
 
     void teardown(CUmemGenericAllocationHandle) override
     {
-        TLLM_CU_CHECK(cuMemUnmap(mAddress, mSize));
+        TLLM_CU_CHECK_FREE_RESOURCE(cuMemUnmap(mAddress, mSize));
     }
 
     CUdeviceptr mAddress;
@@ -259,7 +263,7 @@ struct MulticastConfigurator : CUDAVirtualMemory::Configurator
 
     void teardown(CUmemGenericAllocationHandle) override
     {
-        TLLM_CU_CHECK(cuMulticastUnbind(mMulticast, mDevice, 0, mSize));
+        TLLM_CU_CHECK_FREE_RESOURCE(cuMulticastUnbind(mMulticast, mDevice, 0, mSize));
     }
 
     CUmemGenericAllocationHandle mMulticast;
@@ -314,38 +318,11 @@ struct BackedConfigurator : CUDAVirtualMemory::Configurator
         , mBackType(backType)
         , mStream(stream)
         , mOndemand(ondemand)
-        , mEvent()
     {
     }
 
-    void setup(CUmemGenericAllocationHandle) override
-    {
-        if (mBackedStorage != nullptr)
-        {
-            TLLM_CU_CHECK(cuMemcpyHtoDAsync_v2(mAddress, mBackedStorage->data(), mSize, mStream));
-        }
-        if (mOndemand)
-        {
-            mBackedStorage.reset();
-        }
-    }
-
-    void teardown(CUmemGenericAllocationHandle) override
-    {
-        if (mBackedStorage == nullptr)
-        {
-            switch (mBackType)
-            {
-            case MemoryType::kCPU: mBackedStorage = BufferManager::cpu(mSize, nvinfer1::DataType::kINT8); break;
-            case MemoryType::kPINNED: mBackedStorage = BufferManager::pinned(mSize, nvinfer1::DataType::kINT8); break;
-            default: TLLM_THROW("Unknown memory type: %d", static_cast<int32_t>(mBackType));
-            }
-        }
-        TLLM_CU_CHECK(cuMemcpyDtoHAsync_v2(mBackedStorage->data(), mAddress, mSize, mStream));
-        // We have to synchronize here, or the memory may be unmapped before the copy operation.
-        TLLM_CU_CHECK(cuEventRecord(mEvent.get(), mStream));
-        mEvent.synchronize();
-    }
+    void setup(CUmemGenericAllocationHandle) override;
+    void teardown(CUmemGenericAllocationHandle) override;
 
     CUdeviceptr mAddress;
     size_t mSize;
@@ -353,7 +330,7 @@ struct BackedConfigurator : CUDAVirtualMemory::Configurator
     CUstream mStream;
     bool mOndemand;
 
-    BufferManager::IBufferPtr mBackedStorage;
+    IBuffer::UniquePtr mBackedStorage;
     CudaEvent mEvent;
 };
 
@@ -455,12 +432,11 @@ private:
     friend VirtualMemoryManagerTest;
 };
 
-// Update to MemoryCounters is done in LocalCreator to more precisely reflect the memory usage.
+// Update to MemoryCounters is done in Creator to more precisely reflect the memory usage.
 class CudaVirtualAddressAllocator
-    : public BaseAllocator<CudaVirtualAddressAllocator, MemoryType::kGPU, /* count */ false>
 {
-    friend class BaseAllocator;
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
+    using Pointer = void*;
 
 public:
     enum BackedMode
@@ -473,11 +449,10 @@ public:
 
     class Configuration
     {
-        CudaVirtualMemoryManager& mManager; // TODO(ytong): do we need this reference to manage lifetime?
+        CudaVirtualMemoryManager* mManager;
         std::string mMark;
         CudaStreamPtr mBackStream;
         std::size_t mPageSize;
-        int mDevice{-1};
         BackedMode mMode;
 
         friend class CudaVirtualAddressAllocator;
@@ -492,14 +467,13 @@ public:
          *                   Note: Virtual Address Allocation is not async. The stream is not used in allocation.
          */
         Configuration(
-            CudaVirtualMemoryManager& manager, std::string const& mark, BackedMode mode, CudaStreamPtr backStream)
+            CudaVirtualMemoryManager* manager, std::string const& mark, BackedMode mode, CudaStreamPtr backStream)
             : mManager(manager)
             , mMark(mark)
             , mBackStream(std::move(backStream))
             , mPageSize(getpagesize())
             , mMode(mode)
         {
-            TLLM_CUDA_CHECK(cudaGetDevice(&mDevice));
         }
     };
 
@@ -508,14 +482,32 @@ public:
     {
     }
 
-protected:
-    void allocateImpl(PointerType* ptr, std::size_t n) const;
-    void deallocateImpl(PointerType ptr, std::size_t n) const;
+    explicit operator bool() const noexcept
+    {
+        return mConfig != nullptr;
+    }
+
+    void allocate(Pointer* ptr, std::size_t n, int device) const;
+    void deallocate(Pointer ptr, std::size_t n) const;
 
 private:
     std::shared_ptr<Configuration> mConfig;
 };
 
-using VirtualAddressDeviceBuffer = GenericBuffer<CudaVirtualAddressAllocator>;
+} // namespace tensorrt_llm::runtime
+
+// Experimental: Global instance
+namespace tensorrt_llm::runtime
+{
+
+CudaVirtualMemoryManager* getVirtualMemoryManager();
+
+// TODO(ytong): torch does not track allocator. This is temporary WAR.
+void cudaVirtualAddressAllocatorDeallocate(void* ptr, std::size_t n);
+
+CudaVirtualAddressAllocator const& getVirtualAddressAllocator();
+void pushVirtualAddressAllocator(
+    std::string const& mark, CudaVirtualAddressAllocator::BackedMode mode, std::shared_ptr<CudaStream> backStream);
+void popVirtualAddressAllocator();
 
 } // namespace tensorrt_llm::runtime

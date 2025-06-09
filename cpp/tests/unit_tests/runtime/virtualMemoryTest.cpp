@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/tllmBuffers.h"
 #include "tensorrt_llm/runtime/virtualMemory.h"
 
 #include <cstdint>
@@ -56,6 +57,10 @@ protected:
         TLLM_CU_CHECK(cuDevicePrimaryCtxRetain(&ctx, dev));
         TLLM_CU_CHECK(cuCtxSetCurrent(ctx));
 
+        // Initialize NVML
+        nvmlReturn_t nvmlResult = nvmlInit();
+        TLLM_CHECK_WITH_INFO(nvmlResult == NVML_SUCCESS, "Failed to initialize NVML: %s", nvmlErrorString(nvmlResult));
+
         if (!memoryInfoAvailable())
         {
             TLLM_LOG_WARNING("Per process memory information unavailable.");
@@ -86,13 +91,9 @@ protected:
         // Get current process ID
         uint32_t currentPid = static_cast<uint32_t>(getpid());
 
-        // Initialize NVML
-        nvmlReturn_t nvmlResult = nvmlInit();
-        TLLM_CHECK_WITH_INFO(nvmlResult == NVML_SUCCESS, "Failed to initialize NVML: %s", nvmlErrorString(nvmlResult));
-
         // Get device handle for GPU 0
         nvmlDevice_t device;
-        nvmlResult = nvmlDeviceGetHandleByIndex(0, &device);
+        auto nvmlResult = nvmlDeviceGetHandleByIndex(0, &device);
         TLLM_CHECK_WITH_INFO(
             nvmlResult == NVML_SUCCESS, "Failed to get device handle: %s", nvmlErrorString(nvmlResult));
 
@@ -1509,7 +1510,7 @@ TEST_F(VirtualMemoryManagerTest, TestCudaVirtualAddressAllocator)
 
     // Create configuration for the virtual address allocator
     auto config = std::make_shared<CudaVirtualAddressAllocator::Configuration>(
-        *mVMManager, mark, CudaVirtualAddressAllocator::BackedMode::NONE, streamPtr);
+        mVMManager.get(), mark, CudaVirtualAddressAllocator::BackedMode::NONE, streamPtr);
 
     auto memoryBegin = getCurrentProcessMemoryInfo();
 
