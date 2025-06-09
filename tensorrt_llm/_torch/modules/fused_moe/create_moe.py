@@ -151,8 +151,6 @@ def create_moe(
         assert moe_load_balancer is None, "moe_load_balancer is not supported in FluxFusedMoE."
         assert model_config.mapping.enable_attention_dp, "FluxFusedMoE should be used with attention dp"
 
-        pack_weights = True
-
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -161,11 +159,9 @@ def create_moe(
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
-            aux_stream=aux_stream,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            enable_alltoall=enable_alltoall,
-            pack_weights=pack_weights,
+            pack_weights=True,
         )
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")

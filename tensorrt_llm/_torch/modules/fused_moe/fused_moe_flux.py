@@ -30,11 +30,9 @@ class FluxFusedMoE(VanillaMoE):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream: Optional[torch.cuda.Stream] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
-        enable_alltoall: bool = False,
         pack_weights: bool = True,
     ):
         super().__init__(
@@ -45,10 +43,8 @@ class FluxFusedMoE(VanillaMoE):
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
-            aux_stream=aux_stream,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            enable_alltoall=enable_alltoall,
             pack_weights=pack_weights,
         )
         self._check_configs()
