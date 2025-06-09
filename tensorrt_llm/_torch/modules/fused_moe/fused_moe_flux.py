@@ -60,7 +60,7 @@ class FluxFusedMoE(VanillaMoE):
                                       ep_group=get_ep_group(self.mapping))
         topk = self.routing_method.get_experts_per_token()
         # flux_m_max is the size for the shared memory(nvshmem) used by flux
-        flux_m_max = self.moe_max_num_tokens * topk * self.mapping.world_size
+        flux_m_max = self.moe_max_num_tokens * topk * self.dist_env.world_size
         moe_args = flux.MoeArguments(
             max_ntokens=self.moe_max_num_tokens,
             hidden=self.hidden_size,
@@ -76,7 +76,7 @@ class FluxFusedMoE(VanillaMoE):
 
         self.flux_rs_op = flux.GemmGroupedV3GatherRS(
             self.num_experts, flux_m_max, self.hidden_size, topk,
-            self.mapping.rank, self.dist_env.world_size, self.tp_size,
+            self.dist_env.rank, self.dist_env.world_size, self.tp_size,
             self.ep_size, 1)
 
     def _check_configs(self):

@@ -20,8 +20,8 @@ class DistEnv:
             init_method = f"tcp://{master_ip}:{master_port}"
             dist.init_process_group(backend="nccl",
                                     init_method=init_method,
-                                    world_size=self.mapping.world_size,
-                                    rank=self.mapping.rank)
+                                    world_size=self.mapping.tp_size,
+                                    rank=self.mapping.tp_rank)
 
     def get_world(self):
         return torch.distributed.group.WORLD
@@ -31,11 +31,11 @@ class DistEnv:
 
     @property
     def rank(self):
-        return self.mapping.rank
+        return self.mapping.tp_rank
 
     @property
     def world_size(self):
-        return self.mapping.world_size
+        return self.mapping.tp_size
 
 
 DIST_ENV = None
