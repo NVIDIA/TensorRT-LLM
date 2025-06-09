@@ -584,15 +584,16 @@ class PyTorchModelEngine(ModelEngine):
 
             available_blocks = kv_cache_manager.get_num_free_blocks()
 
+            maximum_tunable_num_tokens = min(
+                self.batch_size * num_tokens_per_request, self.max_num_tokens,
+                available_blocks * kv_cache_manager.tokens_per_block)
+
             # Calculate number of full-length requests and remaining tokens
             # Each request has num_tokens_per_request tokens, except possibly the last one
-            full_len_request_num = self.max_num_tokens // num_tokens_per_request
-            remaining_tokens = self.max_num_tokens % num_tokens_per_request
+            full_len_request_num = maximum_tunable_num_tokens // num_tokens_per_request
+            remaining_tokens = maximum_tunable_num_tokens % num_tokens_per_request
 
             request_num = full_len_request_num if remaining_tokens == 0 else full_len_request_num + 1
-
-            if self.max_num_tokens > available_blocks * kv_cache_manager.tokens_per_block:
-                return None, None
 
             requests = kv_cache_manager.add_dummy_requests(
                 request_ids=list(range(full_len_request_num)),
@@ -617,7 +618,7 @@ class PyTorchModelEngine(ModelEngine):
             result.context_requests = requests
             result.generation_requests = []
 
-            return result, _create_extra_inputs(1, self.max_num_tokens)
+            return result, _create_extra_inputs(1, maximum_tunable_num_tokens)
 
         @contextlib.contextmanager
         def release_batch(result):
