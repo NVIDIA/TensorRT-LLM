@@ -141,7 +141,7 @@ class Llama4Attention(Attention):
         if self.attn_temperature_tuning:
             q = self._attention_scaling(q, position_ids)
         out_scale = None
-        if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
+        if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales or self.o_proj.has_w4a8_awq:
             out_scale = self.o_proj.inv_input_scale
 
         q, k, v = self.convert_qkv(q, k, v)

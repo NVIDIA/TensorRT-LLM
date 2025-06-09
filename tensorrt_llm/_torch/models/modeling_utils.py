@@ -95,10 +95,12 @@ class MetaInitMode(TorchDispatchMode):
         return func(*args, **kwargs)
 
 
-def duplicate_kv_weight(weight: torch.Tensor, head_dim: int,
-                        tensor_parallel_size: int):
+def duplicate_kv_weight(weight: torch.Tensor,
+                        head_dim: int,
+                        tensor_parallel_size: int,
+                        factor: int = 1):
 
-    num_kv_heads = weight.shape[0] // head_dim
+    num_kv_heads = weight.shape[0] * factor // head_dim
 
     if num_kv_heads >= tensor_parallel_size:
         assert num_kv_heads % tensor_parallel_size == 0

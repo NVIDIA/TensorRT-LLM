@@ -24,10 +24,11 @@
 namespace torch_ext
 {
 
-class W4A16GemmRunner : public torch::CustomClassHolder
+class finegrainedMixedDtypeGemmRunner : public torch::CustomClassHolder
 {
 public:
-    explicit W4A16GemmRunner(at::ScalarType activationDtype, at::ScalarType outputDtype, int64_t quant_mode = 0);
+    explicit finegrainedMixedDtypeGemmRunner(
+        at::ScalarType activationDtype, at::ScalarType outputDtype, int64_t quant_mode = 0);
 
     at::Tensor runGemm(at::Tensor const& A, at::Tensor const& B_packed, at::Tensor const& scales,
         int64_t group_size_long, int64_t configIdx = -1, std::optional<at::Tensor> bias = std::nullopt,

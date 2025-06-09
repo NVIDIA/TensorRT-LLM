@@ -44,7 +44,8 @@
 namespace torch_ext
 {
 
-W4A16GemmRunner::W4A16GemmRunner(at::ScalarType activationDtype, at::ScalarType outputDtype, int64_t quant_mode)
+finegrainedMixedDtypeGemmRunner::finegrainedMixedDtypeGemmRunner(
+    at::ScalarType activationDtype, at::ScalarType outputDtype, int64_t quant_mode)
     : mActivationDtype(activationDtype)
     , mOutputDtype(outputDtype)
 {
@@ -139,18 +140,19 @@ W4A16GemmRunner::W4A16GemmRunner(at::ScalarType activationDtype, at::ScalarType 
     }
     else
     {
-        TORCH_CHECK(false, "Unsupported quant mode for W4A16GemmRunner: ", quant_mode);
+        TORCH_CHECK(false, "Unsupported quant mode for finegrainedMixedDtypeGemmRunner: ", quant_mode);
     }
 
-    TORCH_CHECK(mGemmRunner, "Failed to create W4A16 GEMM runner for activation type ", c10::toString(activationDtype));
+    TORCH_CHECK(mGemmRunner, "Failed to create finegrained Mixed Dtype GEMM runner for activation type ",
+        c10::toString(activationDtype));
     mConfigs = mGemmRunner->getConfigs(); // Get configs via the interface
-    TORCH_CHECK(!mConfigs.empty(), "Failed to get CUTLASS configs for W4A16 GEMM with activation type ",
+    TORCH_CHECK(!mConfigs.empty(), "Failed to get CUTLASS configs for finegrainedMixedDtype GEMM with activation type ",
         c10::toString(activationDtype));
 }
 
-at::Tensor W4A16GemmRunner::runGemm(at::Tensor const& A, at::Tensor const& B_packed, at::Tensor const& scales,
-    int64_t group_size_long, int64_t configIdx, std::optional<at::Tensor> bias, std::optional<at::Tensor> zeros,
-    double alpha) const
+at::Tensor finegrainedMixedDtypeGemmRunner::runGemm(at::Tensor const& A, at::Tensor const& B_packed,
+    at::Tensor const& scales, int64_t group_size_long, int64_t configIdx, std::optional<at::Tensor> bias,
+    std::optional<at::Tensor> zeros, double alpha) const
 {
     TORCH_CHECK(A.is_cuda() && B_packed.is_cuda() && scales.is_cuda(), "All input tensors must be on CUDA");
     TORCH_CHECK(A.scalar_type() == mActivationDtype, "Activation tensor A's dtype ", c10::toString(A.scalar_type()),
@@ -271,9 +273,9 @@ at::Tensor W4A16GemmRunner::runGemm(at::Tensor const& A, at::Tensor const& B_pac
     return C_tensor;
 }
 
-int64_t W4A16GemmRunner::getNumConfigs() const
+int64_t finegrainedMixedDtypeGemmRunner::getNumConfigs() const
 {
-    TORCH_CHECK(mGemmRunner, "W4A16GemmRunner not initialized properly.");
+    TORCH_CHECK(mGemmRunner, "finegrainedMixedDtypeGemmRunner not initialized properly.");
     return static_cast<int64_t>(mConfigs.size());
 }
 
@@ -281,8 +283,8 @@ int64_t W4A16GemmRunner::getNumConfigs() const
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::W4A16GemmRunner>("W4A16GemmRunner")
+    m.class_<torch_ext::finegrainedMixedDtypeGemmRunner>("finegrainedMixedDtypeGemmRunner")
         .def(torch::init<at::ScalarType, at::ScalarType, int64_t>())
-        .def("run_gemm", &torch_ext::W4A16GemmRunner::runGemm)
-        .def("get_num_configs", &torch_ext::W4A16GemmRunner::getNumConfigs);
+        .def("run_gemm", &torch_ext::finegrainedMixedDtypeGemmRunner::runGemm)
+        .def("get_num_configs", &torch_ext::finegrainedMixedDtypeGemmRunner::getNumConfigs);
 }

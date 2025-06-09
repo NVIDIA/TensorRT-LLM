@@ -404,9 +404,9 @@ class Linear(nn.Module):
                 self.input_scale = Parameter(torch.tensor(1.,
                                                           dtype=torch.float32),
                                              requires_grad=False)
-                self.inv_input_scale = Parameter(
-                    torch.tensor(1., dtype=torch.float32), requires_grad=False
-                )  # todo delete?? where does it get used in other quant modes?
+                self.inv_input_scale = Parameter(torch.tensor(
+                    1., dtype=torch.float32),
+                                                 requires_grad=False)
 
                 self.alpha = Parameter(torch.empty([1], dtype=torch.float32),
                                        requires_grad=False)
@@ -496,7 +496,7 @@ class Linear(nn.Module):
                 # NOTE: without the preprocess during the runtime, the gemm output nan's. in order to use the preprocess_weights_for_mixed_gemm
                 # we need to cast the weight to int8 first.
 
-                output = torch.ops.trtllm.w4a16_gemm(
+                output = torch.ops.trtllm.finegrained_mixed_dtype_gemm(
                     input.contiguous(),
                     self.weight,
                     self.weight_scale.T.contiguous(),
@@ -504,33 +504,22 @@ class Linear(nn.Module):
                     qc.has_zero_point,
                     bias,
                     zeros=None)
+
             elif self.has_w4a8_awq:
                 if self.pre_quant_scale is not None:
                     pre_quant_scale = self.pre_quant_scale.repeat(
                         input.shape[0], 1)
                     input = torch.mul(input, pre_quant_scale)
 
-                cur_input_scale = self.input_scale
-                if input.dtype != torch.float8_e4m3fn:
-                    if self.input_scale is not None:
-                        # Static quantization
-                        qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                            input, self.input_scale)
+                # Static quantization
+                qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    input, self.input_scale)
 
-                        p_input = static_quantize_e4m3_per_tensor_debug(
-                            input, self.input_scale)
-                        print(f"{torch.equal(p_input, qinput)}")
-                    else:
-                        assert False
-                        # Dynamic quantization
-                        qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
-                            input)
-                        cur_input_scale = cur_input_scale.to(torch.float32)
-                else:
-                    assert False
-                    qinput = input
+                p_input = static_quantize_e4m3_per_tensor_debug(
+                    input, self.input_scale)
+                # print(f"{torch.equal(p_input, qinput)}")
 
-                output = torch.ops.trtllm.w4a16_gemm(
+                output = torch.ops.trtllm.finegrained_mixed_dtype_gemm(
                     input=qinput,
                     weight=self.weight,
                     scales=self.weight_scale.T.contiguous(),
@@ -723,17 +712,20 @@ class Linear(nn.Module):
                     _copy(self.input_scale, input_scale)
                     _copy(self.alpha, alpha)
 
-                    pre_quant_scale = load_weight_shard(
-                        weights[0]['pre_quant_scale'], self.tp_size,
-                        self.tp_rank, self.tp_mode, device)
+                    if 'pre_quant_scale' in weights[0]:
+                        pre_quant_scale = load_weight_shard(
+                            weights[0]['pre_quant_scale'], self.tp_size,
+                            self.tp_rank, self.tp_mode, device)
 
-                    # NOTE:Create this tensor in load_weights, since not all layer have this tensor and memory is not allocated for it (same as W4A16)
-                    self.pre_quant_scale = Parameter(
-                        torch.ones((self.in_features, ), dtype=torch.float16),
-                        requires_grad=False).to(device=device)
+                        # NOTE:Create this tensor in load_weights, since not all layer have this tensor and memory is not allocated for it (same as W4A16)
+                        self.pre_quant_scale = Parameter(
+                            torch.ones((self.in_features, ),
+                                       dtype=torch.float16),
+                            requires_grad=False).to(device=device)
 
-                    _copy(self.pre_quant_scale, pre_quant_scale)
+                        _copy(self.pre_quant_scale, pre_quant_scale)
 
+                    self.inv_input_scale.data = 1.0 / self.input_scale
         elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
             assert len(weights) == 3
 
