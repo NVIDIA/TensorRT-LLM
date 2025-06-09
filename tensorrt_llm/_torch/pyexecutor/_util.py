@@ -262,7 +262,7 @@ class KvCacheCreator:
             self, model_engine: PyTorchModelEngine) -> KVCacheManager:
         executor_config = self._executor_config
         mapping = self._mapping
-        assert executor_config.pytorch_backend_config.use_kv_cache, "Only construct KV cache when it is needed."
+        assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
 
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
