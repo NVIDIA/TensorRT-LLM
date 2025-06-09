@@ -15,6 +15,8 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
+from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled, nvtx_range,
                                  trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
@@ -33,7 +35,7 @@ from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
                           LlmRequestState, executor_request_to_llm_request)
 from .model_engine import ModelEngine
 from .sampler import Sampler, SampleState, SampleStateTensors, TorchSampler
-from .scheduler import ScheduledRequests
+from .scheduler import RequestScheduler, ScheduledRequests
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -159,11 +161,12 @@ class BatchStatePP(BatchState):
 class PyExecutor:
 
     def __init__(self,
-                 resource_manager,
-                 scheduler,
+                 resource_manager: ResourceManager,
+                 scheduler: RequestScheduler,
                  model_engine: ModelEngine,
                  sampler: Sampler,
                  dist: Distributed,
+                 max_num_sequences: int,
                  disable_overlap_scheduler: bool = False,
                  max_input_len: int = 2048,
                  max_batch_size: int = 8,
@@ -262,11 +265,13 @@ class PyExecutor:
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
-        if self.draft_model_engine is not None and self.event_loop.__name__ != self._executor_loop.__name__:
-            raise NotImplementedError(
-                "Drafting is not supported for selected executor loop. "
-                "Please disable disagg/pipeline parallelism/overlap scheduler.")
-
+        if self.draft_model_engine is not None:
+            if self.event_loop.__name__ != self._executor_loop.__name__:
+                raise NotImplementedError(
+                    "Drafting is not supported for selected executor loop. "
+                    "Please disable disagg/pipeline parallelism/overlap scheduler."
+                )
+            self.draft_seq_slot_manager = SeqSlotManager(max_num_sequences)
         self.worker_started = False
         self.worker_lock = threading.Lock()
         if start_worker:
@@ -1778,7 +1783,8 @@ class PyExecutor:
                         max_new_tokens=request.py_max_new_tokens,
                         input_tokens=input_tokens,
                         sampling_config=request.sampling_config,
-                        is_streaming=False)
+                        is_streaming=False,
+                        is_draft=True)
 
                     draft_batch.context_requests.append(new_request)
                 elif getattr(request, "py_num_accepted_draft_tokens", 0) == 0:
@@ -1787,7 +1793,8 @@ class PyExecutor:
                         max_new_tokens=request.py_max_new_tokens,
                         input_tokens=input_tokens[:-1],
                         sampling_config=request.sampling_config,
-                        is_streaming=False)
+                        is_streaming=False,
+                        is_draft=True)
                     # Explicitly add the last token so get_last_tokens() returns
                     # the right value
                     new_request.add_new_token(input_tokens[-1], beam_idx)
@@ -1799,7 +1806,8 @@ class PyExecutor:
                         max_new_tokens=request.py_max_new_tokens,
                         input_tokens=input_tokens,
                         sampling_config=request.sampling_config,
-                        is_streaming=False)
+                        is_streaming=False,
+                        is_draft=True)
                     new_request.context_chunk_size = num_accepted_tokens + 1
                     new_request.context_current_position = len(
                         input_tokens) - num_accepted_tokens - 1
@@ -1818,12 +1826,16 @@ class PyExecutor:
 
     @nvtx_range("_prepare_draft_tokens")
     def _prepare_draft_tokens(self, scheduled_requests: ScheduledRequests):
+        if not self.draft_model_engine:
+            raise ValueError("Draft model engine is not set")
+
         try:
             draft_batch, num_rejected_tokens = self._prepare_draft_batch(
                 scheduled_requests)
 
             if draft_batch.batch_size == 0:
                 return
+            self.draft_seq_slot_manager.prepare_resources(draft_batch)
 
             req_id_to_old_request = {
                 req.py_request_id: req
@@ -1870,6 +1882,8 @@ class PyExecutor:
                             target_model_req.py_draft_tokens
                     ) < target_model_req.py_draft_pages_allocated:
                         new_requests.append(req)
+                    else:
+                        self.draft_seq_slot_manager.free_resources(req)
 
                 return new_requests
 

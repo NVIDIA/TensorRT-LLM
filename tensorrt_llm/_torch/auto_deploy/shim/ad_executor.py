@@ -310,6 +310,7 @@ def create_autodeploy_executor(
         model_engine=engine,
         sampler=sampler,
         dist=mpi_dist,
+        max_num_sequences=ad_config.max_batch_size * dist_mapping.pp_size,
         disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         max_input_len=ad_config.max_input_len,
         max_batch_size=ad_config.max_batch_size,

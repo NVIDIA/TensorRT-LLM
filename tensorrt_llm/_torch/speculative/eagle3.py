@@ -9,7 +9,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
+from ..pyexecutor.sampler import (SampleStateTensors, SampleStateTorch,
+                                  TorchSampler, seq_slice)
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 from .mtp import MTPSampler
 
@@ -194,8 +195,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
 
 class Eagle3Sampler(TorchSampler):
 
-    def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs: dict[str, torch.Tensor]) -> SampleState:
+    def sample_async(
+            self, scheduled_requests: ScheduledRequests,
+            model_outputs: dict[str, torch.Tensor]) -> SampleStateTorch:
         if "d2t" not in model_outputs:
             return super().sample_async(scheduled_requests, model_outputs)
         d2t = model_outputs["d2t"]
@@ -205,18 +207,19 @@ class Eagle3Sampler(TorchSampler):
         self._process_requests(requests,
                                raw_logits,
                                new_tokens=new_tokens_device)
-        d2t = d2t.reshape(new_tokens_device.shape)
-        new_tokens_device = d2t[new_tokens_device] + new_tokens_device
+        all_slices = (seq_slice(request, self.BEAM, size=0)
+                      for request in requests)
+        for slc in all_slices:
+            new_tokens_device[slc] += d2t[new_tokens_device[slc]]
         device = SampleStateTensors(new_tokens=new_tokens_device)
         host = SampleStateTensors(
             new_tokens=new_tokens_device.to('cpu', non_blocking=True))
         sampler_event = torch.cuda.Event()
         sampler_event.record()
-        return SampleState(scheduled_requests=scheduled_requests,
-                           logits=None,
-                           device=device,
-                           host=host,
-                           sampler_event=sampler_event)
+        return SampleStateTorch(scheduled_requests=scheduled_requests,
+                                device=device,
+                                host=host,
+                                sampler_event=sampler_event)
 
 
 class Eagle3OneModelSampler(MTPSampler):

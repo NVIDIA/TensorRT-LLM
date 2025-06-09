@@ -502,6 +502,7 @@ def create_py_executor_instance(
                       model_engine=model_engine,
                       sampler=sampler,
                       dist=dist,
+                      max_num_sequences=max_num_sequences,
                       disable_overlap_scheduler=pytorch_backend_config.
                       disable_overlap_scheduler,
                       max_batch_size=executor_config.max_batch_size,
