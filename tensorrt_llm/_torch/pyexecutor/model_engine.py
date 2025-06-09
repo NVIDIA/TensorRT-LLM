@@ -505,6 +505,17 @@ class PyTorchModelEngine(ModelEngine):
             hidden_size=self.model.config.hidden_size,
             dtype=torch_dtype_to_str(self.model.config.torch_dtype))
 
+    @property
+    def use_mrope(self):
+        use_mrope = False
+        try:
+            use_mrope = self.model.model_config.pretrained_config.rope_scaling[
+                'type'] == 'mrope'
+        except Exception:
+            pass
+        logger.info(f"Detected use_mrope: {use_mrope}")
+        return use_mrope
+
     @contextmanager
     def set_warmup_flag(self):
         self.in_warmup = True
@@ -541,6 +552,7 @@ class PyTorchModelEngine(ModelEngine):
         if kv_cache_manager is None:
             logger.info("Skipping warm up as no KV Cache manager allocated.")
             return
+        use_mrope = self.use_mrope
 
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy request to None in warmup.
@@ -557,6 +569,7 @@ class PyTorchModelEngine(ModelEngine):
                     list(range(batch_size - 1)),
                     is_gen=True,
                     max_num_draft_tokens=self.max_draft_len,
+                    use_mrope=use_mrope,
                 )
                 available_tokens = kv_cache_manager.get_num_available_tokens(
                     self.max_draft_len)
@@ -569,6 +582,7 @@ class PyTorchModelEngine(ModelEngine):
                     token_nums=[token_num],
                     is_gen=True,
                     max_num_draft_tokens=self.max_draft_len,
+                    use_mrope=use_mrope,
                 )[0]
                 # Add the longest request before all other seq_len=1 request to simulate the padding CUDA graph case.
                 # This batch contains both the longest request and the shortest requests,
@@ -579,7 +593,9 @@ class PyTorchModelEngine(ModelEngine):
                 result.generation_requests = requests
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(
-                        request_ids=list(range(batch_size)))
+                        request_ids=list(range(batch_size)),
+                        use_mrope=use_mrope,
+                    )
             else:
                 result = None
             return result
@@ -2049,6 +2065,22 @@ class PyTorchModelEngine(ModelEngine):
                                                       attn_metadata,
                                                       spec_metadata,
                                                       new_tensors_device)
+<<<<<<< HEAD
+=======
+
+            # prepare mrope_position_deltas for cuda graph if necessary
+            if 'mrope_config' in inputs:
+                if 'mrope_position_deltas' in inputs['mrope_config']:
+                    mrope_position_deltas_tensor = torch.cat(
+                        inputs['mrope_config']['mrope_position_deltas'], dim=0)
+                    extra_model_inputs = {
+                        "mrope_position_deltas": mrope_position_deltas_tensor,
+                    }
+
+            if extra_model_inputs is not None:
+                inputs.update(extra_model_inputs)
+            self.last_spec_metadata = spec_metadata
+>>>>>>> e5bbe52a4 (fix cuda graph + mrope)
 
             self.iter_counter += 1
 

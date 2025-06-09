@@ -335,6 +335,7 @@ class KVCacheManager(BaseResourceManager):
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
+        use_mrope: bool = False,
     ):
         beam_width = 1
         requests = []
@@ -349,12 +350,15 @@ class KVCacheManager(BaseResourceManager):
                 1
             ] * token_num if self.impl.cross_kv else None
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
+            mrope_position_deltas = torch.zeros(
+                1, device="cuda", dtype=torch.int32) if use_mrope else None
             req = LlmRequest(request_id=req_id,
                              max_new_tokens=1,
                              input_tokens=[1] * token_num,
                              sampling_config=SamplingConfig(
                                  sampling_params._get_sampling_config()),
                              is_streaming=False,
+                             mrope_position_deltas=mrope_position_deltas,
                              encoder_input_tokens=encoder_input_tokens)
             req.is_dummy_request = True
             req.paged_kv_block_ids = []

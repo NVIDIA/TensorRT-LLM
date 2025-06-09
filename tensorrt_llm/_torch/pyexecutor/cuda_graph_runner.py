@@ -61,6 +61,7 @@ class DecodingCUDAGraphRunner:
         self.spec_metadata = spec_metadata
         self._output = None
         self._graph = None
+        self.optional_extra_model_inputs = ["mrope_position_deltas"]
 
     def __del__(self):
         self._graph.reset()
@@ -120,6 +121,23 @@ class DecodingCUDAGraphRunner:
         self.input_ids[:seqlen].copy_(input_ids)
         self.position_ids[:, :seqlen].copy_(position_ids)
 
+<<<<<<< HEAD
+=======
+        if self.extra_model_inputs:
+            # use optional_extra_model_inputs to fit dummy requests given by operations like estimate_max_kv_cache_tokens
+            if extra_model_inputs is None:
+                assert set(self.extra_model_inputs.keys()).issubset(
+                    set(self.optional_extra_model_inputs)
+                ), "Model was captured with extra model inputs, so extra_model_inputs must be provided to run()"
+            else:
+                for key in self.extra_model_inputs:
+                    if key not in extra_model_inputs and key in self.optional_extra_model_inputs:
+                        continue
+                    assert key in extra_model_inputs, f"Graph runner is missing extra input {key}"
+                    dst_tensor = self.extra_model_inputs[key]
+                    dst_tensor.copy_(extra_model_inputs[key])
+
+>>>>>>> e5bbe52a4 (fix cuda graph + mrope)
         assert self._output is not None and self._graph is not None
         self._graph.replay()
         return self._output
