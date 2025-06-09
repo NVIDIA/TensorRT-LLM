@@ -1501,7 +1501,13 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     }
 
     TLLM_LOG_DEBUG("%s::storeNewBlock - store the last block", mLogPrefix.c_str());
-    storeBlock(blockKeys.back(), cacheBlockIds[beamIdx][blockKeys.size() - 1], prevBlock);
+    auto storedBlocks = storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+    assert(storedBlocks.size() < 2);
+    if (storedBlocks.size() == 1)
+    {
+        assert(storedBlocks[0]->getBlockKey() == blockKeys.back());
+        TLLM_LOG_DEBUG("%s::storeNewBlock - stored block %d", mLogPrefix.c_str(), storedBlocks[0]->getBlockId());
+    }
 }
 
 void WindowBlockManager::storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
