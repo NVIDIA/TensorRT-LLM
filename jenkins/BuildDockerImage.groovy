@@ -203,7 +203,6 @@ def prepareWheelFromBuildStage(makefileStage, arch) {
 
     def wheelScript = 'scripts/get_wheel_from_package.py'
     def wheelArgs = "--arch ${arch} --upload_path " + env.uploadPath
-    // def wheelArgs = "--arch ${arch} --upload_path " + "sw-tensorrt-generic/llm-artifacts/LLM/PipelineMonitor/L0_MergeRequest_PR/89"
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
 }
 
