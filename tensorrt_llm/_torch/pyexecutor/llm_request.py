@@ -275,6 +275,20 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         return self.is_attention_dp_dummy or self.is_cuda_graph_dummy
 
 
+def create_responses(requests, use_fast_logits=False, mpi_world_rank=0):
+    # responses = [r.create_response(use_fast_logits, mpi_world_rank) for r in requests]
+    cpp_responses = tensorrt_llm.bindings.internal.batch_manager.create_responses(
+        requests, use_fast_logits, mpi_world_rank)
+    responses = []
+    assert len(cpp_responses) == len(requests), \
+        f"Expected {len(requests)} responses, got {len(cpp_responses)}"
+    for cpp_response, request in zip(cpp_responses, requests):
+        responses.append(
+            LlmResponse(cpp_response, request.py_result
+                        ) if cpp_response is not None else None)
+    return responses
+
+
 def convert_wordlist(word_list) -> List[List[int]]:
     """Converts a wordlist from format:
 

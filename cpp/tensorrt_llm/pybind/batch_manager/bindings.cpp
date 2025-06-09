@@ -25,6 +25,7 @@
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/pybind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
@@ -404,6 +405,23 @@ void initBindings(pybind11::module_& m)
                  runtime::TllmRuntime const&>(),
             py::arg("max_beam_width"), py::arg("max_seq_len"), py::arg("buffer_manager"), py::arg("model_config"),
             py::arg("world_config"), py::arg("decoding_config"), py::arg("runtime"));
+
+    m.def(
+        "create_responses",
+        [](std::vector<tb::LlmRequest>& requests, bool useFastLogits, int32_t mpiWorldRank)
+        {
+            py::gil_scoped_release release;
+            NVTX3_SCOPED_RANGE(create_responses);
+            std::vector<std::optional<tle::Response>> responses;
+            responses.reserve(requests.size());
+            for (auto& request : requests)
+            {
+                responses.push_back(request.createResponse(useFastLogits, mpiWorldRank));
+            }
+            return responses;
+        },
+        py::arg("requests"), py::arg("use_fast_logits"), py::arg("mpi_world_rank"),
+        "Creates a list of Response objects.");
 }
 
 } // namespace tensorrt_llm::pybind::batch_manager

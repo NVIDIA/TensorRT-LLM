@@ -2041,10 +2041,11 @@ class PyExecutor:
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
         )
         for request in self.active_requests:
-            req_id = request.py_request_id
+            # req_id = request.py_request_id
             # no responses for dummy request, and finish it
             if request.is_attention_dp_dummy:
                 requests_to_terminate.append(request)
+                self.active_requests.remove(request)
                 continue
 
             if request.is_generation_only_request:
@@ -2055,11 +2056,17 @@ class PyExecutor:
                         not self.disable_overlap_scheduler
                         and request.py_decoding_iter <= 1):
                     new_active_requests.append(request)
+                    self.active_requests.remove(request)
                     continue
 
             request.draft_tokens = request.py_draft_tokens
             request.decoding_iter = request.py_decoding_iter
+
+            # responses = create_responses(self.active_requests, False, self.dist.rank)
+            # for i, request in enumerate(self.active_requests):
             response: Response = request.create_response(False, self.dist.rank)
+            # response = responses[i]
+            req_id = request.py_request_id
             request_done = False
             if response:
                 request_done = response.result.is_final
