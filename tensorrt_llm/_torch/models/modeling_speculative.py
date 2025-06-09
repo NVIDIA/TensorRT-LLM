@@ -224,13 +224,13 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
 
     def __init__(
         self,
-        eagle3_draft_model: Eagle3DraftModel,
         model_config: LlamaConfig,
+        start_layer_idx: int = 0,
     ):
         draft_vocab_size = model_config.pretrained_config.vocab_size
         if model_config.pretrained_config.draft_vocab_size is not None:
             draft_vocab_size = model_config.pretrained_config.draft_vocab_size
-        super().__init__(eagle3_draft_model,
+        super().__init__(Eagle3DraftModel(model_config, start_layer_idx),
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=draft_vocab_size)
@@ -319,9 +319,7 @@ def get_draft_model(model_config, draft_config):
     spec_dec_mode = model_config.spec_config.spec_dec_mode
     if spec_dec_mode.is_eagle3_one_model():
         return Eagle3ForCausalLM(
-            Eagle3DraftModel(draft_config,
-                             model_config.pretrained_config.num_hidden_layers),
-            draft_config)
+            draft_config, model_config.pretrained_config.num_hidden_layers)
     else:
         raise NotImplemented(
             f"get_draft_model does not support speculative decoding mode {spec_dec_mode}."
