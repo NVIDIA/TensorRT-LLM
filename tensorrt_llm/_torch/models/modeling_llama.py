@@ -950,9 +950,16 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
 class Llama4InputProcessor(InputProcessor):
 
-    def __init__(self, model_path, model_config, tokenizer):
-        self.processor = AutoProcessor.from_pretrained(model_path,
-                                                       use_fast=True)
+    def __init__(self,
+                 model_path,
+                 model_config,
+                 tokenizer,
+                 trust_remote_code: bool = True):
+        self.use_fast = True
+        self.processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
         self.model_config = model_config
         self.tokenizer = tokenizer
         self.vocab_size = model_config.text_config.vocab_size
