@@ -68,6 +68,8 @@ MODEL_PATH_DICT = {
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
     "mixtral_8x7b_v0.1_instruct_fp8": "Mixtral-8x7B-Instruct-v0.1-fp8",
+    "mixtral_8x7b_v0.1_instruct_fp4":
+    "modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp4",
     "mixtral_8x22b_v0.1": "Mixtral-8x22B-v0.1",
     "mistral_7b_v0.1": "mistral-7b-v0.1",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
@@ -336,6 +338,7 @@ class PerfTestConfig:
         num_reqs: int = 512,
         concurrency: int = -1,
         quantization: str = "",
+        kv_cache_dtype: str = "auto",
         ep_size: int = None,
         tp_size: int = 1,
         pp_size: int = 1,
@@ -379,6 +382,8 @@ class PerfTestConfig:
         self.concurrency = concurrency
         # Quantization type.
         self.quantization = quantization
+        # KV Cache dtype
+        self.kv_cache_dtype = kv_cache_dtype
         # Multiple Profiles
         self.multiple_profiles = False
         # EP Size
@@ -475,6 +480,10 @@ class PerfTestConfig:
         # Add quantization type.
         if self.quantization != "":
             entries.append(f"quant:{self.quantization}")
+
+        # Add kv cache dtype.
+        if self.kv_cache_dtype != "auto":
+            entries.append(f"kv_cache_dtype:{self.kv_cache_dtype}")
 
         # Add number of requests.
         if self.num_reqs != 512:
@@ -579,6 +588,11 @@ class PerfTestConfig:
                 "quant:") else labels.pop(0).replace("quant:", "")
 
         if len(labels) > 0:
+            self.kv_cache_dtype = "auto" if not labels[0].startswith(
+                "kv_cache_dtype:") else labels.pop(0).replace(
+                    "kv_cache_dtype:", "")
+
+        if len(labels) > 0:
             self.num_reqs = 512 if not labels[0].startswith("reqs:") else int(
                 labels.pop(0).replace("reqs:", ""))
 
@@ -636,6 +650,8 @@ class PerfTestConfig:
         # Validate dtype.
         VALID_DTYPES = ["float32", "float16", "bfloat16", "float8", "float4"]
         assert self.data_type in VALID_DTYPES, f"Invalid data_type {self.data_type}!"
+        VALID_KV_CACHE_DTYPES = ["auto", "fp8"]
+        assert self.kv_cache_dtype in VALID_KV_CACHE_DTYPES, f"Invalid kv_cache_dtype {self.kv_cache_dtype}!"
 
         # Validate quantization mode.
         if self.model_name in MODEL_PATH_DICT.keys():
