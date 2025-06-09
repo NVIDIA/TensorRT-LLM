@@ -142,6 +142,9 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
     def jobName = getShortenedJobName(env.JOB_NAME)
     def buildID = env.BUILD_ID
 
+    def archSuffix = arch == "arm64" ? "arm" : "amd"
+    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+
     switch(type)
     {
     case "build":
@@ -229,7 +232,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                         fieldRef:
                           fieldPath: spec.nodeName
                   - name: jnlp
-                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11
+                    image: ${jnlpImage}
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:

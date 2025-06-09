@@ -81,6 +81,8 @@ def _test_llm_multimodal_general(llm_venv,
 
     if "neva-22b" in tllm_model_name and get_device_memory() < 80000:
         pytest.skip("GPU memory is insufficient.")
+    if "Mistral-Small" in tllm_model_name and get_device_memory() < 80000:
+        pytest.skip("GPU memory is insufficient.")
 
     print("Converting huggingface model into binary format...")
     # ckpt from llm_models/<model_name> --> cmodels/<model_name>/<dtype>

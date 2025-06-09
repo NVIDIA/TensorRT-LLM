@@ -74,16 +74,18 @@ constexpr inline T roundUp(T a, T b)
 
 DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParams, bool for_configure_plugin)
 {
+    int const smVersion = tensorrt_llm::common::getSMVersion();
     if (xqaParams.multi_query_tokens)
     {
         auto const grpSize = xqaParams.num_q_heads / xqaParams.num_kv_heads;
         // Ampere XQA supports spec dec with pre-compiled cubins (may also work with JIT but not implemented yet)
         // Hopper XQA supports spec dec with JIT, but only for E4M3 kv cache data type. Only allow 64%grpSize==0 for
         // now.
-        return (tensorrt_llm::common::getSMVersion() == 90
-                   && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3 && 64 % grpSize == 0)
-            ? mJITImpl.get()
-            : mPrecompiledImpl.get();
+        bool const supportedByHopperXqa
+            = (smVersion == 90 && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3 && 64 % grpSize == 0);
+        bool const supportedBySm120Mla
+            = (smVersion == 120 && xqaParams.isMLA() && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3);
+        return (supportedByHopperXqa || supportedBySm120Mla) ? mJITImpl.get() : mPrecompiledImpl.get();
     }
 
     std::optional<bool> envEnableXQAJIT = tensorrt_llm::common::getEnvEnableXQAJIT();
@@ -94,8 +96,7 @@ DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParam
     }
     else
     {
-        // If no env var set, default to precompiled impl for sm120, otherwise default to JIT.
-        return tensorrt_llm::common::getSMVersion() == 120 ? mPrecompiledImpl.get() : mJITImpl.get();
+        return mJITImpl.get();
     }
 }
 
