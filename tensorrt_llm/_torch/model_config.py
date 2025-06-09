@@ -23,18 +23,13 @@ class MoeLoadBalancerConfig:
                                                                   repr=False)
     layer_updates_per_iter: int = 0
 
-    num_experts: Optional[int] = field(default=None, init=False)
     ep_rank: Optional[int] = field(default=None, init=False)
     ep_size: Optional[int] = field(default=None, init=False)
 
-    def setup(self, num_experts: int, ep_rank: int, ep_size: int) -> None:
-        self.num_experts = num_experts
+    def setup(self, ep_rank: int, ep_size: int) -> None:
         self.ep_rank = ep_rank
         self.ep_size = ep_size
-        if self.num_slots is None:
-            self.num_slots = self.num_experts
-        assert self.num_slots >= self.num_experts
-        assert self.num_slots % self.ep_size == 0
+        assert self.num_slots is not None
 
     @property
     def num_local_slots(self) -> int:
@@ -49,17 +44,13 @@ class MoeLoadBalancerConfig:
         return self.slot_start + self.num_local_slots
 
     def get_layer_initial_global_assignments(self, layer_idx: int) -> List[int]:
-        if self.initial_global_assignments is None:
-            return [(ep_rank * self.num_experts // self.ep_size + i) %
-                    self.num_experts for ep_rank in range(self.ep_size)
-                    for i in range(self.num_local_slots)]
-        else:
+        if self.initial_global_assignments is not None:
             assert layer_idx in self.initial_global_assignments
             assert len(
                 self.initial_global_assignments[layer_idx]) == self.num_slots
-            assert set(self.initial_global_assignments[layer_idx]) == set(
-                range(self.num_experts))
             return self.initial_global_assignments[layer_idx]
+        else:
+            return None
 
 
 @dataclass(kw_only=True)
