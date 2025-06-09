@@ -4,7 +4,6 @@ import functools
 import gc
 import glob
 import inspect
-import itertools
 import math
 import multiprocessing
 import os
@@ -621,13 +620,12 @@ class PyTorchModelEngine(ModelEngine):
             return result, _create_extra_inputs(1, self.max_num_tokens)
 
         @contextlib.contextmanager
-        def release_batch(result):
+        def release_batch(result: ScheduledRequests | None):
             try:
                 yield result
             finally:
                 if result is not None:
-                    for req in itertools.chain(result.generation_requests,
-                                               result.context_requests):
+                    for req in result.all_requests():
                         kv_cache_manager.free_resources(req)
                         if spec_resource_manager is not None:
                             spec_resource_manager.free_resources(req)
@@ -2155,9 +2153,7 @@ class PyTorchModelEngine(ModelEngine):
         num_ctx_req = len(scheduled_requests.context_requests)
         logits_tensor = outputs["logits"]
 
-        for idx, request in enumerate(
-                itertools.chain(scheduled_requests.context_requests,
-                                scheduled_requests.generation_requests)):
+        for idx, request in enumerate(scheduled_requests.all_requests()):
             logits_processors = getattr(request, "py_logits_post_processors",
                                         None)
             if not logits_processors:

@@ -11,7 +11,6 @@ import traceback
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager
-from itertools import chain
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -1704,8 +1703,7 @@ class PyExecutor:
         total_num_draft_tokens = 0
         total_num_accepted_tokens = 0
         num_requests_with_draft_tokens = 0
-        for request in chain(scheduled_requests.context_requests,
-                             scheduled_requests.generation_requests):
+        for request in scheduled_requests.all_requests():
             num_draft_tokens = 0 if request.py_last_draft_tokens is None else len(
                 request.py_last_draft_tokens)
             num_accepted_tokens = getattr(request,
@@ -1829,8 +1827,7 @@ class PyExecutor:
 
             req_id_to_old_request = {
                 req.py_request_id: req
-                for req in chain(scheduled_requests.context_requests,
-                                 scheduled_requests.generation_requests)
+                for req in scheduled_requests.all_requests()
             }
 
             spec_metadata = self.model_engine.last_spec_metadata
@@ -1865,8 +1862,7 @@ class PyExecutor:
 
             def _process_decoded_tokens():
                 new_requests = []
-                for req in chain(draft_batch.context_requests,
-                                 draft_batch.generation_requests):
+                for req in draft_batch.all_requests():
                     target_model_req = req_id_to_old_request[req.py_request_id]
                     target_model_req.py_draft_tokens.append(
                         req.get_last_tokens(0))
@@ -2113,14 +2109,12 @@ class PyExecutor:
 
     def _add_inflight_ids(self, scheduled_requests):
         """Add reqids of current requests to self.inflight_req_ids."""
-        for req in chain(scheduled_requests.context_requests,
-                         scheduled_requests.generation_requests):
+        for req in scheduled_requests.all_requests():
             self.inflight_req_ids.insert(req.request_id)
 
     def _remove_inflight_ids(self, scheduled_requests):
         """Remove reqids of current requests from self.inflight_req_ids."""
-        for req in chain(scheduled_requests.context_requests,
-                         scheduled_requests.generation_requests):
+        for req in scheduled_requests.all_requests():
             self.inflight_req_ids.erase(req.request_id)
 
     def _should_exclude_last_generation_logits(self) -> bool:

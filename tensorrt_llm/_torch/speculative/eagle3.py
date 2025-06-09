@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from itertools import chain
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -112,8 +111,7 @@ class Eagle3SpecMetadata(SpecMetadata):
             seq_start += seqlen
 
         hidden_states_gather_ids = []
-        for req in chain(scheduled_requests.context_requests,
-                         scheduled_requests.generation_requests):
+        for req in scheduled_requests.all_requests():
             hidden_states_gather_ids.extend(
                 req_id_to_gather_ids[req.py_request_id])
 
