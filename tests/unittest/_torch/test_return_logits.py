@@ -8,7 +8,6 @@ from utils.util import force_ampere
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, PyResult
 from tensorrt_llm.bindings.executor import Response, Result
 from tensorrt_llm.executor.result import Logprob
@@ -56,11 +55,13 @@ def test_LlmResponse_pickle():
 
 
 @force_ampere  # Save H100 resource
-@pytest.mark.parametrize("enable_trtllm_sampler", [False, True])
-@pytest.mark.parametrize("gather_context_logits", [False, True])
-@pytest.mark.parametrize("gather_generation_logits", [False, True])
 @pytest.mark.parametrize("return_log_probs", [False, True])
-def test_generate_with_return_logits(enable_trtllm_sampler: bool,
+@pytest.mark.parametrize("gather_generation_logits", [False, True])
+@pytest.mark.parametrize("gather_context_logits", [False, True])
+@pytest.mark.parametrize("enable_trtllm_sampler", [False, True])
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+def test_generate_with_return_logits(disable_overlap_scheduler: bool,
+                                     enable_trtllm_sampler: bool,
                                      gather_context_logits: bool,
                                      gather_generation_logits: bool,
                                      return_log_probs: bool):
@@ -68,17 +69,13 @@ def test_generate_with_return_logits(enable_trtllm_sampler: bool,
             or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
 
-    if enable_trtllm_sampler and (gather_generation_logits or return_log_probs):
-        pytest.skip(
-            "TRTLLMSampler does not support gather_generation_logits or return_log_probs"
-        )
+    if enable_trtllm_sampler and return_log_probs:
+        pytest.skip("TRTLLMSampler does not support return_log_probs")
     elif not enable_trtllm_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
     build_config = BuildConfig()
     build_config.gather_context_logits = gather_context_logits
-
-    pytorch_config = PyTorchConfig(enable_trtllm_sampler=enable_trtllm_sampler)
 
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
@@ -89,11 +86,14 @@ def test_generate_with_return_logits(enable_trtllm_sampler: bool,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
-        pytorch_backend_config=pytorch_config,
+        enable_trtllm_sampler=enable_trtllm_sampler,
+        disable_overlap_scheduler=disable_overlap_scheduler,
     )
 
     sampling_params = SamplingParams(
         max_tokens=8,
+        top_k=1,
+        top_p=1,
         return_context_logits=gather_context_logits,
         return_generation_logits=gather_generation_logits,
         logprobs=return_log_probs)
@@ -106,10 +106,12 @@ def test_generate_with_return_logits(enable_trtllm_sampler: bool,
             assert output.context_logits is None
 
         if gather_generation_logits:
-            assert output.outputs[0].generation_logits is not None
-            assert output.outputs[0].generation_logits.ndim == 2
-            assert output.outputs[0].generation_logits.shape[
-                0] == sampling_params.max_tokens
+            gen_logits = output.outputs[0].generation_logits
+            assert gen_logits is not None
+            assert gen_logits.ndim == 2
+            assert gen_logits.shape[0] == sampling_params.max_tokens
+            assert torch.argmax(gen_logits,
+                                dim=1).tolist() == output.outputs[0].token_ids
         else:
             assert output.outputs[0].generation_logits is None
 
@@ -120,11 +122,13 @@ def test_generate_with_return_logits(enable_trtllm_sampler: bool,
 
 
 @force_ampere  # Save H100 resource
-@pytest.mark.parametrize("enable_trtllm_sampler", [False, True])
-@pytest.mark.parametrize("gather_context_logits", [False, True])
-@pytest.mark.parametrize("gather_generation_logits", [False, True])
 @pytest.mark.parametrize("return_log_probs", [False, True])
-def test_generate_async_with_return_logits(enable_trtllm_sampler: bool,
+@pytest.mark.parametrize("gather_generation_logits", [False, True])
+@pytest.mark.parametrize("gather_context_logits", [False, True])
+@pytest.mark.parametrize("enable_trtllm_sampler", [False, True])
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
+                                           enable_trtllm_sampler: bool,
                                            gather_context_logits: bool,
                                            gather_generation_logits: bool,
                                            return_log_probs: bool):
@@ -132,17 +136,13 @@ def test_generate_async_with_return_logits(enable_trtllm_sampler: bool,
             or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
 
-    if enable_trtllm_sampler and (gather_generation_logits or return_log_probs):
-        pytest.skip(
-            "TRTLLMSampler does not support gather_generation_logits or return_log_probs"
-        )
+    if enable_trtllm_sampler and return_log_probs:
+        pytest.skip("TRTLLMSampler does not support return_log_probs")
     elif not enable_trtllm_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
     build_config = BuildConfig()
     build_config.gather_context_logits = gather_context_logits
-
-    pytorch_config = PyTorchConfig(enable_trtllm_sampler=enable_trtllm_sampler)
 
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
@@ -153,10 +153,13 @@ def test_generate_async_with_return_logits(enable_trtllm_sampler: bool,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
-        pytorch_backend_config=pytorch_config,
+        enable_trtllm_sampler=enable_trtllm_sampler,
+        disable_overlap_scheduler=disable_overlap_scheduler,
     )
     sampling_params = SamplingParams(
         max_tokens=8,
+        top_k=1,
+        top_p=1,
         return_context_logits=gather_context_logits,
         return_generation_logits=gather_generation_logits,
         logprobs=return_log_probs)
@@ -172,9 +175,13 @@ def test_generate_async_with_return_logits(enable_trtllm_sampler: bool,
             assert output.context_logits is None
 
         if gather_generation_logits:
-            assert output.outputs[0].generation_logits is not None
-            assert output.outputs[0].generation_logits.ndim == 2
-            assert output.outputs[0].generation_logits.shape[0] == 1
+            gen_logits = output.outputs[0].generation_logits
+            assert gen_logits is not None
+            assert gen_logits.ndim == 2
+            assert gen_logits.shape[0] == 1
+            assert torch.argmax(
+                gen_logits,
+                dim=1).tolist()[0] == output.outputs[0].token_ids[-1]
         else:
             assert output.outputs[0].generation_logits is None
 
