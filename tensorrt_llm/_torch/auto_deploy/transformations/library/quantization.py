@@ -165,7 +165,8 @@ def _insert_quantized_bmm(
             )
 
     # Update node arguments and kwargs
-    node.kwargs = {**node.kwargs, **scales}
+    scale_values = [scales[scale_name] for scale_name in quantization_impl.scale_names()]
+    node.args = (*node.args, *scale_values)
 
 
 def quantize(gm: GraphModule, quant_config: Dict[str, Any]):
