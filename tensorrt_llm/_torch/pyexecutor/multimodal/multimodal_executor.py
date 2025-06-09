@@ -257,7 +257,6 @@ class MMExecutor(PyExecutor):
 
                 response.set_final()
                 new_responses.update({request.id: response})
-                # self._terminate_request(request) # TODO: add resource manager for multimodal executor
 
         self._enqueue_responses(new_responses)
         self.active_requests = [req for req in self.active_requests if req.id not in new_responses]
@@ -379,7 +378,7 @@ class MultimodalModelEngine(PyTorchModelEngine):
         self.max_batch_size = max_batch_size
         self.model = create_input_processor(model_path, None)
 
-    async def _prepare_inputs(self, scheduled_requests):
+    def _prepare_inputs(self, scheduled_requests):
         """Prepare inputs for batch processing.
 
         Args:
@@ -390,11 +389,9 @@ class MultimodalModelEngine(PyTorchModelEngine):
                 - Dict mapping modality to ordered list of items
                 - List of offsets for each request (based on token lengths)
         """
-        # 1. prefetch all the contents
         all_mm_items = []
         for request in scheduled_requests:
             all_mm_items.extend(request.items)
-        # 2. Process items and track their completion
         processed_items = {}  # Dict to track processed items by (req_id, item_id)
 
         # Process items asynchronously
@@ -402,12 +399,12 @@ class MultimodalModelEngine(PyTorchModelEngine):
             # Calculate token length and preprocess
             # TODO: Need to converge for all models on this, currently we don't have an uniform way to get the token length
             # https://github.com/vllm-project/vllm/blob/54631f826233dbd1c046f9a70e98bc2e25edff1a/vllm/model_executor/models/llava.py#L151
-            #ready_item.length = self.model.get_num_image_tokens(image_width=ready_item.data.width, image_height=ready_item.data.height)
+            # ready_item.length = self.model.get_num_image_tokens(image_width=ready_item.data.width, image_height=ready_item.data.height)
             # TODO: VLLM output lenght is not correct, need to fix it
             image_size = (ready_item.data.height, ready_item.data.width)
+            # TODO: Add other modalities. We should know length for each item here
             ready_item.length = self.model.image_size_to_num_tokens(image_size)
-            # If not converted to tensor, the results will be off
-            ready_item.data =  ToTensor()(ready_item.data)
+            ready_item.data = ToTensor()(ready_item.data)
             ready_item.data = self.model._preprocess([ready_item.data])[0] # _preprocess involves H2D transfer
             processed_items[(ready_item.req_id, ready_item.id)] = ready_item
 
@@ -415,7 +412,6 @@ class MultimodalModelEngine(PyTorchModelEngine):
         batch_mm_items = {}
         batch_request_offsets = []
         current_offset = 0
-
         for request in scheduled_requests:
             batch_request_offsets.append(current_offset)
             request_offset = 0
@@ -443,26 +439,23 @@ class MultimodalModelEngine(PyTorchModelEngine):
             modality: [item.data for item in items]
             for modality, items in batch_mm_items.items()
         }
-        # Stack all mm tensors and issue one encoder forward pass
-        # Shape after torch.cat (total_patches, 3, pix_height, pix_width) - image only
-        for item in batch_mm_items['image']:
-            batch_mm_input = torch.cat(batch_mm_data['image'])
-        batch_mm_features = self.model._process(batch_mm_input) if len(batch_mm_data['image']) > 0 else None
-        assert batch_mm_features.shape[0] == sum([item.length for item in batch_mm_items['image']]), "batch_mm_features should have the same length as sum of item.length"
-        assert batch_mm_features.dim() == 2, "batch_mm_features should be a 2D tensor"
+        # Shape after torch.cat (total_patches, 3, pix_height, pix_width) - image
+        batch_image_input = torch.cat(batch_mm_data['image'])
+        batch_image_features = self.model._process(batch_image_input) if len(batch_mm_data['image']) > 0 else None
+        assert batch_image_features.shape[0] == sum([item.length for item in batch_mm_items['image']]), "batch_mm_features should have the same length as sum of item.length"
+        assert batch_image_features.dim() == 2, "batch_mm_features should be a 2D tensor"
 
         # TODO: add mrope config which seems need input ids of llm request, deferring for now
         mrope_config = None
-
-        if batch_mm_features is None:
+        if batch_image_features is None:
             return None
 
         return {
-            "mm_embeddings": batch_mm_features,
+            "mm_embeddings": batch_image_features,  # maybe extend to dict if other modality added
             "mrope_config": mrope_config,
             "batch_request_offsets": batch_request_offsets
         }
 
     def forward(self, scheduled_requests, resource_manager = None):
-        batch_mm_items, batch_request_offsets = asyncio.run(self._prepare_inputs(scheduled_requests))
+        batch_mm_items, batch_request_offsets = self._prepare_inputs(scheduled_requests)
         return self._model_forward(batch_mm_items, batch_request_offsets)

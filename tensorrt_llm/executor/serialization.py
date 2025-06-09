@@ -148,7 +148,6 @@ class Unpickler(pickle.Unpickler):
             # and class should be added to the approved_imports. If the class
             # is being used as part of a routine scenario, then it should be added
             # to the appropriate base classes above.
-            print(f'find class: super().find_class(module, name) = {super().find_class(module, name)}')
             raise ValueError(f"Import {module} | {name} is not allowed")
         return super().find_class(module, name)
 

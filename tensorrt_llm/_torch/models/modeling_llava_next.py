@@ -292,12 +292,10 @@ class LlavaNextInputProcessor(InputProcessor):
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
             "multi_modal_data", {})
+        assert 'image' in mm_data
 
         input_ids = self.tokenizer(
             text_prompt, return_tensors="pt").input_ids[0].to(self.device)
-
-        if 'image' not in mm_data:
-            return input_ids.to(torch.int32).tolist(), {}
 
         mm_tensor = self._preprocess(mm_data['image'])
         mm_features = torch.stack(

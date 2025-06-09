@@ -395,6 +395,7 @@ def get_ctx_gen_server_urls(
             mm_server_urls.append(f"http://{cfg.hostname}:{cfg.port}")
 
     if len(mm_server_urls) > 0:
+        # TODO: enable fully disagg mode (e+p+d) later
         return mm_server_urls, gen_server_urls
     else:
         return ctx_server_urls, gen_server_urls
@@ -454,7 +455,6 @@ def disaggregated(config_file: Optional[str],
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 
-# TODO: add merge this mode into offical disaggregated mode
 @click.command("multimodal_disaggregated")
 @click.option("-c",
               "--config_file",

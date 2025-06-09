@@ -55,8 +55,9 @@ class MultimodalDisaggServerConfig():
     server_configs: List[Union[MultimodalServerConfig, CtxGenServerConfig]]
     hostname: str = "localhost"
     port: int = 8000
-    #mm_router_config: Optional[RouterConfig] = None
-    #gen_router_config: Optional[RouterConfig] = None
+    # TODO: add router support for multimodal disagg
+    # mm_router_config: Optional[RouterConfig] = None
+    # gen_router_config: Optional[RouterConfig] = None
 
 @dataclass
 class DisaggServerConfig():

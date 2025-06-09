@@ -1,7 +1,5 @@
 import copy
-
 import tensorrt_llm
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...distributed import MPIDist

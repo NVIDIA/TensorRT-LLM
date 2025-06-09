@@ -49,10 +49,6 @@ class OpenAIMultiModalDisaggServer:
         assert len(mm_servers) == 1, "Currently only one multimodal server is supported"
         # We should remove this restriction pretty soon (also need to modify the broadcast mm_embed logic in model runner)
         assert len(gen_servers) == 1, "Currently only one generation server is supported"
-        #self.gen_router = create_router(gen_router_config, gen_servers)
-        #self.ctx_router = create_router(ctx_router_config, ctx_servers)
-
-        #self.mm_router = create_router(mm_router_config, mm_servers)
 
         assert os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1", "Multimodal disaggregated mode is not supported in disaggregated_gen benchmark mode"
 

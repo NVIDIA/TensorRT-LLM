@@ -489,6 +489,8 @@ def create_py_executor_instance(
     cache_transceiver_config = executor_config.cache_transceiver_config
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, kv_cache_manager, attention_type, cache_transceiver_config)
+    # Unfortunately, we cannot init this comm lazily only for mm_disagg request
+    # TODO: Add ncclBcast support in trtllm nccl communicator
     model_engine._setup_mm_emb_comm() # Keep diagg mm_emb communicator close to where kvcache_transceiver created
 
     return PyExecutor(resource_manager,

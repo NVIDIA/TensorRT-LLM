@@ -1,6 +1,6 @@
 import os
-from dataclasses import dataclass, field
-from typing import List, Optional, Union, AsyncIterator, Any
+from dataclasses import dataclass
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -16,6 +16,7 @@ __all__ = [
     "PromptAdapterRequest",
     "GenerationRequest",
 ]
+
 
 @dataclass(slots=True)
 class LoRARequest:
@@ -67,6 +68,7 @@ class PromptAdapterRequest:
     @property
     def local_path(self):
         return self.prompt_adapter_local_path
+
 
 class GenerationRequest:
 

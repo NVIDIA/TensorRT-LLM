@@ -166,6 +166,7 @@ class ZeroMqQueue:
             # Verify HMAC
             if not self._verify_hmac(data, actual_hmac):
                 raise RuntimeError("HMAC verification failed")
+
             obj = serialization.loads(
                 data, approved_imports=serialization.BASE_ZMQ_CLASSES)
         else:

@@ -21,7 +21,7 @@ class MultimodalEncoder:
                  model: Union[str, Path],
                  trust_remote_code: bool = False,
                  tensor_parallel_size: int = 1,  # TP should never be used for mm-encoder
-                 data_parallel_size: int = 1,  # placeholder for future use
+                 data_parallel_size: int = 1,  # TODO: Placeholder for future use in multimodal encoder server
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  **kwargs: Any) -> None:
@@ -153,7 +153,6 @@ class MultimodalEncoder:
         )
         return result
 
-
     def _build_model(self):
         model_loader = CachedModelLoader(self.args,
                                          mpi_session=self.mpi_session,
@@ -176,7 +175,6 @@ class MultimodalEncoder:
         executor_config.trt_engine_dir = self._engine_dir
         executor_config.max_batch_size = max_batch_size
         executor_config.max_num_active_requests = 2048
-
 
         self._executor = self._executor_cls.create(
             self._engine_dir,

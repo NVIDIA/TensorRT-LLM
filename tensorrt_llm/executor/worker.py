@@ -2,20 +2,13 @@ import copy
 import datetime
 import enum
 import json
-import logging
-import multiprocessing as mp
 import os
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import closing
-from itertools import chain
-from multiprocessing.synchronize import Event as EventType
 from pathlib import Path
-from queue import Empty, Full, Queue
-from threading import Lock, Thread
-from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
-                    Set, Tuple, Type, Union)
+from queue import Queue
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 

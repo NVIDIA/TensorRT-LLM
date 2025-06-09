@@ -69,7 +69,10 @@ class SharedTensorContainer:
     """A class for sharing tensors between processes.
 
     This class provides a simple way to share tensors between processes
-    using Python's multiprocessing mechanisms.
+    using pytorch reduce/rebuild methods.
+
+    Note: Whenever you call reduce_tensor, you must call the corresponding rebuild method at consumer process(es), otherwise, the producer process cannot release the memory
+    to caching allocator as the innner refcount never reach zero.
     """
     def __init__(self, method_key: int, tensor_handle: Dict[str, Any]):
         self.method_key = method_key

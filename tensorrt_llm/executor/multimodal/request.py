@@ -136,9 +136,6 @@ class MultimodalRequest:
 
     def __init__(self, items: Optional[List[MultimodalItem]] = None):
         self.items = items or []  # type: List[MultimodalItem]
-        self.is_dummy = False
-        self.state = "PENDING"  # LOADED, PROCESSED, COMPLETED
-        self.sampling_params = None
         self.id: Optional[int] = None
         self.error_message = None
 

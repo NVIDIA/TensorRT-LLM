@@ -59,8 +59,7 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager)
 from .scheduler import ScheduledRequests
 from tensorrt_llm._torch.multimodal import SharedTensorContainer
-from tensorrt_llm._torch.pyexecutor.multimodal.shared_tensor_handle_pool import get_tensor_pool
-import base64
+from tensorrt_llm._torch.pyexecutor.multimodal.shared_tensor_handle_pool import get_handle_buffer
 
 MAX_UINT64 = (1 << 64) - 1
 
@@ -1150,9 +1149,8 @@ class PyTorchModelEngine(ModelEngine):
                 if self.mapping.rank == 0:
                     # Leading rank will rebuild the tensor in local device
                     shared_tensor = SharedTensorContainer.from_dict(mm_tensor_handle).get_local_view()
-                    # TODO: Add to tensor pool to prevent immediate cuda close ipc handle call, which will introduces cpu overhead
-                    # TODO: Potential issue: in SharedTensorPool, we cannot spawn the new background process to handle the ipc close call
-                    tensor_pool = get_tensor_pool(async_ipc_release=False)
+                    # TODO: this is a temp solution to avoid immediate free the handle                    
+                    tensor_pool = get_handle_buffer()
                     tensor_pool.add_handle(str(request.py_request_id), shared_tensor)
                     multimodal_embedding.copy_(shared_tensor)
                     self.mm_emb_dist.broadcast(multimodal_embedding)
