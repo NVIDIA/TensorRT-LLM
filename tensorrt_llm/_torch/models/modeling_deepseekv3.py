@@ -628,7 +628,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
-        self.allreduce = AllReduce(self.mapping, dtype=config.torch_dtype)
+        self.allreduce = AllReduce(self.mapping,
+                                   dtype=config.torch_dtype,
+                                   ar_backend=model_config.ar_backend)
         self.moe_allreduce = MoEAllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
 

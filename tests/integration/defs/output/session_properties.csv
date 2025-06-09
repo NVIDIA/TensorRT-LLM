@@ -1,0 +1,2 @@
+username,start_timestamp,hostname,ip,nvidia_driver_version,nvidia_device_count,os_properties,cpu_properties,gpu_properties,trt_change_id,trt_branch,commit_timestamp,cuda_version,cublas_version,cudnn_version,end_timestamp
+,2025-05-22 07:19:47,ipp2-1606.nvidia.com,10.176.4.8,575.57.05,1,"{'os_name': 'posix', 'platform': 'Linux', 'platform_version': '#144-Ubuntu SMP Fri Feb 7 20:47:38 UTC 2025'}","{'cpu_count': 32, 'cpu_freq': {'current': 1500.167875, 'min': 1500.0, 'max': 3000.0}}","{'device_product_name': 'H100 PCIe', 'pci_device_id': 590418142}",,,,,,,2025-05-22 07:55:34

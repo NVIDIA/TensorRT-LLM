@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import pickle
 import sys
 import traceback
@@ -97,16 +96,14 @@ def row_linear_residual_norm_fusion_forward(
     reference_output = tuple(t.cuda() for t in reference_output)
 
     MPI.COMM_WORLD.barrier()
-    os.environ["TRTLLM_MNNVL_AR_ENABLED"] = "1"
 
-    allreduce = AllReduce(
-        mapping=Mapping(
-            world_size=tensor_parallel_size,
-            tp_size=tensor_parallel_size,
-            rank=tensor_parallel_rank,
-        ),
-        dtype=dtype,
-    )
+    allreduce = AllReduce(mapping=Mapping(
+        world_size=tensor_parallel_size,
+        tp_size=tensor_parallel_size,
+        rank=tensor_parallel_rank,
+    ),
+                          dtype=dtype,
+                          ar_backend="MNVL")
 
     # Since all the modules here are provided by TRT-LLM,
     # so it has to be fullgraph compatible

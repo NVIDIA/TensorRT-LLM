@@ -77,6 +77,7 @@ class ModelConfig(Generic[TConfig]):
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
+    ar_backend: str = 'TRTLLM'  # options can be MNVL, TRTLLM
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
