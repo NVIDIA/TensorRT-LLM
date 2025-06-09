@@ -51,22 +51,22 @@ struct TopKRedType
     using TypeCmp = std::conditional_t<sizeof(T) == 4, uint64_t, uint32_t>;
     using IdxT = std::conditional_t<sizeof(T) == 4, int32_t, int16_t>;
     static constexpr int moveBits = (sizeof(T) == 4) ? 32 : 16;
-
+    static constexpr int maxIdx = 65535;
     TypeCmp compValIdx;
 
     static __host__ __device__ inline TypeCmp makeCmpVal(T val, int32_t idx = 0)
     {
         auto valueBits = cub::Traits<T>::TwiddleIn(reinterpret_cast<typename cub::Traits<T>::UnsignedBits&>(val));
         TypeCmp compactTmp = reinterpret_cast<TypeCmp&>(valueBits);
-        compactTmp = (compactTmp << moveBits) | idx;
-        // Since idx is always smaller than 65536 and positive, we can directly use it as the lower 16 bits
+        compactTmp = (compactTmp << moveBits) | (0xFFFF & (maxIdx - idx));
+        // Use 65535 minus idx to give higher priority to elements with smaller indices.
         return compactTmp;
     }
 
     static __host__ __device__ void unpack(T& value, int32_t& index, TypeCmp cmp)
     {
-        // Since idx is always smaller than 65536 and positive, we can directly use it as the lower 16 bits
-        index = static_cast<int32_t>(cmp & 0xFFFF);
+        // Since “65535-idx” is always smaller than 65536 and positive, we can directly use it as the lower 16 bits
+        index = maxIdx - static_cast<int32_t>((cmp & 0xFFFF));
 
         auto compactTmp = cmp >> moveBits;
         auto valueBits
