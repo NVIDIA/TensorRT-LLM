@@ -125,14 +125,12 @@ class ZeroMqQueue:
                                            protocol=pickle.HIGHEST_PROTOCOL)
             else:
                 data = obj
-            if self.use_hmac_encryption:
-                # Send pickled data with HMAC appended
-                with nvtx_range_debug("_sign_data",
-                                      color="blue",
-                                      category="IPC"):
-                    data = self._sign_data(data)
-            with nvtx_range_debug("send", color="blue", category="IPC"):
-                self.socket.send(data)
+        if self.use_hmac_encryption:
+            # Send pickled data with HMAC appended
+            with nvtx_range_debug("_sign_data", color="blue", category="IPC"):
+                data = self._sign_data(data)
+        with nvtx_range_debug("send", color="blue", category="IPC"):
+            self.socket.send(data)
 
     def put_noblock(self, obj: Any):
         self.setup_lazily()
@@ -140,14 +138,11 @@ class ZeroMqQueue:
                               color="blue",
                               category="IPC"):
             data = serialization.dumps(obj)
-            if self.use_hmac_encryption:
-                with nvtx_range_debug("_sign_data",
-                                      color="blue",
-                                      category="IPC"):
-                    data = self._sign_data(data)
-            with nvtx_range_debug("send(noblock)", color="blue",
-                                  category="IPC"):
-                self.socket.send(data, flags=zmq.NOBLOCK)
+        if self.use_hmac_encryption:
+            with nvtx_range_debug("_sign_data", color="blue", category="IPC"):
+                data = self._sign_data(data)
+        with nvtx_range_debug("send(noblock)", color="blue", category="IPC"):
+            self.socket.send(data, flags=zmq.NOBLOCK)
 
     async def put_async(self, obj: Any):
         self.setup_lazily()
