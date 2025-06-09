@@ -1149,7 +1149,7 @@ class BaseLlmArgs(BaseModel):
 
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
-                if self.backend != 'pytorch':
+                if self.backend not in ['pytorch', '_autodeploy']:
                     eagle_config = _EagleConfig(
                         self.speculative_config.eagle_choices,
                         self.speculative_config.greedy_sampling,
@@ -1169,7 +1169,7 @@ class BaseLlmArgs(BaseModel):
                         eagle3_one_model)
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
-                assert self.backend == 'pytorch'
+                assert self.backend in ['pytorch', '_autodeploy']
                 assert self.speculative_config.prompt_lookup_num_tokens > 0 and self.speculative_config.max_matching_ngram_size > 0
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 from tensorrt_llm._torch.speculative import NGramConfig
@@ -1379,8 +1379,8 @@ class TrtLlmArgs(BaseLlmArgs):
         ExtendedRuntimePerfKnobConfig] = Field(
             default=None, description="Extended runtime perf knob config.")
 
-    calib_config: Optional[CalibConfig] = Field(
-        default_factory=CalibConfig, description="Calibration config.")
+    calib_config: CalibConfig = Field(default_factory=CalibConfig,
+                                      description="Calibration config.")
 
     embedding_parallel_mode: str = Field(
         default='SHARDING_ALONG_VOCAB',
@@ -1446,8 +1446,6 @@ class TrtLlmArgs(BaseLlmArgs):
         self._setup_enable_build_cache()
         self._setup_speculative_config()
         self._setup_embedding_parallel_mode()
-
-        self.calib_config = self.calib_config or CalibConfig()
 
     @field_validator("max_input_len")
     @classmethod
@@ -1562,7 +1560,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
     build_config: Optional[object] = Field(
-        default_factory=lambda: BuildConfig(),
+        default_factory=BuildConfig,
         description="Build config.",
         exclude_from_json=True,
         frozen=True,
@@ -1657,11 +1655,6 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "If true, enable min-latency mode. Currently only used for Llama4.",
     )
-
-    auto_deploy_config: Optional[object] = Field(
-        default=None,
-        description="Auto deploy config.",
-        json_schema_extra={"type": f"Optional[object]"})
 
     @field_validator('load_format', mode='before')
     @classmethod
