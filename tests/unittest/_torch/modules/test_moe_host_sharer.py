@@ -78,6 +78,11 @@ class TestHostMoeTensorSharer(unittest.TestCase):
         size = comm.Get_size()
         layer_id = 0
 
+        # Test tensor parameters
+        experts_per_rank = 2  # Each rank is responsible for 2 consecutive experts
+        expert_count = size * experts_per_rank
+        tensor_shape = (16, 32)  # Use 2D tensor for testing
+
         # Maximum supported ranks (can adjust as needed)
         max_ranks = 8
         if size > max_ranks:
@@ -87,16 +92,11 @@ class TestHostMoeTensorSharer(unittest.TestCase):
         shared_comm = comm.Split_type(split_type=MPI.COMM_TYPE_SHARED)
 
         # Initialize HostMoeTensorSharer
-        sharer = HostMoeTensorSharer(layer_id, shared_comm)
+        sharer = HostMoeTensorSharer(layer_id, expert_count, shared_comm)
 
         # Set shared memory base name
         shared_memory_base_name = "test_host_sharer"
         sharer.set_shared_memory_base_name(shared_memory_base_name)
-
-        # Test tensor parameters
-        experts_per_rank = 2  # Each rank is responsible for 2 consecutive experts
-        expert_count = size * experts_per_rank
-        tensor_shape = (16, 32)  # Use 2D tensor for testing
 
         # Calculate the range of experts this rank is responsible for
         start_expert_id = rank * experts_per_rank
@@ -123,6 +123,8 @@ class TestHostMoeTensorSharer(unittest.TestCase):
             if expert_id not in my_expert_ids:
                 sharer.pre_register_host_tensor_with_shape(
                     expert_id, "weight", torch.float32, tensor_shape)
+
+        sharer.finalize_layer_weights()
 
         # Ensure all processes have created and registered their tensors
         comm.Barrier()

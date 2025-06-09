@@ -12,7 +12,7 @@ class DecoderLayer(nn.Module, ABC):
     @abstractmethod
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
@@ -22,7 +22,7 @@ class DecoderLayer(nn.Module, ABC):
 
     def skip_forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,

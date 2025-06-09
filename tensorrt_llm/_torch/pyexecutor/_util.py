@@ -112,7 +112,9 @@ class KvCacheCreator:
         logger.info(
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
-            f"fraction is set {fraction}, kv size is {kv_size_per_token}")
+            f"fraction is set {fraction}, kv size is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
+            f", tmp kv_mem { (alloc_kv_tokens * kv_size_per_token) / (GB):.2f} GiB"
+        )
         max_tokens = int((available_kv_mem) // kv_size_per_token)
         max_tokens = max(max_tokens, 0)
         return max_tokens
@@ -190,9 +192,14 @@ class KvCacheCreator:
 
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+        end, total_gpu_memory = torch.cuda.mem_get_info()
+        total_used_bytes = total_gpu_memory - end
         model_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         logger.info(
             f"Memory used after loading model weights (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
+        )
+        logger.info(
+            f"Memory used after loading model weights (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
         )
 
         py_executor.set_gather_responses(True)
