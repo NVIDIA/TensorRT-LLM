@@ -46,7 +46,7 @@
 #include <random>
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
-#include <tensorrt_llm/executor/cache_transmission/cacheConcatenate.h>
+#include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
 
 #include "gtest/gtest.h"
 #include <gmock/gmock.h>
@@ -614,16 +614,16 @@ protected:
             ASSERT_EQ(numHeads, 1);
         }
         int numHeadsPerRank = (numHeads + mTpSize - 1) / mTpSize;
-        mDuplicateHeadFactor = 1;
+        mDupHeadFactor = 1;
         if (mTpSize > numHeads)
         {
-            mDuplicateHeadFactor = mTpSize / numHeads;
+            mDupHeadFactor = mTpSize / numHeads;
             ASSERT_EQ(numHeadsPerRank, 1);
         }
         if (isMLA || enableDPAttention)
         {
             numHeadsPerRank = numHeads;
-            mDuplicateHeadFactor = 1;
+            mDupHeadFactor = 1;
         }
         auto hiddenSize = numHeadsPerRank * sizePerHead;
         auto maxBlocksPerSeq = 10;
@@ -914,7 +914,7 @@ protected:
         int layerSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.size() / mPpSize;
         int startLayerId = layerSizePerRank * mPpRank;
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
-        int startHeadId = headSizePerRank * (mTpRank / mDuplicateHeadFactor);
+        int startHeadId = headSizePerRank * (mTpRank / mDupHeadFactor);
         bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;
         if (mIsMLA || enableDP)
         {
@@ -978,7 +978,7 @@ protected:
         int layerSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.size() / mPpSize;
         int startLayerId = layerSizePerRank * mPpRank;
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
-        int startHeadId = headSizePerRank * (mTpRank / mDuplicateHeadFactor);
+        int startHeadId = headSizePerRank * (mTpRank / mDupHeadFactor);
         bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;
         if (mIsMLA || enableDP)
         {
@@ -1071,7 +1071,7 @@ protected:
     bool mContextDP{false};
     bool mGenerationDP{false};
     bool mIsMLA{false};
-    int mDuplicateHeadFactor{1};
+    int mDupHeadFactor{1};
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
     std::unique_ptr<CacheTransBufferManager> mCacheTransBufferManager;

@@ -26,7 +26,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
-#include "tensorrt_llm/executor/cache_transmission/cacheConcatenate.h"
+#include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -71,7 +71,7 @@ bool CacheFormatter::needSendCache(
 {
     // int selfTpRank = selfIdx % selfConfig.getParallelConfig().mTensorParallelism;
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    if (targetInfo.mDuplicateHeadFactor <= 1)
+    if (targetInfo.mDupHeadFactor <= 1)
     {
         return true;
     }
@@ -85,7 +85,7 @@ bool CacheFormatter::needSendCache(
         selfTpRankInDpGroup = selfTpRank % selfTPNumInDPGroup;
     }
 
-    return selfTpRankInDpGroup % targetInfo.mDuplicateHeadFactor == 0;
+    return selfTpRankInDpGroup % targetInfo.mDupHeadFactor == 0;
 }
 
 std::vector<executor::kv_cache::Connection const*> CacheFormatter::pickRecvConnections(
@@ -93,7 +93,7 @@ std::vector<executor::kv_cache::Connection const*> CacheFormatter::pickRecvConne
     SizeType32 selfIdx, CacheState const& destConfig) const
 {
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
-    if (targetInfo.mPeerDuplicateHeadFactor <= 1)
+    if (targetInfo.mPeerDupHeadFactor <= 1)
     {
         return connections;
     }
@@ -102,7 +102,7 @@ std::vector<executor::kv_cache::Connection const*> CacheFormatter::pickRecvConne
     std::vector<executor::kv_cache::Connection const*> ret;
     for (int i = 0; i < targetInfo.mDomainTPSize; i++)
     {
-        if (i % targetInfo.mPeerDuplicateHeadFactor == 0)
+        if (i % targetInfo.mPeerDupHeadFactor == 0)
         {
             for (int j = 0; j < targetInfo.mDomainPPSize; j++)
             {
@@ -211,13 +211,13 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
         auto cacheBlockSize = inputKvCacheBlocks.front()->getSize();
 
         auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
-        int peerDuplicateHeadFactor = targetInfo.mPeerDuplicateHeadFactor;
+        int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto targetNum = connections.size();
         TLLM_CHECK((cacheBlockSize * blockNum) % targetNum == 0);
         auto const targetBufferSize = (cacheBlockSize * blockNum) / targetNum * peerDuplicateHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
         TLLM_LOG_DEBUG(" formatOutput bufferTargetNum: %d, targetNum: %d, peerDuplicateHeadFactor: %d dupliacete:%d ",
-            bufferTargetNum, targetNum, peerDuplicateHeadFactor, targetInfo.mDuplicateHeadFactor);
+            bufferTargetNum, targetNum, peerDuplicateHeadFactor, targetInfo.mDupHeadFactor);
 
         auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
             cacheBufferId, bufferTargetNum, targetBufferSize, bufferManager);
@@ -436,7 +436,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
             }
             {
                 NVTX3_SCOPED_RANGE(formatInputConcatenate);
-                executor::kv_cache::concatenateKVCacheDispatch(recvBufferTmps.data(), recvBufferTmps.size(),
+                executor::kv_cache::concatKVCacheDispatch(recvBufferTmps.data(), recvBufferTmps.size(),
                     getCounterparts(selfConfig, selfIdx, destConfig), destConfig, outputBuffers.data(),
                     outputBuffers.size(), selfIdx, selfConfig, bufferManager);
                 bufferManager.getStream().synchronize();
@@ -661,13 +661,13 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
 
                 if (legacyPath)
                 {
-                    executor::kv_cache::concatenateKVCacheDispatch(recvSplitCaches.data(), recvSplitCaches.size(),
+                    executor::kv_cache::concatKVCacheDispatch(recvSplitCaches.data(), recvSplitCaches.size(),
                         getCounterparts(selfConfig, selfIdx, destConfig), destConfig, outputBuffers.data(),
                         outputBuffers.size(), selfIdx, selfConfig, bufferManager);
                 }
                 else
                 {
-                    executor::kv_cache::concatenateKvCacheV2Dispatch(
+                    executor::kv_cache::concatKvCacheV2Dispatch(
                         recvSplitCaches, outputBuffers, destConfig, selfConfig, selfIdx, bufferManager);
                 }
                 bufferManager.getStream().synchronize();

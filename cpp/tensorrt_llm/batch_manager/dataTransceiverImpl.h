@@ -20,7 +20,7 @@
 #include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/executor/cache_transmission/cacheConcatenate.h"
+#include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 
 namespace tensorrt_llm::batch_manager
 {
