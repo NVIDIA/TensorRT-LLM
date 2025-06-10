@@ -221,7 +221,7 @@ class Eagle3Sampler(TorchSampler):
             token_idx += len(state.scheduled_requests.chunked_requests)
 
         def get_new_token(request: LlmRequest, new_tokens: torch.Tensor,
-                          skip: int, beam: int) -> int:
+                          beam: int, skip: int) -> int:
             new_token = new_tokens[token_idx + skip]
             request.add_new_token(new_token, beam)
             return new_token

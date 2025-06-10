@@ -277,8 +277,8 @@ class TorchSampler(Sampler):
     def update_requests(
             self,
             state: SampleState,
-            get_new_token: Callable[[LlmRequest, torch.Tensor, int, int],
-                                    int] = add_token,
+            add_token: Callable[[LlmRequest, torch.Tensor, int, int],
+                                int] = add_token,
             *,
             req_callback: Callable[[LlmRequest], None] = None) -> None:
         assert isinstance(state, SampleState)
@@ -293,8 +293,7 @@ class TorchSampler(Sampler):
                     # Reject.
                     break
                 num_accepted += 1
-                new_token = get_new_token(req, new_tokens, num_accepted,
-                                          self.BEAM)
+                new_token = add_token(req, new_tokens, self.BEAM, num_accepted)
                 if self._handle_stop_criteria(req, new_token, beam=self.BEAM):
                     break
             self.handle_logits(req, state, beam=self.BEAM, count=num_accepted)
@@ -308,7 +307,7 @@ class TorchSampler(Sampler):
                 continue
 
             if req.state != LlmRequestState.GENERATION_COMPLETE:
-                new_token = get_new_token(req, new_tokens, 0, self.BEAM)
+                new_token = add_token(req, new_tokens, self.BEAM, 0)
                 self._handle_stop_criteria(req, new_token, beam=self.BEAM)
                 req.py_decoding_iter += 1
             if req_callback:
@@ -316,7 +315,7 @@ class TorchSampler(Sampler):
 
         for req in state.scheduled_requests.generation_requests:
             if req.state != LlmRequestState.GENERATION_COMPLETE:
-                new_token = get_new_token(req, new_tokens, 0, self.BEAM)
+                new_token = add_token(req, new_tokens, self.BEAM, 0)
                 self._handle_stop_criteria(req, new_token, beam=self.BEAM)
                 if len(req.py_draft_tokens) > 0:
                     process_draft_tokens(req, new_token)
