@@ -297,15 +297,15 @@ private:
         executor::DecodingConfig const& decodingConfig, bool gatherGenerationLogits,
         std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs = std::nullopt);
 
-    void reshape(runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits);
-
     //! @brief set max sizes for pre-allocation
     void setMaxBufferSizes(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, runtime::ModelConfig const& modelConfig,
         std::optional<SizeType32> maxNumRuntimeTokens);
 
     //! @brief set sizes depending on scheduled requests
     void setBufferSizes(RequestVector const& contextRequests, RequestVector const& genRequests);
+
+    void reshape(runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
+        runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits);
 
     void setFromInputs(RequestVector const& contextRequests, RequestVector const& genRequests, SizeType32 maxBeamWidth,
         SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers,
