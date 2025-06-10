@@ -452,7 +452,7 @@ void RuntimeBuffers::prepareBuffersForCudaGraph(SizeType32 maxSequenceLength)
 
 void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, RequestVector const& genRequests,
     SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers,
-    kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
+    runtime::decoder::DecoderState const& decoderState, kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
     kv_cache_manager::BaseKVCacheManager* crossKvCacheManagerPtr,
     rnn_state_manager::RnnStateManager* rnnStateManagerPtr, PeftTable const& peftTable,
     runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
@@ -764,7 +764,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         {
             // copy from lookahead decoding buffer
             mLookaheadBuffers->setFromInputs(numContextRequests, numGenRequests, *requestTypes, *seqSlots,
-                decoderBuffers.lookaheadBuffers.value(), runtime, modelConfig, worldConfig);
+                decoderState.getLookaheadBuffers(), runtime, modelConfig, worldConfig);
         }
     }
 
@@ -882,12 +882,12 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
         {
             prepareExplicitDraftTokenBuffers(
-                decoderBuffers.explicitDraftTokensBuffers, runtime, modelConfig, worldConfig);
+                decoderState.getExplicitDraftTokensBuffers(), runtime, modelConfig, worldConfig);
         }
         if (modelConfig.getSpeculativeDecodingMode().isEagle())
         {
             prepareEagleBuffers(
-                contextRequests, genRequests, decoderBuffers.eagleBuffers, runtime, modelConfig, worldConfig);
+                contextRequests, genRequests, decoderState.getEagleBuffers(), runtime, modelConfig, worldConfig);
         }
     }
 
@@ -895,7 +895,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
 }
 
 void RuntimeBuffers::prepareExplicitDraftTokenBuffers(
-    runtime::ExplicitDraftTokensBuffers::Inputs& explicitDraftTokensBuffers, TllmRuntime const& runtime,
+    runtime::ExplicitDraftTokensBuffers::Inputs const& explicitDraftTokensBuffers, TllmRuntime const& runtime,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -910,7 +910,7 @@ void RuntimeBuffers::prepareExplicitDraftTokenBuffers(
 }
 
 void RuntimeBuffers::prepareEagleBuffers(RequestVector const& contextRequests, RequestVector const& genRequests,
-    runtime::EagleBuffers::Inputs& eagleBuffers, TllmRuntime const& runtime, ModelConfig const& modelConfig,
+    runtime::EagleBuffers::Inputs const& eagleBuffers, TllmRuntime const& runtime, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -925,10 +925,10 @@ void RuntimeBuffers::prepareEagleBuffers(RequestVector const& contextRequests, R
 
 std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorMap&> RuntimeBuffers::prepareStep(
     RequestVector const& contextRequests, RequestVector const& genRequests, SizeType32 maxBeamWidth,
-    SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers, kv_cache_manager::BaseKVCacheManager* kvCacheManager,
-    kv_cache_manager::BaseKVCacheManager* crossKvCacheManager, rnn_state_manager::RnnStateManager* rnnStateManager,
-    PeftTable const& peftTable, TllmRuntime const& runtime, ModelConfig const& modelConfig,
-    WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
+    SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers, runtime::decoder::DecoderState const& decoderState,
+    kv_cache_manager::BaseKVCacheManager* kvCacheManager, kv_cache_manager::BaseKVCacheManager* crossKvCacheManager,
+    rnn_state_manager::RnnStateManager* rnnStateManager, PeftTable const& peftTable, TllmRuntime const& runtime,
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
     OptionalRef<runtime::ITensor const> newOutputTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -937,8 +937,8 @@ std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorM
     setBufferSizes(contextRequests, genRequests);
     reshape(runtime, modelConfig, worldConfig, gatherGenerationLogits);
 
-    setFromInputs(contextRequests, genRequests, maxBeamWidth, maxAttentionWindow, decoderBuffers, kvCacheManager,
-        crossKvCacheManager, rnnStateManager, peftTable, runtime, modelConfig, worldConfig, trtOverlap,
+    setFromInputs(contextRequests, genRequests, maxBeamWidth, maxAttentionWindow, decoderBuffers, decoderState,
+        kvCacheManager, crossKvCacheManager, rnnStateManager, peftTable, runtime, modelConfig, worldConfig, trtOverlap,
         newOutputTokens);
 
     fillIOMaps(modelConfig, worldConfig);

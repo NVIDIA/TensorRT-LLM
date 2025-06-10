@@ -365,28 +365,24 @@ void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& specu
             ITensor::makeShape({mMaxBatchSize * speculativeDecodingModule->getMaxDraftPathLen()}));
     }
 
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
+    if (speculativeDecodingMode.isExplicitDraftTokens())
+    {
+        mJointDecodingOutput->explicitDraftTokensBuffers = runtime::ExplicitDraftTokensBuffers::Inputs();
+        mJointDecodingOutput->explicitDraftTokensBuffers->create(
+            mMaxBatchSize, bufferManager, modelConfig, worldConfig);
+    }
+    else if (speculativeDecodingMode.isEagle())
+    {
+        mJointDecodingOutput->eagleBuffers = runtime::EagleBuffers::Inputs();
+        mJointDecodingOutput->eagleBuffers->create(mMaxBatchSize, bufferManager, modelConfig, worldConfig);
+    }
+    else if (speculativeDecodingMode.isLookaheadDecoding())
+    {
+        mJointDecodingOutput->lookaheadOutputs
+            = runtime::LookaheadDecodingBuffers(mMaxBatchSize, mMaxDecodingEngineTokens, bufferManager);
+        mJointDecodingInput->lookaheadInputs->tokensPerStep = mJointDecodingOutput->lookaheadOutputs->generationLengths;
+    }
 
-void DecoderState::setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) const
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    mJointDecodingOutput->explicitDraftTokensBuffers = std::move(explicitDraftTokensBuffers);
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-void DecoderState::setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) const
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    mJointDecodingOutput->lookaheadOutputs = std::move(lookaheadDecodingBuffers);
-    mJointDecodingInput->lookaheadInputs->tokensPerStep = mJointDecodingOutput->lookaheadOutputs->generationLengths;
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-void DecoderState::setupEagle(EagleBuffers::Inputs eagleBuffers) const
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    mJointDecodingOutput->eagleBuffers = std::move(eagleBuffers);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -543,6 +539,21 @@ SizeType32 DecoderState::getMaxDecodingEngineTokens() const
 SpeculativeDecodingMode DecoderState::getSpeculativeDecodingMode() const
 {
     return mSpeculativeDecodingMode;
+}
+
+ExplicitDraftTokensBuffers::Inputs const& DecoderState::getExplicitDraftTokensBuffers() const
+{
+    return *mJointDecodingOutput->explicitDraftTokensBuffers;
+}
+
+EagleBuffers::Inputs const& DecoderState::getEagleBuffers() const
+{
+    return *mJointDecodingOutput->eagleBuffers;
+}
+
+LookaheadDecodingBuffers const& DecoderState::getLookaheadBuffers() const
+{
+    return *mJointDecodingOutput->lookaheadOutputs;
 }
 
 std::vector<SizeType32> const& DecoderState::getNumDecodingEngineTokens() const

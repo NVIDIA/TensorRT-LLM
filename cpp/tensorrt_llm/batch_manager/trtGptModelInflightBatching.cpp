@@ -1436,19 +1436,6 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
             getMaxSequenceLen(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
         mDecoderState->setupSpeculativeDecoding(mDecoderState->getSpeculativeDecodingMode(),
             mModelConfig.getMaxDecodingTokens(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
-
-        if (decodingMode.isExplicitDraftTokens())
-        {
-            mDecoderState->setupExplicitDraftTokens(mDecoderBuffers->explicitDraftTokensBuffers);
-        }
-        else if (decodingMode.isLookahead())
-        {
-            mDecoderState->setupLookahead(mDecoderBuffers->lookaheadBuffers.value());
-        }
-        else if (decodingMode.isEagle())
-        {
-            mDecoderState->setupEagle(mDecoderBuffers->eagleBuffers);
-        }
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -1606,7 +1593,7 @@ void TrtGptModelInflightBatching::prepareDistGenBufferAndDecoder(RequestVector c
         auto const bufferId = getFusedBufferId();
         auto& runtimeBuffers = *mBuffers[bufferId];
         runtimeBuffers.prepareStep(cacheTransCompleteRequests, {}, getMaxBeamWidth(), getMaxAttentionWindow(),
-            *mDecoderBuffers, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
+            *mDecoderBuffers, *mDecoderState, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
             mPeftTables[mMicroBatchId], *mRuntime, mModelConfig, mWorldConfig, getGatherGenerationLogits(),
             isTrtOverlap());
         auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
@@ -1671,7 +1658,7 @@ TrtGptModelInflightBatching::prepareBuffers(
         : std::nullopt;
 
     auto [optProfileId, inputMap, outputMap] = runtimeBuffers.prepareStep(contextRequests, generationRequests,
-        mOperatingBeamWidth, getMaxAttentionWindow(), *mDecoderBuffers, mKvCacheManager.get(),
+        mOperatingBeamWidth, getMaxAttentionWindow(), *mDecoderBuffers, *mDecoderState, mKvCacheManager.get(),
         mCrossKvCacheManager.get(), mRnnStateManager.get(), mPeftTables[bufferId], *mRuntime, mModelConfig,
         mWorldConfig, getGatherGenerationLogits(), isTrtOverlap(), allNewTokens);
 

@@ -36,6 +36,11 @@
 namespace tensorrt_llm::runtime
 {
 class TllmRuntime;
+
+namespace decoder
+{
+class DecoderState;
+} // namespace decoder
 } // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::batch_manager
@@ -274,20 +279,21 @@ public:
 
     std::tuple<SizeType32, TensorMap const&, TensorMap&> prepareStep(RequestVector const& contextRequests,
         RequestVector const& genRequests, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
-        DecoderBuffers& decoderBuffers, kv_cache_manager::BaseKVCacheManager* kvCacheManager,
-        kv_cache_manager::BaseKVCacheManager* crossKvCacheManager, rnn_state_manager::RnnStateManager* rnnStateManager,
-        PeftTable const& peftTable, runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
+        DecoderBuffers& decoderBuffers, runtime::decoder::DecoderState const& decoderState,
+        kv_cache_manager::BaseKVCacheManager* kvCacheManager, kv_cache_manager::BaseKVCacheManager* crossKvCacheManager,
+        rnn_state_manager::RnnStateManager* rnnStateManager, PeftTable const& peftTable,
+        runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
         OptionalRef<runtime::ITensor const> newOutputTokens = std::nullopt);
 
     void prepareBuffersForCudaGraph(SizeType32 maxSequenceLength);
 
-    void prepareExplicitDraftTokenBuffers(runtime::ExplicitDraftTokensBuffers::Inputs& explicitDraftTokensBuffers,
+    void prepareExplicitDraftTokenBuffers(runtime::ExplicitDraftTokensBuffers::Inputs const& explicitDraftTokensBuffers,
         runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig);
 
     void prepareEagleBuffers(RequestVector const& contextRequests, RequestVector const& genRequests,
-        runtime::EagleBuffers::Inputs& eagleBuffers, runtime::TllmRuntime const& runtime,
+        runtime::EagleBuffers::Inputs const& eagleBuffers, runtime::TllmRuntime const& runtime,
         runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 
 private:
@@ -309,7 +315,7 @@ private:
 
     void setFromInputs(RequestVector const& contextRequests, RequestVector const& genRequests, SizeType32 maxBeamWidth,
         SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers,
-        kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
+        runtime::decoder::DecoderState const& decoderState, kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
         kv_cache_manager::BaseKVCacheManager* crossKvCacheManagerPtr,
         rnn_state_manager::RnnStateManager* rnnStateManagerPtr, PeftTable const& peftTable,
         runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
