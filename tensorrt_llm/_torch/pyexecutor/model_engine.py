@@ -156,7 +156,8 @@ def prefetch_files(file_names: List[str]):
     # Each rank loads files with indices local_rank, local_rank + local_mpi_size, local_rank + 2*local_mpi_size, etc.
     local_file_names = file_names[local_mpi_rank()::local_mpi_size()]
 
-    max_processes = min(multiprocessing.cpu_count() * 2, 16)
+    max_processes = min(multiprocessing.cpu_count() * 2, 16,
+                        len(local_file_names))
     with multiprocessing.Pool(processes=max_processes) as pool:
         pool.map(_prefetch_one_file, local_file_names)
 
