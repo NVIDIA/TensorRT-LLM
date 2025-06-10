@@ -216,7 +216,6 @@ class Eagle3Sampler(TorchSampler):
     def update_requests(self, state: SampleState) -> None:
         if state.sampler_event:
             state.sampler_event.synchronize()
-        new_tokens_list = state.host.new_tokens.tolist()
         scheduled_requests = state.scheduled_requests
 
         token_idx = 0
@@ -224,7 +223,7 @@ class Eagle3Sampler(TorchSampler):
 
         def add_tokens(request: LlmRequest,
                        skip_tokens: int = 0) -> tuple[int, bool]:
-            new_token = new_tokens_list[token_idx + skip_tokens]
+            new_token = state.host.new_tokens[token_idx + skip_tokens]
             request.add_new_token(new_token, beam_idx)
             return new_token, self._handle_stop_criteria(request,
                                                          new_token,
