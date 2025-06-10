@@ -66,6 +66,11 @@ public:
         CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
         = 0;
 
+    [[nodiscard]] virtual std::vector<executor::kv_cache::Connection const*> pickRecvConnections(
+        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
+        SizeType32 selfIdx, CacheState const& destConfig) const
+        = 0;
+
     /// @brief Destructor.
     virtual ~IOFormatter() = default;
 };
