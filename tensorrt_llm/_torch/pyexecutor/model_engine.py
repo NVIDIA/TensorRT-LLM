@@ -292,9 +292,11 @@ def get_rank_model_storage(model):
 
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
                                    max_batch_size: int, max_num_tokens: int,
+                                   max_draft_len: int,
                                    padding_enabled: bool) -> list[int]:
     # This is the largest possible batch size for a pure decoding batch.
-    max_cuda_graph_bs = min(max_batch_size, max_num_tokens)
+    max_cuda_graph_bs = min(max_batch_size,
+                            int(max_num_tokens / (1 + max_draft_len)))
 
     result = []
     # This function assumes cuda_graph_batch_sizes is sorted
@@ -434,40 +436,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_backend = get_attention_backend(attn_backend)
 
-        # This field is initialized lazily on the first forward pass.
-        # This is convenient because:
-        # 1) The attention metadata depends on the KV cache manager.
-        # 2) The KV cache manager depends on the model configuration.
-        # 3) The model configuration is not loaded until the model engine
-        # is initialized.
-        #
-        # NOTE: This can simplified by decoupling the model config loading and
-        # the model engine.
-        self.attn_metadata = None
-        self.iter_states = {}
-        self._cuda_graphs = {}
-        self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
-        self._run_cuda_graphs = pytorch_backend_config.use_cuda_graph
-
-        self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
-
-        self._cuda_graph_batch_sizes = _filter_cuda_graph_batch_sizes(
-            pytorch_backend_config.cuda_graph_batch_sizes, self.batch_size,
-            self.max_num_tokens, self._cuda_graph_padding_enabled
-        ) if pytorch_backend_config.cuda_graph_batch_sizes else []
-
-        self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
-                                           self._cuda_graph_batch_sizes else 0)
-
-        self.previous_batch_indices_cuda = torch.empty((self.max_num_tokens, ),
-                                                       dtype=torch.int,
-                                                       device='cuda')
-        self.input_ids_cuda = torch.empty((self.max_num_tokens, ),
-                                          dtype=torch.int,
-                                          device='cuda')
-        self.position_ids_cuda = torch.empty((self.max_num_tokens, ),
-                                             dtype=torch.int,
-                                             device='cuda')
         if self.is_spec_decode:
             self.spec_metadata = None
             self.spec_config.update_from_model_config(self.model.config)
@@ -491,6 +459,42 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.without_logits = False
             self.max_draft_len = 0
+
+        # This field is initialized lazily on the first forward pass.
+        # This is convenient because:
+        # 1) The attention metadata depends on the KV cache manager.
+        # 2) The KV cache manager depends on the model configuration.
+        # 3) The model configuration is not loaded until the model engine
+        # is initialized.
+        #
+        # NOTE: This can simplified by decoupling the model config loading and
+        # the model engine.
+        self.attn_metadata = None
+        self.iter_states = {}
+        self._cuda_graphs = {}
+        self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
+        self._run_cuda_graphs = pytorch_backend_config.use_cuda_graph
+
+        self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
+
+        self._cuda_graph_batch_sizes = _filter_cuda_graph_batch_sizes(
+            pytorch_backend_config.cuda_graph_batch_sizes, self.batch_size,
+            self.max_num_tokens, self.max_draft_len,
+            self._cuda_graph_padding_enabled
+        ) if pytorch_backend_config.cuda_graph_batch_sizes else []
+
+        self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
+                                           self._cuda_graph_batch_sizes else 0)
+
+        self.previous_batch_indices_cuda = torch.empty((self.max_num_tokens, ),
+                                                       dtype=torch.int,
+                                                       device='cuda')
+        self.input_ids_cuda = torch.empty((self.max_num_tokens, ),
+                                          dtype=torch.int,
+                                          device='cuda')
+        self.position_ids_cuda = torch.empty((self.max_num_tokens, ),
+                                             dtype=torch.int,
+                                             device='cuda')
         self.iter_counter = 0
 
         # We look up this key in resource_manager during forward to find the
@@ -1356,6 +1360,9 @@ class PyTorchModelEngine(ModelEngine):
         num_draft_tokens = len(draft_tokens)
         previous_batchs = len(previous_batch_indices)
         num_requests = len(request_ids)
+        total_num_tokens = len(position_ids)
+        assert total_num_tokens <= self.max_num_tokens, (
+            "total_num_tokens should be less than or equal to max_num_tokens")
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids,
@@ -1431,7 +1438,6 @@ class PyTorchModelEngine(ModelEngine):
                     self.previous_batch_indices_cuda[:previous_batchs]],
                 non_blocking=True)
 
-        total_num_tokens = len(position_ids)
         position_ids = torch.tensor(position_ids,
                                     dtype=torch.int,
                                     pin_memory=True)
@@ -1558,6 +1564,8 @@ class PyTorchModelEngine(ModelEngine):
                 multi_modal_data.append(multimodal_embedding)
 
         num_tokens = len(input_ids)
+        assert num_tokens <= self.max_num_tokens, (
+            "num_tokens should be less than or equal to max_num_tokens")
         input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=True)
         self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
@@ -1826,6 +1834,8 @@ class PyTorchModelEngine(ModelEngine):
             output_token_idx += 1
 
         num_tokens = len(input_ids)
+        assert num_tokens <= self.max_num_tokens, (
+            "num_tokens should be less than or equal to max_num_tokens")
         input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=True)
         self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
