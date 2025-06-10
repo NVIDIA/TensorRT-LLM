@@ -640,15 +640,13 @@ pipeline {
 
                     def status = ""
                     def jobName = "/LLM/helpers/BuildDockerImageSanityTest"
-                    def jobPath = trtllm_utils.resolveFullJobName(jobName).replace('/', '/job/').substring(1)
-                    def jenkinsUrl = env.JENKINS_URL
-                    def credentials = env.localJobCredentials
-                    def handle = triggerRemoteJob(
-                        job: "${jenkinsUrl}${jobPath}/",
-                        auth: CredentialsAuth(credentials: credentials),
-                        parameters: trtllm_utils.toRemoteBuildParameters(parameters),
-                        pollInterval: 60,
-                        abortTriggeredJob: true,
+                    // def jobPath = trtllm_utils.resolveFullJobName(jobName).replace('/', '/job/').substring(1)
+                    // def jenkinsUrl = env.JENKINS_URL
+                    // def credentials = env.localJobCredentials
+                    def handle = build(
+                        job: jobName,
+                        parameters: trtllm_utils.toBuildParameters(parameters),
+                        propagate: false,
                     )
                     status = handle.getBuildResult().toString()
 
