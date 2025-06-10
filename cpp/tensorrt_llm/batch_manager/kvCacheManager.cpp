@@ -2121,8 +2121,8 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
     std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
     uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor)
 {
-    TLLM_LOG_INFO("Calculating max num blocks for %s: {.allottedPrimaryMemBytes=%" PRIu64
-                  ", .allottedSecondaryMemBytes=%" PRIu64 "}",
+    TLLM_LOG_DEBUG("Calculating max num blocks for %s: {.allottedPrimaryMemBytes=%" PRIu64
+                   ", .allottedSecondaryMemBytes=%" PRIu64 "}",
         isCrossAttention ? "Cross KvCacheManager" : "Self KvCacheManager", allottedPrimaryMemBytes,
         allottedSecondaryMemBytes);
 
@@ -2146,7 +2146,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
 
     auto const extraCostMemoryBytes = extraCostMemory
         * std::accumulate(cacheSizeBytesPerTokenPerWindow.cbegin(), cacheSizeBytesPerTokenPerWindow.cend(),
-            SizeType32{0}, [](SizeType32 acc, auto const cost) { return cost.second; });
+            SizeType32{0}, [](SizeType32 acc, auto const cost) { return acc + cost.second; });
 
     TLLM_LOG_DEBUG(
         "extraCostMemoryBytes [all windows] [Gib]: %0.2f", extraCostMemoryBytes / static_cast<double>(1 << 30));
