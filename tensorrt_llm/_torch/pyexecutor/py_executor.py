@@ -2000,7 +2000,7 @@ class PyExecutor:
             f'before gather, rank = {self.dist.rank}, responses = {responses}')
         if self.enable_attention_dp:
             if self.dist.world_size == 1:
-                responses_list = [responses]
+                pass
             elif not self.gather_all_responses:
                 response_list = ResponseList(
                     [r._response for r in responses.values()])
@@ -2012,16 +2012,14 @@ class PyExecutor:
 
                 responses_list = self.dist.tp_gather(packed_responses)
 
-                unpacked_res = {}
+                responses = {}
                 if self.dist.rank == 0:
                     for res in responses_list:
                         for response, py_result, req_id in itertools.zip_longest(
                                 res._response_list._responses,
                                 res._py_result_list._py_results,
                                 res._req_id_list):
-                            unpacked_res[req_id] = LlmResponse(
-                                response, py_result)
-                    responses = unpacked_res
+                            responses[req_id] = LlmResponse(response, py_result)
             else:
                 response_list = ResponseList(
                     [r._response for r in responses.values()])
@@ -2033,13 +2031,12 @@ class PyExecutor:
 
                 responses_list = self.dist.allgather(packed_responses)
 
-                unpacked_res = {}
+                responses = {}
                 for res in responses_list:
                     for response, py_result, req_id in itertools.zip_longest(
                             res._response_list._responses,
                             res._py_result_list._py_results, res._req_id_list):
-                        unpacked_res[req_id] = LlmResponse(response, py_result)
-                responses = unpacked_res
+                        responses[req_id] = LlmResponse(response, py_result)
             # if self.dist.rank == 0 or self.gather_all_responses:
             #     gather_responses = {}
             #     if responses_list is not None:
