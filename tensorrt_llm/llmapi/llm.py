@@ -800,7 +800,7 @@ class BaseLLM:
 
 
 @append_docstring(TRT_LLM_DOCSTRING)
-class TrtLLM(BaseLLM):
+class _TrtLLM(BaseLLM):
     """LLM class is the main class for running a LLM model using TensorRT-LLM backend.
 
     Parameters:
@@ -818,6 +818,8 @@ class TrtLLM(BaseLLM):
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
+        # TODO: deprecate backend in LLM kwargs
+
         super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
                          trust_remote_code, tensor_parallel_size, dtype,
                          revision, tokenizer_revision, **kwargs)
@@ -853,7 +855,7 @@ class TrtLLM(BaseLLM):
 
 
 @append_docstring(TORCH_LLM_DOCSTRING)
-class TorchLLM(BaseLLM):
+class _TorchLLM(BaseLLM):
     """LLM class is the main class for running a LLM model using PyTorch backend.
 
     Parameters:
@@ -872,7 +874,9 @@ class TorchLLM(BaseLLM):
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
-        kwargs.pop('backend', None)
+        # TODO: deprecate backend in LLM kwargs
+        kwargs.pop("backend", None)
+
         super().__init__(model,
                          tokenizer,
                          tokenizer_mode,
@@ -886,14 +890,26 @@ class TorchLLM(BaseLLM):
                          **kwargs)
 
 
-TLLM_USE_TRT_ENGINE = os.environ.get("TLLM_USE_TRT_ENGINE", "1")
+class LLM(_TrtLLM):
+
+    def __init__(self,
+                 model: Union[str, Path],
+                 tokenizer: Optional[Union[str, Path, TokenizerBase,
+                                           PreTrainedTokenizerBase]] = None,
+                 tokenizer_mode: Literal['auto', 'slow'] = 'auto',
+                 skip_tokenizer_init: bool = False,
+                 trust_remote_code: bool = False,
+                 tensor_parallel_size: int = 1,
+                 dtype: str = "auto",
+                 revision: Optional[str] = None,
+                 tokenizer_revision: Optional[str] = None,
+                 **kwargs: Any) -> None:
+        super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
+                         trust_remote_code, tensor_parallel_size, dtype,
+                         revision, tokenizer_revision, **kwargs)
 
 
-class LLM(TrtLLM if TLLM_USE_TRT_ENGINE == "1" else TorchLLM):
-    pass
-
-
-_LLM_REPR = "TrtLLM" if TLLM_USE_TRT_ENGINE == "1" else "TorchLLM"
+_LLM_REPR = "TrtLLM"
 
 # sphinx will ignore the LLM's docstring if it is not explicitly set
 LLM.__doc__ = \
@@ -904,4 +920,4 @@ LLM.__doc__ = \
     The default backend is the TensorRT backend.
 
     Parameters:
-""" + TRT_LLM_DOCSTRING if TLLM_USE_TRT_ENGINE == "1" else TORCH_LLM_DOCSTRING
+""" + TRT_LLM_DOCSTRING
