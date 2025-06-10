@@ -2234,6 +2234,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
     }
 
     BlocksPerWindow windowSizeToBlocks;
+    TLLM_LOG_INFO("Blocks per window size:");
     for (size_t i = 0; i < windowSizes.size(); ++i)
     {
         auto const windowSize = windowSizes.at(i);
