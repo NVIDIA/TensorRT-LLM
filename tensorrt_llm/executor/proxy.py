@@ -9,7 +9,6 @@ import torch
 import zmq
 import zmq.asyncio
 
-import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_rank, nvtx_range_debug
@@ -297,8 +296,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             worker_cls=self.worker_cls,
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
-            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
-            BASE_ZMQ_CLASSES=serialization.BASE_ZMQ_CLASSES)
+            ready_signal=ExecutorBindingsProxy.READY_SIGNAL,
+        )
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)
 
