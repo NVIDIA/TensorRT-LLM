@@ -10,8 +10,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.sampler import (Sampler, SampleState, SampleStateTensors,
-                                  TorchSampler)
+from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 from .mtp import MTPSampler
 
@@ -194,15 +193,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 break
 
 
-class Eagle3Sampler(Sampler):
-
-    def __init__(self, sampler_args: TorchSampler.Args):
-        self.max_seq_len = sampler_args.max_seq_len
-
-    _meet_max_token_stop_criteria = TorchSampler._meet_max_token_stop_criteria
-    _meet_stop_token_criteria = staticmethod(
-        TorchSampler._meet_stop_token_criteria)
-    _handle_stop_criteria = TorchSampler._handle_stop_criteria
+class Eagle3Sampler(TorchSampler):
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs: dict[str, torch.Tensor]) -> SampleState:

@@ -39,6 +39,7 @@ class SampleState:
     scheduled_requests: ScheduledRequests
 
     logits: torch.Tensor | None = None
+    log_probs: torch.Tensor | None = None
 
     device: SampleStateTensors = None
     host: SampleStateTensors = None
@@ -180,11 +181,6 @@ def add_token(request: LlmRequest,
     return new_token
 
 
-@dataclass(frozen=True, kw_only=True)
-class SampleStateTorch(SampleState):
-    log_probs: torch.Tensor | None = None
-
-
 class TorchSampler(Sampler):
     BEAM = 0
 
@@ -259,8 +255,8 @@ class TorchSampler(Sampler):
         return False
 
     @staticmethod
-    def handle_logits(request: LlmRequest, state: SampleStateTorch, *,
-                      beam: int, count: int):
+    def handle_logits(request: LlmRequest, state: SampleState, *, beam: int,
+                      count: int):
         current_slice = seq_slice(request, beam, size=count)
         if request.py_return_generation_logits:
             assert state.logits is not None
@@ -277,8 +273,8 @@ class TorchSampler(Sampler):
             assert beam == 0, "The following call relies on beam_width to be 1 - hence the list with a single element"
             request.py_result.append_log_probs([token_log_probs])
 
-    def update_requests(self, state: SampleStateTorch) -> None:
-        assert isinstance(state, SampleStateTorch)
+    def update_requests(self, state: SampleState) -> None:
+        assert isinstance(state, SampleState)
         if state.sampler_event:
             state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens
@@ -311,9 +307,8 @@ class TorchSampler(Sampler):
             req.py_num_accepted_draft_tokens = num_accepted
             req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
 
-    def sample_async(
-            self, scheduled_requests: ScheduledRequests,
-            model_outputs: dict[str, torch.Tensor]) -> SampleStateTorch:
+    def sample_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs: dict[str, torch.Tensor]) -> SampleState:
         requests = scheduled_requests.all_requests()
         raw_logits = model_outputs["logits"]
         new_tokens_device = self.store.new_tokens_device
@@ -332,7 +327,7 @@ class TorchSampler(Sampler):
         new_tokens_host = new_tokens_device.to(device="cpu", non_blocking=True)
         sampler_event = torch.cuda.Event()
         sampler_event.record()
-        return SampleStateTorch(
+        return SampleState(
             scheduled_requests=scheduled_requests,
             device=SampleStateTensors(new_tokens=new_tokens_device),
             host=SampleStateTensors(new_tokens=new_tokens_host),
