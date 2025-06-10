@@ -373,6 +373,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    jnlpImage = "urm.nvidia.com/docker/jenkins/inbound-agent:4.13.3-1"
 
     switch(type)
     {
@@ -557,7 +558,17 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                           fieldPath: spec.nodeName
                   - name: jnlp
                     image: ${jnlpImage}
-                    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
+                    args: []
+                    env:
+                    - name: JENKINS_SECRET
+                      valueFrom:
+                        secretKeyRef:
+                          name: jenkins-agent-secret
+                          key: secret
+                    - name: JENKINS_NAME
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: metadata.name
                     resources:
                       requests:
                         cpu: '2'
