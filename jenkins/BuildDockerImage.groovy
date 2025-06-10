@@ -633,6 +633,7 @@ pipeline {
                         'branch': LLM_BRANCH,
                         'globalVars': globalVarsJson,
                         'targetArch': "aarch64-linux-gnu",
+                        'dockerImage': globalVars[IMAGE_KEY_TO_TAG]['NGC Devel Image amd64'],
                     ]
 
                     echo "trigger BuildDockerImageSanityTest job, params: ${parameters}"
