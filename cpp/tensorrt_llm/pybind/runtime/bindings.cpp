@@ -331,11 +331,9 @@ void initBindings(pybind11::module_& m)
         .def("setup", &tr::decoder::DecoderState::setup, py::arg("max_batch_size"), py::arg("max_beam_width"),
             py::arg("max_attention_window"), py::arg("sink_token_length"), py::arg("max_sequence_length"),
             py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
-        .def("allocate_speculative_decoding_buffers", &tr::decoder::DecoderState::allocateSpeculativeDecodingBuffers,
-            py::arg("speculative_decoding_mode"), py::arg("dtype"), py::arg("buffer_manager"))
         .def("setup_speculative_decoding", &tr::decoder::DecoderState::setupSpeculativeDecoding,
-            py::arg("speculative_decoding_mode"), py::arg("max_tokens_per_engine_step"), py::arg("model_config"),
-            py::arg("world_config"), py::arg("buffer_manager"))
+            py::arg("speculative_decoding_mode"), py::arg("max_tokens_per_engine_step"), py::arg("dtype"),
+            py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
         .def_property_readonly("joint_decoding_input", &tr::decoder::DecoderState::getJointDecodingInput)
         .def_property_readonly("joint_decoding_output", &tr::decoder::DecoderState::getJointDecodingOutput)
         .def_property_readonly(
