@@ -732,8 +732,7 @@ class TRTLLMSampler(Sampler):
                                     rank=1)
                         })
 
-                if len(num_new_tokens[beam]
-                       ) > 0 and request.py_return_log_probs:
+                if num_new_tokens[beam] > 0 and request.py_return_log_probs:
                     cum_log_probs.append(
                         state.host.cum_log_probs[seq_slot * beam_width +
                                                  beam].item())
