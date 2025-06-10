@@ -2749,7 +2749,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     LoraParams& lora_params, bool use_fp8_block_scaling, bool min_latency_mode, MoeMinLatencyParams& min_latency_params,
     cudaStream_t stream)
 {
-    printf("ENABLE_OPENED_CUTLASS_MOE_GEMM\n");
     static constexpr bool int_scales_required
         = std::is_same<WeightType, uint8_t>::value || std::is_same<WeightType, cutlass::uint4b_t>::value;
     static constexpr bool fp8_scales_required

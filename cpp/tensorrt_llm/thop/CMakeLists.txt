@@ -88,16 +88,16 @@ target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
 
 if(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common
-                             PRIVATE "ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM")
+                             PUBLIC "ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM")
   message(STATUS "Enable open source Cutlass low latency gemm kernel")
 endif()
 
 if(ENABLE_OPENED_CUTLASS_FP4_GEMM)
-  target_compile_definitions(th_common PRIVATE ENABLE_OPENED_CUTLASS_FP4_GEMM)
+  target_compile_definitions(th_common PUBLIC ENABLE_OPENED_CUTLASS_FP4_GEMM)
 endif()
 
 if(ENABLE_OPENED_CUTLASS_MOE_GEMM)
-  target_compile_definitions(th_common PRIVATE ENABLE_OPENED_CUTLASS_MOE_GEMM)
+  target_compile_definitions(th_common PUBLIC ENABLE_OPENED_CUTLASS_MOE_GEMM)
 endif()
 
 if(ENABLE_MULTI_DEVICE)

@@ -152,7 +152,6 @@ if(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
                              PRIVATE ${3RDPARTY_DIR}/cutlass/examples)
   set_property(TARGET low_latency_gemm_src PROPERTY POSITION_INDEPENDENT_CODE
                                                     ON)
-
 endif()
 
 if(ENABLE_OPENED_CUTLASS_FP4_GEMM)

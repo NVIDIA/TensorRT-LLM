@@ -217,11 +217,6 @@ public:
         int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank, bool min_latency_mode,
         torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
-#if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
-        printf("ENABLE_OPENED_CUTLASS_MOE_GEMM\n");
-#else
-        printf("NOT ENABLE_OPENED_CUTLASS_MOE_GEMM\n");
-#endif
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
         freeProfileWorkspace();

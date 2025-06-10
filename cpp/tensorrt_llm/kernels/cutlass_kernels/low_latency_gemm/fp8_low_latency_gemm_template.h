@@ -423,7 +423,6 @@ void CutlassLowLatencyFp8GemmRunner<T>::gemm(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B,
     void* D, int m, int n, int k, float pdl_overlap_ratio, float prefetch_ratio, ConfigType gemmConfig,
     char* workspacePtr, size_t const workspaceBytes, cudaStream_t stream)
 {
-    printf("ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM\n");
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     dispatchToArch(static_cast<__nv_fp8_e4m3 const*>(A), static_cast<__nv_fp8_e4m3 const*>(B), alpha, beta,
         static_cast<T const*>(C), static_cast<T*>(D), m, n, k, pdl_overlap_ratio, prefetch_ratio, gemmConfig,

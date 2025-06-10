@@ -223,7 +223,6 @@ std::shared_ptr<PersistentWorkspaceInterface> GemmAllReduceImplRunner<GemmTraits
 template <typename GemmTraits>
 int GemmAllReduceImplRunner<GemmTraits>::run(ProblemArgs const& problem, cudaStream_t stream)
 {
-    printf("ENABLE_OPENED_CUTLASS_ALLREDUCE_GEMM\n");
     auto swapped_problem = swapAB(problem);
     TLLM_CHECK_WITH_INFO(mGemmRegistry.count(swapped_problem.launch_config) > 0, "No cutlass gemm impl found.");
     auto gemm_impl = mGemmRegistry.at(swapped_problem.launch_config);

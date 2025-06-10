@@ -254,7 +254,6 @@ void CutlassFp4GemmRunner<T>::gemm(void* D, void const* A, void const* B, void c
     float const* global_sf, int m, int n, int k, int batch_count, tkc::CutlassGemmConfig gemmConfig, char* workspace,
     const size_t workspaceBytes, cudaStream_t stream)
 {
-    printf("ENABLE_OPENED_CUTLASS_FP4_GEMM\n");
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     dispatchToArch(reinterpret_cast<T*>(D), A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig,
         workspace, workspaceBytes, stream);
