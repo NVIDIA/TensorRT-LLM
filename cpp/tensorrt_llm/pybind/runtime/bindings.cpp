@@ -323,10 +323,11 @@ void initBindings(pybind11::module_& m)
             py::arg("requests") = std::nullopt);
 
     py::class_<tr::decoder::DecoderState>(m, "DecoderState")
-        .def(py::init<nvinfer1::DataType, tr::BufferManager const&>(), py::arg("dtype"), py::arg("buffer_manager"))
-        .def("setup", &tr::decoder::DecoderState::setup, py::arg("max_batch_size"), py::arg("max_beam_width"),
-            py::arg("max_attention_window"), py::arg("sink_token_length"), py::arg("max_sequence_length"),
-            py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
+        .def(py::init<tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32,
+                 nvinfer1::DataType, tr::ModelConfig const&, tr::WorldConfig const&, tr::BufferManager const&>(),
+            py::arg("max_batch_size"), py::arg("max_beam_width"), py::arg("max_attention_window"),
+            py::arg("sink_token_length"), py::arg("max_sequence_length"), py::arg("dtype"), py::arg("model_config"),
+            py::arg("world_config"), py::arg("buffer_manager"))
         .def("setup_speculative_decoding", &tr::decoder::DecoderState::setupSpeculativeDecoding,
             py::arg("speculative_decoding_mode"), py::arg("max_tokens_per_engine_step"), py::arg("dtype"),
             py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))

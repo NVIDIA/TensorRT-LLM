@@ -316,9 +316,8 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     auto decoder = GptDecoderBatched(streamPtr);
     decoder.setup(decodingMode, batchSize, maxBeamWidth, maxSeqLength, dataType, modelConfig, worldConfig);
 
-    decoder::DecoderState decoderState(dataType, manager);
-    decoderState.setup(
-        batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength, modelConfig, worldConfig, manager);
+    decoder::DecoderState decoderState(batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength,
+        dataType, modelConfig, worldConfig, manager);
     if (!modelConfig.getSpeculativeDecodingMode().isNone())
     {
         decoderState.setupSpeculativeDecoding(modelConfig.getSpeculativeDecodingMode(), maxGeneratedTokensPerStep,
@@ -454,9 +453,8 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     auto decoder = GptDecoderBatched(streamPtr);
     decoder.setup(decodingMode, batchSize, maxBeamWidth, maxSeqLength, dataType, modelConfig, worldConfig);
 
-    decoder::DecoderState decoderState(dataType, manager);
-    decoderState.setup(
-        batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength, modelConfig, worldConfig, manager);
+    decoder::DecoderState decoderState(batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength,
+        dataType, modelConfig, worldConfig, manager);
     if (!modelConfig.getSpeculativeDecodingMode().isNone())
     {
         decoderState.setupSpeculativeDecoding(modelConfig.getSpeculativeDecodingMode(), maxGeneratedTokensPerStep,
@@ -608,9 +606,8 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     auto decoder = GptDecoderBatched(streamPtr);
     decoder.setup(decodingMode, batchSize, maxBeamWidth, maxSeqLength, dataType, modelConfig, worldConfig);
 
-    decoder::DecoderState decoderState(dataType, manager);
-    decoderState.setup(
-        batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength, modelConfig, worldConfig, manager);
+    decoder::DecoderState decoderState(batchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSeqLength,
+        dataType, modelConfig, worldConfig, manager);
     if (!modelConfig.getSpeculativeDecodingMode().isNone())
     {
         decoderState.setupSpeculativeDecoding(modelConfig.getSpeculativeDecodingMode(), maxGeneratedTokensPerStep,

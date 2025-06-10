@@ -1426,10 +1426,9 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
         mDecoder->setup(decodingMode, getMaxNumSequences(), mOperatingBeamWidth, getMaxSequenceLen(), decoderType,
             mModelConfig, mWorldConfig);
 
-        mDecoderState = std::make_unique<runtime::decoder::DecoderState>(decoderType, mRuntime->getBufferManager());
-
-        mDecoderState->setup(getMaxNumSequences(), mOperatingBeamWidth, getMaxAttentionWindow(), getSinkTokenLen(),
-            getMaxSequenceLen(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
+        mDecoderState = std::make_unique<runtime::decoder::DecoderState>(getMaxNumSequences(), mOperatingBeamWidth,
+            getMaxAttentionWindow(), getSinkTokenLen(), getMaxSequenceLen(), decoderType, mModelConfig, mWorldConfig,
+            mRuntime->getBufferManager());
 
         if (!mModelConfig.getSpeculativeDecodingMode().isNone())
         {
