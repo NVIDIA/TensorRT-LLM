@@ -653,7 +653,7 @@ trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch 
 
 ### Benchmark
 
-To run the benchmark, we suggest using the `trtllm-bench` tool. Please refer to the following script:
+To run the benchmark, we suggest using the `trtllm-bench` tool. Please refer to the following script on B200:
 
 ```bash
 #!/bin/bash
