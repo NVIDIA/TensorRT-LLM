@@ -579,7 +579,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 ${pvcVolume}
         """.stripIndent(),
     ]
-
+    println "podConfig: ${podConfig}"
     return podConfig
 }
 
