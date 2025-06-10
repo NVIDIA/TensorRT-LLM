@@ -1371,6 +1371,7 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
     }
     buildArgs = "--clean"
+    buildArgs += " --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl"
     if (cpu_arch == AARCH64_TRIPLE) {
         buildArgs += " -a '90-real;100-real;120-real'"
     }
