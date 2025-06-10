@@ -95,3 +95,23 @@ jobs:
           OPERATION: 'POST-PROCESSING'
           CI_SERVER: ${{ secrets.CI_SERVER }}
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  Report-Status:
+    name: Report Authorization Failure
+    runs-on: ubuntu-latest
+    needs: [Authorization]
+    if: ${{ needs.Authorization.result != 'success' }}
+    steps:
+      - name: Create Commit Status
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              context: 'blossom-ci',
+              sha: '${{ github.event.issue.pull_request.head.sha }}',
+              target_url: 'https://github.com/NVIDIA/TensorRT-LLM/actions/runs/${{github.run_id}}',
+              state: 'failure',
+              description: 'CI testing could not start due to authorization failure',
+            })
