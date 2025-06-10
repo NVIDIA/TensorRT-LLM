@@ -114,7 +114,7 @@ bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forCo
         bool hasPerfGain = mayHavePerfGain(xqaParams);
         if (!hasPerfGain)
         {
-            TLLM_LOG_DEBUG("JIT XQA is not used: no performance gain");
+            TLLM_LOG_DEBUG("JIT XQA is not used: maybe no performance gain");
             return false;
         }
         return true;
