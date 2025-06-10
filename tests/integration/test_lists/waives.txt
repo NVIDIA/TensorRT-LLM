@@ -437,3 +437,4 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_2_1B::test_fp8_pp2 SKIP (https://nv
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-70B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-70B] SKIP (https://nvbugs/5323316)
 disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5328160)
 test_e2e.py::test_trtllm_bench_llmapi_launch[trt_backend-llama-v3-llama3-8b] SKIP (https://nvbugs/5320234)
+stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test] SKIP (https://nvbugs/5328495)
