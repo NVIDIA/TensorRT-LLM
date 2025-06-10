@@ -83,7 +83,7 @@ class MllamaDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
@@ -146,8 +146,8 @@ class MllamaTextModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        positions: Optional[torch.LongTensor],
+        input_ids: torch.IntTensor,
+        positions: Optional[torch.IntTensor],
         cross_attention_states: Optional[torch.LongTensor],
         cross_attention_mask: Optional[torch.LongTensor],
         full_text_row_masked_out_mask: Optional[Tuple[torch.Tensor,
@@ -211,8 +211,8 @@ class MllamaForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        positions: Optional[torch.LongTensor],
+        input_ids: torch.IntTensor,
+        positions: Optional[torch.IntTensor],
         cross_attention_states: Optional[torch.LongTensor],
         cross_attention_mask: Optional[torch.LongTensor],
         full_text_row_masked_out_mask: Optional[Tuple[torch.Tensor,
@@ -303,8 +303,8 @@ class MllamaForConditionalGeneration(nn.Module):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
         # TODO:  figure out the image-related inputs in kwargs

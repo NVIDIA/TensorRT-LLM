@@ -54,15 +54,15 @@ def populate_benchmark_config(**kwargs):
 
 
 # Default Mixtral configurations
-num_experts = 8
-k = 2
+num_experts = 256
+k = 8
 hidden_size = 4096
-inter_size = 14336
-tp_size = 4
+inter_size = 2048
+tp_size = 8
 ep_size = 1
 world_rank = 0
 act_fn = 3
-dtype_string = make_dtype_string()  # All dtypes
+dtype_string = make_dtype_string(["fp4", "wfp4afp8"])  # All dtypes
 routing_string = make_routing_string(
     name="uniform",
     is_distribution=True)  # Use the default uniform random distribution

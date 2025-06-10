@@ -38,9 +38,8 @@ from .request import (CancellingRequest, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import (GenerationResult, IterationResult, LogProbsResult,
                      ResponseWrapper, compute_logprobs)
-from .utils import (PERIODICAL_RESP_IN_AWAIT, ErrorResponse, IntraProcessQueue,
-                    RequestError, WorkerCommIpcAddrs, has_event_loop,
-                    is_llm_response)
+from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
+                    WorkerCommIpcAddrs, has_event_loop, is_llm_response)
 
 __all__ = [
     "GenerationExecutorWorker",
@@ -127,7 +126,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                     create_py_executor
                 create_executor = create_py_executor
                 args["lora_config"] = lora_config
-            elif executor_config.backend == "autodeploy":
+            elif executor_config.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
                 create_executor = create_autodeploy_executor
@@ -373,6 +372,7 @@ class GenerationExecutorWorker(GenerationExecutor):
         prompt_tuning_config = None
         multimodal_embedding = None
         mrope_config = None
+        multimodal_input = None
         if request.multimodal_embedding is not None:
             multimodal_embedding = request.multimodal_embedding
         if request.prompt_adapter_request is not None:
@@ -387,6 +387,13 @@ class GenerationExecutorWorker(GenerationExecutor):
 
         if request.mrope_config is not None:
             mrope_config = tllm.MropeConfig(**request.mrope_config)
+
+        if request.multimodal_input is not None:
+            multimodal_input = tllm.MultimodalInput(
+                multimodal_hashes=request.multimodal_input.multimodal_hashes,
+                multimodal_positions=request.multimodal_input.
+                multimodal_positions,
+                multimodal_lengths=request.multimodal_input.multimodal_lengths)
 
         context_phase_params = None
         request_type = tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
@@ -453,6 +460,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
+                multimodal_input=multimodal_input,
                 multimodal_embedding=multimodal_embedding,
                 mrope_config=mrope_config,
                 logits_post_processor_name=(
@@ -631,9 +639,10 @@ def worker_main(
         request_queue = IpcQueue(worker_queues.request_queue_addr,
                                  is_server=False,
                                  name="worker_request_queue")
-        request_error_queue = IpcQueue(worker_queues.request_error_queue_addr,
-                                       is_server=False,
-                                       name="worker_request_error_queue")
+        worker_init_status_queue = IpcQueue(
+            worker_queues.worker_init_status_queue_addr,
+            is_server=False,
+            name="worker_init_status_queue")
         mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
                                        is_server=False,
                                        fuse_message=True,
@@ -649,7 +658,7 @@ def worker_main(
             # processes, each one is a PAIR zmq socket
             result_queues = [
                 FusedIpcQueue(is_server=True,
-                              fuse_message=PERIODICAL_RESP_IN_AWAIT,
+                              fuse_message=False,
                               name=f"postprocess_{i}_feedin_queue")
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
@@ -658,7 +667,7 @@ def worker_main(
             # Proxy process to handle the postprocess
             result_queue = FusedIpcQueue(worker_queues.result_queue_addr,
                                          is_server=False,
-                                         fuse_message=PERIODICAL_RESP_IN_AWAIT,
+                                         fuse_message=False,
                                          name="worker_result_queue")
 
     def notify_proxy_threads_to_quit():
@@ -722,7 +731,7 @@ def worker_main(
         logger.error(traceback.format_exc())
         print_colored_debug(f"error: {traceback.format_exc()}", "red")
         if is_leader:
-            request_error_queue.put(e)
+            worker_init_status_queue.put(e)
         return
 
     with worker:
@@ -740,16 +749,17 @@ def worker_main(
                                                    mp_stats_queue)
                 worker._set_iteration_result_queue(worker.kv_events_queues,
                                                    kv_cache_events_queue)
-                request_error_queue.put(ready_signal)
+                worker_init_status_queue.put(ready_signal)
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
                     elif isinstance(req, GenerationRequest):
                         try:
                             worker.submit(req)
-                            request_error_queue.put(None)  # None means success
                         except RequestError as e:
-                            request_error_queue.put(e)
+                            logger.error(f"submit request failed: {e}")
+                            worker._await_response_helper.temp_error_responses.put(
+                                ErrorResponse(req.id, e, req.id))
                     else:
                         raise ValueError(f"Unknown request type: {type(req)}")
 
@@ -762,10 +772,9 @@ def worker_main(
         except Exception as e:  # other critical errors
             if is_leader:
                 notify_proxy_threads_to_quit()
-            err = Exception(f"Failed during generation: {e}")
             logger.error(traceback.format_exc())
-            if is_leader:
-                request_error_queue.put(err)
+            # This will be captured by mpi4py and handled by future.done_callback
+            raise e
 
 
 class AwaitResponseHelper:
@@ -774,14 +783,15 @@ class AwaitResponseHelper:
     class HandlerKind(enum.Enum):
         unknown = 0
         single_process_worker = 1
-        ipc_periodically = 2
-        ipc_batched = 3
+        ipc_batched = 2
 
     def __init__(self, worker: "GenerationExecutorWorker"):
         # TODO: make worker weakref
         self.worker = worker
         self.handler_kind: AwaitResponseHelper.HandlerKind = AwaitResponseHelper.HandlerKind.unknown
         self.enable_postprocprocess_parallel = self.worker.enable_postprocess_parallel
+        # The error responses when submit request failed will be put here
+        self.temp_error_responses = Queue()
 
     def responses_handler(self, responses: List[tllm.Response]):
         HandlerKind = AwaitResponseHelper.HandlerKind
@@ -799,10 +809,7 @@ class AwaitResponseHelper:
                 # The ExecutorBindingProxy is used
                 print_colored_debug(f"creating await_response helper for IPC\n",
                                     color="yellow")
-                if PERIODICAL_RESP_IN_AWAIT:
-                    self.handler_kind = HandlerKind.ipc_periodically
-                else:
-                    self.handler_kind = HandlerKind.ipc_batched
+                self.handler_kind = HandlerKind.ipc_batched
             else:
                 raise NotImplementedError
 
@@ -811,8 +818,6 @@ class AwaitResponseHelper:
                 return self.handle_for_worker(responses)
             case HandlerKind.ipc_batched:
                 return self.handle_for_ipc_batched(responses)
-            case HandlerKind.ipc_periodically:
-                return self.handle_for_ipc_periodically(responses)
             case _:
                 raise NotImplementedError
 
@@ -825,6 +830,10 @@ class AwaitResponseHelper:
             filter(
                 lambda _: _,
                 [self.worker._engine_response_callback(r) for r in responses]))
+
+        # append the error responses to the temp_error_responses
+        while not self.temp_error_responses.empty():
+            responses.append(self.temp_error_responses.get())
 
         with nvtx_range_debug(f"await_response-{len(responses)}",
                               color="red",
@@ -862,34 +871,6 @@ class AwaitResponseHelper:
         # Notify the events in bulk for performance.
         if async_queues:
             _SyncQueue.notify_many(event_loop, async_queues)
-
-    def handle_for_ipc_periodically(self,
-                                    responses: List[tllm.Response]) -> None:
-        ''' Return the responses to Proxy via IPC. This will put Rsp to a Queue
-        in a FusedIpcQueue, and a background thread will batch them and invoke
-        IPC periodically. '''
-
-        with nvtx_range_debug(f"handle_for_ipc_periodically-{len(responses)}",
-                              color="red",
-                              category="Worker"):
-
-            for response in responses:
-
-                if self.worker._has_background_error():
-                    response = self.worker._create_error_response(response)
-                elif response.has_error():
-                    response = ErrorResponse(response.client_id,
-                                             response.error_msg,
-                                             response.request_id)
-                else:
-                    logprobs_result = _get_logprobs(
-                        self.worker, response, self.worker._is_pytorch_backend)
-                    if logprobs_result:
-                        response = ResponseWrapper(response, logprobs_result)
-
-                # TODO: To verify the performance of using ZMQ instead of SharedMemory
-                # to send the logits tensor back to the Proxy process.
-                _send_rsp(self.worker, response)
 
     def handle_for_ipc_batched(self, responses: List[tllm.Response]) -> None:
         ''' Perform the IPC in batch explicitly. '''

@@ -42,12 +42,14 @@ set_directory_properties(
 
 set(INSTANTIATION_GENERATION_DIR
     ${CMAKE_CURRENT_BINARY_DIR}/cutlass_instantiations)
+
 execute_process(
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/python/
   COMMAND
     ${Python3_EXECUTABLE} generate_kernels.py -a
     "${CMAKE_CUDA_ARCHITECTURES_ORIG};${CMAKE_CUDA_ARCHITECTURES_NATIVE}" -o
     ${INSTANTIATION_GENERATION_DIR}
+  OUTPUT_VARIABLE _KERNEL_GEN_OUTPUT
   RESULT_VARIABLE _KERNEL_GEN_SUCCESS)
 
 if(NOT _KERNEL_GEN_SUCCESS MATCHES 0)
@@ -55,6 +57,23 @@ if(NOT _KERNEL_GEN_SUCCESS MATCHES 0)
     FATAL_ERROR
       "Failed to generate CUTLASS kernel instantiations due to ${_KERNEL_GEN_SUCCESS}."
   )
+endif()
+
+file(GLOB_RECURSE INSTANTIATIONS_GENERATED ${INSTANTIATION_GENERATION_DIR}/*.cu)
+string(STRIP "${_KERNEL_GEN_OUTPUT}" _KERNEL_GEN_OUTPUT)
+
+# Sort both lists to ensure order doesn't matter
+list(SORT _KERNEL_GEN_OUTPUT)
+list(SORT INSTANTIATIONS_GENERATED)
+
+# Compare the lists
+if(NOT _KERNEL_GEN_OUTPUT STREQUAL INSTANTIATIONS_GENERATED)
+  list(REMOVE_ITEM INSTANTIATIONS_GENERATED ${_KERNEL_GEN_OUTPUT})
+  message(
+    WARNING
+      "There exist stale generated kernels in ${INSTANTIATION_GENERATION_DIR}. Removing these files:\n${INSTANTIATIONS_GENERATED}"
+  )
+  file(REMOVE ${INSTANTIATIONS_GENERATED})
 endif()
 
 # Get the sources for Mixed Input GEMM launchers

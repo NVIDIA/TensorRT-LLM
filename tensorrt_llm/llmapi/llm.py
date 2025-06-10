@@ -27,11 +27,12 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
 from ..executor.postproc_worker import PostprocParams
 from ..executor.utils import (create_mpi_comm_session,
                               get_spawn_proxy_process_env)
-from ..inputs import PromptInputs, create_input_processor, prompt_inputs
+from ..inputs import (PromptInputs, create_input_processor,
+                      create_input_processor_with_hash, prompt_inputs)
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .llm_args import (LLMARGS_EXPLICIT_DOCSTRING, PybindMirror, TorchLlmArgs,
-                       TrtLlmArgs)
+                       TrtLlmArgs, _AutoDeployLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -116,8 +117,13 @@ class LLM:
         self._llm_id = None
 
         try:
-            llm_args_cls = TorchLlmArgs if kwargs.get(
-                'backend', None) == 'pytorch' else TrtLlmArgs
+            backend = kwargs.get('backend', None)
+            if backend == 'pytorch':
+                llm_args_cls = TorchLlmArgs
+            elif backend == '_autodeploy':
+                llm_args_cls = _AutoDeployLlmArgs
+            else:
+                llm_args_cls = TrtLlmArgs
 
             self.args = llm_args_cls.from_kwargs(
                 model=model,
@@ -332,22 +338,38 @@ class LLM:
                 sampling_params.add_special_tokens = False
 
         query_token_ids = None
+        multimodal_input = None
         multimodal_embedding = None
         mrope_config = None
         if "prompt_token_ids" in inputs:
+            # TODO: if specify prompt_token_ids, the mm hashing is not supported yet
             prompt_token_ids = inputs['prompt_token_ids']
             prompt = None
             query_token_ids = inputs.get("query_token_ids", None)
         elif "prompt" in inputs:
-            with nvtx_range_debug("input_processor"):
-                prompt_token_ids, extra_processed_inputs = self.input_processor(
-                    inputs, sampling_params)
+            if 'multi_modal_data' in inputs:
+                # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
+                # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
+                # In the future, we should refactor this to:
+                # 1. Extend support for more modalities and models
+                # 2. Decouple input processor into distinct phases (preprocessor (all preprocessing logics), vision model (fuse in model fwd), etc.
+                input_processor_with_hash = create_input_processor_with_hash(
+                    self.input_processor)
+                with nvtx_range_debug("input_processor_with_hash"):
+                    prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
+                        inputs, sampling_params)
+            else:
+                with nvtx_range_debug("input_processor"):
+                    prompt_token_ids, extra_processed_inputs = self.input_processor(
+                        inputs, sampling_params)
             prompt = inputs['prompt']
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
                 multimodal_embedding = extra_processed_inputs.get(
                     'mm_embedding')
                 mrope_config = extra_processed_inputs.get('mrope_config')
+                multimodal_input = extra_processed_inputs.get(
+                    'multimodal_input')
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
@@ -367,6 +389,7 @@ class LLM:
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
+            multimodal_input=multimodal_input,
             multimodal_embedding=multimodal_embedding,
             mrope_config=mrope_config,
             kv_cache_retention_config=kv_cache_retention_config,
@@ -465,7 +488,7 @@ class LLM:
                     )
                 sampling_params._setup(self.tokenizer)
             # auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.
-            if self.args.backend not in ["pytorch", "autodeploy"]:
+            if self.args.backend not in ["pytorch", "_autodeploy"]:
                 if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
                     sampling_params.return_context_logits = True
                     sampling_params._context_logits_auto_enabled = True
@@ -482,7 +505,7 @@ class LLM:
     def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams) -> None:
 
-        if self.args.backend == "pytorch":
+        if self.args.backend in ["pytorch", "_autodeploy"]:
             # TODO: remove these checks after PyTorch backend
             # fully support TopK prompt and generation logprobs.
             if sampling_params.prompt_logprobs:
@@ -494,7 +517,7 @@ class LLM:
                     f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
                 )
             return
-        elif self.args.backend == "autodeploy":
+        elif self.args.backend == "_autodeploy":
             return
 
         build_config = self.args.build_config
@@ -647,7 +670,7 @@ class LLM:
             executor_config,
             backend=self.args.backend,
             pytorch_backend_config=self.args.get_pytorch_backend_config()
-            if self.args.backend == "pytorch" else None,
+            if self.args.backend in ["pytorch", "_autodeploy"] else None,
             mapping=self.args.parallel_config.to_mapping(),
             build_config=self.args.build_config
             if self._on_trt_backend else None,
@@ -694,9 +717,9 @@ class LLM:
 
         # TODO smor- need to refine what is the desired behavior if lora is enabled
         # in terms of the tokenizer initialization process
-        if hasattr(
-                self.args, "backend"
-        ) and self.args.backend == "pytorch" and self.args.lora_config is not None:
+        if hasattr(self.args, "backend") and self.args.backend in [
+                "pytorch", "_autodeploy"
+        ] and self.args.lora_config is not None:
             num_lora_dirs = len(self.args.lora_config.lora_dir)
             if num_lora_dirs == 1:
                 tokenizer_path = self.args.lora_config.lora_dir[0]

@@ -30,7 +30,7 @@ namespace kernels
 namespace trtllmGenFp8BlockScaleMoe
 {
 
-namespace tg = trtllm::gen;
+namespace btg = batchedGemm::trtllm::gen;
 
 namespace Routing
 {
@@ -51,24 +51,27 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "")
 
 Runner::Runner() {}
 
+Runner::Runner(int32_t tileTokensDim)
+    : mTileTokensDim(tileTokensDim)
+{
+}
+
 void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
     int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset, int32_t localNumExperts, float routedScalingFactor,
     int32_t* routingExpertIndexes, int32_t* expertCountHistogram, int32_t* permutedIdxSize,
     int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
     void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
-    int32_t* numNonExitingCtas, tg::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
+    int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
     RoutingMethodType routingMethodType, cudaStream_t stream)
 {
     // Some restriction to be lifted by https://github.com/NVIDIA/TensorRT-LLM/pull/4063
     TLLM_CHECK_WITH_INFO(topK == 1 || topK == 8, "top_k can only be 1 or 8.");
-    // FIXME: hardcoded for now
-    int32_t tileN = 8;
 
     if (routingMethodType == RoutingMethodType::DeepSeekV3)
     {
         moe::dev::routing::Data routingData;
         routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
-        routingData.mDtypeExpW = tg::Dtype::Bfloat16;
+        routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
 
         // output:
@@ -97,7 +100,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumExpertGroups = nGroup;
         routingData.mNumLimitedGroups = topkGroup;
         routingData.mTopK = topK;
-        routingData.mPaddingLog2 = computeLog2(tileN);
+        routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
         routingData.mLocalExpertsStartIdx = localExpertOffset;
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
@@ -109,7 +112,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     {
         moe::dev::routingLlama4::Data routingData;
         // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
-        routingData.mDtypeExpW = tg::Dtype::Bfloat16;
+        routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         routingData.mUsePdl = true;
 
         // output:
@@ -138,7 +141,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // routingData.mNumExpertGroups = n_group;
         // routingData.mNumLimitedGroups = topk_group;
         routingData.mTopK = topK;
-        routingData.mPaddingLog2 = computeLog2(tileN);
+        routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
         routingData.mLocalExpertsStartIdx = localExpertOffset;
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
@@ -147,7 +150,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         moe::dev::routingLlama4::run(routingData, stream);
     }
     else if (routingMethodType == RoutingMethodType::Renormalize /* default */
-        || routingMethodType == RoutingMethodType::Qwen3 /* Softmax -> TopK */)
+        || routingMethodType == RoutingMethodType::RenormalizeNaive /* Softmax -> TopK */)
     {
         moe::dev::routingQwen3::Data routingData;
 
@@ -155,11 +158,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // Config
         //
 
-        routingData.mDtypeExpW = tg::Dtype::Bfloat16;
+        routingData.mDtypeExpW = btg::Dtype::Bfloat16;
         // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
         routingData.mUsePdl = true;
-        routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::Qwen3;
-        routingData.mNormTopkProb = routingMethodType == RoutingMethodType::Renormalize;
+        routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
+        routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
+
         routingData.mPtrScores = routingLogits;
 
         //
@@ -185,7 +189,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumTokens = numTokens;
         routingData.mNumExperts = numExperts;
         routingData.mTopK = topK;
-        routingData.mPaddingLog2 = computeLog2(tileN);
+        routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
         routingData.mLocalExpertsStartIdx = localExpertOffset;
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
@@ -204,7 +208,7 @@ namespace PermuteGemm1
 {
 
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
-    trtllm::gen::Dtype dtypeElt, int32_t tileTokensDim, bool useDeepSeekFp8)
+    btg::Dtype dtypeElt, int32_t tileTokensDim, bool useDeepSeekFp8)
 {
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {.eltType = dtypeElt,
         .outputType = dtypeElt,
@@ -218,8 +222,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     return options;
 }
 
-Runner::Runner(trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8)
+Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim)
     : mDtypeElt(dtypeElt)
+    , mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(getOptions(mDtypeElt, mTileTokensDim, useDeepSeekFp8)))
 {
 }
@@ -249,7 +254,7 @@ size_t Runner::getWorkspaceSizeInBytes(
 namespace Gemm2
 {
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
-    trtllm::gen::Dtype dtypeElt, trtllm::gen::Dtype dtypeOut, int32_t tileTokensDim, bool useDeepSeekFp8)
+    btg::Dtype dtypeElt, btg::Dtype dtypeOut, int32_t tileTokensDim, bool useDeepSeekFp8)
 {
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {.eltType = dtypeElt,
         .outputType = dtypeOut,
@@ -263,9 +268,10 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     return options;
 }
 
-Runner::Runner(tg::Dtype dtypeElt, tg::Dtype outputDtype, bool useDeepSeekFp8)
+Runner::Runner(btg::Dtype dtypeElt, btg::Dtype outputDtype, bool useDeepSeekFp8, int tileTokensDim)
     : mDtypeElt(dtypeElt)
     , mOutputDtype(outputDtype)
+    , mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
           getOptions(mDtypeElt, mOutputDtype, mTileTokensDim, useDeepSeekFp8)))
 {
@@ -296,9 +302,9 @@ size_t Runner::getWorkspaceSizeInBytes(
 
 namespace MoE
 {
-Runner::Runner(trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8)
-    : mPermuteGemm1(PermuteGemm1::Runner(dtypeElt, useDeepSeekFp8))
-    , mGemm2(Gemm2::Runner(dtypeElt, tg::Dtype::Bfloat16, useDeepSeekFp8))
+Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim)
+    : mPermuteGemm1(PermuteGemm1::Runner(dtypeElt, useDeepSeekFp8, tileTokensDim))
+    , mGemm2(Gemm2::Runner(dtypeElt, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim))
 {
 }
 
@@ -311,8 +317,8 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     convertSfData.outSfPtr = workspace.hidden_states_scale_linear;
     convertSfData.hiddenDimSf = args.hidden_size / 16;
     convertSfData.numTokens = args.num_tokens;
-    convertSfData.sfLayoutSrc = tg::SfLayout::R128c4;
-    convertSfData.sfLayoutDst = tg::SfLayout::Linear;
+    convertSfData.sfLayoutSrc = btg::SfLayout::R128c4;
+    convertSfData.sfLayoutDst = btg::SfLayout::Linear;
     convertSfData.mUsePdl = true;
 
     // Setup activation data
@@ -370,7 +376,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     moe::dev::activation::Data activationData;
     moe::dev::finalize::Data finalizeData;
     moe::dev::convertsf::Data convertSfData;
-
+    sync_check_cuda_error(stream);
     setOpsData(args, workspace, convertSfData, activationData, finalizeData);
 
     void* hidden_states_scale_linear{args.hidden_states_scale};
@@ -386,7 +392,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     void* gemm2_input = workspace.gemm1_output;
     void* gemm2_input_scale = workspace.gemm1_output_scale;
     // We do activation only for DeepSeek FP8, as cubins do not have fused activation.
-    if (args.mDtypeElt == tg::Dtype::E4m3 && args.mUseDeepSeekFp8)
+    if (args.mDtypeElt == btg::Dtype::E4m3 && args.mUseDeepSeekFp8)
     {
         // Run activation
         moe::dev::activation::run(activationData, stream);
@@ -402,6 +408,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
     // Run finalize
     moe::dev::finalize::run(finalizeData, stream);
+    sync_check_cuda_error(stream);
 }
 } // namespace MoE
 
