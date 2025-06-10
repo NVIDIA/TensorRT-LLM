@@ -66,6 +66,40 @@ def test_renormalize_moe_routing(top_k):
     assert torch.allclose(scales, reference_scales)
 
 
+def gen_unique_logits(num_tokens, num_experts, dtype):
+    unique_logits = torch.rand((num_tokens, num_experts), dtype=dtype)
+
+    for i in range(unique_logits.size(0)):
+        torch.manual_seed(42 * i)
+        unique_row = torch.randperm(num_experts)
+        unique_logits[i] = unique_row.to(dtype)
+
+    return unique_logits.cuda()
+
+
+@pytest.mark.parametrize("num_tokens", [1, 30, 2000])
+@pytest.mark.parametrize("top_k", [2, 8])
+@pytest.mark.parametrize("dtype",
+                         [torch.bfloat16, torch.float32, torch.float16])
+@pytest.mark.parametrize("num_experts", [8, 67, 128])
+def test_customized_renormalize_moe_routing(num_tokens, top_k, num_experts,
+                                            dtype):
+
+    #Because the order of equal elements is unpredictable, we use unique data to prevent any ambiguity.
+    router_logits = gen_unique_logits(num_tokens, num_experts, dtype)
+
+    routing = RenormalizeMoeRoutingMethod(top_k=top_k,
+                                          force_enable_pytorch_op=False)
+    indices, scales = routing.apply(router_logits)
+
+    ref_routing = RenormalizeMoeRoutingMethod(top_k=top_k,
+                                              force_enable_pytorch_op=True)
+    reference_indices, reference_scales = ref_routing.apply(router_logits)
+
+    assert torch.equal(indices, reference_indices)
+    assert torch.allclose(scales, reference_scales)
+
+
 def test_sparse_mixer_reference():
     routing = SparseMixerMoeRoutingMethod(top_k=2, eps=0.2)
     assert routing.experts_per_token == 2

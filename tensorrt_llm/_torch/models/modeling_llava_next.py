@@ -4,8 +4,8 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import (AutoConfig, AutoModel, AutoProcessor, LlavaNextConfig,
-                          PretrainedConfig, PreTrainedModel)
+from transformers import (AutoConfig, AutoModel, AutoProcessor, AutoTokenizer,
+                          LlavaNextConfig, PretrainedConfig, PreTrainedModel)
 from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llava_next.modeling_llava_next import \
     LlavaNextMultiModalProjector
@@ -26,10 +26,22 @@ from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 class LlavaNextInputProcessor(InputProcessor):
 
-    def __init__(self, model_path, model_config, tokenizer):
+    def __init__(self,
+                 model_path,
+                 model_config,
+                 tokenizer,
+                 trust_remote_code: bool = True):
         self.tokenizer = tokenizer
-        self.processor = AutoProcessor.from_pretrained(model_path,
-                                                       use_fast=True)
+        self.use_fast = True
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                trust_remote_code=trust_remote_code,
+                use_fast=self.use_fast)
+        self.processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
         self.model_config = model_config
 
         self.device = 'cuda'
@@ -80,7 +92,7 @@ class LlavaNextInputProcessor(InputProcessor):
         return [
             self.processor(text="dummy",
                            images=image,
-                           do_rescale=not isinstance(image, torch.Tensor),
+                           do_rescale=not isinstance(images[0], torch.Tensor),
                            return_tensors="pt",
                            device=self.device)['pixel_values'][0].to(
                                self.device) for image in images

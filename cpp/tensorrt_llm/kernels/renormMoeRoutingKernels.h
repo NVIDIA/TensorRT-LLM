@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,16 +14,16 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/iBuffer.h"
+#pragma once
 
-using namespace tensorrt_llm::runtime;
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
-namespace tensorrt_llm
+#include "tensorrt_llm/common/cudaUtils.h"
+
+namespace tensorrt_llm::kernels
 {
-namespace kernels
-{
-void kvCacheBlockPartialCopy(IBuffer& dst, IBuffer const& src, unsigned int numLayers, unsigned int numHeads,
-    unsigned int tokensPerBlock, unsigned int numHidden, unsigned int numTokensToCopy, int kvFactor,
-    cudaStream_t stream);
-} // namespace kernels
-} // namespace tensorrt_llm
+template <typename InputT, typename OutputT, typename IdxT>
+void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
+    int64_t const numExperts, int64_t const topK, cudaStream_t const stream);
+} // namespace tensorrt_llm::kernels

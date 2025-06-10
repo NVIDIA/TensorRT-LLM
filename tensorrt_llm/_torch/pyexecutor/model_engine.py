@@ -584,15 +584,16 @@ class PyTorchModelEngine(ModelEngine):
 
             available_blocks = kv_cache_manager.get_num_free_blocks()
 
+            maximum_tunable_num_tokens = min(
+                self.batch_size * num_tokens_per_request, self.max_num_tokens,
+                available_blocks * kv_cache_manager.tokens_per_block)
+
             # Calculate number of full-length requests and remaining tokens
             # Each request has num_tokens_per_request tokens, except possibly the last one
-            full_len_request_num = self.max_num_tokens // num_tokens_per_request
-            remaining_tokens = self.max_num_tokens % num_tokens_per_request
+            full_len_request_num = maximum_tunable_num_tokens // num_tokens_per_request
+            remaining_tokens = maximum_tunable_num_tokens % num_tokens_per_request
 
             request_num = full_len_request_num if remaining_tokens == 0 else full_len_request_num + 1
-
-            if self.max_num_tokens > available_blocks * kv_cache_manager.tokens_per_block:
-                return None, None
 
             requests = kv_cache_manager.add_dummy_requests(
                 request_ids=list(range(full_len_request_num)),
@@ -617,7 +618,7 @@ class PyTorchModelEngine(ModelEngine):
             result.context_requests = requests
             result.generation_requests = []
 
-            return result, _create_extra_inputs(1, self.max_num_tokens)
+            return result, _create_extra_inputs(1, maximum_tunable_num_tokens)
 
         @contextlib.contextmanager
         def release_batch(result):
@@ -1163,12 +1164,17 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq.append(past_seen_token_num)
             multimodal_embedding = request.multimodal_embedding
             if multimodal_embedding is not None:
-                multi_modal_data.append(multimodal_embedding)
+                multimodal_embedding = multimodal_embedding.pin_memory(
+                ) if multimodal_embedding.device == 'cpu' else multimodal_embedding
+                multi_modal_data.append(
+                    multimodal_embedding.to('cuda', non_blocking=True))
 
             mrope_rotary_cos_sin = request.mrope_rotary_cos_sin
             if mrope_rotary_cos_sin is not None:
+                mrope_rotary_cos_sin = mrope_rotary_cos_sin.pin_memory(
+                ) if mrope_rotary_cos_sin.device == 'cpu' else mrope_rotary_cos_sin
                 mrope_config['mrope_rotary_cos_sin'].append(
-                    mrope_rotary_cos_sin)
+                    mrope_rotary_cos_sin.to('cuda', non_blocking=True))
             request.py_batch_idx = batch_idx
             batch_idx += 1
 
@@ -1200,10 +1206,11 @@ class PyTorchModelEngine(ModelEngine):
 
             mrope_position_deltas = request.mrope_position_deltas
             if mrope_position_deltas is not None:
+                mrope_position_deltas = torch.tensor([mrope_position_deltas],
+                                                     dtype=torch.int32,
+                                                     pin_memory=True)
                 mrope_config['mrope_position_deltas'].append(
-                    torch.tensor([mrope_position_deltas],
-                                 dtype=torch.int32).to('cuda',
-                                                       non_blocking=True))
+                    mrope_position_deltas.to('cuda', non_blocking=True))
         extend_requests += extend_dummy_requests
 
         if not self._disable_overlap_scheduler and self.is_spec_decode:
