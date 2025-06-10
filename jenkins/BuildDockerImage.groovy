@@ -632,7 +632,7 @@ pipeline {
                         'enableFailFast': false,
                         'branch': LLM_BRANCH,
                         'globalVars': globalVarsJson,
-                        'targetArch': "aarch64-linux-gnu",
+                        'targetArch': "x86_64-linux-gnu",
                         'dockerImage': globalVars[IMAGE_KEY_TO_TAG]['NGC Devel Image amd64'],
                     ]
 
@@ -660,3 +660,45 @@ pipeline {
         }
     } // stages
 } // pipeline
+
+
+// {
+//     dockerImage=urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/devel:x86_64-ngc-devel-torch_skip-a1db409-github-pr-4939-169,
+//     uploadPath=sw-tensorrt-generic/llm-artifacts/LLM/PipelineMonitor/L0_MergeRequest_PR/109,
+//     gitlabCommit=8166649d033109319d7d08cf9541d8996848018f,
+//     artifactPath=sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/2052,
+//     gitlabSourceRepoHttpUrl=https://gitlab-master.nvidia.com/ftp/GitHubSync/TensorRT-LLM.git,
+//     branch=github-pr-4656,
+//     enableFailFast=false,
+//     globalVars={
+//         "github_pr_api_url":"https://api.github.com/repos/NVIDIA/TensorRT-LLM/pulls/4656",
+//         "cached_changed_file_list":null,
+//         "action_info":{
+//             "trigger_info":"Triggered by <a href=\"https://github.com/NVIDIA/TensorRT-LLM/pull/4656#issuecomment-2957879424\" target=\"_blank\">GitHub Pull Request #4656<\/a>, Comment User: <a href=\"https://github.com/ZhanruiSunCh\" target=\"_blank\">ZhanruiSunCh<\/a><br/>Git Commit: c232874b151882b47a5017cc5344685cb2c668e6<br/><br/>",
+//             "parents":[
+//                 {
+//                     "name":"LLM/helpers/PR_Github",
+//                     "url":"https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/helpers/job/PR_Github/8225/",
+//                     "build_number":"8225"
+//                 },
+//                 {
+//                     "name":"LLM/PipelineMonitor/L0_MergeRequest_PR",
+//                     "url":"https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/PipelineMonitor/job/L0_MergeRequest_PR/109/",
+//                     "build_number":"109"
+//                 },
+//                 {
+//                     "name":"LLM/helpers/BuildDockerImages",
+//                     "url":"https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/helpers/job/BuildDockerImages/198/",
+//                     "build_number":"198"
+//                 }
+//             ]
+//         },
+//         "image_key_to_tag":{
+//             "NGC Devel Image amd64":"urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/devel:x86_64-ngc-devel-torch_skip-a1db409-github-pr-4939-169",
+//             "NGC Release Image amd64":"urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:x86_64-ngc-release-torch_skip-a1db409-github-pr-4939-169",
+//             "NGC Devel Image arm64":"urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/devel:sbsa-ngc-devel-torch_skip-a1db409-github-pr-4939-169",
+//             "NGC Release Image arm64":"urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:sbsa-ngc-release-torch_skip-a1db409-github-pr-4939-169"
+//         }
+//     },
+//     targetArch=aarch64-linux-gnu
+// }
