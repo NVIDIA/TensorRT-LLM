@@ -166,10 +166,12 @@ class VariableLengthLowLatencyBuffer:
 
 
 class BufferPool:
-    """ A pool to allocate buffers on demand.
+    """ A pool that allocates buffers on demand.
 
-        TODO: In the current version of DeepEP, only one Buffer object may
-        exist globally at any time; otherwise, the behavior is undefined.
+        Although the pool interface allows creating multiple buffers, the
+        current version of DeepEP supports at most one `deep_ep.Buffer` at a
+        time. Please ensure that all references to `VariableLengthBuffer` are
+        released before getting another buffer.
     """
 
     def __init__(self):
