@@ -36,28 +36,8 @@ class ScheduledRequests:
     def batch_size(self) -> int:
         return len(self.context_requests) + len(self.generation_requests)
 
-    def sorted_generation_requests(self) -> RequestList:
-        extend_requests = []
-        generation_requests = []
-        for request in self.generation_requests:
-            if len(request.py_draft_tokens) > 0:
-                extend_requests.append(request)
-            else:
-                generation_requests.append(request)
-        return list(chain(extend_requests, generation_requests))
-
     def all_requests(self) -> list[LlmRequest]:
-        """Return all scheduled requests in the original execution order.
-
-        The decoding pipeline expects that, within the generation requests, those
-        that currently hold draft tokens ("extend requests") come **before** the
-        pure generation-only requests.  The helper :py:meth:`sorted_generation_requests`
-        already provides that ordering, so we can simply reuse it here to
-        preserve the original behaviour while still exposing the more specific
-        accessor.
-        """
-        return list(
-            chain(self.context_requests, self.sorted_generation_requests()))
+        return list(chain(self.context_requests, self.generation_requests))
 
 
 class RequestScheduler(ABC):

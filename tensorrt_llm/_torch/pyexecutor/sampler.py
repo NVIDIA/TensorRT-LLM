@@ -314,7 +314,7 @@ class TorchSampler(Sampler):
             if req_callback:
                 req_callback(req)
 
-        for req in state.scheduled_requests.sorted_generation_requests():
+        for req in state.scheduled_requests.generation_requests:
             if req.state != LlmRequestState.GENERATION_COMPLETE:
                 new_token = get_new_token(req, new_tokens, 0, self.BEAM)
                 self._handle_stop_criteria(req, new_token, beam=self.BEAM)
