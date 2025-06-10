@@ -28,11 +28,9 @@ def get_model_yaml_config(model_label: str) -> dict:
         """
     base_config = {
         'enable_attention_dp': True,
-        'pytorch_backend_config': {
-            'print_iter_log': True,
-            'use_cuda_graph': True,
-            'cuda_graph_padding_enabled': True,
-        }
+        'print_iter_log': True,
+        'use_cuda_graph': True,
+        'cuda_graph_padding_enabled': True,
     }
 
     # Pattern-based configurations for models matching specific substrings
