@@ -18,7 +18,9 @@
 #include "request.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -817,6 +819,26 @@ void initRequestBindings(pybind11::module_& m)
                 }
             })
         .def(py::pickle(responseGetstate, responseSetstate));
+
+    m.def(
+        "serialize_responses",
+        [](std::vector<tle::Response> const& responses)
+        {
+            py::gil_scoped_release release;
+            NVTX3_SCOPED_RANGE(serialize_responses);
+            return tle::Serialization::serialize(responses);
+        },
+        py::arg("serialize_responses"), "Serializes a list of Response objects.");
+
+    m.def(
+        "deserialize_responses",
+        [](std::vector<char>& data)
+        {
+            py::gil_scoped_release release;
+            NVTX3_SCOPED_RANGE(deserialize_responses);
+            return tle::Serialization::deserializeResponses(data);
+        },
+        py::arg("deserialize_responses"), "Deserializes a list into Response objects.");
 }
 
 } // namespace tensorrt_llm::pybind::executor

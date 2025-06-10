@@ -19,7 +19,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             print_colored, print_colored_debug)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import PostprocWorkerConfig
+from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
@@ -150,6 +150,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.request_queue.put(CancellingRequest(request_id))
 
     def dispatch_result_task(self) -> bool:
+        from tensorrt_llm._torch.pyexecutor.llm_request import \
+            restore_llm_responses_from_serialize_friendly_list
+
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
         if (res := self.result_queue.get()) is None:
@@ -176,7 +179,8 @@ class GenerationExecutorProxy(GenerationExecutor):
                     res, ErrorResponse):
                 self._results.pop(client_id)
 
-        res = res if isinstance(res, list) else [res]
+        if not isinstance(res[0], PostprocWorker.Output):
+            res = restore_llm_responses_from_serialize_friendly_list(res[0])
 
         for i in res:
             global_tracer().log_instant("IPC.get")
