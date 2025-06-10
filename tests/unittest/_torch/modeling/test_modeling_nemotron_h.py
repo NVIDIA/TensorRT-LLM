@@ -104,7 +104,7 @@ def _generate(
         # one token already generated at prefill
         for i in range(tokens_to_generate - 1):
             num_cached_tokens_per_seq = [
-                prompt_len + i + 1 for prompt_len in prompt_lens
+                prompt_len + i for prompt_len in prompt_lens
             ]
             position_ids = torch.tensor([num_cached_tokens_per_seq],
                                         dtype=torch.int64,
@@ -316,26 +316,26 @@ def test_nemotron_h_correctness():
 
     decode_logprobs_ref_initial_no_batching = [
         torch.tensor([
-            -2.2722280025482178, -0.5235245823860168, -0.8821321725845337,
-            -1.9436249732971191, -0.07366813719272614, -0.4224405586719513,
-            -0.3872227966785431, -0.06121065467596054, -1.0475994348526
+            -2.2722280025482178, -0.5124826431274414, -0.7916123270988464,
+            -2.1908130645751953, -0.059298671782016754, -0.5125972032546997,
+            -0.3856367766857147, -0.055953752249479294, -1.1059765815734863
         ]),
         torch.tensor([
-            -1.329713225364685, -1.6879069805145264, -0.040034178644418716,
-            -0.4808207154273987, -0.3581068515777588, -0.2784178853034973,
-            -0.005814795847982168, -0.0563097707927227, -0.05941024422645569
+            -1.329713225364685, -1.5038213729858398, -0.021283088251948357,
+            -0.38457369804382324, -0.3582419157028198, -0.16527847945690155,
+            -0.0044861179776489735, -0.059462934732437134, -0.041099339723587036
         ])
     ]
     decode_logprobs_ref_initial_with_batching = [
         torch.tensor([
-            -2.2877156734466553, -0.507795512676239, -0.8313305377960205,
-            -1.940523386001587, -0.07369701564311981, -0.4190545976161957,
-            -0.4250463843345642, -0.061063338071107864, -1.046282410621643
+            -2.2877156734466553, -0.46699056029319763, -0.7909849286079407,
+            -2.1276988983154297, -0.062114741653203964, -0.5291495323181152,
+            -0.38685765862464905, -0.05595658719539642, -1.1020748615264893
         ]),
         torch.tensor([
-            -1.3567769527435303, -1.7291667461395264, -0.04527968540787697,
-            -0.4836069345474243, -0.3971801698207855, -0.2481495887041092,
-            -0.005787517875432968, -0.056093256920576096, -0.058267030864953995
+            -1.3567769527435303, -1.5647790431976318, -0.022344056516885757,
+            -0.38503751158714294, -0.3581986725330353, -0.18398350477218628,
+            -0.004726295825093985, -0.05941498652100563, -0.04291720315814018
         ])
     ]
 
@@ -381,7 +381,6 @@ def test_nemotron_h_correctness():
                                    decode_logprobs_ref_initial_no_batching[i],
                                    atol=initial_impl_atol,
                                    rtol=0.0)
-        print(f"{decode_logprobs_no_batching=}")
         print(
             f"max decode without batching diff: {torch.max(torch.abs(decode_logprobs_no_batching - decode_logprobs_ref_initial_no_batching[i]))}"
         )
@@ -560,7 +559,6 @@ def test_nemotron_h_correctness_2():
             extract_decode_logprobs(result).cpu()
             for result in results_no_batching
         ]
-        print(f"{decode_logprobs_no_batching[0]=}")
 
         results_batching = nemotron_h.generate(text_prompts, sampling_params)
         completions_batching = [
