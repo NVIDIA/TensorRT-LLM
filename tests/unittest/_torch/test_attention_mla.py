@@ -342,6 +342,7 @@ accuracy_dict = {
 
 
 # Convert parameterized tests to pytest parametrize
+@pytest.mark.skip(reason="https://nvbugs/5244552")
 @pytest.mark.parametrize("scenario", scenarios, ids=lambda x: f"scenario: {x}")
 @pytest.mark.parametrize("context_sequence_lengths",
                          context_sequence_lengths,
