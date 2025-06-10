@@ -38,6 +38,8 @@
 #define USE_SMALL_IO 1
 #endif
 
+void warmup(cudaDeviceProp const& prop, float ms, cudaStream_t stream = nullptr);
+
 bool const isTracing = []()
 {
     auto const v = std::getenv("XQA_IS_TRACING");
@@ -118,23 +120,40 @@ inline void hash_combine(std::size_t& seed, T const& v)
     seed ^= hasher(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
 }
 
+#if IS_MLA
+template <uint32_t nbKHeads, uint32_t runtimeHeadGrpSize = headGrpSize, uint32_t qSeqLen = 1>
+#else
 #if SPEC_DEC
 template <uint32_t nbKHeads, uint32_t runtimeHeadGrpSize, uint32_t qSeqLen>
 #else
 template <uint32_t nbKHeads>
 #endif
+#endif
 void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, bool verbose = false,
     bool saveData = false, uint32_t ctxLen = ~0U, uint32_t slidingWinSize = std::numeric_limits<uint32_t>::max())
 {
+#if IS_MLA
+    if (nbKHeads != 1)
+    {
+        GTEST_SKIP() << "MLA only supports 1 K head";
+    }
+#endif
     constexpr uint32_t nbVHeads = nbKHeads;
 #if SPEC_DEC
     assert(qSeqLen <= seqLen);
     constexpr uint32_t nbQHeads = nbKHeads * runtimeHeadGrpSize;
+#if IS_MLA
+    constexpr uint32_t nbBlocksPerGrp = qSeqLen;
+#else
     constexpr uint32_t nbBlocksPerGrpMMA = divUp(qSeqLen * runtimeHeadGrpSize, rowsPerBlock);
     constexpr uint32_t nbBlocksPerGrpGMMA = divUp(qSeqLen, rowsPerBlock / runtimeHeadGrpSize);
     constexpr uint32_t nbBlocksPerGrp = std::max(nbBlocksPerGrpMMA, nbBlocksPerGrpGMMA);
+#endif // IS_MLA
 #else
     constexpr uint32_t nbQHeads = nbKHeads * headGrpSize;
+#if !(IS_MLA)
+    constexpr uint32_t qSeqLen = 1;
+#endif
 #endif
 
 #if !(SLIDING_WINDOW)
@@ -199,21 +218,21 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     size_t const maxSeqLen = seqLen;
 #endif
     uint32_t const totalNbCacheHeads = (nbKHeads + nbVHeads) * maxSeqLen * beamWidth * batchSize;
-    size_t const totalNbCacheElems = validElemsPerHead * size_t(totalNbCacheHeads);
+    size_t const totalNbCacheElems = validElemsPerKHead * size_t(totalNbCacheHeads);
 
 #if USE_INPUT_KV
-    size_t const qkvElems = validElemsPerHead * (nbQHeads + nbKHeads * 2) * beamWidth * batchSize;
+    size_t const qkvElems = validElemsPerKHead * (nbQHeads + nbKHeads * 2) * beamWidth * batchSize;
 #endif
 
 #if SPEC_DEC
-    size_t const qElems = validElemsPerHead * qSeqLen * nbQHeads * beamWidth * batchSize;
-    size_t const outElems = validElemsPerHead * qSeqLen * nbQHeads * beamWidth * batchSize;
+    size_t const qElems = validElemsPerKHead * qSeqLen * nbQHeads * beamWidth * batchSize;
+    size_t const outElems = validElemsPerVHead * qSeqLen * nbQHeads * beamWidth * batchSize;
 #else
-    size_t const qElems = validElemsPerHead * nbQHeads * beamWidth * batchSize;
-    size_t const outElems = validElemsPerHead * nbQHeads * beamWidth * batchSize;
+    size_t const qElems = validElemsPerKHead * nbQHeads * beamWidth * batchSize;
+    size_t const outElems = validElemsPerVHead * nbQHeads * beamWidth * batchSize;
 #endif
     size_t const inputElems
-        = (useInputKV ? validElemsPerHead * (nbQHeads + nbKHeads * 2) * beamWidth * batchSize : qElems);
+        = (useInputKV ? validElemsPerKHead * (nbQHeads + nbKHeads * 2) * beamWidth * batchSize : qElems);
     size_t const cacheBytes = cacheElemSize * totalNbCacheElems;
     size_t const inputBytes = inputElemSize * inputElems;
     size_t const outputBytes = outputElemSize * outElems;
@@ -247,12 +266,12 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     std::unique_ptr<CUevent_st, cudaError (*)(cudaEvent_t)> const ticEv{tic, &cudaEventDestroy};
     std::unique_ptr<CUevent_st, cudaError (*)(cudaEvent_t)> const tocEv{toc, &cudaEventDestroy};
 
-    auto const ropeCosSin = ManagedMemBuf<Vec<float, validElemsPerHead>>(seqLen);
+    auto const ropeCosSin = ManagedMemBuf<Vec<float, validElemsPerKHead>>(seqLen);
 #if USE_INPUT_KV && defined(ROPE_STYLE) && ROPE_STYLE
     for (uint32_t m = 0; m < seqLen; m++)
     {
         auto& pairs = ropeCosSin[m];
-        constexpr uint32_t nbPairs = exactDiv(validElemsPerHead, 2);
+        constexpr uint32_t nbPairs = exactDiv(validElemsPerKHead, 2);
         for (uint32_t i = 0; i < nbPairs; i++)
         {
             float const theta = m * std::pow(1E4F, (-1.F / nbPairs) * i);
@@ -263,13 +282,13 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #endif
     auto const cacheHeads = ManagedMemBuf<GMemCacheHead>(totalNbCacheHeads);
 #if USE_INPUT_KV
-    auto const qkvHeads = ManagedMemBuf<IOHead[beamWidth][nbQHeads + nbKHeads * 2]>(batchSize);
+    auto const qkvHeads = ManagedMemBuf<InputHead[beamWidth][nbQHeads + nbKHeads * 2]>(batchSize);
 #endif
 #if SPEC_DEC
-    auto const qHeads = ManagedMemBuf<IOHead[beamWidth][qSeqLen][nbQHeads]>(batchSize);
+    auto const qHeads = ManagedMemBuf<InputHead[beamWidth][qSeqLen][nbQHeads]>(batchSize);
     auto const output = ManagedMemBuf<OutputHead[beamWidth][qSeqLen][nbQHeads]>(batchSize);
 #else
-    auto const qHeads = ManagedMemBuf<IOHead[beamWidth][nbQHeads]>(batchSize);
+    auto const qHeads = ManagedMemBuf<InputHead[beamWidth][nbQHeads]>(batchSize);
     auto const output = ManagedMemBuf<OutputHead[beamWidth][nbQHeads]>(batchSize);
 #endif
     auto const rcpOutScale = ManagedMemBuf<float>(1);
@@ -342,7 +361,11 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         // Init random host uint32_t masks for reference codes.
         for (uint32_t kvPosIdx = 0; kvPosIdx < qSeqLen; kvPosIdx++)
         {
+#if IS_MLA
+            hostMask[tokenIdx * qSeqLen + kvPosIdx] = (tokenIdx >= kvPosIdx);
+#else
             hostMask[tokenIdx * qSeqLen + kvPosIdx] = maskDist(rng);
+#endif
         }
 
         // Pack boolean masks into bits.
@@ -391,13 +414,18 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
                 return;
             }
             size_t const nbCacheElemsForThisThrd
-                = validElemsPerHead * std::min<size_t>(headsPerThrd, totalNbCacheHeads - headsPerThrd * i);
+                = validElemsPerKHead * std::min<size_t>(headsPerThrd, totalNbCacheHeads - headsPerThrd * i);
             std::generate_n(cacheHeads[headsPerThrd * i].data, nbCacheElemsForThisThrd, genCacheElem);
         };
         for (uint32_t i = 0; i < nbThrds; i++)
         {
             futures.emplace_back(std::async(std::launch::async, threadTask, i));
         }
+        for (auto& f : futures)
+        {
+            f.wait();
+        }
+        futures.clear();
         std::normal_distribution<float> dist{0.f, 1.f};
 
 #if USE_INPUT_KV
@@ -426,12 +454,24 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #endif
 #endif
 #if USE_PAGED_KV_CACHE
-        // std::shuffle(&pageList[0][0][0][0], &pageList[0][0][0][0] + totalNbPages, rng);
+        std::shuffle(&pageList[0][0][0][0], &pageList[0][0][0][0] + totalNbPages, rng);
 #endif
-        for (auto& f : futures)
+#if IS_MLA
+#if USE_PAGED_KV_CACHE
+        for (uint32_t idxReq = 0; idxReq < batchSize; idxReq++)
         {
-            f.wait();
+            for (uint32_t idxBeam = 0; idxBeam < beamWidth; idxBeam++)
+            {
+                for (uint32_t idxPage = 0; idxPage < nbPagesPerSeq; idxPage++)
+                {
+                    pageList[idxReq][idxBeam][1][idxPage] = pageList[idxReq][idxBeam][0][idxPage];
+                }
+            }
         }
+#else
+        static_assert(false, "not implemented");
+#endif
+#endif
     }
     else
     {
@@ -552,6 +592,22 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         (useQGMMA ? ioHeadBytes : paddedInputHeadBytes) * headGrpSize
             * beamWidth)); // 8 is sufficient for qgmma kernel.
 #endif
+#if IS_MLA
+    auto runKernel = [&]()
+    {
+        launchMLA(prop, qSeqLen, qScale,
+#if SPEC_DEC
+            &output[0][0][0][0], &qHeads[0][0][0][0],
+#else
+            &output[0][0][0], &qHeads[0][0][0],
+#endif
+            cacheHeads.get(),
+#if USE_PAGED_KV_CACHE
+            pageListArg,
+#endif
+            maxSeqLen, &seqLenList[0][0], batchSize, kvCacheScale.get(), semaphores.get(), scratch, stream);
+    };
+#else
     auto runKernel = [&]()
     {
         auto const launchFunc = useQGMMA ? &launchHopperF8MHA : &launchMHA;
@@ -601,6 +657,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             semaphores.get(), scratch, stream);
         checkCuda(cudaGetLastError());
     };
+#endif
     if (testPerf && !isTracing)
     {
         if (verbose)
@@ -608,6 +665,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             printf("warming up\n");
         }
 
+        warmup(prop, 20.F, stream);
         for (int32_t i = 0; i < 20; i++)
         {
             runKernel();
@@ -654,8 +712,8 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         size_t const totalNbCacheLoadBytes = gmemCacheHeadBytes * (nbKHeads + nbVHeads) * nbLoadedCacheTokens;
         float const totalTraffic
             = totalNbCacheLoadBytes + inputBytes + outputBytes; // we ignore page indices and beam search indices.
-        float const solTime = totalTraffic / bandwidth * 1E3f;
-        float const solRatio = solTime / ms;
+        float const dramSolTime = totalTraffic / bandwidth * 1E3f;
+        float const dramSolRatio = dramSolTime / ms;
         if (verbose)
         {
             printf("done\n");
@@ -664,18 +722,21 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             printf("bandwidth = %e\n", (float) bandwidth);
             printf("traffic=%e\n", (float) totalTraffic);
         }
-        printf("solRatio: %f%% (%f ms)\n", solRatio * 100, ms);
+        float const tops = headGrpSize * qSeqLen * float(seqLen) * (validElemsPerKHead + validElemsPerVHead) * 2
+            * nbKHeads * batchSize / (ms * 1E-3F) * 1E-12F;
+        printf("dramSolRatio: %f%% (%f ms, TOPS = %f)\n", dramSolRatio * 100, ms, tops);
     }
     if (refCheck)
     {
+        float const qScaleForRef = isMLA ? qScale * sqrtf(576.F) : qScale;
         if (saveData)
         {
-            save<float>("kv.bin", &cacheHeads[0][0], validElemsPerHead * cacheHeads.size());
+            save<float>("kv.bin", &cacheHeads[0][0], validElemsPerKHead * cacheHeads.size());
 #if SPEC_DEC
             save<float>(
-                "q.bin", &qHeads[0][0][0][0][0], validElemsPerHead * nbQHeads * qSeqLen * beamWidth * batchSize);
+                "q.bin", &qHeads[0][0][0][0][0], validElemsPerKHead * nbQHeads * qSeqLen * beamWidth * batchSize);
 #else
-            save<float>("q.bin", &qHeads[0][0][0][0], validElemsPerHead * nbQHeads * beamWidth * batchSize);
+            save<float>("q.bin", &qHeads[0][0][0][0], validElemsPerKHead * nbQHeads * beamWidth * batchSize);
 #endif
         }
 
@@ -694,7 +755,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         float maxAbsErr = 0.F;
         float maxRelErr = 0.F;
         uint32_t nbErrors = 0;
-        float const allowedErr = ((useQGMMA || lowPrecOutput) ? 0.15f : 0.005f);
+        float const allowedErr = ((useQGMMA || lowPrecOutput || isMLA) ? 0.15f : 0.05f);
         float const allowedRelErr = allowedErr;
         auto checkClose = [&](auto type, float val, float ref, float epsilon) mutable
         {
@@ -743,10 +804,10 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #else
                     auto const rh = kvh;
 #endif
-                    Vec<CacheElem, validElemsPerHead> ref;
+                    Vec<CacheElem, validElemsPerKHead> ref;
                     std::transform(
                         rh.data, rh.data + rh.size, ref.data, [&](auto x) { return CacheElem{float(x) / kScale}; });
-                    for (int e = 0; e < validElemsPerHead; e++)
+                    for (int e = 0; e < validElemsPerKHead; e++)
                     {
                         checkClose(CacheElem{}, float(ch[e]), float(ref[e]), allowedErr / kScale);
                     }
@@ -756,10 +817,10 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #endif
 
 #if SPEC_DEC
-        std::vector<std::array<std::array<Vec<float, validElemsPerHead>, nbQHeads * qSeqLen>, beamWidth>> outputF32(
+        std::vector<std::array<std::array<Vec<float, validElemsPerVHead>, nbQHeads * qSeqLen>, beamWidth>> outputF32(
             batchSize);
 #else
-        std::vector<std::array<std::array<Vec<float, validElemsPerHead>, nbQHeads>, beamWidth>> outputF32(batchSize);
+        std::vector<std::array<std::array<Vec<float, validElemsPerVHead>, nbQHeads>, beamWidth>> outputF32(batchSize);
 #endif
 #pragma omp for
         for (uint32_t req = 0; req < batchSize; req++)
@@ -771,7 +832,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
                 {
                     for (uint32_t q = 0; q < nbQHeads; q++)
                     {
-                        for (uint32_t i = 0; i < validElemsPerHead; i++)
+                        for (uint32_t i = 0; i < validElemsPerVHead; i++)
                         {
                             outputF32[req][b][q_len * nbQHeads + q][i] = float(output[req][b][q_len][q][i]);
                         }
@@ -780,7 +841,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #else
                 for (uint32_t q = 0; q < nbQHeads; q++)
                 {
-                    for (uint32_t i = 0; i < validElemsPerHead; i++)
+                    for (uint32_t i = 0; i < validElemsPerVHead; i++)
                     {
                         outputF32[req][b][q][i] = float(output[req][b][q][i]);
                     }
@@ -793,9 +854,9 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         {
 #if SPEC_DEC
             save<float>(
-                "out.bin", &outputF32[0][0][0][0], validElemsPerHead * nbQHeads * qSeqLen * beamWidth * batchSize);
+                "out.bin", &outputF32[0][0][0][0], validElemsPerVHead * nbQHeads * qSeqLen * beamWidth * batchSize);
 #else
-            save<float>("out.bin", &outputF32[0][0][0][0], validElemsPerHead * nbQHeads * beamWidth * batchSize);
+            save<float>("out.bin", &outputF32[0][0][0][0], validElemsPerVHead * nbQHeads * beamWidth * batchSize);
 #endif
             fout_refOutput = std::ofstream("ref_cpp.bin", std::ios::binary | std::ios::trunc);
         }
@@ -859,22 +920,23 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #if SPEC_DEC
                         Eigen::Matrix<float, runtimeHeadGrpSize, validElemsPerHead, Eigen::RowMajor> refOutput;
                         refOutput = refAttention<InputElem>(&qHeads[req][b][q_len][runtimeHeadGrpSize * idxKHead],
-                            kCacheSeq, vCacheSeq, seqLen, qScale, kvCacheScale[0], xScale, hostMask, qSeqLen, q_len);
+                            kCacheSeq, vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize,
+                            hostMask, qSeqLen, q_len);
 #else
                     Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refOutput;
                     if (useQGMMA)
                     {
                         refOutput = refFlashAttention<CacheElem, 64>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
-                            vCacheSeq, seqLen, qScale, kvCacheScale[0], xScale, slidingWinSize);
+                            vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize);
                         // refOutput = refAttention<CacheElem>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
-                        // vCacheSeq, seqLen, qScale, kvCacheScale[0], xScale, slidingWinSize);
+                        // vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize);
                     }
                     else
                     {
                         // refOutput = refFlashAttention<InputElem, 64>(&qHeads[req][b][headGrpSize * idxKHead],
-                        // kCacheSeq, vCacheSeq, seqLen, qScale, kvCacheScale[0], xScale);
+                        // kCacheSeq, vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale);
                         refOutput = refAttention<InputElem>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
-                            vCacheSeq, seqLen, qScale, kvCacheScale[0], xScale, slidingWinSize);
+                            vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize);
                     }
 #endif
                         if (lowPrecOutput)
@@ -893,7 +955,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
                     for (uint32_t i = 0; i < headGrpSize; i++)
 #endif
                         {
-                            for (uint32_t j = 0; j < validElemsPerHead; j++)
+                            for (uint32_t j = 0; j < validElemsPerVHead; j++)
                             {
 #if SPEC_DEC
                                 float const val
@@ -934,6 +996,16 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 constexpr bool runPerfTest = false;
 constexpr bool runCheckTest = true;
 
+#if IS_MLA
+TEST(RefCheck, mla)
+{
+    // runTest<1, headGrpSize, 2>(1, 2, runPerfTest, runCheckTest, true, true);
+    runTest<1, headGrpSize, 1>(32, 200, runPerfTest, runCheckTest, true, true);
+    runTest<1, headGrpSize, 2>(32, 200, runPerfTest, runCheckTest, true, true);
+    runTest<1, headGrpSize, 2>(2, 1000, runPerfTest, runCheckTest, true, true);
+    runTest<1, headGrpSize, 13>(2, 257, runPerfTest, runCheckTest, true, true);
+}
+#else
 #define HEAD_GROUP_SIZE HEAD_GRP_SIZE
 #define Q_SEQ_LEN 62
 
@@ -956,6 +1028,39 @@ TEST(RefCheck, llama_V2_70b_3)
     runTest<8, HEAD_GROUP_SIZE, Q_SEQ_LEN>(8, 2048, runPerfTest, runCheckTest);
     runTest<8, HEAD_GROUP_SIZE, Q_SEQ_LEN>(8, 4096, runPerfTest, runCheckTest);
 }
+#endif
+
+#else
+
+#if IS_MLA
+TEST(RefCheck, mla)
+{
+    // runTest<1>(1, 2, false, true, true, true);
+    runTest<1>(1, 2048, false, true, true, true);
+    runTest<1>(2, 2, false, true);
+    runTest<1>(2, 15, false, true);
+    runTest<1>(2, 256, false, true);
+    runTest<1>(2, 514, false, true);
+    runTest<1>(1, 4096, false, true);
+    runTest<1>(120, 367, false, true);
+    runTest<1>(112, 2158, false, true);
+}
+
+TEST(Perf, mla)
+{
+#ifndef NDEBUG
+    GTEST_SKIP() << "Skipping perf tests for debug build";
+#endif
+    runTest<1>(38, 4096, true, false);
+}
+
+TEST(Perf, mla_real)
+{
+#ifndef NDEBUG
+    GTEST_SKIP() << "Skipping perf tests for debug build";
+#endif
+    runTest<1>(64, 4096, true, false);
+}
 
 #else
 TEST(RefCheck, llama_V2_70b)
@@ -973,147 +1078,6 @@ TEST(RefCheck, llama_V2_70b)
     runTest<8>(120, 367, false, true);
     // runTest<8>(1792, 2048, false, true);
 }
-
-#if ENABLE_NVRTC
-#define NVRTC_RUN(x) ASSERT_EQ(NVRTC_SUCCESS, (x))
-#define CU_RUN(x) ASSERT_EQ(CUDA_SUCCESS, (x))
-
-TEST(NVRTC, compile)
-{
-    checkCuda(cudaFree(nullptr));
-    int device;
-    checkCuda(cudaGetDevice(&device));
-    cudaDeviceProp prop;
-    checkCuda(cudaGetDeviceProperties(&prop, device));
-
-    int const major = prop.major;
-    int const minor = prop.minor;
-    ASSERT_GT(major, 0);
-
-    std::vector<char const*> headers_content = {
-        tensorrt_llm::kernels::cuda_hint_cuh_content,
-        tensorrt_llm::kernels::defines_h_content,
-        tensorrt_llm::kernels::ldgsts_cuh_content,
-        tensorrt_llm::kernels::mha_h_content,
-        tensorrt_llm::kernels::mha_utils_cuh_content,
-        tensorrt_llm::kernels::mma_cuh_content,
-        tensorrt_llm::kernels::platform_h_content,
-        tensorrt_llm::kernels::utils_cuh_content,
-        tensorrt_llm::kernels::utils_h_content,
-        tensorrt_llm::kernels::mha_stdheaders_cuh_content,
-        tensorrt_llm::kernels::gmma_cuh_content,
-        tensorrt_llm::kernels::gmma_impl_cuh_content,
-        tensorrt_llm::kernels::barriers_cuh_content,
-        tensorrt_llm::kernels::tma_h_content,
-        tensorrt_llm::kernels::paired_f32_op_cuh_content,
-        tensorrt_llm::kernels::cuda_bf16_h_content,
-        tensorrt_llm::kernels::cuda_bf16_hpp_content,
-        tensorrt_llm::kernels::cuda_fp16_h_content,
-        tensorrt_llm::kernels::cuda_fp16_hpp_content,
-        tensorrt_llm::kernels::cuda_fp8_h_content,
-        tensorrt_llm::kernels::cuda_fp8_hpp_content,
-        tensorrt_llm::kernels::vector_types_h_content,
-        tensorrt_llm::kernels::vector_functions_h_content,
-        tensorrt_llm::kernels::device_types_h_content,
-    };
-    std::vector<char const*> headers_name = {"cuda_hint.cuh", "defines.h", "ldgsts.cuh", "mha.h", "mhaUtils.cuh",
-        "mma.cuh", "platform.h", "utils.cuh", "utils.h", "mha_stdheaders.cuh", "gmma.cuh", "gmma_impl.cuh",
-        "barriers.cuh", "tma.h", "cuda_bf16.h", "cuda_bf16.hpp", "cuda_fp16.h", "cuda_fp16.hpp", "cuda_fp8.h",
-        "cuda_fp8.hpp", "vector_types.h", "vector_functions.h", "device_types.h"};
-    assert(headers_content.size() == headers_name.size());
-    std::pair<char const* const, std::function<bool(int, int)>> const sourceFileAndArchCond[] = {
-        {tensorrt_llm::kernels::mha_cu_content, [](int major, int minor) { return major >= 8; }},
-        {tensorrt_llm::kernels::mha_sm90_cu_content, [](int major, int minor) { return major == 9 && minor == 0; }}};
-    for (int input_fp16 : {0, 1})
-        for (int cache_enum : {0, 1, 2})
-            for (int head_dim : {64, 128, 256})
-                for (bool use_paged_kv_cache : {false, true})
-                    for (int beam_width : {1, 4})
-                        for (auto const& [source_file, archCond] : sourceFileAndArchCond)
-                        {
-                            if (!archCond(major, minor))
-                            {
-                                continue;
-                            }
-                            if ((source_file == tensorrt_llm::kernels::mha_sm90_cu_content)
-                                && !(cache_enum == 2 && beam_width == 1))
-                            {
-                                continue;
-                            }
-                            std::string arch_flag = "-arch=sm_" + std::to_string(major) + std::to_string(minor);
-                            if ((major == 9 || major == 10) && minor == 0)
-                            {
-                                arch_flag += "a";
-                            }
-                            std::vector<std::string> options = {
-                                "-dw",
-                                "-std=c++17",
-                                "--use_fast_math",
-                                arch_flag,
-                                "-default-device",
-                                "-DGENERATE_CUBIN=1",
-                                "-DNDEBUG",
-                                input_fp16 ? "-DDTYPE=__half" : "-DDTYPE=__nv_bfloat16",
-                                "-DINPUT_FP16=" + std::to_string(input_fp16),
-                                "-DHEAD_DIM=" + std::to_string(head_dim),
-                                "-DUSE_PAGED_KV_CACHE=" + std::to_string(use_paged_kv_cache ? 1 : 0),
-                                "-DBEAM_WIDTH=" + std::to_string(beam_width),
-                                "-DCACHE_ELEM_ENUM=" + std::to_string(cache_enum),
-                                "-DTOKENS_PER_PAGE=" + std::to_string(use_paged_kv_cache ? 64 : 0),
-                                "-DHEAD_GRP_SIZE=8",
-                                "-DM_TILESIZE=8",
-                                "-DUSE_CUSTOM_BARRIER=1",
-                            };
-                            if (cache_enum == 2 && source_file == tensorrt_llm::kernels::mha_sm90_cu_content)
-                            {
-                                options.push_back("-DUSE_INPUT_KV=1");
-                                options.push_back("-DROPE_STYLE=1");
-                                options.push_back("-DSLIDING_WINDOW=1");
-                                options.push_back("-DLOW_PREC_OUTPUT=1");
-                            }
-                            std::vector<char const*> options_cstr;
-                            for (auto const& option : options)
-                            {
-                                options_cstr.push_back(option.c_str());
-                            }
-
-                            nvrtcProgram program;
-                            std::string log;
-
-                            NVRTC_RUN(nvrtcCreateProgram(&program, source_file, "program", headers_content.size(),
-                                headers_content.data(), headers_name.data()));
-                            auto status = nvrtcCompileProgram(program, options_cstr.size(), options_cstr.data());
-                            if (status != NVRTC_SUCCESS)
-                            {
-                                size_t log_size;
-                                NVRTC_RUN(nvrtcGetProgramLogSize(program, &log_size));
-                                log.resize(log_size);
-                                NVRTC_RUN(nvrtcGetProgramLog(program, const_cast<char*>(log.data())));
-                                FAIL() << log;
-                            }
-
-                            size_t cubinSize;
-                            NVRTC_RUN(nvrtcGetCUBINSize(program, &cubinSize));
-                            ASSERT_GT(cubinSize, 1000);
-                            std::string cubinContent(cubinSize, ' ');
-                            NVRTC_RUN(nvrtcGetCUBIN(program, const_cast<char*>(cubinContent.c_str())));
-
-                            NVRTC_RUN(nvrtcDestroyProgram(&program));
-
-                            ///
-                            CUmodule module;
-                            CU_RUN(cuModuleLoadData(&module, static_cast<void const*>(cubinContent.c_str())));
-                            CUfunction function;
-                            CU_RUN(cuModuleGetFunction(&function, module, "kernel_mha"));
-                            ASSERT_NE(function, nullptr);
-                            CUdeviceptr shmem_dev_ptr;
-                            CU_RUN(cuModuleGetGlobal(&shmem_dev_ptr, nullptr, module, "smemSize"));
-                            unsigned int shmem_bytes = 0;
-                            CU_RUN(cuMemcpyDtoH(&shmem_bytes, shmem_dev_ptr, sizeof(unsigned int)));
-                            ASSERT_GT(shmem_bytes, 1000);
-                        }
-}
-#endif
 
 TEST(Perf, tracing_long)
 {
@@ -1202,4 +1166,167 @@ TEST(Perf, tmp)
 #endif
     runTest<4>(32, 100, true, false);
 }
+#endif
+
+#if ENABLE_NVRTC
+#define NVRTC_RUN(x) ASSERT_EQ(NVRTC_SUCCESS, (x))
+#define CU_RUN(x) ASSERT_EQ(CUDA_SUCCESS, (x))
+
+TEST(NVRTC, compile)
+{
+    checkCuda(cudaFree(nullptr));
+    int device;
+    checkCuda(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    checkCuda(cudaGetDeviceProperties(&prop, device));
+
+    int const major = prop.major;
+    int const minor = prop.minor;
+    ASSERT_GT(major, 0);
+
+    std::vector<char const*> headers_content = {
+        tensorrt_llm::kernels::cuda_hint_cuh_content,
+        tensorrt_llm::kernels::defines_h_content,
+        tensorrt_llm::kernels::ldgsts_cuh_content,
+        tensorrt_llm::kernels::mha_h_content,
+        tensorrt_llm::kernels::mha_utils_cuh_content,
+        tensorrt_llm::kernels::mma_cuh_content,
+        tensorrt_llm::kernels::platform_h_content,
+        tensorrt_llm::kernels::utils_cuh_content,
+        tensorrt_llm::kernels::utils_h_content,
+        tensorrt_llm::kernels::mha_stdheaders_cuh_content,
+        tensorrt_llm::kernels::mha_components_cuh_content,
+        tensorrt_llm::kernels::mla_sm120_cuh_content,
+        tensorrt_llm::kernels::gmma_cuh_content,
+        tensorrt_llm::kernels::gmma_impl_cuh_content,
+        tensorrt_llm::kernels::barriers_cuh_content,
+        tensorrt_llm::kernels::tma_h_content,
+        tensorrt_llm::kernels::cuda_bf16_h_content,
+        tensorrt_llm::kernels::cuda_bf16_hpp_content,
+        tensorrt_llm::kernels::cuda_fp16_h_content,
+        tensorrt_llm::kernels::cuda_fp16_hpp_content,
+        tensorrt_llm::kernels::cuda_fp8_h_content,
+        tensorrt_llm::kernels::cuda_fp8_hpp_content,
+        tensorrt_llm::kernels::vector_types_h_content,
+        tensorrt_llm::kernels::vector_functions_h_content,
+        tensorrt_llm::kernels::device_types_h_content,
+    };
+    std::vector<char const*> headers_name = {"cuda_hint.cuh", "defines.h", "ldgsts.cuh", "mha.h", "mhaUtils.cuh",
+        "mma.cuh", "platform.h", "utils.cuh", "utils.h", "mha_stdheaders.cuh", "mha_components.cuh", "mla_sm120.cuh",
+        "gmma.cuh", "gmma_impl.cuh", "barriers.cuh", "tma.h", "cuda_bf16.h", "cuda_bf16.hpp", "cuda_fp16.h",
+        "cuda_fp16.hpp", "cuda_fp8.h", "cuda_fp8.hpp", "vector_types.h", "vector_functions.h", "device_types.h"};
+    assert(headers_content.size() == headers_name.size());
+    auto test = [&](int input_fp16, int cache_enum, int head_dim, int head_grp_size, bool use_paged_kv_cache,
+                    int beam_width, char const* source_file, int compileMajor, int compileMinor)
+    {
+        std::string arch_flag = "-arch=sm_" + std::to_string(compileMajor) + std::to_string(compileMinor);
+        if ((compileMajor == 9 || compileMajor == 10 || compileMajor == 12) && compileMinor == 0)
+        {
+            arch_flag += "a";
+        }
+        std::vector<std::string> options = {
+            "-dw",
+            "-std=c++17",
+            "--use_fast_math",
+            arch_flag,
+            "-default-device",
+            "-DGENERATE_CUBIN=1",
+            "-DNDEBUG",
+            input_fp16 ? "-DDTYPE=__half" : "-DDTYPE=__nv_bfloat16",
+            "-DINPUT_FP16=" + std::to_string(input_fp16),
+            "-DHEAD_ELEMS=" + std::to_string(head_dim),
+            "-DBEAM_WIDTH=" + std::to_string(beam_width),
+            "-DCACHE_ELEM_ENUM=" + std::to_string(cache_enum),
+            "-DTOKENS_PER_PAGE=" + std::to_string(use_paged_kv_cache ? 32 : 0),
+            "-DHEAD_GRP_SIZE=" + std::to_string(head_grp_size),
+            "-DM_TILESIZE=" + std::to_string(head_grp_size),
+            "-DUSE_CUSTOM_BARRIER=1",
+        };
+        if (cache_enum == 2 && source_file == tensorrt_llm::kernels::mha_sm90_cu_content)
+        {
+            options.push_back("-DUSE_INPUT_KV=1");
+            options.push_back("-DROPE_STYLE=1");
+            options.push_back("-DSLIDING_WINDOW=1");
+            options.push_back("-DLOW_PREC_OUTPUT=1");
+        }
+        std::vector<char const*> options_cstr;
+        for (auto const& option : options)
+        {
+            options_cstr.push_back(option.c_str());
+        }
+
+        nvrtcProgram program;
+        std::string log;
+
+        NVRTC_RUN(nvrtcCreateProgram(
+            &program, source_file, "program", headers_content.size(), headers_content.data(), headers_name.data()));
+        auto status = nvrtcCompileProgram(program, options_cstr.size(), options_cstr.data());
+        if (status != NVRTC_SUCCESS)
+        {
+            size_t log_size;
+            NVRTC_RUN(nvrtcGetProgramLogSize(program, &log_size));
+            log.resize(log_size);
+            NVRTC_RUN(nvrtcGetProgramLog(program, const_cast<char*>(log.data())));
+            FAIL() << log;
+        }
+
+        size_t cubinSize;
+        NVRTC_RUN(nvrtcGetCUBINSize(program, &cubinSize));
+        ASSERT_GT(cubinSize, 1000);
+        std::string cubinContent(cubinSize, ' ');
+        NVRTC_RUN(nvrtcGetCUBIN(program, const_cast<char*>(cubinContent.c_str())));
+
+        NVRTC_RUN(nvrtcDestroyProgram(&program));
+
+        if (compileMajor == major && compileMinor == minor)
+        {
+            CUmodule module;
+            CU_RUN(cuModuleLoadData(&module, static_cast<void const*>(cubinContent.c_str())));
+            CUfunction function;
+            CU_RUN(cuModuleGetFunction(&function, module, "kernel_mha"));
+            ASSERT_NE(function, nullptr);
+            CUdeviceptr shmem_dev_ptr;
+            CU_RUN(cuModuleGetGlobal(&shmem_dev_ptr, nullptr, module, "smemSize"));
+            unsigned int shmem_bytes = 0;
+            CU_RUN(cuMemcpyDtoH(&shmem_bytes, shmem_dev_ptr, sizeof(unsigned int)));
+            ASSERT_GT(shmem_bytes, 1000);
+        }
+    };
+
+    test(0, 2, 576, 128, true, 1, tensorrt_llm::kernels::mla_sm120_cu_content, 12, 0);
+
+    std::pair<char const* const, std::function<bool(int, int)>> const sourceFileAndArchCond[] = {
+        {tensorrt_llm::kernels::mha_cu_content, [](int major, int minor) { return major >= 8; }},
+        {tensorrt_llm::kernels::mha_sm90_cu_content, [](int major, int minor) { return major == 9 && minor == 0; }}};
+    for (int input_fp16 : {0, 1})
+    {
+        for (int cache_enum : {0, 1, 2})
+        {
+            for (int head_dim : {64, 128, 256})
+            {
+                for (bool use_paged_kv_cache : {false, true})
+                {
+                    for (int beam_width : {1, 4})
+                    {
+                        for (auto const& [source_file, archCond] : sourceFileAndArchCond)
+                        {
+                            if (!archCond(major, minor))
+                            {
+                                continue;
+                            }
+                            if ((source_file == tensorrt_llm::kernels::mha_sm90_cu_content)
+                                && !(cache_enum == 2 && beam_width == 1))
+                            {
+                                continue;
+                            }
+                            test(input_fp16, cache_enum, head_dim, 8, use_paged_kv_cache, beam_width, source_file,
+                                major, minor);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+#endif
 #endif

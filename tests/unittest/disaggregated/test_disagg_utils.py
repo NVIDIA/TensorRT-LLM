@@ -57,7 +57,6 @@ def verify_disagg_config(config: DisaggServerConfig):
     assert config.ctx_router_config.type == "round_robin"
     assert config.gen_router_config.type == "load_balancing"
     assert len(config.server_configs) == 3
-    assert config.condition is None
 
 
 def test_parse_disagg_config_file(sample_yaml_file):

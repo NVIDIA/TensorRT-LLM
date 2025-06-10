@@ -75,8 +75,17 @@ class AutoModelForCausalLMFactory(ModelFactory):
         self.tokenizer_kwargs.setdefault("trust_remote_code", True)
         self._quant_config = None
 
-        # heuristic to disable use_cache
+        # NEVER use cache
         self.model_kwargs["use_cache"] = False
+
+        # special handling for torch_dtype in model_kwargs since HF does not correctly update
+        # torch_dtype string to an actual torch.dtype object (only with default)
+        if "torch_dtype" in self.model_kwargs:
+            dtype = self.model_kwargs["torch_dtype"]
+            if isinstance(dtype, str):
+                dtype = getattr(torch, self.model_kwargs["torch_dtype"])
+            assert isinstance(dtype, torch.dtype), f"Invalid dtype: {dtype}"
+            self.model_kwargs["torch_dtype"] = dtype
 
         # prefetch the model+checkpoint
         self.prefetch_checkpoint()
@@ -322,19 +331,18 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # additional heuristic to disable use_cache
-        self.model_kwargs["text_config"] = self.model_kwargs.get("text_config", {})
-        self.model_kwargs["text_config"]["use_cache"] = False
-
-        self.model_kwargs["text_config"]["max_position_embeddings"] = self.model_kwargs[
-            "max_position_embeddings"
-        ]
-
-        # additional heuristic to propagate use of num_hidden_layers
+        # additional heuristic to propagate "important keys"
         # TODO (lucaslie): WAR until we have better support on dashboard to control model_kwargs
-        nhl_key = "num_hidden_layers"
-        if nhl_key in self.model_kwargs:
-            self.model_kwargs["text_config"][nhl_key] = self.model_kwargs[nhl_key]
+        keys_to_propagate = [
+            "num_hidden_layers",
+            "max_position_embeddings",
+            "use_cache",
+            "torch_dtype",
+        ]
+        self.model_kwargs["text_config"] = self.model_kwargs.get("text_config", {})
+        for key in keys_to_propagate:
+            if key in self.model_kwargs:
+                self.model_kwargs["text_config"][key] = self.model_kwargs[key]
 
     @property
     def automodel_from_config(self):
