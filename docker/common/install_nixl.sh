@@ -38,7 +38,6 @@ fi
 ARCH_NAME="x86_64-linux-gnu"
 if [ "$(uname -m)" != "amd64" ] && [ "$(uname -m)" != "x86_64" ]; then
   ARCH_NAME="aarch64-linux-gnu"
-  EXTRA_NIXL_ARGS="-Ddisable_gds_backend=true"
 fi
 
 if [ $ARCH_NAME != "x86_64-linux-gnu" ]; then

@@ -159,6 +159,8 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         return;
     }
 
+    TLLM_LOG_ERROR("copyBlock: Non-DRAM mode copy: mode = %d, pool_size = %d", mode, pools.size());
+
     for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
     {
         auto srcPtr = computeBlockPointer(src, pools, poolIdx);

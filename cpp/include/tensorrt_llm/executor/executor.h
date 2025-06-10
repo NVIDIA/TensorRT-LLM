@@ -582,8 +582,8 @@ public:
     explicit KvCacheRetentionConfig(std::vector<TokenRangeRetentionConfig> const& tokenRangeRetentionPriorities,
         RetentionPriority decodeRetentionPriority = kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt,
-        KvCacheTransferMode transferMode = KvCacheTransferMode::DRAM,
-        std::optional<std::string> directory = std::nullopt);
+        KvCacheTransferMode transferMode = KvCacheTransferMode::GDS,
+        std::optional<std::string> directory = std::string("/workspace/external/results/memory"));
 
     [[nodiscard]] std::vector<TokenRangeRetentionConfig> getTokenRangeRetentionConfigs() const;
     [[nodiscard]] RetentionPriority getDecodeRetentionPriority() const;
