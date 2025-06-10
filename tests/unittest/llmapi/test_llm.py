@@ -6,10 +6,12 @@ import os
 
 # Required for test_generate_with_seed to pass.
 # See the discussion in https://github.com/NVIDIA/TensorRT-LLM/pull/4264#issuecomment-2943269891
-# Note that currently functions like getEnvForceDeterministic are implemented using static variables,
-# which means they are only initialized once per CPP translation unit (and should be refactored to be non static later).
-# Therefore, the following line must be ahead of any tensorrt_llm imports.
-os.environ['FORCE_DETERMINISTIC'] = '1'
+# The following line must be ahead of any tensorrt_llm imports,
+# since currently env util functions like getEnvForceDeterministic are implemented using static variables,
+# which means they are only initialized once the CPP translation unit is loaded (should be refactored to be non static later).
+os.environ['TRTLLM_FORCE_XQA'] = '1'
+# Note that we cannot use os.environ['FORCE_DETERMINISTIC'] = '1' here,
+# since it will disable KV cache reuse and make test_llm_api_draft_target fail.
 
 import random
 import shutil
