@@ -32,13 +32,15 @@ from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
-                              PostprocWorkerConfig, postproc_worker_main)
+                              PostprocWorkerConfig,
+                              make_postproc_inputs_serialize_friendly,
+                              postproc_worker_main)
 from .request import (CancellingRequest, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import (GenerationResult, IterationResult, LogProbsResult,
                      ResponseWrapper, compute_logprobs)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    WorkerCommIpcAddrs, has_event_loop, is_llm_response)
+                    WorkerCommIpcAddrs, has_event_loop)
 
 __all__ = [
     "GenerationExecutorWorker",
@@ -869,6 +871,8 @@ class AwaitResponseHelper:
 
     def handle_for_ipc_batched(self, responses: List[tllm.Response]) -> None:
         ''' Perform the IPC in batch explicitly. '''
+        from tensorrt_llm._torch.pyexecutor.llm_request import \
+            make_llm_responses_serialize_friendly
         postproc_batches = [
             []
             for _ in range(self.worker.postproc_config.num_postprocess_workers)
@@ -884,6 +888,9 @@ class AwaitResponseHelper:
                 # serialized when it has error.
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
+                self.worker._pop_result(response.client_id)
+            elif response.is_final:
+                self.worker._pop_result(response.client_id)
             else:
                 logprobs_result = _get_logprobs(self.worker, response,
                                                 self.worker._is_pytorch_backend)
@@ -898,10 +905,12 @@ class AwaitResponseHelper:
         if postproc_batches:
             for wid, batch in enumerate(postproc_batches):
                 if batch:
-                    self.worker.postproc_queues[wid].put(batch)
+                    self.worker.postproc_queues[wid].put(
+                        make_postproc_inputs_serialize_friendly(batch))
 
         if rsp_batch:
-            self.worker.result_queue.put(rsp_batch)
+            self.worker.result_queue.put(
+                make_llm_responses_serialize_friendly(rsp_batch))
 
 
 def _get_params_for_first_rsp(
@@ -986,13 +995,3 @@ def _send_rsp(
             worker.postproc_queues[pid].put(inp)
         else:
             postproc_batches[pid].append(inp)
-
-    # Eliminate the finished GenerationRequest instances timely, which may
-    # take considerable memory.
-    if is_llm_response(response):
-        if response.has_error() or response.result.is_final:
-            worker._pop_result(response.client_id)
-    elif isinstance(response, ErrorResponse):
-        worker._pop_result(response.client_id)
-    else:
-        raise ValueError(f"Unknown response type: {response}")

@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -223,12 +223,17 @@ class LlmResponse:
                  py_result: PyResult):
         self._response = response
         self._py_result = py_result
+        self._has_error = response.has_error()
+        self.is_final = response.result.is_final
 
     def __getstate__(self):
-        return self._response, self._py_result
+        return self._response, self._py_result, self._has_error, self.is_final
 
     def __setstate__(self, state):
-        self._response, self._py_result = state
+        self._response, self._py_result, self._has_error, self.is_final = state
+
+    def has_error(self) -> bool:
+        return self._has_error
 
     @property
     def result(self) -> tensorrt_llm.bindings.executor.Result:
@@ -242,6 +247,61 @@ class LlmResponse:
 
     def __getattr__(self, item):
         return getattr(self._response, item)
+
+
+class ResponseList:
+    """ResponseList wraps a list of `Response` objects and provides fast serialization support"""
+
+    def __init__(self,
+                 responses: list[tensorrt_llm.bindings.executor.Response]):
+        self.responses = responses
+
+    def __reduce__(self):
+        return (ResponseList.deserialize, (self.serialize(), ))
+
+    def serialize(self):
+        return tensorrt_llm.bindings.executor.serialize_responses(
+            self.responses)
+
+    @staticmethod
+    def deserialize(responses):
+        responses = tensorrt_llm.bindings.executor.deserialize_responses(
+            responses)
+        return ResponseList(responses)
+
+
+def make_llm_responses_serialize_friendly(
+        responses: Tuple[List[LlmResponse], Dict[int, LlmResponse]]) -> dict:
+    if isinstance(responses, list):
+        return {
+            "response_list": ResponseList([r._response for r in responses]),
+            "py_result_list": [r._py_result for r in responses],
+        }
+    elif isinstance(responses, dict):
+        return {
+            "req_id_list": list(responses.keys()),
+            "response_list":
+            ResponseList([r._response for r in responses.values()]),
+            "py_result_list": [r._py_result for r in responses.values()],
+        }
+
+
+def restore_llm_responses_from_serialize_friendly_list(
+        responses: dict) -> list[LlmResponse]:
+    return [
+        LlmResponse(response, py_result) for response, py_result in zip(
+            responses["response_list"].responses, responses["py_result_list"])
+    ]
+
+
+def restore_llm_responses_from_serialize_friendly_dict(
+        responses: dict) -> dict[int, LlmResponse]:
+    llm_responses = {}
+    for request_id, response, py_result in zip(
+            responses["req_id_list"], responses["response_list"].responses,
+            responses["py_result_list"]):
+        llm_responses[request_id] = LlmResponse(response, py_result)
+    return llm_responses
 
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
