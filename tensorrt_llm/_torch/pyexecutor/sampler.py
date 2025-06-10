@@ -8,13 +8,14 @@ from tensorrt_llm._torch.pyexecutor.handle_context_logits import \
     HandleContextLogits
 from tensorrt_llm._torch.pyexecutor.handle_generation_logits import \
     HandleGenerationLogits
+from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import \
+    MakeDecodingBatchInputOutput
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings import (CudaStream, DataType, ModelConfig,
                                    WorldConfig, make_sampling_config)
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
-from tensorrt_llm.bindings.internal.algorithms import (
-    CreateNewDecoderRequests, MakeDecodingBatchInputOutput)
+from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers)
 from tensorrt_llm.bindings.internal.runtime import (BufferManager, DecoderState,
@@ -281,7 +282,7 @@ class TorchSampler(Sampler):
             token_idx += len(scheduled_requests.chunked_requests)
 
         for request in scheduled_requests.context_requests:
-            if request.get_context_remaining_length() != 0:
+            if request.context_remaining_length != 0:
                 advance_idx()
                 continue
 
