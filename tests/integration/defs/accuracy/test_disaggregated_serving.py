@@ -212,6 +212,7 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
 
+    @pytest.mark.skip_device_not_contain(["H200"])
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {"disable_overlap_scheduler": True}
