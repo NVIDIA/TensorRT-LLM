@@ -609,7 +609,7 @@ def worker_main(
     cpus = os.sched_getaffinity(pid)
     if cpus:
         logger.warning(
-            f"Found worker process {pid} was bound to {cpus}, this may harm"
+            f"Found worker process {pid} was bound to {cpus}, this may harm "
             "performance.", )
         logger.warning(f"Will clear the cpu affinity")
         clear_sched_affinity(pid)

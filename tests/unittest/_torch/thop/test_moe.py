@@ -900,14 +900,30 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
                                                       args.gemm2_scales_global)
 
     output = torch.ops.trtllm.fp4_block_scale_moe_runner(
-        expert_logits, routing_bias, hidden_states_fp4,
-        hidden_states_scale_linear_fp4, gemm1_weights_fp4_shuffled,
-        gemm1_scales_fp4_shuffled, gemm2_weights_fp4_shuffled,
-        gemm2_scales_fp4_shuffled, scale_c_fc1, scale_gate_fc1, scale_c_fc2,
-        num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
-        num_experts, routed_scaling, tile_tokens_dim, routing_method_type)
+        expert_logits,
+        routing_bias,
+        hidden_states_fp4,
+        hidden_states_scale_linear_fp4,
+        gemm1_weights_fp4_shuffled,
+        gemm1_scales_fp4_shuffled,
+        gemm2_weights_fp4_shuffled,
+        gemm2_scales_fp4_shuffled,
+        scale_c_fc1,
+        scale_gate_fc1,
+        scale_c_fc2,
+        num_experts,
+        top_k,
+        n_groups,
+        top_k_groups,
+        intermediate_size,
+        0,
+        num_experts,
+        routed_scaling,
+        tile_tokens_dim,
+        routing_method_type,
+        do_finalize=True)
 
-    output_dequant_actual = output.to(torch.float)
+    output_dequant_actual = output[0].to(torch.float)
 
     #
     # Check the results
