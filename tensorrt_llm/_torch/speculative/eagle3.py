@@ -5,12 +5,13 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.sampler import (SampleStateTensors, SampleStateTorch,
-                                  TorchSampler, seq_slice)
+from ..pyexecutor.sampler import (Sampler, SampleState, SampleStateTensors,
+                                  TorchSampler)
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 from .mtp import MTPSampler
 
@@ -193,33 +194,108 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 break
 
 
-class Eagle3Sampler(TorchSampler):
+class Eagle3Sampler(Sampler):
 
-    def sample_async(
-            self, scheduled_requests: ScheduledRequests,
-            model_outputs: dict[str, torch.Tensor]) -> SampleStateTorch:
-        if "d2t" not in model_outputs:
-            return super().sample_async(scheduled_requests, model_outputs)
-        d2t = model_outputs["d2t"]
-        raw_logits = model_outputs["logits"]
-        requests = scheduled_requests.all_requests()
-        new_tokens_device = self.store.new_tokens_device
-        self._process_requests(requests,
-                               raw_logits,
-                               new_tokens=new_tokens_device)
-        all_slices = (seq_slice(request, self.BEAM, size=0)
-                      for request in requests)
-        for slc in all_slices:
-            new_tokens_device[slc] += d2t[new_tokens_device[slc]]
+    def __init__(self, sampler_args: TorchSampler.Args):
+        self.max_seq_len = sampler_args.max_seq_len
+
+    _meet_max_token_stop_criteria = TorchSampler._meet_max_token_stop_criteria
+    _meet_stop_token_criteria = staticmethod(
+        TorchSampler._meet_stop_token_criteria)
+    _handle_stop_criteria = TorchSampler._handle_stop_criteria
+
+    def sample_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs: dict[str, torch.Tensor]) -> SampleState:
+        logits = model_outputs["logits"]
+        new_tokens_device = torch.argmax(logits, dim=-1)
+        if "d2t" in model_outputs:
+            d2t = model_outputs["d2t"]
+            new_tokens_device = d2t[new_tokens_device] + new_tokens_device
         device = SampleStateTensors(new_tokens=new_tokens_device)
         host = SampleStateTensors(
             new_tokens=new_tokens_device.to('cpu', non_blocking=True))
         sampler_event = torch.cuda.Event()
         sampler_event.record()
-        return SampleStateTorch(scheduled_requests=scheduled_requests,
-                                device=device,
-                                host=host,
-                                sampler_event=sampler_event)
+        return SampleState(scheduled_requests=scheduled_requests,
+                           device=device,
+                           host=host,
+                           sampler_event=sampler_event)
+
+    def update_requests(self, state: SampleState) -> None:
+        if state.sampler_event:
+            state.sampler_event.synchronize()
+        new_tokens_list = state.host.new_tokens.tolist()
+        scheduled_requests = state.scheduled_requests
+
+        request_idx = 0
+        token_idx = 0
+        beam_idx = 0
+
+        def advance_idx(num_tokens=1):
+            nonlocal request_idx, token_idx
+            request_idx += 1
+            token_idx += num_tokens
+
+        if hasattr(scheduled_requests, 'chunked_requests'):
+            request_idx += len(scheduled_requests.chunked_requests)
+            token_idx += len(scheduled_requests.chunked_requests)
+
+        for request in scheduled_requests.context_requests:
+            if request.get_context_remaining_length() != 0:
+                advance_idx()
+                continue
+
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                new_token = new_tokens_list[token_idx]
+                num_tokens = request.add_new_token(new_token, beam_idx)
+                self._handle_stop_criteria(request, new_token, beam=beam_idx)
+
+                request.py_decoding_iter += 1
+            advance_idx()
+
+        extend_requests = []
+        generation_requests = []
+        for request in scheduled_requests.generation_requests:
+            if len(request.py_draft_tokens) > 0:
+                extend_requests.append(request)
+            else:
+                generation_requests.append(request)
+
+        for request in extend_requests:
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                new_token = new_tokens_list[token_idx]
+                num_tokens = request.add_new_token(new_token, beam_idx)
+                self._handle_stop_criteria(request, new_token, beam=beam_idx)
+
+                # Accept draft tokens (if we have any) if and only if they match the new
+                # token exactly.
+                num_accepted = 0
+                new_tokens = [new_token]
+                for draft_token in request.py_draft_tokens:
+                    if draft_token != new_token:
+                        # Reject.
+                        break
+                    num_accepted += 1
+                    new_token = new_tokens_list[token_idx + num_accepted]
+                    num_tokens = request.add_new_token(new_token, beam_idx)
+                    new_tokens.append(num_tokens)  # `num_tokens`->`new_token`
+
+                    if self._handle_stop_criteria(request,
+                                                  new_token,
+                                                  beam=beam_idx):
+                        break
+                request.py_decoding_iter += 1
+                request.py_num_accepted_draft_tokens = num_accepted
+                request.py_rewind_len = request.py_draft_pages_allocated - num_accepted
+            advance_idx(len(request.py_draft_tokens) + 1)
+
+        for request in generation_requests:
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                new_token = new_tokens_list[token_idx]
+                num_tokens = request.add_new_token(new_token, beam_idx)
+                self._handle_stop_criteria(request, new_token, beam=beam_idx)
+                request.py_decoding_iter += 1
+            advance_idx()
 
 
 class Eagle3OneModelSampler(MTPSampler):
