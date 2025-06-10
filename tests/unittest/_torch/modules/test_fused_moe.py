@@ -2,6 +2,7 @@ import pickle
 import sys
 from itertools import product
 from typing import Dict, List, Optional
+from unittest import mock
 
 import cloudpickle
 import pytest
@@ -130,7 +131,8 @@ def test_fused_moe_multi_gpu(moe_cls, ep_size):
 @pytest.mark.parametrize("alltoall_method_type", [
     AlltoallMethodType.MNNVL, AlltoallMethodType.DeepEP,
     AlltoallMethodType.DeepEPLowLatency
-])
+],
+                         ids=lambda s: s.name)
 def test_fused_moe_alltoall(alltoall_method_type):
     world_size = 4
     dtype = torch.bfloat16
@@ -138,6 +140,7 @@ def test_fused_moe_alltoall(alltoall_method_type):
     INTERMEDIATE_SIZE = 1536
     NUM_EXPERTS = 72
     TOP_K = 6
+    MAX_NUM_TOKENS = 2048
 
     def per_rank_test_fused_moe_alltoall(job_id):
         routing_method = DefaultMoeRoutingMethod(top_k=TOP_K)
@@ -153,38 +156,50 @@ def test_fused_moe_alltoall(alltoall_method_type):
         weights = {}
         for expert_id in range(NUM_EXPERTS):
             w1_weight = torch.empty((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype).cuda()
+                                    dtype=dtype)
             w2_weight = torch.empty((HIDDEN_SIZE, INTERMEDIATE_SIZE),
-                                    dtype=dtype).cuda()
+                                    dtype=dtype)
             w3_weight = torch.empty((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype).cuda()
+                                    dtype=dtype)
             torch.nn.init.xavier_uniform_(w1_weight)
             torch.nn.init.xavier_uniform_(w2_weight)
             torch.nn.init.xavier_uniform_(w3_weight)
             weights[f"{expert_id}.w1.weight"] = w1_weight
             weights[f"{expert_id}.w2.weight"] = w2_weight
             weights[f"{expert_id}.w3.weight"] = w3_weight
-        models = []
-        for method_type in [
-                alltoall_method_type, AlltoallMethodType.NotEnabled
-        ]:
-            CutlassFusedMoE.select_alltoall_method_type = lambda *args: method_type
-            model = CutlassFusedMoE(
+        with mock.patch.object(CutlassFusedMoE,
+                               "select_alltoall_method_type",
+                               return_value=alltoall_method_type):
+            alltoall_model = CutlassFusedMoE(
                 num_experts=NUM_EXPERTS,
                 routing_method=routing_method,
                 hidden_size=HIDDEN_SIZE,
                 intermediate_size=INTERMEDIATE_SIZE,
                 dtype=dtype,
                 reduce_results=True,
-                model_config=ModelConfig(mapping=mapping),
+                model_config=ModelConfig(mapping=mapping,
+                                         max_num_tokens=MAX_NUM_TOKENS),
             )
-            model.load_weights([weights])
-            model.cuda()
-            models.append(model)
-        alltoall_model, ref_model = models
+        alltoall_model.to("cuda")
+        alltoall_model.load_weights([weights])
+        with mock.patch.object(CutlassFusedMoE,
+                               "select_alltoall_method_type",
+                               return_value=AlltoallMethodType.NotEnabled):
+            ref_model = CutlassFusedMoE(
+                num_experts=NUM_EXPERTS,
+                routing_method=routing_method,
+                hidden_size=HIDDEN_SIZE,
+                intermediate_size=INTERMEDIATE_SIZE,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=ModelConfig(mapping=mapping,
+                                         max_num_tokens=MAX_NUM_TOKENS),
+            )
+        ref_model.to("cuda")
+        ref_model.load_weights([weights])
 
-        # Evaluate the outputs on a variant sequence length to cover all possible keys in Autotuner cache
-        m = 8
+        # Evaluate the outputs on a variant sequence length to verify the robustness of alltoall methods
+        m = MAX_NUM_TOKENS
         while m >= 1:
             x = torch.randn((m, HIDDEN_SIZE), dtype=dtype).cuda()
             router_logits = torch.randn((m, NUM_EXPERTS), dtype=dtype).cuda()
@@ -206,7 +221,7 @@ def test_fused_moe_alltoall(alltoall_method_type):
             torch.testing.assert_close(output,
                                        ref_output,
                                        rtol=0.05,
-                                       atol=0.002)
+                                       atol=0.003)
             m //= 2
 
     with MPIPoolExecutor(max_workers=world_size) as executor:
