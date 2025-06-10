@@ -373,7 +373,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
-    jnlpImage = "urm.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11"
 
     switch(type)
     {
