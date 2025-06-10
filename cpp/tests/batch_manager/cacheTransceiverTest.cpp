@@ -734,13 +734,8 @@ protected:
                 mConnectionManager = std::make_unique<texec::kv_cache::MpiConnectionManager>(mComm);
             }
 
-            auto makeFormatter = [this]()
-            {
-                return mIsMLA ? std::unique_ptr<IOFormatter>(
-                           std::make_unique<MLACacheFormatter>(mManager.get(), mCacheTransBufferManager.get()))
-                              : std::unique_ptr<IOFormatter>(
-                                  std::make_unique<CacheFormatter>(mManager.get(), mCacheTransBufferManager.get()));
-            };
+            auto makeFormatter
+                = [this]() { return createCacheFormatter(mManager.get(), mCacheTransBufferManager.get(), mIsMLA); };
 
             if (mIsContext)
             {
