@@ -25,7 +25,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
-#include "tensorrt_llm/executor/cache_transmission/cacheConcatenate.h"
+#include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
@@ -449,7 +449,7 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
             NVTX3_SCOPED_RANGE(formatInputConcatenate);
 
             // recvSplitCaches size == ppdomainsize
-            executor::kv_cache::concatenateKvCacheV2Dispatch(
+            executor::kv_cache::concatKvCacheV2Dispatch(
                 recvSplitCaches, outputBuffers, destConfig, selfConfig, selfIdx, bufferManager);
         }
         bufferManager.getStream().synchronize();
