@@ -281,7 +281,11 @@ public:
             AttentionOp::EnqueueContextParams<T> enqueue_params{common_enqueue_params};
             enqueue_params.host_block_offsets = host_block_offsets;
             enqueue_params.batch_size = num_seqs;
-            enqueue_params.softmaxStatsPtr = softmax_stats_tensor->data_ptr<float2>();
+            if (softmax_stats_tensor.has_value())
+            {
+                enqueue_params.softmaxStatsPtr = static_cast<float2*>(softmax_stats_tensor.value().data_ptr());
+            }
+
             if (op.isMLAEnabled())
             {
                 mla_params.cache_seq_lens = sequence_lengths_ptr;

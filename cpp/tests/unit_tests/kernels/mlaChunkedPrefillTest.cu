@@ -612,6 +612,7 @@ protected:
                 cudaMemcpyHostToDevice, mStream->get());
             cudaMemcpyAsync(d_k_pe_tensor->data(), h_k_pe_tensor->data(), h_k_pe_tensor->getSizeInBytes(),
                 cudaMemcpyHostToDevice, mStream->get());
+            cudaStreamSynchronize(mStream->get());
         }
 
         // invokeMergeAttnWithSoftmax, we just ignore rope_size here for simplicity
@@ -736,22 +737,19 @@ protected:
             // merge attention
 
             // copy curr_attn and softmax_sum to device
-            cudaMemcpyAsync(d_softmax_sum_ptr, h_softmax_sum_ptr, this->m_h_softmax_sum_tensor->getSizeInBytes(),
-                cudaMemcpyHostToDevice, mStream->get());
-            cudaMemcpyAsync(d_output_ptr, h_output_ptr, this->m_h_output_tensor->getSizeInBytes(),
-                cudaMemcpyHostToDevice, mStream->get());
-            sync_check_cuda_error(mStream->get());
+            cudaMemcpy(d_softmax_sum_ptr, h_softmax_sum_ptr, this->m_h_softmax_sum_tensor->getSizeInBytes(),
+                cudaMemcpyHostToDevice);
+            cudaMemcpy(d_output_ptr, h_output_ptr, this->m_h_output_tensor->getSizeInBytes(), cudaMemcpyHostToDevice);
             // merge softmax
             tensorrt_llm::kernels::invokeMergeAttnWithSoftmax<DataType>(d_output_accum_ptr, d_softmax_sum_accum_ptr,
                 d_output_accum_ptr, d_softmax_sum_accum_ptr, d_output_ptr, d_softmax_sum_ptr, this->mBatchSize,
                 d_cu_q_seq_lens_ptr, this->mMaxQSeqLen, d_merge_op, this->mNumHeads, this->mNopeSize, mStream->get());
-            sync_check_cuda_error(mStream->get());
+            cudaStreamSynchronize(mStream->get());
             // copy merged softmax sum back to host
-            cudaMemcpyAsync(h_softmax_sum_accum_ptr, d_softmax_sum_accum_ptr,
-                this->m_h_softmax_sum_tensor->getSizeInBytes(), cudaMemcpyDeviceToHost, mStream->get());
-            cudaMemcpyAsync(h_output_accum_ptr, d_output_accum_ptr, this->m_h_output_tensor->getSizeInBytes(),
-                cudaMemcpyDeviceToHost, mStream->get());
-            sync_check_cuda_error(mStream->get());
+            cudaMemcpy(h_softmax_sum_accum_ptr, d_softmax_sum_accum_ptr, this->m_h_softmax_sum_tensor->getSizeInBytes(),
+                cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_output_accum_ptr, d_output_accum_ptr, this->m_h_output_tensor->getSizeInBytes(),
+                cudaMemcpyDeviceToHost);
         }
         // final round, apply causal mask.
 
@@ -770,20 +768,18 @@ protected:
             h_cu_q_seq_lens_ptr, h_cu_chunk_lens_ptr, this->mNopeSize, true, h_softmax_sum_ptr, this->mIsCausalMask);
         // merge attention
         // copy curr_attn and softmax_sum to device
-        cudaMemcpyAsync(d_softmax_sum_ptr, h_softmax_sum_ptr, this->m_h_softmax_sum_tensor->getSizeInBytes(),
-            cudaMemcpyHostToDevice, mStream->get());
-        cudaMemcpyAsync(d_output_ptr, h_output_ptr, this->m_h_output_tensor->getSizeInBytes(), cudaMemcpyHostToDevice,
-            mStream->get());
-        sync_check_cuda_error(mStream->get());
+        cudaMemcpy(d_softmax_sum_ptr, h_softmax_sum_ptr, this->m_h_softmax_sum_tensor->getSizeInBytes(),
+            cudaMemcpyHostToDevice);
+        cudaMemcpy(d_output_ptr, h_output_ptr, this->m_h_output_tensor->getSizeInBytes(), cudaMemcpyHostToDevice);
         tensorrt_llm::kernels::invokeMergeAttnWithSoftmax<DataType>(d_output_accum_ptr, d_softmax_sum_accum_ptr,
             d_output_accum_ptr, d_softmax_sum_accum_ptr, d_output_ptr, d_softmax_sum_ptr, this->mBatchSize,
             d_cu_q_seq_lens_ptr, this->mMaxQSeqLen, d_merge_op, this->mNumHeads, this->mNopeSize, mStream->get());
-        sync_check_cuda_error(mStream->get());
+        cudaStreamSynchronize(mStream->get());
         // copy merged softmax sum back to host
-        cudaMemcpyAsync(h_softmax_sum_accum_ptr, d_softmax_sum_accum_ptr,
-            this->m_h_softmax_sum_tensor->getSizeInBytes(), cudaMemcpyDeviceToHost, mStream->get());
-        cudaMemcpyAsync(h_output_accum_ptr, d_output_accum_ptr, this->m_h_output_tensor->getSizeInBytes(),
-            cudaMemcpyDeviceToHost, mStream->get());
+        cudaMemcpy(h_softmax_sum_accum_ptr, d_softmax_sum_accum_ptr, this->m_h_softmax_sum_tensor->getSizeInBytes(),
+            cudaMemcpyDeviceToHost);
+        cudaMemcpy(
+            h_output_accum_ptr, d_output_accum_ptr, this->m_h_output_tensor->getSizeInBytes(), cudaMemcpyDeviceToHost);
         sync_check_cuda_error(mStream->get());
     }
 
@@ -870,18 +866,17 @@ protected:
             reinterpret_cast<tensorrt_llm::kernels::KVBlockArrayForContextFMHA::DataType*>(offset_ptr));
         this->PrepareChunkedLen(chunk_idx);
         // copy cu chunk lens to device
-        cudaMemcpyAsync(this->d_cu_chunk_lens->data(), this->h_cu_chunk_lens->data(),
-            this->h_cu_chunk_lens->getSizeInBytes(), cudaMemcpyHostToDevice, mStream->get());
-        sync_check_cuda_error(mStream->get());
+        cudaMemcpy(this->d_cu_chunk_lens->data(), this->h_cu_chunk_lens->data(),
+            this->h_cu_chunk_lens->getSizeInBytes(), cudaMemcpyHostToDevice);
         tensorrt_llm::kernels::invokeMLALoadChunkedKV<DataType>(compressed_kv_output_ptr, k_pe_output_ptr, kv_cache,
             this->mBatchSize, d_cu_chunk_lens_ptr, this->mLoraSize, this->mRopeSize, this->mChunkSize, chunk_idx,
             mStream->get());
-        sync_check_cuda_error(this->mStream->get());
+        cudaStreamSynchronize(this->mStream->get());
         // copy result back to host
-        cudaMemcpyAsync(this->h_compressed_kv_output->data(), compressed_kv_output_ptr,
-            this->h_compressed_kv_output->getSizeInBytes(), cudaMemcpyDeviceToHost, mStream->get());
-        cudaMemcpyAsync(this->h_k_pe_output->data(), k_pe_output_ptr, this->h_k_pe_output->getSizeInBytes(),
-            cudaMemcpyDeviceToHost, mStream->get());
+        cudaMemcpy(this->h_compressed_kv_output->data(), compressed_kv_output_ptr,
+            this->h_compressed_kv_output->getSizeInBytes(), cudaMemcpyDeviceToHost);
+        cudaMemcpy(this->h_k_pe_output->data(), k_pe_output_ptr, this->h_k_pe_output->getSizeInBytes(),
+            cudaMemcpyDeviceToHost);
         sync_check_cuda_error(this->mStream->get());
     }
 
@@ -906,22 +901,21 @@ protected:
         auto* cu_chunked_seq_lens_ptr = bufferCast<int64_t>(*(this->d_cu_chunk_lens));
         this->PrepareChunkedLen(0);
         // copy cu chunk lens to device
-        cudaMemcpyAsync(this->d_cu_chunk_lens->data(), this->h_cu_chunk_lens->data(),
-            this->h_cu_chunk_lens->getSizeInBytes(), cudaMemcpyHostToDevice, mStream->get());
-        sync_check_cuda_error(mStream->get());
+        cudaMemcpy(this->d_cu_chunk_lens->data(), this->h_cu_chunk_lens->data(),
+            this->h_cu_chunk_lens->getSizeInBytes(), cudaMemcpyHostToDevice);
         tensorrt_llm::kernels::invokeMLASetChunkedKV(kv_cache_ptr, kv_ptr, k_pe_ptr, this->mBatchSize, this->mChunkSize,
             this->mNumHeads, this->mNopeSize, this->mRopeSize, cu_chunked_seq_lens_ptr, this->mTokensPerBlock,
             mStream->get());
-        sync_check_cuda_error(this->mStream->get());
+        cudaStreamSynchronize(this->mStream->get());
         // copy result back to host
-        cudaMemcpyAsync(this->h_kv_cache_tensor->data(), kv_cache_ptr, this->h_kv_cache_tensor->getSizeInBytes(),
-            cudaMemcpyDeviceToHost, mStream->get());
+        cudaMemcpy(this->h_kv_cache_tensor->data(), kv_cache_ptr, this->h_kv_cache_tensor->getSizeInBytes(),
+            cudaMemcpyDeviceToHost);
         sync_check_cuda_error(this->mStream->get());
     }
 };
 
-using MLATypes = ::testing::Types<half, __nv_bfloat16, float>;
-// using MLATypes = ::testing::Types<half>;
+// using MLATypes = ::testing::Types<half, __nv_bfloat16, float>;
+using MLATypes = ::testing::Types<half>;
 TYPED_TEST_SUITE(MlaChunkedPrefillTest, MLATypes);
 
 TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillDefault)

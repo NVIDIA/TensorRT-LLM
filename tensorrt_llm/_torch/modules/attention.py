@@ -937,7 +937,12 @@ class MLA(nn.Module):
         attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         chunk_size = attn_metadata.runtime_features.normal_chunk_size
-        cached_kv_lens = attn_metadata.kv_lens_runtime
+        # cached_kv_lens = attn_metadata.kv_lens_runtime
+        cached_kv_lens = torch.tensor(
+            attn_metadata.kv_cache_params.num_cached_tokens_per_seq,
+            dtype=torch.int,
+            device='cpu',
+        )
         for loop_idx in range(chunked_loop_num):
             cu_chunked_seq_len[loop_idx, 0] = 0
             used_chunk_seq_len = loop_idx * chunk_size
@@ -1011,7 +1016,8 @@ class MLA(nn.Module):
             dtype=torch.float,
             device=q.device,
         )
-        attn_output = None
+        attn_output = q.new_empty((q.size(0), self.num_heads * self.v_head_dim),
+                                  dtype=q.type())
         chunked_seq_len = torch.empty(
             (chunked_loop_num, attn_metadata.num_seqs),
             dtype=torch.int64,
@@ -1190,7 +1196,8 @@ class MLA(nn.Module):
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
-            if trtllm_attention.is_mla_context_paged_kv_cache_enabled():
+            if trtllm_attention.is_chunked_prefill_for_mla_context(
+                    attn_metadata):
                 return self.forward_context_with_chunked_prefill(
                     q, compressed_kv, k_pe, attn_metadata, position_ids)
             elif trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):

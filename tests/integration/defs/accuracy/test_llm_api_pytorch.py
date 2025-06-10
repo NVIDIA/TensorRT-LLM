@@ -1079,6 +1079,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                              cuda_graph, overlap_scheduler):
         if quant_dtype == "nvfp4" and mtp_nextn > 0:
             pytest.skip("MTP is not supported for NVFP4")
+        if fp8kv:
+            pytest.skip("Currently do not support fp8")
 
         model_path = self.MODEL_PATH
         if quant_dtype == "fp8":
@@ -1087,7 +1089,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only"
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=True)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,

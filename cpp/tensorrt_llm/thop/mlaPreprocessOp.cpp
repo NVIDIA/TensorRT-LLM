@@ -562,7 +562,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? kv_scale_orig_quant"
         ", Tensor? kv_scale_quant_orig"
         ", int layer_idx"
-        ", int head_size"
+        ", int lora_size"
+        ", int rope_size"
         ", int tokens_per_block"
         ", int chunked_size"
         ", int chunked_index"
@@ -570,7 +571,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int sink_token_length"
         ", int beam_width"
         ", int quant_mode"
-        ") -> Tensor");
+        ") -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
