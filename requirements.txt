@@ -56,3 +56,4 @@ matplotlib # FIXME: this is added to make nvtx happy
 meson
 ninja
 etcd3
+blake3

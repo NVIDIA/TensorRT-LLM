@@ -5,6 +5,7 @@ import torch
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel, Qwen2_5_VLForConditionalGeneration,
                           Qwen2VLForConditionalGeneration)
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
 from ...functional import RopeEmbeddingUtils, RotaryScalingType
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
@@ -233,6 +234,38 @@ class Qwen2VLInputProcessorBase(InputProcessor):
 
         self.cos_ori = self.rotary_cos_sin[:, :, 0]
         self.sin_ori = self.rotary_cos_sin[:, :, 1]
+
+    def get_num_tokens_per_image(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+        num_frames: int = 1,
+        do_resize: bool = True,
+    ):
+        patch_size = self.model_config.vision_config.patch_size
+        merge_size = self.model_config.vision_config.spatial_merge_size
+        temporal_patch_size = self.model_config.vision_config.temporal_patch_size
+        if do_resize:
+            resized_height, resized_width = smart_resize(
+                height=image_height,
+                width=image_width,
+                factor=patch_size * merge_size,
+                min_pixels=self.processor.image_processor.min_pixels,
+                max_pixels=self.processor.image_processor.max_pixels,
+            )
+            image_width, image_height = resized_width, resized_height
+
+        padded_num_frames = num_frames + num_frames % temporal_patch_size
+
+        grid_t = max(padded_num_frames // temporal_patch_size, 1)
+        grid_h = image_height // patch_size
+        grid_w = image_width // patch_size
+
+        num_patches = grid_t * grid_h * grid_w
+        num_vision_tokens = num_patches // (merge_size**2)
+
+        return num_vision_tokens
 
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
