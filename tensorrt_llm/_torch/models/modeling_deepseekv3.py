@@ -400,7 +400,7 @@ class Deepseekv3MoE(nn.Module):
             reduce_output=False)
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_backend)
+                                   strategy=model_config.allreduce_strategy)
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {
             key: torch.cuda.Event()
@@ -630,7 +630,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
         self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_backend,
+                                   strategy=model_config.allreduce_strategy,
                                    dtype=config.torch_dtype)
         self.moe_allreduce = MoEAllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None

@@ -79,7 +79,7 @@ class ModelConfig(Generic[TConfig]):
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
-    allreduce_backend: AllReduceStrategy = AllReduceStrategy.AUTO
+    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
@@ -123,9 +123,9 @@ class ModelConfig(Generic[TConfig]):
             key = strategy.upper()
             return maps[key] if key in maps else AllReduceStrategy.AUTO
 
-        if isinstance(self.allreduce_backend, str):
-            self.allreduce_backend = get_all_reduce_strategy(
-                self.allreduce_backend)
+        if isinstance(self.allreduce_strategy, str):
+            self.allreduce_strategy = get_all_reduce_strategy(
+                self.allreduce_strategy)
 
     @property
     def fuse_pos_embd(self):

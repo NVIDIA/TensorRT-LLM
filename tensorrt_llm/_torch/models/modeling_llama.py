@@ -284,7 +284,7 @@ class Llama4MoE(nn.Module):
         self.mapping = model_config.mapping
         self.all_reduce = AllReduce(
             mapping=model_config.mapping,
-            strategy=model_config.allreduce_backend,
+            strategy=model_config.allreduce_strategy,
         )
         self.moe_event = [torch.cuda.Event(), torch.cuda.Event()]
         self.aux_stream = aux_stream
@@ -418,7 +418,7 @@ class Llama4DecoderLayer(DecoderLayer):
 
         self.mapping = model_config.mapping
         self.all_reduce = AllReduce(mapping=model_config.mapping,
-                                    strategy=model_config.allreduce_backend)
+                                    strategy=model_config.allreduce_strategy)
         self.next_layer_layernorm: RMSNorm = None
         self.next_attn: LlamaAttention = None
 
@@ -629,7 +629,7 @@ class Eagle3LlamaAttention(LlamaAttention):
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
-        )
+            allreduce_strategy=model_config.allreduce_strategy)
 
 
 class Eagle3LlamaDecoderLayer(DecoderLayer):

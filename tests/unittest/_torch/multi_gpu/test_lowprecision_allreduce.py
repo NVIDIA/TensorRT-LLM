@@ -88,7 +88,7 @@ def run_single_rank(dtype, strategy, message_size):
             )
 
             self.allreduce = AllReduce(mapping=self.mapping,
-                                       allreduce_backend=self.strategy).cuda()
+                                       strategy=self.strategy).cuda()
 
             self.input_tensors = []
             for i in range(self.world_size):
