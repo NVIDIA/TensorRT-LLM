@@ -558,17 +558,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                           fieldPath: spec.nodeName
                   - name: jnlp
                     image: ${jnlpImage}
-                    args: []
-                    env:
-                    - name: JENKINS_SECRET
-                      valueFrom:
-                        secretKeyRef:
-                          name: jenkins-agent-secret
-                          key: secret
-                    - name: JENKINS_NAME
-                      valueFrom:
-                        fieldRef:
-                          fieldPath: metadata.name
+                    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
                         cpu: '2'
