@@ -19,24 +19,23 @@
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif // #ifndef _WIN32
 
-#include "cutlass/cutlass.h"
 #include "cutlass/arch/arch.h"
-#include "cutlass/util/packed_stride.hpp"
+#include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
-#include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
+#include "cutlass/util/packed_stride.hpp"
 
 #include "cutlass_extensions/gemm_configs.h"
 
 #include "../include/allreduce_gemm_runner.h"
+#include "communication/sm90_allreduce_nvls_warpspecialized.hpp"
 #include "epilogue/sm90_visitor_allreduce_tma_warpspecialized.hpp"
 #include "kernel/sm90_gemm_allreduce_tma_warpspecialized_pingpong.hpp"
-#include "communication/sm90_allreduce_nvls_warpspecialized.hpp"
-
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"

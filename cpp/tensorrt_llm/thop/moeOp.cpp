@@ -43,10 +43,14 @@ namespace torch_ext
 
 namespace common = tensorrt_llm::common;
 #if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+constexpr auto BlockScaleVectorSize
+    = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
 namespace kernels = tensorrt_llm::kernels::cutlass_kernels;
 using ActivationType = tensorrt_llm::kernels::cutlass_kernels::ActivationType;
 using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 #else
+constexpr auto BlockScaleVectorSize
+    = tensorrt_llm::kernels::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
 namespace kernels = tensorrt_llm::kernels;
 using ActivationType = tensorrt_llm::ActivationType;
 using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput;
@@ -593,16 +597,12 @@ private:
             TORCH_CHECK(fc2_global.dim() == 1, "fc2 global must be 1D");
             TORCH_CHECK(fc1_weight_block.sizes()[0] == num_experts_on_rank
                     && fc1_weight_block.sizes()[1] == inter_size * 2
-                    && fc1_weight_block.sizes()[2] * FP8_PER_INT32
-                            * TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
-                        == hidden_size,
+                    && fc1_weight_block.sizes()[2] * FP8_PER_INT32 * BlockScaleVectorSize == hidden_size,
                 "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
             TORCH_CHECK(fc2_weight_block.sizes()[0] == num_experts_on_rank && fc2_weight_block.sizes()[1] == hidden_size
-                    && fc2_weight_block.sizes()[2] * FP8_PER_INT32
-                            * TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
-                        == inter_size,
+                    && fc2_weight_block.sizes()[2] * FP8_PER_INT32 * BlockScaleVectorSize == inter_size,
                 "fc2 weight block size must be (num_experts_on_rank, hidden_size, inter_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc2_global.sizes()[0] == num_experts_on_rank, "fc2 global size must be (num_experts_on_rank,)");

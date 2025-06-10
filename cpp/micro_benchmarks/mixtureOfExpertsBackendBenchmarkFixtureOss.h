@@ -20,7 +20,12 @@
 
 #include <nlohmann/json.hpp>
 
+// #if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+#if true
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#else
 #include "moe_kernels.h"
+#endif
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
@@ -37,10 +42,22 @@
 #include <unordered_map>
 #include <vector>
 
+// #if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+#if true
+using namespace tensorrt_llm::kernels::cutlass_kernels;
+using ActivationType = tensorrt_llm::kernels::cutlass_kernels::ActivationType;
+using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
+using tensorrt_llm::kernels::cutlass_kernels::isGatedActivation;
+#else
 using namespace tensorrt_llm::kernels;
+using ActivationType = tensorrt_llm::ActivationType;
+using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput;
+using tensorrt_llm::isGatedActivation;
+#endif
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::cutlass_extensions;
+using LoraParams = tensorrt_llm::kernels::LoraParams;
 
 static BufferManager::CudaStreamPtr streamPtr;
 static std::unique_ptr<BufferManager> bufferManager;
@@ -298,20 +315,13 @@ public:
     using WeightType = typename TypeTuple_::WeightType;
     using OutputType = typename TypeTuple_::OutputType;
     constexpr static bool INT4 = std::is_same_v<WeightType, cutlass::uint4b_t>;
-    constexpr static bool NVFP4 = std::is_same_v<DataType, SafeFP4> && std::is_same_v<WeightType, SafeFP4>;
-    constexpr static bool FP8 = std::is_same_v<DataType, SafeFP8> && std::is_same_v<WeightType, SafeFP8>;
-    constexpr static bool WFP4AFP8 = std::is_same_v<WeightType, SafeFP4> && std::is_same_v<DataType, SafeFP8>;
-    constexpr static bool INT_QUANT = !std::is_same_v<DataType, WeightType>
-        && (std::is_same_v<WeightType, cutlass::uint4b_t> || std::is_same_v<WeightType, uint8_t>);
-    constexpr static bool ANY_FP4 = NVFP4 || WFP4AFP8;
-    using InputType = std::conditional_t<NVFP4, OutputType, DataType>;
-    using WeightStorage = std::conditional_t<INT_QUANT || ANY_FP4, uint8_t, WeightType>;
-    constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || ANY_FP4) ? 2 : 1;
+    constexpr static bool FP4 = std::is_same_v<DataType, SafeFP4>;
+    constexpr static bool FP8 = std::is_same_v<DataType, SafeFP8>;
+    constexpr static bool INT_QUANT = !std::is_same_v<DataType, WeightType>;
+    using InputType = std::conditional_t<FP4, OutputType, DataType>;
+    using WeightStorage = std::conditional_t<INT_QUANT || FP4, uint8_t, WeightType>;
+    constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || FP4) ? 2 : 1;
     int const BASE_HIDDEN_SIZE = 64 / sizeof(WeightType) * WEIGHT_ELEM_PER_BYTE;
-
-    constexpr static int64_t FP4_VECTOR_SIZE = NVFP4
-        ? tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
-        : tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize;
 
     std::vector<BufferManager::IBufferPtr> managed_buffers;
     int* mSelectedExperts{};
@@ -323,33 +333,12 @@ public:
 
     constexpr static nvinfer1::DataType toDTypeID()
     {
-        if (FP8 || WFP4AFP8)
-            return nvinfer1::DataType::kFP8;
-        if (NVFP4)
-            return nvinfer1::DataType::kFP4;
-        if (INT_QUANT && INT4)
-            return nvinfer1::DataType::kINT4;
-        if (INT_QUANT)
-            return nvinfer1::DataType::kINT8;
-        if (std::is_same_v<DataType, float>)
-            return nvinfer1::DataType::kFLOAT;
-        if (std::is_same_v<DataType, half>)
-            return nvinfer1::DataType::kHALF;
-#ifdef ENABLE_BF16
-        if (std::is_same_v<DataType, nv_bfloat16>)
-            return nvinfer1::DataType::kBF16;
-#endif
-        TLLM_THROW("Unrecognised format");
-    };
-
-    constexpr static nvinfer1::DataType toWTypeID()
-    {
         if (FP8)
             return nvinfer1::DataType::kFP8;
-        if (NVFP4 || WFP4AFP8)
+        if (FP4)
             return nvinfer1::DataType::kFP4;
         if (INT_QUANT && INT4)
-            return nvinfer1::DataType::kINT4;
+            return nvinfer1::DataType::kINT4; // Hack to distinguish int4, use unsigned
         if (INT_QUANT)
             return nvinfer1::DataType::kINT8;
         if (std::is_same_v<DataType, float>)
@@ -359,8 +348,9 @@ public:
 #ifdef ENABLE_BF16
         if (std::is_same_v<DataType, nv_bfloat16>)
             return nvinfer1::DataType::kBF16;
-#endif
+#else
         TLLM_THROW("Unrecognised format");
+#endif
     };
 
     template <class T>
@@ -372,7 +362,7 @@ public:
         }
         else if constexpr (std::is_same_v<T, SafeFP4>)
         {
-            return nvinfer1::DataType::kFP4;
+            return nvinfer1::DataType::kINT64;
         }
         else if constexpr (std::is_same_v<T, uint8_t>)
         {
@@ -407,10 +397,10 @@ public:
         static_assert(!FP8, "FP8 Tests enabled on unsupported CUDA version");
 #endif
 #ifndef ENABLE_FP4
-        static_assert(!ANY_FP4, "FP4 Tests enabled on unsupported CUDA version");
+        static_assert(!FP4, "FP4 Tests enabled on unsupported CUDA version");
 #endif
         bool should_skip_unsupported_fp8 = getSMVersion() < 89 && FP8;
-        bool should_skip_unsupported_fp4 = (getSMVersion() < 100 || getSMVersion() >= 120) && ANY_FP4;
+        bool should_skip_unsupported_fp4 = (getSMVersion() < 100 || getSMVersion() >= 120) && FP4;
         return should_skip_unsupported_fp8 || should_skip_unsupported_fp4;
     }
 
@@ -463,7 +453,7 @@ public:
     float* mExpertFP8Scale3{};
 
     float* mExpertFP4ActScale1{};
-    using ElementSF = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::ElementSF;
+    using ElementSF = TmaWarpSpecializedGroupedGemmInput::ElementSF;
     ElementSF* mExpertFP4WeightSf1{};
     float* mExpertFP4GlobalScale1{};
     float* mExpertFP4ActScale2{};
@@ -485,7 +475,7 @@ public:
     bool mIsGated = false;
     int mGatedMultiplier = 1;
 
-    tensorrt_llm::ActivationType mActType = tensorrt_llm::ActivationType::Relu;
+    ActivationType mActType = ActivationType::Relu;
 
     QuantParams mQuantParams{};
     bool mUseLora = false;
@@ -519,13 +509,12 @@ public:
         mInterSize = inter_size / parallelism_config.tp_size;
         mNumExperts = num_experts;
         mK = k;
-        mIsGated = tensorrt_llm::isGatedActivation(mActType);
+        mIsGated = isGatedActivation(mActType);
         mGatedMultiplier = mIsGated ? 2 : 1;
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
-        size_t workspace_size
-            = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, {},
-                mUseLora, /*use_deepseek_fp8_block_scale=*/false, /*min_latency_mode=*/false, mUsePrequantScale);
+        size_t workspace_size = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK,
+            mActType, {}, mUseLora, /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, mUsePrequantScale);
 
         mWorkspace = allocBuffer<char>(workspace_size);
         size_t const expert_matrix_size = mNumExperts * mHiddenSize * mInterSize;
@@ -556,19 +545,20 @@ public:
 
             mQuantParams = QuantParams::FP8(mExpertFP8Scale1, mExpertFP8Scale2, mExpertFP8Scale3);
         }
-        else if constexpr (ANY_FP4)
+        else if constexpr (FP4)
         {
             mExpertFP4ActScale1 = allocBuffer<float>(1);
-            mExpertFP4WeightSf1 = allocBuffer<ElementSF>(num_experts * gated_inter * mHiddenSize / FP4_VECTOR_SIZE);
+            mExpertFP4WeightSf1 = allocBuffer<ElementSF>(
+                num_experts * gated_inter * mHiddenSize / TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize);
             mExpertFP4GlobalScale1 = allocBuffer<float>(num_experts);
 
             mExpertFP4ActScale2 = allocBuffer<float>(1);
-            mExpertFP4WeightSf2 = allocBuffer<ElementSF>(num_experts * mInterSize * mHiddenSize / FP4_VECTOR_SIZE);
+            mExpertFP4WeightSf2 = allocBuffer<ElementSF>(
+                num_experts * mInterSize * mHiddenSize / TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize);
             mExpertFP4GlobalScale2 = allocBuffer<float>(num_experts);
 
-            auto func = NVFP4 ? QuantParams::FP4 : QuantParams::FP8MXFP4;
-            mQuantParams = func(mExpertFP4ActScale1, mExpertFP4WeightSf1, mExpertFP4GlobalScale1, mExpertFP4ActScale2,
-                mExpertFP4WeightSf2, mExpertFP4GlobalScale2);
+            mQuantParams = QuantParams::FP4(mExpertFP4ActScale1, mExpertFP4WeightSf1, mExpertFP4GlobalScale1,
+                mExpertFP4ActScale2, mExpertFP4WeightSf2, mExpertFP4GlobalScale2);
         }
 
         mSelectedExperts = allocBuffer<int>(mTotalTokens * mK);
@@ -764,7 +754,7 @@ public:
             mExpertWeight1, mExpertBias1, mActType, mExpertWeight2, mExpertBias2, mQuantParams, mTotalTokens,
             mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
             parallelism_config, mUseLora, mLoraParams,
-            /*use_deepseek_fp8_block_scale=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
+            /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
     }
 
     void runBenchmark(benchmark::State& state);
@@ -784,7 +774,7 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     int const num_tokens = state.range(7);
     mUseBias = state.range(8);
     mUseFinalScale = state.range(9);
-    mActType = static_cast<tensorrt_llm::ActivationType>(state.range(10));
+    mActType = static_cast<ActivationType>(state.range(10));
     int tactic_idx1 = state.range(11);
     int tactic_idx2 = state.range(12);
     int const routing_config = state.range(13);
@@ -802,7 +792,6 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     state.counters["act_fn"] = (int) mActType;
     state.counters["routing_config"] = (int) routing_config;
     state.counters["dtype"] = (int) toDTypeID();
-    state.counters["wtype"] = (int) toWTypeID();
 
     std::stringstream ss;
     ss << "Experts,K,Hidden,Inter,TP,EP,Rank,Tokens,Bias,Scale,Actfn,Tactic,Routing=";

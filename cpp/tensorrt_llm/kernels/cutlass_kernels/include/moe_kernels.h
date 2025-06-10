@@ -15,8 +15,8 @@
  */
 
 #pragma once
+#include "./moe_gemm_kernels.h"
 #include "cutlass/gemm/gemm.h"
-#include "moe_gemm_kernels.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"

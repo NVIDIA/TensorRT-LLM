@@ -16,7 +16,7 @@
  */
 
 // Include the fixture with the actual benchmark code
-#include "mixtureOfExpertsBackendBenchmarkFixture.h"
+#include "mixtureOfExpertsBackendBenchmarkFixtureOss.h"
 
 /*
  * Below is all the setup for parameterising the benchmarks
@@ -377,7 +377,7 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
             {
                 continue;
             }
-            else if (BenchClass::NVFP4 && !hasDtype("fp4"))
+            else if (BenchClass::FP4 && !hasDtype("fp4"))
             {
                 continue;
             }
@@ -400,10 +400,6 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
             }
             else if (std::is_same_v<typename BenchClass::WeightType, __nv_bfloat16> && !hasDtype("bfloat16")
                 && !hasDtype("bf16"))
-            {
-                continue;
-            }
-            else if (BenchClass::WFP4AFP8 && !hasDtype("wfp4afp8"))
             {
                 continue;
             }
@@ -472,16 +468,16 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
                 if (!has_tactic_ids2)
                     t2 = t1;
 
-                benchmark->Args({num_experts,                                             //
-                    get_range("k"),                                                       //
-                    get_range("hidden_size"),                                             //
-                    get_range("inter_size"),                                              //
-                    tp_size, ep_size, world_rank,                                         //
-                    get_range("num_tokens"),                                              //
-                    bias, do_final_scale,                                                 //
-                    get_range("act_fn", 0, (int) tensorrt_llm::ActivationType::Identity), //
-                    t1,                                                                   //
-                    t2,                                                                   //
+                benchmark->Args({num_experts,                                 //
+                    get_range("k"),                                           //
+                    get_range("hidden_size"),                                 //
+                    get_range("inter_size"),                                  //
+                    tp_size, ep_size, world_rank,                             //
+                    get_range("num_tokens"),                                  //
+                    bias, do_final_scale,                                     //
+                    get_range("act_fn", 0, (int) (ActivationType::Identity)), //
+                    t1,                                                       //
+                    t2,                                                       //
                     *routing_config});
             }
         }
@@ -497,7 +493,7 @@ void argGenHardcoded(benchmark::internal::Benchmark* benchmark)
     auto inter_size_mul = {4.f};               // {7.f/2.f, 4.f};
     auto num_tokens = {2048};                  // {1, 20, 200, 2048};
     auto use_bias = {0};                       // {0, 1};
-    auto activation_type = {tensorrt_llm::ActivationType::Gelu};
+    auto activation_type = {(ActivationType::Gelu)};
     // {tensorrt_llm::ActivationType::Relu, tensorrt_llm::ActivationType::Gelu,
     // tensorrt_llm::ActivationType::Silu, tensorrt_llm::ActivationType::Geglu,
     // tensorrt_llm::ActivationType::Swiglu};
@@ -563,7 +559,6 @@ BENCHMARK_BASIC(SafeFP8, SafeFP8, half)
 #endif
 #ifdef ENABLE_FP4
 BENCHMARK_BASIC(SafeFP4, SafeFP4, half)
-BENCHMARK_BASIC(SafeFP8, SafeFP4, half)
 #endif
 
 void delayedRegisterBenchmark()
@@ -583,7 +578,6 @@ void delayedRegisterBenchmark()
 #endif
 #ifdef ENABLE_FP4
         BENCHMARK_BASIC_DO_REGISTER(SafeFP4, SafeFP4, half);
-        BENCHMARK_BASIC_DO_REGISTER(SafeFP8, SafeFP4, half);
 #endif
     }
 }
@@ -663,7 +657,7 @@ void help()
            "Useful for quick perf tests, prefer a full sweep and manually setting the tactic for more accurate "
            "results"
            "- dtypes - A list of dtypes to run this config through.\n"
-           "Allowed values are: fp8, fp4, wfp4afp8, int4, int8, float, half, bfloat16\n"
+           "Allowed values are: fp8, int4, int8, float, half, bfloat16\n"
            "If this argument is omitted all dtypes will be run. Note, not all tactics are supported for all "
            "dtypes,\n"
            "unsupported tactics will be skipped with a warning.\n"

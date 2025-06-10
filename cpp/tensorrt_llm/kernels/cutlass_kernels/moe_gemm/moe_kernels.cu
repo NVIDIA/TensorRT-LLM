@@ -756,12 +756,14 @@ __host__ __device__ constexpr int64_t getOffsetActivationSF(int64_t expert_id, i
     return sf_offset * gemm_k / TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
 }
 
+constexpr static int NVFP4_VEC_SIZE = 16;
+
 template <class GemmOutputType, class ComputeElem>
 __device__ uint32_t quantizePackedFP4Value(ComputeElem& post_act_val, float global_scale_val,
     int64_t num_tokens_before_expert, int64_t expert_id, int64_t token_id, int64_t elem_idx, int64_t num_cols,
     int64_t max_tokens_per_expert, TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat)
 {
-    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = NVFP4_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
     // Quantize the input to FP4
     static_assert(std::is_same_v<GemmOutputType, __nv_bfloat16> || std::is_same_v<GemmOutputType, half>);
     static_assert(ComputeElem::kElements == CVT_FP4_ELTS_PER_THREAD);
@@ -776,14 +778,13 @@ __device__ uint32_t quantizePackedFP4Value(ComputeElem& post_act_val, float glob
     auto act_sf_expert = act_sf_flat + getOffsetActivationSF(expert_id, num_tokens_before_expert, num_cols);
 
     // Use `token - num_tokens_before_expert` because we want this to be relative to the start of this expert
-    auto sf_out
-        = cvt_quant_to_fp4_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF, CVT_FP4_NUM_THREADS_PER_SF>(
-            std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx, std::nullopt /* numRows */,
-            num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED);
+    auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF,
+        CVT_FP4_NUM_THREADS_PER_SF, NVFP4_VEC_SIZE>(std::nullopt /* batchIdx */, token_id - num_tokens_before_expert,
+        elem_idx, std::nullopt /* numRows */, num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED);
 
     // Do the conversion and set the output and scaling factor
     constexpr bool UE8M0 = false;
-    auto res = cvt_warp_fp16_to_fp4<GemmOutputType, UE8M0>(packed_vec, global_scale_val, sf_out);
+    auto res = cvt_warp_fp16_to_fp4<GemmOutputType, NVFP4_VEC_SIZE, UE8M0>(packed_vec, global_scale_val, sf_out);
     return res;
 }
 
@@ -792,20 +793,19 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id, int
     TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf)
 {
-    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = NVFP4_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
 
     // We need to offset into the scaling factors for just this expert
     auto act_sf_expert = act_sf_flat + getOffsetActivationSF(expert_id, num_tokens_before_expert, num_cols);
 
     // Use `token - num_tokens_before_expert` because we want this to be relative to the start of this expert
-    auto sf_out
-        = cvt_quant_to_fp4_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF, CVT_FP4_NUM_THREADS_PER_SF>(
-            std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx, std::nullopt /* numRows */,
-            num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED);
+    auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF,
+        CVT_FP4_NUM_THREADS_PER_SF, NVFP4_VEC_SIZE>(std::nullopt /* batchIdx */, token_id - num_tokens_before_expert,
+        elem_idx, std::nullopt /* numRows */, num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED);
     if (sf_out)
     {
         auto const sf_in = cvt_quant_to_fp4_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF,
-            CVT_FP4_NUM_THREADS_PER_SF>(std::nullopt /* batchIdx */, source_token_id, elem_idx,
+            CVT_FP4_NUM_THREADS_PER_SF, NVFP4_VEC_SIZE>(std::nullopt /* batchIdx */, source_token_id, elem_idx,
             std::nullopt /* numRows */, num_cols, const_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(input_sf),
             FP4QuantizationSFLayout::SWIZZLED);
         *sf_out = *sf_in;

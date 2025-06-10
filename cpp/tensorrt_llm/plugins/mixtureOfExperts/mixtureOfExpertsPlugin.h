@@ -30,7 +30,6 @@
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/cudaStreamPlugin/cudaStreamPlugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
-#include "tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin/weightOnlyGroupwiseQuantMatmulPlugin.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include <cassert>
 #include <set>
@@ -47,6 +46,8 @@ using QuantParams = tensorrt_llm::kernels::cutlass_kernels::QuantParams;
 using ActivationType = tensorrt_llm::kernels::cutlass_kernels::ActivationType;
 using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using tensorrt_llm::kernels::cutlass_kernels::isGatedActivation;
+constexpr auto BlockScaleVectorSize
+    = ::tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
 #else
 namespace kernels = tensorrt_llm::kernels;
 using MoeMinLatencyParams = tensorrt_llm::kernels::MoeMinLatencyParams;
@@ -54,7 +55,8 @@ using MOEParallelismConfig = tensorrt_llm::kernels::MOEParallelismConfig;
 using QuantParams = tensorrt_llm::kernels::QuantParams;
 using ActivationType = tensorrt_llm::ActivationType;
 using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput;
-using ::tensorrt_llm::isGatedActivation;
+using tensorrt_llm::isGatedActivation;
+constexpr auto BlockScaleVectorSize = ::tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
 #endif
 
 class MixtureOfExpertsGemmProfiler;
@@ -125,7 +127,7 @@ class MixtureOfExpertsPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
     using LoraPluginProfilerPtr = std::shared_ptr<CublasLtGemmPluginProfiler>;
-    using LoraImplPtr = std::shared_ptr<kernels::LoraImpl>;
+    using LoraImplPtr = std::shared_ptr<tensorrt_llm::kernels::LoraImpl>;
     MixtureOfExpertsPlugin() = delete;
     MixtureOfExpertsPlugin(bool remove_input_padding, int number_of_experts, int experts_per_token,
         int expert_hidden_size, int expert_inter_size, int groupwise_quant_algo, int group_size,
@@ -250,7 +252,7 @@ private:
         int scale_6_idx = -1, int scale_7_idx = -1, int scale_8_idx = -1) const;
 
     int getNumLoraRequests(nvinfer1::PluginTensorDesc const* input_tensor) const;
-    kernels::LoraParams getLoraParams(
+    tensorrt_llm::kernels::LoraParams getLoraParams(
         nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, void* workspace);
 
     enum class RequestType : int32_t

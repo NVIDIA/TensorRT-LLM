@@ -694,14 +694,12 @@ QuantParams tensorrt_llm::plugins::MixtureOfExpertsPlugin::getQuantParams(nvinfe
         TLLM_CHECK(desc_6->dims.nbDims == 1);
         TLLM_CHECK(desc_1->dims.d[0] == 1);
         TLLM_CHECK_WITH_INFO(desc_2->dims.d[0] == experts_per_node && desc_2->dims.d[1] == gated_inter_size
-                && desc_2->dims.d[2]
-                    == mExpertHiddenSize / TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize,
+                && desc_2->dims.d[2] == mExpertHiddenSize / BlockScaleVectorSize,
             "Incorrect shape for FP4 scale");
         TLLM_CHECK_WITH_INFO(desc_3->dims.d[0] == experts_per_node, "Incorrect shape for FP4 scale");
         TLLM_CHECK(desc_4->dims.d[0] == 1);
         TLLM_CHECK_WITH_INFO(desc_5->dims.d[0] == experts_per_node && desc_5->dims.d[1] == mExpertHiddenSize
-                && desc_5->dims.d[2]
-                    == mExpertInterSize / TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize,
+                && desc_5->dims.d[2] == mExpertInterSize / BlockScaleVectorSize,
             "Incorrect shape for FP4 scale");
         TLLM_CHECK_WITH_INFO(desc_6->dims.d[0] == experts_per_node, "Incorrect shape for FP4 scale");
         return QuantParams::FP4(static_cast<float const*>(scale_1),

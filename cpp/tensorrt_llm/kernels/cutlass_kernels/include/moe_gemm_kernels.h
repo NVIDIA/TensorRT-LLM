@@ -28,6 +28,8 @@
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/layout/layout.h"
 
+#include "./common.h"
+
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
@@ -39,18 +41,6 @@ constexpr auto transpose_stride(T const& t)
 {
     return cute::prepend(cute::prepend(cute::take<2, cute::rank_v<T>>(t), cute::get<0>(t)), cute::get<1>(t));
 }
-
-// Note update moe.py to match
-enum class ActivationType
-{
-    Gelu = 0,
-    Relu,
-    Silu,
-    Swiglu,
-    Geglu,
-    Identity,
-    InvalidType
-};
 
 template <typename AType, typename BType, typename BScaleType, typename OType>
 struct GroupedGemmInput
