@@ -173,6 +173,7 @@ class AttentionMetadata:
                 self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
 
         if self.has_cross_sub_metadata:
+            self.cross._seq_lens = self._seq_lens
             self.cross._seq_lens_cuda = self._seq_lens_cuda
 
     @property
@@ -252,11 +253,6 @@ class AttentionMetadata:
         return self._num_tokens
 
     def prepare(self):
-        """
-        Hook to be called before the forward step of the model.
-        """
-
-    def prepare_device(self):
         """
         Hook to be called before the forward step of the model.
         """

@@ -79,7 +79,7 @@ class Eagle3ResourceManager(BaseResourceManager):
         # allocate hidden state tensors and update slot ids
         self.slot_ids = []
         for req in context_batch:
-            if req.is_first_context_chunk():
+            if req.is_first_context_chunk:
                 slot_id = self.slot_manager.add_slot(req.request_id)
                 self.slot_ids.append(slot_id)
         # reset the flag before model forward
@@ -178,7 +178,6 @@ class Eagle3SpecMetadata(SpecMetadata):
         if self.is_draft_model:
             self.eagle3_resource_manager.is_first_draft = False
 
-    def prepare_device(self):
         self.hidden_states_read_indices[:self.num_tokens].copy_(
             self.hidden_states_read_indices_host, non_blocking=True)
         self.hidden_states_write_indices[:self.num_tokens].copy_(
