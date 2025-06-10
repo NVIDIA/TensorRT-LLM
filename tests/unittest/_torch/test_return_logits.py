@@ -14,7 +14,7 @@ from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.llm_utils import BuildConfig, KvCacheConfig
 
 prompts = ["A B C"]
-global_kvcache_config = KvCacheConfig(max_tokens=256)
+global_kvcache_config = KvCacheConfig(max_tokens=2048)
 
 
 def test_LlmResponse_pickle():
@@ -54,19 +54,26 @@ def test_LlmResponse_pickle():
     assert pickle_result.log_probs == logprobs
 
 
+@pytest.mark.skip(reason="https://nvbugs/5327892")
 @force_ampere  # Save H100 resource
-@pytest.mark.parametrize("gather_context_logits", [False, True])
-@pytest.mark.parametrize("gather_generation_logits", [False, True])
 @pytest.mark.parametrize("return_log_probs", [False, True])
-def test_generate_with_return_logits(gather_context_logits: bool,
+@pytest.mark.parametrize("gather_generation_logits", [False, True])
+@pytest.mark.parametrize("gather_context_logits", [False, True])
+@pytest.mark.parametrize("enable_trtllm_sampler", [False, True])
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+def test_generate_with_return_logits(disable_overlap_scheduler: bool,
+                                     enable_trtllm_sampler: bool,
+                                     gather_context_logits: bool,
                                      gather_generation_logits: bool,
                                      return_log_probs: bool):
     if not (gather_context_logits or gather_generation_logits
             or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
 
-    if gather_context_logits:
-        pytest.skip("gather_context_logits unimplemented yet")
+    if enable_trtllm_sampler and return_log_probs:
+        pytest.skip("TRTLLMSampler does not support return_log_probs")
+    elif not enable_trtllm_sampler and gather_context_logits:
+        pytest.skip("TorchSampler does not support gather_context_logits")
 
     build_config = BuildConfig()
     build_config.gather_context_logits = gather_context_logits
@@ -76,51 +83,68 @@ def test_generate_with_return_logits(gather_context_logits: bool,
                            "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
         build_config=build_config,
+        gather_context_logits=gather_context_logits,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
+        enable_trtllm_sampler=enable_trtllm_sampler,
+        disable_overlap_scheduler=disable_overlap_scheduler,
     )
+
     sampling_params = SamplingParams(
         max_tokens=8,
+        top_k=1,
+        top_p=1,
         return_context_logits=gather_context_logits,
         return_generation_logits=gather_generation_logits,
-        logprobs=return_log_probs)
+        logprobs=return_log_probs,
+    )
 
-    for output in llm.generate(prompts, sampling_params=sampling_params):
-        if gather_context_logits:
-            assert output.context_logits is not None
-            assert len(prompts[0].split()) + \
-                   1 == output.context_logits.shape[0]
-        else:
-            assert output.context_logits is None
+    with llm:
+        for output in llm.generate(prompts, sampling_params=sampling_params):
+            if gather_context_logits:
+                assert output.context_logits is not None
+                assert len(prompts[0].split()) == output.context_logits.shape[0]
+            else:
+                assert output.context_logits is None
 
-        if gather_generation_logits:
-            assert output.outputs[0].generation_logits is not None
-            assert output.outputs[0].generation_logits.ndim == 2
-            assert output.outputs[0].generation_logits.shape[
-                0] == sampling_params.max_tokens
-        else:
-            assert output.outputs[0].generation_logits is None
+            if gather_generation_logits:
+                gen_logits = output.outputs[0].generation_logits
+                assert gen_logits is not None
+                assert gen_logits.ndim == 2
+                assert gen_logits.shape[0] == sampling_params.max_tokens
+                assert torch.argmax(
+                    gen_logits, dim=1).tolist() == output.outputs[0].token_ids
+            else:
+                assert output.outputs[0].generation_logits is None
 
-        if return_log_probs:
-            assert len(output.outputs[0].logprobs) == sampling_params.max_tokens
-        else:
-            assert len(output.outputs[0].logprobs) == 0
+            if return_log_probs:
+                assert len(
+                    output.outputs[0].logprobs) == sampling_params.max_tokens
+            else:
+                assert len(output.outputs[0].logprobs) == 0
 
 
+@pytest.mark.skip(reason="https://nvbugs/5327892")
 @force_ampere  # Save H100 resource
-@pytest.mark.parametrize("gather_context_logits", [False, True])
-@pytest.mark.parametrize("gather_generation_logits", [False, True])
 @pytest.mark.parametrize("return_log_probs", [False, True])
-def test_generate_async_with_return_logits(gather_context_logits: bool,
+@pytest.mark.parametrize("gather_generation_logits", [False, True])
+@pytest.mark.parametrize("gather_context_logits", [False, True])
+@pytest.mark.parametrize("enable_trtllm_sampler", [False, True])
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
+                                           enable_trtllm_sampler: bool,
+                                           gather_context_logits: bool,
                                            gather_generation_logits: bool,
                                            return_log_probs: bool):
     if not (gather_context_logits or gather_generation_logits
             or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
 
-    if gather_context_logits:
-        pytest.skip("gather_context_logits unimplemented yet")
+    if enable_trtllm_sampler and return_log_probs:
+        pytest.skip("TRTLLMSampler does not support return_log_probs")
+    elif not enable_trtllm_sampler and gather_context_logits:
+        pytest.skip("TorchSampler does not support gather_context_logits")
 
     build_config = BuildConfig()
     build_config.gather_context_logits = gather_context_logits
@@ -130,35 +154,44 @@ def test_generate_async_with_return_logits(gather_context_logits: bool,
                            "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
         build_config=build_config,
+        gather_context_logits=gather_context_logits,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
+        enable_trtllm_sampler=enable_trtllm_sampler,
+        disable_overlap_scheduler=disable_overlap_scheduler,
     )
     sampling_params = SamplingParams(
         max_tokens=8,
+        top_k=1,
+        top_p=1,
         return_context_logits=gather_context_logits,
         return_generation_logits=gather_generation_logits,
         logprobs=return_log_probs)
 
-    for idx, output in enumerate(
-            llm.generate_async(prompts[0],
-                               sampling_params=sampling_params,
-                               streaming=True)):
-        if gather_context_logits:
-            assert output.context_logits is not None
-            assert len(prompts[0].split()) + \
-                   1 == output.context_logits.shape[0]
-        else:
-            assert output.context_logits is None
+    with llm:
+        for idx, output in enumerate(
+                llm.generate_async(prompts[0],
+                                   sampling_params=sampling_params,
+                                   streaming=True)):
+            if gather_context_logits:
+                assert output.context_logits is not None
+                assert len(prompts[0].split()) == output.context_logits.shape[0]
+            else:
+                assert output.context_logits is None
 
-        if gather_generation_logits:
-            assert output.outputs[0].generation_logits is not None
-            assert output.outputs[0].generation_logits.ndim == 2
-            assert output.outputs[0].generation_logits.shape[0] == 1
-        else:
-            assert output.outputs[0].generation_logits is None
+            if gather_generation_logits:
+                gen_logits = output.outputs[0].generation_logits
+                assert gen_logits is not None
+                assert gen_logits.ndim == 2
+                assert gen_logits.shape[0] == 1
+                assert torch.argmax(
+                    gen_logits,
+                    dim=1).tolist()[0] == output.outputs[0].token_ids[-1]
+            else:
+                assert output.outputs[0].generation_logits is None
 
-        if return_log_probs:
-            assert len(output.outputs[0].logprobs) == idx + 1
-        else:
-            assert len(output.outputs[0].logprobs) == 0
+            if return_log_probs:
+                assert len(output.outputs[0].logprobs) == idx + 1
+            else:
+                assert len(output.outputs[0].logprobs) == 0

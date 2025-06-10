@@ -40,6 +40,7 @@ add_library(
   allgatherOp.cpp
   allreduceOp.cpp
   attentionOp.cpp
+  causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
@@ -74,6 +75,7 @@ add_library(
   redrafterCurandOp.cpp
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
+  renormMoeRoutingOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp

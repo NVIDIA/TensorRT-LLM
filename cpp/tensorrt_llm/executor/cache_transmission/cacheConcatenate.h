@@ -36,6 +36,8 @@ struct TargetRanksInfo
     int mDomainPPSize;
     int mDomainTPSize;
     std::vector<int> mIRanks;
+    int mDuplicateHeadFactor;
+    int mPeerDuplicateHeadFactor;
 };
 
 TargetRanksInfo targetIRanks(

@@ -17,7 +17,6 @@
 
 #include "bindings.h"
 #include "moeBindings.h"
-#include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
@@ -28,7 +27,6 @@
 #include "tensorrt_llm/runtime/decodingOutput.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
-#include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -39,9 +37,7 @@
 #include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
-#include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
-#include "tensorrt_llm/runtime/worldConfig.h"
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
 #include <pybind11/stl.h>
@@ -216,23 +212,6 @@ void initBindings(pybind11::module_& m)
         .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false)
         .def_property_readonly("stream", &tr::BufferManager::getStream);
 
-    py::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
-        .def(py::init<tr::SpeculativeDecodingMode::UnderlyingType>(), py::arg("state"))
-        .def_static("NoneType", &tr::SpeculativeDecodingMode::None)
-        .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal)
-        .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa)
-        .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding)
-        .def_static("ExplicitDraftTokens", &tr::SpeculativeDecodingMode::ExplicitDraftTokens)
-        .def_property_readonly("is_none", &tr::SpeculativeDecodingMode::isNone)
-        .def_property_readonly("is_draft_tokens_external", &tr::SpeculativeDecodingMode::isDraftTokensExternal)
-        .def_property_readonly("is_medusa", &tr::SpeculativeDecodingMode::isMedusa)
-        .def_property_readonly("is_lookahead_decoding", &tr::SpeculativeDecodingMode::isLookaheadDecoding)
-        .def_property_readonly("is_explicit_draft_tokens", &tr::SpeculativeDecodingMode::isExplicitDraftTokens)
-        .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind)
-        .def_property_readonly("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue)
-        .def_property_readonly("predicts_draft_tokens", &tr::SpeculativeDecodingMode::predictsDraftTokens)
-        .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind);
-
     py::classh<tr::TllmRuntime>(m, "TllmRuntime")
         .def(py::init(
             [](std::filesystem::path engine_path, float gpu_weights_percent = 1.0f, bool use_shape_inference = true)
@@ -282,7 +261,6 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("medusa_paths", &tr::decoder_batch::Request::medusaPaths)
         .def_readwrite("medusa_tree_ids", &tr::decoder_batch::Request::medusaTreeIds)
         .def_readwrite("lookahead_runtime_config", &tr::decoder_batch::Request::lookaheadRuntimeConfig);
-    py::bind_vector<std::vector<tr::decoder_batch::Request>>(m, "VectorRequest");
 
     py::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
         .def(py::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), py::arg("logits"),
@@ -290,9 +268,11 @@ void initBindings(pybind11::module_& m)
         .def(py::init<std::vector<tr::ITensor::SharedConstPtr>>(), py::arg("logits"))
         .def_readwrite("logits", &tr::decoder_batch::Input::logits)
         .def_readwrite("max_decoder_steps", &tr::decoder_batch::Input::maxDecoderSteps)
+        .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots)
+        .def_readwrite("batch_slots_request_order", &tr::decoder_batch::Input::batchSlotsRequestOrder)
         .def_readwrite("cache_indirection", &tr::decoder_batch::Input::cacheIndirection)
-        .def_readwrite("predicted_draft_logits", &tr::decoder_batch::Input::predictedDraftLogits)
-        .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots);
+        .def_readwrite("generation_steps", &tr::decoder_batch::Input::generationSteps)
+        .def_readwrite("predicted_draft_logits", &tr::decoder_batch::Input::predictedDraftLogits);
 
     py::class_<tr::decoder_batch::Output>(m, "DecoderBatchOutput")
         .def(py::init())
@@ -347,32 +327,72 @@ void initBindings(pybind11::module_& m)
         .def("setup", &tr::decoder::DecoderState::setup, py::arg("max_batch_size"), py::arg("max_beam_width"),
             py::arg("max_attention_window"), py::arg("sink_token_length"), py::arg("max_sequence_length"),
             py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
+        .def("allocate_speculative_decoding_buffers", &tr::decoder::DecoderState::allocateSpeculativeDecodingBuffers,
+            py::arg("speculative_decoding_mode"), py::arg("dtype"), py::arg("buffer_manager"))
+        .def("setup_speculative_decoding", &tr::decoder::DecoderState::setupSpeculativeDecoding,
+            py::arg("speculative_decoding_mode"), py::arg("max_tokens_per_engine_step"), py::arg("model_config"),
+            py::arg("world_config"), py::arg("buffer_manager"))
+        .def("setup_explicit_draft_tokens", &tr::decoder::DecoderState::setupExplicitDraftTokens,
+            py::arg("explicit_draft_tokens_buffers"))
+        .def("setup_lookahead", &tr::decoder::DecoderState::setupLookahead, py::arg("lookahead_decoding_buffers"))
         .def_property_readonly("joint_decoding_input", &tr::decoder::DecoderState::getJointDecodingInput)
         .def_property_readonly("joint_decoding_output", &tr::decoder::DecoderState::getJointDecodingOutput)
-        .def_property_readonly("sequence_lengths",
-            [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getSequenceLengths()); })
         .def_property_readonly(
-            "all_new_tokens", [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getAllNewTokens()); })
+            "sequence_lengths", py::overload_cast<>(&tr::decoder::DecoderState::getSequenceLengths, py::const_))
+        .def("get_sequence_lengths",
+            py::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getSequenceLengths, py::const_),
+            py::arg("batch_idx"))
+        .def_property_readonly("all_new_tokens", &tr::decoder::DecoderState::getAllNewTokens)
+        .def_property_readonly("finished_sum", &tr::decoder::DecoderState::getFinishedSum)
+        .def_property_readonly("finish_reasons", &tr::decoder::DecoderState::getFinishReasons)
+        .def_property_readonly("ids", py::overload_cast<>(&tr::decoder::DecoderState::getIds, py::const_))
+        .def("get_ids", py::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getIds, py::const_),
+            py::arg("batch_idx"))
         .def_property_readonly(
-            "finished_sum", [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getFinishedSum()); })
-        .def_property_readonly("finish_reasons",
-            [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getFinishReasons()); });
+            "gathered_ids", py::overload_cast<>(&tr::decoder::DecoderState::getGatheredIds, py::const_))
+        .def("get_gathered_ids",
+            py::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getGatheredIds, py::const_),
+            py::arg("batch_idx"))
+        .def_property_readonly("parent_ids", &tr::decoder::DecoderState::getParentIds)
+        .def_property_readonly(
+            "cum_log_probs", py::overload_cast<>(&tr::decoder::DecoderState::getCumLogProbs, py::const_))
+        .def("get_cum_log_probs",
+            py::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getCumLogProbs, py::const_),
+            py::arg("batch_idx"))
+        .def_property_readonly("log_probs", py::overload_cast<>(&tr::decoder::DecoderState::getLogProbs, py::const_))
+        .def("get_log_probs", py::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getLogProbs, py::const_),
+            py::arg("batch_idx"))
+        .def_property_readonly("next_draft_tokens", &tr::decoder::DecoderState::getNextDraftTokens)
+        .def_property_readonly("prev_draft_tokens_lengths", &tr::decoder::DecoderState::getPrevDraftTokensLengths)
+        .def_property_readonly("next_draft_tokens_lengths", &tr::decoder::DecoderState::getNextDraftTokensLengths)
+        .def_property_readonly("accepted_lengths_cum_sum", &tr::decoder::DecoderState::getAcceptedLengthsCumSum)
+        .def_property_readonly("accepted_packed_paths", &tr::decoder::DecoderState::getAcceptedPackedPaths)
+        .def_property_readonly("finished_steps", &tr::decoder::DecoderState::getFinishedSteps)
+        .def_property_readonly("max_beam_width", &tr::decoder::DecoderState::getMaxBeamWidth)
+        .def_property_readonly("max_sequence_length", &tr::decoder::DecoderState::getMaxSequenceLength)
+        .def_property_readonly("max_decoding_decoder_tokens", &tr::decoder::DecoderState::getMaxDecodingDecoderTokens)
+        .def_property_readonly("max_decoding_engine_tokens", &tr::decoder::DecoderState::getMaxDecodingEngineTokens)
+        .def_property_readonly("num_decoding_engine_tokens",
+            py::overload_cast<>(&tr::decoder::DecoderState::getNumDecodingEngineTokens, py::const_))
+        .def("get_num_decoding_engine_tokens",
+            py::overload_cast<tr::SizeType32>(&tr::decoder::DecoderState::getNumDecodingEngineTokens, py::const_),
+            py::arg("batch_idx"))
+        .def("set_num_decoding_engine_tokens", &tr::decoder::DecoderState::setNumDecodingEngineTokens,
+            py::arg("batch_idx"), py::arg("num_tokens"))
+        .def_property_readonly("speculative_decoding_mode", &tr::decoder::DecoderState::getSpeculativeDecodingMode);
 
     py::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
-        .def(py::init<tr::GptDecoderBatched::CudaStreamPtr, tr::SpeculativeDecodingMode const&, nvinfer1::DataType>(),
-            py::arg("stream"), py::arg("speculative_decoding_mode"), py::arg("dtype"))
+        .def(py::init<tr::GptDecoderBatched::CudaStreamPtr>(), py::arg("stream"))
         .def("setup", &tr::GptDecoderBatched::setup, py::arg("mode"), py::arg("max_batch_size"),
-            py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("sink_token_length"),
-            py::arg("max_sequence_length"), py::arg("max_tokens_per_step"), py::arg("dtype"), py::arg("model_config"),
+            py::arg("max_beam_width"), py::arg("max_sequence_length"), py::arg("dtype"), py::arg("model_config"),
             py::arg("world_config"))
-        .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("output"), py::arg("input"))
+        .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("decoder_state"), py::arg("output"),
+            py::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
         .def_property_readonly(
             "decoder_stream",
             [](tr::GptDecoderBatched& self) -> tr::CudaStream const& { return *self.getDecoderStream(); },
-            py::return_value_policy::reference)
-        .def_property_readonly(
-            "decoder_state", py::overload_cast<>(&tr::GptDecoderBatched::getDecoderState, py::const_));
+            py::return_value_policy::reference);
 
     m.def(
         "lamport_initialize_all",
@@ -431,4 +451,28 @@ void initBindings(pybind11::module_& m)
     initMoeBindings(m);
 }
 
+void initBindingsEarly(py::module_& m)
+{
+    py::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
+        .def(py::init<tr::SpeculativeDecodingMode::UnderlyingType>(), py::arg("state"))
+        .def_static("NoneType", &tr::SpeculativeDecodingMode::None)
+        .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal)
+        .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa)
+        .def_static("Eagle", &tr::SpeculativeDecodingMode::Eagle)
+        .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding)
+        .def_static("ExplicitDraftTokens", &tr::SpeculativeDecodingMode::ExplicitDraftTokens)
+        .def_property_readonly("is_none", &tr::SpeculativeDecodingMode::isNone)
+        .def_property_readonly("is_draft_tokens_external", &tr::SpeculativeDecodingMode::isDraftTokensExternal)
+        .def_property_readonly("is_medusa", &tr::SpeculativeDecodingMode::isMedusa)
+        .def_property_readonly("is_eagle", &tr::SpeculativeDecodingMode::isEagle)
+        .def_property_readonly("is_lookahead_decoding", &tr::SpeculativeDecodingMode::isLookaheadDecoding)
+        .def_property_readonly("is_explicit_draft_tokens", &tr::SpeculativeDecodingMode::isExplicitDraftTokens)
+        .def_property_readonly("updates_position_ids", &tr::SpeculativeDecodingMode::updatesPositionIds)
+        .def_property_readonly("requires_attention_mask", &tr::SpeculativeDecodingMode::requiresAttentionMask)
+        .def_property_readonly("predicts_draft_tokens", &tr::SpeculativeDecodingMode::predictsDraftTokens)
+        .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind)
+        .def_property_readonly("variable_draft_length", &tr::SpeculativeDecodingMode::variableDraftLength)
+        .def_property_readonly("has_draft_logits", &tr::SpeculativeDecodingMode::hasDraftLogits)
+        .def_property_readonly("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue);
+}
 } // namespace tensorrt_llm::pybind::runtime

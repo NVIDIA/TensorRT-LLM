@@ -18,11 +18,13 @@ BASE_ZMQ_CLASSES = {
     "llmapi.run_llm_with_postproc": ["perform_faked_oai_postprocess"
                                      ],  # only used in tests
     ### starting import of torch models classes. They are used in test_llm_multi_gpu.py.
+    "tensorrt_llm._torch.model_config": ["MoeLoadBalancerConfig"],
     "tensorrt_llm._torch.models.modeling_bert":
     ["BertForSequenceClassification"],
     "tensorrt_llm._torch.models.modeling_clip": ["CLIPVisionModel"],
     "tensorrt_llm._torch.models.modeling_deepseekv3": ["DeepseekV3ForCausalLM"],
     "tensorrt_llm._torch.models.modeling_gemma3": ["Gemma3ForCausalLM"],
+    "tensorrt_llm._torch.models.modeling_hyperclovax": ["HCXVisionForCausalLM"],
     "tensorrt_llm._torch.models.modeling_llama": [
         "Eagle3LlamaForCausalLM",
         "LlamaForCausalLM",
@@ -48,21 +50,30 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm._torch.models.modeling_siglip": ["SiglipVisionModel"],
     "tensorrt_llm._torch.models.modeling_vila": ["VilaModel"],
     ### ending import of torch models classes
+    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm._torch.pyexecutor.llm_request":
     ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
+    "tensorrt_llm._torch.speculative.mtp": ["MTPConfig"],
+    "tensorrt_llm._torch.speculative.interface": ["SpeculativeDecodingMode"],
+    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm.auto_parallel.config": ["AutoParallelConfig", "CostModel"],
+    "tensorrt_llm.auto_parallel.cluster_info":
+    ["ClusterInfo", "MathThroughput"],
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm.bindings.executor": [
-        "BatchingType", "CapacitySchedulerPolicy", "ContextPhaseParams",
+        "BatchingType", "CacheTransceiverConfig", "CapacitySchedulerPolicy",
+        "ContextPhaseParams", "ContextChunkingPolicy", "DynamicBatchConfig",
         "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
         "FinishReason", "KvCacheConfig", "KvCacheTransferMode",
         "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
-        "SchedulerConfig", "DynamicBatchConfig"
+        "SchedulerConfig"
     ],
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig"],
+    "tensorrt_llm._torch.model_config": ["MoeLoadBalancerConfig"],
     "tensorrt_llm.builder": ["BuildConfig"],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
+    "tensorrt_llm.inputs.multimodal": ["MultimodalInput"],
     "tensorrt_llm.executor.postproc_worker": [
         "PostprocArgs", "PostprocParams", "PostprocWorkerConfig",
         "PostprocWorker.Input", "PostprocWorker.Output"
@@ -81,7 +92,7 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm.llmapi.llm_args": [
         "_ModelFormatKind", "_ParallelConfig", "CalibConfig",
         "CapacitySchedulerPolicy", "KvCacheConfig", "LookaheadDecodingConfig",
-        "TrtLlmArgs", "SchedulerConfig", "LoadFormat"
+        "TrtLlmArgs", "SchedulerConfig", "LoadFormat", "DynamicBatchConfig"
     ],
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.llm_utils":
@@ -102,6 +113,9 @@ BASE_ZMQ_CLASSES = {
     ],
     "torch._utils": ["_rebuild_tensor_v2"],
     "torch.storage": ["_load_from_bytes"],
+    "transformers.tokenization_utils_fast": ["PreTrainedTokenizerFast"],
+    "tokenizers": ["Tokenizer", "AddedToken"],
+    "tokenizers.models": ["Model"],
 }
 
 

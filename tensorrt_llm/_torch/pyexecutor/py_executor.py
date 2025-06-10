@@ -33,7 +33,7 @@ from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
                           LlmRequestState, executor_request_to_llm_request)
 from .model_engine import ModelEngine
-from .sampler import Sampler, SampleState, SampleStateTensors
+from .sampler import Sampler, SampleState, SampleStateTensors, TorchSampler
 from .scheduler import ScheduledRequests
 
 # Environment variable to specify iteration ranges for profiling start/stop.
@@ -280,6 +280,8 @@ class PyExecutor:
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
             raise e
+        finally:
+            self._executor_loop_cleanup()
 
     def start_worker(self):
         self.worker_lock.acquire()
@@ -551,9 +553,9 @@ class PyExecutor:
                 req_stat.dis_serving_stats.kv_cache_size = req.kv_cache_size
             return req_stat
 
-        def get_queued_req_stats(req: RequestQueueItem) -> RequestStats:
+        def get_queued_req_stats(request_id: int) -> RequestStats:
             req_stat = RequestStats()
-            req_stat.id = req.id
+            req_stat.id = request_id
             req_stat.context_prefill_position = 0
             req_stat.num_generated_tokens = 0
             req_stat.avg_num_decoded_tokens_per_iter = 0
@@ -571,9 +573,10 @@ class PyExecutor:
             req_stats.append(req_stat)
 
         for req in list(self.request_queue.queue):
-            req_stat = get_queued_req_stats(req)
-            req_stat.stage = RequestStage.QUEUED
-            req_stats.append(req_stat)
+            if isinstance(req, RequestQueueItem):
+                req_stat = get_queued_req_stats(req.id)
+                req_stat.stage = RequestStage.QUEUED
+                req_stats.append(req_stat)
 
         for req in finished_requests:
             req_stat = get_req_stats(req)
@@ -832,7 +835,6 @@ class PyExecutor:
                     self._process_iter_stats(finished_requests,
                                              self.active_requests,
                                              previous_batch)
-        self._executor_loop_cleanup()
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
@@ -894,6 +896,11 @@ class PyExecutor:
                 finished_requests = []
 
                 if scheduled_batch.batch_size > 0:
+                    if self.kv_cache_transceiver:
+                        # For generation requests which have completed KV cache transfer
+                        self._prepare_disagg_gen_transmission_complete(
+                            scheduled_batch)
+
                     has_ngram_iter_stats = is_ngram and self.model_engine.spec_config.spec_dec_mode.is_ngram(
                     ) and iter_stats is not None
                     if has_ngram_iter_stats:
@@ -913,6 +920,9 @@ class PyExecutor:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
+
+                        # Return the first token to the client
+                        self._handle_first_token_response(scheduled_batch)
 
                     batch_outputs = self._forward_step(scheduled_batch)
 
@@ -949,8 +959,6 @@ class PyExecutor:
                             scheduled_requests=scheduled_batch),
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
-
-        self._executor_loop_cleanup()
 
     def _prepare_draft_requests(self):
         try:
@@ -1029,6 +1037,11 @@ class PyExecutor:
                 self._pause_requests(scheduled_batch.paused_requests)
 
                 if scheduled_batch.batch_size > 0:
+                    if self.kv_cache_transceiver:
+                        # For generation requests which have completed KV cache transfer
+                        self._prepare_disagg_gen_transmission_complete(
+                            scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     # The generation requests that are do not have batch_idx,
@@ -1045,6 +1058,9 @@ class PyExecutor:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
+
+                        # Return the first token to the client
+                        self._handle_first_token_response(scheduled_batch)
 
                     previous_tensors_device = self.previous_batch and self.previous_batch.sample_state.device
 
@@ -1071,11 +1087,11 @@ class PyExecutor:
                     # This is necessary because _forward_step updates the state before _update_requests is executed.
                     scheduled_batch.chunked_requests = [
                         r for r in scheduled_batch.context_requests
-                        if r.get_context_remaining_length() != 0
+                        if r.context_remaining_length != 0
                     ]
                     scheduled_batch.context_requests = [
                         r for r in scheduled_batch.context_requests
-                        if r.get_context_remaining_length() == 0
+                        if r.context_remaining_length == 0
                     ]
 
                     if self.enable_iter_perf_stats:
@@ -1090,8 +1106,6 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
-
-        self._executor_loop_cleanup()
 
     def _process_previous_batch(self):
         self._update_requests(self.previous_batch.sample_state)
@@ -1407,8 +1421,9 @@ class PyExecutor:
             ctx_blocks_list = [0] * (block_size +
                                      self.dist.cp_config['cp_anchor_size'])
 
-            req = executor_request_to_llm_request(req_id, exe_req,
-                                                  ctx_blocks_list)
+            req = executor_request_to_llm_request(
+                req_id, exe_req, self._should_exclude_last_generation_logits(),
+                ctx_blocks_list)
             req.gen_iters = 0
             req.ctx_iters = 0
             req.ctx_blocks = ctx_blocks
@@ -1432,7 +1447,9 @@ class PyExecutor:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')
         else:
             return [
-                executor_request_to_llm_request(req_item.id, req_item.request)
+                executor_request_to_llm_request(
+                    req_item.id, req_item.request,
+                    self._should_exclude_last_generation_logits())
                 for req_item in new_requests
             ]
 
@@ -1488,8 +1505,7 @@ class PyExecutor:
                 request_ids=[0],
                 is_gen=not self.has_context_request,
                 prepare_resource=not self.has_context_request,
-                max_num_draft_tokens=0
-                if self.has_context_request else self.max_draft_tokens,
+                max_num_draft_tokens=self.max_draft_tokens,
             )[0]
             llm_request.is_attention_dp_dummy = True
             self.active_requests.append(llm_request)
@@ -1525,7 +1541,8 @@ class PyExecutor:
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
-                req.py_draft_tokens = req.context_phase_params.draft_tokens
+                ctx_draft_tokens = req.context_phase_params.draft_tokens
+                req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.sampling_config.beam_width
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
@@ -1583,14 +1600,20 @@ class PyExecutor:
         @nvtx_range(
             f"[Executor] _forward_step: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
         )
-        def forward(scheduled_requests, resource_manager, new_tensors_device):
-            return self.model_engine.forward(scheduled_requests,
-                                             resource_manager,
-                                             new_tensors_device)
+        def forward(scheduled_requests, resource_manager, new_tensors_device,
+                    gather_context_logits):
+            return self.model_engine.forward(
+                scheduled_requests,
+                resource_manager,
+                new_tensors_device,
+                gather_context_logits=gather_context_logits)
 
         try:
+            gather_context_logits = any(
+                a.py_return_context_logits
+                for a in scheduled_requests.context_requests)
             outputs = forward(scheduled_requests, self.resource_manager,
-                              new_tensors_device)
+                              new_tensors_device, gather_context_logits)
             return outputs
         except Exception as e:
             traceback.print_exc()
@@ -1602,16 +1625,18 @@ class PyExecutor:
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy request
-        req = self.active_requests[-1]
-        if req.is_attention_dp_dummy:
-            req.state = LlmRequestState.GENERATION_COMPLETE
-            self.inflight_req_ids.erase(req.py_request_id)
-            self._terminate_request(req)
-            self.active_requests.remove(req)
+        if self.active_requests and self.active_requests[
+                -1].is_attention_dp_dummy:
+            request = self.active_requests[-1]
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            self.inflight_req_ids.erase(request.py_request_id)
+            self._terminate_request(request)
+            self.active_requests.remove(request)
 
         for request in scheduled_requests.context_requests:
-            request.move_to_next_context_chunk()
-            if request.get_context_remaining_length() == 0:
+            if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
+                request.move_to_next_context_chunk()
+            if request.context_remaining_length == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
 
     def _update_request_states_star_attention(
@@ -1983,6 +2008,19 @@ class PyExecutor:
                         self.responses.update({req_id: [resp]})
                 self.response_cv.notify_all()
 
+    @nvtx_range("_handle_first_token_response")
+    def _handle_first_token_response(self, scheduled_batch):
+        new_responses = {}
+        for req in scheduled_batch.generation_requests:
+            if req.py_decoding_iter == 1:
+                logger.debug(
+                    f'Send first token response for request {req.py_request_id}'
+                )
+                response = req.create_response(False, self.dist.rank)
+                new_responses.update({req.py_request_id: response})
+
+        self._enqueue_responses(new_responses)
+
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
         new_responses = {}
@@ -2000,7 +2038,8 @@ class PyExecutor:
 
             if request.is_generation_only_request:
                 # If request is in transmission, so we don't need to emit a response
-                # Also, for the first iteration with overlap, we should skip since first token has already been emitted by context server
+                # Also, for the first iteration with overlap, we should skip since first
+                # token has already been emitted previously
                 if request.is_disagg_generation_transmission_in_progress or (
                         not self.disable_overlap_scheduler
                         and request.py_decoding_iter <= 1):
@@ -2083,3 +2122,19 @@ class PyExecutor:
         for req in chain(scheduled_requests.context_requests,
                          scheduled_requests.generation_requests):
             self.inflight_req_ids.erase(req.request_id)
+
+    def _should_exclude_last_generation_logits(self) -> bool:
+        # When overlap scheduler is enabled then when starting to handle a new prompt,
+        # sample_async is called twice before the first call to update_requests:
+        # - 1st time as a context request that handles on the 1st generated token
+        # - 2nd time as a generation request that handles on the 2nd generated token.
+        # and only after these two calls the sampler's update_request method is called.
+        # So in a sampler that works by the expected flow of handling the logits in
+        # sample_async (TorchSampler is an anomaly that instead does that on
+        # update_requests), every update_request doesn't handle the newest token, but one
+        # before it. Since all these calls work on the same request object, then its
+        # logits storage contains the logits of both the token update_requests should work
+        # on, and also its next token. Thus, excluding the last generation logits from any
+        # getter is required, when not using TorchSampler.
+        return not self.disable_overlap_scheduler and not isinstance(
+            self.sampler, TorchSampler)

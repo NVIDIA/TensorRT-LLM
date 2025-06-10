@@ -16,6 +16,7 @@ from utils.llm_data import llm_models_root
 # TODO: Add cuda graph enabled tests.
 # Cuda graph cannot currently be enabled for ngram because cuda graph requires
 # spec metadata and ngram does not have it.
+@pytest.mark.skip(reason="https://nvbugs/5324239")
 @pytest.mark.parametrize("use_cuda_graph,attn_backend",
                          [[False, "TRTLLM"], [False, "FLASHINFER"]])
 def test_llama_ngram(use_cuda_graph: bool, attn_backend: str):
@@ -26,7 +27,7 @@ def test_llama_ngram(use_cuda_graph: bool, attn_backend: str):
     models_path = llm_models_root()
 
     pytorch_config = dict(
-        enable_overlap_scheduler=False,
+        disable_overlap_scheduler=True,
         use_cuda_graph=use_cuda_graph,
         # Only create a single CUDA graph to prevent OOM in CI
         attn_backend=attn_backend,

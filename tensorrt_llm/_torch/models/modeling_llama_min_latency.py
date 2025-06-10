@@ -15,7 +15,7 @@ from ...models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PredefinedAttentionMask
 from ..model_config import ModelConfig
-from ..modules.fused_moe import (BaseMoeRoutingMethod, FusedMoE,
+from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
                                  FusedMoEQuantScalesFP8,
                                  Llama4RenormalizeMoeRoutingMethod,
                                  MoEWeightLoadingMode)
@@ -127,7 +127,6 @@ class Llama4MinLatencyLinear(Linear):
     def apply_linear(
         self,
         input,
-        weight,
         bias,
         lora_params: Optional[dict] | None = None,
         layer_idx: Optional[int] | None = None,
@@ -232,12 +231,12 @@ class Llama4MinLatencyLinear(Linear):
         # If special gemm+swiglu kernel is not used and enable_fused_gemm_swiglu is True, we need to apply swiglu
         # manually.
         if self.enable_fused_gemm_swiglu:
-            intermediate = super().apply_linear(input, weight, bias,
-                                                lora_params, layer_idx)
+            intermediate = super().apply_linear(input, bias, lora_params,
+                                                layer_idx)
             return swiglu(intermediate)
 
         # Otherwise, call the default apply_linear method.
-        return super().apply_linear(input, weight, bias, lora_params, layer_idx)
+        return super().apply_linear(input, bias, lora_params, layer_idx)
 
     # Set the position_ids for the next call to apply_linear.
     def set_position_ids(self, position_ids: Optional[torch.LongTensor] = None):
@@ -433,7 +432,7 @@ class Llama4MinLatencyAttention(Llama4Attention):
                                      all_reduce_params, skip_attn_scaling)
 
 
-class Llama4MinLatencyFusedMoE(FusedMoE):
+class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
 
     def __init__(
         self,

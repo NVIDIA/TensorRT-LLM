@@ -42,7 +42,6 @@ from ..bindings.executor import (
                                  PeftCacheConfig as _PeftCacheConfig,
                                  SchedulerConfig as _SchedulerConfig) # isort: skip
 # isort: on
-from transformers import PreTrainedTokenizerBase
 
 # yapf: enable
 from ..builder import BuildConfig, EngineConfig
@@ -1087,7 +1086,7 @@ class BaseLlmArgs(BaseModel):
             self.speculative_model
         ) if self.speculative_model is not None else None
         if model_obj.is_local_model and self.backend not in [
-                'pytorch', 'autodeploy'
+                'pytorch', '_autodeploy'
         ]:
             # Load parallel_config from the engine.
             self.model_format = get_model_format(self.model)
@@ -1191,7 +1190,7 @@ class BaseLlmArgs(BaseModel):
 
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
-                if self.backend != 'pytorch':
+                if self.backend not in ['pytorch', '_autodeploy']:
                     eagle_config = _EagleConfig(
                         self.speculative_config.eagle_choices,
                         self.speculative_config.greedy_sampling,
@@ -1211,7 +1210,7 @@ class BaseLlmArgs(BaseModel):
                         eagle3_one_model)
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.NGRAM
-                assert self.backend == 'pytorch'
+                assert self.backend in ['pytorch', '_autodeploy']
                 assert self.speculative_config.prompt_lookup_num_tokens > 0 and self.speculative_config.max_matching_ngram_size > 0
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 from tensorrt_llm._torch.speculative import NGramConfig
@@ -1259,9 +1258,11 @@ class BaseLlmArgs(BaseModel):
                     "lora_dir is empty, so custom embedding or lm head will not be applied."
                 )
 
-        if self.enable_lora and self.lora_config is not None and self.backend == 'pytorch':
+        if self.enable_lora and self.lora_config is not None and self.backend in [
+                'pytorch', '_autodeploy'
+        ]:
             logger.warning(
-                "enable_lora is ignored when lora_config is provided for pytorch backend."
+                f"enable_lora is ignored when lora_config is provided for {self.backend} backend."
             )
 
         if self.lora_config is not None:
@@ -1497,10 +1498,10 @@ class TorchLlmArgs(BaseLlmArgs):
         "If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used."
     )
 
-    moe_load_balancer: Optional[Union[object, dict, str]] = Field(
+    moe_load_balancer: Optional[Union[object, str]] = Field(
         default=None,
         description="Configuration for MoE load balancing.",
-        json_schema_extra={"type": f"Union[MoeLoadBalancerConfig, dict, str]"})
+        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.")
@@ -1616,29 +1617,23 @@ class TorchLlmArgs(BaseLlmArgs):
         self.model_format = _ModelFormatKind.HF
 
         if isinstance(self.moe_load_balancer, str):
-            assert os.path.exists(self.moe_load_balancer)
-            if self.moe_load_balancer.endswith(".json"):
-                with open(self.moe_load_balancer) as f:
-                    self.moe_load_balancer = json.load(f)
-            elif self.moe_load_balancer.endswith((".yaml", ".yml")):
-                with open(self.moe_load_balancer) as f:
-                    self.moe_load_balancer = yaml.safe_load(f)
-            else:
-                raise ValueError(
-                    f"Unsupported moe load balancer config file: {self.moe_load_balancer}"
+            if not os.path.exists(self.moe_load_balancer):
+                raise FileNotFoundError(
+                    f"MoE load balancer config file not found: {self.moe_load_balancer}"
                 )
-        if isinstance(self.moe_load_balancer, dict):
-            self.moe_load_balancer = MoeLoadBalancerConfig(
-                **self.moe_load_balancer)
+            try:
+                with open(self.moe_load_balancer) as f:
+                    moe_load_balancer_config = yaml.safe_load(f)
+                self.moe_load_balancer = MoeLoadBalancerConfig(
+                    **moe_load_balancer_config)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load MoE load balancer config file: {self.moe_load_balancer}"
+                ) from e
 
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-
-        # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
-        # Just a WAR to support the auto_deploy
-        if self.auto_deploy_config is not None:
-            return self.auto_deploy_config
 
         return PyTorchConfig(
             extra_resource_managers=self.extra_resource_managers,
@@ -1719,7 +1714,7 @@ class TorchLlmArgs(BaseLlmArgs):
         2. If cuda_graph_batch_sizes is not provided, it is generated based on cuda_graph_max_batch_size
         3. If both are provided, cuda_graph_batch_sizes must match the generated values
         """
-        if self.cuda_graph_batch_sizes is not None:
+        if self.cuda_graph_batch_sizes:
             self.cuda_graph_batch_sizes = sorted(self.cuda_graph_batch_sizes)
             if self.cuda_graph_max_batch_size != 0:
                 if self.cuda_graph_batch_sizes != self._generate_cuda_graph_batch_sizes(
@@ -1744,12 +1739,114 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
 
+class _AutoDeployLlmArgs(TorchLlmArgs):
+    """LLM arguments specifically for AutoDeploy backend.
+
+    This class extends TorchLlmArgs with AutoDeploy-specific configuration options.
+    AutoDeploy provides automatic deployment and optimization of language models
+    with various attention backends and optimization strategies.
+    """
+
+    model_factory: Literal[
+        "AutoModelForCausalLM", "AutoModelForImageTextToText"] = Field(
+            default="AutoModelForCausalLM",
+            description="The model factory to use for loading the model.",
+        )
+
+    model_kwargs: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=
+        "Extra kwargs for the model config class to customize the model config. "
+        "These arguments take precedence over default values or config values in the model config "
+        "file. Arguments are resolved in order: 1) Default values in model config class, 2) Values "
+        "in model config file, 3) Values in model_kwargs. Note: if a kwarg doesn't exist in the "
+        "model config class, it will be ignored.",
+    )
+
+    mla_backend: Literal["MultiHeadLatentAttention"] = Field(
+        default="MultiHeadLatentAttention",
+        description="The Multi-Head Latent Attention backend to use.",
+    )
+
+    skip_loading_weights: bool = Field(
+        default=False,
+        description=
+        "Whether to skip loading model weights during initialization. "
+        "If True, only the model architecture is loaded.",
+    )
+
+    free_mem_ratio: float = Field(
+        default=0.8,
+        description="The fraction of available memory to allocate for cache. "
+        "Must be between 0.0 and 1.0.",
+    )
+
+    simple_shard_only: bool = Field(
+        default=False,
+        description=
+        "If True, force simple sharding (all_gather) in tensor parallelism. "
+        "If False, auto-detect and use column+row (all_reduce) sharding when possible.",
+    )
+
+    # TODO: Remove this field once tokens_per_block is properly passed through
+    attn_page_size: int = Field(
+        default=64,
+        description=
+        "Page size for attention (tokens_per_block). For TritonWithFlattenedInputs "
+        "backend, this should equal max_seq_len. Temporary field until tokens_per_block gets "
+        "properly passed through.",
+    )
+
+    @field_validator("free_mem_ratio")
+    @classmethod
+    def validate_free_mem_ratio(cls, v):
+        """Validate that free_mem_ratio is between 0.0 and 1.0."""
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(
+                f"free_mem_ratio must be between 0.0 and 1.0, got {v}")
+        return v
+
+    @print_traceback_on_error
+    def model_post_init(self, __context):
+        # Modify default values that differ from TorchLlmArgs
+        new_defaults = {
+            "max_batch_size": 8,
+            "max_seq_len": 512,
+            "attn_backend": "FlashInfer",
+            # TODO: Remove this when overlap scheduler is supported (https://github.com/NVIDIA/TensorRT-LLM/issues/4364)
+            "disable_overlap_scheduler": True,
+        }
+        for k, v_default in new_defaults.items():
+            if k not in self.__pydantic_fields_set__:
+                setattr(self, k, v_default)
+
+        # NOTE: Only call super() after setting the default values since default values should be
+        # set first.
+        super().model_post_init(__context)
+
+        # Handle attn_page_size for TritonWithFlattenedInputs backend
+        if self.attn_backend == "TritonWithFlattenedInputs":
+            self.attn_page_size = self.max_seq_len
+
+        # Add max_position_embeddings to model_kwargs
+        # TODO (lucaslie): this is more HF specific than a generic model_kwargs. Ideally, we can
+        # move this to the HF model factory but we don't have access to max_seq_len there right now.
+        self.model_kwargs["max_position_embeddings"] = min(
+            self.max_seq_len,
+            self.model_kwargs.get("max_position_embeddings", self.max_seq_len),
+        )
+
+    # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
+    def get_pytorch_backend_config(self) -> "_AutoDeployLlmArgs":
+        """Return the _AutoDeployLlmArgs (self) object."""
+        return self
+
+
 def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,
         extra_llm_api_options: Optional[str] = None) -> Dict:
 
-    from .._torch.pyexecutor.config import PyTorchConfig
     field_mapping = {
         "quant_config": QuantConfig,
         "calib_config": CalibConfig,
@@ -1762,18 +1859,18 @@ def update_llm_args_with_extra_dict(
         "speculative_config": DecodingBaseConfig,
         "batching_type": BatchingType,
         "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
-        "pytorch_backend_config": PyTorchConfig,
         "cache_transceiver_config": CacheTransceiverConfig,
     }
-    for field, field_type in field_mapping.items():
-        if field in llm_args_dict:
-            if field == "speculative_config":
-                llm_args_dict[field] = field_type.from_dict(
-                    llm_args_dict[field])
+    for field_name, field_type in field_mapping.items():
+        if field_name in llm_args_dict:
+            if field_name == "speculative_config":
+                llm_args_dict[field_name] = field_type.from_dict(
+                    llm_args_dict[field_name])
             else:
-                llm_args_dict[field] = field_type(**llm_args_dict[field])
+                llm_args_dict[field_name] = field_type(
+                    **llm_args_dict[field_name])
             extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
-            logger.warning(f"Overriding {field} {extra_llm_str}")
+            logger.warning(f"Overriding {field_name} {extra_llm_str}")
 
     llm_args = llm_args | llm_args_dict
     return llm_args

@@ -1642,9 +1642,12 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
                                      streaming=False,
                                      backend=None):
     LLM_CLASS = LLM
+    llm_extra_kwargs = {}
     if backend == "pytorch":
         from tensorrt_llm._torch import LLM as LLM_torch
         LLM_CLASS = LLM_torch
+    else:
+        llm_extra_kwargs["fast_build"] = True
 
     llm = LLM_CLASS(
         llama_model_path,
@@ -1652,7 +1655,7 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
         build_config=BuildConfig(gather_context_logits=True),
         tensor_parallel_size=tp_size,
         gather_generation_logits=True,
-        fast_build=True,
+        **llm_extra_kwargs,
     )
 
     prompts = ["A B C D E F G H I J K"]
@@ -1924,6 +1927,63 @@ def test_llm_get_stats(return_context_logits, enable_iter_req_stats):
                                return_context_logits=return_context_logits,
                                pytorch_backend=False,
                                enable_iter_req_stats=enable_iter_req_stats)
+
+
+def test_llm_get_queued_stats():
+    enable_iter_req_stats = True
+    use_overlap = False
+    tp_size = 1
+
+    num_requests = 10
+    repeated_prompts = ["A B C D E F G H I J K L M"] * num_requests
+
+    llm_args_extra = {}
+    sampling_args_extra = {}
+
+    from tensorrt_llm._torch import LLM as LLM_torch
+
+    llm_args_extra.update(
+        dict(enable_iter_perf_stats=True,
+             enable_iter_req_stats=enable_iter_req_stats,
+             disable_overlap_scheduler=not use_overlap))
+    LLM_CLASS = LLM_torch
+
+    llm = LLM_CLASS(model=llama_model_path,
+                    kv_cache_config=global_kvcache_config,
+                    tensor_parallel_size=tp_size,
+                    max_batch_size=1,
+                    **llm_args_extra)
+
+    max_tokens = 10
+    sampling_params = SamplingParams(max_tokens=max_tokens,
+                                     **sampling_args_extra)
+
+    max_tries = 10
+    has_queue_requests = False
+
+    while not has_queue_requests and max_tries > 0:
+        max_tries -= 1
+        # Generate outputs, which will queue requests
+        for output in llm.generate(repeated_prompts,
+                                   sampling_params=sampling_params):
+            print(output)
+
+        results = llm.get_stats(2)
+
+        for index, result in enumerate(results):
+            if "requestStats" in result:
+                for requestStat in result["requestStats"]:
+                    if requestStat["stage"] == "QUEUED":
+                        has_queue_requests = True
+                        assert requestStat["numGeneratedTokens"] == 0
+
+        if not has_queue_requests:
+            print("No queued requests found, retrying...")
+            asyncio.sleep(1)
+        else:
+            print("Found queued requests, breaking out of the loop.")
+
+    assert has_queue_requests
 
 
 def llm_get_stats_async_test_harness(tp_size: int = 1,
@@ -2203,7 +2263,7 @@ def test_llm_abort_request(llm_for_sampling_params,
 
 
 def test_llm_sampling_params_n_lt_max_batch_size():
-    sampling_params = SamplingParams(n=2, best_of=1)
+    sampling_params = SamplingParams(n=2, top_p=0.95)
     build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,

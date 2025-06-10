@@ -12,7 +12,7 @@ def deepseek_v3_attention(
     self,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
+    position_ids: Optional[torch.IntTensor] = None,
     past_key_value: Optional[Cache] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
@@ -171,8 +171,8 @@ CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
 }
 
 
-def get_model_from_config_patched(model_config, trust_remote_code):
-    model = _from_config_original(model_config, trust_remote_code=trust_remote_code)
+def get_model_from_config_patched(config, **kwargs):
+    model = _from_config_original(config, **kwargs)
     # Patch modules
     for _, module in model.named_modules():
         if type(module).__name__ in CUSTOM_MODULE_PATCHES.keys():
