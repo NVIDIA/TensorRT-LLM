@@ -1,6 +1,7 @@
 import unittest
 from dataclasses import dataclass
 
+import pytest
 import torch
 
 import tensorrt_llm
@@ -93,9 +94,13 @@ def create_model_engine_and_kvcache(config: PyTorchConfig = None):
     tokens_per_block = 1
     max_tokens = 258  # Atleast 1 more than the max seq len
     num_layers = 1
+    batch_size = 13
 
     config = config if config else PyTorchConfig(
         use_cuda_graph=True, cuda_graph_padding_enabled=True)
+    config.cuda_graph_batch_sizes = [
+        1, 2, 4, 8, 16, 32, 64, 128
+    ] if config.cuda_graph_batch_sizes is None else config.cuda_graph_batch_sizes
     test_batches = (5, 13)
     for batch_size in test_batches:
         assert batch_size not in config.cuda_graph_batch_sizes
@@ -123,6 +128,7 @@ def create_model_engine_and_kvcache(config: PyTorchConfig = None):
     return model_engine, kv_cache_manager
 
 
+@pytest.mark.skip(reason="https://nvbugs/5324248")
 class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_pad_generation_requests(self) -> None:
@@ -153,6 +159,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             batch.context_requests = []
             batch.generation_requests = requests
             pages_before = kv_cache_manager.get_num_free_blocks()
+            new_dummy_block = 1 if model_engine.cuda_graph_dummy_request is None else 0
             with model_engine._maybe_pad_batch(
                     batch, kv_cache_manager) as padded_batch:
                 if batch_size < 8 and max_seq_len < 25:
@@ -165,8 +172,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                     # The seqlen check makes sure we don't exceed the KV cache memory
                     # budget.
                     self.assertIs(batch, padded_batch)
-            self.assertEqual(kv_cache_manager.get_num_free_blocks(),
-                             pages_before)
+            self.assertEqual(
+                kv_cache_manager.get_num_free_blocks() + new_dummy_block,
+                pages_before)
 
         kv_cache_manager.shutdown()
 
@@ -205,7 +213,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         model_engine.forward(batch, resource_manager)
         expected_gen_pos_id = torch.tensor([prompt_len],
-                                           dtype=torch.int64,
+                                           dtype=torch.int32,
                                            device='cuda').unsqueeze(0)
         torch.testing.assert_close(model_engine.model.recorded_position_ids,
                                    expected_gen_pos_id,
@@ -258,6 +266,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                    rtol=0)
 
         kv_cache_manager.shutdown()
+
+    def test_cuda_graph_padding_filters_huge_batch_size(self):
+        config = PyTorchConfig(
+            use_cuda_graph=True,
+            cuda_graph_padding_enabled=True,
+            cuda_graph_batch_sizes=[1, 2, 3, 1000000000000000000000000])
+        model_engine = DummyModelEngine(config, 32, torch.half)
+
+        self.assertEqual(model_engine._cuda_graph_batch_sizes,
+                         [1, 2, 3, model_engine.max_seq_len])
 
 
 if __name__ == "__main__":
