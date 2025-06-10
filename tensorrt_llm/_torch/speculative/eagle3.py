@@ -6,7 +6,6 @@ from torch import nn
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -214,67 +213,26 @@ class Eagle3Sampler(TorchSampler):
                            sampler_event=sampler_event)
 
     def update_requests(self, state: SampleState) -> None:
+        assert isinstance(state, SampleState)
         if state.sampler_event:
             state.sampler_event.synchronize()
-        scheduled_requests = state.scheduled_requests
-
         token_idx = 0
-        beam_idx = 0
+        if hasattr(state.scheduled_requests, 'chunked_requests'):
+            token_idx += len(state.scheduled_requests.chunked_requests)
 
-        def add_tokens(request: LlmRequest,
-                       skip_tokens: int = 0) -> tuple[int, bool]:
-            new_token = state.host.new_tokens[token_idx + skip_tokens]
-            request.add_new_token(new_token, beam_idx)
-            return new_token, self._handle_stop_criteria(request,
-                                                         new_token,
-                                                         beam=beam_idx)
+        def get_new_token(request: LlmRequest, new_tokens: torch.Tensor,
+                          skip: int, beam: int) -> int:
+            new_token = new_tokens[token_idx + skip]
+            request.add_new_token(new_token, beam)
+            return new_token
 
-        if hasattr(scheduled_requests, 'chunked_requests'):
-            token_idx += len(scheduled_requests.chunked_requests)
-
-        for request in scheduled_requests.context_requests:
-            if request.get_context_remaining_length() != 0:
-                token_idx += 1
-                continue
-
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                add_tokens(request)
-                request.py_decoding_iter += 1
+        def req_callback(request: LlmRequest):
+            nonlocal token_idx
             token_idx += 1
+            if request.is_context_finished:
+                token_idx += len(request.py_draft_tokens)
 
-        extend_requests = []
-        generation_requests = []
-        for request in scheduled_requests.generation_requests:
-            if len(request.py_draft_tokens) > 0:
-                extend_requests.append(request)
-            else:
-                generation_requests.append(request)
-
-        for request in extend_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                new_token, _ = add_tokens(request)
-
-                # Accept draft tokens (if we have any) if and only if they match the new
-                # token exactly.
-                num_accepted = 0
-                for draft_token in request.py_draft_tokens:
-                    if draft_token != new_token:
-                        # Reject.
-                        break
-                    num_accepted += 1
-                    _, is_stop = add_tokens(request, num_accepted)
-                    if is_stop:
-                        break
-                request.py_decoding_iter += 1
-                request.py_num_accepted_draft_tokens = num_accepted
-                request.py_rewind_len = request.py_draft_pages_allocated - num_accepted
-            token_idx += len(request.py_draft_tokens) + 1
-
-        for request in generation_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                add_tokens(request)
-                request.py_decoding_iter += 1
-            token_idx += 1
+        super().update_requests(state, get_new_token, req_callback=req_callback)
 
 
 class Eagle3OneModelSampler(MTPSampler):
