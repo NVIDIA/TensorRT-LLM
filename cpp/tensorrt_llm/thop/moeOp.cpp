@@ -49,8 +49,7 @@ namespace kernels = tensorrt_llm::kernels::cutlass_kernels;
 using ActivationType = tensorrt_llm::kernels::cutlass_kernels::ActivationType;
 using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 #else
-constexpr auto BlockScaleVectorSize
-    = tensorrt_llm::kernels::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
+constexpr auto BlockScaleVectorSize = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
 namespace kernels = tensorrt_llm::kernels;
 using ActivationType = tensorrt_llm::ActivationType;
 using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput;

@@ -56,7 +56,7 @@ using QuantParams = tensorrt_llm::kernels::QuantParams;
 using ActivationType = tensorrt_llm::ActivationType;
 using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput;
 using tensorrt_llm::isGatedActivation;
-constexpr auto BlockScaleVectorSize = ::tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
+constexpr auto BlockScaleVectorSize = ::tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
 #endif
 
 class MixtureOfExpertsGemmProfiler;

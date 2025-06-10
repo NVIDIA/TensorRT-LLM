@@ -52,6 +52,7 @@ endfunction()
 
 add_benchmark(mixtureOfExpertsBackendBenchmark
               mixtureOfExpertsBackendBenchmarkLauncher.cu)
-
-add_benchmark(mixtureOfExpertsBackendBenchmarkOss
-              mixtureOfExpertsBackendBenchmarkLauncherOss.cu)
+if(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+  add_benchmark(mixtureOfExpertsBackendBenchmarkOss
+                mixtureOfExpertsBackendBenchmarkLauncherOss.cu)
+endif()
