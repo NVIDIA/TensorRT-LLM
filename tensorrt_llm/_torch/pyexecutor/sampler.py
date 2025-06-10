@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 
@@ -174,6 +173,7 @@ def seq_slice(request: LlmRequest, beam: int, *,
 def add_token(request: LlmRequest,
               new_tokens: torch.Tensor,
               beam: int,
+              *,
               step: int = 0) -> int:
     seq_slot = request.seq_slot
     assert seq_slot is not None
@@ -274,13 +274,7 @@ class TorchSampler(Sampler):
             assert beam == 0, "The following call relies on beam_width to be 1 - hence the list with a single element"
             request.py_result.append_log_probs([token_log_probs])
 
-    def update_requests(
-            self,
-            state: SampleState,
-            add_token: Callable[[LlmRequest, torch.Tensor, int, int],
-                                int] = add_token,
-            *,
-            req_callback: Callable[[LlmRequest], None] = None) -> None:
+    def update_requests(self, state: SampleState) -> None:
         assert isinstance(state, SampleState)
         if state.sampler_event:
             state.sampler_event.synchronize()
@@ -293,42 +287,42 @@ class TorchSampler(Sampler):
                     # Reject.
                     break
                 num_accepted += 1
-                new_token = add_token(req, new_tokens, self.BEAM, num_accepted)
+                new_token = add_token(req,
+                                      new_tokens,
+                                      self.BEAM,
+                                      step=num_accepted)
                 if self._handle_stop_criteria(req, new_token, beam=self.BEAM):
                     break
-            self.handle_logits(req, state, beam=self.BEAM, count=num_accepted)
+            if num_accepted > 0:
+                self.handle_logits(req,
+                                   state,
+                                   beam=self.BEAM,
+                                   count=num_accepted)
             req.py_num_accepted_draft_tokens = num_accepted
             req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
 
         for req in state.scheduled_requests.context_requests:
             if req.get_context_remaining_length() != 0:
-                if req_callback:
-                    req_callback(req)
                 continue
 
             if req.state != LlmRequestState.GENERATION_COMPLETE:
-                new_token = add_token(req, new_tokens, self.BEAM, 0)
+                new_token = add_token(req, new_tokens, self.BEAM)
                 self._handle_stop_criteria(req, new_token, beam=self.BEAM)
                 req.py_decoding_iter += 1
-            if req_callback:
-                req_callback(req)
 
         for req in state.scheduled_requests.generation_requests:
             if req.state != LlmRequestState.GENERATION_COMPLETE:
-                new_token = add_token(req, new_tokens, self.BEAM, 0)
+                new_token = add_token(req, new_tokens, self.BEAM)
                 self._handle_stop_criteria(req, new_token, beam=self.BEAM)
                 if len(req.py_draft_tokens) > 0:
                     process_draft_tokens(req, new_token)
                 else:
                     self.handle_logits(req, state, beam=self.BEAM, count=1)
                 req.py_decoding_iter += 1
-            if req_callback:
-                req_callback(req)
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs: dict[str, torch.Tensor]) -> SampleState:
         requests = scheduled_requests.all_requests()
-        raw_logits = model_outputs["logits"]
         new_tokens_device = self.store.new_tokens_device
         logits_shape = (*new_tokens_device.shape, self.vocab_size)
         gen_logits = None
@@ -338,8 +332,8 @@ class TorchSampler(Sampler):
         if any(req.py_return_log_probs for req in requests):
             log_probs = torch.empty(logits_shape, device="cpu")
         self._process_requests(requests,
-                               raw_logits,
-                               new_tokens=new_tokens_device,
+                               model_outputs,
+                               new_tokens_device,
                                gen_logits=gen_logits,
                                log_probs=log_probs)
         new_tokens_host = new_tokens_device.to(device="cpu", non_blocking=True)
@@ -355,13 +349,15 @@ class TorchSampler(Sampler):
 
     def _process_requests(self,
                           requests: list[LlmRequest],
-                          raw_logits: torch.Tensor,
-                          *,
+                          model_outputs: dict[str, torch.Tensor],
                           new_tokens: torch.Tensor,
+                          *,
                           gen_logits: torch.Tensor | None = None,
                           log_probs: torch.Tensor | None = None):
         beam = self.BEAM
         offset = 0
+        raw_logits = model_outputs["logits"]
+
         for request in requests:
             steps = 1
             if len(request.py_draft_tokens) > 0:
@@ -376,6 +372,9 @@ class TorchSampler(Sampler):
 
             current_slice = seq_slice(request, beam, size=steps)
             new_tokens[current_slice] = next_tokens
+            if "d2t" in model_outputs:  # Eagle3
+                new_tokens[current_slice] += model_outputs["d2t"][
+                    new_tokens[current_slice]]
             if gen_logits:
                 gen_logits[current_slice] = logits
             if log_probs:

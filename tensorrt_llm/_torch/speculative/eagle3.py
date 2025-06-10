@@ -4,13 +4,11 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
+from ..pyexecutor.sampler import TorchSampler
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 from .mtp import MTPSampler
 
@@ -191,48 +189,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                    self.hidden_size].copy_(to_save,
                                                            non_blocking=True)
                 break
-
-
-class Eagle3Sampler(TorchSampler):
-
-    def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs: dict[str, torch.Tensor]) -> SampleState:
-        logits = model_outputs["logits"]
-        new_tokens_device = torch.argmax(logits, dim=-1)
-        if "d2t" in model_outputs:
-            d2t = model_outputs["d2t"]
-            new_tokens_device = d2t[new_tokens_device] + new_tokens_device
-        device = SampleStateTensors(new_tokens=new_tokens_device)
-        host = SampleStateTensors(
-            new_tokens=new_tokens_device.to('cpu', non_blocking=True))
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
-        return SampleState(scheduled_requests=scheduled_requests,
-                           device=device,
-                           host=host,
-                           sampler_event=sampler_event)
-
-    def update_requests(self, state: SampleState) -> None:
-        assert isinstance(state, SampleState)
-        if state.sampler_event:
-            state.sampler_event.synchronize()
-        token_idx = 0
-        if hasattr(state.scheduled_requests, 'chunked_requests'):
-            token_idx += len(state.scheduled_requests.chunked_requests)
-
-        def get_new_token(request: LlmRequest, new_tokens: torch.Tensor,
-                          beam: int, skip: int) -> int:
-            new_token = new_tokens[token_idx + skip]
-            request.add_new_token(new_token, beam)
-            return new_token
-
-        def req_callback(request: LlmRequest):
-            nonlocal token_idx
-            token_idx += 1
-            if request.is_context_finished:
-                token_idx += len(request.py_draft_tokens)
-
-        super().update_requests(state, get_new_token, req_callback=req_callback)
 
 
 class Eagle3OneModelSampler(MTPSampler):
