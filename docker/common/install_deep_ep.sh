@@ -3,7 +3,7 @@
 set -euxo pipefail
 
 GITHUB_URL=${GITHUB_MIRROR:-https://github.com}
-DEEPEP_COMMIT=2b266cf6452134f993ab0fcb3ef2d5de7683c561
+DEEP_EP_COMMIT=2b266cf6452134f993ab0fcb3ef2d5de7683c561
 
 if [ "$(. /etc/os-release && echo $ID)" == "rocky" ]; then
     echo "Skipping DeepEP installation in the Rocky distribution."
@@ -16,7 +16,7 @@ export NVCC_APPEND_FLAGS="--threads 4"
 # Custom NVSHMEM
 curl -fsSL https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz | tar xz
 pushd nvshmem_src
-curl -fsSL $GITHUB_URL/deepseek-ai/DeepEP/raw/$DEEPEP_COMMIT/third-party/nvshmem.patch | patch -p1
+curl -fsSL $GITHUB_URL/deepseek-ai/DeepEP/raw/$DEEP_EP_COMMIT/third-party/nvshmem.patch | patch -p1
 sed "s/TRANSPORT_VERSION_MAJOR 3/TRANSPORT_VERSION_MAJOR 103/" -i src/CMakeLists.txt
 ln -s libmlx5.so.1 "$libmlx5_dir/libmlx5.so"
 cmake -S . -B build \
@@ -38,10 +38,10 @@ make -C build install
 popd
 
 # DeepEP
-curl -fsSL $GITHUB_URL/deepseek-ai/DeepEP/archive/$DEEPEP_COMMIT.tar.gz | tar xz
-TORCH_CUDA_ARCH_LIST="9.0;10.0;12.0" NVSHMEM_DIR=/opt/custom_nvshmem pip install -v --no-cache-dir ./DeepEP-$DEEPEP_COMMIT
+curl -fsSL $GITHUB_URL/deepseek-ai/DeepEP/archive/$DEEP_EP_COMMIT.tar.gz | tar xz
+TORCH_CUDA_ARCH_LIST="9.0;10.0;12.0" NVSHMEM_DIR=/opt/custom_nvshmem pip install -v --no-cache-dir ./DeepEP-$DEEP_EP_COMMIT
 
 # Clean up
 rm -r nvshmem_src
 rm "$libmlx5_dir/libmlx5.so"
-rm -r DeepEP-$DEEPEP_COMMIT
+rm -r DeepEP-$DEEP_EP_COMMIT
