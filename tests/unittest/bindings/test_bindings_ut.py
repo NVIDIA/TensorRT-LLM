@@ -25,7 +25,8 @@ def test_quant_mode():
     assert _tb.QuantMode.fp8_qdq().has_fp8_qdq
 
     quant_mode = _tb.QuantMode.from_description(True, True, True, True, True,
-                                                True, True, True)
+                                                True, True, True, False, False,
+                                                False, False, False, False)
     assert quant_mode.has_int4_weights
     quant_mode -= _tb.QuantMode.int4_weights()
     assert not quant_mode.has_int4_weights
