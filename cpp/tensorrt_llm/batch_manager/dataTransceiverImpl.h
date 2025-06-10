@@ -18,7 +18,10 @@
 #pragma once
 
 #include "cacheFormatter.h"
+#include "cacheTransBuffer.h"
 #include "dataTransceiver.h"
+#include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 
 namespace tensorrt_llm::batch_manager
 {

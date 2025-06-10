@@ -31,13 +31,14 @@
 
 namespace tensorrt_llm::executor::kv_cache
 {
+
 struct TargetRanksInfo
 {
     int mDomainPPSize;
     int mDomainTPSize;
     std::vector<int> mIRanks;
-    int mDuplicateHeadFactor;
-    int mPeerDuplicateHeadFactor;
+    int mDupHeadFactor;
+    int mPeerDupHeadFactor;
 };
 
 TargetRanksInfo targetIRanks(
@@ -46,17 +47,19 @@ TargetRanksInfo targetIRanks(
 TargetRanksInfo TargetRanksInfoForDP(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
 
-void concatenateKVCacheDispatch(runtime::ITensor::SharedPtr* inputBlocks, int inputBlockNum,
+void concatKVCacheDispatch(runtime::ITensor::SharedPtr* inputBlocks, int inputBlockNum,
     std::vector<int> const& inputRanks, kv_cache::CacheState const& peerCacheState,
     runtime::ITensor::SharedPtr* outputBlocks, int outputBlockNum, int selfRank,
     kv_cache::CacheState const& selfCacheState, runtime::BufferManager const& bufferManager);
+
 nvinfer1::Dims makeShapeFromCacheState(kv_cache::CacheState const& cacheState);
 
 void splitKVCacheDispatch(std::vector<runtime::ITensor::SharedPtr> const& kVCacheBlocks,
     std::vector<runtime::ITensor::SharedPtr>& ouputSplitBlocks, kv_cache::CacheState const& peerCacheState,
     kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager);
 
-void concatenateKvCacheV2Dispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
+void concatKvCacheV2Dispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
     std::vector<runtime::ITensor::SharedPtr>& outputKvCacheBlocks, kv_cache::CacheState const& peerCacheState,
     kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager);
+
 } // namespace tensorrt_llm::executor::kv_cache
