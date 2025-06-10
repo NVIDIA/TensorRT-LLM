@@ -39,8 +39,7 @@ class LibnumaSystemConan(ConanFile):
             for lib in lib_candidates:
                 if os.path.exists(lib):
                     self.output.info(f"Using libnuma from: {lib}")
-                    self.cpp_info.exelinkflags = [lib]
-                    self.cpp_info.sharedlinkflags = [lib]
+                    self.cpp_info.set_property("cmake_link_options", [lib])
                     break
             else:
                 raise ConanInvalidConfiguration(
