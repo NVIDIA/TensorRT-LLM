@@ -13,7 +13,7 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 }
 
 // UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
-UPLOAD_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/PipelineMonitor/L0_MergeRequest_PR/102"
+UPLOAD_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_MergeRequest_PR/5934"
 
 LLM_ROOT = "llm"
 
