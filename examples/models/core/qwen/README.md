@@ -665,6 +665,7 @@ ep_size=8
 min_input_len=1024
 max_input_len=min_input_len
 max_batch_size=512
+# We want to limit the number of prefill requests to 1 with in-flight batching.
 max_num_tokens=$(( max_input_len + max_batch_size - 1 ))
 kv_cache_free_gpu_mem_fraction=0.6
 concurrency=128
@@ -674,25 +675,22 @@ path_data=./aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt
 echo -e "disable_overlap_scheduler: false\nuse_cuda_graph: true\nprint_iter_log: true\ncuda_graph_batch_sizes: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128]\nenable_attention_dp: true " > ${path_config}
 
 mpirun --allow-run-as-root --oversubscribe -n 1 \
-trtllm-bench \
---model ${folder_model} \
---model_path ${folder_model} \
-throughput \
---backend pytorch \
---max_batch_size ${max_batch_size} \
---max_num_tokens ${max_num_tokens} \
---dataset ${path_data} \
---tp ${num_gpus}\
---ep ${ep_size} \
---kv_cache_free_gpu_mem_fraction ${kv_cache_free_gpu_mem_fraction} \
---extra_llm_api_options ${path_config} \
---concurrency ${concurrency} \
---num_requests $(( concurrency * 5 )) \
---warmup 0 \
---streaming
+trtllm-bench --model ${folder_model} --model_path ${folder_model} throughput \
+  --backend pytorch \
+  --max_batch_size ${max_batch_size} \
+  --max_num_tokens ${max_num_tokens} \
+  --dataset ${path_data} \
+  --tp ${num_gpus}\
+  --ep ${ep_size} \
+  --kv_cache_free_gpu_mem_fraction ${kv_cache_free_gpu_mem_fraction} \
+  --extra_llm_api_options ${path_config} \
+  --concurrency ${concurrency} \
+  --num_requests $(( concurrency * 5 )) \
+  --warmup 0 \
+  --streaming
 ```
 
-We suggest to use real dataset for benchmark to prevent the imbalance of MoE. Here, we use the `aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt`, which has 10000 samples with average input length 1024 and output length 2048. If you don't have the dataset and you want to run the benchmark, you can use the following command to generate some random dataset:
+We suggest benchmarking with a real dataset. It will prevent from having improperly distributed tokens in the MoE. Here, we use the `aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt` dataset. It has 10000 samples with an average input length of 1024 and an average output length of 2048. If you don't have a dataset (this or an other) and you want to run the benchmark, you can use the following command to generate a random dataset:
 
 ```bash
 min_input_len=1024
