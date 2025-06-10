@@ -1773,41 +1773,33 @@ class PyExecutor:
                 input_tokens = spec_config.get_draft_model_prompt(
                     request.get_tokens()[beam_idx])
 
+                def create_new_request(input_tokens):
+                    return LlmRequest(request_id=request.py_request_id,
+                                      max_new_tokens=request.py_max_new_tokens,
+                                      input_tokens=input_tokens,
+                                      sampling_config=request.sampling_config,
+                                      is_streaming=False,
+                                      is_draft=True)
+
                 if request.max_beam_num_tokens - 1 == request.py_prompt_len:
                     # This is the first time the draft model is seeing this request.
                     # Prepare a context request. We discard the first token and take
                     # the newly decoded one - this is the convention for EAGLE 2 and 3.
                     assert num_draft_tokens == 0
-                    new_request = LlmRequest(
-                        request_id=request.py_request_id,
-                        max_new_tokens=request.py_max_new_tokens,
-                        input_tokens=input_tokens,
-                        sampling_config=request.sampling_config,
-                        is_streaming=False,
-                        is_draft=True)
-
+                    new_request = create_new_request(input_tokens)
                     draft_batch.context_requests.append(new_request)
                 elif getattr(request, "py_num_accepted_draft_tokens", 0) == 0:
-                    new_request = LlmRequest(
-                        request_id=request.py_request_id,
-                        max_new_tokens=request.py_max_new_tokens,
-                        input_tokens=input_tokens[:-1],
-                        sampling_config=request.sampling_config,
-                        is_streaming=False,
-                        is_draft=True)
+                    new_request = create_new_request(input_tokens[:-1])
                     # Explicitly add the last token so get_last_tokens() returns
                     # the right value
                     new_request.add_new_token(input_tokens[-1], beam_idx)
                     new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
                     draft_batch.generation_requests.append(new_request)
                 else:
-                    new_request = LlmRequest(
-                        request_id=request.py_request_id,
-                        max_new_tokens=request.py_max_new_tokens,
-                        input_tokens=input_tokens,
-                        sampling_config=request.sampling_config,
-                        is_streaming=False,
-                        is_draft=True)
+                    new_request = create_new_request(input_tokens)
+                    new_request.context_chunk_size = num_accepted_tokens + 1
+                    new_request.context_current_position = len(
+                        input_tokens) - num_accepted_tokens - 1
                     new_request.context_chunk_size = num_accepted_tokens + 1
                     new_request.context_current_position = len(
                         input_tokens) - num_accepted_tokens - 1
