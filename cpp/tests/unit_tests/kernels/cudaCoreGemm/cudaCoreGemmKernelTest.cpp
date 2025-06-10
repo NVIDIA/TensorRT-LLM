@@ -314,8 +314,7 @@ float run_cublas_kernel(Params& params, int warmup, int iter)
 }
 
 template <typename InputType, typename OutputType>
-bool benchmark_and_verify(int m, int n, int k, tensorrt_llm::common::QuantMode const& quant_mode, int warmup, int iter,
-    bool debug = false, bool run_cublas = false)
+bool benchmark_and_verify(int m, int n, int k, int warmup, int iter, bool debug = false, bool run_cublas = false)
 {
     constexpr nvinfer1::DataType kInputDatatype = std::is_same<InputType, float>::value ? nvinfer1::DataType::kFLOAT
         : std::is_same<InputType, half>::value                                          ? nvinfer1::DataType::kHALF
@@ -352,8 +351,7 @@ bool benchmark_and_verify(int m, int n, int k, tensorrt_llm::common::QuantMode c
     d_act.copy_from(h_act.data());
     d_weight.copy_from(h_weight.data());
 
-    Params params{
-        d_act.data(), d_weight.data(), h_alpha[0], d_out.data(), m, n, k, quant_mode, kInputDatatype, kOutputDatatype};
+    Params params{d_act.data(), d_weight.data(), h_alpha[0], d_out.data(), m, n, k, kInputDatatype, kOutputDatatype};
 
     run_cpu<InputType, OutputType>(h_weight.data(), h_act.data(), h_alpha[0], params, h_out_gt.data());
 
@@ -397,19 +395,18 @@ TEST(Kernel, Fp8Gemv)
     std::vector<int> ms{1, 2, 3, 4};
     std::vector<int> ns{2048, 4096};
     std::vector<int> ks{2048, 4096};
-    tensorrt_llm::common::QuantMode quant_mode = tensorrt_llm::common::QuantMode::fromQuantAlgo("FP8");
     for (auto m : ms)
     {
         for (auto n : ns)
         {
             for (auto k : ks)
             {
-                pass = benchmark_and_verify<__nv_fp8_e4m3, float>(m, n, k, quant_mode, warmup, iter);
+                pass = benchmark_and_verify<__nv_fp8_e4m3, float>(m, n, k, warmup, iter);
                 EXPECT_TRUE(pass);
-                pass = benchmark_and_verify<__nv_fp8_e4m3, half>(m, n, k, quant_mode, warmup, iter);
+                pass = benchmark_and_verify<__nv_fp8_e4m3, half>(m, n, k, warmup, iter);
                 EXPECT_TRUE(pass);
 #if defined(ENABLE_BF16)
-                pass = benchmark_and_verify<__nv_fp8_e4m3, __nv_bfloat16>(m, n, k, quant_mode, warmup, iter);
+                pass = benchmark_and_verify<__nv_fp8_e4m3, __nv_bfloat16>(m, n, k, warmup, iter);
                 EXPECT_TRUE(pass);
 #endif
             }
@@ -426,19 +423,18 @@ TEST(Kernel, Fp16Gemv)
     std::vector<int> ms{1, 2, 3, 4};
     std::vector<int> ns{2048, 4096};
     std::vector<int> ks{2048, 4096};
-    tensorrt_llm::common::QuantMode quant_mode = tensorrt_llm::common::QuantMode::fromQuantAlgo("FP8");
     for (auto m : ms)
     {
         for (auto n : ns)
         {
             for (auto k : ks)
             {
-                pass = benchmark_and_verify<float, float>(m, n, k, quant_mode, warmup, iter);
+                pass = benchmark_and_verify<float, float>(m, n, k, warmup, iter);
                 EXPECT_TRUE(pass);
-                pass = benchmark_and_verify<half, half>(m, n, k, quant_mode, warmup, iter);
+                pass = benchmark_and_verify<half, half>(m, n, k, warmup, iter);
                 EXPECT_TRUE(pass);
 #if defined(ENABLE_BF16)
-                pass = benchmark_and_verify<__nv_bfloat16, __nv_bfloat16>(m, n, k, quant_mode, warmup, iter);
+                pass = benchmark_and_verify<__nv_bfloat16, __nv_bfloat16>(m, n, k, warmup, iter);
                 EXPECT_TRUE(pass);
 #endif
             }

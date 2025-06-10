@@ -72,6 +72,7 @@ struct Params
         , alpha(_alpha)
         , inputType(_inputType)
         , outputType(_outputType)
+        , use_torch_flow(false)
         , scale_a(nullptr)
         , scale_b(nullptr)
     {
