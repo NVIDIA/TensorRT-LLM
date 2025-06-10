@@ -216,7 +216,7 @@ def generate_dynamic_shapes(max_batch_size, max_seq_len):
     return dynamic_shapes
 
 
-def _hf_model_dir_or_hub_id(
+def hf_model_dir_or_hub_id(
     hf_model_dir: str,
     hf_hub_id: str,
 ) -> str:
@@ -281,7 +281,7 @@ def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 _SMALL_MODEL_CONFIGS = {
     "meta-llama/Meta-Llama-3.1-8B-Instruct": {
-        "model": _hf_model_dir_or_hub_id(
+        "model": hf_model_dir_or_hub_id(
             f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
         ),
@@ -294,7 +294,7 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "mistralai/Mixtral-8x7B-Instruct-v0.1": {
-        "model": _hf_model_dir_or_hub_id(
+        "model": hf_model_dir_or_hub_id(
             f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1",
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
         ),
@@ -307,7 +307,7 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "microsoft/Phi-3-mini-4k-instruct": {
-        "model": _hf_model_dir_or_hub_id(
+        "model": hf_model_dir_or_hub_id(
             f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct",
             "microsoft/Phi-3-mini-4k-instruct",
         ),
@@ -320,7 +320,7 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
-        "model": _hf_model_dir_or_hub_id(
+        "model": hf_model_dir_or_hub_id(
             f"{llm_models_root()}/Llama-4-Scout-17B-16E-Instruct",
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
         ),
@@ -346,7 +346,7 @@ _SMALL_MODEL_CONFIGS = {
         },
     },
     "deepseek-ai/DeepSeek-V3": {
-        "model": _hf_model_dir_or_hub_id(
+        "model": hf_model_dir_or_hub_id(
             f"{llm_models_root()}/DeepSeek-V3",
             "deepseek-ai/DeepSeek-V3",
         ),
