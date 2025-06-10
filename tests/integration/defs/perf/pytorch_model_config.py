@@ -60,12 +60,14 @@ def get_model_yaml_config(model_label: str) -> dict:
             ],
             'config': {
                 'cuda_graph_padding_enabled': True,
-                'cuda_graph_batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]
+                'cuda_graph_batch_sizes':
+                [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]
             }
         },
         # DeepSeek R1 model with specific batch size 128
         {
-            'patterns': 'deepseek_r1-bench-pytorch-float16-maxbs:128-maxnt:1127-input_output_len:1000,2000-quant:fp8-reqs:5120-con:1024-ep:8-gpus:8',
+            'patterns':
+            'deepseek_r1-bench-pytorch-float16-maxbs:128-maxnt:1127-input_output_len:1000,2000-quant:fp8-reqs:5120-con:1024-ep:8-gpus:8',
             'config': {
                 'cuda_graph_batch_sizes': [128]
             }
