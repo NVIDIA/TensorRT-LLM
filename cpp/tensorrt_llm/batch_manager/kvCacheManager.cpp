@@ -2161,12 +2161,12 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         if (config.maxTokens.has_value())
         {
             auto const maxTokensFromConfig = static_cast<uint64_t>(config.maxTokens.value());
-            TLLM_LOG_INFO("Maximum kv-cache token overridden by configuration as '%ld'.", maxTokensFromConfig);
+            TLLM_LOG_DEBUG("Maximum kv-cache token overridden by configuration as '%ld'.", maxTokensFromConfig);
             maxTokens = std::min(maxTokensFromConfig, maxTokens);
         }
-        TLLM_LOG_INFO("Primary maxTokens for windowSize %d: %ld", windowSize, maxTokens);
+        TLLM_LOG_DEBUG("Primary maxTokens for windowSize %d: %ld", windowSize, maxTokens);
         SizeType32 const blocksInPrimaryPool = tc::ceilDiv(maxTokens, tokensPerBlock);
-        TLLM_LOG_INFO(
+        TLLM_LOG_DEBUG(
             "Number of blocks in KV cache primary pool for windowSize %d: %d", windowSize, blocksInPrimaryPool);
         return blocksInPrimaryPool;
     };
@@ -2177,7 +2177,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         auto const maxTokensSecondary
             = static_cast<SizeType32>(allottedSecondaryMemBytes * windowSizeShare / cacheSizeBytesPerToken);
         SizeType32 const blocksInSecondaryPool = std::max(0, maxTokensSecondary / tokensPerBlock);
-        TLLM_LOG_INFO(
+        TLLM_LOG_DEBUG(
             "Number of blocks in KV cache secondary pool for windowSize %d: %d, onboard blocks to primary memory "
             "before reuse: %s",
             windowSize, blocksInSecondaryPool, config.onboardBlocks ? "true" : "false");
@@ -2217,7 +2217,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
             "sizes, or differing values. This is not supported with Variable Sliding Window Attention. Local window "
             "sizes for reference: %s",
             rank, vec2str(windowSizes).c_str());
-        TLLM_LOG_INFO(
+        TLLM_LOG_DEBUG(
             "[RANK %d] Before mpi::MpiOp::MIN reduction: window sizes %s / primary blocks %s / secondary blocks %s",
             rank, vec2str(windowSizes).c_str(), vec2str(blocksPrimary).c_str(), vec2str(blocksSecondary).c_str());
         // make sure all ranks use same value for max blocks
@@ -2228,7 +2228,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         COMM_SESSION.allreduce(
             blocksSecondary.data(), blocksWorld.data(), windowSizes.size(), mpi::MpiType::kINT32, mpi::MpiOp::MIN);
         blocksSecondary = blocksWorld;
-        TLLM_LOG_INFO(
+        TLLM_LOG_DEBUG(
             "[RANK %d] After mpi::MpiOp::MIN reduction: window sizes %s / primary blocks %s / secondary blocks %s",
             rank, vec2str(windowSizes).c_str(), vec2str(blocksPrimary).c_str(), vec2str(blocksSecondary).c_str());
     }
@@ -2237,7 +2237,11 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
     for (size_t i = 0; i < windowSizes.size(); ++i)
     {
         auto const windowSize = windowSizes.at(i);
-        windowSizeToBlocks[windowSize] = {blocksPrimary.at(i), blocksSecondary.at(i)};
+        auto const primaryBlocks = blocksPrimary.at(i);
+        auto const secondayBlocks = blocksSecondary.at(i);
+        TLLM_LOG_INFO(
+            "[windowSize=%d] {.primaryBlocks=%d, .secondayBlocks=%d}", windowSize, primaryBlocks, secondayBlocks);
+        windowSizeToBlocks[windowSize] = {primaryBlocks, secondayBlocks};
     }
     return windowSizeToBlocks;
 }
