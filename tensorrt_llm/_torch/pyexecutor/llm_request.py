@@ -185,6 +185,8 @@ class LlmResult:
 class LlmResponse:
     """LlmResponse wraps `bindings.executor.Response` but detour some features to Python implementation"""
 
+    _is_llm_response = True
+
     def __init__(self, response: tensorrt_llm.bindings.executor.Response,
                  py_result: PyResult):
         self._response = response
