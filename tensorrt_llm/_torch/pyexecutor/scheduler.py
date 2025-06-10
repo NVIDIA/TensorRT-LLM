@@ -37,7 +37,15 @@ class ScheduledRequests:
         return len(self.context_requests) + len(self.generation_requests)
 
     def all_requests(self) -> list[LlmRequest]:
-        return list(chain(self.context_requests, self.generation_requests))
+        extend_requests = []
+        generation_requests = []
+        for request in self.generation_requests:
+            if len(request.py_draft_tokens) > 0:
+                extend_requests.append(request)
+            else:
+                generation_requests.append(request)
+        return list(
+            chain(self.context_requests, extend_requests, generation_requests))
 
 
 class RequestScheduler(ABC):
