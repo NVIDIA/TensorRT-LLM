@@ -12,7 +12,7 @@ from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention, QkNormType
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
@@ -68,7 +68,6 @@ class AttentionBlock(Attention):
             max_position_embeddings=pretrained_config.max_position_embeddings,
             bias=True,
             pos_embd_params=pos_embd_params,
-            qk_norm_type=QkNormType.none,
             layer_idx=layer_idx,
             dtype=pretrained_config.torch_dtype,
             dense_bias=True,
