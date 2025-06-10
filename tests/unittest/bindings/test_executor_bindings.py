@@ -969,6 +969,17 @@ def test_multimodal_embedding():
         small_embedding), "Multimodal embedding with different shape failed"
 
 
+def test_multimodal_input():
+    multimodal_hashes = [[1, 2, 3], [4, 5, 6]]
+    multimodal_positions = [1, 2, 3]
+    multimodal_lengths = [4, 5, 6]
+    config = trtllm.MultimodalInput(multimodal_hashes, multimodal_positions,
+                                    multimodal_lengths)
+    assert config.multimodal_hashes == multimodal_hashes
+    assert config.multimodal_positions == multimodal_positions
+    assert config.multimodal_lengths == multimodal_lengths
+
+
 def test_mrope_config():
     mrope_rotary_cos_sin = torch.ones(1, 4194304)
     mrope_position_deltas = torch.tensor([-50])
