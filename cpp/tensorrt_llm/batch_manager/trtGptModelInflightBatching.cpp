@@ -573,6 +573,7 @@ TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(BlocksPerWi
     // TODO: This is problematic, as createBuffers edits the state of trtGptModelInflightBatching, but
     // what if there are different window values for cross+self etc. in encoder+decoder scenario...
     createBuffers(mDecodingConfig, mAdditionalModelOutputs);
+    createDecoder(mDecodingConfig.getDecodingMode());
     return {newBlocksPerWindow, newMaxAttentionWindowVec};
 }
 
