@@ -59,8 +59,9 @@ class OpenAIServer:
         self.server_role = server_role
         self.binding_addr = None  # Will be set in __call__
         hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
+        trust_remote_code = llm.args.trust_remote_code
         try:
-            self.processor = AutoProcessor.from_pretrained(hf_tokenizer_path)
+            self.processor = AutoProcessor.from_pretrained(hf_tokenizer_path, trust_remote_code=trust_remote_code)
         except Exception:
             logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
             self.processor = None

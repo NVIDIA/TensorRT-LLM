@@ -13,8 +13,9 @@ from ...utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                       reswizzle_sf, swizzle_sf, unswizzle_sf)
 from .interface import MoE
 from .moe_load_balancer import get_moe_load_balancer
-from .quantization import (FP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
-                           MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod,
+from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
+                           FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
+                           NVFP4CutlassFusedMoEMethod,
                            UnquantizedFusedMoEMethod, WInt4AFP8FusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
@@ -226,7 +227,7 @@ class CutlassFusedMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return FP8BlockScalesFusedMoEMethod()
+                return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
@@ -289,7 +290,7 @@ class CutlassFusedMoE(MoE):
         ) and is_first_call:
             self.layer_load_balancer.wait_for_gpu_stage()
 
-        use_fp8_block_scaling = False
+        use_deepseek_fp8_block_scale = False
         use_w4a8_group_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
 
@@ -359,8 +360,8 @@ class CutlassFusedMoE(MoE):
                             x, self.fc31_input_scale, self.scaling_vector_size,
                             False)
 
-            elif self.has_fp8_block_scales:
-                use_fp8_block_scaling = True
+            elif self.has_deepseek_fp8_block_scales:
+                use_deepseek_fp8_block_scale = True
             elif self.has_w4afp8:
                 use_w4a8_group_scaling = True
                 weight_dtype = torch.quint4x2
@@ -431,7 +432,7 @@ class CutlassFusedMoE(MoE):
             ep_rank=ep_rank,
             cluster_size=cluster_size,
             cluster_rank=cluster_rank,
-            use_fp8_block_scaling=use_fp8_block_scaling,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
             use_w4a8_group_scaling=use_w4a8_group_scaling,
             min_latency_mode=cutlass_min_latency_mode,
             tune_max_num_tokens=self.tune_max_num_tokens,
