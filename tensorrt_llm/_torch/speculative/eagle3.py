@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.logger import logger
@@ -218,31 +219,29 @@ class Eagle3Sampler(TorchSampler):
         new_tokens_list = state.host.new_tokens.tolist()
         scheduled_requests = state.scheduled_requests
 
-        request_idx = 0
         token_idx = 0
         beam_idx = 0
 
-        def advance_idx(num_tokens=1):
-            nonlocal request_idx, token_idx
-            request_idx += 1
-            token_idx += num_tokens
+        def add_tokens(request: LlmRequest,
+                       skip_tokens: int = 0) -> tuple[int, bool]:
+            new_token = new_tokens_list[token_idx + skip_tokens]
+            request.add_new_token(new_token, beam_idx)
+            return new_token, self._handle_stop_criteria(request,
+                                                         new_token,
+                                                         beam=beam_idx)
 
         if hasattr(scheduled_requests, 'chunked_requests'):
-            request_idx += len(scheduled_requests.chunked_requests)
             token_idx += len(scheduled_requests.chunked_requests)
 
         for request in scheduled_requests.context_requests:
             if request.get_context_remaining_length() != 0:
-                advance_idx()
+                token_idx += 1
                 continue
 
             if request.state != LlmRequestState.GENERATION_COMPLETE:
-                new_token = new_tokens_list[token_idx]
-                num_tokens = request.add_new_token(new_token, beam_idx)
-                self._handle_stop_criteria(request, new_token, beam=beam_idx)
-
+                add_tokens(request)
                 request.py_decoding_iter += 1
-            advance_idx()
+            token_idx += 1
 
         extend_requests = []
         generation_requests = []
@@ -254,39 +253,29 @@ class Eagle3Sampler(TorchSampler):
 
         for request in extend_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:
-                new_token = new_tokens_list[token_idx]
-                num_tokens = request.add_new_token(new_token, beam_idx)
-                self._handle_stop_criteria(request, new_token, beam=beam_idx)
+                new_token, _ = add_tokens(request)
 
                 # Accept draft tokens (if we have any) if and only if they match the new
                 # token exactly.
                 num_accepted = 0
-                new_tokens = [new_token]
                 for draft_token in request.py_draft_tokens:
                     if draft_token != new_token:
                         # Reject.
                         break
                     num_accepted += 1
-                    new_token = new_tokens_list[token_idx + num_accepted]
-                    num_tokens = request.add_new_token(new_token, beam_idx)
-                    new_tokens.append(num_tokens)  # `num_tokens`->`new_token`
-
-                    if self._handle_stop_criteria(request,
-                                                  new_token,
-                                                  beam=beam_idx):
+                    _, is_stop = add_tokens(request, num_accepted)
+                    if is_stop:
                         break
                 request.py_decoding_iter += 1
                 request.py_num_accepted_draft_tokens = num_accepted
                 request.py_rewind_len = request.py_draft_pages_allocated - num_accepted
-            advance_idx(len(request.py_draft_tokens) + 1)
+            token_idx += len(request.py_draft_tokens) + 1
 
         for request in generation_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:
-                new_token = new_tokens_list[token_idx]
-                num_tokens = request.add_new_token(new_token, beam_idx)
-                self._handle_stop_criteria(request, new_token, beam=beam_idx)
+                add_tokens(request)
                 request.py_decoding_iter += 1
-            advance_idx()
+            token_idx += 1
 
 
 class Eagle3OneModelSampler(MTPSampler):
