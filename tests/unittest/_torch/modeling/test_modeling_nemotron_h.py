@@ -31,6 +31,9 @@ def extract_decode_logprobs(result: RequestOutput,
 @skip_gpu_memory_less_than(
     (2 * 8 + 1) * 2**30)  # 8B, bf16, plus 1 GB for good measure
 def test_nemotron_h_correctness():
+    # This test is close to memory limit on A30 (with 24GB), so empty cache first
+    torch.cuda.empty_cache()
+
     model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
     text_prompts = [
         "The future of AI is",
