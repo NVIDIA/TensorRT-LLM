@@ -90,6 +90,12 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b-bench-pytorch-bfloat16-maxbs:512-input_output_len:1000,1000-reqs:8-con:1]
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b-bench-pytorch-bfloat16-maxbs:512-maxnt:20000-input_output_len:20000,2000-reqs:8-con:1]
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b-bench-pytorch-bfloat16-maxbs:512-input_output_len:500,2000-reqs:500-con:250]
+  # FP8 prequantized pyt backend
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b_fp8-bench-pytorch-float8-maxbs:512-maxnt:5000-input_output_len:5000,500-reqs:8-con:1]
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b_fp8-bench-pytorch-float8-maxbs:512-input_output_len:500,2000-reqs:8-con:1]
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b_fp8-bench-pytorch-float8-maxbs:512-input_output_len:1000,1000-reqs:8-con:1]
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b_fp8-bench-pytorch-float8-maxbs:512-maxnt:20000-input_output_len:20000,2000-reqs:8-con:1]
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b_fp8-bench-pytorch-float8-maxbs:512-input_output_len:500,2000-reqs:500-con:250]
   #long time llama_nemotron cases
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b-bench-bfloat16-maxbs:64-input_output_len:5000,500-reqs:8-con:1] # timeout for l20, l40s, a100
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b-bench-bfloat16-maxbs:64-input_output_len:5000,500-quant:fp8-reqs:8-con:1] #timeout for l20, l40s, failed for a100
