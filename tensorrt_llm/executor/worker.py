@@ -238,6 +238,7 @@ class GenerationExecutorWorker(GenerationExecutor):
     def await_response_task(self) -> bool:
         return self._await_response_helper()
 
+    @nvtx_range_debug("_has_background_error")
     def _has_background_error(self) -> bool:
         return not self._error_queue.empty()
 
@@ -889,7 +890,7 @@ class AwaitResponseHelper:
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
                 self.worker._pop_result(response.client_id)
-            elif response.result.is_final:
+            elif response.is_final:
                 self.worker._pop_result(response.client_id)
             else:
                 logprobs_result = _get_logprobs(self.worker, response,
