@@ -171,14 +171,13 @@ public:
     std::unique_ptr<EncoderBuffers> encoderBuffers;
 
     //! Medusa
-    std::unique_ptr<MedusaBuffers> medusaBuffers;
-
+    std::unique_ptr<MedusaBuffers> mMedusaBuffers;
     //! Lookahead decoding
-    std::optional<runtime::LookaheadRuntimeBuffers> lookaheadBuffers;
+    std::unique_ptr<runtime::LookaheadRuntimeBuffers> mLookaheadBuffers;
     //! Explicit draft tokens decoding
-    std::optional<runtime::ExplicitDraftTokensBuffers> explicitDraftTokensBuffers;
+    std::unique_ptr<runtime::ExplicitDraftTokensBuffers> mExplicitDraftTokensBuffers;
     //! Eagle decoding
-    std::optional<runtime::EagleBuffers> eagleBuffers;
+    std::unique_ptr<runtime::EagleBuffers> mEagleBuffers;
 
     //! Language adapter routing information if language adapter is presented, [numTokens, numLanguages]
     TensorPtr languageAdapterRoutings;
@@ -283,12 +282,13 @@ public:
 
     void prepareBuffersForCudaGraph(SizeType32 maxSequenceLength);
 
-    void prepareExplicitDraftTokenBuffers(DecoderBuffers& decoderBuffers, runtime::TllmRuntime const& runtime,
-        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
+    void prepareExplicitDraftTokenBuffers(runtime::ExplicitDraftTokensBuffers::Inputs& explicitDraftTokensBuffers,
+        runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
+        runtime::WorldConfig const& worldConfig);
 
     void prepareEagleBuffers(RequestVector const& contextRequests, RequestVector const& genRequests,
-        DecoderBuffers& decoderBuffers, runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig);
+        runtime::EagleBuffers::Inputs& eagleBuffers, runtime::TllmRuntime const& runtime,
+        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 
 private:
     void create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,

@@ -181,21 +181,23 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
 
     if (modelConfig.getSpeculativeDecodingMode().isMedusa())
     {
-        medusaBuffers = std::make_unique<MedusaBuffers>(
+        mMedusaBuffers = std::make_unique<MedusaBuffers>(
             maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig, decodingConfig, runtime);
     }
     else if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
     {
-        lookaheadBuffers.emplace(
+        mLookaheadBuffers = std::make_unique<runtime::LookaheadRuntimeBuffers>(
             maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig, decodingConfig, runtime);
     }
     else if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
     {
-        explicitDraftTokensBuffers.emplace(maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig);
+        mExplicitDraftTokensBuffers = std::make_unique<runtime::ExplicitDraftTokensBuffers>(
+            maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig);
     }
     else if (modelConfig.getSpeculativeDecodingMode().isEagle())
     {
-        eagleBuffers.emplace(maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig, decodingConfig);
+        mEagleBuffers = std::make_unique<runtime::EagleBuffers>(
+            maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig, decodingConfig);
     }
 
     if (modelConfig.useLanguageAdapter())
@@ -355,26 +357,26 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
         loraBuffers->reshape(numSequences);
     }
 
-    if (medusaBuffers)
+    if (mMedusaBuffers)
     {
-        medusaBuffers->reshape(
+        mMedusaBuffers->reshape(
             numContextRequests, numGenRequests, modelConfig.getSpeculativeDecodingModulePtr()->getMaxDecodingTokens());
     }
 
-    if (lookaheadBuffers && modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
+    if (mLookaheadBuffers && modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
     {
-        lookaheadBuffers->reshape(
+        mLookaheadBuffers->reshape(
             numContextRequests, numGenRequests, modelConfig.getSpeculativeDecodingModulePtr()->getMaxDecodingTokens());
     }
 
-    if (explicitDraftTokensBuffers)
+    if (mExplicitDraftTokensBuffers)
     {
-        explicitDraftTokensBuffers->reshape(numContextRequests, numGenRequests, modelConfig);
+        mExplicitDraftTokensBuffers->reshape(numContextRequests, numGenRequests, modelConfig);
     }
 
-    if (eagleBuffers)
+    if (mEagleBuffers)
     {
-        eagleBuffers->reshape(numContextRequests, numGenRequests, modelConfig);
+        mEagleBuffers->reshape(numContextRequests, numGenRequests, modelConfig);
     }
 
     auto const numRequests = getNumRequests();
@@ -761,7 +763,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
         {
             // copy from lookahead decoding buffer
-            lookaheadBuffers->setFromInputs(numContextRequests, numGenRequests, *requestTypes, *seqSlots,
+            mLookaheadBuffers->setFromInputs(numContextRequests, numGenRequests, *requestTypes, *seqSlots,
                 decoderBuffers.lookaheadBuffers.value(), runtime, modelConfig, worldConfig);
         }
     }
@@ -839,7 +841,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         if (transformerBuffers)
         {
             TensorPtr decoderPositionIds = modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding()
-                ? lookaheadBuffers->positionIdsDevice
+                ? mLookaheadBuffers->positionIdsDevice
                 : nullptr;
             transformerBuffers->copyPositionIds(runtime, positionIdsHost, isChatGlm || isGlm, decoderPositionIds);
         }
@@ -879,40 +881,43 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
     {
         if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
         {
-            prepareExplicitDraftTokenBuffers(decoderBuffers, runtime, modelConfig, worldConfig);
+            prepareExplicitDraftTokenBuffers(
+                decoderBuffers.explicitDraftTokensBuffers, runtime, modelConfig, worldConfig);
         }
         if (modelConfig.getSpeculativeDecodingMode().isEagle())
         {
-            prepareEagleBuffers(contextRequests, genRequests, decoderBuffers, runtime, modelConfig, worldConfig);
+            prepareEagleBuffers(
+                contextRequests, genRequests, decoderBuffers.eagleBuffers, runtime, modelConfig, worldConfig);
         }
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void RuntimeBuffers::prepareExplicitDraftTokenBuffers(DecoderBuffers& decoderBuffers, TllmRuntime const& runtime,
+void RuntimeBuffers::prepareExplicitDraftTokenBuffers(
+    runtime::ExplicitDraftTokensBuffers::Inputs& explicitDraftTokensBuffers, TllmRuntime const& runtime,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    TLLM_CHECK(explicitDraftTokensBuffers);
+    TLLM_CHECK(mExplicitDraftTokensBuffers);
 
-    explicitDraftTokensBuffers->setFromInputs(numContextRequests, numGenRequests, *requestTypes, *seqSlots,
-        decoderBuffers.explicitDraftTokensBuffers, *transformerBuffers->positionIds, modelConfig, worldConfig,
+    mExplicitDraftTokensBuffers->setFromInputs(numContextRequests, numGenRequests, *requestTypes, *seqSlots,
+        explicitDraftTokensBuffers, *transformerBuffers->positionIds, modelConfig, worldConfig,
         runtime.getBufferManager(), runtime.getStream());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void RuntimeBuffers::prepareEagleBuffers(RequestVector const& contextRequests, RequestVector const& genRequests,
-    DecoderBuffers& decoderBuffers, TllmRuntime const& runtime, ModelConfig const& modelConfig,
+    runtime::EagleBuffers::Inputs& eagleBuffers, TllmRuntime const& runtime, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    TLLM_CHECK(eagleBuffers);
+    TLLM_CHECK(mEagleBuffers);
 
-    eagleBuffers->setFromInputs(contextRequests, genRequests, *requestTypes, *seqSlots, decoderBuffers.eagleBuffers,
+    mEagleBuffers->setFromInputs(contextRequests, genRequests, *requestTypes, *seqSlots, eagleBuffers,
         runtime.getBufferManager(), modelConfig, worldConfig);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -1018,21 +1023,21 @@ void RuntimeBuffers::fillIOMaps(ModelConfig const& modelConfig, WorldConfig cons
         inputMap.insert_or_assign("language_adapter_routings", languageAdapterRoutings);
     }
 
-    if (medusaBuffers)
+    if (mMedusaBuffers)
     {
-        medusaBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
+        mMedusaBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
     }
-    if (lookaheadBuffers)
+    if (mLookaheadBuffers)
     {
-        lookaheadBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
+        mLookaheadBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
     }
-    if (explicitDraftTokensBuffers)
+    if (mExplicitDraftTokensBuffers)
     {
-        explicitDraftTokensBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
+        mExplicitDraftTokensBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
     }
-    if (eagleBuffers)
+    if (mEagleBuffers)
     {
-        eagleBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
+        mEagleBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
     }
 
     for (auto const& outputTensor : mAdditionalOutputTensors)
