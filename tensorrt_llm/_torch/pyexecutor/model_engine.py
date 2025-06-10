@@ -1359,7 +1359,6 @@ class PyTorchModelEngine(ModelEngine):
             num_extra_kv_tokens=0 if self.spec_config is None else
             self.spec_config.num_extra_kv_tokens)
         attn_metadata.kv_cache_manager = kv_cache_manager
-        attn_metadata.prepare()
 
         # Prepare spec host metadata
         if spec_metadata is not None:
@@ -1371,14 +1370,11 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = total_num_tokens
             spec_metadata.seq_lens = sequence_lengths
-            spec_metadata.prepare()
 
-        # Prepare device position ids and gather ids
+        # Prepare metadata, device position ids and gather ids
+        attn_metadata.prepare()
         self.position_ids_cuda[:total_num_tokens].copy_(position_ids,
                                                         non_blocking=True)
-
-        # Prepare device metadata
-        attn_metadata.prepare_device()
         if spec_metadata is not None:
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
                                                                 total_draft_lens]
@@ -1386,7 +1382,7 @@ class PyTorchModelEngine(ModelEngine):
                                                              non_blocking=True)
             spec_metadata.gather_ids = self.gather_ids_cuda[:gather_ids.
                                                             shape[0]]
-            spec_metadata.prepare_device()
+            spec_metadata.prepare()
 
         # Prepare device tensors
         num_tokens = len(input_ids)
@@ -1584,7 +1580,6 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.max_seq_len = self.max_seq_len
             attn_metadata.request_ids = request_ids
             attn_metadata.prepare()
-            attn_metadata.prepare_device()
 
         lora_params = self._get_lora_params_from_requests(
             scheduled_requests, attn_metadata)
@@ -1612,7 +1607,6 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.num_tokens = num_tokens
             spec_metadata.seq_lens = sequence_lengths
             spec_metadata.prepare()
-            spec_metadata.prepare_device()
             inputs['spec_metadata'] = spec_metadata
 
         # support attention dp
@@ -1851,7 +1845,6 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_manager = kv_cache_manager
 
         attn_metadata.prepare()
-        attn_metadata.prepare_device()
         if self.enable_attention_dp:
             all_rank_num_tokens = self.dist.tp_allgather(
                 attn_metadata.num_tokens)

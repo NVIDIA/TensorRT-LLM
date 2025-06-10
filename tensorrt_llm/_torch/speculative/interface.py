@@ -161,11 +161,6 @@ class SpecMetadata:
         Hook to be called before the forward step of the model.
         """
 
-    def prepare_device(self):
-        """
-        Hook to be called before the forward step of the model.
-        """
-
     def create_cuda_graph_metadata(self, max_batch_size: int):
         """
         Creates metadata for CUDA graph execution.
