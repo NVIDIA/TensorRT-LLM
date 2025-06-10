@@ -4,7 +4,7 @@ import types
 
 import pytest
 import torch
-from _model_test_utils import _hf_model_dir_or_hub_id
+from _model_test_utils import hf_model_dir_or_hub_id
 from transformers import AutoConfig, AutoModelForCausalLM
 from utils.llm_data import llm_models_root
 
@@ -78,7 +78,7 @@ def _generate_ds_attention_mask(b, s):
     "model_name, module_name, patch, inputs",
     [
         pytest.param(
-            _hf_model_dir_or_hub_id(
+            hf_model_dir_or_hub_id(
                 f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1",
                 "deepseek-ai/DeepSeek-R1",
             ),
@@ -91,7 +91,7 @@ def _generate_ds_attention_mask(b, s):
             ],
         ),  # attention requires  inputs [hidden_states, attention_mask, position_ids]
         pytest.param(
-            _hf_model_dir_or_hub_id(
+            hf_model_dir_or_hub_id(
                 f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1",
                 "deepseek-ai/DeepSeek-R1",
             ),
