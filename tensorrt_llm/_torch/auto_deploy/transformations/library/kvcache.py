@@ -150,8 +150,11 @@ def resize_kv_cache(
 
     free_mem_ratio specifies the fraction of available memory to occupy.
     """
+    ad_logger.info("Free memory ratio", free_mem_ratio)
     free_mem, total_mem = torch.cuda.mem_get_info()
-    ad_logger.info(f"Free memory: {free_mem}, Total memory: {total_mem}")
+    ad_logger.info(
+        f"Free memory (MB): {free_mem // 1024 // 1024} , Total memory (MB): {total_mem // 1024 // 1024}"
+    )
     current_cache_size = cm.current_cache_size_bytes()
     current_num_pages = cm.info.num_pages
     ad_logger.info(
