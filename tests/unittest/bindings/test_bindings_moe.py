@@ -136,6 +136,8 @@ class TestMoePythonBindings(unittest.TestCase):
             ep_size=self.ep_size,
             layer_updates_per_iter=self.layer_updates_per_iter)
 
+        balancer.set_use_gpu_memcpy(True)
+
         # Add a layer
         layer = balancer.add_layer(expert_count=self.expert_count,
                                    top_k=self.top_k,
@@ -205,6 +207,8 @@ class TestMoePythonBindings(unittest.TestCase):
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,
             layer_updates_per_iter=self.layer_updates_per_iter)
+
+        balancer.set_use_gpu_memcpy(True)
 
         # Create initial weight assignments
         initial_assignments = []

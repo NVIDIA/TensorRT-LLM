@@ -1627,8 +1627,12 @@ def build_pixtral_engine(args):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=0)
 
+        # attention_mask is of shape [batch, patches].
+        mask = attention_mask[:, None, None, :]
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask).transpose(1, 2).contiguous()
+            q, k, v, attn_mask=mask).transpose(1, 2).contiguous()
+
         attn_output = attn_output.reshape(batch, patches, -1)
         attn_output = self.o_proj(attn_output)
 

@@ -1,7 +1,7 @@
 import copy
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Type
 
 import torch
 
@@ -59,7 +59,7 @@ class SpeculativeDecodingMode(IntEnum):
     def has_spec_decoder(self):
         return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
 
-    def extend_ctx(self, attention_backend: AttentionBackend):
+    def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
         If true, treat generation requests with draft tokens as
         chunked context requests at the kernel level. Required for
@@ -68,7 +68,7 @@ class SpeculativeDecodingMode(IntEnum):
 
         # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
         return (self.is_eagle3()
-                and not (isinstance(attention_backend, TrtllmAttention)
+                and not (issubclass(attention_backend, TrtllmAttention)
                          and get_sm_version() == 100)) or self.is_ngram()
 
     @staticmethod

@@ -222,7 +222,8 @@ def routing_reference_renormalize(expert_logits, top_k, num_experts, padding):
 
 
 # Softmax->TopK -> Normalize
-def routing_reference_qwen3(expert_logits, top_k, num_experts, padding):
+def routing_reference_renormalize_naive(expert_logits, top_k, num_experts,
+                                        padding):
     norm_topk_prob = True
     scores = torch.nn.functional.softmax(expert_logits.float(), dim=-1)
     topk_values, topk_idx = torch.topk(scores, k=top_k, dim=-1)
@@ -718,9 +719,9 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
                 "top_k_groups": None,
                 "routed_scaling": None,
                 "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.Qwen3
+                "routing_method_type": RoutingMethodType.RenormalizeNaive
             },
-            id="Qwen3"),
+            id="RoutingRenormalizeNaive"),
     ],
 )
 def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
@@ -754,7 +755,7 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     if routing_method_type == RoutingMethodType.DeepSeekV3:
         expert_logits = torch.randn((num_tokens, num_experts),
                                     device='cuda').to(torch.float)
-    elif routing_method_type == RoutingMethodType.Qwen3 or routing_method_type == RoutingMethodType.Renormalize:
+    elif routing_method_type == RoutingMethodType.RenormalizeNaive or routing_method_type == RoutingMethodType.Renormalize:
         expert_logits = torch.randn((num_tokens, num_experts),
                                     device='cuda').to(torch.bfloat16)
 
@@ -825,9 +826,9 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
     elif routing_method_type == RoutingMethodType.Renormalize:
         permute_info, scores = routing_reference_renormalize(
             expert_logits, top_k, num_experts, padding)
-    elif routing_method_type == RoutingMethodType.Qwen3:
-        permute_info, scores = routing_reference_qwen3(expert_logits, top_k,
-                                                       num_experts, padding)
+    elif routing_method_type == RoutingMethodType.RenormalizeNaive:
+        permute_info, scores = routing_reference_renormalize_naive(
+            expert_logits, top_k, num_experts, padding)
 
     args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
                     top_k, padding, hidden_states_fp4_bytes,
@@ -915,14 +916,30 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
                                                       args.gemm2_scales_global)
 
     output = torch.ops.trtllm.fp4_block_scale_moe_runner(
-        expert_logits, routing_bias, hidden_states_fp4,
-        hidden_states_scale_linear_fp4, gemm1_weights_fp4_shuffled,
-        gemm1_scales_fp4_shuffled, gemm2_weights_fp4_shuffled,
-        gemm2_scales_fp4_shuffled, scale_c_fc1, scale_gate_fc1, scale_c_fc2,
-        num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
-        num_experts, routed_scaling, tile_tokens_dim, routing_method_type)
+        expert_logits,
+        routing_bias,
+        hidden_states_fp4,
+        hidden_states_scale_linear_fp4,
+        gemm1_weights_fp4_shuffled,
+        gemm1_scales_fp4_shuffled,
+        gemm2_weights_fp4_shuffled,
+        gemm2_scales_fp4_shuffled,
+        scale_c_fc1,
+        scale_gate_fc1,
+        scale_c_fc2,
+        num_experts,
+        top_k,
+        n_groups,
+        top_k_groups,
+        intermediate_size,
+        0,
+        num_experts,
+        routed_scaling,
+        tile_tokens_dim,
+        routing_method_type,
+        do_finalize=True)
 
-    output_dequant_actual = output.to(torch.float)
+    output_dequant_actual = output[0].to(torch.float)
 
     #
     # Check the results
