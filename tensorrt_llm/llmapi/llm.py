@@ -219,6 +219,8 @@ class LLM:
             KvCacheRetentionConfig, Sequence[KvCacheRetentionConfig]]] = None,
         disaggregated_params: Optional[Union[
             DisaggregatedParams, Sequence[DisaggregatedParams]]] = None,
+        disagg_mm_params: Optional[Union[
+            MultimodalParams, Sequence[MultimodalParams]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -266,6 +268,7 @@ class LLM:
                 kv_cache_retention_config=_item_at(kv_cache_retention_config,
                                                    i),
                 disaggregated_params=_item_at(disaggregated_params, i),
+                disagg_mm_params=_item_at(disagg_mm_params, i),
                 streaming=False)
             futures.append(future)
 
