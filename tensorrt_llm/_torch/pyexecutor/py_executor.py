@@ -687,16 +687,19 @@ class PyExecutor:
 
     def _executor_loop_pp(self):
         torch.cuda.set_device(self.device_id)
+        got_finish_signal = False
         microbatch_id = 0
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while not self.is_shutdown or len(self.active_requests) > 0:
+            while not got_finish_signal or len(self.active_requests) > 0:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                if self.is_shutdown and len(self.active_requests) == 0:
+                got_finish_signal = self._merge_requests(
+                    new_requests) or got_finish_signal
+                if got_finish_signal and len(self.active_requests) == 0:
                     break
 
                 if self.enable_iter_perf_stats:
@@ -704,7 +707,8 @@ class PyExecutor:
                         len(new_requests),
                         self.new_active_requests_queue_latency_ms)
 
-                self._pad_attention_dp_dummy_request()
+                if not got_finish_signal:
+                    self._pad_attention_dp_dummy_request()
 
                 scheduled_batch, _, _ = self._schedule()
 
@@ -838,6 +842,7 @@ class PyExecutor:
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
+        got_finish_signal = False
         is_ngram = hasattr(
             self.model_engine, "spec_config"
         ) and self.model_engine.spec_config is not None and self.model_engine.spec_config.spec_dec_mode.is_ngram(
@@ -845,12 +850,14 @@ class PyExecutor:
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while not self.is_shutdown or len(self.active_requests) > 0:
+            while not got_finish_signal or len(self.active_requests) > 0:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                if self.is_shutdown and len(self.active_requests) == 0:
+                got_finish_signal = self._merge_requests(
+                    new_requests) or got_finish_signal
+                if got_finish_signal and len(self.active_requests) == 0:
                     break
 
                 if self.kv_cache_transceiver:
@@ -861,7 +868,8 @@ class PyExecutor:
                         len(new_requests),
                         self.new_active_requests_queue_latency_ms)
 
-                self._pad_attention_dp_dummy_request()
+                if not got_finish_signal:
+                    self._pad_attention_dp_dummy_request()
 
                 if self.draft_model_engine is not None or is_ngram:
                     self._prepare_draft_requests()
@@ -986,15 +994,18 @@ class PyExecutor:
 
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
+        got_finish_signal = False
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
-            while not self.is_shutdown or len(self.active_requests) > 0:
+            while not got_finish_signal or len(self.active_requests) > 0:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
                 new_requests = self._fetch_new_requests()
-                if self.is_shutdown and len(self.active_requests) == 0:
+                got_finish_signal = self._merge_requests(
+                    new_requests) or got_finish_signal
+                if got_finish_signal and len(self.active_requests) == 0:
                     break
 
                 if self.kv_cache_transceiver:
@@ -1005,7 +1016,8 @@ class PyExecutor:
                         len(new_requests),
                         self.new_active_requests_queue_latency_ms)
 
-                self._pad_attention_dp_dummy_request()
+                if not got_finish_signal:
+                    self._pad_attention_dp_dummy_request()
 
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
                 )
@@ -1211,16 +1223,6 @@ class PyExecutor:
             new_requests, py_request_objects = self._broadcast_new_requests(
                 new_requests, py_request_objects)
 
-        # drop requests arriving after shutdown
-        valid_new_requests = []
-        for req_item in new_requests:
-            if req_item.is_shutdown_request():
-                self.is_shutdown = True
-                break
-            else:
-                valid_new_requests.append(req_item)
-        new_requests = valid_new_requests
-
         if py_request_objects and (self.dist.tp_size > 1
                                    or self.dist.has_pp) and self.dist.rank > 0:
             attr_name, req_obj_dict = py_request_objects
@@ -1229,8 +1231,6 @@ class PyExecutor:
 
         if not self.enable_attention_dp:
             self._update_new_active_requests_queue_latency(new_requests)
-            new_requests = self._merge_requests(new_requests)
-            self.active_requests.extend(new_requests)
             return new_requests
 
         num_new_requests_all_ranks = len(new_requests)
@@ -1242,7 +1242,8 @@ class PyExecutor:
 
         self.has_context_request = False
         new_requests_cur_rank = []
-        if new_requests != [] and self.expected_num_active_requests > all_ranks_num_active_requests[
+        if new_requests != [] and not new_requests[0].is_shutdown_request(
+        ) and self.expected_num_active_requests > all_ranks_num_active_requests[
                 self.dist.tp_rank]:
             # Balance context tokens across ranks
             HeapVal = namedtuple(
@@ -1297,8 +1298,8 @@ class PyExecutor:
         self.num_fetch_requests_cur_rank = self.num_fetch_requests_cur_rank + len(
             new_requests_cur_rank)
 
-        new_requests_cur_rank = self._merge_requests(new_requests_cur_rank)
-        self.active_requests.extend(new_requests_cur_rank)
+        if len(new_requests) == 1 and new_requests[0].is_shutdown_request():
+            new_requests_cur_rank = new_requests
         return new_requests_cur_rank
 
     def _add_kv_cache_events(self):
@@ -1309,6 +1310,16 @@ class PyExecutor:
         # Flush iteration events at each iteration to ensure that events have enough time
         # to be transferred to main thread when user needs them.
         kv_cache_manager.flush_iteration_events()
+
+    def _merge_tp_requests(self, new_requests: List[RequestQueueItem]):
+        for req_item in new_requests:
+            if req_item.is_shutdown_request():
+                return True
+        for req_item in new_requests:
+            req = executor_request_to_llm_request(req_item.id, req_item.request)
+            self.active_requests.append(req)
+
+        return False
 
     def _collect_py_objects_from_requests(
             self, requests: list[RequestQueueItem],
@@ -1335,6 +1346,8 @@ class PyExecutor:
         to each request.
         """
         for item in requests:
+            if item.is_shutdown_request():
+                continue
             py_obj = py_request_objects.get(item.id)
             if py_obj is not None:
                 setattr(item.request, attribute_name, py_obj)
@@ -1379,7 +1392,9 @@ class PyExecutor:
 
     def _merge_star_attention_requests(self,
                                        new_requests: list[RequestQueueItem]):
-        result = []
+        for req_item in new_requests:
+            if req_item.is_shutdown_request():
+                return True
         for req_item in new_requests:
             req_id, exe_req, query_token_ids = req_item.id, req_item.request, req_item.query
             ctx_len0 = len(exe_req.input_token_ids)
@@ -1429,10 +1444,9 @@ class PyExecutor:
             req.ctx_blocks = ctx_blocks
             req.ctx_position_blocks = position_blocks
             req.query_id = query_token_ids
+            self.active_requests.append(req)
 
-            result.append(req)
-
-        return result
+        return False
 
     @nvtx_range("_merge_requests")
     def _merge_requests(self, new_requests: list[RequestQueueItem]):
@@ -1440,18 +1454,14 @@ class PyExecutor:
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
             if cp_type == 'star_attention':
-                return self._merge_star_attention_requests(new_requests)
+                ret = self._merge_star_attention_requests(new_requests)
             elif cp_type == 'ring_attention':
                 raise NotImplementedError("ring attention not implemented yet")
             else:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')
         else:
-            return [
-                executor_request_to_llm_request(
-                    req_item.id, req_item.request,
-                    self._should_exclude_last_generation_logits())
-                for req_item in new_requests
-            ]
+            ret = self._merge_tp_requests(new_requests)
+        return ret
 
     @nvtx_range("_schedule")
     def _schedule(self):
