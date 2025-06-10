@@ -29,8 +29,7 @@ class HandleContextLogits:
         decoder_buffer_logits = [torch.empty(0)] * len(decoder_buffers.logits)
         for batch_index, llm_req in enumerate(context_requests):
             num_context_logits = num_context_logits_vec[batch_index]
-            draft_length = llm_req.num_draft_tokens if llm_req.is_last_context_chunk(
-            ) else 0
+            draft_length = llm_req.num_draft_tokens if llm_req.is_last_context_chunk else 0
 
             if llm_req.py_return_context_logits:
                 if llm_req.prepopulated_prompt_len > 0:

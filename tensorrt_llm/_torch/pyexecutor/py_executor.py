@@ -1087,11 +1087,11 @@ class PyExecutor:
                     # This is necessary because _forward_step updates the state before _update_requests is executed.
                     scheduled_batch.chunked_requests = [
                         r for r in scheduled_batch.context_requests
-                        if r.get_context_remaining_length() != 0
+                        if r.context_remaining_length != 0
                     ]
                     scheduled_batch.context_requests = [
                         r for r in scheduled_batch.context_requests
-                        if r.get_context_remaining_length() == 0
+                        if r.context_remaining_length == 0
                     ]
 
                     if self.enable_iter_perf_stats:
@@ -1636,7 +1636,7 @@ class PyExecutor:
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
                 request.move_to_next_context_chunk()
-            if request.get_context_remaining_length() == 0:
+            if request.context_remaining_length == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
 
     def _update_request_states_star_attention(
