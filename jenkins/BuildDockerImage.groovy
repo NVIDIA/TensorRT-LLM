@@ -632,8 +632,8 @@ pipeline {
                         'enableFailFast': false,
                         'branch': LLM_BRANCH,
                         'globalVars': globalVarsJson,
-                        'targetArch': "x86_64-linux-gnu",
-                        'dockerImage': globalVars[IMAGE_KEY_TO_TAG]['NGC Devel Image amd64'],
+                        // 'dockerImage': globalVars[IMAGE_KEY_TO_TAG]['NGC Devel Image amd64'],
+                        'dockerImage': 'urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505292346-4931',
                     ]
 
                     echo "trigger BuildDockerImageSanityTest job, params: ${parameters}"
@@ -702,3 +702,43 @@ pipeline {
 //     },
 //     targetArch=aarch64-linux-gnu
 // }
+// [
+//     gitlabSourceRepoHttpUrl: 'https://gitlab-master.nvidia.com/ftp/tekit.git',
+//     gitlabCommit: 'b6261862419c33d6ce2313aff1e7116067d6037d',
+//     artifactPath: 'sw-tensorrt-generic/llm-artifacts/LLM/release-0.20/L0_PostMerge/35',
+//     uploadPath: 'sw-tensorrt-generic/llm-artifacts/LLM/release-0.20/L0_PostMerge/35',
+//     enableFailFast: false,
+//     testFilter: [
+//         "reuse_stage_list": null,
+//         "skip_test": false,
+//         "stage_list": null,
+//         "gpu_type": null,
+//         "test_backend": null,
+//         "post_merge": true,
+//         "add_multi_gpu_test": false,
+//         "only_multi_gpu_test": false,
+//         "disable_multi_gpu_test": false,
+//         "extra_stage": null,
+//         "multi_gpu_file_changed": true,
+//         "only_pytorch_file_changed": false,
+//         "debug": false,
+//         "auto_trigger_tag_list": []
+//     ],
+//     dockerImage: 'urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505292346-4931',
+//     wheelDockerImagePy310: 'urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310-trt10.10.0.31-skip-tritondevel-202505292346-4931',
+//     wheelDockerImagePy312: 'urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312-trt10.10.0.31-skip-tritondevel-202505292346-4931',
+//     globalVars: [
+//         "github_pr_api_url": null,
+//         "cached_changed_file_list": null,
+//         "action_info": [
+//             "trigger_info": "Started by GitLab push by Yanchao Lu<br/>Git Commit: b6261862419c33d6ce2313aff1e7116067d6037d<br/><br/>",
+//             "parents": [
+//                 [
+//                     "name": "LLM/release-0.20/L0_PostMerge",
+//                     "url": "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/release-0.20/job/L0_PostMerge/35/",
+//                     "build_number": "35"
+//                 ]
+//             ]
+//         ]
+//     ]
+// ]
