@@ -226,7 +226,7 @@ def buildImage(config, imageKeyToTag)
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
     def makefileStage = config.makefileStage
 
-    def tmpTag = "a1db409-github-pr-4939-169" // TODO: remove this
+    def tmpTag = "1aa1b5b-github-pr-4939-192" // TODO: remove this
     // def tmpTag = LLM_DEFAULT_TAG
 
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${tmpTag}"
@@ -469,7 +469,7 @@ def getCommonParameters()
 {
     return [
         'gitlabSourceRepoHttpUrl': LLM_REPO,
-        'gitlabCommit': '0b93afba5bf94180ddfc5db3c20e417c073b7a35',
+        'gitlabCommit': env.gitlabCommit,
         'artifactPath': ARTIFACT_PATH,
         'uploadPath': UPLOAD_PATH,
     ]
@@ -632,6 +632,7 @@ pipeline {
                         'enableFailFast': false,
                         'branch': LLM_BRANCH,
                         'globalVars': globalVarsJson,
+                        'artifactCommit': '1aa1b5b4a3daf77ff10838ab530b128cbf8dea2e',
                         // 'dockerImage': globalVars[IMAGE_KEY_TO_TAG]['NGC Devel Image amd64'],
                         'dockerImage': 'urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505292346-4931',
                     ]
