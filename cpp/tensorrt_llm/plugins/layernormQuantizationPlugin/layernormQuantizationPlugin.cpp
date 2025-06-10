@@ -140,20 +140,24 @@ bool LayernormQuantizationPlugin::supportsFormatCombination(
             return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
         }
     }
-    else if (pos == 4 + static_cast<int>(mClampValEnabled))
+    else
     {
-        // Quantized output
-        return (inOut[pos].type == mOutputType) && (inOut[pos].format == TensorFormat::kLINEAR);
-    }
-    else if (pos == 5 && mDynActScaling)
-    {
-        // Dynamic scaling if enabled
-        return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
-    }
-    else if (pos == 6 + static_cast<int>(mClampValEnabled))
-    {
-        // Per-token activation sum if enabled
-        return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+        auto const output_pos = pos - nbInputs;
+        if (output_pos == 0)
+        {
+            // Quantized output
+            return (inOut[pos].type == mOutputType) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
+        else if (output_pos == 1 && mDynActScaling)
+        {
+            // Dynamic scaling if enabled
+            return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
+        else if (output_pos == 2 && static_cast<int>(mClampValEnabled))
+        {
+            // Clamp value
+            return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
     }
 
     // We should never reach this point

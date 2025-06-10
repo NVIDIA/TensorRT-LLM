@@ -52,7 +52,9 @@ __inline__ __device__ Tf compute_layernorm(Tf val, float s_mean, float s_varianc
  * First pass (loop) computes the mean and variance via Var[x] = E[x²] - E[x]²
  * Second pass computes and writes normed_output
  *
- * use_shmem controls if we cache input values into shared memory
+ * QuantT is the quantized data type (e.g. int8_t, __nv_fp8_e4m3)
+ *
+ * USE_SHMEM controls if we cache input values into shared memory
  *
  * Optional: with dynamic scaling, the last pass doesn't write immediately but finds the
  *           amax per row. A final pass scales to int8 accordingly, and writes output to
@@ -95,20 +97,20 @@ __global__ void generalLayerNorm(T const* input, T const* gamma, T const* beta, 
     for (int i = tidx; i < n_elems; i += blockDim.x)
     {
         const T val = input[bidx * n_elems + i];
-        if (USE_SHMEM)
+        if constexpr (USE_SHMEM)
         {
             shmem[i] = val;
         }
 
         const float_packed_t val_f = cuda_cast<float_packed_t>(val);
         local_sum += cuda_sum<float>(val_f);
-        if (USE_DIFF_OF_SQUARES)
+        if constexpr (USE_DIFF_OF_SQUARES)
         {
             local_var_sum += cuda_sum<float>(val_f * val_f);
         }
     }
 
-    if (USE_DIFF_OF_SQUARES)
+    if constexpr (USE_DIFF_OF_SQUARES)
     {
         float packed[2] = {local_sum, local_var_sum};
         blockReduceSumV2<float, 2>(packed);
@@ -124,7 +126,7 @@ __global__ void generalLayerNorm(T const* input, T const* gamma, T const* beta, 
     {
         mean = mean / hidden_dim;
         s_mean = mean;
-        if (USE_DIFF_OF_SQUARES)
+        if constexpr (USE_DIFF_OF_SQUARES)
         {
             variance = (variance / hidden_dim) - (mean * mean); // Var[x] = E[x²] - E[x]²
             s_variance = rsqrtf(variance + eps);
@@ -132,7 +134,7 @@ __global__ void generalLayerNorm(T const* input, T const* gamma, T const* beta, 
     }
     __syncthreads();
 
-    if (!USE_DIFF_OF_SQUARES)
+    if constexpr (!USE_DIFF_OF_SQUARES)
     {
         for (int i = tidx; i < n_elems; i += blockDim.x)
         {
@@ -168,7 +170,7 @@ __global__ void generalLayerNorm(T const* input, T const* gamma, T const* beta, 
         {
             val = cuda_clamp(val, clamp_min, clamp_max);
             amax = cuda_max(cuda_max<T_scalar, T>(cuda_abs(val)), amax);
-            if (USE_SHMEM)
+            if constexpr (USE_SHMEM)
             {
                 shmem[i] = val;
             }
@@ -200,7 +202,7 @@ __global__ void generalLayerNorm(T const* input, T const* gamma, T const* beta, 
         {
             int const index = bidx * n_elems + i;
             float_packed_t val_f = cuda_cast<float_packed_t>(USE_SHMEM ? shmem[i] : input[index]);
-            if (!USE_SHMEM)
+            if constexpr (!USE_SHMEM)
             {
                 val_f = compute_layernorm(val_f, s_mean, s_variance, gamma, beta, i);
             }
