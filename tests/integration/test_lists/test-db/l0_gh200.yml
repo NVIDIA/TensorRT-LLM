@@ -33,6 +33,7 @@ l0_gh200:
       gpu:
       - '*h200*'
       linux_distribution_name: ubuntu*
+      cpu: aarch64
     terms:
       stage: post_merge
       backend: tensorrt

@@ -45,6 +45,11 @@ def add_multimodal_args(parser):
                         type=int,
                         default=8,
                         help="The number of video frames to be sampled.")
+    parser.add_argument("--image_format",
+                        type=str,
+                        choices=["pt", "pil"],
+                        default="pt",
+                        help="The format of the image.")
     return parser
 
 
@@ -72,7 +77,7 @@ def main():
 
     llm, sampling_params = setup_llm(args)
 
-    image_format = "pt"  # ["pt", "pil"]
+    image_format = args.image_format
     if args.model_type is not None:
         model_type = args.model_type
     else:
@@ -80,6 +85,7 @@ def main():
             open(os.path.join(llm._hf_model_dir, 'config.json')))['model_type']
     assert model_type in ALL_SUPPORTED_MULTIMODAL_MODELS, f"Unsupported model_type: {model_type}"
 
+    device = "cuda"
     inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
                                              model_dir=llm._hf_model_dir,
                                              model_type=model_type,
@@ -87,12 +93,13 @@ def main():
                                              prompts=args.prompt,
                                              media=args.media,
                                              image_data_format=image_format,
-                                             num_frames=args.num_frames)
+                                             num_frames=args.num_frames,
+                                             device=device)
 
     outputs = llm.generate(inputs, sampling_params)
 
     for i, output in enumerate(outputs):
-        prompt = inputs[i]['prompt']
+        prompt = args.prompt[i]
         generated_text = output.outputs[0].text
         print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
 

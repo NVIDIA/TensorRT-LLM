@@ -16,7 +16,7 @@
  */
 
 #include "moeBindings.h"
-#include "tensorrt_llm/runtime/moeLoadBalancer.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
 #include <pybind11/functional.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -98,6 +98,8 @@ void initMoeBindings(pybind11::module_& m)
     py::class_<tr::MoeLoadBalancer>(m, "MoeLoadBalancer")
         .def(py::init<int, int, int>(), py::arg("ep_rank"), py::arg("ep_size"), py::arg("layer_updates_per_iter"),
             "Initialize the MoeLoadBalancer with the specified expert parallel rank, size, and update frequency")
+        .def("set_use_gpu_memcpy", &tr::MoeLoadBalancer::setUseGpuMemcpy, py::arg("use_gpu_memcpy"),
+            "Set whether to use GPU memcpy for weight updates")
         .def("add_layer", &tr::MoeLoadBalancer::AddLayer, py::arg("expert_count"), py::arg("top_k"),
             py::arg("slot_count_per_rank"), "Add a new MOE layer to the load balancer")
         .def("finalize_model", &tr::MoeLoadBalancer::finalizeModel,

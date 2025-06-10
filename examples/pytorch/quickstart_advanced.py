@@ -78,6 +78,13 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--use_cuda_graph', default=False, action='store_true')
+    parser.add_argument('--cuda_graph_padding_enabled',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--cuda_graph_batch_sizes',
+                        nargs='+',
+                        type=int,
+                        default=None)
     parser.add_argument('--print_iter_log',
                         default=False,
                         action='store_true',
@@ -103,6 +110,7 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_nextn', type=int, default=1)
     parser.add_argument('--eagle_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
+    parser.add_argument('--use_one_model', default=False, action='store_true')
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
@@ -111,6 +119,10 @@ def add_llm_args(parser):
     parser.add_argument('--relaxed_topk', type=int, default=1)
     parser.add_argument('--relaxed_delta', type=float, default=0.)
 
+    # HF
+    parser.add_argument('--trust_remote_code',
+                        default=False,
+                        action='store_true')
     return parser
 
 
@@ -132,6 +144,11 @@ def setup_llm(args):
     ) if args.spec_decode_algo is not None else None
 
     if spec_decode_algo == 'MTP':
+        if not args.use_one_model:
+            print(
+                "MTP only supports one model style spec decode; ignoring default use_one_model=False"
+            )
+
         spec_config = MTPDecodingConfig(
             num_nextn_predict_layers=args.spec_decode_nextn,
             use_relaxed_acceptance_for_thinking=args.
@@ -141,7 +158,8 @@ def setup_llm(args):
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_nextn,
-            pytorch_eagle_weights_path=args.eagle_model_dir)
+            pytorch_eagle_weights_path=args.eagle_model_dir,
+            eagle3_one_model=args.use_one_model)
     elif spec_decode_algo == "NGRAM":
         spec_config = NGramDecodingConfig(
             prompt_lookup_num_tokens=args.spec_decode_nextn,
@@ -160,6 +178,8 @@ def setup_llm(args):
               kv_cache_config=kv_cache_config,
               attn_backend=args.attention_backend,
               use_cuda_graph=args.use_cuda_graph,
+              cuda_graph_padding_enabled=args.cuda_graph_padding_enabled,
+              cuda_graph_batch_sizes=args.cuda_graph_batch_sizes,
               load_format=args.load_format,
               print_iter_log=args.print_iter_log,
               enable_iter_perf_stats=args.print_iter_log,
@@ -177,7 +197,8 @@ def setup_llm(args):
               moe_tensor_parallel_size=args.moe_tp_size,
               moe_cluster_parallel_size=args.moe_cluster_size,
               enable_chunked_prefill=args.enable_chunked_prefill,
-              speculative_config=spec_config)
+              speculative_config=spec_config,
+              trust_remote_code=args.trust_remote_code)
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,

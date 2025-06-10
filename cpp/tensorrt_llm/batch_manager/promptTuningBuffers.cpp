@@ -117,7 +117,6 @@ void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVect
     runtime::BufferManager const& manager, bool packed)
 {
     NVTX3_SCOPED_RANGE_WITH_NAME(range, "PromptTuningBuffers::fill");
-    manager.setZero(*mPromptTuningParams.embeddingTable);
 
     auto const numContextRequests = static_cast<SizeType32>(contextRequests.size());
 

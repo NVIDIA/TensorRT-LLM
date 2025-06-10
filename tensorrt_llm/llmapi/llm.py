@@ -27,7 +27,8 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
 from ..executor.postproc_worker import PostprocParams
 from ..executor.utils import (create_mpi_comm_session,
                               get_spawn_proxy_process_env)
-from ..inputs import PromptInputs, create_input_processor, prompt_inputs
+from ..inputs import (PromptInputs, create_input_processor,
+                      create_input_processor_with_hash, prompt_inputs)
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .llm_args import (LLMARGS_EXPLICIT_DOCSTRING, PybindMirror, TorchLlmArgs,
@@ -337,22 +338,38 @@ class LLM:
                 sampling_params.add_special_tokens = False
 
         query_token_ids = None
+        multimodal_input = None
         multimodal_embedding = None
         mrope_config = None
         if "prompt_token_ids" in inputs:
+            # TODO: if specify prompt_token_ids, the mm hashing is not supported yet
             prompt_token_ids = inputs['prompt_token_ids']
             prompt = None
             query_token_ids = inputs.get("query_token_ids", None)
         elif "prompt" in inputs:
-            with nvtx_range_debug("input_processor"):
-                prompt_token_ids, extra_processed_inputs = self.input_processor(
-                    inputs, sampling_params)
+            if 'multi_modal_data' in inputs:
+                # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
+                # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
+                # In the future, we should refactor this to:
+                # 1. Extend support for more modalities and models
+                # 2. Decouple input processor into distinct phases (preprocessor (all preprocessing logics), vision model (fuse in model fwd), etc.
+                input_processor_with_hash = create_input_processor_with_hash(
+                    self.input_processor)
+                with nvtx_range_debug("input_processor_with_hash"):
+                    prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
+                        inputs, sampling_params)
+            else:
+                with nvtx_range_debug("input_processor"):
+                    prompt_token_ids, extra_processed_inputs = self.input_processor(
+                        inputs, sampling_params)
             prompt = inputs['prompt']
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
                 multimodal_embedding = extra_processed_inputs.get(
                     'mm_embedding')
                 mrope_config = extra_processed_inputs.get('mrope_config')
+                multimodal_input = extra_processed_inputs.get(
+                    'multimodal_input')
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
@@ -372,6 +389,7 @@ class LLM:
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
+            multimodal_input=multimodal_input,
             multimodal_embedding=multimodal_embedding,
             mrope_config=mrope_config,
             kv_cache_retention_config=kv_cache_retention_config,

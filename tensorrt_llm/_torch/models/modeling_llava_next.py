@@ -4,8 +4,8 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import (AutoConfig, AutoModel, AutoProcessor, LlavaNextConfig,
-                          PretrainedConfig, PreTrainedModel)
+from transformers import (AutoConfig, AutoModel, AutoProcessor, AutoTokenizer,
+                          LlavaNextConfig, PretrainedConfig, PreTrainedModel)
 from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llava_next.modeling_llava_next import \
     LlavaNextMultiModalProjector
@@ -26,10 +26,22 @@ from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 class LlavaNextInputProcessor(InputProcessor):
 
-    def __init__(self, model_path, model_config, tokenizer):
+    def __init__(self,
+                 model_path,
+                 model_config,
+                 tokenizer,
+                 trust_remote_code: bool = True):
         self.tokenizer = tokenizer
-        self.processor = AutoProcessor.from_pretrained(model_path,
-                                                       use_fast=True)
+        self.use_fast = True
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                trust_remote_code=trust_remote_code,
+                use_fast=self.use_fast)
+        self.processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
         self.model_config = model_config
 
         self.device = 'cuda'
@@ -57,12 +69,20 @@ class LlavaNextInputProcessor(InputProcessor):
         hf_mm_projector = module_dict["multi_modal_projector"].to(
             self.dtype).to(self.device)
 
-        # Use TRTLLM vision tower(CLIPVisionModel)
-        vision_model_config = ModelConfig(
-            pretrained_config=model_config.vision_config, attn_backend="TRTLLM")
-        self.vision_tower = CLIPVisionModel(vision_model_config).to(
-            self.device).to(self.dtype)
-        self.vision_tower.load_weights(hf_vision_tower.state_dict())
+        # For A100 GPU, fallback to HF vision tower due to accuracy issue in TRT-LLM CLIPAttention
+        # Otherwise, use TRTLLM vision tower(CLIPVisionModel)
+        prop = torch.cuda.get_device_properties(0)
+        sm_version = prop.major * 10 + prop.minor
+        self.use_hf_vision_tower = sm_version == 80
+        if self.use_hf_vision_tower:
+            self.vision_tower = hf_vision_tower.to(self.device)
+        else:
+            vision_model_config = ModelConfig(
+                pretrained_config=model_config.vision_config,
+                attn_backend="TRTLLM")
+            self.vision_tower = CLIPVisionModel(vision_model_config).to(
+                self.device).to(self.dtype)
+            self.vision_tower.load_weights(hf_vision_tower.state_dict())
 
         # Use HF multi-modal projector
         self.mm_projector = hf_mm_projector
@@ -72,7 +92,7 @@ class LlavaNextInputProcessor(InputProcessor):
         return [
             self.processor(text="dummy",
                            images=image,
-                           do_rescale=not isinstance(image, torch.Tensor),
+                           do_rescale=not isinstance(images[0], torch.Tensor),
                            return_tensors="pt",
                            device=self.device)['pixel_values'][0].to(
                                self.device) for image in images
@@ -80,12 +100,16 @@ class LlavaNextInputProcessor(InputProcessor):
 
     @nvtx_range("[Vision] process")
     def _process(self, pixel_values):
-        attn_metadata = self.vision_tower.prepare_attn_metadata(
-            pixel_values.shape[0])
-        image_features: Tuple[torch.Tensor] = self.vision_tower(
-            pixel_values,
-            attn_metadata=attn_metadata,
-        )
+        if self.use_hf_vision_tower:
+            image_features = self.vision_tower(
+                pixel_values, output_hidden_states=True).hidden_states
+        else:
+            attn_metadata = self.vision_tower.prepare_attn_metadata(
+                pixel_values.shape[0])
+            image_features: Tuple[torch.Tensor] = self.vision_tower(
+                pixel_values,
+                attn_metadata=attn_metadata,
+            )
         selected_image_feature = image_features[-2][:, 1:]
         image_features = self.mm_projector(selected_image_feature)
         return image_features.reshape(-1, image_features.shape[-1])
@@ -238,8 +262,8 @@ class LlavaNextModel(PreTrainedModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
         **kwargs,

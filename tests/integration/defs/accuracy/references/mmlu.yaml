@@ -20,6 +20,10 @@ meta-llama/Llama-3.1-8B:
     accuracy: 64.99
 meta-llama/Llama-3.1-8B-Instruct:
   - accuracy: 68.17
+  - spec_dec_algo: EAGLE3
+    accuracy: 68.20
+  - spec_dec_algo: NGRAM
+    accuracy: 68.17
   - quant_algo: FP8
     accuracy: 67.93
   - quant_algo: FP8

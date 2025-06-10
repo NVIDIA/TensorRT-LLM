@@ -63,8 +63,11 @@ set(XQA_SOURCES
     "gmma_impl.cuh"
     "barriers.cuh"
     "tma.h"
+    "mha_components.cuh"
+    "mla_sm120.cuh"
     "mha.cu"
-    "mha_sm90.cu")
+    "mha_sm90.cu"
+    "mla_sm120.cu")
 
 # For ${Python3_EXECUTABLE}
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -98,8 +101,15 @@ if(BUILD_XQA_TESTS)
   FetchContent_MakeAvailable(googletest eigen)
 
   enable_testing()
-  add_executable(unitTests mha.cu mha_sm90.cu test/test.cpp
-                           test/refAttention.cpp)
+  add_executable(
+    unitTests
+    mha.cu
+    mha_sm90.cu
+    mla_sm120.cu
+    tensorMap.cpp
+    test/warmup.cu
+    test/test.cpp
+    test/refAttention.cpp)
   target_include_directories(unitTests PUBLIC ${EIGEN3_INCLUDE_DIR})
   target_link_libraries(unitTests PUBLIC GTest::gtest GTest::gtest_main cuda
                                          Eigen3::Eigen)

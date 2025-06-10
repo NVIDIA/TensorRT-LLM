@@ -28,7 +28,9 @@ extern "C"
         // sm >= 80
         TLLM_XQA_JIT_HMMA = 0,
         // sm == 90
-        TLLM_XQA_JIT_QGMMA = 1
+        TLLM_XQA_JIT_QGMMA = 1,
+        // sm == 120
+        TLLM_XQA_JIT_MLA = 2,
     } tllmXqaJitKernelType;
 
     typedef enum

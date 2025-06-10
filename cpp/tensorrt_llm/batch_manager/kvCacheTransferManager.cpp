@@ -141,6 +141,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                 {
                     auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
                     int const numLayers = pools[poolIdx].numLayers;
+                    int const kvFactor = pools[poolIdx].kvFactor;
                     int const numHeads = pools[poolIdx].numKvHeads;
                     int const sizePerHead = pools[poolIdx].sizePerHead;
                     auto shape = srcPtr->getShape();
@@ -148,8 +149,8 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                     TLLM_CHECK_WITH_INFO(
                         shape.nbDims == 4, "Expected KVCache block to have 4 dims, got %d", shape.nbDims);
 
-                    tk::kvCacheBlockPartialCopy(
-                        *dstPtr, *srcPtr, numLayers, numHeads, tokensPerBlock, sizePerHead, numTokensToCopy, stream);
+                    tk::kvCacheBlockPartialCopy(*dstPtr, *srcPtr, numLayers, numHeads, tokensPerBlock, sizePerHead,
+                        numTokensToCopy, kvFactor, stream);
                 }
             }
         }

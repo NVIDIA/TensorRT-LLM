@@ -2,10 +2,10 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
-from ...model_config import ModelConfig, MoeLoadBalancerConfig
+from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor
 from .interface import MoE, MoEWeightLoadingMode
-from .quantization import (FP8BlockScalesFusedMoEMethod,
+from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
@@ -71,18 +71,15 @@ class TRTLLMGenFusedMoE(MoE):
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
         assert not self.use_dp, "AttentionDP is not supported in TRTLLMGenFusedMoE."
 
-        # A dummy MoeLoadBalancerConfig to generate default initial_global_assignments and initial_local_expert_ids
-        moe_load_balancer_config = MoeLoadBalancerConfig()
-        moe_load_balancer_config.setup(num_experts=num_experts,
-                                       ep_rank=self.ep_rank,
-                                       ep_size=self.ep_size)
-
-        self.num_slots = moe_load_balancer_config.num_slots
-        self.initial_global_assignments = moe_load_balancer_config.get_layer_initial_global_assignments(
-            layer_idx)
-        self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
-        self.slot_start = moe_load_balancer_config.slot_start
-        self.slot_end = moe_load_balancer_config.slot_end
+        self.num_slots = self.num_experts
+        self.expert_size_per_partition = self.num_experts // self.ep_size
+        self.initial_global_assignments = [
+            (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
+            self.num_experts for ep_rank in range(self.ep_size)
+            for local_slot_id in range(self.expert_size_per_partition)
+        ]
+        self.slot_start = self.ep_rank * self.expert_size_per_partition
+        self.slot_end = self.slot_start + self.expert_size_per_partition
         self.initial_local_expert_ids = self.initial_global_assignments[
             self.slot_start:self.slot_end]
         assert len(
@@ -93,12 +90,12 @@ class TRTLLMGenFusedMoE(MoE):
             self.create_weights()
 
     def _check_configs(self):
-        assert self.has_fp8_block_scales or self.has_nvfp4, "TRTLLMGenFusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
+        assert self.has_deepseek_fp8_block_scales or self.has_nvfp4, "TRTLLMGenFusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
 
     def _get_quant_method(self):
         if self.quant_config is not None:
             if self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return FP8BlockScalesFusedMoEMethod()
+                return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4TRTLLMGenFusedMoEMethod()
             else:
@@ -153,7 +150,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         # TODO: since routing kernel is integrated into moe_runner for fp8,
         #       here we just route the I/Os for moe_runner
-        if self.has_fp8_block_scales:
+        if self.has_deepseek_fp8_block_scales:
             x_val, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
 
             # FIXME: tile_tokens_dim is hardcoded for now
