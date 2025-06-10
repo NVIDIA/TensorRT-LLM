@@ -296,7 +296,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             worker_cls=self.worker_cls,
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
-            ready_signal=ExecutorBindingsProxy.READY_SIGNAL,
+            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
         )
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)
