@@ -11,7 +11,6 @@ from tensorrt_llm._utils import mpi_barrier
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
