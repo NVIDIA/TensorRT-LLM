@@ -117,6 +117,7 @@ BASE_ZMQ_CLASSES = {
     "torch._utils": ["_rebuild_tensor_v2"],
     "torch.storage": ["_load_from_bytes"],
     "transformers.tokenization_utils_fast": ["PreTrainedTokenizerFast"],
+    "transformers.models.llama.tokenization_llama_fast": ["LlamaTokenizerFast"],
     "tokenizers": ["Tokenizer", "AddedToken"],
     "tokenizers.models": ["Model"],
 }
