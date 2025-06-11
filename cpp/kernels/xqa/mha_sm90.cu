@@ -453,7 +453,8 @@ __device__ void rescaleGemm1AccForNewColMax_sync(uint32_t warpRank, ShmQWiseVec 
 template <bool dstIsStrided = false, typename DstHead>
 __device__ void finalizeAndWriteOut_sync(uint32_t threadRank, uint32_t warpRank, DstHead* dst,
     SharedMem::OutSwizzleBuf& swizzleBuf, Gemm1Acc& acc, float xvoScale, CtaBarrier& warpGrpBar,
-    ShmQWiseVec const& accColSum, uint32_t nbKHeads = 0 /* only for final result in spec dec. */);
+    ShmQWiseVec const& accColSum, uint32_t nbKHeads = 0 /* only for final result in spec dec. */,
+    ShmQWiseVec const& accColMax, ShmQWiseVec const* attentionSinksVec);
 #else
 __device__ void transposeVTile(
     uint32_t warpRank, uint32_t lane, SharedMem::VTBuffer& dst, SharedMem::VBuffer const& src);
@@ -651,6 +652,7 @@ CUBIN_EXPORT __global__
 #else
             IOHead const* __restrict__ const q, // [nbReq][beamWidth][nbQHeads],
 #endif
+            float const* attentionSinks, // [headGrpSize]
             KVCacheList<usePagedKVCache> const cacheList,
 #if USE_BEAM_SEARCH
             BeamSearchParams const beamSearchParams,
@@ -1252,7 +1254,7 @@ CUBIN_EXPORT __global__
                     IOHead* const dst = (scratchMem.tokens() + idxChunk).template cast<IOHead>();
 #if SWAP_AB
                     finalizeAndWriteOut_sync(threadIdx.x, warpRank, dst, smem.outSwizzleBuf(idxXBuf), acc, xvoScale,
-                        smem.gemm1WarpGrpBar, smem.gemm1AccColSum);
+                        smem.gemm1WarpGrpBar, smem.gemm1AccColSum, smem.gemm1AccColMax, nullptr);
 #else
                     finalizeAndWriteOut_sync(warpRank, dst, smem.outSwizzleBuf(idxXBuf), acc, xvoScale,
                         smem.gemm1AccColSum, 1, ctaNbValidTokens);
@@ -1262,9 +1264,16 @@ CUBIN_EXPORT __global__
                 {
                     uint32_t const outOffset = headGrpSize * (nbKHeads * (beamWidth * ctaInputTokBeg) + idxHeadGrp);
                     OutputHead* const dst = &output[outOffset];
+                    ShmQWiseVec const* attentionSinksVec = nullptr;
+                    if (attentionSinks != nullptr)
+                    {
+                        attentionSinksVec
+                            = reinterpret_cast<ShmQWiseVec const*>(attentionSinks + headGrpSize * idxHeadGrp);
+                    }
 #if SWAP_AB
                     finalizeAndWriteOut_sync<SPEC_DEC>(threadIdx.x, warpRank, dst, smem.outSwizzleBuf(idxXBuf), acc,
-                        xvoScale, smem.gemm1WarpGrpBar, smem.gemm1AccColSum, nbKHeads);
+                        xvoScale, smem.gemm1WarpGrpBar, smem.gemm1AccColSum, nbKHeads, smem.gemm1AccColMax,
+                        attentionSinksVec);
 #else
                     finalizeAndWriteOut_sync(warpRank, dst, smem.outSwizzleBuf(idxXBuf), acc, xvoScale,
                         smem.gemm1AccColSum, nbKHeads, ctaNbValidTokens);
@@ -1584,6 +1593,17 @@ CUBIN_EXPORT __global__
                     }
                 }
                 unused(bar.consumed.arrive());
+            }
+            // Add the attention sinks.
+            if (attentionSinks != nullptr)
+            {
+                for (uint32_t i = 0; i < headsPerWarp; i++)
+                {
+                    uint32_t const idxHead = wid + nbMathWarps * i;
+                    float sink = expf(
+                        attentionSinks[min(idxHead, headGrpSize - 1) + idxHeadGrp * headGrpSize] - states[i].max);
+                    states[i].sum += sink;
+                }
             }
             __syncthreads();
             uint32_t const outOffset = headGrpSize * (nbKHeads * (beamWidth * ctaInputTokBeg) + idxHeadGrp);
@@ -2878,12 +2898,19 @@ __device__ inline void saveTransposedOutput(uint32_t threadRank, uint32_t warpRa
 template <bool dstIsStrided, typename DstHead>
 __device__ inline void finalizeAndWriteOut_sync(uint32_t threadRank, uint32_t warpRank, DstHead* dst,
     SharedMem::OutSwizzleBuf& swizzleBuf, Gemm1Acc& acc, float xvoScale, CtaBarrier& warpGrpBar,
-    ShmQWiseVec const& accColSum, uint32_t nbKHeads)
+    ShmQWiseVec const& accColSum, uint32_t nbKHeads, ShmQWiseVec const& accColMax, ShmQWiseVec const* attentionSinksVec)
 {
     // @fixme: if ctaNbQHeads is large, use loadShmColWiseVecNoDup + rcp + shfl to avoid 8x waste of mufu.rcp
     // static_assert(ctaNbQHeads <= 8, "Warning: consider using loadShmColWiseVecNoDup + rcp + shfl to avoid 8x waste of
     // mufu.rcp");
-    auto const regColSum = loadShmColWiseVecWithDup(accColSum);
+    auto regColSum = loadShmColWiseVecWithDup(accColSum);
+    if (attentionSinksVec != nullptr)
+    {
+        auto const regAccColMax = loadShmColWiseVecWithDup(accColMax);
+        auto const regAttentionSinks = loadShmColWiseVecWithDup(attentionSinksVec[0]);
+        auto regColSinks = expf(regAttentionSinks - regAccColMax);
+        regColSum = regColSum + regColSinks;
+    }
     auto const regOutScale = __frcp_rn(regColSum) * xvoScale;
     rescaleAcc(acc, regOutScale);
 
@@ -3175,6 +3202,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #else
     InputHead const* q,
 #endif
+    float const* attentionSinks, // [headGrpSize]
 #if USE_PAGED_KV_CACHE
 #if PAGED_KV_CACHE_LAYOUT == 1
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
@@ -3286,7 +3314,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #else
         q,
 #endif
-        cacheList,
+        attentionSinks, cacheList,
 #if USE_BEAM_SEARCH
         beamSearchParams,
 #endif
@@ -3322,7 +3350,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #else
         q,
 #endif
-        cacheList,
+        attentionSinks, cacheList,
 #if USE_BEAM_SEARCH
         beamSearchParams,
 #endif

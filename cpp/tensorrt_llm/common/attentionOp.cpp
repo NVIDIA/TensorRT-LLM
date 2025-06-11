@@ -55,6 +55,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     T const* qkv_bias;
     T const* relative_attention_bias;
     bool const* attention_mask;
+    float const* attention_sinks;
     float const* logn_scaling_ptr;
     int const* cache_indir;
     void* context_buf;
@@ -620,6 +621,9 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     // Attention mask input.
     params.attention_mask = input_params.attention_mask;
     params.attention_mask_stride = input_params.attention_mask_stride;
+
+    // Attention sinks.
+    params.attention_sinks = input_params.attention_sinks;
 
     // The slope of linear position bias per head, e.g., ALiBi.
     if (input_params.linear_bias_slopes != nullptr)
@@ -2222,6 +2226,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.relative_attention_bias_stride = relative_attention_bias_stride;
     dispatch_params.attention_mask = params.attention_mask;
     dispatch_params.attention_mask_stride = params.attention_mask_stride;
+    dispatch_params.attention_sinks = params.attention_sinks;
     dispatch_params.max_distance = max_distance;
     dispatch_params.cache_indir = params.cache_indir;
     dispatch_params.context_buf = mCpSize > 1 ? mhaOutput : params.context_buf; //
