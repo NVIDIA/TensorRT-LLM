@@ -35,7 +35,7 @@ namespace Routing
 {
 
 // The type of method in top-K routing, for use in torch custom op
-// Please keep this in sync with the counterpart defined in tensorrt_llm/_torch/modules/fused_moe.py
+// Please keep this in sync with the counterpart defined in tensorrt_llm/_torch/modules/fused_moe/routing.py
 enum class RoutingMethodType : int64_t
 {
     // Default: Softmax -> TopK
@@ -46,8 +46,8 @@ enum class RoutingMethodType : int64_t
     DeepSeekV3 = 2,
     // Llama4: Top1 -> Sigmoid
     Llama4 = 3,
-    // Qwen3: Softmax -> TopK -> Renormalize
-    Qwen3 = 4,
+    // RenormalizeNaive: Softmax -> TopK -> Renormalize
+    RenormalizeNaive = 4,
     // Unspecified
     Unspecified = 5,
 };
@@ -60,7 +60,7 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
     case RoutingMethodType::Renormalize: return "Renormalize";
     case RoutingMethodType::DeepSeekV3: return "DeepSeekV3";
     case RoutingMethodType::Llama4: return "Llama4";
-    case RoutingMethodType::Qwen3: return "Qwen3";
+    case RoutingMethodType::RenormalizeNaive: return "RenormalizeNaive";
     default: TLLM_CHECK_WITH_INFO(false, "Invalid routing method"); return "";
     };
 }
@@ -211,6 +211,9 @@ struct MoERunnerArgs
     // Output:
     void* output = nullptr;
     float* output_scale = nullptr;
+
+    // finalize
+    bool do_finalize{true};
 };
 
 struct MoEWorkspace

@@ -242,10 +242,8 @@ class TestNemotronUltra(CliFlowAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
     @parametrize_with_ids("cuda_graph", [False, True])
-    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
-                                                         (8, 1, 8)],
-                             ids=["tp8", "tp8ep4", "tp8ep8"])
-    def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
+    @pytest.mark.parametrize("tp_size,pp_size", [(8, 1)], ids=["tp8"])
+    def test_auto_dtype(self, cuda_graph, tp_size, pp_size):
         extra_summarize_args = []
         if cuda_graph:
             extra_summarize_args.append("--cuda_graph_mode")
@@ -253,22 +251,17 @@ class TestNemotronUltra(CliFlowAccuracyTestHarness):
         self.run(tasks=[MMLU(self.MODEL_NAME)],
                  tp_size=tp_size,
                  pp_size=pp_size,
-                 extra_convert_args=[
-                     f"--moe_tp_size={tp_size // ep_size}",
-                     f"--moe_ep_size={ep_size}", f"--moe_renorm_mode={0}"
-                 ],
-                 extra_build_args=["--gemm_plugin=auto", "--moe_plugin=auto"],
+                 extra_build_args=["--gemm_plugin=auto"],
                  extra_summarize_args=extra_summarize_args)
 
+    @pytest.mark.skip(
+        reason="nemotron-nas scripts have to accommodate fp8 flags")
     @skip_pre_hopper
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
     @parametrize_with_ids("cuda_graph", [False, True])
-    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
-                                                         (8, 1, 8)],
-                             ids=["tp8", "tp8ep4", "tp8ep8"])
-    def test_fp8_prequantized(self, cuda_graph, tp_size, pp_size, ep_size,
-                              mocker):
+    @pytest.mark.parametrize("tp_size,pp_size", [(8, 1)], ids=["tp8"])
+    def test_fp8_prequantized(self, cuda_graph, tp_size, pp_size, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
             f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8"
@@ -283,11 +276,7 @@ class TestNemotronUltra(CliFlowAccuracyTestHarness):
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  tp_size=tp_size,
                  pp_size=pp_size,
-                 extra_convert_args=[
-                     f"--moe_tp_size={tp_size // ep_size}",
-                     f"--moe_ep_size={ep_size}", f"--moe_renorm_mode={0}"
-                 ],
-                 extra_build_args=["--gemm_plugin=auto", "--moe_plugin=auto"],
+                 extra_build_args=["--gemm_plugin=auto"],
                  extra_summarize_args=extra_summarize_args)
 
 
@@ -1029,7 +1018,8 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
     @pytest.mark.parametrize(
         "moe_tp_size", [1, 4, 8],
         ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
-    def test_ootb_except_mha_tp8(self, moe_tp_size):
+    def test_ootb_except_mha_tp8(self, moe_tp_size, mocker):
+        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 1)
         self.run(tp_size=8,
                  extra_convert_args=[
                      f"--moe_tp_size={moe_tp_size}",

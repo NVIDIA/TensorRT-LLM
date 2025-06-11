@@ -870,6 +870,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 ]
         return prompt_tuning_configs
 
+    # TODO: add multimodal input for TRT engine backend
+
     def _prepare_mrope_executor(self, batch_input_ids_list, mrope: MropeParams):
         mrope_configs = len(batch_input_ids_list) * [None]
         if mrope != None:

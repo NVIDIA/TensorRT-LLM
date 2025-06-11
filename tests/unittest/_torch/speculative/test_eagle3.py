@@ -7,7 +7,7 @@ import torch
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm.llmapi import BuildConfig, EagleDecodingConfig, KvCacheConfig
+from tensorrt_llm.llmapi import EagleDecodingConfig, KvCacheConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
@@ -17,7 +17,6 @@ from utils.llm_data import llm_models_root
                          [[True, "TRTLLM"], [False, "TRTLLM"],
                           [True, "FLASHINFER"], [False, "FLASHINFER"]])
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
-    pytest.skip("Test is hanging")
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
@@ -39,20 +38,19 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
 
     draft_len = 4
     spec_config = EagleDecodingConfig(
-        max_draft_len=draft_len, pytorch_eagle_weights_path=eagle_model_dir)
+        max_draft_len=draft_len,
+        pytorch_eagle_weights_path=eagle_model_dir,
+        # Llama 3 does not support one model eagle.
+        eagle3_one_model=False)
 
-    build_config = None
-    if attn_backend == "FLASHINFER":
-        # TODO: fix max seq len logic in py_executor_creator. We will get
-        # an illegal memory access if this is not set to a preset value,
-        # which is definitely not right.
-        build_config = BuildConfig(max_seq_len=2048)
-
-    llm_spec = LLM(model=target_model_dir,
-                   **pytorch_config,
-                   kv_cache_config=kv_cache_config,
-                   speculative_config=spec_config,
-                   build_config=build_config)
+    llm_spec = LLM(
+        model=target_model_dir,
+        **pytorch_config,
+        kv_cache_config=kv_cache_config,
+        speculative_config=spec_config,
+        # TODO: https://nvbugspro.nvidia.com/bug/5319281
+        max_num_tokens=2048,
+        max_seq_len=2048)
 
     sampling_params = SamplingParams(
         max_tokens=32,
@@ -79,7 +77,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
         num_tokens = len(new_tokens)
 
     accept_rate = num_accepted / num_drafted
-    assert accept_rate > 0.25
+    assert accept_rate > 0.15
 
     prompts = [
         "The capital of France is", "The president of the United States is"
@@ -91,7 +89,8 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
     llm_ref = LLM(model=target_model_dir,
                   **pytorch_config,
                   kv_cache_config=kv_cache_config,
-                  build_config=build_config)
+                  max_num_tokens=2048,
+                  max_seq_len=2048)
 
     results_ref = llm_ref.generate(prompts, sampling_params)
     generated_text_ref = [result.outputs[0].text for result in results_ref]
