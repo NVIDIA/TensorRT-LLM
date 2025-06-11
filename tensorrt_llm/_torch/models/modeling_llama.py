@@ -301,7 +301,7 @@ class Llama4MoE(nn.Module):
         routed_output = self.experts(
             hidden_states,
             router_logits,
-            cutlass_min_latency_mode=cutlass_min_latency_mode,
+            do_finalize=not cutlass_min_latency_mode,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
         )
