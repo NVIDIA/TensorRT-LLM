@@ -72,6 +72,10 @@ std::shared_ptr<IGrammarMatcher> XGrammarMatcherFactory::Create(tle::GuidedDecod
         grammarMatcher = std::make_shared<xgrammar::GrammarMatcher>(mXGrammarCompiler->CompileGrammar(grammar));
         break;
     }
+    case tle::GuidedDecodingParams::GuideType::kSTRUCTURAL_TAG:
+    {
+        TLLM_CHECK_WITH_INFO(false, "kSTRUCTURAL_TAG is not supported by the xgrammar backend");
+    }
     case tle::GuidedDecodingParams::GuideType::kLARK_GRAMMAR:
     {
         TLLM_CHECK_WITH_INFO(false, "kLARK_GRAMMAR is not supported by the xgrammar backend");

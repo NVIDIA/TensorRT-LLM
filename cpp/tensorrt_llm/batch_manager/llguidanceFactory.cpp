@@ -100,6 +100,10 @@ std::shared_ptr<IGrammarMatcher> LLGuidanceMatcherFactory::Create(tle::GuidedDec
     {
         TLLM_CHECK_WITH_INFO(false, "kEBNF_GRAMMAR is not supported by the llguidance backend");
     }
+    case tle::GuidedDecodingParams::GuideType::kSTRUCTURAL_TAG:
+    {
+        TLLM_CHECK_WITH_INFO(false, "kSTRUCTURAL_TAG is not supported by the llguidance backend");
+    }
     }
 
     checkMatcher(matcher.get());
