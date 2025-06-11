@@ -106,6 +106,9 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softma
         // load softmax stat
         int const global_softmax_stats_offset = (global_q_offset + local_token_idx) * num_heads + head_idx;
         float2 curr_stats = curr_softmax_stats[global_softmax_stats_offset];
+        // hack, current softmax stats max is not multiplied by bmm1_scale
+        // TODO: delete this line when trtllm gen kernel return the right max value.
+        curr_stats.x *= 0.072168784; // 1 / sqrt(128 + 64), head_size is 128 for output, but for bmm1 is 192
         float2 pre_stats = pre_softmax_stats[global_softmax_stats_offset];
 
         // load attn
@@ -231,7 +234,7 @@ __global__ void setChunkedKVCacheForMLAKernel(T* output_kv, T* const kv, T* cons
     int64_t const cache_kv_len = cu_seq_lens[batch_idx + 1] - cu_seq_lens[batch_idx];
     int const kv_cache_block_num = (max_seq_len + kv_cache_tokens_per_block - 1) / kv_cache_tokens_per_block;
     int const kv_cache_block_size = num_heads * kv_cache_tokens_per_block * (uncompressed_head_size + rope_size);
-    int const offset_for_kv_in_mem_pool = kv_cache_block_num * kv_cache_block_size;
+    int64_t const offset_for_kv_in_mem_pool = kv_cache_block_num * kv_cache_block_size;
     int64_t const kv_offset = num_heads * uncompressed_head_size;
     size_t const seq_len_loop_end = cache_kv_len;
     for (int local_token_idx = (threadIdx.x / KT::kThreadPerHead) + blockIdx.x * KT::kCpTokenPerBlock;
@@ -245,14 +248,14 @@ __global__ void setChunkedKVCacheForMLAKernel(T* output_kv, T* const kv, T* cons
         {
 
             int64_t ld_kv_global_offset
-                = (global_token_offset + local_token_idx) * 2 * num_heads * uncompressed_head_size
+                = int64_t(global_token_offset + local_token_idx) * 2 * num_heads * uncompressed_head_size
                 + head_idx * uncompressed_head_size;
             int64_t ld_kv_local_offset = head_dim_vec_idx;
             auto k_data = (reinterpret_cast<typename KT::VecT*>(kv + ld_kv_global_offset))[ld_kv_local_offset];
             auto v_data
                 = (reinterpret_cast<typename KT::VecT*>(kv + kv_offset + ld_kv_global_offset))[ld_kv_local_offset];
 
-            int64_t st_k_global_offset = batch_idx * 2 * offset_for_kv_in_mem_pool
+            int64_t st_k_global_offset = int64_t(batch_idx) * 2 * offset_for_kv_in_mem_pool
                 + local_token_idx / kv_cache_tokens_per_block * kv_cache_block_size
                 + head_idx * kv_cache_tokens_per_block * (uncompressed_head_size + rope_size)
                 + (local_token_idx % kv_cache_tokens_per_block) * (uncompressed_head_size + rope_size);
@@ -265,10 +268,10 @@ __global__ void setChunkedKVCacheForMLAKernel(T* output_kv, T* const kv, T* cons
         else
         {
             // rope h = 1
-            int64_t ld_rope_global_offset = (global_token_offset + local_token_idx) * rope_size;
+            int64_t ld_rope_global_offset = int64_t(global_token_offset + local_token_idx) * rope_size;
             int64_t ld_rope_local_offset = head_dim_vec_idx - KT::kKVThreadPerHead;
             auto rope_data = (reinterpret_cast<typename KT::VecT*>(k_pe + ld_rope_global_offset))[ld_rope_local_offset];
-            int64_t st_rope_global_offset = batch_idx * 2 * offset_for_kv_in_mem_pool
+            int64_t st_rope_global_offset = int64_t(batch_idx) * 2 * offset_for_kv_in_mem_pool
                 + local_token_idx / kv_cache_tokens_per_block * kv_cache_block_size
                 + head_idx * kv_cache_tokens_per_block * (uncompressed_head_size + rope_size)
                 + (local_token_idx % kv_cache_tokens_per_block) * (uncompressed_head_size + rope_size);
