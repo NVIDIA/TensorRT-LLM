@@ -962,6 +962,13 @@ class MLA(nn.Module):
                 else:
                     merge_op_tensor[loop_idx, s] = 0  # skip
 
+        # set merge op for last attn
+        for s in range(num_contexts):
+            if cached_kv_lens[s] == 0:
+                merge_op_tensor[chunked_loop_num, s] = 2  # copy only
+            else:
+                merge_op_tensor[chunked_loop_num, s] = 1  # merge
+
     def forward_context_with_chunked_prefill(
         self,
         q: torch.Tensor,
@@ -988,6 +995,7 @@ class MLA(nn.Module):
                                       self.num_heads * self.qk_rope_head_dim)
         q_pe, k_pe = self.rotary_emb(
             position_ids[..., :attn_metadata.num_ctx_tokens], [q_pe, k_pe])
+        k_pe = k_pe.contiguous()
 
         # build q for attention op
         q_view = q.view(-1, self.num_heads,
@@ -1017,10 +1025,10 @@ class MLA(nn.Module):
             device=q.device,
         )
         attn_output = q.new_empty((q.size(0), self.num_heads * self.v_head_dim),
-                                  dtype=q.type())
+                                  dtype=q.dtype)
         chunked_seq_len = torch.empty(
             (chunked_loop_num, attn_metadata.num_seqs),
-            dtype=torch.int64,
+            dtype=torch.int,
             device='cuda',
         )
         host_chunked_seq_len = torch.empty_like(
@@ -1128,7 +1136,6 @@ class MLA(nn.Module):
         # deal with the uncached kv
         kv = self.kv_b_proj(compressed_kv)
 
-        k_pe = k_pe.contiguous()
         # append paged kv cache for mla
         # we may finish it inside the attention op by passing latent_cache
         trtllm_attention.append_paged_kv_cache_for_mla(
