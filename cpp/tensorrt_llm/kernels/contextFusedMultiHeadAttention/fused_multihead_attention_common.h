@@ -263,6 +263,8 @@ struct MHARunnerParams
     void* outputSfPtr;
     // The softmax_status ptr for RingAttention.
     void* softmaxStatsPtr;
+    // The attention sinks ptr.
+    float const* attentionSinksPtr;
     // The packed mask ptr.
     void const* packedMaskPtr;
     // The cumulative Q sequence lengths.

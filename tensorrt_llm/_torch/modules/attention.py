@@ -383,6 +383,7 @@ class Attention(nn.Module):
         lora_params: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
+        attention_sinks: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -434,6 +435,11 @@ class Attention(nn.Module):
                                  and (self.attn_backend == "TRTLLM"
                                       or self.attn_backend == "FLASHINFER")
                                  and is_torch_compiling())
+
+        if attention_sinks is not None:
+            assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
+            assert not use_custom_inplace_op, "Attention sinks are not supported when using custom inplace op."
+
         if use_custom_inplace_op:
             output = self.create_output(q)
             attn_custom_op_inplace(
@@ -459,6 +465,7 @@ class Attention(nn.Module):
                 mrope_position_deltas,
                 attention_window_size,
                 attention_mask_data,
+                attention_sinks=attention_sinks
             )
             if output_sf is not None:
                 output = Fp4QuantizedTensor(output, output_sf)
