@@ -563,6 +563,7 @@ void TrtGptModelInflightBatching::adjustMaxAttentionWindow(SizeType32 numPrimary
         // TODO(nhaber): This is problematic, as createBuffers edits the state of trtGptModelInflightBatching, but what
         // if there are different window values for cross+self etc. in encoder+decoder scenario...
         createBuffers(mDecodingConfig, mAdditionalModelOutputs);
+        createDecoder(mDecodingConfig.getDecodingMode());
     }
 }
 
@@ -1476,26 +1477,6 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
     }
 
     mDecodingInputs.resize(mNumMicroBatches);
-
-    // Reset the spec decoder buffers after we recreate the decoder buffers.
-    if (mDecoderState)
-    {
-        // auto const decodingMode = decodingConfig.getDecodingMode();
-        auto const decodingMode = getDecodingMode(
-            mModelConfig.getSpeculativeDecodingMode(), mDecodingConfig.getDecodingMode(), mOperatingBeamWidth);
-        if (decodingMode.isExplicitDraftTokens())
-        {
-            mDecoderState->setupExplicitDraftTokens(mDecoderBuffers->explicitDraftTokensBuffers);
-        }
-        else if (decodingMode.isLookahead())
-        {
-            mDecoderState->setupLookahead(mDecoderBuffers->lookaheadBuffers.value());
-        }
-        else if (decodingMode.isEagle())
-        {
-            mDecoderState->setupEagle(mDecoderBuffers->eagleBuffers);
-        }
-    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
