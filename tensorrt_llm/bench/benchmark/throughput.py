@@ -25,7 +25,6 @@ from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
-from tensorrt_llm.executor.postproc_worker import PostprocArgs
 from tensorrt_llm.llmapi import LLM, CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
@@ -369,7 +368,7 @@ def throughput_command(
                                          pad_id=eos_id,
                                          n=beam_width,
                                          use_beam_search=beam_width > 1)
-        post_proc_params = None # No detokenization
+        post_proc_params = None  # No detokenization
 
         # Perform warmup if requested.
         if warmup > 0:
