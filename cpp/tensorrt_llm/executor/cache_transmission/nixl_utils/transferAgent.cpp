@@ -22,14 +22,84 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <nixl_types.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 namespace tensorrt_llm::executor::kv_cache
 {
+
+// 文件锁RAII管理类
+class FileLock
+{
+private:
+    int fd_;
+    std::string lockFile_;
+    bool locked_;
+
+public:
+    explicit FileLock(std::string const& lockFile)
+        : fd_(-1)
+        , lockFile_(lockFile)
+        , locked_(false)
+    {
+    }
+
+    ~FileLock()
+    {
+        unlock();
+    }
+
+    bool lock()
+    {
+        if (locked_)
+            return true;
+
+        // 创建锁文件目录（如果不存在）
+        size_t pos = lockFile_.find_last_of('/');
+        if (pos != std::string::npos)
+        {
+            std::string dir = lockFile_.substr(0, pos);
+            mkdir(dir.c_str(), 0755);
+        }
+
+        fd_ = open(lockFile_.c_str(), O_CREAT | O_WRONLY, 0644);
+        if (fd_ == -1)
+        {
+            TLLM_LOG_ERROR("Failed to open lock file: %s", lockFile_.c_str());
+            return false;
+        }
+
+        if (flock(fd_, LOCK_EX) == -1)
+        {
+            TLLM_LOG_ERROR("Failed to acquire file lock: %s", lockFile_.c_str());
+            close(fd_);
+            fd_ = -1;
+            return false;
+        }
+
+        locked_ = true;
+        return true;
+    }
+
+    void unlock()
+    {
+        if (locked_ && fd_ != -1)
+        {
+            flock(fd_, LOCK_UN);
+            close(fd_);
+            fd_ = -1;
+            locked_ = false;
+        }
+    }
+};
 
 static std::string getAvailableIP()
 {
@@ -198,11 +268,18 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     : mName{config.mName}
 {
     nixl_status_t status;
-    auto envPort = common::getEnvNixlPort();
-    uint16_t port = envPort > 0 ? getIncrmentPort(envPort) : getAvailablePort();
-    nixlAgentConfig nixlConfig{config.useProgThread, true, port};
-    mAddress = getAvailableIP() + ":" + std::to_string(port);
-    mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+    {
+        FileLock lock("/tmp/trtllm_nixl_port.lock");
+        if (!lock.lock())
+        {
+            TLLM_THROW("Failed to lock /tmp/trtllm_nixl_port.lock");
+        }
+        auto envPort = common::getEnvNixlPort();
+        uint16_t port = envPort > 0 ? getIncrmentPort(envPort) : getAvailablePort();
+        nixlAgentConfig nixlConfig{config.useProgThread, true, port};
+        mAddress = getAvailableIP() + ":" + std::to_string(port);
+        mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+    }
 
     nixl_b_params_t init1;
     nixl_mem_list_t mems1;
@@ -337,6 +414,9 @@ void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionIn
 {
     std::string ip = connectionInfo.substr(0, connectionInfo.find(":"));
     std::string port = connectionInfo.substr(connectionInfo.find(":") + 1);
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "NixlTransferAgent::connectRemoteAgent connectRemoteAgent to %s remoteagent name: %s", connectionInfo.c_str(),
+        name.c_str());
     TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "connectRemoteAgent get empty ip or port, connectionInfo: %s",
         connectionInfo.c_str());
     nixl_opt_args_t md_extra_params;
