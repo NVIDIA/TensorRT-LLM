@@ -114,7 +114,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
     if len(case_fn) > 80:
         case_fn = case_fn[:80]
     output_xml = os.path.join(output_dir,
-                              f'sub-results-unittests-{case_fn}.xml')
+                              f'results-sub-unittests-{case_fn}.xml')
 
     command = [
         '-m',
