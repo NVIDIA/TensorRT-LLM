@@ -29,7 +29,7 @@ class Mamba2Metadata:
                                       device="cuda")
 
         # sequence index for prefill requests [num_prefill_tokens] - specifies which request each token belongs to
-        self.seq_idx: torch.Tensor
+        self.seq_idx: torch.Tensor = None
 
     def prepare(self, attn_metadata: AttentionMetadata):
         num_contexts = attn_metadata.num_contexts
