@@ -297,6 +297,79 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         return tuple()
 
 
+def load_expert_fc31_input_scale_fp8_qdq(w1_input_scale, w3_input_scale,
+                                         dst_fc31_input_scale: torch.Tensor):
+    dst_fc31_input_scale.copy_(
+        max(w1_input_scale[...].reshape([]), w3_input_scale[...].reshape([])))
+
+
+def load_expert_fc2_input_scale_fp8_qdq(w2_input_scale,
+                                        dst_fc2_input_scale: torch.Tensor):
+    dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
+
+
+def load_activation_scales_fp8_qdq(module: torch.nn.Module, weights: Dict):
+    tmp_fc31_input_scale = torch.empty(module.num_experts, dtype=torch.float32)
+    tmp_fc2_input_scale = torch.empty(module.num_experts, dtype=torch.float32)
+    for expert_id in range(module.num_experts):
+        if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+            w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
+            w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
+            w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+        elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+            w1_input_scale = weights[f"gate_up_proj_input_scale"]
+            w3_input_scale = weights[f"gate_up_proj_input_scale"]
+            w2_input_scale = weights[f"down_proj_input_scale"]
+        else:
+            raise NotImplementedError(
+                f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
+            )
+
+        load_expert_fc31_input_scale_fp8_qdq(w1_input_scale, w3_input_scale,
+                                             tmp_fc31_input_scale[expert_id])
+
+        load_expert_fc2_input_scale_fp8_qdq(w2_input_scale,
+                                            tmp_fc2_input_scale[expert_id])
+
+    # max_fc31_input_scale is the maximum of all w1 input scales and w3 input scales.
+    # It's used to quantize fc31 input inside the MOE op
+    max_fc31_input_scale = tmp_fc31_input_scale.max()
+    # max_fc2_input_scale is the maximum of all w2 input scales.
+    max_fc2_input_scale = tmp_fc2_input_scale.max()
+
+    return max_fc31_input_scale, max_fc2_input_scale
+
+
+def requantize_expert_w3_w1_weight_fp8_qdq(module: torch.nn.Module,
+                                           w1_weight_scale, w3_weight_scale,
+                                           dst_w3_w1_weight: torch.Tensor):
+    w1_weight_scale = w1_weight_scale[...].reshape([])
+    w3_weight_scale = w3_weight_scale[...].reshape([])
+    max_w3_w1_weight_scale = max(w1_weight_scale, w3_weight_scale)
+
+    w3_weight = dst_w3_w1_weight.narrow(
+        dim=0, start=0,
+        length=module.intermediate_size_per_partition).to(dtype=module.dtype)
+    w1_weight = dst_w3_w1_weight.narrow(
+        dim=0,
+        start=module.intermediate_size_per_partition,
+        length=module.intermediate_size_per_partition).to(dtype=module.dtype)
+    dequant_w3_weight = w3_weight * w3_weight_scale
+    dequant_w1_weight = w1_weight * w1_weight_scale
+    requant_w3_weight = (dequant_w3_weight / max_w3_w1_weight_scale).to(
+        torch.float8_e4m3fn)
+    requant_w1_weight = (dequant_w1_weight / max_w3_w1_weight_scale).to(
+        torch.float8_e4m3fn)
+
+    dst_w3_w1_weight.narrow(
+        dim=0, start=0,
+        length=module.intermediate_size_per_partition).copy_(requant_w3_weight)
+    dst_w3_w1_weight.narrow(
+        dim=0,
+        start=module.intermediate_size_per_partition,
+        length=module.intermediate_size_per_partition).copy_(requant_w1_weight)
+
+
 class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
 
     def create_weights(self, module: torch.nn.Module):
@@ -350,17 +423,6 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
             fc1_input_dequant=module.fc31_input_dequant,
         )
 
-    def load_expert_fc31_input_scale_fp8_qdq(
-            self, w1_input_scale, w3_input_scale,
-            dst_fc31_input_scale: torch.Tensor):
-        dst_fc31_input_scale.copy_(
-            max(w1_input_scale[...].reshape([]),
-                w3_input_scale[...].reshape([])))
-
-    def load_expert_fc2_input_scale_fp8_qdq(self, w2_input_scale,
-                                            dst_fc2_input_scale: torch.Tensor):
-        dst_fc2_input_scale.copy_(w2_input_scale[...].reshape([]))
-
     def load_expert_w3_w1_weight_scale_fp8_qdq(
             self, w1_weight_scale, w3_weight_scale,
             dst_w3_w1_weight_scale: torch.Tensor):
@@ -368,73 +430,14 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
         w3_weight_scale = w3_weight_scale[...].reshape([])
         dst_w3_w1_weight_scale.copy_(max(w1_weight_scale, w3_weight_scale))
 
-    def requantize_expert_w3_w1_weight_fp8_qdq(self, module: torch.nn.Module,
-                                               w1_weight_scale, w3_weight_scale,
-                                               dst_w3_w1_weight: torch.Tensor):
-        w1_weight_scale = w1_weight_scale[...].reshape([])
-        w3_weight_scale = w3_weight_scale[...].reshape([])
-        max_w3_w1_weight_scale = max(w1_weight_scale, w3_weight_scale)
-
-        w3_weight = dst_w3_w1_weight.narrow(
-            dim=0, start=0, length=module.intermediate_size_per_partition).to(
-                dtype=module.dtype)
-        w1_weight = dst_w3_w1_weight.narrow(
-            dim=0,
-            start=module.intermediate_size_per_partition,
-            length=module.intermediate_size_per_partition).to(
-                dtype=module.dtype)
-        dequant_w3_weight = w3_weight * w3_weight_scale
-        dequant_w1_weight = w1_weight * w1_weight_scale
-        requant_w3_weight = (dequant_w3_weight / max_w3_w1_weight_scale).to(
-            torch.float8_e4m3fn)
-        requant_w1_weight = (dequant_w1_weight / max_w3_w1_weight_scale).to(
-            torch.float8_e4m3fn)
-
-        dst_w3_w1_weight.narrow(
-            dim=0, start=0,
-            length=module.intermediate_size_per_partition).copy_(
-                requant_w3_weight)
-        dst_w3_w1_weight.narrow(
-            dim=0,
-            start=module.intermediate_size_per_partition,
-            length=module.intermediate_size_per_partition).copy_(
-                requant_w1_weight)
-
     def load_expert_w2_weight_scale_fp8(self, w2_weight_scale,
                                         dst_w2_weight_scale: torch.Tensor):
         dst_w2_weight_scale.copy_(w2_weight_scale[...].reshape([]))
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         # Step1: Load input scales.
-        tmp_fc31_input_scale = torch.empty(module.num_experts,
-                                           dtype=torch.float32)
-        tmp_fc2_input_scale = torch.empty(module.num_experts,
-                                          dtype=torch.float32)
-        for expert_id in range(module.num_experts):
-            if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-                w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
-                w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
-                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
-            elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_input_scale = weights[f"gate_up_proj_input_scale"]
-                w3_input_scale = weights[f"gate_up_proj_input_scale"]
-                w2_input_scale = weights[f"down_proj_input_scale"]
-            else:
-                raise NotImplementedError(
-                    f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
-                )
-
-            self.load_expert_fc31_input_scale_fp8_qdq(
-                w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
-
-            self.load_expert_fc2_input_scale_fp8_qdq(
-                w2_input_scale, tmp_fc2_input_scale[expert_id])
-
-        # max_fc31_input_scale is the maximum of all w1 input scales and w3 input scales.
-        # It's used to quantize fc31 input inside the MOE op
-        max_fc31_input_scale = tmp_fc31_input_scale.max()
-        # max_fc2_input_scale is the maximum of all w2 input scales.
-        max_fc2_input_scale = tmp_fc2_input_scale.max()
+        max_fc31_input_scale, max_fc2_input_scale = load_activation_scales_fp8_qdq(
+            module, weights)
 
         # Step2: Load weight scales and requantize w3_w1_weight.
         tmp_w3_w1_weight_scale = torch.empty(module.expert_size_per_partition,
@@ -463,7 +466,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
                 w1_weight_scale, w3_weight_scale,
                 tmp_w3_w1_weight_scale[expert_idx])
 
-            self.requantize_expert_w3_w1_weight_fp8_qdq(
+            requantize_expert_w3_w1_weight_fp8_qdq(
                 module, w1_weight_scale, w3_weight_scale,
                 module.w3_w1_weight.data[expert_idx])
 

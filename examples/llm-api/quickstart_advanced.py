@@ -54,7 +54,7 @@ def add_llm_args(parser):
                         choices=[
                             'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
                             'DEEPGEMM', 'CUTEDSL'
-                        ])
+                        , 'TRITON'])
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
