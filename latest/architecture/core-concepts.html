@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc0" />
+  <meta name="docsearch:version" content="0.21.0rc1" />
 
 
   </head>
@@ -514,22 +514,22 @@
 <span id="core-concepts"></span><h1>Model Definition<a class="headerlink" href="#model-definition" title="Link to this heading">#</a></h1>
 <p>TensorRT-LLM has a Model Definition API that can be used to define
 Large Language Models. This API is built on top of the powerful
-<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/index.html#">TensorRT Python API</a>
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/index.html">TensorRT Python API</a>
 to create graph representations of deep neural networks in TensorRT. To become
 familiar with the core concepts of the TensorRT API, refer to the
-<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/coreConcepts.html">Core Concepts</a>
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/coreConcepts.html">Core Concepts</a>
 section of the TensorRT documentation before proceeding further.</p>
 <p>In TensorRT-LLM, the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/tensorrt_llm/builder.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder</span></code></a> class
 contains a
-<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder"><code class="docutils literal notranslate"><span class="pre">tensorrt.Builder</span></code></a>
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Core/Builder.html#id1"><code class="docutils literal notranslate"><span class="pre">tensorrt.Builder</span></code></a>
 object. That instance is used in the <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder.create_network</span></code>
 method to create an instance of the
-<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Network.html#tensorrt.INetworkDefinition"><code class="docutils literal notranslate"><span class="pre">tensorrt.INetworkDefinition</span></code></a>
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Graph/Network.html#tensorrt.INetworkDefinition"><code class="docutils literal notranslate"><span class="pre">tensorrt.INetworkDefinition</span></code></a>
 class. The <code class="docutils literal notranslate"><span class="pre">INetworkDefinition</span></code> object can then be populated using the free
 functions defined in the
 <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/tensorrt_llm/functional.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm.functional</span></code></a>.</p>
 <p>A simple example of such a free function is <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.activation</span></code> that inserts a
-<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Layers.html#tensorrt.IActivationLayer"><code class="docutils literal notranslate"><span class="pre">tensorrt.IActivationLayer</span></code></a>
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Graph/Layers.html#tensorrt.IActivationLayer"><code class="docutils literal notranslate"><span class="pre">tensorrt.IActivationLayer</span></code></a>
 node in the graph of the model:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># In tensorrt_llm.functional:</span>
 
@@ -558,23 +558,23 @@ functions such as the <code class="docutils literal notranslate"><span class="pr
 <p>When the TensorRT-LLM’s Model Definition API is utilized, a graph of the network is
 assembled.  The graph can later be traversed or transformed using the graph
 traversal API exposed by the
-<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/LayerBase.html#tensorrt.ILayer"><code class="docutils literal notranslate"><span class="pre">tensorrt.ILayer</span></code></a>
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Graph/LayerBase.html#tensorrt.ILayer"><code class="docutils literal notranslate"><span class="pre">tensorrt.ILayer</span></code></a>
 class. That graph will also be optimized by TensorRT during the compilation of
 the engine, as explained in the next section.</p>
 </section>
 <section id="compilation">
 <h1>Compilation<a class="headerlink" href="#compilation" title="Link to this heading">#</a></h1>
 <p>Once populated, the instance of the
-<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Graph/Network.html#tensorrt.INetworkDefinition"><code class="docutils literal notranslate"><span class="pre">tensorrt.INetworkDefinition</span></code></a>,
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Graph/Network.html#tensorrt.INetworkDefinition"><code class="docutils literal notranslate"><span class="pre">tensorrt.INetworkDefinition</span></code></a>,
 can be compiled into an efficient engine by the
-<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder"><code class="docutils literal notranslate"><span class="pre">tensorrt.Builder</span></code></a>
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Core/Builder.html#id1"><code class="docutils literal notranslate"><span class="pre">tensorrt.Builder</span></code></a>
 In TensorRT-LLM, it is done through the <code class="docutils literal notranslate"><span class="pre">build_engine</span></code> member function of the
 <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.Builder</span></code> class that calls the
-<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder.build_serialized_network"><code class="docutils literal notranslate"><span class="pre">build_serialized_network</span></code></a>
+[<code class="docutils literal notranslate"><span class="pre">build_serialized_network</span></code>](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Core/Builder.html#tensorrt.Builder.build_serialized_network
 method of the
-<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/Core/Builder.html#tensorrt.Builder"><code class="docutils literal notranslate"><span class="pre">tensorrt.Builder</span></code></a>
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/Core/Builder.html#id1"><code class="docutils literal notranslate"><span class="pre">tensorrt.Builder</span></code></a>
 object. That call, if everything works as expected, produces an instance of the
-<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/api/python_api/infer/FoundationalTypes/HostMemory.html#tensorrt.IHostMemory"><code class="docutils literal notranslate"><span class="pre">tensorrt.IHostMemory</span></code></a>
+<a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/infer/FoundationalTypes/HostMemory.html#tensorrt.IHostMemory"><code class="docutils literal notranslate"><span class="pre">tensorrt.IHostMemory</span></code></a>
 class. That object is an optimized TensorRT engine that can be stored as a
 binary file.</p>
 <section id="tensorrt-compiler">
@@ -1021,9 +1021,9 @@ srun<span class="w"> </span><span class="se">\</span>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 03, 2025.</p>
+  <p>Last updated on June 09, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ae2ce6">9ae2ce6</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
   
 </div></div>
       

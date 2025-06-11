@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc0" />
+  <meta name="docsearch:version" content="0.21.0rc1" />
 
 
   </head>
@@ -751,6 +751,12 @@ However, for the PyTorch backend, specified with the <code class="docutils liter
 </dd></dl>
 
 <dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-disaggregated-m">
+<span id="cmdoption-trtllm-serve-disaggregated-metadata_server_config_file"></span><span class="sig-name descname"><span class="pre">-m</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--metadata_server_config_file</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;metadata_server_config_file&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-disaggregated-m" title="Link to this definition">#</a></dt>
+<dd><p>Path to metadata server config file</p>
+</dd></dl>
+
+<dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-disaggregated-t">
 <span id="cmdoption-trtllm-serve-disaggregated-server_start_timeout"></span><span class="sig-name descname"><span class="pre">-t</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--server_start_timeout</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;server_start_timeout&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-disaggregated-t" title="Link to this definition">#</a></dt>
 <dd><p>Server start timeout</p>
@@ -760,6 +766,17 @@ However, for the PyTorch backend, specified with the <code class="docutils liter
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-disaggregated-r">
 <span id="cmdoption-trtllm-serve-disaggregated-request_timeout"></span><span class="sig-name descname"><span class="pre">-r</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--request_timeout</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;request_timeout&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-disaggregated-r" title="Link to this definition">#</a></dt>
 <dd><p>Request timeout</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-disaggregated-l">
+<span id="cmdoption-trtllm-serve-disaggregated-log_level"></span><span class="sig-name descname"><span class="pre">-l</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--log_level</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;log_level&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-disaggregated-l" title="Link to this definition">#</a></dt>
+<dd><p>The logging level.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Options<span class="colon">:</span></dt>
+<dd class="field-odd"><p>internal_error | error | warning | info | verbose | debug | trace</p>
+</dd>
+</dl>
 </dd></dl>
 
 </section>
@@ -923,6 +940,24 @@ However, for the PyTorch backend, specified with the <code class="docutils liter
 <dd class="field-odd"><p>deepseek-r1</p>
 </dd>
 </dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-metadata_server_config_file">
+<span class="sig-name descname"><span class="pre">--metadata_server_config_file</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;metadata_server_config_file&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-metadata_server_config_file" title="Link to this definition">#</a></dt>
+<dd><p>Path to metadata server config file</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-server_role">
+<span class="sig-name descname"><span class="pre">--server_role</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;server_role&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-server_role" title="Link to this definition">#</a></dt>
+<dd><p>Server role. Specify this value only if running in disaggregated mode.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-0">
+<span class="sig-name descname"><span class="pre">--trust_remote_code</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;trust_remote_code&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-0" title="Link to this definition">#</a></dt>
+<dd><p>Whether to trust remote code.</p>
 </dd></dl>
 
 <p class="rubric">Arguments</p>
@@ -1101,9 +1136,9 @@ However, for the PyTorch backend, specified with the <code class="docutils liter
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 03, 2025.</p>
+  <p>Last updated on June 09, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ae2ce6">9ae2ce6</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
   
 </div></div>
       

@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc0" />
+  <meta name="docsearch:version" content="0.21.0rc1" />
 
 
   </head>
@@ -511,7 +511,9 @@
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">socket</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">tempfile</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">Union</span>
@@ -538,7 +540,7 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span> <span class="n">PybindMirror</span><span class="p">,</span> <span class="n">TorchLlmArgs</span><span class="p">,</span>
-                       <span class="n">TrtLlmArgs</span><span class="p">)</span>
+                       <span class="n">TrtLlmArgs</span><span class="p">,</span> <span class="n">_AutoDeployLlmArgs</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">CachedModelLoader</span><span class="p">,</span> <span class="n">KvCacheRetentionConfig</span><span class="p">,</span>
                         <span class="n">LlmBuildStats</span><span class="p">,</span> <span class="n">ModelLoader</span><span class="p">,</span> <span class="n">_ModelRuntimeContext</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.mpi_session</span><span class="w"> </span><span class="kn">import</span> <span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">external_mpi_comm_available</span>
@@ -601,6 +603,7 @@
 <span class="s2">    Attributes:</span>
 <span class="s2">        tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.</span>
 <span class="s2">        workspace (pathlib.Path): The directory to store intermediate files.</span>
+<span class="s2">        llm_id (str): The unique ID of the LLM instance.</span>
 <span class="s2">&quot;&quot;&quot;</span>
 
 
@@ -629,10 +632,16 @@
                  <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;executor_cls&quot;</span><span class="p">,</span> <span class="n">GenerationExecutor</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_llm_id</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="k">try</span><span class="p">:</span>
-            <span class="n">llm_args_cls</span> <span class="o">=</span> <span class="n">TorchLlmArgs</span> <span class="k">if</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
-                <span class="s1">&#39;backend&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="o">==</span> <span class="s1">&#39;pytorch&#39;</span> <span class="k">else</span> <span class="n">TrtLlmArgs</span>
+            <span class="n">backend</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;backend&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="s1">&#39;pytorch&#39;</span><span class="p">:</span>
+                <span class="n">llm_args_cls</span> <span class="o">=</span> <span class="n">TorchLlmArgs</span>
+            <span class="k">elif</span> <span class="n">backend</span> <span class="o">==</span> <span class="s1">&#39;_autodeploy&#39;</span><span class="p">:</span>
+                <span class="n">llm_args_cls</span> <span class="o">=</span> <span class="n">_AutoDeployLlmArgs</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">llm_args_cls</span> <span class="o">=</span> <span class="n">TrtLlmArgs</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">args</span> <span class="o">=</span> <span class="n">llm_args_cls</span><span class="o">.</span><span class="n">from_kwargs</span><span class="p">(</span>
                 <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
@@ -705,6 +714,16 @@
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">workspace</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="o">.</span><span class="n">name</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span> <span class="k">else</span> <span class="kc">None</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">llm_id</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_llm_id</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">hostname</span> <span class="o">=</span> <span class="n">socket</span><span class="o">.</span><span class="n">gethostname</span><span class="p">()</span>
+            <span class="n">pid</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getpid</span><span class="p">()</span>
+            <span class="n">timestamp</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_llm_id</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">hostname</span><span class="si">}</span><span class="s2">-</span><span class="si">{</span><span class="n">pid</span><span class="si">}</span><span class="s2">-</span><span class="si">{</span><span class="n">timestamp</span><span class="si">}</span><span class="s2">&quot;</span>
+
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_llm_id</span>
 
 <div class="viewcode-block" id="LLM.generate">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.generate">[docs]</a>
@@ -989,7 +1008,7 @@
                     <span class="p">)</span>
                 <span class="n">sampling_params</span><span class="o">.</span><span class="n">_setup</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
             <span class="c1"># auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;autodeploy&quot;</span><span class="p">]:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">]:</span>
                 <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_context_logits</span><span class="p">:</span>
                     <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_context_logits</span> <span class="o">=</span> <span class="kc">True</span>
                     <span class="n">sampling_params</span><span class="o">.</span><span class="n">_context_logits_auto_enabled</span> <span class="o">=</span> <span class="kc">True</span>
@@ -1006,7 +1025,7 @@
     <span class="k">def</span><span class="w"> </span><span class="nf">_check_arguments</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">query_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                          <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">]:</span>
             <span class="c1"># TODO: remove these checks after PyTorch backend</span>
             <span class="c1"># fully support TopK prompt and generation logprobs.</span>
             <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">prompt_logprobs</span><span class="p">:</span>
@@ -1018,7 +1037,7 @@
                     <span class="sa">f</span><span class="s2">&quot;PyTorch backend currently only supports `logprobs=1`. Received `logprobs=</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span><span class="si">}</span><span class="s2">` (Top</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">logprobs</span><span class="si">}</span><span class="s2"> logprobs). Please set `logprobs=1` in `sampling_params` instead.&quot;</span>
                 <span class="p">)</span>
             <span class="k">return</span>
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;autodeploy&quot;</span><span class="p">:</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">:</span>
             <span class="k">return</span>
 
         <span class="n">build_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
@@ -1171,7 +1190,7 @@
             <span class="n">executor_config</span><span class="p">,</span>
             <span class="n">backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span>
             <span class="n">pytorch_backend_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">get_pytorch_backend_config</span><span class="p">()</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">]</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">to_mapping</span><span class="p">(),</span>
             <span class="n">build_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
@@ -1218,9 +1237,9 @@
 
         <span class="c1"># TODO smor- need to refine what is the desired behavior if lora is enabled</span>
         <span class="c1"># in terms of the tokenizer initialization process</span>
-        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s2">&quot;backend&quot;</span>
-        <span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">lora_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s2">&quot;backend&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">in</span> <span class="p">[</span>
+                <span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span>
+        <span class="p">]</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">lora_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">num_lora_dirs</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">lora_config</span><span class="o">.</span><span class="n">lora_dir</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">num_lora_dirs</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
                 <span class="n">tokenizer_path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">lora_config</span><span class="o">.</span><span class="n">lora_dir</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
@@ -1427,9 +1446,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 03, 2025.</p>
+  <p>Last updated on June 09, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ae2ce6">9ae2ce6</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
   
 </div></div>
       

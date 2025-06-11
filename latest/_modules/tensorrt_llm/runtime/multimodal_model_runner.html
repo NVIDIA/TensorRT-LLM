@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc0" />
+  <meta name="docsearch:version" content="0.21.0rc1" />
 
 
   </head>
@@ -1440,9 +1440,6 @@
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;pixtral&#39;</span><span class="p">:</span>
             <span class="c1"># Hold on to pixel_values and input_ids.</span>
             <span class="n">dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_precision</span><span class="p">)</span>
-            <span class="n">pixel_values</span> <span class="o">=</span> <span class="n">image</span><span class="p">[</span><span class="s2">&quot;pixel_values&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
-            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">image</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
-
             <span class="c1"># Shape of pixel values from the processor varies with the raw image.</span>
             <span class="c1"># So we create a new tensor with a fixed shape as expected by the vision</span>
             <span class="c1"># encoder and create a corresponding attention mask.</span>
@@ -1450,19 +1447,30 @@
             <span class="n">patch_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">patch_size</span>
             <span class="n">d_min</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">finfo</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">min</span>
             <span class="n">num_patches</span> <span class="o">=</span> <span class="p">(</span><span class="n">image_size</span> <span class="o">//</span> <span class="n">patch_size</span><span class="p">)</span>
-            <span class="n">image</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">image_size</span><span class="p">,</span> <span class="n">image_size</span><span class="p">),</span>
-                               <span class="n">fill_value</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                               <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                               <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
-            <span class="n">attention_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_patches</span><span class="p">,</span> <span class="n">num_patches</span><span class="p">),</span>
-                                        <span class="n">fill_value</span><span class="o">=</span><span class="n">d_min</span><span class="p">,</span>
-                                        <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                                        <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
-            <span class="n">h</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="n">pixel_values</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">:]</span>
-            <span class="n">image</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="p">:</span><span class="n">h</span><span class="p">,</span> <span class="p">:</span><span class="n">w</span><span class="p">]</span> <span class="o">=</span> <span class="n">pixel_values</span>
-            <span class="n">attention_mask</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="p">:</span><span class="n">h</span> <span class="o">//</span> <span class="n">patch_size</span><span class="p">,</span> <span class="p">:</span><span class="n">w</span> <span class="o">//</span> <span class="n">patch_size</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
+            <span class="n">padded_image</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">(</span>
+                <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">image_size</span><span class="p">,</span> <span class="n">image_size</span><span class="p">),</span>
+                <span class="n">fill_value</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
+            <span class="n">padded_attention_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">(</span>
+                <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">num_patches</span><span class="p">,</span> <span class="n">num_patches</span><span class="p">),</span>
+                <span class="n">fill_value</span><span class="o">=</span><span class="n">d_min</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
+            <span class="n">h</span><span class="p">,</span> <span class="n">w</span><span class="p">,</span> <span class="n">input_ids</span> <span class="o">=</span> <span class="p">[],</span> <span class="p">[],</span> <span class="p">[]</span>
+            <span class="k">for</span> <span class="n">img_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">):</span>
+                <span class="n">pixel_values</span> <span class="o">=</span> <span class="n">image</span><span class="p">[</span><span class="s2">&quot;pixel_values&quot;</span><span class="p">][</span><span class="n">img_idx</span><span class="p">]</span>
+                <span class="n">img_h</span><span class="p">,</span> <span class="n">img_w</span> <span class="o">=</span> <span class="n">pixel_values</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">:]</span>
+                <span class="n">padded_image</span><span class="p">[</span><span class="n">img_idx</span><span class="p">,</span> <span class="p">:,</span> <span class="p">:</span><span class="n">img_h</span><span class="p">,</span> <span class="p">:</span><span class="n">img_w</span><span class="p">]</span> <span class="o">=</span> <span class="n">pixel_values</span>
+                <span class="n">padded_attention_mask</span><span class="p">[</span><span class="n">img_idx</span><span class="p">,</span> <span class="p">:</span><span class="n">img_h</span> <span class="o">//</span> <span class="n">patch_size</span><span class="p">,</span> <span class="p">:</span><span class="n">img_w</span> <span class="o">//</span>
+                                      <span class="n">patch_size</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
+                <span class="n">input_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">image</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">][</span><span class="n">img_idx</span><span class="p">])</span>
+                <span class="n">h</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">img_h</span><span class="p">)</span>
+                <span class="n">w</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">img_w</span><span class="p">)</span>
+
+            <span class="n">image</span> <span class="o">=</span> <span class="n">padded_image</span>
             <span class="n">other_vision_inputs</span> <span class="o">=</span> <span class="p">{</span>
-                <span class="s2">&quot;attention_mask&quot;</span><span class="p">:</span> <span class="n">attention_mask</span><span class="p">,</span>
+                <span class="s2">&quot;attention_mask&quot;</span><span class="p">:</span> <span class="n">padded_attention_mask</span><span class="p">,</span>
             <span class="p">}</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;llava_next&#39;</span><span class="p">:</span>
             <span class="nb">input</span> <span class="o">=</span> <span class="n">image</span>
@@ -1681,12 +1689,29 @@
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;pixtral&#39;</span><span class="p">:</span>
             <span class="n">relevant_patch_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">patch_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">spatial_merge_size</span>
             <span class="n">output_img_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">image_size</span> <span class="o">//</span> <span class="n">relevant_patch_size</span>
-            <span class="n">visual_features</span> <span class="o">=</span> <span class="n">visual_features</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span>
-                <span class="n">output_img_size</span><span class="p">,</span> <span class="n">output_img_size</span><span class="p">,</span>
-                <span class="o">-</span><span class="mi">1</span><span class="p">)[:</span><span class="n">h</span> <span class="o">//</span> <span class="n">relevant_patch_size</span><span class="p">,</span> <span class="p">:</span><span class="n">w</span> <span class="o">//</span>
-                    <span class="n">relevant_patch_size</span><span class="p">]</span><span class="o">.</span><span class="n">flatten</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="c1"># Note: max_h * max_w shall serve as the `tokens_per_task` in ptuning prompt table.</span>
+            <span class="n">max_h</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">h</span><span class="p">)</span> <span class="o">//</span> <span class="n">relevant_patch_size</span>
+            <span class="n">max_w</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">w</span><span class="p">)</span> <span class="o">//</span> <span class="n">relevant_patch_size</span>
+            <span class="n">visual_embed_dim</span> <span class="o">=</span> <span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+            <span class="n">relevant_visual_features</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span>
+                                                   <span class="n">max_h</span> <span class="o">*</span> <span class="n">max_w</span><span class="p">,</span>
+                                                   <span class="n">visual_embed_dim</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">img_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">):</span>
+                <span class="n">complete_features</span> <span class="o">=</span> <span class="n">visual_features</span><span class="p">[</span><span class="n">img_idx</span><span class="p">]</span>
+                <span class="n">complete_features</span> <span class="o">=</span> <span class="n">complete_features</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span>
+                    <span class="n">output_img_size</span><span class="p">,</span> <span class="n">output_img_size</span><span class="p">,</span> <span class="n">visual_embed_dim</span><span class="p">)</span>
+                <span class="n">relevant_h</span> <span class="o">=</span> <span class="n">h</span><span class="p">[</span><span class="n">img_idx</span><span class="p">]</span> <span class="o">//</span> <span class="n">relevant_patch_size</span>
+                <span class="n">relevant_w</span> <span class="o">=</span> <span class="n">w</span><span class="p">[</span><span class="n">img_idx</span><span class="p">]</span> <span class="o">//</span> <span class="n">relevant_patch_size</span>
+                <span class="n">flattened_features</span> <span class="o">=</span> <span class="n">complete_features</span><span class="p">[:</span><span class="n">relevant_h</span><span class="p">,</span> <span class="p">:</span>
+                                                       <span class="n">relevant_w</span><span class="p">,</span> <span class="p">:]</span><span class="o">.</span><span class="n">flatten</span><span class="p">(</span>
+                                                           <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                <span class="n">relevant_visual_features</span><span class="p">[</span><span class="n">img_idx</span><span class="p">,</span> <span class="p">:</span><span class="n">relevant_h</span> <span class="o">*</span>
+                                         <span class="n">relevant_w</span><span class="p">,</span> <span class="p">:]</span> <span class="o">=</span> <span class="n">flattened_features</span>
+            <span class="n">visual_features</span> <span class="o">=</span> <span class="n">relevant_visual_features</span>
             <span class="n">input_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ptuning_setup_pixtral</span><span class="p">(</span><span class="n">input_ids</span><span class="o">=</span><span class="n">input_ids</span><span class="p">)</span>
-            <span class="n">length</span> <span class="o">=</span> <span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+            <span class="c1"># Note: length is not used for pixtral model downstream. Setting it to a list</span>
+            <span class="c1"># of length of input_ids causes errors downstream. So, supplying a placeholder.</span>
+            <span class="n">length</span> <span class="o">=</span> <span class="n">input_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
 
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;llava_next&#39;</span><span class="p">:</span>
             <span class="n">visual_features</span> <span class="o">=</span> <span class="n">LlavaNextUtils</span><span class="o">.</span><span class="n">rearrange_image_features</span><span class="p">(</span>
@@ -2329,7 +2354,7 @@
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.get_rope_index">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_rope_index</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
-        <span class="n">input_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">LongTensor</span><span class="p">,</span>
+        <span class="n">input_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">,</span>
         <span class="n">image_grid_thw</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">LongTensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">video_grid_thw</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">LongTensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">attention_mask</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -2361,7 +2386,7 @@
 <span class="sd">                Here we calculate the text start position_ids as the max vision position_ids plus 1.</span>
 
 <span class="sd">        Args:</span>
-<span class="sd">            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):</span>
+<span class="sd">            input_ids (`torch.IntTensor` of shape `(batch_size, sequence_length)`):</span>
 <span class="sd">                Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide</span>
 <span class="sd">                it.</span>
 <span class="sd">            image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):</span>
@@ -2375,7 +2400,7 @@
 <span class="sd">                - 0 for tokens that are **masked**.</span>
 
 <span class="sd">        Returns:</span>
-<span class="sd">            position_ids (`torch.LongTensor` of shape `(3, batch_size, sequence_length)`)</span>
+<span class="sd">            position_ids (`torch.IntTensor` of shape `(3, batch_size, sequence_length)`)</span>
 <span class="sd">            mrope_position_deltas (`torch.Tensor` of shape `(batch_size)`)</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">spatial_merge_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">spatial_merge_size</span>
@@ -2594,16 +2619,19 @@
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup_pixtral">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ptuning_setup_pixtral</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">):</span>
         <span class="c1"># input_ids obtained from processor has token_ids for text as well as image tokens</span>
-        <span class="c1"># where each image token is represented the same image_token_index (10 for this model).</span>
+        <span class="c1"># where each image token is represented by the same image_token_index.</span>
         <span class="n">image_token_index</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">image_token_index</span>
         <span class="n">vocab_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vocab_size</span>
         <span class="c1"># Replace all image tokens with a unique token_id &gt; text_vacab_size.</span>
         <span class="c1"># This shall be used to lookup the prompt table.</span>
-        <span class="n">replacer</span> <span class="o">=</span> <span class="n">vocab_size</span>
-        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">input_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">])):</span>
-            <span class="k">if</span> <span class="n">input_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="n">image_token_index</span><span class="p">:</span>
-                <span class="n">input_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">replacer</span>
-                <span class="n">replacer</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="k">for</span> <span class="n">img_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">):</span>
+            <span class="c1"># Note: We reset replacer to text_vocab_size for each sample. This is as opposed to doing `replacer = vocab_size + img_idx * tokens_per_task`.</span>
+            <span class="c1"># That part of the look-up manipulation is done by the `task_ids` input to PromptEmbedding forward.</span>
+            <span class="n">replacer</span> <span class="o">=</span> <span class="n">vocab_size</span>
+            <span class="k">for</span> <span class="n">token_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">input_ids</span><span class="p">[</span><span class="n">img_idx</span><span class="p">])):</span>
+                <span class="k">if</span> <span class="n">input_ids</span><span class="p">[</span><span class="n">img_idx</span><span class="p">][</span><span class="n">token_idx</span><span class="p">]</span> <span class="o">==</span> <span class="n">image_token_index</span><span class="p">:</span>
+                    <span class="n">input_ids</span><span class="p">[</span><span class="n">img_idx</span><span class="p">][</span><span class="n">token_idx</span><span class="p">]</span> <span class="o">=</span> <span class="n">replacer</span>
+                    <span class="n">replacer</span> <span class="o">+=</span> <span class="mi">1</span>
         <span class="k">return</span> <span class="n">input_ids</span></div>
 
 
@@ -2745,7 +2773,24 @@
                 <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">image_path</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
                     <span class="n">image_path</span> <span class="o">=</span> <span class="n">image_path</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">path_sep</span><span class="p">)</span>
                 <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="n">image_path</span><span class="p">)</span>
-
+        <span class="k">elif</span> <span class="s2">&quot;pixtral&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">image_urls</span> <span class="o">=</span> <span class="p">[</span>
+                    <span class="s2">&quot;https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;https://www.ilankelman.org/stopsigns/australia.jpg&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;https://huggingface.co/microsoft/kosmos-2-patch14-224/resolve/main/snowman.png&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg&quot;</span><span class="p">,</span>
+                <span class="p">]</span>
+                <span class="k">while</span> <span class="nb">len</span><span class="p">(</span><span class="n">image_urls</span><span class="p">)</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">:</span>
+                    <span class="n">image_urls</span> <span class="o">*=</span> <span class="mi">2</span>
+                <span class="n">image_urls</span> <span class="o">=</span> <span class="n">image_urls</span><span class="p">[:</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">]</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="o">=</span> <span class="s2">&quot;,&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">image_urls</span><span class="p">)</span>
+                <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="n">image_urls</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">image_path</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+                    <span class="n">image_path</span> <span class="o">=</span> <span class="n">image_path</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">path_sep</span><span class="p">)</span>
+                <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="n">image_path</span><span class="p">)</span>
+            <span class="n">images</span> <span class="o">=</span> <span class="p">[</span><span class="n">images</span><span class="p">]</span> <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">images</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="k">else</span> <span class="n">images</span>
         <span class="k">elif</span> <span class="s2">&quot;nougat&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
             <span class="n">filepath</span> <span class="o">=</span> <span class="n">hf_hub_download</span><span class="p">(</span>
                 <span class="n">repo_id</span><span class="o">=</span><span class="s2">&quot;hf-internal-testing/fixtures_docvqa&quot;</span><span class="p">,</span>
@@ -2998,9 +3043,15 @@
             <span class="n">post_prompt</span> <span class="o">=</span> <span class="s2">&quot;[/INST]&quot;</span>
             <span class="n">prompt</span> <span class="o">=</span> <span class="n">pre_prompt</span> <span class="o">+</span> <span class="n">input_text</span> <span class="o">+</span> <span class="n">post_prompt</span>
             <span class="n">dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_precision</span><span class="p">)</span>
-            <span class="n">image</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">(</span><span class="n">text</span><span class="o">=</span><span class="n">prompt</span><span class="p">,</span>
-                                   <span class="n">images</span><span class="o">=</span><span class="p">[</span><span class="n">raw_image</span><span class="p">],</span>
-                                   <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="n">image</span> <span class="o">=</span> <span class="p">{</span><span class="s1">&#39;pixel_values&#39;</span><span class="p">:</span> <span class="p">[],</span> <span class="s1">&#39;input_ids&#39;</span><span class="p">:</span> <span class="p">[]}</span>
+            <span class="k">for</span> <span class="n">img_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">):</span>
+                <span class="n">image_info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">(</span><span class="n">text</span><span class="o">=</span><span class="n">prompt</span><span class="p">,</span>
+                                            <span class="n">images</span><span class="o">=</span><span class="p">[</span><span class="n">raw_image</span><span class="p">[</span><span class="n">img_idx</span><span class="p">]],</span>
+                                            <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+                <span class="n">image</span><span class="p">[</span><span class="s1">&#39;pixel_values&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">image_info</span><span class="p">[</span><span class="s1">&#39;pixel_values&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">))</span>
+                <span class="n">image</span><span class="p">[</span><span class="s1">&#39;input_ids&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">image_info</span><span class="p">[</span><span class="s1">&#39;input_ids&#39;</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">))</span>
 
         <span class="k">elif</span> <span class="s1">&#39;internvl&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
             <span class="n">pre_prompt</span> <span class="o">=</span> <span class="s2">&quot;&lt;|system|&gt;</span><span class="se">\n</span><span class="s2">你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。&lt;|end|&gt;&lt;|user|&gt;</span><span class="se">\n</span><span class="s2">&lt;image&gt;</span><span class="se">\n</span><span class="s2">&quot;</span>
@@ -3204,7 +3255,9 @@
                         <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span>
                             <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">input_text</span><span class="p">)),</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
                             <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
-        <span class="k">if</span> <span class="n">image</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># Note: For pixtral model, image is a dict with each value being a list of tensors.</span>
+        <span class="c1"># Moving to device is handled above. So, it&#39;s safe to skip this for pixtral.</span>
+        <span class="k">if</span> <span class="n">image</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="s1">&#39;pixtral&#39;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
             <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
         <span class="c1"># Generate decoder_input_ids for enc-dec models</span>
         <span class="c1"># Custom prompts can be added as:</span>
@@ -3354,9 +3407,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 03, 2025.</p>
+  <p>Last updated on June 09, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ae2ce6">9ae2ce6</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
   
 </div></div>
       
