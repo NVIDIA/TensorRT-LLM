@@ -8,6 +8,8 @@ import transformers
 
 from tensorrt_llm import logger
 from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -77,7 +79,7 @@ class ModelConfig(Generic[TConfig]):
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
-    ar_backend: str = 'TRTLLM'  # options can be MNNVL, TRTLLM
+    allreduce_backend: AllReduceStrategy = AllReduceStrategy.AUTO
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
@@ -106,6 +108,23 @@ class ModelConfig(Generic[TConfig]):
                                               "architectures"):
             self.is_generation = self.is_generation_model(
                 self.pretrained_config.architectures)
+
+        def map_ar_strategy(strategy: str = "AUTO"):
+            maps = {
+                "AUTO": AllReduceStrategy.AUTO,
+                "NCCL": AllReduceStrategy.NCCL,
+                "UB": AllReduceStrategy.UB,
+                "MIN_LATENCY": AllReduceStrategy.MIN_LATENCY,
+                "ONESHOT": AllReduceStrategy.ONESHOT,
+                "TWOSHOT": AllReduceStrategy.TWOSHOT,
+                "LOWPRECISION": AllReduceStrategy.LOWPRECISION,
+                "MNNVL": AllReduceStrategy.MNNVL
+            }
+            key = strategy.upper()
+            return maps[key] if key in maps else AllReduceStrategy.AUTO
+
+        if isinstance(self.allreduce_backend, str):
+            self.allreduce_backend = map_ar_strategy(self.allreduce_backend)
 
     @property
     def fuse_pos_embd(self):

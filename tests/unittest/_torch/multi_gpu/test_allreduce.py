@@ -124,7 +124,7 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
     ).cuda()
     norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
 
-    allreduce = AllReduce(mapping=mapping).cuda()
+    allreduce = AllReduce(model_config=ModelConfig(mapping=mapping)).cuda()
 
     scale = torch.tensor(1.0, dtype=torch.float32).cuda()
     linear.load_weights([dict(weight=weights[0])])
