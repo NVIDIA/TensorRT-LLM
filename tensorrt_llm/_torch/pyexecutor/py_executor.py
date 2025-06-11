@@ -1508,6 +1508,10 @@ class PyExecutor:
                 max_num_draft_tokens=self.max_draft_tokens,
             )[0]
             llm_request.is_attention_dp_dummy = True
+            spec_resource_manager = self.resource_manager.get_resource_manager(
+                'spec_resource_manager')
+            if spec_resource_manager is not None:
+                spec_resource_manager.add_dummy_requests([0])
             self.active_requests.append(llm_request)
 
     @nvtx_range("_prepare_disagg_gen_init")
