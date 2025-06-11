@@ -515,7 +515,7 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
 
         return super().forward(x,
                                router_logits,
-                               cutlass_min_latency_mode=False,
+                               do_finalize=True,
                                output_dtype=output_dtype)
 
 
