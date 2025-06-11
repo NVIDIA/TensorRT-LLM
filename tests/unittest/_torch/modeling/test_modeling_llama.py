@@ -80,6 +80,8 @@ class TestLlama(unittest.TestCase):
 
     @parameterized.expand([None, "FP8"])
     def test_llama_sanity(self, quant_algo):
+        from tensorrt_llm._torch.debug.debug_hook import enable_debug
+        enable_debug()
         config_dict = deepcopy(LLAMA_3_1_8B_CONFIG)
         # 8B * sizeof(float16) plus some extra for activations
         mem_for_full_model = (2 + 1) * 8 * 2**(30)
@@ -202,6 +204,9 @@ class TestLlama(unittest.TestCase):
         """
         Compare output to HF
         """
+        from tensorrt_llm._torch.debug.debug_hook import debugger_addon
+
+        # enable_debug(r"tensor_dump")
         backend = scenario.backend
         metadata_cls = get_attention_backend(backend).Metadata
 
@@ -284,7 +289,7 @@ class TestLlama(unittest.TestCase):
         # decoding only.
         position_ids = [torch.arange(0, input_ids.size(-1))]
         position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
-        with torch.inference_mode():
+        with torch.inference_mode() and debugger_addon(llama, r"tensor_dump"):
             attn_metadata.prepare()
             logits = llama.forward(input_ids=input_ids,
                                    position_ids=position_ids,
