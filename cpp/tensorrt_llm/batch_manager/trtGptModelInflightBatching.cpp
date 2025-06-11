@@ -1797,18 +1797,18 @@ void TrtGptModelInflightBatching::setupDecoderStep(
     {
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
 
-        auto [batchSlots, decoderRequests, samplingConfigs]
+        auto [batchSlots, samplingConfigs, lookaheadPrompt, lookaheadAlgoConfigs]
             = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig, mDecodingConfig, contextRequests,
                 mRuntime->getBufferManager(), logitsType, inputBuffers, *mDecoderState, mRuntime->getStream(),
                 *mDecoder->getDecoderStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.medusaBuffers);
 
-        if (!decoderRequests.empty())
+        auto const localBatchSize = batchSlots->getSize();
+        if (localBatchSize > 0)
         {
-            // Setup underlying decoder.
-            auto const localBatchSize = batchSlots->getSize();
             auto samplingConfig = SamplingConfig(samplingConfigs);
             mDecoder->getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
-                {mDecoderState->getJointDecodingOutput()}, mModelConfig.getDataType(), {decoderRequests});
+                {mDecoderState->getJointDecodingOutput()}, mModelConfig.getDataType(), lookaheadPrompt,
+                lookaheadAlgoConfigs);
 
             auto const& stream = mDecoder->getDecoderStream();
             CudaEvent event{};

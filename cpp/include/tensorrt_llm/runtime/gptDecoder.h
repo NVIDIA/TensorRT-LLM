@@ -57,7 +57,8 @@ public:
     virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
         std::optional<DecodingOutput> const& output = std::nullopt,
         std::optional<nvinfer1::DataType> explicitDraftTokensDType = std::nullopt,
-        std::optional<std::vector<decoder_batch::Request> const> const& requests = std::nullopt)
+        std::optional<std::vector<TensorConstPtr>> const& lookaheadPrompt = std::nullopt,
+        std::optional<std::vector<executor::LookaheadDecodingConfig>> const& lookaheadAlgoConfigs = std::nullopt)
         = 0;
 
     virtual void forwardAsync(DecodingOutput& output, DecodingInput const& input) = 0;
@@ -91,7 +92,9 @@ public:
     void setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
         std::optional<DecodingOutput> const& output = std::nullopt,
         std::optional<nvinfer1::DataType> explicitDraftTokensDType = std::nullopt,
-        std::optional<std::vector<decoder_batch::Request> const> const& requests = std::nullopt) override;
+        std::optional<std::vector<TensorConstPtr>> const& lookaheadPrompt = std::nullopt,
+        std::optional<std::vector<executor::LookaheadDecodingConfig>> const& lookaheadAlgoConfigs
+        = std::nullopt) override;
 
     void forwardAsync(DecodingOutput& output, DecodingInput const& input) override;
 
