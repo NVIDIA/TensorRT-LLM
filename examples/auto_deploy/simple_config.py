@@ -26,6 +26,8 @@ class SimpleConfig:
         "AutoModelForCausalLM"
     )
     skip_loading_weights: bool = False  # only load the architecture, not the weights
+    checkpoint_device: Optional[str] = None  # Device on which to load the model checkpoint
+    # (defaults to the same device as the rest of the pipeline)
     customize_tokenizer: bool = False  # True: tokenizer from the model factory, False: from LLM api
 
     ### MODEL EXTRA KWARGS #########################################################################
