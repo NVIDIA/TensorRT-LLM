@@ -79,7 +79,8 @@ bool DecoderXQAImplJIT::mayHavePerfGain(XQAParams const& xqaParams) const
     if (xqaParams.multi_block_mode)
     {
         int history_length = xqaParams.max_past_kv_length;
-        multi_block_count = history_length / kMinHistoryTokensPerBlock;
+        // Always use at least 1 block regardless of history length
+        multi_block_count = std::max(1, history_length / kMinHistoryTokensPerBlock);
     }
     int block_count = num_kv_heads * batch_size * multi_block_count;
     return static_cast<float>(block_count) * kEnableMinBlockFactor >= static_cast<float>(mRunner->mMultiProcessorCount);
@@ -98,12 +99,25 @@ bool DecoderXQAImplJIT::shouldUse(XQAParams const& umbrellaXQAParams, bool forCo
                 return true;
             }
         }
+        TLLM_LOG_DEBUG("JIT XQA is not used: no supported configuration found for any beam_width");
         return false;
     }
     else
     {
         auto const& xqaParams = umbrellaXQAParams;
-        return supportConfig(xqaParams, forConfigurePlugin) && mayHavePerfGain(xqaParams);
+        bool isConfigSupported = supportConfig(xqaParams, forConfigurePlugin);
+        if (!isConfigSupported)
+        {
+            TLLM_LOG_DEBUG("JIT XQA is not used: unsupported configuration");
+            return false;
+        }
+        bool hasPerfGain = mayHavePerfGain(xqaParams);
+        if (!hasPerfGain)
+        {
+            TLLM_LOG_DEBUG("JIT XQA is not used: maybe no performance gain");
+            return false;
+        }
+        return true;
     }
 }
 

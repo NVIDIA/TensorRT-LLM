@@ -460,6 +460,8 @@ class SampleStateTensorsHostTRTLLM(SampleStateTensors):
     finished_sum: torch.Tensor
     finish_reasons: torch.Tensor
     sequence_lengths: torch.Tensor
+    log_probs: torch.Tensor
+    cum_log_probs: torch.Tensor
 
 
 @dataclass(kw_only=True)
@@ -650,12 +652,23 @@ class TRTLLMSampler(Sampler):
         sequence_lengths = self.algs.decoder_state.sequence_lengths.to(
             'cpu', non_blocking=True)
 
+        log_probs = torch.empty([0], dtype=torch.float, device='cpu')
+        cum_log_probs = torch.empty([0], dtype=torch.float, device='cpu')
+        if any(request.py_return_log_probs
+               for request in scheduled_requests.all_requests):
+            log_probs = self.algs.decoder_state.log_probs.to('cpu',
+                                                             non_blocking=True)
+            cum_log_probs = self.algs.decoder_state.cum_log_probs.to(
+                'cpu', non_blocking=True)
+
         device = SampleStateTensors(new_tokens=new_tokens_device_tensor)
 
         host = SampleStateTensorsHostTRTLLM(new_tokens=new_output_tokens,
                                             finished_sum=finished_sum,
                                             finish_reasons=finish_reasons,
-                                            sequence_lengths=sequence_lengths)
+                                            sequence_lengths=sequence_lengths,
+                                            log_probs=log_probs,
+                                            cum_log_probs=cum_log_probs)
 
         sampler_event = torch.cuda.Event()
         sampler_event.record()
@@ -691,6 +704,9 @@ class TRTLLMSampler(Sampler):
             current_num_of_tokens = request.max_beam_num_tokens
             num_new_tokens = [0] * beam_width
 
+            log_probs = []
+            cum_log_probs = []
+
             for beam in range(beam_width):
                 seq_len = sequence_lengths_host_data[seq_slot * beam_width +
                                                      beam].item()
@@ -702,9 +718,31 @@ class TRTLLMSampler(Sampler):
                     new_token = new_tokens_host[step][seq_slot][beam]
                     request.add_new_token(new_token, beam)
 
+                    if request.py_return_log_probs:
+                        # NOTE: Log probs with drafting has not been tested yet.
+                        begin_log_probs_offset = request.prompt_len if request.sampling_config.beam_width == 1 else 0
+                        current_token = seq_len - request.prompt_len - len(
+                            num_new_tokens[beam]) + step
+
+                        log_probs.append({
+                            new_token.item():
+                            Logprob(logprob=state.host.log_probs[seq_slot][beam]
+                                    [begin_log_probs_offset +
+                                     current_token].item(),
+                                    rank=1)
+                        })
+
+                if num_new_tokens[beam] > 0 and request.py_return_log_probs:
+                    cum_log_probs.append(
+                        state.host.cum_log_probs[seq_slot * beam_width +
+                                                 beam].item())
+
                 finish_reason = finish_reasons_host[seq_slot * beam_width +
                                                     beam].item()
                 request.set_finished_reason(FinishReason(finish_reason), beam)
+
+            if request.py_return_log_probs:
+                request.py_result.append_log_probs([log_probs], cum_log_probs)
 
             # Set number of tokens predicted per runtime iteration. Will be > 1 for speculative decoding.
             request.update_num_tokens_per_iteration(
