@@ -1337,7 +1337,7 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
 
     sh "env | sort"
-    sh "tar -zvxf ${linuxPkgName}"
+    sh "tar -zvxf ${pkgName}"
 
     // Check for prohibited files in the package
     sh '''
