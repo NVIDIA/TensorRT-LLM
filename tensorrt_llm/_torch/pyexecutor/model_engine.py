@@ -1201,10 +1201,10 @@ class PyTorchModelEngine(ModelEngine):
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
-        is_mtp = isinstance(new_tensors_device, SampleStateTensorsMTP)
-        if is_mtp:
-            new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
-            next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
+            if self.without_logits:
+                assert isinstance(new_tensors_device, SampleStateTensorsMTP)
+                new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
+                next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
 
         # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
         # at the end of extend_requests.
@@ -1212,7 +1212,8 @@ class PyTorchModelEngine(ModelEngine):
         extend_dummy_requests = []
         generation_requests = []
         for request in scheduled_requests.generation_requests:
-            if len(request.py_draft_tokens) > 0 or is_mtp:
+            if len(request.py_draft_tokens
+                   ) > 0 or next_draft_tokens_device is not None:
                 if request.is_dummy:
                     extend_dummy_requests.append(request)
                 else:
@@ -1242,7 +1243,7 @@ class PyTorchModelEngine(ModelEngine):
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
             # (2) a dummy request; or
             # (3) the first step in the generation server of disaggregated serving
-            if not is_mtp or request.is_dummy or request.py_batch_idx is None:
+            if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                 # get token ids, including input token ids and draft token ids. For these dummy requests,
                 # no need to copy the token ids.
                 if not request.is_dummy:
@@ -1357,7 +1358,7 @@ class PyTorchModelEngine(ModelEngine):
                                         pin_memory=True)
             self.draft_tokens_cuda[:len(draft_tokens)].copy_(draft_tokens,
                                                              non_blocking=True)
-        if is_mtp:
+        if next_draft_tokens_device is not None:
             if previous_batch_len > 0:
                 previous_slots = previous_seq_slots_device()
                 # previous input ids
