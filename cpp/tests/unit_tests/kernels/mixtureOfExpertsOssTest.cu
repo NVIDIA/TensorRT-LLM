@@ -7,7 +7,9 @@
 #include <gtest/gtest.h>
 #include <numeric>
 
-// #if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+//  Temporary opend-sourced version. Will be daleted when open-sourced moe_gemm support MXFP4
+
+// #if defined(USING_OSS_CUTLASS_MOE_GEMM)
 #if true
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
 #else
@@ -22,7 +24,7 @@
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 using LoraParams = tensorrt_llm::kernels::LoraParams;
-// #if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+// #if defined(USING_OSS_CUTLASS_MOE_GEMM)
 #if true
 namespace kernels = tensorrt_llm::kernels::cutlass_kernels;
 using GemmProfilerBackend = tensorrt_llm::kernels::cutlass_kernels::GemmProfilerBackend;

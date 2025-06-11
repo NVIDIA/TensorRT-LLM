@@ -34,11 +34,6 @@
 #include "tensorrt_llm/thop/fp8Op.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "tensorrt_llm/thop/userbuffersTensor.h"
-// #if defined(ENABLE_OPENED_CUTLASS_FP4_GEMM)
-// #include "tensorrt_llm/kernels/cutlass_kernels/fp4_gemm/fp4_gemm_template.h"
-// #else
-// #include "fp4_gemm.h"
-// #endif
 
 #if ENABLE_MULTI_DEVICE
 #include <ATen/cuda/EmptyTensor.h>

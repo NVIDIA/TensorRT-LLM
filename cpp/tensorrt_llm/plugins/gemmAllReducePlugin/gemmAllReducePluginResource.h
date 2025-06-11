@@ -17,7 +17,7 @@
 
 #include "NvInferPlugin.h"
 
-#if defined(ENABLE_OPENED_CUTLASS_ALLREDUCE_GEMM)
+#if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
 #include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
 #else
 #include "allreduce_gemm_runner.h"
@@ -30,7 +30,7 @@ using namespace nvinfer1;
 namespace tensorrt_llm::plugins
 {
 
-#if defined(ENABLE_OPENED_CUTLASS_ALLREDUCE_GEMM)
+#if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
 namespace cutlass_kernels = ::tensorrt_llm::kernels::opened_cutlass_kernels;
 #else
 namespace cutlass_kernels = ::tensorrt_llm::kernels::cutlass_kernels;

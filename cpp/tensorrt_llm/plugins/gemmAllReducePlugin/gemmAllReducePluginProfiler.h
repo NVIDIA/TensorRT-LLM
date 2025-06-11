@@ -15,7 +15,7 @@
  */
 #pragma once
 
-#if defined(ENABLE_OPENED_CUTLASS_ALLREDUCE_GEMM)
+#if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
 #include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
 #else
 #include "allreduce_gemm_runner.h"
@@ -31,7 +31,7 @@ namespace tensorrt_llm::plugins
  * multi-GPU workloads as tuning only runs on single-GPU.
  */
 
-#if defined(ENABLE_OPENED_CUTLASS_ALLREDUCE_GEMM)
+#if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
 namespace cutlass_kernels = ::tensorrt_llm::kernels::opened_cutlass_kernels;
 #else
 namespace cutlass_kernels = ::tensorrt_llm::kernels::cutlass_kernels;

@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+// Temporary opend-sourced version. Will be daleted when open-sourced moe_gemm support MXFP4
+
 // Include the fixture with the actual benchmark code
 #include "mixtureOfExpertsBackendBenchmarkFixtureOss.h"
 

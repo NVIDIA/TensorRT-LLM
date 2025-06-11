@@ -20,7 +20,7 @@
 
 #include <nlohmann/json.hpp>
 
-// #if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+// #if defined(USING_OSS_CUTLASS_MOE_GEMM)
 #if true
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
 #else
@@ -41,8 +41,8 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
-
-// #if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+// Temporary opend-sourced version. Will be daleted when open-sourced moe_gemm support MXFP4
+// #if defined(USING_OSS_CUTLASS_MOE_GEMM)
 #if true
 using namespace tensorrt_llm::kernels::cutlass_kernels;
 using ActivationType = tensorrt_llm::kernels::cutlass_kernels::ActivationType;

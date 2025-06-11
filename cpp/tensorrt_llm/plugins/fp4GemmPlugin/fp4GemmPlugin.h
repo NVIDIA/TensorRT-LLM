@@ -17,7 +17,7 @@
 
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
-#if defined(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
 #include "tensorrt_llm/kernels/cutlass_kernels/include/fp4_gemm.h"
 #else
 #include "fp4_gemm.h"
@@ -32,7 +32,7 @@
 namespace tensorrt_llm::plugins
 {
 
-#if defined(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
 using Fp4GemmRunnerPtr = std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunnerInterface>;
 #else
 using Fp4GemmRunnerPtr

@@ -18,7 +18,7 @@
 #define TRT_MIXTURE_OF_EXPERTS_PLUGIN_H
 
 #include "NvInferPlugin.h"
-#if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
 #else
 #include "moe_kernels.h"
@@ -38,7 +38,7 @@
 
 namespace tensorrt_llm::plugins
 {
-#if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
 namespace kernels = tensorrt_llm::kernels::cutlass_kernels;
 using MoeMinLatencyParams = tensorrt_llm::kernels::cutlass_kernels::MoeMinLatencyParams;
 using MOEParallelismConfig = tensorrt_llm::kernels::cutlass_kernels::MOEParallelismConfig;

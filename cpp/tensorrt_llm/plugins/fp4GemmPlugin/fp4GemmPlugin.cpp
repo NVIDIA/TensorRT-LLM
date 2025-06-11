@@ -25,7 +25,7 @@ using namespace tensorrt_llm::common;
 using tensorrt_llm::plugins::Fp4GemmPluginCreator;
 using tensorrt_llm::plugins::Fp4GemmPlugin;
 using tensorrt_llm::plugins::Fp4GemmPluginProfiler;
-#if defined(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
 using namespace tensorrt_llm::kernels::cutlass_kernels;
 #else
 using namespace tensorrt_llm::kernels::internal_cutlass_kernels;

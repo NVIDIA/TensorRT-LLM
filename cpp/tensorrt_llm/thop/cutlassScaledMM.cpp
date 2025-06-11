@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#if defined(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
+#if defined(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
 #include "tensorrt_llm/kernels/cutlass_kernels/include/low_latency_gemm.h"
 #else
 #include "low_latency_gemm.h"
@@ -24,7 +24,7 @@
 #include <torch/extension.h>
 
 using torch::Tensor;
-#if defined(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
+#if defined(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
 using tensorrt_llm::kernels::cutlass_kernels::CutlassLowLatencyFp8GemmRunner;
 using tensorrt_llm::kernels::cutlass_kernels::CutlassLowLatencyFp8GemmRunnerInterface;
 using tensorrt_llm::kernels::cutlass_kernels::LowLatencyCutlassGemmConfig;

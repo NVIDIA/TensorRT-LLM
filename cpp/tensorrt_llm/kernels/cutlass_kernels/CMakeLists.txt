@@ -144,7 +144,7 @@ set(GEMM_SWIGLU_SM90_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
 add_library(gemm_swiglu_sm90_src STATIC ${GEMM_SWIGLU_SM90_SRC_CU})
 
-if(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
+if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   file(GLOB LOW_LATENCY_GEMM_SRC_CU
        "${CMAKE_CURRENT_SOURCE_DIR}/low_latency_gemm/*.cu")
   add_library(low_latency_gemm_src STATIC ${LOW_LATENCY_GEMM_SRC_CU})
@@ -154,13 +154,13 @@ if(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
                                                     ON)
 endif()
 
-if(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+if(USING_OSS_CUTLASS_FP4_GEMM)
   file(GLOB FP4_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/fp4_gemm/*.cu")
   add_library(fp4_gemm_src STATIC ${FP4_SRC_CU} ${FP4_CU_INSTANTIATIONS})
   set_property(TARGET fp4_gemm_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 endif()
 
-if(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+if(USING_OSS_CUTLASS_MOE_GEMM)
   file(GLOB MOE_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/moe_gemm/*.cu")
   add_library(moe_gemm_src STATIC ${MOE_GEMM_SRC_CU} ${GROUPED_SRC_CPP}
                                   ${GROUPED_CU_INSTANTIATIONS})
@@ -170,7 +170,7 @@ if(ENABLE_OPENED_CUTLASS_MOE_GEMM)
   set_property(TARGET moe_gemm_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 endif()
 
-if(ENABLE_OPENED_CUTLASS_ALLREDUCE_GEMM)
+if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   add_library(
     ar_gemm_src STATIC
     ${ARGEMM_SRC_CU}
@@ -223,7 +223,7 @@ endfunction()
 
 set(TARGET_LIB
     fpA_intB_gemm_src;fb_gemm_src;fp8_blockscale_gemm_src;gemm_swiglu_sm90_src)
-if(ENABLE_OPENED_CUTLASS_LOW_LATENCY_GEMM)
+if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   list(APPEND TARGET_LIB low_latency_gemm_src)
 endif()
 foreach(target_name ${TARGET_LIB})
@@ -231,7 +231,7 @@ foreach(target_name ${TARGET_LIB})
 endforeach()
 
 set(TARGET_LIB fpA_intB_gemm_src;fb_gemm_src)
-if(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+if(USING_OSS_CUTLASS_FP4_GEMM)
   list(APPEND TARGET_LIB fp4_gemm_src)
 endif()
 foreach(target_name ${TARGET_LIB})
@@ -239,10 +239,10 @@ foreach(target_name ${TARGET_LIB})
 endforeach()
 
 set(TARGET_LIB "")
-if(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+if(USING_OSS_CUTLASS_MOE_GEMM)
   list(APPEND TARGET_LIB moe_gemm_src)
 endif()
-if(ENABLE_OPENED_CUTLASS_ALLREDUCE_GEMM)
+if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   list(APPEND TARGET_LIB ar_gemm_src)
 endif()
 foreach(target_name ${TARGET_LIB})

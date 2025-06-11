@@ -19,7 +19,7 @@
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "tensorrt_llm/thop/userbuffersTensor.h"
-#if defined(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
 #include "tensorrt_llm/kernels/cutlass_kernels/include/fp4_gemm.h"
 #else
 #include "fp4_gemm.h"
@@ -37,7 +37,7 @@
 #include <vector>
 
 namespace tkc = tensorrt_llm::cutlass_extensions;
-#if defined(ENABLE_OPENED_CUTLASS_FP4_GEMM)
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
 using tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunner;
 using tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunnerInterface;
 #else

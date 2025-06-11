@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
 #else
@@ -42,7 +42,7 @@ namespace torch_ext
 {
 
 namespace common = tensorrt_llm::common;
-#if defined(ENABLE_OPENED_CUTLASS_MOE_GEMM)
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
 constexpr auto BlockScaleVectorSize
     = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
 namespace kernels = tensorrt_llm::kernels::cutlass_kernels;
