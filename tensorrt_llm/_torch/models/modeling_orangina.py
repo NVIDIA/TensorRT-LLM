@@ -3,6 +3,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 from torch import nn
+from torch.nn.parameter import Parameter
 from tqdm import tqdm
 
 from tensorrt_llm._torch.distributed import AllReduceParams
@@ -79,9 +80,9 @@ class AttentionBlock(Attention):
         # Only apply sliding window to every other layer
         self.sliding_window = pretrained_config.sliding_window if layer_idx % 2 == 0 else None
 
-        # TODO: pass sinks to Attention kernel
-        self.sinks = torch.empty(pretrained_config.num_attention_heads,
-                                 dtype=torch.bfloat16)
+        self.sinks = Parameter(
+            torch.empty(pretrained_config.num_attention_heads // self.tp_size,
+                        dtype=torch.float32))
         self.norm = RMSNorm(hidden_size=pretrained_config.hidden_size,
                             eps=pretrained_config.rms_norm_eps,
                             dtype=pretrained_config.torch_dtype)
@@ -107,7 +108,14 @@ class AttentionBlock(Attention):
                                all_reduce_params=all_reduce_params,
                                lora_params=lora_params,
                                attention_window_size=attention_window_size,
+                               attention_sinks=self.sinks.data,
                                **kwargs)
+
+    def load_weights(self, weights: Dict):
+        sinks = weights[0]['sinks'][self.num_heads *
+                                    self.tp_rank:self.num_heads *
+                                    (self.tp_rank + 1)]
+        self.sinks.data = sinks.to(torch.float32)
 
 
 class MLPBlock(torch.nn.Module):
@@ -139,8 +147,6 @@ class MLPBlock(torch.nn.Module):
         self.routing_method = RenormalizeMoeRoutingMethod(
             top_k=pretrained_config.num_experts_per_tok)
 
-        # TODO: route "block.x.mlp" weights to "block.x.mlp.experts" in weight loading
-        # TODO: add bias
         self.experts = create_moe(
             routing_method=self.routing_method,
             num_experts=pretrained_config.num_experts,
@@ -150,6 +156,7 @@ class MLPBlock(torch.nn.Module):
             reduce_results=True,
             model_config=config,
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
+            bias=True,
         )
 
     @staticmethod
@@ -281,7 +288,6 @@ class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
             hidden_size=model_config.pretrained_config.hidden_size,
             vocab_size=model_config.pretrained_config.vocab_size,
         )
-        # TODO: add unembedding, which is implemented as lm_head in DecoderModelForCausalLM
 
     def forward(
         self,
@@ -317,14 +323,17 @@ class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
             "qkv_proj": "qkv",
             "o_proj": "out",
             "lm_head": "unembedding",
-            "sinks": "sdpa.sinks",
-            # "experts": ["mlp1", "mlp2"]
         }
+        head_dim = self.config.head_dim
+        num_q_head = self.config.num_attention_heads
+        num_kv_head = self.config.num_key_value_heads
+        num_expert = self.config.num_experts
         for name, module in tqdm(list(self.named_modules()),
                                  desc="Loading weights"):
             if len(module._parameters) <= 0:
                 continue
             names = name.split(".")
+            module_weights = {}
             if names[-1] in params_map:
                 names[-1] = params_map[names[-1]]
             # Drop the first "model" prefix
@@ -333,18 +342,58 @@ class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
             else:
                 name = '.'.join(names)
             module_weights = filter_weights(name, weights)
-            # TODO: Make sure MoE is fused or not.
             if isinstance(module, MoE):
-                pass
-            elif isinstance(module, AttentionBlock):
-                module_weight = filter_weights(name, weights)
-                module.sinks.data = module_weight[name]
-            # TODO: Make sure QKV is fused or not.
+                # [num_experts, intermediate_size * 2, hidden_size]
+                gate_up_proj = filter_weights(name.replace("experts", "mlp1"),
+                                              weights)
+                # [num_experts, intermediate_size, hidden_size]
+                down_proj = filter_weights(name.replace("experts", "mlp2"),
+                                           weights)
+                moe_weights = {
+                    'gate_up_proj': [
+                        gate_up_proj['weight'][i, :, :].transpose(0, 1)
+                        for i in range(num_expert)
+                    ],
+                    'down_proj': [
+                        down_proj['weight'][i, :, :].transpose(0, 1)
+                        for i in range(num_expert)
+                    ],
+                    'gate_up_proj.bias':
+                    [gate_up_proj['bias'][i, :] for i in range(num_expert)],
+                    'down_proj.bias':
+                    [down_proj['bias'][i, :] for i in range(num_expert)]
+                }
+                module.load_weights(weights=[moe_weights])
             elif hasattr(module, "load_weights"):
                 # Load Attention module weights.
                 if 'qkv' in name:
-                    continue
-                module.load_weights(weights=[module_weights])
+                    q_weight = module_weights['weight'][:head_dim *
+                                                        num_q_head, :]
+                    k_weight = module_weights['weight'][head_dim *
+                                                        num_q_head:head_dim *
+                                                        (num_q_head +
+                                                         num_kv_head), :]
+                    v_weight = module_weights['weight'][:head_dim *
+                                                        num_kv_head, :]
+                    q_bias = module_weights['bias'][:head_dim * num_q_head]
+                    k_bias = module_weights['bias'][head_dim *
+                                                    num_q_head:head_dim *
+                                                    (num_q_head + num_kv_head)]
+                    v_bias = module_weights['bias'][:head_dim * num_kv_head]
+                    qkv_weights = [{
+                        'weight': q_weight,
+                        'bias': q_bias
+                    }, {
+                        'weight': k_weight,
+                        'bias': k_bias
+                    }, {
+                        'weight': v_weight,
+                        'bias': v_bias
+                    }]
+                    module.load_weights(weights=qkv_weights)
+                else:
+                    # Dense & gate & sinks
+                    module.load_weights(weights=[module_weights])
             else:
                 # Load LN weights.
                 for n, p in module._parameters.items():

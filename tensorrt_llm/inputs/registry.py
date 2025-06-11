@@ -63,17 +63,25 @@ class DefaultInputProcessor(InputProcessor):
                           max_length=sampling_params.truncate_prompt_tokens)
 
         with nvtx_range_debug("tokenize prompt"):
-            token_ids = self.tokenizer.encode(
-                inputs["prompt"],
-                add_special_tokens=sampling_params.add_special_tokens,
-                **kwargs)
+            try:
+                token_ids = self.tokenizer.encode(
+                        inputs["prompt"],
+                        add_special_tokens=sampling_params.add_special_tokens,
+                        **kwargs)
+            except:
+                # Tiktoken path
+                token_ids = self.tokenizer.encode(inputs["prompt"])
 
         if "query" in inputs:
             with nvtx_range_debug("tokenize query"):
-                query_token_ids = self.tokenizer.encode(
-                    inputs["query"],
-                    add_special_tokens=sampling_params.add_special_tokens,
-                    **kwargs)
+                try:
+                    query_token_ids = self.tokenizer.encode(
+                            inputs["query"],
+                            add_special_tokens=sampling_params.add_special_tokens,
+                            **kwargs)
+                except:
+                    # Tiktoken path
+                    query_token_ids = self.tokenizer.encode(inputs["query"])
             return token_ids, {"query_token_ids": query_token_ids}
 
         return token_ids, None

@@ -54,6 +54,7 @@ class CutlassFusedMoE(MoE):
         aux_stream: Optional[torch.cuda.Stream] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
+        bias: bool = False,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
     ):
@@ -67,6 +68,7 @@ class CutlassFusedMoE(MoE):
             reduce_results=reduce_results,
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
+            bias=bias,
         )
 
         self.layer_idx = layer_idx

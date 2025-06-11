@@ -62,6 +62,7 @@ def create_moe(
     override_quant_config: Optional[QuantConfig] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
+    bias: bool = False,
     apply_router_weight_on_input: bool = False,
     layer_idx: Optional[int] = None,
 ) -> MoE:
@@ -71,6 +72,9 @@ def create_moe(
     moe_load_balancer = get_moe_load_balancer()
     if moe_load_balancer is not None:
         assert moe_cls == WideEPMoE, "MoE Load Balance is only supported in WideEPMoE now."
+
+    if bias:
+        assert moe_cls == CutlassFusedMoE, "bias is only supported in CutlassFusedMoE."
 
     if moe_cls == TRTLLMGenFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
@@ -97,6 +101,7 @@ def create_moe(
             model_config=model_config,
             aux_stream=aux_stream,
             weight_loading_mode=weight_loading_mode,
+            bias=bias,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
         )

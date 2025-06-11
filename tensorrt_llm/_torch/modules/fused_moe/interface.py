@@ -41,6 +41,7 @@ class MoE(nn.Module):
         model_config: ModelConfig = ModelConfig(),
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
+        bias: bool = False,
     ):
         from ...distributed import AllReduce
 
@@ -50,7 +51,7 @@ class MoE(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.weight_loading_mode = weight_loading_mode
-
+        self.bias = bias
         self.dtype = dtype
         self.reduce_results = reduce_results
 
