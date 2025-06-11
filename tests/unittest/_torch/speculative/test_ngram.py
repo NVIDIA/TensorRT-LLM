@@ -34,7 +34,7 @@ def test_llama_ngram(use_cuda_graph: bool, attn_backend: str):
         cuda_graph_batch_sizes=[1],
     )
 
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=2080)
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False)
 
     sampling_params = SamplingParams(
         max_tokens=32,
