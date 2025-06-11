@@ -50,7 +50,7 @@ public:
     using VecTokenExtraIds = Base::VecTokenExtraIds;
     using LogitsPostProcessor = Base::LogitsPostProcessor;
 
-    // 46 parameters
+    // 49 parameters
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -58,6 +58,9 @@ public:
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<std::vector<std::vector<SizeType32>>> multimodalHashes = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalPositions = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalLengths = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
@@ -82,20 +85,30 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
-        : Base(requestId,                                                                                        //
-            maxNewTokens,                                                                                        //
-            std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),                                  //
-            samplingConfig,                                                                                      //
-            isStreaming,                                                                                         //
-            endId,                                                                                               //
-            padId,                                                                                               //
-            embeddingBias,                                                                                       //
-            badWordsList,                                                                                        //
-            stopWordsList,                                                                                       //
-            positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))  //
-                                    : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),     //
-            promptEmbeddingTable,                                                                                //
-            promptVocabSize,                                                                                     //
+        : Base(requestId,                                                                                       //
+            maxNewTokens,                                                                                       //
+            std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),                                 //
+            samplingConfig,                                                                                     //
+            isStreaming,                                                                                        //
+            endId,                                                                                              //
+            padId,                                                                                              //
+            embeddingBias,                                                                                      //
+            badWordsList,                                                                                       //
+            stopWordsList,                                                                                      //
+            positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value())) //
+                                    : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),    //
+            promptEmbeddingTable,                                                                               //
+            promptVocabSize,                                                                                    //
+            multimodalHashes.has_value()
+                ? std::make_optional(
+                    std::make_shared<std::vector<std::vector<SizeType32>>>(std::move(multimodalHashes.value()))) //
+                : std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>>(std::nullopt),            //
+            multimodalPositions.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalPositions.value()))              //
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),                         //
+            multimodalLengths.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalLengths.value()))                //
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),                         //
             multimodalEmbedding,                                                                                 //
             mropeRotaryCosSin,                                                                                   //
             mropePositionDeltas,                                                                                 //

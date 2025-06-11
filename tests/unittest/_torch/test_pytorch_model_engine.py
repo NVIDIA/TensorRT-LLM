@@ -94,6 +94,7 @@ def create_model_engine_and_kvcache(config: PyTorchConfig = None):
     tokens_per_block = 1
     max_tokens = 258  # Atleast 1 more than the max seq len
     num_layers = 1
+    batch_size = 13
 
     config = config if config else PyTorchConfig(
         use_cuda_graph=True, cuda_graph_padding_enabled=True)
@@ -265,6 +266,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                    rtol=0)
 
         kv_cache_manager.shutdown()
+
+    def test_cuda_graph_padding_filters_huge_batch_size(self):
+        config = PyTorchConfig(
+            use_cuda_graph=True,
+            cuda_graph_padding_enabled=True,
+            cuda_graph_batch_sizes=[1, 2, 3, 1000000000000000000000000])
+        model_engine = DummyModelEngine(config, 32, torch.half)
+
+        self.assertEqual(model_engine._cuda_graph_batch_sizes,
+                         [1, 2, 3, model_engine.max_seq_len])
 
 
 if __name__ == "__main__":
