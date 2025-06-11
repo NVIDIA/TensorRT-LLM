@@ -39,7 +39,7 @@ using TensorPtr = ITensor::SharedPtr;
 
 template <typename T>
 GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth,
-    size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
+    size_t vocabSize, size_t vocabSizePadded, CudaStreamPtr const& stream,
     std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule)
     : mManager{std::make_shared<BufferManager>(stream)}
     , mMaxBatchSize(maxBatchSize)

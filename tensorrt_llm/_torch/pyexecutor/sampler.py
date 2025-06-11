@@ -553,7 +553,6 @@ class TRTLLMSampler(Sampler):
             mode=self.decoding_mode,
             max_batch_size=self.executor_config.max_batch_size,
             max_beam_width=self.executor_config.max_beam_width,
-            max_sequence_length=self.executor_config.max_seq_len,
             dtype=self.logits_datatype,
             model_config=self.model_config,
             world_config=self.world_config)

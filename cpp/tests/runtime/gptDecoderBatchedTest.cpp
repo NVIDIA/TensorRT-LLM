@@ -314,7 +314,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
 
     // set up decoder
     auto decoder = GptDecoderBatched(streamPtr);
-    decoder.setup(decodingMode, batchSize, maxBeamWidth, maxSeqLength, dataType, modelConfig, worldConfig);
+    decoder.setup(decodingMode, batchSize, maxBeamWidth, dataType, modelConfig, worldConfig);
 
     decoder::DecoderState decoderState(dataType, manager);
     if (!modelConfig.getSpeculativeDecodingMode().isNone())
@@ -453,7 +453,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
 
     // set up decoder
     auto decoder = GptDecoderBatched(streamPtr);
-    decoder.setup(decodingMode, batchSize, maxBeamWidth, maxSeqLength, dataType, modelConfig, worldConfig);
+    decoder.setup(decodingMode, batchSize, maxBeamWidth, dataType, modelConfig, worldConfig);
 
     decoder::DecoderState decoderState(dataType, manager);
     if (!modelConfig.getSpeculativeDecodingMode().isNone())
@@ -608,7 +608,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
 
     // set up decoder
     auto decoder = GptDecoderBatched(streamPtr);
-    decoder.setup(decodingMode, batchSize, maxBeamWidth, maxSeqLength, dataType, modelConfig, worldConfig);
+    decoder.setup(decodingMode, batchSize, maxBeamWidth, dataType, modelConfig, worldConfig);
 
     decoder::DecoderState decoderState(dataType, manager);
     if (!modelConfig.getSpeculativeDecodingMode().isNone())
