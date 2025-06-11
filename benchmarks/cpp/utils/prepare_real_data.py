@@ -8,9 +8,11 @@ import click
 from datasets import load_dataset
 from PIL import Image
 from pydantic import BaseModel, model_validator
-from utils.utils import (get_norm_dist_lengths, multimodal_dataset_dump,
-                         print_multimodal_dataset, print_text_dataset,
-                         text_dataset_dump)
+
+from benchmarks.cpp.utils.utils import (get_norm_dist_lengths,
+                                        multimodal_dataset_dump,
+                                        print_multimodal_dataset,
+                                        print_text_dataset, text_dataset_dump)
 
 
 def validate_output_len_dist(ctx, param, value):

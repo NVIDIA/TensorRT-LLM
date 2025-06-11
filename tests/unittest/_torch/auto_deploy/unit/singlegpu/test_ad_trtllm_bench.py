@@ -1,4 +1,3 @@
-import subprocess
 import tempfile
 import warnings
 
@@ -7,6 +6,7 @@ from _model_test_utils import hf_model_dir_or_hub_id
 from click.testing import CliRunner
 from utils.llm_data import llm_models_root
 
+from benchmarks.cpp.prepare_dataset import cli as prepare_dataset_cli
 from tensorrt_llm.commands.bench import main as trtllm_bench
 
 
@@ -14,10 +14,10 @@ def prepare_dataset(temp_dir, model_name):
     _DATASET_NAME = "synthetic_128_128.txt"
     dataset_path = f"{temp_dir}/{_DATASET_NAME}"
     with open(dataset_path, "w") as outfile:
-        subprocess.run(
+        runner = CliRunner()
+        result = runner.invoke(
+            prepare_dataset_cli,
             [
-                "python",
-                "benchmarks/cpp/prepare_dataset.py",
                 "--stdout",
                 "--tokenizer",
                 model_name,
@@ -33,9 +33,11 @@ def prepare_dataset(temp_dir, model_name):
                 "--num-requests",
                 "10",
             ],
-            stdout=outfile,
-            check=True,
+            catch_exceptions=False,
         )
+        if result.exit_code != 0:
+            raise RuntimeError(f"Failed to prepare dataset: {result.output}")
+        outfile.write(result.output)
     return dataset_path
 
 

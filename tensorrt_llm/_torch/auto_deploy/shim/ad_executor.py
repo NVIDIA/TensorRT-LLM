@@ -190,7 +190,6 @@ class ADEngine(ModelEngine):
             else:
                 previous_batch_indices.append(request.py_batch_idx)
                 input_pos.append(request.max_beam_num_tokens)
-
             # check for draft tokens
             if request.draft_tokens:
                 input_ids[-1].extend([t for t in request.draft_tokens])

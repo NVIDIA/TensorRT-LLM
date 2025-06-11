@@ -1,9 +1,11 @@
 import random
 
 import click
-from utils.utils import (gen_random_tokens, get_norm_dist_lengths,
-                         get_unif_dist_lengths, print_text_dataset,
-                         text_dataset_dump)
+
+from benchmarks.cpp.utils.utils import (gen_random_tokens,
+                                        get_norm_dist_lengths,
+                                        get_unif_dist_lengths,
+                                        print_text_dataset, text_dataset_dump)
 
 
 @click.command()
