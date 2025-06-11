@@ -1499,16 +1499,17 @@ class PyExecutor:
                 or req.is_disagg_generation_transmission_in_progress else 1
                 for req in self.active_requests
             ])
-
-        if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
-            llm_request = self.kv_cache_manager.add_dummy_requests(
-                request_ids=[0],
+        num_dummy_request = self.expected_num_active_requests - num_active_request
+        if num_dummy_request > 0:
+            llm_request_list = self.kv_cache_manager.add_dummy_requests(
+                request_ids=list(range(num_dummy_request)),
                 is_gen=not self.has_context_request,
                 prepare_resource=not self.has_context_request,
                 max_num_draft_tokens=self.max_draft_tokens,
-            )[0]
-            llm_request.is_attention_dp_dummy = True
-            self.active_requests.append(llm_request)
+            )
+            for llm_request in llm_request_list:
+                llm_request.is_attention_dp_dummy = True
+            self.active_requests += llm_request_list
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
@@ -1625,13 +1626,12 @@ class PyExecutor:
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy request
-        if self.active_requests and self.active_requests[
-                -1].is_attention_dp_dummy:
-            request = self.active_requests[-1]
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            self.inflight_req_ids.erase(request.py_request_id)
-            self._terminate_request(request)
-            self.active_requests.remove(request)
+        for request in self.active_requests[:]:
+            if request.is_attention_dp_dummy:
+                request.state = LlmRequestState.GENERATION_COMPLETE
+                self.inflight_req_ids.erase(request.py_request_id)
+                self._terminate_request(request)
+                self.active_requests.remove(request)
 
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
