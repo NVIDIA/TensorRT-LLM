@@ -1,8 +1,10 @@
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
+
+from tensorrt_llm.serve.openai_protocol import StreamOptions
 
 
 class ScaffoldingOutput:
@@ -37,10 +39,28 @@ class GenerationTask(Task):
     skip_tokenizer: bool = False
     skip_detokenizer: bool = False
 
-    # sampling params
+    # sampling params for openai
+    # Ordered by official OpenAI API documentation
+    # https://platform.openai.com/docs/api-reference/completions/create
+    # The special case is `num_logprobs`, its original name si `logprobs` but conflicted by the result field
+    best_of: Optional[int] = None
+    echo: Optional[bool] = False
+    frequency_penalty: Optional[float] = 0.0
+    logit_bias: Optional[Dict[str, float]] = None
+    num_logprobs: Optional[int] = None
     max_tokens: Optional[int] = 2048
+    n: int = 1
+    presence_penalty: Optional[float] = 0.0
+    seed: Optional[int] = None
+    stop: Optional[Union[str, List[str]]] = field(default_factory=list)
+    stream: Optional[bool] = False
+    stream_options: Optional[StreamOptions] = None
+    suffix: Optional[str] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
+    user: Optional[str] = None
+
+    # sampling params
     top_k: Optional[int] = None
     return_context_logits: Optional[bool] = False
 

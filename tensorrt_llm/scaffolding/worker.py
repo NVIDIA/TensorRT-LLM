@@ -57,6 +57,14 @@ def add_attr_if_not_none(obj, attr, candidate_values):
             return
 
 
+# a list of sampling parameters supported by the OpenAI Completions API
+OPENAI_COMPLETIONS_PARAMS = [
+    "best_of", "echo", "frequency_penalty", "logit_bias", "num_logprobs",
+    "max_tokens", "n", "presence_penalty", "seed", "stop", "stream",
+    "stream_options", "suffix", "temperature", "top_p", "user"
+]
+
+
 # Worker for standard openai api
 class OpenaiWorker(Worker):
 
@@ -73,9 +81,15 @@ class OpenaiWorker(Worker):
             "model": self.model,
             "prompt": task.input_str,
         }
-        add_param_if_not_none(params, "max_tokens", [task.max_tokens])
-        add_param_if_not_none(params, "temperature", [task.temperature])
-        add_param_if_not_none(params, "top_p", [task.top_p])
+
+        for param_name in OPENAI_COMPLETIONS_PARAMS:
+            param_value = getattr(task, param_name, None)
+
+            if param_name == "num_logprobs":
+                param_name = "logprobs"
+
+            add_param_if_not_none(params, param_name, [param_value])
+
         return params
 
     def fill_generation_task_with_response(self, task: GenerationTask,
