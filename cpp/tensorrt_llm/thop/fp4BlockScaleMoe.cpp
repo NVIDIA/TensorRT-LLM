@@ -53,6 +53,8 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
 
     if (n_group.has_value())
     {
+        TORCH_CHECK(static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3,
+            "Routing kernel with groups implies DeepSeekV3 routing method.");
         TORCH_CHECK(topk_group.has_value(), "if n_group is given, topk_group must be given");
         TORCH_CHECK(num_experts % n_group.value() == 0, "num_experts must be divisible by n_group");
         TORCH_CHECK(top_k <= 8, "Current routing kernel (with groups) only supports top_k<=8.");
@@ -62,9 +64,10 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
         TORCH_CHECK(top_k < (topk_group.value() * num_experts / n_group.value()),
             "top_k must be less than total number of experts in selected groups");
     }
-    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Qwen3)
+    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize
+        || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::RenormalizeNaive)
     {
-        TORCH_CHECK(top_k == 8, "Current routing kernel (no groups, Qwen3) only supports top_k=8.");
+        TORCH_CHECK(top_k == 8, "Current routing kernel (no groups, renormalize) only supports top_k=8.");
     }
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4)
     {
