@@ -1942,6 +1942,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             runLLMDocBuild(pipeline, config=VANILLA_CONFIG)
         }],
     ]
+    //Clear docBuildConfigs for feat/orangina
+    docBuildConfigs = [:]
 
     fullSet += docBuildConfigs.keySet()
 
@@ -2015,6 +2017,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     if (env.targetArch == AARCH64_TRIPLE) {
         sanityCheckConfigs = aarch64SanityCheckConfigs
     }
+    //Clear sanityCheckConfigs for feat/orangina
+    sanityCheckConfigs = [:]
 
     sanityCheckJobs = sanityCheckConfigs.collectEntries {key, values -> [toStageName(values[1], key), {
         cacheErrorAndUploadResult(toStageName(values[1], key), {
