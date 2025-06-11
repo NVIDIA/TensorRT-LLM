@@ -419,7 +419,7 @@ class RopeParams:
                     self.original_max_positions,
                 })
         if rope_inv_freq is not None:
-            rope_inv_freq = torch.torch.tensor(
+            rope_inv_freq = torch.tensor(
                 rope_inv_freq,
                 dtype=torch.float32,
                 device='cuda',
@@ -428,7 +428,7 @@ class RopeParams:
             rope_cos_sin = rope_cos_sin.reshape(
                 self.max_positions, -1,
                 2)[:, :self.dim // 2, :].transpose(0, 2, 1).reshape(1, -1)
-        rope_cos_sin = torch.torch.tensor(
+        rope_cos_sin = torch.tensor(
             rope_cos_sin,
             dtype=torch.float32,
             device='cuda',
