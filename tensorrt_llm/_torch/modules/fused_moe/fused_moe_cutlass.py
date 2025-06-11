@@ -466,7 +466,7 @@ class CutlassFusedMoE(MoE):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
-        cutlass_min_latency_mode: bool = False,
+        do_finalize: bool = True,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -481,6 +481,8 @@ class CutlassFusedMoE(MoE):
         # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = (num_rows + self.moe_max_num_tokens -
                       1) // self.moe_max_num_tokens
+        # TODO: remove cutlass_min_latency_mode since it is not used anymore
+        cutlass_min_latency_mode = not do_finalize
 
         if cutlass_min_latency_mode:
             assert num_chunks == 1 and (
