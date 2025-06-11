@@ -154,11 +154,6 @@ class Mamba2Mixer(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
 
-        # warm up does not prepare resources, there are two warmup requests
-        is_warmup = attn_metadata.kv_cache_manager is None or attn_metadata.request_ids == [
-            0
-        ]
-
         # calculate split size
         num_contexts = attn_metadata.num_contexts
         num_generations = attn_metadata.seq_lens.shape[0] - num_contexts
@@ -167,11 +162,18 @@ class Mamba2Mixer(nn.Module):
         split_gen = sum_seq[-1] - split_ctx
         split_size = [split_ctx, split_gen]
 
-        # handle warm up request
-        if not is_warmup:
-            state_indices = attn_metadata.kv_cache_manager.get_state_indices()
-            split_indices = torch.split(state_indices,
-                                        [num_contexts, num_generations])
+        state_indices = attn_metadata.kv_cache_manager.get_state_indices()
+
+        # warm up does not prepare resources, so no relevant state indices
+        is_warmup = state_indices.numel() == 0
+        if is_warmup:
+            # in this case, assume batch takes first indices in mamba cache
+            state_indices = torch.arange(num_contexts + num_generations,
+                                         device=state_indices.device,
+                                         dtype=state_indices.dtype)
+
+        split_indices = torch.split(state_indices,
+                                    [num_contexts, num_generations])
 
         split_seq_lens = torch.split(attn_metadata.seq_lens,
                                      [num_contexts, num_generations])
@@ -200,15 +202,11 @@ class Mamba2Mixer(nn.Module):
         out = []
         for req_type in batch:
 
-            if not is_warmup:
-                indices = split_indices[req_type].to(torch.long).to(
-                    torch.device("cuda"))
-                conv_states = attn_metadata.kv_cache_manager.get_conv_states(
-                    self.layer_idx)
-                ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
-                    self.layer_idx)
-            else:
-                indices = None
+            indices = split_indices[req_type].to(torch.device("cuda"))
+            conv_states = attn_metadata.kv_cache_manager.get_conv_states(
+                self.layer_idx)
+            ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
+                self.layer_idx)
 
             z, xbc, dt = torch.split(
                 split_zxbcdt[req_type],
@@ -234,15 +232,13 @@ class Mamba2Mixer(nn.Module):
                     cu_seqlens.diff(),
                     output_size=cu_seqlens[-1]).unsqueeze(0)
 
-                current_conv_states = torch.empty_like(
-                    conv_states[indices, ...]) if not is_warmup else None
                 xbc = causal_conv1d_fn(xbc.transpose(0, 1),
                                        self.conv1d.weight,
                                        self.conv1d.bias,
                                        activation="silu",
-                                       conv_states=current_conv_states,
-                                       query_start_loc=cu_seqlens).transpose(
-                                           0, 1)
+                                       conv_states=conv_states,
+                                       query_start_loc=cu_seqlens,
+                                       cache_indices=indices).transpose(0, 1)
 
                 x, B, C = torch.split(xbc.unsqueeze(0), [
                     self.tp_d_inner,
@@ -278,18 +274,17 @@ class Mamba2Mixer(nn.Module):
                 )
                 y = rearrange(y, "b l h p -> (b l) (h p)")
 
+                # copy new ssm state
+                ssm_states[indices] = current_ssm_states
+
             # decode
             else:
-
-                # get conv and ssm states for decode
-                if not is_warmup:
-                    current_conv_states = conv_states[indices]
-                    current_ssm_states = ssm_states[indices]
-
-                # update conv states
-                xbc = causal_conv1d_update(xbc, current_conv_states,
-                                           self.conv1d.weight, self.conv1d.bias,
-                                           "silu")
+                xbc = causal_conv1d_update(xbc,
+                                           conv_states,
+                                           self.conv1d.weight,
+                                           self.conv1d.bias,
+                                           activation="silu",
+                                           conv_state_indices=indices)
 
                 x, B, C = torch.split(
                     xbc,
@@ -314,7 +309,7 @@ class Mamba2Mixer(nn.Module):
                 z = rearrange(z, "b (h p) -> b h p", p=self.head_dim)
 
                 y = selective_state_update(
-                    current_ssm_states,
+                    ssm_states,
                     x_reshaped,
                     dt,
                     A,
@@ -324,17 +319,13 @@ class Mamba2Mixer(nn.Module):
                     z=z,
                     dt_bias=dt_bias,
                     dt_softplus=self.delta_softplus,
+                    state_batch_indices=indices,
                 )
 
                 y = rearrange(y, "b h p -> b (h p)")
 
             # gated norm
             y = self.norm(y)
-
-            # copy new conv and ssm states
-            if not is_warmup:
-                conv_states.index_copy_(0, indices, current_conv_states)
-                ssm_states.index_copy_(0, indices, current_ssm_states)
 
             # append output
             out.append(y)

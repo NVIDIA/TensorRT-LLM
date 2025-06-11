@@ -295,7 +295,7 @@ class KVCacheManager(BaseResourceManager):
                                    == self.mapping.cp_size - 1 else 0),
                         req_beam_width, req)
             else:
-                if req.is_first_context_chunk():
+                if req.is_first_context_chunk:
                     self.impl.add_sequence(req.py_request_id, req.prompt_len,
                                            req_beam_width, req)
                     for _ in range(self.num_extra_kv_tokens):
@@ -578,7 +578,9 @@ class MambaCacheManager(BaseResourceManager):
         self.mamba_cache_index: Dict[int, int] = {}
 
         # mamba cache state indices
-        self.state_indices: torch.Tensor = torch.Tensor()
+        self.state_indices: torch.Tensor = torch.tensor([],
+                                                        device=device,
+                                                        dtype=torch.int32)
 
     def prepare_mamba_cache_blocks(self, request_ids: List[int]):
         state_indices = []
@@ -593,7 +595,7 @@ class MambaCacheManager(BaseResourceManager):
                 block = self.mamba_cache_free_blocks.pop()
                 self.mamba_cache_index[r] = block
                 state_indices.append(block)
-        self.state_indices = torch.as_tensor(state_indices, dtype=torch.long)
+        self.state_indices = torch.as_tensor(state_indices, dtype=torch.int32)
 
     def free_mamba_cache_blocks(self, request_id: int):
         if request_id in self.mamba_cache_index:

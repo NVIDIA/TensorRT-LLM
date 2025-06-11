@@ -248,6 +248,12 @@ def launch_server(host: str,
     default=None,
     help="Server role. Specify this value only if running in disaggregated mode."
 )
+@click.option(
+    "--trust_remote_code",
+    type=bool,
+    default=False,
+    help="Whether to trust remote code.",
+)
 def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           log_level: str, backend: str, max_beam_width: int,
           max_batch_size: int, max_num_tokens: int, max_seq_len: int,
@@ -292,6 +298,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         metadata_server_config_file)
 
     if metadata_server_cfg is not None:
+        assert server_role is not None, "server_role is required when metadata_server_cfg is provided"
         try:
             server_role = ServerRole[server_role.upper()]
         except ValueError:

@@ -743,7 +743,8 @@ struct KernelParams
         params.ptrSoftmaxStats = options.softmaxStatsPtr;
 
         params.mAttentionWindowSize = options.mAttentionWindowSize;
-        if (isSlidingOrChunkedCausalMask(options.mMaskType) && options.mMaxSeqLenKv > options.mChunkedAttentionSize)
+        if (isSlidingOrChunkedCausalMask(static_cast<TrtllmGenAttentionMaskType>(kernelMeta.mMaskType))
+            && options.mChunkedAttentionSize != INT_MAX)
         {
             TLLM_CHECK_WITH_INFO((options.mChunkedAttentionSize & (options.mChunkedAttentionSize - 1)) == 0,
                 "Chunked attention size must be a power of 2");

@@ -28,6 +28,7 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "cutlass_extensions/communication/collective/sm90_allreduce_nvls_warpspecialized.hpp"
+#include "cutlass_extensions/epilogue/fusion/sm90_visitor_allreduce_tma_warpspecialized.hpp"
 #include "cutlass_extensions/gemm/kernel/sm90_gemm_allreduce_tma_warpspecialized_pingpong.hpp"
 
 #include "tensorrt_llm/common/cudaUtils.h"

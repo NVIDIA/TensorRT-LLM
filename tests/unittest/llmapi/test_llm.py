@@ -3,6 +3,16 @@ import datetime
 import gc
 import json
 import os
+
+# Required for test_generate_with_seed to pass.
+# See the discussion in https://github.com/NVIDIA/TensorRT-LLM/pull/4264#issuecomment-2943269891
+# The following line must be ahead of any tensorrt_llm imports,
+# since currently env util functions like getEnvForceDeterministic are implemented using static variables,
+# which means they are only initialized once the CPP translation unit is loaded (should be refactored to be non static later).
+os.environ['TRTLLM_FORCE_XQA'] = '1'
+# Note that we cannot use os.environ['FORCE_DETERMINISTIC'] = '1' here,
+# since it will disable KV cache reuse and make test_llm_api_draft_target fail.
+
 import random
 import shutil
 import sys
@@ -1642,9 +1652,12 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
                                      streaming=False,
                                      backend=None):
     LLM_CLASS = LLM
+    llm_extra_kwargs = {}
     if backend == "pytorch":
         from tensorrt_llm._torch import LLM as LLM_torch
         LLM_CLASS = LLM_torch
+    else:
+        llm_extra_kwargs["fast_build"] = True
 
     llm = LLM_CLASS(
         llama_model_path,
@@ -1652,7 +1665,7 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
         build_config=BuildConfig(gather_context_logits=True),
         tensor_parallel_size=tp_size,
         gather_generation_logits=True,
-        fast_build=True,
+        **llm_extra_kwargs,
     )
 
     prompts = ["A B C D E F G H I J K"]
@@ -1927,7 +1940,6 @@ def test_llm_get_stats(return_context_logits, enable_iter_req_stats):
 
 
 def test_llm_get_queued_stats():
-
     enable_iter_req_stats = True
     use_overlap = False
     tp_size = 1
@@ -1949,7 +1961,6 @@ def test_llm_get_queued_stats():
     llm = LLM_CLASS(model=llama_model_path,
                     kv_cache_config=global_kvcache_config,
                     tensor_parallel_size=tp_size,
-                    fast_build=True,
                     max_batch_size=1,
                     **llm_args_extra)
 
