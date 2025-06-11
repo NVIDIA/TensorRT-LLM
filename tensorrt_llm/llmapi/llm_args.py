@@ -1797,6 +1797,12 @@ class _AutoDeployLlmArgs(TorchLlmArgs):
         "properly passed through.",
     )
 
+    checkpoint_device: Optional[str] = Field(
+        default=None,
+        description="Device on which to load the model checkpoint. "
+        "Defaults to the same device as the rest of the pipeline.",
+    )
+
     @field_validator("free_mem_ratio")
     @classmethod
     def validate_free_mem_ratio(cls, v):
