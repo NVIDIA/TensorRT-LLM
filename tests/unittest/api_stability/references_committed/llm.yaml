@@ -66,10 +66,10 @@ methods:
         default: null
       # Quantization and calibration
       quant_config:
-        annotation: Optional[tensorrt_llm.models.modeling_utils.QuantConfig]
+        annotation: tensorrt_llm.models.modeling_utils.QuantConfig
         default: null
       calib_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_utils.CalibConfig]
+        annotation: tensorrt_llm.llmapi.llm_utils.CalibConfig
         default: null
       # Speculative decoding
       speculative_config:
