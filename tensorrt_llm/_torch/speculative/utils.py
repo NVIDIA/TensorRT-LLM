@@ -55,16 +55,17 @@ def get_spec_resource_manager(spec_config, model_config, max_num_requests):
         return None
 
 
-def get_spec_decoder(config: SpecConfig, sampler_args: TorchSampler.Args):
-    if config.spec_dec_mode.is_mtp():
-        return MTPSampler(sampler_args, nextn=config.num_nextn_predict_layers)
-    elif config.spec_dec_mode.is_eagle3():
+def get_spec_decoder(sampler_args: TorchSampler.Args, spec_config: SpecConfig):
+    if spec_config.spec_dec_mode.is_mtp():
+        return MTPSampler(sampler_args,
+                          nextn=spec_config.num_nextn_predict_layers)
+    if spec_config.spec_dec_mode.is_eagle3():
         # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process
         return TorchSampler(sampler_args)
-    elif config.spec_dec_mode.is_eagle3_one_model():
+    if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSampler(sampler_args)
     raise ValueError(
-        f"Unsupported speculative decoding mode: {config.spec_dec_mode}")
+        f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
 
 def get_num_spec_layers(spec_config):
