@@ -10,7 +10,12 @@ from torch import nn
 from tensorrt_llm._utils import mpi_barrier
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
+<<<<<<< HEAD
                                      AllReduceStrategy, MoEAllReduceParams)
+=======
+                                     AllReduceStrategy)
+from tensorrt_llm.logger import logger
+>>>>>>> 7f3955b17 (Address comments)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
@@ -478,7 +483,7 @@ class AllReduce(nn.Module):
             the AUTO strategy.
         """
         self.skip_ar = mapping.tp_size == 1
-        self._mnvl_allreduce = None
+        self._mnnvl_allreduce = None
         self._tllm_allreduce = None
         self._create_allreduce(mapping, ar_backend, strategy, dtype)
 
@@ -491,7 +496,7 @@ class AllReduce(nn.Module):
                              and dtype in MNNVLAllReduce.get_supported_dtype())
                         and (not mapping.has_cp()) and mapping.tp_size > 1)
         if enable_mnnvl:
-            self._mnvl_allreduce = MNNVLAllReduce(mapping, dtype)
+            self._mnnvl_allreduce = MNNVLAllReduce(mapping, dtype)
 
         self._tllm_allreduce = TLLMAllReduce(mapping, strategy)
 
@@ -522,7 +527,7 @@ class AllReduce(nn.Module):
             RESIDUAL_RMS_NORM_QUANT_FP8: [norm_quant, residual]
             RESIDUAL_RMS_NORM_OUT_QUANT_FP8: [norm, norm_quant, residual]
             RESIDUAL_RMS_NORM_QUANT_NVFP4: [norm_quant_fp4, scale_factor, residual]
-            RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: [norm, norm_quant_fp4, scale_factor, residual]P
+            RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: [norm, norm_quant_fp4, scale_factor, residual]
         '''
         if self.skip_ar or (all_reduce_params is not None
                             and all_reduce_params.enable_allreduce == False):
@@ -531,11 +536,12 @@ class AllReduce(nn.Module):
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
 
-        if self._mnvl_allreduce:
-            mnnvl_output = self._mnvl_allreduce(
+        if self._mnnvl_allreduce:
+            mnnvl_output = self._mnnvl_allreduce(
                 input, all_reduce_params=all_reduce_params)
             if mnnvl_output is not None:
                 return mnnvl_output
+            logger.info(f"Fallback to tllm_allreduce.")
 
         # MNNVL only support part of AllReduceFusionOp provided in params.
         output = self._tllm_allreduce(
