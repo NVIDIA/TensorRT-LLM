@@ -173,8 +173,8 @@ def seq_slice(request: LlmRequest, beam: int, *,
 
 def add_token(request: LlmRequest,
               new_tokens: torch.Tensor,
-              beam: int,
               *,
+              beam: int,
               step: int = 0) -> int:
     seq_slot = request.seq_slot
     assert seq_slot is not None
@@ -290,7 +290,7 @@ class TorchSampler(Sampler):
                 num_accepted += 1
                 new_token = add_token(req,
                                       new_tokens,
-                                      self.BEAM,
+                                      beam=self.BEAM,
                                       step=num_accepted)
                 if self._handle_stop_criteria(req, new_token, beam=self.BEAM):
                     break
@@ -307,13 +307,13 @@ class TorchSampler(Sampler):
                 continue
 
             if req.state != LlmRequestState.GENERATION_COMPLETE:
-                new_token = add_token(req, new_tokens, self.BEAM)
+                new_token = add_token(req, new_tokens, beam=self.BEAM)
                 self._handle_stop_criteria(req, new_token, beam=self.BEAM)
                 req.py_decoding_iter += 1
 
         for req in state.scheduled_requests.generation_requests:
             if req.state != LlmRequestState.GENERATION_COMPLETE:
-                new_token = add_token(req, new_tokens, self.BEAM)
+                new_token = add_token(req, new_tokens, beam=self.BEAM)
                 self._handle_stop_criteria(req, new_token, beam=self.BEAM)
                 if len(req.py_draft_tokens) > 0:
                     process_draft_tokens(req, new_token)
@@ -395,7 +395,7 @@ class TorchStarAttentionSampler(TorchSampler):
 
         output_token_idx = request.output_token_idx
         new_token = new_tokens_list[output_token_idx]
-        num_tokens = request.add_new_token(new_token, beam_idx)
+        request.add_new_token(new_token, beam_idx)
 
         current_logits = logits[output_token_idx].unsqueeze(0)
         if request.py_return_generation_logits:
@@ -407,7 +407,7 @@ class TorchStarAttentionSampler(TorchSampler):
                 Logprob(logprob=log_probs.item(), rank=1)
             }]])
 
-        self._handle_stop_criteria(request, new_token, num_tokens, beam_idx)
+        self._handle_stop_criteria(request, new_token, beam=beam_idx)
         if request.state != LlmRequestState.GENERATION_COMPLETE:
             request.py_decoding_iter += 1
 
@@ -619,7 +619,8 @@ class TRTLLMSampler(Sampler):
             cum_log_probs = self.algs.decoder_state.cum_log_probs.to(
                 'cpu', non_blocking=True)
 
-        device = SampleStateTensors(new_tokens=new_tokens_device_tensor)
+        device = SampleStateTensors(
+            new_tokens=self.algs.decoder_state.all_new_tokens)
 
         host = SampleStateTensorsHostTRTLLM(new_tokens=new_output_tokens,
                                             finished_sum=finished_sum,
@@ -674,7 +675,10 @@ class TRTLLMSampler(Sampler):
                     seq_len - request.get_num_tokens(beam))
 
                 for step in range(num_new_tokens[beam]):
-                    add_token(request, new_tokens_host, beam, step=step)
+                    new_token = add_token(request,
+                                          new_tokens_host,
+                                          beam=beam,
+                                          step=step)
 
                     if request.py_return_log_probs:
                         # NOTE: Log probs with drafting has not been tested yet.
@@ -683,7 +687,7 @@ class TRTLLMSampler(Sampler):
                             num_new_tokens[beam]) + step
 
                         log_probs.append({
-                            new_token.item():
+                            new_token:
                             Logprob(logprob=state.host.log_probs[seq_slot][beam]
                                     [begin_log_probs_offset +
                                      current_token].item(),
