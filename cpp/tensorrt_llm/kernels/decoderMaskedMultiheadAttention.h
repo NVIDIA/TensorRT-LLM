@@ -152,6 +152,9 @@ struct Multihead_attention_params_base
     bool const* attention_mask = nullptr;
     int attention_mask_stride = 0;
 
+    // The attention sinks [num_heads_q].
+    float const* attention_sinks = nullptr;
+
     // If relative position embedding is used
     T const* relative_attention_bias = nullptr;
     int relative_attention_bias_stride = 0;

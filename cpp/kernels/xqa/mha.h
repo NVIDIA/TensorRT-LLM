@@ -101,10 +101,11 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #else
     InputHead const* q,
 #endif
+    float const* attentionSinks, // [headGrpSize]
 #if USE_PAGED_KV_CACHE
-    GMemCacheHead* pool, // global pool of pages
+    GMemCacheHead* pool,         // global pool of pages
     KVCachePageIndex const*
-        kvCachePageList, // device pointer. shape: KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]
+        kvCachePageList,         // device pointer. shape: KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]
 #else
     GMemKVCacheHead* kvCacheData,
 #endif
@@ -136,10 +137,11 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #else
     InputHead const* q,
 #endif
+    float const* attentionSinks, // [headGrpSize]
 #if USE_PAGED_KV_CACHE
-    GMemCacheHead* pool, // global pool of pages
+    GMemCacheHead* pool,         // global pool of pages
     KVCachePageIndex const*
-        kvCachePageList, // device pointer. shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
+        kvCachePageList,         // device pointer. shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
 #else
     GMemKVCacheHead* kvCacheData,
 #endif

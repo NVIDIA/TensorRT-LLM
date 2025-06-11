@@ -2243,6 +2243,13 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // Compute the sum.
     sum = block_sum<WARPS_PER_BLOCK>(&red_smem[WARPS_PER_BLOCK], sum);
 
+    // Add the attention sinks.
+    // It has been moved to the end of the kernel if the multi-block mode is enabled.
+    if (!MULTI_BLOCK_FLAG && params.attention_sinks != nullptr)
+    {
+        sum += expf(params.attention_sinks[tidx] - qk_max);
+    }
+
 // Normalize the logits.
 #ifdef MMHA_FP8_SCALE_P_INSTEAD_OF_V
     float logit_scale = (FP8_KV_CACHE ? kv_scale_quant_orig_f : 1.0f);
@@ -2693,6 +2700,12 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 
             if (oo == 0 && (Dh == Dh_MAX || oi < Dh))
             {
+                // Add the attention sinks.
+                if (params.attention_sinks != nullptr)
+                {
+                    final_sum += expf(params.attention_sinks[hi] - final_max);
+                }
+
                 auto const inv_sum = __fdividef(
                     write_attention_quant ? *params.attention_out_scale_orig_quant : 1.f, final_sum + 1.e-6f);
 

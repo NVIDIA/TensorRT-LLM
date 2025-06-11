@@ -130,7 +130,8 @@ template <uint32_t nbKHeads>
 #endif
 #endif
 void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, bool verbose = false,
-    bool saveData = false, uint32_t ctxLen = ~0U, uint32_t slidingWinSize = std::numeric_limits<uint32_t>::max())
+    bool saveData = false, bool hasAttentionSinks = false, uint32_t ctxLen = ~0U,
+    uint32_t slidingWinSize = std::numeric_limits<uint32_t>::max())
 {
 #if IS_MLA
     if (nbKHeads != 1)
@@ -541,6 +542,17 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         }
     }
 
+    // Allocate the attention sinks (per head)
+    auto attentionSinks = ManagedMemBuf<float>(headGrpSize);
+    // The attention sinks ptr.
+    float* attentionSinksPtr = hasAttentionSinks ? reinterpret_cast<float*>(attentionSinks.get()) : nullptr;
+    // Initialize the attention sinks (use large values to detect the potential bugs).
+    for (uint32_t i = 0; i < headGrpSize; i++)
+    {
+        // Range: [2, 5]
+        attentionSinks.get()[i] = 2.f + float(i % 4);
+    }
+
     if (verbose)
     {
         printf("migrating data to gpu\n");
@@ -563,6 +575,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #if BEAM_WIDTH > 1
         cacheIndir.prefetch(dev, stream);
 #endif
+        attentionSinks.prefetch(dev, stream);
     };
     prefetchToDevice(device);
     checkCuda(cudaMemsetAsync(semaphores.get(), 0, 4 * nbSemaphores, stream));
@@ -643,7 +656,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             &qHeads[0][0][0],
 #endif
 #endif
-            cacheHeads.get(),
+            attentionSinksPtr, cacheHeads.get(),
 #if USE_PAGED_KV_CACHE
             pageListArg,
 #endif
@@ -931,10 +944,13 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
                             hostMask, qSeqLen, q_len);
 #else
                     Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refOutput;
+                    auto const refAttentionSinks
+                        = hasAttentionSinks ? attentionSinksPtr + headGrpSize * idxKHead : nullptr;
                     if (useQGMMA)
                     {
                         refOutput = refFlashAttention<CacheElem, 64>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
-                            vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize);
+                            vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize,
+                            refAttentionSinks);
                         // refOutput = refAttention<CacheElem>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
                         // vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize);
                     }
@@ -942,8 +958,9 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
                     {
                         // refOutput = refFlashAttention<InputElem, 64>(&qHeads[req][b][headGrpSize * idxKHead],
                         // kCacheSeq, vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale);
-                        refOutput = refAttention<InputElem>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
-                            vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize);
+                        refOutput
+                            = refAttention<InputElem>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq, vCacheSeq,
+                                seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize, refAttentionSinks);
                     }
 #endif
                         if (lowPrecOutput)
@@ -1091,11 +1108,23 @@ TEST(RefCheck, llama_V2_70b)
     runTest<2>(2, 514, false, true);
     runTest<1>(1, 4096, false, true);
 #if SLIDING_WINDOW
-    runTest<2>(2, 4096, false, true, false, false, ~0, 256);
-    runTest<2>(2, 400, false, true, false, false, ~0U, 256);
+    runTest<2>(2, 4096, false, true, false, false, false, ~0, 256);
+    runTest<2>(2, 400, false, true, false, false, false, ~0U, 256);
 #endif
     runTest<8>(120, 367, false, true);
-    // runTest<8>(1792, 2048, false, true);
+    runTest<8>(1792, 2048, false, true);
+}
+
+TEST(RefCheck, attention_sinks)
+{
+    auto runAttentionSinksTest = [](uint32_t batchSize, uint32_t seqLen)
+    { runTest<2>(batchSize, seqLen, false, true, false, false, /*hasAttentionSinks*/ true); };
+
+    runAttentionSinksTest(2, 2);
+    runAttentionSinksTest(2, 15);
+    runAttentionSinksTest(2, 256);
+    runAttentionSinksTest(2, 514);
+    runAttentionSinksTest(1, 4096);
 }
 
 TEST(Perf, tracing_long)
@@ -1159,7 +1188,7 @@ TEST(Perf, mlperf_gptj)
 #ifndef NDEBUG
     GTEST_SKIP() << "Skipping perf tests for debug build";
 #endif
-    runTest<32>(396, 800 + 224, true, false, false, false, 800);
+    runTest<32>(396, 800 + 224, true, false, false, false, false, 800);
 }
 
 TEST(Perf, mlperf_llama)

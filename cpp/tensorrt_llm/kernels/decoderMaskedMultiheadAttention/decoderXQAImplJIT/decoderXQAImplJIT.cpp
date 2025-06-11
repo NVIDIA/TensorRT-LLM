@@ -410,6 +410,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         {
             appendParam(&launchParams.ropeCosSin);
         }
+        appendParam(&xqaParams.attention_sinks);
         appendParam(&launchParams.kvCacheParams);
         if (xqaParams.beam_width > 1)
         {
