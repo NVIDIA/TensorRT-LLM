@@ -854,8 +854,8 @@ class BaseLlmArgs(BaseModel):
         default=0, description="The maximum number of prompt adapter tokens.")
 
     # Quantization and calibration configurations
-    quant_config: Optional[QuantConfig] = Field(
-        default=None, description="Quantization config.")
+    quant_config: QuantConfig = Field(default_factory=QuantConfig,
+                                      description="Quantization config.")
 
     # Several options from ExecutorConfig, expanded here for less hierarchy
     kv_cache_config: KvCacheConfig = Field(default_factory=KvCacheConfig,
@@ -981,82 +981,6 @@ class BaseLlmArgs(BaseModel):
     def speculative_model_format(self) -> _ModelFormatKind:
         return self._speculative_model_format
 
-    @print_traceback_on_error
-    def model_post_init(self, __context: Any):
-        self._ensure_lora_config_consistency()
-
-        self.max_input_len = self.max_input_len or 1024
-        self.quant_config = self.quant_config or QuantConfig()
-
-        if self.skip_tokenizer_init:
-            self.tokenizer = None
-        else:
-            self.tokenizer = tokenizer_factory(
-                self.tokenizer,
-                trust_remote_code=self.trust_remote_code,
-                use_fast=self.tokenizer_mode != 'slow')
-
-        if torch.cuda.get_device_properties(0).major < 8:
-            if self.dtype == 'auto':
-                self.dtype = 'float16'
-            if self.dtype == 'bfloat16':
-                raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
-
-        if self.gpus_per_node is None:
-            logger.warning(
-                f"Using default gpus_per_node: {torch.cuda.device_count()}")
-            self.gpus_per_node = torch.cuda.device_count()
-        assert self.gpus_per_node is not None
-
-        if self.moe_cluster_parallel_size is None:
-            self.moe_cluster_parallel_size = -1
-
-        if self.moe_tensor_parallel_size is None:
-            self.moe_tensor_parallel_size = -1
-
-        if self.moe_expert_parallel_size is None:
-            self.moe_expert_parallel_size = -1
-
-        self._parallel_config = _ParallelConfig(
-            tp_size=self.tensor_parallel_size,
-            pp_size=self.pipeline_parallel_size,
-            cp_size=self.context_parallel_size,
-            gpus_per_node=self.gpus_per_node,
-            moe_cluster_size=self.moe_cluster_parallel_size,
-            moe_tp_size=self.moe_tensor_parallel_size,
-            moe_ep_size=self.moe_expert_parallel_size,
-            enable_attention_dp=self.enable_attention_dp,
-            cp_config=self.cp_config)
-
-        model_obj = _ModelWrapper(self.model)
-
-        if model_obj.is_local_model and self.backend not in [
-                'pytorch', '_autodeploy'
-        ]:
-            # Load parallel_config from the engine.
-            model_format = get_model_format(self.model)
-
-            if model_format is _ModelFormatKind.TLLM_ENGINE:
-                if self.build_config is not None:
-                    logger.warning(
-                        "The build_config is ignored for model format of TLLM_ENGINE."
-                    )
-                self._load_config_from_engine(model_obj.model_dir)
-                runtime_defaults = self._pretrained_config.runtime_defaults
-                if runtime_defaults:
-                    self.kv_cache_config.fill_empty_fields_from_runtime_defaults(
-                        runtime_defaults)
-
-            # Load parallel_config from the checkpoint.
-            elif model_format is _ModelFormatKind.TLLM_CKPT:
-                # We need to create a temporary instance to call _load_config_from_ckpt
-                self._load_config_from_ckpt(model_obj.model_dir)
-        else:
-            model_format = _ModelFormatKind.HF
-
-        # Store the model format in the values
-        self._model_format = model_format
-
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "BaseLlmArgs":
         """Create `LlmArgs` instance from kwargs.
@@ -1069,23 +993,29 @@ class BaseLlmArgs(BaseModel):
         """
         kwargs = BaseLlmArgs._check_consistency(dict(kwargs))
 
+        ret = cls(**kwargs)
+        return ret
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_build_config_consistency(cls, kwargs: dict, info):
         # TODO: remove this after PyT become default
         # to adapt PyT with build_config as input
         if kwargs.get("backend", None) == "pytorch":
-            if b := kwargs.get("build_config", None):
+            if build_config := kwargs.get("build_config", None):
                 for key in [
                         "max_batch_size", "max_num_tokens", "max_seq_len",
                         "max_input_len", "max_beam_width"
                 ]:
-                    if key in kwargs and getattr(b, key) is not None:
-                        if kwargs[key] is not None and kwargs[key] != getattr(
-                                b, key):
+                    if getattr(build_config, key) is not None:
+                        if (v := kwargs.get(key,
+                                            None)) is not None and v != getattr(
+                                                build_config, key):
                             logger.warning(
                                 f"overriding {key} from build_config")
-                        kwargs[key] = getattr(b, key)
+                        kwargs[key] = getattr(build_config, key)
 
-        ret = cls(**kwargs)
-        return ret
+        return kwargs
 
     def to_dict(self) -> dict:
         """Dump `LlmArgs` instance to a dict.
@@ -1113,6 +1043,25 @@ class BaseLlmArgs(BaseModel):
 
         return kwargs_dict
 
+    @field_validator("dtype")
+    @classmethod
+    def validate_dtype(cls, v, info):
+        if torch.cuda.get_device_properties(0).major < 8:
+            if v == 'auto':
+                v = 'float16'
+            if v == 'bfloat16':
+                raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
+        return v
+
+    @field_validator("gpus_per_node")
+    @classmethod
+    def validate_gpus_per_node(cls, v, info):
+        if v is None:
+            logger.warning(
+                f"Using default gpus_per_node: {torch.cuda.device_count()}")
+            v = torch.cuda.device_count()
+        return v
+
     @field_validator("model")
     @classmethod
     def validate_model(cls, v, info):
@@ -1120,7 +1069,26 @@ class BaseLlmArgs(BaseModel):
             raise ValueError(f"Invalid model: {v}")
         return v
 
-    def _setup_speculative_config(self):
+    @model_validator(mode="after")
+    def set_default_max_input_len(self):
+        if self.max_input_len is None:
+            self.max_input_len = 1024
+        return self
+
+    @model_validator(mode="after")
+    def validate_and_init_tokenizer(self):
+        """Initialize tokenizer based on configuration."""
+        if self.skip_tokenizer_init:
+            self.tokenizer = None
+        else:
+            self.tokenizer = tokenizer_factory(
+                self.tokenizer,
+                trust_remote_code=self.trust_remote_code,
+                use_fast=self.tokenizer_mode != 'slow')
+        return self
+
+    @model_validator(mode="after")
+    def validate_speculative_config(self):
         if self.speculative_config:
             if isinstance(self.speculative_config, LookaheadDecodingConfig):
                 lookahead_config = self.speculative_config
@@ -1207,7 +1175,10 @@ class BaseLlmArgs(BaseModel):
         if self._speculative_model and speculative_model_obj.is_local_model:
             self._speculative_model_format = _ModelFormatKind.HF
 
-    def _ensure_lora_config_consistency(self):
+        return self
+
+    @model_validator(mode="after")
+    def validate_lora_config_consistency(self):
         if self.lora_config:
             if self.max_lora_rank is not None:
                 logger.warning(
@@ -1243,36 +1214,90 @@ class BaseLlmArgs(BaseModel):
                 )
                 self.lora_config.lora_target_modules = list(
                     default_trtllm_modules_to_hf_modules.keys())
+        return self
 
     @model_validator(mode="after")
-    @classmethod
-    def validate_the_model(cls, v):
-        is_trt_llm_args = isinstance(v, TrtLlmArgs)
+    def validate_parallel_config(self):
+        if self.moe_cluster_parallel_size is None:
+            self.moe_cluster_parallel_size = -1
+
+        if self.moe_tensor_parallel_size is None:
+            self.moe_tensor_parallel_size = -1
+
+        if self.moe_expert_parallel_size is None:
+            self.moe_expert_parallel_size = -1
+
+        self._parallel_config = _ParallelConfig(
+            tp_size=self.tensor_parallel_size,
+            pp_size=self.pipeline_parallel_size,
+            cp_size=self.context_parallel_size,
+            gpus_per_node=self.gpus_per_node,
+            moe_cluster_size=self.moe_cluster_parallel_size,
+            moe_tp_size=self.moe_tensor_parallel_size,
+            moe_ep_size=self.moe_expert_parallel_size,
+            enable_attention_dp=self.enable_attention_dp,
+            cp_config=self.cp_config)
+        return self
+
+    @model_validator(mode="after")
+    def validate_build_config(self):
+        is_trt_llm_args = isinstance(self, TrtLlmArgs)
 
         # TODO: remove the checker when manage weights support all data types
-        if is_trt_llm_args and v.fast_build and (
-                v.quant_config.quant_algo is QuantAlgo.FP8
-                or v.quant_config.quant_algo is None):
-            v._update_plugin_config("manage_weights", True)
+        if is_trt_llm_args and self.fast_build and (self.quant_config.quant_algo
+                                                    is QuantAlgo.FP8):
+            self._update_plugin_config("manage_weights", True)
 
-        if v.parallel_config._world_size == 1 and v.build_config:
-            v.build_config.plugin_config.nccl_plugin = None
+        if self.parallel_config._world_size == 1 and self.build_config:
+            self.build_config.plugin_config.nccl_plugin = None
 
-        if v.enable_lora and v.lora_config is None and v.backend != 'pytorch':
-            v.build_config.plugin_config.lora_plugin = 'auto'
-            if v.max_lora_rank is not None:
-                v.build_config.lora_config.max_lora_rank = v.max_lora_rank
+        if self.enable_lora and self.lora_config is None and self.backend != 'pytorch':
+            self.build_config.plugin_config.lora_plugin = 'auto'
+            if self.max_lora_rank is not None:
+                self.build_config.lora_config.max_lora_rank = self.max_lora_rank
 
-        if v.enable_prompt_adapter:
-            v.build_config.max_prompt_embedding_table_size = v.max_prompt_adapter_token * v.build_config.max_batch_size
+        if self.enable_prompt_adapter:
+            self.build_config.max_prompt_embedding_table_size = self.max_prompt_adapter_token * self.build_config.max_batch_size
 
-        if v.max_beam_width is None:
-            if v.build_config:
-                v.max_beam_width = v.build_config.max_beam_width
+        if self.max_beam_width is None:
+            if self.build_config:
+                self.max_beam_width = self.build_config.max_beam_width
             else:
-                v.max_beam_width = 1
+                self.max_beam_width = 1
 
-        return v
+        return self
+
+    @model_validator(mode="after")
+    def validate_model_format_misc(self):
+        model_obj = _ModelWrapper(self.model)
+
+        if model_obj.is_local_model and self.backend not in [
+                'pytorch', '_autodeploy'
+        ]:
+            # Load parallel_config from the engine.
+            model_format = get_model_format(self.model)
+
+            if model_format is _ModelFormatKind.TLLM_ENGINE:
+                if self.build_config is not None:
+                    logger.warning(
+                        "The build_config is ignored for model format of TLLM_ENGINE."
+                    )
+                self._load_config_from_engine(model_obj.model_dir)
+                runtime_defaults = self._pretrained_config.runtime_defaults
+                if runtime_defaults:
+                    self.kv_cache_config.fill_empty_fields_from_runtime_defaults(
+                        runtime_defaults)
+
+            # Load parallel_config from the checkpoint.
+            elif model_format is _ModelFormatKind.TLLM_CKPT:
+                # We need to create a temporary instance to call _load_config_from_ckpt
+                self._load_config_from_ckpt(model_obj.model_dir)
+        else:
+            model_format = _ModelFormatKind.HF
+
+        # Store the model format in the values
+        self._model_format = model_format
+        return self
 
     def _update_plugin_config(self, key: str, value: Any):
         setattr(self.build_config.plugin_config, key, value)
@@ -1401,16 +1426,12 @@ class TrtLlmArgs(BaseLlmArgs):
     _convert_checkpoint_options: Dict[str,
                                       Any] = PrivateAttr(default_factory=dict)
 
-    # This state helps to manage the build_config initialization.
-    _build_config_init_method: Optional[Literal["from_kwargs", "from_engine",
-                                                "default"]] = PrivateAttr(
-                                                    default=None)
-
     @property
     def auto_parallel_config(self) -> AutoParallelConfig:
         return self._auto_parallel_config
 
-    def _setup_embedding_parallel_mode(self):
+    @model_validator(mode="after")
+    def setup_embedding_parallel_mode(self):
         if self.embedding_parallel_mode == 'NONE':
             self._convert_checkpoint_options['use_parallel_embedding'] = False
         elif self.embedding_parallel_mode == 'SHARDING_ALONG_VOCAB':
@@ -1420,11 +1441,10 @@ class TrtLlmArgs(BaseLlmArgs):
             self._convert_checkpoint_options['use_parallel_embedding'] = True
             self._convert_checkpoint_options['embedding_sharding_dim'] = 1
         # No else clause needed since validation already happened
+        return self
 
-    @print_traceback_on_error
-    def model_post_init(self, __context):
-        super().model_post_init(__context)
-
+    @model_validator(mode="after")
+    def validate_auto_parallel(self):
         self._auto_parallel_config = AutoParallelConfig(
             sharded_io_allowlist=[
                 "past_key_value_\\d+",
@@ -1441,42 +1461,28 @@ class TrtLlmArgs(BaseLlmArgs):
         if self.parallel_config.auto_parallel:
             self.parallel_config.world_size = self.auto_parallel_world_size
 
-        # Setup build config after model initialization
-        self._setup_build_config()
-        self._setup_enable_build_cache()
-        self._setup_speculative_config()
-        self._setup_embedding_parallel_mode()
+        return self
 
-    @field_validator("max_input_len")
-    @classmethod
-    def validate_max_input_len(cls, v, info):
-        values = info.data
-        if values.get("build_config") is not None and values[
-                "_build_config_init_method"] == "from_kwargs":
-            logger.warning(
-                f"max_input_len [{v}] is ignored because it's specified in build_config"
-            )
-        return v
-
-    def _setup_enable_build_cache(self):
+    @model_validator(mode="after")
+    def validate_enable_build_cache(self):
         if not self.enable_build_cache:
-            return
+            return self
         self.enable_build_cache = BuildCacheConfig() if isinstance(
             self.enable_build_cache, bool) else self.enable_build_cache
         if not isinstance(self.enable_build_cache, BuildCacheConfig):
             raise ValueError(
                 f"Invalid build_cache_config: {self.enable_build_cache}")
+        return self
 
-    def _setup_build_config(self):
+    @model_validator(mode="after")
+    def validate_build_config_knobs(self):
         """Setup the build configuration based on the provided parameters.
 
         This method handles:
         1. Creating a default BuildConfig if none is provided
         2. Validating that runtime parameters don't exceed build-time parameters
-        3. Setting the _build_config_init_method attribute
         """
         if self.build_config is None:
-            self._build_config_init_method = "default"
             kwargs = {}
             if self.max_batch_size:
                 kwargs["max_batch_size"] = self.max_batch_size
@@ -1489,8 +1495,6 @@ class TrtLlmArgs(BaseLlmArgs):
             if self.max_input_len:
                 kwargs["max_input_len"] = self.max_input_len
             self.build_config = BuildConfig(**kwargs)
-        else:
-            self._build_config_init_method = self._build_config_init_method or "from_kwargs"
 
         # Note: max_batch_size and max_num_tokens in LlmArgs are for runtime,
         # which will be passed to the C++ Executor API, overwriting the values
@@ -1521,6 +1525,8 @@ class TrtLlmArgs(BaseLlmArgs):
                 logger.warning(
                     f"max_input_len [{self.max_input_len}] is overridden by build_config.max_input_len [{self.build_config.max_input_len}] in build_config"
                 )
+
+        return self
 
 
 LlmArgs = TrtLlmArgs
@@ -1682,15 +1688,9 @@ class TorchLlmArgs(BaseLlmArgs):
     def extra_resource_managers(self, value: Dict[str, object]) -> None:
         self._extra_resource_managers = value
 
-    @print_traceback_on_error
-    def model_post_init(self, __context):
+    @model_validator(mode="after")
+    def validate_moe_load_balancer(self):
         from .._torch.model_config import MoeLoadBalancerConfig
-
-        super().model_post_init(__context)
-        self._model_format = _ModelFormatKind.HF
-
-        self._setup_speculative_config()
-
         if isinstance(self.moe_load_balancer, str):
             if not os.path.exists(self.moe_load_balancer):
                 raise FileNotFoundError(
@@ -1705,6 +1705,7 @@ class TorchLlmArgs(BaseLlmArgs):
                 raise ValueError(
                     f"Failed to load MoE load balancer config file: {self.moe_load_balancer}"
                 ) from e
+        return self
 
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
@@ -1753,38 +1754,6 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError("cuda_graph_max_batch_size must be non-negative")
         return v
 
-    @staticmethod
-    def _generate_cuda_graph_batch_sizes(max_batch_size: int,
-                                         padding_enabled: bool) -> List[int]:
-        """Generate a list of batch sizes for CUDA graphs.
-
-        Args:
-            max_batch_size: Maximum batch size to generate up to
-            padding_enabled: Whether padding is enabled, which affects the batch size distribution
-
-        Returns:
-            List of batch sizes to create CUDA graphs for
-        """
-        if padding_enabled:
-            batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
-        else:
-            batch_sizes = list(range(1, 32)) + [32, 64, 128]
-
-        # Add powers of 2 up to max_batch_size
-        batch_sizes += [
-            2**i for i in range(8, math.floor(math.log(max_batch_size, 2)))
-        ]
-
-        # Filter and sort batch sizes
-        batch_sizes = sorted(
-            [size for size in batch_sizes if size <= max_batch_size])
-
-        # Add max_batch_size if not already included
-        if max_batch_size != batch_sizes[-1]:
-            batch_sizes.append(max_batch_size)
-
-        return batch_sizes
-
     @model_validator(mode='after')
     def validate_cuda_graph_config(self) -> 'TorchLlmArgs':
         """Validate CUDA graph configuration.
@@ -1817,6 +1786,38 @@ class TorchLlmArgs(BaseLlmArgs):
             self.cuda_graph_max_batch_size = max_batch_size
 
         return self
+
+    @staticmethod
+    def _generate_cuda_graph_batch_sizes(max_batch_size: int,
+                                         padding_enabled: bool) -> List[int]:
+        """Generate a list of batch sizes for CUDA graphs.
+
+        Args:
+            max_batch_size: Maximum batch size to generate up to
+            padding_enabled: Whether padding is enabled, which affects the batch size distribution
+
+        Returns:
+            List of batch sizes to create CUDA graphs for
+        """
+        if padding_enabled:
+            batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
+        else:
+            batch_sizes = list(range(1, 32)) + [32, 64, 128]
+
+        # Add powers of 2 up to max_batch_size
+        batch_sizes += [
+            2**i for i in range(8, math.floor(math.log(max_batch_size, 2)))
+        ]
+
+        # Filter and sort batch sizes
+        batch_sizes = sorted(
+            [size for size in batch_sizes if size <= max_batch_size])
+
+        # Add max_batch_size if not already included
+        if max_batch_size != batch_sizes[-1]:
+            batch_sizes.append(max_batch_size)
+
+        return batch_sizes
 
 
 class _AutoDeployLlmArgs(TorchLlmArgs):
