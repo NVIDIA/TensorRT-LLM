@@ -22,31 +22,46 @@ from argparse import Namespace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Optional
-from tensorrt_llm.models import PretrainedConfig
 
 import safetensors
 import torch
 from transformers.models.auto import AutoModel
-from transformers.models.auto.configuration_auto import AutoConfig
 
 import tensorrt_llm.models.modeling_utils
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.llama.convert import (dup_kv_weight,
-                                               get_tllm_linear_weight,
-                                               get_weight, get_weight_and_bias,
+from tensorrt_llm.models import PretrainedConfig
+from tensorrt_llm.models.llama.convert import (get_weight, get_weight_and_bias,
                                                split)
 
 BASE_MODEL_TLLM_WEIGHT_PREFIX = "base_model."
 DRAFTER_TLLM_WEIGHT_PREFIX = "drafter."
 
-# Add new models here as needed
-REDRAFTER_MAP = {"QWenForCausalLM": "ReDrafterForQWenLM",
-                 "LLaMAForCausalLM": "ReDrafterForLLaMALM"}
+# To add support for a new base model in ReDrafter:
+# 1. Add the base model's tensorrt_llm class name mapping in `REDRAFTER_MAP` below
+# 2. Create a new ReDrafter class in `tensorrt_llm/redrafter/models.py` by inheriting from `ReDrafterMixin`
+# 3. Add the new ReDrafter class to the model registry in `tensorrt_llm/models/__init__.py`
+#
+# Example:
+# REDRAFTER_MAP = {
+#     "QWenForCausalLM": "ReDrafterForQWenLM",
+#     "Qwen2ForCausalLM": "ReDrafterForQWenLM",
+#     "LlamaForCausalLM": "ReDrafterForLLaMALM"
+# }
+
+REDRAFTER_MAP = {
+    "QWenForCausalLM": "ReDrafterForQWenLM",
+    "Qwen2ForCausalLM": "ReDrafterForQWenLM",
+    "LlamaForCausalLM": "ReDrafterForLLaMALM"
+}
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dir", type=str, default=None, required=True)
+    parser.add_argument("--base_model_checkpoint_dir",
+                        type=str,
+                        default=None,
+                        required=True)
     parser.add_argument("--drafter_model_dir",
                         type=str,
                         default=None,
@@ -242,6 +257,7 @@ def hf_drafter(
 
     return weights
 
+
 def hf_redrafter_config(
     tllm_base_model_config: tensorrt_llm.models.modeling_utils.PretrainedConfig,
     drafter_config: Namespace,  # DrafterConfig
@@ -268,20 +284,23 @@ def hf_redrafter_config(
     setattr(tllm_config, "redrafter_greedy_search", redrafter_greedy_search)
 
     # Exclude the redrafter weights from any quantisation
-    if hasattr(tllm_config, "quantization") and tllm_config.quantization is not None:
+    if hasattr(tllm_config,
+               "quantization") and tllm_config.quantization is not None:
         # If quantization is an object/namespace, handle it accordingly
-        if hasattr(tllm_config.quantization, "exclude_modules"):
-            redrafter_exclude_modules = ['drafter', 'drafter.layers', 'drafter.lm_head']
+        if getattr(tllm_config.quantization, "exclude_modules",
+                   None) is not None:
+            redrafter_exclude_modules = [
+                'drafter', 'drafter.layers', 'drafter.lm_head'
+            ]
             num_redrafter_layers = tllm_config.redrafter_num_layers
             if tllm_config.redrafter_is_rnn:
                 redrafter_exclude_modules += ['drafter.rnn_u', 'drafter.rnn_w']
             for lyrnum in range(num_redrafter_layers):
-                redrafter_exclude_modules += [f'drafter.layers.{lyrnum}', f'drafter.layers.{lyrnum}.linear']
+                redrafter_exclude_modules += [
+                    f'drafter.layers.{lyrnum}',
+                    f'drafter.layers.{lyrnum}.linear'
+                ]
             tllm_config.quantization.exclude_modules += redrafter_exclude_modules
-
-    # Align type to drafter type for gemm plugin
-    if tllm_config.dtype == 'bfloat16':
-        tllm_config.dtype = 'float16'
 
     return tllm_config
 
@@ -289,7 +308,7 @@ def hf_redrafter_config(
 def convert_and_save(
     rank: int,
     tp_size: int,
-    hf_base_model_dir: str,
+    base_model_checkpoint_dir: str,
     hf_drafter_model: Optional[AutoModel],
     dtype: str,
     use_parallel_embedding: bool,
@@ -303,27 +322,11 @@ def convert_and_save(
         tp_size=tp_size,
     )
 
-    # Load model configuration
-    config_path = os.path.join(hf_base_model_dir, 'config.json')
-    stade_dict_path = os.path.join(hf_base_model_dir, f'rank{rank}.safetensors')
-
-    model_config = PretrainedConfig.from_json_file(config_path)
-    model_config = copy.deepcopy(model_config)
-
-    # Prepare rank-specific configuration
-    rank_config = copy.deepcopy(model_config)
-    rank_config.set_rank(rank)
-
     # Load and prepare weights
+    stade_dict_path = os.path.join(base_model_checkpoint_dir,
+                                   f'rank{rank}.safetensors')
     weights_safe = safetensors.safe_open(stade_dict_path, framework="pt")
     weights = {k: weights_safe.get_tensor(k) for k in weights_safe.keys()}
-
-    # Convert bfloat16 tensors to float16
-    # TODO: Support ReDrafter for bfloat16.
-    weights = {
-        k: v.to(torch.float16) if v.dtype == torch.bfloat16 else v
-        for k, v in weights.items()
-    }
 
     if hf_drafter_model is not None:
         drafter_weights = hf_drafter(
@@ -342,7 +345,7 @@ def convert_and_save(
 def multi_worker_convert_and_save(
     workers: int,
     tp_size: int,
-    hf_base_model_dir: str,
+    base_model_checkpoint_dir: str,
     hf_drafter_model: Optional[AutoModel],
     dtype: str,
     use_parallel_embedding: bool,
@@ -355,7 +358,7 @@ def multi_worker_convert_and_save(
                 convert_and_save,
                 rank,
                 tp_size,
-                hf_base_model_dir,
+                base_model_checkpoint_dir,
                 hf_drafter_model,
                 dtype,
                 use_parallel_embedding,
@@ -382,8 +385,8 @@ def create_and_save_config(args):
         pp_size=1,
     )
 
-    hf_base_model_dir = args.model_dir
-    config_path = os.path.join(hf_base_model_dir, 'config.json')
+    base_checkpoint_dir = args.base_model_checkpoint_dir
+    config_path = os.path.join(base_checkpoint_dir, 'config.json')
     model_config = PretrainedConfig.from_json_file(config_path)
     tllm_model_config = copy.deepcopy(model_config)
 
@@ -405,14 +408,13 @@ def create_and_save_config(args):
     return drafter_hf_config
 
 
-
 def main():
     args = parse_arguments()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
     drafter_hf_config = create_and_save_config(args)
-    hf_base_model_dir = args.model_dir
+    base_checkpoint_dir = args.base_model_checkpoint_dir
 
     hf_drafter_model: Optional[AutoModel] = None
     if args.drafter_model_dir:
@@ -442,13 +444,14 @@ def main():
     multi_worker_convert_and_save(
         args.workers,
         args.tp_size,
-        hf_base_model_dir,
+        base_checkpoint_dir,
         hf_drafter_model,
         args.dtype,
         args.use_parallel_embedding,
         args.embedding_sharding_dim,
         args.output_dir,
     )
+
 
 if __name__ == "__main__":
     main()
