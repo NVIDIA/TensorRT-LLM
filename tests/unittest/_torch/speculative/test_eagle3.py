@@ -13,7 +13,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
 
 
-@pytest.mark.skip(reason="https://nvbugs/5280806")
 @pytest.mark.parametrize("use_cuda_graph,attn_backend",
                          [[True, "TRTLLM"], [False, "TRTLLM"],
                           [True, "FLASHINFER"], [False, "FLASHINFER"]])
