@@ -362,7 +362,7 @@ class TorchSampler(Sampler):
         for request in requests:
             steps = 1
             if len(request.py_draft_tokens) > 0:
-                assert not self.mixed_sampler, "Speculative decoding not supported in mixed sampler"  # TODO: why?
+                assert not self.mixed_sampler, "Speculative decoding not supported in mixed sampler"
                 steps += len(request.py_draft_tokens)
             logits = raw_logits[offset:offset + steps]
 
