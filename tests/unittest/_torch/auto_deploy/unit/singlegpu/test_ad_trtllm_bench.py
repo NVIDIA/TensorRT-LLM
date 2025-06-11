@@ -2,7 +2,6 @@ import subprocess
 import tempfile
 import warnings
 
-import pytest
 import yaml
 from _model_test_utils import hf_model_dir_or_hub_id
 from click.testing import CliRunner
@@ -51,12 +50,11 @@ def test_trtllm_bench():
                 {"model_kwargs": {"num_hidden_layers": 2}, "cuda_graph_batch_sizes": [1, 2]}, f
             )
 
-        with pytest.warns(UserWarning, match="Failed to prepare dataset"):
-            try:
-                dataset_path = prepare_dataset(temp_dir, model_name)
-            except Exception as e:
-                warnings.warn(f"Failed to prepare dataset: {e}", UserWarning)
-                return
+        try:
+            dataset_path = prepare_dataset(temp_dir, model_name)
+        except Exception as e:
+            warnings.warn(f"Failed to prepare dataset: {e}")
+            return
 
         runner = CliRunner()
         result = runner.invoke(
