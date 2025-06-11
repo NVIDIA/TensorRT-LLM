@@ -5,6 +5,7 @@ import torch
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel, Qwen2_5_VLForConditionalGeneration,
                           Qwen2VLForConditionalGeneration)
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
 from ...functional import RopeEmbeddingUtils, RotaryScalingType
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
@@ -20,12 +21,18 @@ from .modeling_utils import register_auto_model
 
 class Qwen2VLInputProcessorBase(InputProcessor):
 
-    def __init__(self, model_path: str, model_config: PretrainedConfig,
-                 tokenizer: AutoTokenizer):
+    def __init__(self,
+                 model_path: str,
+                 model_config: PretrainedConfig,
+                 tokenizer: AutoTokenizer,
+                 trust_remote_code: bool = True):
         self.model_config = model_config
         self.tokenizer = tokenizer
-        self.processor = AutoProcessor.from_pretrained(model_path,
-                                                       use_fast=False)
+        self.use_fast = False
+        self.processor = AutoProcessor.from_pretrained(
+            model_path,
+            use_fast=self.use_fast,
+            trust_remote_code=trust_remote_code)
 
         # NOTE: Using attn_implementation='flash_attention_2' to avoid the issue of vision model's GPU OOM.
         model = self.get_model_class().from_pretrained(
@@ -228,12 +235,52 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         self.cos_ori = self.rotary_cos_sin[:, :, 0]
         self.sin_ori = self.rotary_cos_sin[:, :, 1]
 
+    def get_num_tokens_per_image(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+        num_frames: int = 1,
+        do_resize: bool = True,
+    ):
+        patch_size = self.model_config.vision_config.patch_size
+        merge_size = self.model_config.vision_config.spatial_merge_size
+        temporal_patch_size = self.model_config.vision_config.temporal_patch_size
+        if do_resize:
+            resized_height, resized_width = smart_resize(
+                height=image_height,
+                width=image_width,
+                factor=patch_size * merge_size,
+                min_pixels=self.processor.image_processor.min_pixels,
+                max_pixels=self.processor.image_processor.max_pixels,
+            )
+            image_width, image_height = resized_width, resized_height
+
+        padded_num_frames = num_frames + num_frames % temporal_patch_size
+
+        grid_t = max(padded_num_frames // temporal_patch_size, 1)
+        grid_h = image_height // patch_size
+        grid_w = image_width // patch_size
+
+        num_patches = grid_t * grid_h * grid_w
+        num_vision_tokens = num_patches // (merge_size**2)
+
+        return num_vision_tokens
+
     def _preprocess(self, text: dict[str, any], mm_data: dict[str, any],
                     mm_processor_kwargs: Dict[str, Any]):
+        images = mm_data.get("image")
+        videos = mm_data.get("video")
+        do_rescale = True
+        if images and isinstance(images[0], torch.Tensor):
+            do_rescale = False
+        if videos and isinstance(videos[0][0], torch.Tensor):
+            do_rescale = False
         return self.processor(text=[text],
-                              images=mm_data.get("image", None),
-                              videos=mm_data.get("video", None),
+                              images=images,
+                              videos=videos,
                               padding=True,
+                              do_rescale=do_rescale,
                               return_tensors='pt',
                               **mm_processor_kwargs)
 
@@ -301,8 +348,8 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         concat_cos_sin = torch.concatenate((cos, sin), axis=-1)
         concat_cos_sin = concat_cos_sin.reshape(concat_cos_sin.shape[0], -1)
         mrope_config = {}
-        mrope_config['mrope_rotary_cos_sin'] = concat_cos_sin
-        mrope_config['mrope_position_deltas'] = mrope_position_deltas
+        mrope_config['mrope_rotary_cos_sin'] = concat_cos_sin.to('cpu')
+        mrope_config['mrope_position_deltas'] = mrope_position_deltas.to('cpu')
         return mrope_config
 
     @torch.inference_mode()
@@ -314,8 +361,6 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
                         inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
 
-        # NOTE: Since we are passed in Tensor images, we don't need to rescale them.
-        mm_processor_kwargs['do_rescale'] = False
         processed_inputs = self._preprocess(text_prompt, mm_data,
                                             mm_processor_kwargs).to(self.device)
         if mm_data:
