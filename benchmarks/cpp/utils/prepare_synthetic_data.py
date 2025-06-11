@@ -1,4 +1,5 @@
 import random
+import warnings
 
 import click
 from utils.utils import (gen_random_tokens, get_norm_dist_lengths,
@@ -14,12 +15,20 @@ def _generate_task_ids_and_lora_config(root_args, num_reqs):
         min_id, max_id = root_args.rand_task_id
         task_ids = [random.randint(min_id, max_id) for _ in range(num_reqs)]
 
-    # Determine if task IDs and LoRA config should be used
-    use_task_config = root_args.task_id != -1 or root_args.rand_task_id is not None
+    use_task_ids = root_args.task_id != -1 or root_args.rand_task_id is not None
 
-    return (task_ids, task_ids if use_task_config else None, {
+    # Determine if LoRA should be used (requires both task IDs and lora_dir)
+    use_lora = use_task_ids and root_args.lora_dir is not None
+
+    # Warn if task IDs are specified but no LoRA directory is provided
+    if use_task_ids and not use_lora:
+        warnings.warn(
+            "Task IDs require LoRA directory. Use --lora-dir or omit task IDs.",
+            UserWarning)
+
+    return (task_ids, task_ids if use_task_ids else None, {
         "lora_dir": root_args.lora_dir
-    } if use_task_config else None)
+    } if use_lora else None)
 
 
 @click.command()
