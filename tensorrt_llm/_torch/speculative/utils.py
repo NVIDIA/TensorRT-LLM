@@ -1,3 +1,4 @@
+from .draft_target import DraftTargetSpecMetadata
 from .eagle3 import (Eagle3OneModelDecoder, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3Sampler, Eagle3SpecMetadata)
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
@@ -30,6 +31,11 @@ def get_spec_metadata(spec_config,
             num_layers=spec_config.num_layers,
             hidden_size=spec_config.hidden_size,
             max_num_tokens=max_num_tokens)
+    elif spec_config.spec_dec_mode.is_draft_target():
+        return DraftTargetSpecMetadata(
+            max_draft_tokens=spec_config.max_draft_tokens,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests)
     else:
         return None
 
