@@ -15,8 +15,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
-from ..model_config import ModelConfig
-
 _thread_local = threading.local()
 
 
@@ -311,16 +309,16 @@ class MNNVLAllReduce(nn.Module):
         self.mapping = mapping
         self.dtype = dtype
         assert (
-            dtype in MNNVLAllReduce.get_supported_dtype()
+            dtype in MNNVLAllReduce.get_supported_dtypes()
             and (not mapping.has_cp())
-        ), "MNNVL all reduce only support dtype {MNNVLAllReduce.get_supported_dtype()} and without cp."
+        ), "MNNVL all reduce only supports dtype {MNNVLAllReduce.get_supported_dtypes()} and without cp."
 
         self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
             self.mapping, dtype)
 
     @staticmethod
-    def get_supported_dtype():
-        return [torch.bfloat16, torch.float32]
+    def get_supported_dtypes():
+        return (torch.bfloat16, torch.float32)
 
     def forward(
         self,
@@ -377,38 +375,38 @@ class MNNVLAllReduce(nn.Module):
 class AllReduce(nn.Module):
 
     def __init__(self,
-                 dtype: Optional[torch.dtype] = None,
-                 model_config: ModelConfig = ModelConfig()):
+                 mapping: Mapping,
+                 strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+                 dtype: Optional[torch.dtype] = None):
         super().__init__()
         """
         AllReduce is a module that performs an all-reduce operation on a tensor.
 
         Args:
-            model_config (ModelConfig): mapping and strategy in it are used.
-                mapping (Mapping):  The parallel mapping config.
-                strategy (AllReduceStrategy):
-                    The following all-reduce strategies are supported:
+            mapping (Mapping):  The parallel mapping config.
+            strategy (AllReduceStrategy):
+                The following all-reduce strategies are supported:
 
-                    - UB: AllReduce uses user-buffer based all-reduce kernel.
+                - UB: AllReduce uses user-buffer based all-reduce kernel.
 
-                    - NCCL: Use NCCL allreduce.
+                - NCCL: Use NCCL allreduce.
 
-                    - MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel.
+                - MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel.
 
-                    - AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
+                - AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
 
-                    - LOWPRECISION: AllReduce quantizes data to lower precision for transmission.
-                    Should only be used on topologies with PCIe switches and without NVLink.
-                    This strategy may result in some precision loss but can improve performance
-                    on specific hardware configurations.
+                - LOWPRECISION: AllReduce quantizes data to lower precision for transmission.
+                  Should only be used on topologies with PCIe switches and without NVLink.
+                  This strategy may result in some precision loss but can improve performance
+                  on specific hardware configurations.
 
-                All strategies support the following operations:
-                    - NONE (AllReduce only)
-                    - RESIDUAL_RMS_NORM
-                    - RESIDUAL_RMS_NORM_QUANT_FP8
-                    - RESIDUAL_RMS_NORM_QUANT_NVFP4
-                    - RESIDUAL_RMS_NORM_OUT_QUANT_FP8
-                    - RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
+            All strategies support the following operations:
+                - NONE (AllReduce only)
+                - RESIDUAL_RMS_NORM
+                - RESIDUAL_RMS_NORM_QUANT_FP8
+                - RESIDUAL_RMS_NORM_QUANT_NVFP4
+                - RESIDUAL_RMS_NORM_OUT_QUANT_FP8
+                - RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
 
             Note: NCCL, UB, and LOWPRECISION strategies only support consequent kernel calls
         instead of fused operations.
@@ -417,18 +415,14 @@ class AllReduce(nn.Module):
             For the reference implementation for each pattern, please refer to the following unit test:
             https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/multi_gpu/test_allreduce.py
 
-            The LOWPRECISION strategy can be selected either by directly specifying it in the constructor
-            or by setting the environment variable FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY when using
-            the AUTO strategy.
+            The LOWPRECISION strategy can be selected either by directly specifying it in the constructor.
         """
 
-        self.mapping = model_config.mapping
+        self.mapping = mapping
         self.workspace = None
-        self.strategy = model_config.allreduce_backend
+        self.strategy = strategy
         self.mnnvl_allreduce = None
 
-        self.force_low_precision_env = os.environ.get(
-            "FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY")
         if self.mapping.tp_size > 1:
             # When Strategy is UB, it is guaranteed that the workspace is not used.
             if self.strategy != AllReduceStrategy.UB:
@@ -438,7 +432,7 @@ class AllReduce(nn.Module):
 
             # Initialize MNNVL AllReduce if needed
             if self.strategy == AllReduceStrategy.MNNVL and (
-                    dtype and dtype in MNNVLAllReduce.get_supported_dtype()
+                    dtype and dtype in MNNVLAllReduce.get_supported_dtypes()
             ) and (not self.mapping.has_cp()):
                 self.mnnvl_allreduce = MNNVLAllReduce(self.mapping,
                                                       dtype) if dtype else None

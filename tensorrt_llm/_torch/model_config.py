@@ -109,12 +109,12 @@ class ModelConfig(Generic[TConfig]):
             self.is_generation = self.is_generation_model(
                 self.pretrained_config.architectures)
 
-        def map_ar_strategy(strategy: str = "AUTO"):
+        def get_all_reduce_strategy(strategy: str = "AUTO"):
             maps = {
                 "AUTO": AllReduceStrategy.AUTO,
                 "NCCL": AllReduceStrategy.NCCL,
                 "UB": AllReduceStrategy.UB,
-                "MIN_LATENCY": AllReduceStrategy.MIN_LATENCY,
+                "MINLATENCY": AllReduceStrategy.MIN_LATENCY,
                 "ONESHOT": AllReduceStrategy.ONESHOT,
                 "TWOSHOT": AllReduceStrategy.TWOSHOT,
                 "LOWPRECISION": AllReduceStrategy.LOWPRECISION,
@@ -124,7 +124,8 @@ class ModelConfig(Generic[TConfig]):
             return maps[key] if key in maps else AllReduceStrategy.AUTO
 
         if isinstance(self.allreduce_backend, str):
-            self.allreduce_backend = map_ar_strategy(self.allreduce_backend)
+            self.allreduce_backend = get_all_reduce_strategy(
+                self.allreduce_backend)
 
     @property
     def fuse_pos_embd(self):

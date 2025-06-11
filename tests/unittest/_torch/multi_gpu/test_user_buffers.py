@@ -17,7 +17,6 @@ from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, AllReduceStrategy,
                                              userbuffers_allreduce_finalize)
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.mapping import Mapping
@@ -129,8 +128,7 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
             tp_size=tensor_parallel_size,
             rank=rank,
         )
-        ar = AllReduce(model_config=ModelConfig(
-            mapping=mapping, allreduce_backend=AllReduceStrategy.UB))
+        ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -222,8 +220,7 @@ def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
             tp_size=tensor_parallel_size,
             rank=rank,
         )
-        ar = AllReduce(model_config=ModelConfig(
-            mapping=mapping, allreduce_backend=AllReduceStrategy.UB))
+        ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
@@ -608,8 +605,7 @@ def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
             tp_size=tensor_parallel_size,
             rank=rank,
         )
-        ar = AllReduce(model_config=ModelConfig(
-            mapping=mapping, allreduce_backend=AllReduceStrategy.UB))
+        ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
@@ -696,9 +692,9 @@ class UBMMAddModel(nn.Module):
             tp_size=tp_size,
             rank=rank,
         )
-        self.ar_0 = AllReduce(model_config=ModelConfig(mapping=mapping)).cuda()
-        self.ar_1 = AllReduce(model_config=ModelConfig(mapping=mapping)).cuda()
-        self.ar_2 = AllReduce(model_config=ModelConfig(mapping=mapping)).cuda()
+        self.ar_0 = AllReduce(mapping=mapping).cuda()
+        self.ar_1 = AllReduce(mapping=mapping).cuda()
+        self.ar_2 = AllReduce(mapping=mapping).cuda()
         self.norm0 = RMSNorm(hidden_size=hidden_size, eps=eps,
                              dtype=dtype).cuda()
         self.norm1 = RMSNorm(hidden_size=hidden_size, eps=eps,
