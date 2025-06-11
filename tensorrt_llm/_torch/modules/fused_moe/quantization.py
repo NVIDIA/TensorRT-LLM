@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List, NamedTuple, Union
+from typing import Dict, List, NamedTuple, Optional, Union
 
 import torch
 from torch import nn
@@ -87,12 +87,26 @@ class FusedMoEMethodBase(ABC):
                                  requires_grad=False)
         module.register_parameter("w2_weight", w2_weight)
 
-    def load_expert_weights_to_dst(self, module: torch.nn.Module,
-                                   weights: List[Dict],
-                                   weight_loading_mode: MoEWeightLoadingMode,
-                                   load_expert_ids: List[int],
-                                   dst_w3_w1_weights_tensor: torch.Tensor,
-                                   dst_w2_weights_tensor: torch.Tensor):
+        # bias
+        if module.bias:
+            w3_w1_bias = nn.Parameter(torch.empty(
+                (w3_w1_weight_shape[0], w3_w1_weight_shape[1]),
+                dtype=module.dtype),
+                                      requires_grad=False)
+            module.register_parameter("w3_w1_bias", w3_w1_bias)
+
+            w2_bias = nn.Parameter(torch.empty(
+                (w2_weight_shape[0], w2_weight_shape[1]), dtype=module.dtype),
+                                   requires_grad=False)
+            module.register_parameter("w2_bias", w2_bias)
+
+    def load_expert_weights_to_dst(
+            self, module: torch.nn.Module, weights: List[Dict],
+            weight_loading_mode: MoEWeightLoadingMode,
+            load_expert_ids: List[int], dst_w3_w1_weights_tensor: torch.Tensor,
+            dst_w2_weights_tensor: torch.Tensor,
+            dst_w3_w1_bias_tensor: Optional[torch.Tensor],
+            dst_w2_bias_tensor: Optional[torch.Tensor]):
         # Multithread weight load is superseded by prefetch_files() in model_engine.py
         # Also, threading adds overhead in order to protect shuffle index cache with critical section.
         for local_slot_id, expert_id in enumerate(load_expert_ids):
@@ -103,12 +117,20 @@ class FusedMoEMethodBase(ABC):
                 w1_weight = weights[f"{expert_id}.w1.weight"]
                 w3_weight = weights[f"{expert_id}.w3.weight"]
                 w2_weight = weights[f"{expert_id}.w2.weight"]
+                if module.bias:
+                    w1_bias = weights[f"{expert_id}.w1.bias"]
+                    w3_bias = weights[f"{expert_id}.w3.bias"]
+                    w2_bias = weights[f"{expert_id}.w2.bias"]
             elif weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
                 w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
                     0, 1)
                 w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
                 w2_weight = weights["down_proj"][expert_id].transpose(
                     0, 1).contiguous()
+                if module.bias:
+                    w1_w3_bias = weights["gate_up_proj.bias"][expert_id]
+                    w1_bias, w3_bias = w1_w3_bias.chunk(2, dim=0)
+                    w2_bias = weights["down_proj.bias"][expert_id]
             else:
                 raise NotImplementedError(
                     f"Unknown weight loading mode in MoE: {weight_loading_mode}"
@@ -120,13 +142,23 @@ class FusedMoEMethodBase(ABC):
             self.load_expert_w2_weight(module, w2_weight,
                                        dst_w2_weights_tensor[expert_idx])
 
+            if module.bias:
+                self.load_expert_w3_w1_weight(
+                    module, w1_bias, w3_bias,
+                    dst_w3_w1_bias_tensor.data[expert_idx])
+
+                self.load_expert_w2_weight(module, w2_bias,
+                                           dst_w2_bias_tensor.data[expert_idx])
+
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode):
 
-        self.load_expert_weights_to_dst(module, weights, weight_loading_mode,
-                                        module.initial_local_expert_ids,
-                                        module.w3_w1_weight.data,
-                                        module.w2_weight.data)
+        self.load_expert_weights_to_dst(
+            module, weights, weight_loading_mode,
+            module.initial_local_expert_ids, module.w3_w1_weight.data,
+            module.w2_weight.data,
+            module.w3_w1_bias.data if module.bias else None,
+            module.w2_bias.data if module.bias else None)
 
         self.load_quant_scales(module, weights)
         # Re-setup quant scales after loading weights as the tensors may have been modified.
@@ -145,17 +177,33 @@ class FusedMoEMethodBase(ABC):
                 module.w2_weight.data.shape[1:],
                 dtype=module.w2_weight.data.dtype,
                 device='cpu')
-            self.load_expert_weights_to_dst(module, weights,
-                                            weight_loading_mode,
-                                            local_shared_load_expert_ids,
-                                            local_shared_w3_w1_tensors,
-                                            local_shared_w2_tensors)
-            module.register_all_parameter_slot_and_to_fix_weight_fns({
-                'w3_w1_weight':
-                local_shared_w3_w1_tensors,
-                'w2_weight':
-                local_shared_w2_tensors
-            })
+            if module.bias:
+                local_shared_w3_w1_bias_tensors = torch.empty(
+                    (len(local_shared_load_expert_ids), ) +
+                    module.w3_w1_bias.data.shape[1:],
+                    dtype=module.w3_w1_bias.data.dtype,
+                    device='cpu')
+                local_shared_w2_bias_tensors = torch.empty(
+                    (len(local_shared_load_expert_ids), ) +
+                    module.w2_bias.data.shape[1:],
+                    dtype=module.w2_bias.data.dtype,
+                    device='cpu')
+            self.load_expert_weights_to_dst(
+                module, weights, weight_loading_mode,
+                local_shared_load_expert_ids, local_shared_w3_w1_tensors,
+                local_shared_w2_tensors,
+                local_shared_w3_w1_bias_tensors if module.bias else None,
+                local_shared_w2_bias_tensors if module.bias else None)
+            weight_fns = {
+                'w3_w1_weight': local_shared_w3_w1_tensors,
+                'w2_weight': local_shared_w2_tensors
+            }
+            if module.bias:
+                weight_fns.update({
+                    'w3_w1_bias': local_shared_w3_w1_bias_tensors,
+                    'w2_bias': local_shared_w2_bias_tensors
+                })
+            module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
             module.layer_load_balancer.host_tensor_sharer.finalize_layer_weights(
             )
 

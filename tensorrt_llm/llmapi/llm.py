@@ -9,6 +9,7 @@ import weakref
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Sequence, Union
 
+import tiktoken
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
@@ -949,6 +950,12 @@ class _TorchLLM(BaseLLM):
         # Tokenizer loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
+
+        # TODO: Properly load tokenizer.
+        if self.tokenizer is None:
+            self.tokenizer = tiktoken.get_encoding("o200k_base")
+            self.tokenizer.eos_token_id = self.tokenizer.eot_token
+            self.tokenizer.pad_token_id = self.tokenizer.eot_token
 
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
