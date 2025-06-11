@@ -431,3 +431,8 @@ examples/test_qwen.py::test_llm_qwen_smooth_quant_single_gpu_summary[qwen2_vl_7b
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-fp8-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5419070)
 examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity] SKIP (https://nvbugs/5421989)
 examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:1-pp:1-float16-RobertaForSequenceClassification-bert/twitter-roberta-base-emotion] SKIP (https://nvbugs/5421989)
+unittest/_torch/auto_deploy/unit/singlegpu SKIP (Not supported by new Triton)
+unittest/_torch/auto_deploy/unit/multigpu SKIP (Not supported by new Triton)
+unittest/_torch/multi_gpu SKIP (Not supported by new Triton. This has several torch.compile cases as well.)
+unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3[False-TRTLLM-False-True-True] SKIP (doesn't work with triton 3.4.0)
+unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3[True-TRTLLM-False-True-True] SKIP (doesn't work with triton 3.4.0)

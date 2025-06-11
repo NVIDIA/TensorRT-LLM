@@ -92,6 +92,9 @@ class ModelConfig(Generic[TConfig]):
 
     force_dynamic_quantization: bool = False
 
+    # If true, use torch.compile for embedding layers.
+    enable_torch_compile_for_embedding = False
+
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
     _frozen: bool = field(default=False, init=False, repr=False)

@@ -160,6 +160,8 @@ class MixtralModel(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
+            enable_torch_compile_for_embedding=model_config.
+            enable_torch_compile_for_embedding,
         )
 
         self.layers = nn.ModuleList([

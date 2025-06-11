@@ -87,6 +87,9 @@ RUN pip3 install --upgrade --no-cache-dir \
     "protobuf>=4.25.8" \
     "jupyter-core>=5.8.1"
 
+# Install Triton
+RUN python3 -m pip install -i https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple triton==3.4.0
+
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
 FROM devel AS tritondevel
