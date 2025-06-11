@@ -53,8 +53,10 @@ public:
 
     virtual ~IGptDecoder() = default;
 
+    /// @param explicitDraftTokensDType is only used by ExplicitDraftTokens model to WAR the lack of bf16 decoder.
     virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
         std::optional<DecodingOutput> const& output = std::nullopt,
+        std::optional<nvinfer1::DataType> explicitDraftTokensDType = std::nullopt,
         std::optional<std::vector<decoder_batch::Request> const> const& requests = std::nullopt)
         = 0;
 
@@ -88,6 +90,7 @@ public:
 
     void setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
         std::optional<DecodingOutput> const& output = std::nullopt,
+        std::optional<nvinfer1::DataType> explicitDraftTokensDType = std::nullopt,
         std::optional<std::vector<decoder_batch::Request> const> const& requests = std::nullopt) override;
 
     void forwardAsync(DecodingOutput& output, DecodingInput const& input) override;

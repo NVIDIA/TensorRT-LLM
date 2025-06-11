@@ -122,7 +122,7 @@ void GptDecoder<T>::disableLookahead(
 
 template <typename T>
 void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
-    std::optional<DecodingOutput> const& output,
+    std::optional<DecodingOutput> const& output, std::optional<nvinfer1::DataType> explicitDraftTokensDType,
     std::optional<std::vector<decoder_batch::Request> const> const& requestsOpt)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -198,9 +198,8 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         explicitDraftTokensParams->temperature = mSamplingConfig.temperature;
         explicitDraftTokensParams->randomDataSample = output->explicitDraftTokensBuffers->randomDataSample;
         explicitDraftTokensParams->temperatures = output->explicitDraftTokensBuffers->temperatures;
-        TLLM_CHECK(requestsOpt);
-        // Ignore the dtype from all other requests assuming that it is the same for all.
-        explicitDraftTokensParams->dtype = requestsOpt.value()[0].dtype;
+        TLLM_CHECK(explicitDraftTokensDType.has_value());
+        explicitDraftTokensParams->dtype = explicitDraftTokensDType.value();
 
         setupParams->decodingParams = explicitDraftTokensParams;
     }

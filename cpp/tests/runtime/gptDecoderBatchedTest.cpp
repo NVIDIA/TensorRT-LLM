@@ -70,8 +70,8 @@ void newRequests(TensorPtr const& batchSlots, std::vector<decoder_batch::Request
 
     // Setup underlying decoder.
     auto samplingConfig = SamplingConfig(samplingConfigs);
-    decoder.getUnderlyingDecoder().setup(
-        samplingConfig, localBatchSize, batchSlots, {decoderState.getJointDecodingOutput()}, {requests});
+    decoder.getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
+        {decoderState.getJointDecodingOutput()}, modelConfig.getDataType(), {requests});
 
     CudaEvent event{};
     decoderStream.record(event);

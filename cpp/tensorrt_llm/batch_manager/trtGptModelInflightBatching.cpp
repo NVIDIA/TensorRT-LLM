@@ -1808,7 +1808,7 @@ void TrtGptModelInflightBatching::setupDecoderStep(
             auto const localBatchSize = batchSlots->getSize();
             auto samplingConfig = SamplingConfig(samplingConfigs);
             mDecoder->getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
-                {mDecoderState->getJointDecodingOutput()}, {decoderRequests});
+                {mDecoderState->getJointDecodingOutput()}, mModelConfig.getDataType(), {decoderRequests});
 
             auto const& stream = mDecoder->getDecoderStream();
             CudaEvent event{};

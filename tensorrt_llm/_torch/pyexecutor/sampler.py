@@ -591,7 +591,8 @@ class TRTLLMSampler(Sampler):
             sampling_config = make_sampling_config(sampling_configs)
             self.algs.decoder.underlying_decoder().setup(
                 sampling_config, local_batch_size, batch_slots,
-                self.algs.decoder_state.joint_decoding_output, decoder_requests)
+                self.algs.decoder_state.joint_decoding_output,
+                self.model_config.data_type, decoder_requests)
 
     @staticmethod
     def beam_width(scheduled_requests: Iterable[LlmRequest]) -> int:

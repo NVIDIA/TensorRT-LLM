@@ -160,9 +160,11 @@ public:
     void setup(tr::SamplingConfig const& samplingConfig, size_t batchSize,
         tr::DecodingInput::TensorConstPtr const& batchSlots,
         std::optional<tr::DecodingOutput> const& output = std::nullopt,
+        std::optional<nvinfer1::DataType> explicitDraftTokensDType = std::nullopt,
         std::optional<std::vector<tr::decoder_batch::Request> const> const& requests = std::nullopt) override
     {
-        PYBIND11_OVERRIDE_PURE(void, IGptDecoder, setup, samplingConfig, batchSize, batchSlots, output, requests);
+        PYBIND11_OVERRIDE_PURE(void, IGptDecoder, setup, samplingConfig, batchSize, batchSlots, output,
+            explicitDraftTokensDType, requests);
     }
 
     void forwardAsync(tr::DecodingOutput& output, tr::DecodingInput const& input) override
@@ -314,13 +316,15 @@ void initBindings(pybind11::module_& m)
             "setup",
             [](tr::IGptDecoder& self, tr::SamplingConfig const& samplingConfig, size_t batchSize,
                 at::Tensor const& batchSlots, std::optional<tr::DecodingOutput> const& output = std::nullopt,
+                std::optional<nvinfer1::DataType> explicitDraftTokensDType = std::nullopt,
                 std::optional<std::vector<tr::decoder_batch::Request> const> const& requests = std::nullopt)
             {
                 auto tensorPtrBatchSlots = tr::TorchView::of(batchSlots);
-                return self.setup(samplingConfig, batchSize, std::move(tensorPtrBatchSlots), output, requests);
+                return self.setup(samplingConfig, batchSize, std::move(tensorPtrBatchSlots), output,
+                    explicitDraftTokensDType, requests);
             },
             py::arg("sampling_config"), py::arg("batch_size"), py::arg("batch_slots"), py::arg("output") = std::nullopt,
-            py::arg("requests") = std::nullopt);
+            py::arg("explicit_draft_tokens_d_type") = std::nullopt, py::arg("requests") = std::nullopt);
 
     py::class_<tr::decoder::DecoderState>(m, "DecoderState")
         .def(py::init<nvinfer1::DataType, tr::BufferManager const&>(), py::arg("dtype"), py::arg("buffer_manager"))

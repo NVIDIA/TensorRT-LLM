@@ -624,11 +624,6 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
                 ? llmReq->getLookaheadConfig()
                 : decodingConfig.getLookaheadDecodingConfig();
         }
-        else if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
-        {
-            // Only Explicit draft tokens model needs dtype to WAR the lack of bf16 decoder.
-            decoderRequest.dtype = modelConfig.getDataType();
-        }
         else if (modelConfig.getSpeculativeDecodingMode().isEagle())
         {
             decoderRequest.eagleConfig
