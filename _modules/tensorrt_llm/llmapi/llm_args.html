@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc0" />
+  <meta name="docsearch:version" content="0.21.0rc1" />
 
 
   </head>
@@ -551,7 +551,6 @@
                                  <span class="n">PeftCacheConfig</span> <span class="k">as</span> <span class="n">_PeftCacheConfig</span><span class="p">,</span>
                                  <span class="n">SchedulerConfig</span> <span class="k">as</span> <span class="n">_SchedulerConfig</span><span class="p">)</span> <span class="c1"># isort: skip</span>
 <span class="c1"># isort: on</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">PreTrainedTokenizerBase</span>
 
 <span class="c1"># yapf: enable</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..builder</span><span class="w"> </span><span class="kn">import</span> <span class="n">BuildConfig</span><span class="p">,</span> <span class="n">EngineConfig</span>
@@ -1668,7 +1667,7 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model</span>
         <span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">model_obj</span><span class="o">.</span><span class="n">is_local_model</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span>
-                <span class="s1">&#39;pytorch&#39;</span><span class="p">,</span> <span class="s1">&#39;autodeploy&#39;</span>
+                <span class="s1">&#39;pytorch&#39;</span><span class="p">,</span> <span class="s1">&#39;_autodeploy&#39;</span>
         <span class="p">]:</span>
             <span class="c1"># Load parallel_config from the engine.</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">model_format</span> <span class="o">=</span> <span class="n">get_model_format</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">)</span>
@@ -1772,7 +1771,7 @@
 
                 <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span>
 
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="o">!=</span> <span class="s1">&#39;pytorch&#39;</span><span class="p">:</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;pytorch&#39;</span><span class="p">,</span> <span class="s1">&#39;_autodeploy&#39;</span><span class="p">]:</span>
                     <span class="n">eagle_config</span> <span class="o">=</span> <span class="n">_EagleConfig</span><span class="p">(</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">eagle_choices</span><span class="p">,</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">greedy_sampling</span><span class="p">,</span>
@@ -1792,7 +1791,7 @@
                         <span class="n">eagle3_one_model</span><span class="p">)</span>
             <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">NGramDecodingConfig</span><span class="p">):</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">speculative_decoding_mode</span> <span class="o">=</span> <span class="n">SpeculativeDecodingMode</span><span class="o">.</span><span class="n">NGRAM</span>
-                <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s1">&#39;pytorch&#39;</span>
+                <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;pytorch&#39;</span><span class="p">,</span> <span class="s1">&#39;_autodeploy&#39;</span><span class="p">]</span>
                 <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">prompt_lookup_num_tokens</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_matching_ngram_size</span> <span class="o">&gt;</span> <span class="mi">0</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span>
                 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.speculative</span><span class="w"> </span><span class="kn">import</span> <span class="n">NGramConfig</span>
@@ -1840,9 +1839,11 @@
                     <span class="s2">&quot;lora_dir is empty, so custom embedding or lm head will not be applied.&quot;</span>
                 <span class="p">)</span>
 
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_lora</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s1">&#39;pytorch&#39;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_lora</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="ow">in</span> <span class="p">[</span>
+                <span class="s1">&#39;pytorch&#39;</span><span class="p">,</span> <span class="s1">&#39;_autodeploy&#39;</span>
+        <span class="p">]:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                <span class="s2">&quot;enable_lora is ignored when lora_config is provided for pytorch backend.&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;enable_lora is ignored when lora_config is provided for </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">backend</span><span class="si">}</span><span class="s2"> backend.&quot;</span>
             <span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -2231,11 +2232,6 @@
     <span class="k">def</span><span class="w"> </span><span class="nf">get_pytorch_backend_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;PyTorchConfig&quot;</span><span class="p">:</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">PyTorchConfig</span>
 
-        <span class="c1"># TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig</span>
-        <span class="c1"># Just a WAR to support the auto_deploy</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_deploy_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_deploy_config</span>
-
         <span class="k">return</span> <span class="n">PyTorchConfig</span><span class="p">(</span>
             <span class="n">extra_resource_managers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">extra_resource_managers</span><span class="p">,</span>
             <span class="n">use_cuda_graph</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span><span class="p">,</span>
@@ -2321,7 +2317,7 @@
 <span class="sd">        2. If cuda_graph_batch_sizes is not provided, it is generated based on cuda_graph_max_batch_size</span>
 <span class="sd">        3. If both are provided, cuda_graph_batch_sizes must match the generated values</span>
 <span class="sd">        &quot;&quot;&quot;</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_batch_sizes</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_batch_sizes</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_batch_sizes</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_batch_sizes</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_max_batch_size</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_batch_sizes</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generate_cuda_graph_batch_sizes</span><span class="p">(</span>
@@ -2346,6 +2342,109 @@
         <span class="k">return</span> <span class="bp">self</span></div>
 </div>
 
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_AutoDeployLlmArgs</span><span class="p">(</span><span class="n">TorchLlmArgs</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;LLM arguments specifically for AutoDeploy backend.</span>
+
+<span class="sd">    This class extends TorchLlmArgs with AutoDeploy-specific configuration options.</span>
+<span class="sd">    AutoDeploy provides automatic deployment and optimization of language models</span>
+<span class="sd">    with various attention backends and optimization strategies.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">model_factory</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span>
+        <span class="s2">&quot;AutoModelForCausalLM&quot;</span><span class="p">,</span> <span class="s2">&quot;AutoModelForImageTextToText&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+            <span class="n">default</span><span class="o">=</span><span class="s2">&quot;AutoModelForCausalLM&quot;</span><span class="p">,</span>
+            <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The model factory to use for loading the model.&quot;</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="n">model_kwargs</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Extra kwargs for the model config class to customize the model config. &quot;</span>
+        <span class="s2">&quot;These arguments take precedence over default values or config values in the model config &quot;</span>
+        <span class="s2">&quot;file. Arguments are resolved in order: 1) Default values in model config class, 2) Values &quot;</span>
+        <span class="s2">&quot;in model config file, 3) Values in model_kwargs. Note: if a kwarg doesn&#39;t exist in the &quot;</span>
+        <span class="s2">&quot;model config class, it will be ignored.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">mla_backend</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;MultiHeadLatentAttention&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;MultiHeadLatentAttention&quot;</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The Multi-Head Latent Attention backend to use.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">skip_loading_weights</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Whether to skip loading model weights during initialization. &quot;</span>
+        <span class="s2">&quot;If True, only the model architecture is loaded.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">free_mem_ratio</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The fraction of available memory to allocate for cache. &quot;</span>
+        <span class="s2">&quot;Must be between 0.0 and 1.0.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">simple_shard_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;If True, force simple sharding (all_gather) in tensor parallelism. &quot;</span>
+        <span class="s2">&quot;If False, auto-detect and use column+row (all_reduce) sharding when possible.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="c1"># TODO: Remove this field once tokens_per_block is properly passed through</span>
+    <span class="n">attn_page_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Page size for attention (tokens_per_block). For TritonWithFlattenedInputs &quot;</span>
+        <span class="s2">&quot;backend, this should equal max_seq_len. Temporary field until tokens_per_block gets &quot;</span>
+        <span class="s2">&quot;properly passed through.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s2">&quot;free_mem_ratio&quot;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_free_mem_ratio</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Validate that free_mem_ratio is between 0.0 and 1.0.&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="mf">0.0</span> <span class="o">&lt;=</span> <span class="n">v</span> <span class="o">&lt;=</span> <span class="mf">1.0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;free_mem_ratio must be between 0.0 and 1.0, got </span><span class="si">{</span><span class="n">v</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">v</span>
+
+    <span class="nd">@print_traceback_on_error</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">model_post_init</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">__context</span><span class="p">):</span>
+        <span class="c1"># Modify default values that differ from TorchLlmArgs</span>
+        <span class="n">new_defaults</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;max_batch_size&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+            <span class="s2">&quot;max_seq_len&quot;</span><span class="p">:</span> <span class="mi">512</span><span class="p">,</span>
+            <span class="s2">&quot;attn_backend&quot;</span><span class="p">:</span> <span class="s2">&quot;FlashInfer&quot;</span><span class="p">,</span>
+            <span class="c1"># TODO: Remove this when overlap scheduler is supported (https://github.com/NVIDIA/TensorRT-LLM/issues/4364)</span>
+            <span class="s2">&quot;disable_overlap_scheduler&quot;</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="p">}</span>
+        <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v_default</span> <span class="ow">in</span> <span class="n">new_defaults</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">k</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">__pydantic_fields_set__</span><span class="p">:</span>
+                <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v_default</span><span class="p">)</span>
+
+        <span class="c1"># NOTE: Only call super() after setting the default values since default values should be</span>
+        <span class="c1"># set first.</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">model_post_init</span><span class="p">(</span><span class="n">__context</span><span class="p">)</span>
+
+        <span class="c1"># Handle attn_page_size for TritonWithFlattenedInputs backend</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_backend</span> <span class="o">==</span> <span class="s2">&quot;TritonWithFlattenedInputs&quot;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">attn_page_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span>
+
+        <span class="c1"># Add max_position_embeddings to model_kwargs</span>
+        <span class="c1"># TODO (lucaslie): this is more HF specific than a generic model_kwargs. Ideally, we can</span>
+        <span class="c1"># move this to the HF model factory but we don&#39;t have access to max_seq_len there right now.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">model_kwargs</span><span class="p">[</span><span class="s2">&quot;max_position_embeddings&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">model_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;max_position_embeddings&quot;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">),</span>
+        <span class="p">)</span>
+
+    <span class="c1"># TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_pytorch_backend_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;_AutoDeployLlmArgs&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return the _AutoDeployLlmArgs (self) object.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="bp">self</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">update_llm_args_with_extra_dict</span><span class="p">(</span>
@@ -2530,9 +2629,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 03, 2025.</p>
+  <p>Last updated on June 09, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9ae2ce6">9ae2ce6</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
   
 </div></div>
       
