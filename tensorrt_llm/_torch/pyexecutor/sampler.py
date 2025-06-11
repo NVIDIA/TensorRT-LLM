@@ -72,10 +72,12 @@ class EarlyStopSampler(Sampler):
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleState:
-        return SampleState(scheduled_requests=scheduled_requests,
-                           logits=model_outputs['logits'])
+        host = SampleStateTensors(logits=model_outputs['logits'],
+                                  new_tokens=torch.empty(0))
+        return SampleState(scheduled_requests=scheduled_requests, host=host)
 
     def update_requests(self, state: SampleState) -> None:
+        assert isinstance(state, SampleState)
         scheduled_requests = state.scheduled_requests
         assert (not scheduled_requests.generation_requests)
         for idx, request in enumerate(scheduled_requests.context_requests):
@@ -610,7 +612,7 @@ class TRTLLMSampler(Sampler):
         log_probs = None
         cum_log_probs = None
         if any(request.py_return_log_probs
-               for request in scheduled_requests.all_requests):
+               for request in scheduled_requests.all_requests()):
             log_probs = self.algs.decoder_state.log_probs.to('cpu',
                                                              non_blocking=True)
             cum_log_probs = self.algs.decoder_state.cum_log_probs.to(
