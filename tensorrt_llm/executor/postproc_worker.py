@@ -117,7 +117,6 @@ class PostprocWorker:
     ) -> "DetokenizedGenerationResultBase":
         from .result import DetokenizedGenerationResultBase
         assert inp.sampling_params is not None
-        assert tokenizer is not None
         return DetokenizedGenerationResultBase(
             inp.rsp.client_id,
             sampling_params=inp.sampling_params,
