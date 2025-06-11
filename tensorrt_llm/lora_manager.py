@@ -201,7 +201,7 @@ class HfLoraLoader:
             raise ValueError(f"adapter_model file does not exist in {lora_dir}")
         lora_weight = load_state_dict(model_path)
         self.lora_weight = lora_weight
-        if adapter_config["modules_to_save"] is not None:
+        if adapter_config.get("modules_to_save") is not None:
             if "lm_head" in adapter_config["modules_to_save"]:
                 self.lm_head = lora_weight["base_model.model.lm_head.weight"]
                 self.vocab_size = self.lm_head.shape[0]
