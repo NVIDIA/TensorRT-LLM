@@ -119,7 +119,8 @@ TEST_F(GdrCopyTest, HelperLifecycle)
     GdrMemDesc* mem_desc = nullptr;
 
     // 1. Allocate using helper
-    ASSERT_NO_THROW(gdrcopy::gdrCudaMalloc<char>(&gdr_ptr, &dev_ptr, TEST_SIZE, &mem_desc, gdrHandle));
+    ASSERT_NO_THROW(gdrcopy::gdrCudaMalloc(
+        reinterpret_cast<void**>(&gdr_ptr), reinterpret_cast<void**>(&dev_ptr), TEST_SIZE, &mem_desc, gdrHandle));
     ASSERT_NE(gdr_ptr, nullptr);
     ASSERT_NE(dev_ptr, nullptr);
     ASSERT_NE(mem_desc, nullptr);

@@ -69,6 +69,12 @@ public:
         return getGpuCountUnderNuma(getCurrentGpuNumaId());
     }
 
+    // Returns a pointer to a memory region on the current GPU's NUMA node.
+    void* allocateCurrentGpuNumaMemory(size_t memorySize);
+
+    // Frees a memory region allocated by allocateCurrentGpuNumaMemory.
+    void freeCurrentGpuNumaMemory(void* ptr, size_t memorySize);
+
     // Returns the detected CPU architecture (e.g., "x86_64", "aarch64").
     std::string getCpuArchitecture();
 

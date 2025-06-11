@@ -200,6 +200,46 @@ int copy_from_mapping(gdr_mh_t handle, void* h_ptr, void const* map_d_ptr, size_
     return GDRLOCKCALL(gdr_internal_copy_from_mapping(handle, h_ptr, map_d_ptr, size));
 }
 
+void gdrCudaMalloc(void** ptr, void** devPtr, size_t mapSize, GdrMemDesc** memDesc, gdr_t handle)
+{
+    TLLM_CHECK_WITH_INFO(isInitialized(), "GDRCopy library is not initialized.");
+    gdr_info_t info;
+    gdr_mh_t mh;
+    char* devMem;
+    void* gdrMap;
+
+    // GDRCOPY Pinned buffer has to be a minimum of a GPU_PAGE_SIZE
+    size_t alignedMapSize = (mapSize + GPU_PAGE_SIZE - 1) & GPU_PAGE_MASK;
+    if (alignedMapSize == 0 && mapSize > 0)
+    {
+        alignedMapSize = GPU_PAGE_SIZE;
+    }
+    TLLM_CUDA_CHECK(cudaMalloc(&devMem, alignedMapSize + GPU_PAGE_SIZE - 1));
+    uint64_t alignedAddr = ((uint64_t) devMem + GPU_PAGE_OFFSET) & GPU_PAGE_MASK;
+    size_t align = alignedAddr - (uint64_t) devMem;
+
+    TLLM_CHECK_WITH_INFO(pin_buffer(handle, alignedAddr, alignedMapSize, 0, 0, &mh) == 0, "GDR pin_buffer failed");
+    TLLM_CHECK_WITH_INFO(map(handle, mh, &gdrMap, alignedMapSize) == 0, "GDR map failed");
+    TLLM_CHECK_WITH_INFO(get_info(handle, mh, &info) == 0, "GDR get_info failed");
+
+    ssize_t off = info.va - alignedAddr;
+
+    *memDesc = new GdrMemDesc();
+    (*memDesc)->gdrDeviceMem = devMem;
+    (*memDesc)->gdrMap = gdrMap;
+    (*memDesc)->gdrMapSize = alignedMapSize;
+    (*memDesc)->gdrOffset = off + align;
+    (*memDesc)->gdrMh = mh;
+
+    *ptr = (void*) ((char*) gdrMap + off);
+    if (devPtr)
+        *devPtr = (void*) (devMem + off + align);
+
+    TLLM_LOG_DEBUG("GDRCOPY : allocated devMem %p gdrMap %p offset %lx mh %lx mapSize %zu at %p",
+        (*memDesc)->gdrDeviceMem, (*memDesc)->gdrMap, (*memDesc)->gdrOffset, (*memDesc)->gdrMh.h,
+        (*memDesc)->gdrMapSize, *ptr);
+}
+
 void gdrCudaFree(GdrMemDesc* memDesc, gdr_t handle)
 {
     CHECK_INITIALIZED();

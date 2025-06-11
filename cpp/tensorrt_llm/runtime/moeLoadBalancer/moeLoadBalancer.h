@@ -79,7 +79,7 @@ public:
 
     virtual ~MoeWeightUpdaterBase() {}
 
-    void addSingleWeightSlot(int localSlotId, std::string const& name, MoeWeight weightSlot);
+    void addSingleWeightSlot(int localSlotId, std::string const& name, MoeWeight weightSlot, bool gpuAccess);
     virtual void addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight) = 0;
     virtual void finalizeWeights();
     virtual void updateWeights(MoePlacementCpuInfo const* placementCpuInfo, int rank = 0, int size = 1) = 0;
@@ -155,6 +155,11 @@ public:
         return &mCpuPlacementInfo;
     }
 
+    tensorrt_llm::kernels::MoePlacementInfo getGpuPlacementInfo()
+    {
+        return mGpuPlacementGpuAccess;
+    }
+
     tensorrt_llm::kernels::MoeLoadBalanceSingleLayerSignal* getSignal()
     {
         return mSingleLayerSignal;
@@ -200,7 +205,8 @@ private:
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo mMetaInfo;
     tensorrt_llm::kernels::MoeLoadBalanceStatisticInfo mStatisticInfo;
     MoePlacementCpuInfo mCpuPlacementInfo;
-    tensorrt_llm::kernels::MoePlacementInfo mGpuPlacement;
+    tensorrt_llm::kernels::MoePlacementInfo mGpuPlacementHostAccess;
+    tensorrt_llm::kernels::MoePlacementInfo mGpuPlacementGpuAccess;
     tensorrt_llm::kernels::MoeLoadBalanceSingleLayerSignal* mSingleLayerSignal = nullptr;
 
     std::mutex mUpdateWeightsMutex;

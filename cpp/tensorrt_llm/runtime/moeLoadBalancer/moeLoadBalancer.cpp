@@ -15,6 +15,7 @@
  */
 
 #include "moeLoadBalancer.h"
+#include "hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.h"
@@ -289,9 +290,9 @@ void freeStatisticInfo(tensorrt_llm::kernels::MoeLoadBalanceStatisticInfo* stati
 }
 
 void allocatePlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& metaInfo,
-    tensorrt_llm::kernels::MoePlacementInfo* placementInfo, bool isCpu = false, bool useManaged = false)
+    tensorrt_llm::kernels::MoePlacementInfo* placementInfo, bool isCpu = false)
 {
-    auto allocFn = [isCpu, useManaged](void** ptr, size_t size)
+    auto allocFn = [isCpu](void** ptr, size_t size)
     {
         if (isCpu)
         {
@@ -299,15 +300,9 @@ void allocatePlacementInfo(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& 
         }
         else
         {
-            if (useManaged)
+            if (HostAccessibleDeviceAllocator::getInstance().isSupported())
             {
-                TLLM_CUDA_CHECK(cudaMallocManaged(ptr, size));
-                int cur_dev;
-                TLLM_CUDA_CHECK(cudaGetDevice(&cur_dev));
-                TLLM_CUDA_CHECK(cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, cur_dev));
-                TLLM_CUDA_CHECK(cudaMemAdvise(*ptr, size, cudaMemAdviseSetAccessedBy, cur_dev));
-                TLLM_CUDA_CHECK(cudaMemAdvise(*ptr, size, cudaMemAdviseSetAccessedBy, cudaCpuDeviceId));
-                TLLM_CUDA_CHECK(cudaMemset(*ptr, 0, size));
+                *ptr = HostAccessibleDeviceAllocator::getInstance().allocate(size);
                 return cudaSuccess;
             }
             else
@@ -334,12 +329,40 @@ void freePlacementInfo(tensorrt_llm::kernels::MoePlacementInfo* placementInfo, b
         }
         else
         {
-            return cudaFree(ptr);
+            if (HostAccessibleDeviceAllocator::getInstance().isSupported())
+            {
+                HostAccessibleDeviceAllocator::getInstance().free(ptr);
+                return cudaSuccess;
+            }
+            else
+            {
+                return cudaFree(ptr);
+            }
         }
     };
     TLLM_CUDA_CHECK(freeFn(placementInfo->expertReplicaCount));
     TLLM_CUDA_CHECK(freeFn(placementInfo->expertReplicaStartOffset));
     TLLM_CUDA_CHECK(freeFn(placementInfo->globalSlotIds));
+}
+
+void getHostAccessibleGpuPlacement(tensorrt_llm::kernels::MoePlacementInfo const* placementInfoGpuAccess,
+    tensorrt_llm::kernels::MoePlacementInfo* placementInfoHostAccess)
+{
+    if (HostAccessibleDeviceAllocator::getInstance().isSupported())
+    {
+        placementInfoHostAccess->expertReplicaStartOffset = static_cast<int*>(
+            HostAccessibleDeviceAllocator::getInstance().getHostPtr(placementInfoGpuAccess->expertReplicaStartOffset));
+        placementInfoHostAccess->expertReplicaCount = static_cast<int*>(
+            HostAccessibleDeviceAllocator::getInstance().getHostPtr(placementInfoGpuAccess->expertReplicaCount));
+        placementInfoHostAccess->globalSlotIds = static_cast<int*>(
+            HostAccessibleDeviceAllocator::getInstance().getHostPtr(placementInfoGpuAccess->globalSlotIds));
+    }
+    else
+    {
+        placementInfoHostAccess->expertReplicaStartOffset = nullptr;
+        placementInfoHostAccess->expertReplicaCount = nullptr;
+        placementInfoHostAccess->globalSlotIds = nullptr;
+    }
 }
 
 tensorrt_llm::kernels::MoeLoadBalanceSingleLayerSignal* allocateSingleLayerSignal()
@@ -377,7 +400,7 @@ SingleLayerMoeLoadBalancer::~SingleLayerMoeLoadBalancer()
 
 void SingleLayerMoeLoadBalancer::addSingleWeightSlot(int localSlotId, std::string const& name, MoeWeight weightSlot)
 {
-    mWeightUpdater->addSingleWeightSlot(localSlotId, name, weightSlot);
+    mWeightUpdater->addSingleWeightSlot(localSlotId, name, weightSlot, mMoeLoadBalancer->mUseGpuMemcpy);
 }
 
 void SingleLayerMoeLoadBalancer::addSingleHostWeight(int expertId, std::string const& name, MoeWeight hostWeight)
@@ -420,7 +443,8 @@ void SingleLayerMoeLoadBalancer::createResources()
     }
 
     allocatePlacementInfo(mMetaInfo, &mCpuPlacementInfo.placementInfoForGPU, true);
-    allocatePlacementInfo(mMetaInfo, &mGpuPlacement, false, true);
+    allocatePlacementInfo(mMetaInfo, &mGpuPlacementGpuAccess, false);
+    getHostAccessibleGpuPlacement(&mGpuPlacementGpuAccess, &mGpuPlacementHostAccess);
 
     mSingleLayerSignal = allocateSingleLayerSignal();
     TLLM_CUDA_CHECK(cudaEventCreate(&mUpdateWeightsDoneEvent));
@@ -432,7 +456,7 @@ void SingleLayerMoeLoadBalancer::destroyResources()
     mWeightUpdater.reset();
     freeStatisticInfo(&mStatisticInfo);
     freePlacementInfo(&mCpuPlacementInfo.placementInfoForGPU, true);
-    freePlacementInfo(&mGpuPlacement, false);
+    freePlacementInfo(&mGpuPlacementGpuAccess, false);
     freeSingleLayerSignal(mSingleLayerSignal);
     TLLM_CUDA_CHECK(cudaEventDestroy(mUpdateWeightsDoneEvent));
 }
@@ -499,14 +523,15 @@ cudaStream_t SingleLayerMoeLoadBalancer::getStream() const
 void SingleLayerMoeLoadBalancer::copyPlacementInfoToGpu()
 {
     cudaStream_t stream = mMoeLoadBalancer->mStream;
-    TLLM_CUDA_CHECK(
-        cudaMemcpyAsync(mGpuPlacement.expertReplicaCount, mCpuPlacementInfo.placementInfoForGPU.expertReplicaCount,
-            sizeof(int) * mMetaInfo.expertCount, cudaMemcpyHostToDevice, stream));
-    TLLM_CUDA_CHECK(cudaMemcpyAsync(mGpuPlacement.expertReplicaStartOffset,
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(mGpuPlacementGpuAccess.expertReplicaCount,
+        mCpuPlacementInfo.placementInfoForGPU.expertReplicaCount, sizeof(int) * mMetaInfo.expertCount,
+        cudaMemcpyHostToDevice, stream));
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(mGpuPlacementGpuAccess.expertReplicaStartOffset,
         mCpuPlacementInfo.placementInfoForGPU.expertReplicaStartOffset, sizeof(int) * mMetaInfo.expertCount,
         cudaMemcpyHostToDevice, stream));
-    TLLM_CUDA_CHECK(cudaMemcpyAsync(mGpuPlacement.globalSlotIds, mCpuPlacementInfo.placementInfoForGPU.globalSlotIds,
-        sizeof(int) * mMetaInfo.epSize * mMetaInfo.slotCountPerRank, cudaMemcpyHostToDevice, stream));
+    TLLM_CUDA_CHECK(
+        cudaMemcpyAsync(mGpuPlacementGpuAccess.globalSlotIds, mCpuPlacementInfo.placementInfoForGPU.globalSlotIds,
+            sizeof(int) * mMetaInfo.epSize * mMetaInfo.slotCountPerRank, cudaMemcpyHostToDevice, stream));
     mCpuPlacementInfo.rankExpertIds.swap(mCpuPlacementInfo.oldRankExpertIds);
     for (int i = 0; i < mMetaInfo.epSize; ++i)
     {
@@ -518,11 +543,11 @@ void SingleLayerMoeLoadBalancer::copyPlacementInfoToGpu()
 
 void SingleLayerMoeLoadBalancer::copyPlacementInfoToGpuByCpu()
 {
-    memcpy(mGpuPlacement.expertReplicaCount, mCpuPlacementInfo.placementInfoForGPU.expertReplicaCount,
+    memcpy(mGpuPlacementHostAccess.expertReplicaCount, mCpuPlacementInfo.placementInfoForGPU.expertReplicaCount,
         sizeof(int) * mMetaInfo.expertCount);
-    memcpy(mGpuPlacement.expertReplicaStartOffset, mCpuPlacementInfo.placementInfoForGPU.expertReplicaStartOffset,
-        sizeof(int) * mMetaInfo.expertCount);
-    memcpy(mGpuPlacement.globalSlotIds, mCpuPlacementInfo.placementInfoForGPU.globalSlotIds,
+    memcpy(mGpuPlacementHostAccess.expertReplicaStartOffset,
+        mCpuPlacementInfo.placementInfoForGPU.expertReplicaStartOffset, sizeof(int) * mMetaInfo.expertCount);
+    memcpy(mGpuPlacementHostAccess.globalSlotIds, mCpuPlacementInfo.placementInfoForGPU.globalSlotIds,
         sizeof(int) * mMetaInfo.epSize * mMetaInfo.slotCountPerRank);
     mCpuPlacementInfo.rankExpertIds.swap(mCpuPlacementInfo.oldRankExpertIds);
     for (int i = 0; i < mMetaInfo.epSize; ++i)
@@ -574,7 +599,7 @@ MoeWeightUpdaterBase::MoeWeightUpdaterBase(
 }
 
 void MoeWeightUpdaterBase::addSingleWeightSlot(
-    int localSlotId, std::string const& name, tensorrt_llm::runtime::MoeWeight weightSlot)
+    int localSlotId, std::string const& name, tensorrt_llm::runtime::MoeWeight weightSlot, bool gpuAccess)
 {
     TLLM_CHECK_WITH_INFO(mWeightSlotsFinalized == false, "Cannot add slots after finalize");
     TLLM_CHECK_WITH_INFO(localSlotId >= 0 && localSlotId < mMetaInfo.slotCountPerRank,
@@ -589,6 +614,12 @@ void MoeWeightUpdaterBase::addSingleWeightSlot(
     }
     TLLM_CHECK_WITH_INFO(mWeightSlots[name][localSlotId].mWeightPtr == nullptr,
         "localSlotId=%d, name=%s already added.", localSlotId, name.c_str());
+    if (!gpuAccess)
+    {
+        // if using cpu copy, change to host accessible pointer.
+        weightSlot.mWeightPtr
+            = tensorrt_llm::runtime::HostAccessibleDeviceAllocator::getInstance().getHostPtr(weightSlot.mWeightPtr);
+    }
     mWeightSlots[name][localSlotId] = weightSlot;
 }
 
@@ -808,6 +839,9 @@ MoeLoadBalancer::MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter
     int currentGpuNumaId = topologyDetector.getCurrentGpuNumaId();
     int numaCpuCount = topologyDetector.getCurrentGpuNumaCpuCount();
     int numaGpuCount = topologyDetector.getGpuCountUnderNuma(currentGpuNumaId);
+    HostAccessibleDeviceAllocator::getInstance().IncRefCount();
+    TLLM_CHECK_WITH_INFO(HostAccessibleDeviceAllocator::getInstance().isSupported(),
+        "HostAccessibleDeviceAllocator is not supported on current platform, please install gdrcopy(gdrdrv).");
     TLLM_CHECK_WITH_INFO(
         numaCpuCount > 0 && numaGpuCount > 0, "numaCpuCount=%d, numaGpuCount=%d", numaCpuCount, numaGpuCount);
     int cpuCountPerGpu = std::max(1, numaCpuCount / numaGpuCount);
@@ -837,7 +871,11 @@ MoeLoadBalancer::MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter
     mMultiThreadWorker.reset(new MultiThreadWorker(numCopyThreads));
 }
 
-MoeLoadBalancer::~MoeLoadBalancer() {}
+MoeLoadBalancer::~MoeLoadBalancer()
+{
+    shutdown();
+    HostAccessibleDeviceAllocator::getInstance().DecRefCount();
+}
 
 std::shared_ptr<SingleLayerMoeLoadBalancer> MoeLoadBalancer::AddLayer(int expertCount, int topK, int slotCountPerRank)
 {

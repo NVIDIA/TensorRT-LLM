@@ -293,7 +293,7 @@ class SingleLayerMoeLoadBalancer:
             layer_id, expert_count,
             shared_mpi_comm) if self.updates_enabled else None
         self.register_weight_fns = []
-        self.to_fix_weight_fns = []
+        self.to_migrate_weight_fns = []
 
         shared_rank = shared_mpi_comm.Get_rank()
         shared_size = shared_mpi_comm.Get_size()
@@ -399,11 +399,11 @@ class SingleLayerMoeLoadBalancer:
         self.single_layer_load_balancer_impl.set_initial_weight_assignments(
             initial_weight_assignments)
 
-    def add_to_fix_weight_fn(self,
-                             fn: Callable,
-                             args: Tuple,
-                             kwargs: Dict = {}):
-        self.to_fix_weight_fns.append((fn, args, kwargs))
+    def add_to_migrate_weight_fn(self,
+                                 fn: Callable,
+                                 args: Tuple,
+                                 kwargs: Dict = {}):
+        self.to_migrate_weight_fns.append((fn, args, kwargs))
 
     def add_register_weight_fn(self,
                                fn: Callable,
@@ -415,17 +415,18 @@ class SingleLayerMoeLoadBalancer:
         """
         self.register_weight_fns.append((fn, args, kwargs))
 
-    def fix_tensor(self, wt: torch.Tensor):
-        torch.ops.trtllm.migrate_to_managed(wt)
+    def make_tensor_host_accessible(self, wt: torch.Tensor):
+        torch.ops.trtllm.migrate_to_host_accessible(wt)
+        torch.cuda.empty_cache()
 
     def register_weight_slots_after_to_cuda(self):
         """
         Register weights after model has been moved to cuda, should be invoked after model.to("cuda") and before finalize_model.
         """
-        for fn, args, kwargs in self.to_fix_weight_fns:
+        for fn, args, kwargs in self.to_migrate_weight_fns:
             fn(*args, **kwargs)
 
-        self.to_fix_weight_fns = []
+        self.to_migrate_weight_fns = []
 
         for fn, args, kwargs in self.register_weight_fns:
             fn(*args, **kwargs)
@@ -665,6 +666,7 @@ class MoeLoadBalancer:
             layer_updates_per_iter: The number of layers to update per iteration
             shared_memory_base_name: Shared memory base name
         """
+        self.is_shutdown = True
         self.ep_rank = ep_rank
         self.ep_size = ep_size
         self.layer_updates_per_iter = layer_updates_per_iter
@@ -889,8 +891,9 @@ def maybe_create_moe_load_balancer(
         model_config.moe_load_balancer.setup(ep_rank=ep_rank, ep_size=ep_size)
         if model_config.moe_load_balancer.layer_updates_per_iter > 0:
             # TODO: remove this when supported.
-            cpu_arch = platform.machine().lower()
-            assert cpu_arch == 'aarch64', "online load balancer only support aarch64, e.g. GB200 now, x86 coming soon."
+            # cpu_arch = platform.machine().lower()
+            # assert cpu_arch == 'aarch64', "online load balancer only support aarch64, e.g. GB200 now, x86 coming soon."
+            pass
 
         moe_load_balancer = MoeLoadBalancer(
             ep_rank=ep_rank,

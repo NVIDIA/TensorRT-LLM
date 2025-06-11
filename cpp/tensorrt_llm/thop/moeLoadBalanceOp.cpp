@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
 
 namespace torch_ext
@@ -159,38 +160,34 @@ torch::Tensor moeLoadBalanceRouting(
 
     auto tokenRoutedSlotIds = torch::empty_like(tokenSelectedExperts);
 
-    tensorrt_llm::kernels::moeComputeRouteDevice(metaInfo, loadBalancer->getPlacementCpuInfo()->placementInfoForGPU,
+    tensorrt_llm::kernels::moeComputeRouteDevice(metaInfo, loadBalancer->getGpuPlacementInfo(),
         tokenSelectedExperts.data_ptr<int>(), tokenRoutedSlotIds.data_ptr<int>(), tokenCount, offsetByEpRank, stream);
 
     return tokenRoutedSlotIds;
 }
 
-void migrateToManaged(at::Tensor& tensor)
+void migrateToHostAccessible(at::Tensor& tensor)
 {
     TORCH_CHECK(tensor.device().is_cuda(), "only support CUDA Tensor");
+
+    TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::HostAccessibleDeviceAllocator::getInstance().isSupported(),
+        "host accessible allocator is not supported on system, please install GDRCopy.");
 
     // 1) compute total bytes
     size_t byte_size = tensor.numel() * tensor.element_size();
 
-    // 2) allocate UVM
-    void* managed_ptr = nullptr;
-    cudaError_t err = cudaMallocManaged(&managed_ptr, byte_size);
-    TORCH_CHECK(err == cudaSuccess, "cudaMallocManaged failed");
+    // 2) allocate host accessible memory
+    void* devPtr = tensorrt_llm::runtime::HostAccessibleDeviceAllocator::getInstance().allocate(byte_size);
 
-    // 3) advise to place on current GPU
-    int cur_dev;
-    TLLM_CUDA_CHECK(cudaGetDevice(&cur_dev));
-    TLLM_CUDA_CHECK(cudaMemAdvise(managed_ptr, byte_size, cudaMemAdviseSetPreferredLocation, cur_dev));
-    TLLM_CUDA_CHECK(cudaMemAdvise(managed_ptr, byte_size, cudaMemAdviseSetAccessedBy, cur_dev));
-    TLLM_CUDA_CHECK(cudaMemAdvise(managed_ptr, byte_size, cudaMemAdviseSetAccessedBy, cudaCpuDeviceId));
+    // 3) copy old data to new memory
+    TLLM_CUDA_CHECK(cudaMemcpy(devPtr, tensor.data_ptr(), byte_size, cudaMemcpyDeviceToDevice));
 
-    // 4) copy old data to UVM
-    TLLM_CUDA_CHECK(cudaMemcpy(managed_ptr, tensor.data_ptr(), byte_size, cudaMemcpyDeviceToDevice));
-
-    // 5) use new DataPtr/StorageImpl to construct storage
+    // 4) use new DataPtr/StorageImpl to construct storage
     //    here managed_ptr is data，and also context，use cudaFree as deleter
     c10::DataPtr dp(
-        managed_ptr, managed_ptr, [](void* ptr) { cudaFree(ptr); }, tensor.device());
+        devPtr, devPtr,
+        [](void* ptr) { tensorrt_llm::runtime::HostAccessibleDeviceAllocator::getInstance().free(ptr); },
+        tensor.device());
     auto allocator = c10::GetAllocator(tensor.device().type());
     auto storage_impl = c10::make_intrusive<c10::StorageImpl>(c10::StorageImpl::use_byte_size_t(), byte_size,
         std::move(dp), allocator,
@@ -275,10 +272,10 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("migrate_to_managed(Tensor tensor) -> ()");
+    m.def("migrate_to_host_accessible(Tensor tensor) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("migrate_to_managed", &torch_ext::migrateToManaged);
+    m.impl("migrate_to_host_accessible", &torch_ext::migrateToHostAccessible);
 }

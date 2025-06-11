@@ -437,6 +437,23 @@ int TopologyDetector::getGpuCountUnderNuma(int numaId)
     return 0;
 }
 
+void* TopologyDetector::allocateCurrentGpuNumaMemory(size_t memorySize)
+{
+    int currentDevice = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&currentDevice));
+    int numaId = getCurrentGpuMemoryNumaId();
+    TLLM_CHECK_WITH_INFO(numaId >= 0, "Current GPU memory has no NUMA ID. Cannot allocate memory.");
+    void* ptr = numa_alloc_onnode(memorySize, numaId);
+    TLLM_CUDA_CHECK(cudaHostRegister(ptr, memorySize, cudaHostRegisterDefault));
+    return ptr;
+}
+
+void TopologyDetector::freeCurrentGpuNumaMemory(void* ptr, size_t memorySize)
+{
+    TLLM_CUDA_CHECK(cudaHostUnregister(ptr));
+    numa_free(ptr, memorySize);
+}
+
 std::string TopologyDetector::getCpuArchitecture()
 {
     return mCpuArchitecture;
