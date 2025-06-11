@@ -369,11 +369,7 @@ def throughput_command(
                                          pad_id=eos_id,
                                          n=beam_width,
                                          use_beam_search=beam_width > 1)
-        post_proc_args = PostprocArgs(tokenizer=checkpoint_path)
-        # post_proc_params = PostprocParams(
-        #     post_processor=None,
-        #     postproc_args=post_proc_args)
-        post_proc_params = None
+        post_proc_params = None # No detokenization
 
         # Perform warmup if requested.
         if warmup > 0:
