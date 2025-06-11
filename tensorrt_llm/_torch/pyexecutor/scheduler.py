@@ -1,6 +1,5 @@
 from abc import ABC, abstractmethod
 from collections import namedtuple
-from itertools import chain
 from typing import Optional
 
 from tensorrt_llm.bindings import executor as tb_executor
