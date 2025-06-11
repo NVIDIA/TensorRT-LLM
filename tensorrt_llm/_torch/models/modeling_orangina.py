@@ -7,7 +7,7 @@ from torch.nn.parameter import Parameter
 from tqdm import tqdm
 
 from tensorrt_llm._torch.distributed import AllReduceParams
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
@@ -29,6 +29,7 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
 class OranginaModelConfig:
     num_hidden_layers: int = 36
     num_experts: int = 128
+    experts_per_token: int = 4
     vocab_size: int = 201088
     hidden_size: int = 2880
     intermediate_size: int = 2880
@@ -36,12 +37,15 @@ class OranginaModelConfig:
     num_attention_heads: int = 64
     num_key_value_heads: int = 8
     sliding_window: int = 128
+    initial_context_length: int = 4096
     rope_theta: float = 150000.0
+    rope_scaling_factor: float = 32.0
+    rope_ntk_alpha: float = 1.0
+    rope_ntk_beta: float = 32.0
 
     # added for TRT-LLM
     torch_dtype: torch.dtype = torch.bfloat16
     rms_norm_eps: float = 1e-05
-    num_experts_per_tok: int = 4
     # TODO: check what the real max_position_embeddings is
     max_position_embeddings: int = 8192
     model_type: str = "mixtral"
@@ -58,8 +62,17 @@ class AttentionBlock(Attention):
         pretrained_config = config.pretrained_config
 
         pos_embd_params = PositionalEmbeddingParams(
-            type=PositionEmbeddingType.rope_gpt_neox,
-            rope=RopeParams.from_config(pretrained_config),
+            type=PositionEmbeddingType.yarn,
+            rope=RopeParams(
+                dim=pretrained_config.head_dim,
+                theta=pretrained_config.rope_theta,
+                scale_type=RotaryScalingType.yarn,
+                scale=pretrained_config.rope_scaling_factor,
+                max_positions=pretrained_config.max_position_embeddings,
+                original_max_positions=pretrained_config.initial_context_length,
+                beta_fast=pretrained_config.rope_ntk_beta,
+                beta_slow=pretrained_config.rope_ntk_alpha),
+            is_neox=False,
         )
 
         super().__init__(
@@ -145,7 +158,7 @@ class MLPBlock(torch.nn.Module):
         )
 
         self.routing_method = RenormalizeMoeRoutingMethod(
-            top_k=pretrained_config.num_experts_per_tok)
+            top_k=pretrained_config.experts_per_token)
 
         self.experts = create_moe(
             routing_method=self.routing_method,
