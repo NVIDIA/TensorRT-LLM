@@ -1026,18 +1026,13 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     self.lora_dirs.append(f"{lora_dir}/{i}")
                     data_cmd += [f"ln -sf {lora_path} {lora_dir}/{i}", ";"]
                 data_cmd += [
-                    "python3",
-                    prepare_data_script,
-                    f"--stdout",
+                    "python3", prepare_data_script, f"--stdout",
                     f"--rand-task-id 0 {nloras-1}",
-                    f"--tokenizer={tokenizer_dir}",
-                    f"--lora-dir={lora_dir}",  # Pass the full LoRA directory path
+                    f"--tokenizer={tokenizer_dir}", f"--lora-dir={lora_dir}",
                     f"token-norm-dist",
                     f"--num-requests={self._config.num_reqs}",
-                    f"--input-mean={input_len}",
-                    f"--output-mean={output_len}",
-                    f"--input-stdev={istdev}",
-                    f"--output-stdev={ostdev}",
+                    f"--input-mean={input_len}", f"--output-mean={output_len}",
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
                     f" > {dataset_path}"
                 ]
             elif self._config.backend == "cppmanager":
@@ -1052,6 +1047,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 ]
                 # generate LoRA weights for C++ runtime
                 # the lora_dir is $engine_dir/loras. This is populated by the convert_lora_cmd executed before this.
+                # The generate_rand_loras.py will create random lora weights to $engine_dir/lora_cpp.
                 generate_rand_lora_script = os.path.join(
                     self._llm_root, "benchmarks", "cpp", "utils",
                     "generate_rand_loras.py")
