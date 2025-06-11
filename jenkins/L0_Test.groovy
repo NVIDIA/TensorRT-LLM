@@ -1317,7 +1317,9 @@ def checkPipInstall(pipeline, wheel_path)
 
 def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312")
 {
-    def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${linuxPkgName}"
+    def pkgName = cpu_arch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-src-" : "tensorrt-llm-release-src-"
+    pkgName += "1aa1b5b4a3daf77ff10838ab530b128cbf8dea2e.tar.gz"
+    def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${pkgName}"
 
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
@@ -2070,7 +2072,8 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                     //     sh "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}"
                     // }
                     sh "env | sort"
-                    runLLMBuildFromPackage(pipeline, values.k8sArch, false, "imageTest/")
+                    def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
+                    runLLMBuildFromPackage(pipeline, cpuArch, false, "imageTest/")
                 })
             }
         }
