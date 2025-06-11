@@ -1819,8 +1819,6 @@ class _AutoDeployLlmArgs(TorchLlmArgs):
             "max_batch_size": 8,
             "max_seq_len": 512,
             "attn_backend": "FlashInfer",
-            # TODO: Remove this when overlap scheduler is supported (https://github.com/NVIDIA/TensorRT-LLM/issues/4364)
-            "disable_overlap_scheduler": True,
         }
         for k, v_default in new_defaults.items():
             if k not in self.__pydantic_fields_set__:

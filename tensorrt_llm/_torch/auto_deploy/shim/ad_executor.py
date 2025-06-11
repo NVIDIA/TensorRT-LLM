@@ -147,7 +147,10 @@ class ADEngine(ModelEngine):
 
     @nvtx_range("ad_prepare_inputs")
     def _prepare_inputs(
-        self, scheduled_requests: ScheduledRequests, resource_manager: ResourceManager
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager,
+        new_tokens: Optional[torch.Tensor] = None,
     ) -> bool:
         """Prepare inputs for AD Model from scheduled requests."""
         # cache manager
@@ -163,6 +166,10 @@ class ADEngine(ModelEngine):
         input_pos: List[int] = []
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
+        previous_batch_indices: List[int] = []
+        # We keep track of the batch index for the requests.
+        # This is needed by the overlap scheduler.
+        batch_idx = 0
 
         # look at context requests first
         for request in context_requests:
@@ -170,21 +177,35 @@ class ADEngine(ModelEngine):
             input_ids.append(request.get_tokens(0))
             input_pos.append(request.context_current_position)
 
-            # only return last logit
+            request.py_batch_idx = batch_idx
+            batch_idx += 1
             last_logit_only.append(True)
 
         # look at extend+generate requests next
         for request in chain(extend_requests, gen_requests):
-            # store input ids and pos of first token in sequence
-            input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
-            input_pos.append(request.max_beam_num_tokens - 1)
+            # new_tokens are provided when the overlap scheduler is enabled.
+            if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
+                input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
+                input_pos.append(request.max_beam_num_tokens - 1)
+            else:
+                previous_batch_indices.append(request.py_batch_idx)
+                input_pos.append(request.max_beam_num_tokens)
 
             # check for draft tokens
             if request.draft_tokens:
                 input_ids[-1].extend([t for t in request.draft_tokens])
 
+            request.py_batch_idx = batch_idx
+            batch_idx += 1
+
             # return all logits
             last_logit_only.append(False)
+
+        # new_tokens is a tensor on the device, we need to convert it to a list of lists.
+        # can we avoid this additional gpu->cpu transfer?
+        new_tokens_list = new_tokens.cpu().tolist() if new_tokens is not None else None
+        for prev_batch_idx in previous_batch_indices:
+            input_ids.append([new_tokens_list[prev_batch_idx]])
 
         # extract cache information for all requests
         for request in chain(context_requests, extend_requests, gen_requests):
@@ -227,7 +248,8 @@ class ADEngine(ModelEngine):
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
-        last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager)
+        new_tokens = getattr(new_tokens_device, "new_tokens", None)
+        last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager, new_tokens)
 
         # compute all logits
         logits = self._compute_logits()
@@ -294,7 +316,11 @@ def create_autodeploy_executor(
     resource_manager.resource_managers.move_to_end("kv_cache_manager", last=True)
 
     # scheduling
-    capacitor_scheduler = BindCapacityScheduler(max_batch_size, kv_cache_manager.impl)
+    capacitor_scheduler = BindCapacityScheduler(
+        max_batch_size,
+        kv_cache_manager.impl,
+        two_step_lookahead=not ad_config.disable_overlap_scheduler,
+    )
     mb_scheduler = BindMicroBatchScheduler(
         max_batch_size, engine.cache_seq_interface.info.max_num_tokens
     )
