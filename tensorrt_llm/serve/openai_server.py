@@ -252,7 +252,7 @@ class OpenAIServer:
             sampling_params = request.to_sampling_params()
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
-
+            # Skip loading when mm_params is provided, i.e., loading + processing is done by encoder server.
             skip_loading = True if request.mm_params is not None else False
             conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config, skip_loading)
 

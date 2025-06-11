@@ -126,8 +126,7 @@ class OpenAIMultiModalDisaggServer:
             pass
 
     async def openai_completion(self, req: CompletionRequest) -> Response:
-        # TODO: support completion mode later
-        assert len(self.mm_servers) == 0, "Multimodal disaggregated mode is not supported in completion mode yet"
+        raise ValueError("Completion mode is not yet supported for multimodal disaggregated server.")
         try:
             gen_req = copy.deepcopy(req)
             if not isinstance(req.prompt, str):
@@ -219,9 +218,7 @@ class OpenAIMultiModalDisaggServer:
         if not gen_req.stream:
             try:
                 if isinstance(gen_req, CompletionRequest):
-                    # TODO: support completion mode later
-                    assert 0, "Completion mode is not supported in multimodal disaggregated mode yet"
-                    gen_response = await self.send_completion_request(gen_server, gen_req)
+                    raise ValueError("Completion mode is not supported in multimodal disaggregated mode.")
                 elif isinstance(gen_req, ChatCompletionRequest):
                     gen_response = await self.send_chat_request(gen_server, gen_req)
                 return gen_response

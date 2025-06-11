@@ -16,15 +16,37 @@ example_images = [
 ]
 
 
-@pytest.mark.parametrize("encoder_model_dir", [
-    "llava-hf/llava-v1.6-mistral-7b-hf",
+@pytest.fixture(scope="function")
+def multimodal_model_config():
+    """Get multimodal model configuration similar to integration tests"""
+    # You can extend this to support multiple models or get from environment
+    model_configs = {
+        'llava-v1.6-mistral-7b-hf': {
+            'model_name': 'llava-v1.6-mistral-7b-hf',
+            'hf_model_dir': 'llava-hf/llava-v1.6-mistral-7b-hf',  # HuggingFace model ID
+        }
+    }
+    
+    return model_configs['llava-v1.6-mistral-7b-hf']
+
+
+@pytest.mark.parametrize("model_key", [
+    "llava-v1.6-mistral-7b-hf",
 ])
-def test_single_image_chat(encoder_model_dir):
+def test_single_image_chat(model_key, multimodal_model_config):
     """Test processing single image using disaggregated encoder + LLM API.
     
     This test verifies that disaggregated multimodal generation produces identical
     results to standard multimodal generation by comparing outputs.
     """
+    # Get model configuration
+    if model_key != "llava-v1.6-mistral-7b-hf":
+        pytest.skip(f"Skipping test for {model_key} - only testing llava-v1.6-mistral-7b-hf for now")
+    
+    # Extract model information from config
+    model_name = multimodal_model_config['model_name']
+    encoder_model_dir = multimodal_model_config['hf_model_dir']
+    
     # Test configuration
     max_tokens = 64
     free_gpu_memory_fraction = 0.6
@@ -161,6 +183,14 @@ def test_single_image_chat(encoder_model_dir):
                 if hasattr(ref_gen, 'logprobs') and hasattr(test_gen, 'logprobs'):
                     assert ref_gen.logprobs == test_gen.logprobs, \
                         f"Log probabilities don't match for output {i}, generation {j}"
+        
+        # Verify non-empty generation for all outputs
+        for i, (ref_output, test_output) in enumerate(zip(outputs_ref, outputs)):
+            ref_text = ref_output.outputs[0].text.strip()
+            test_text = test_output.outputs[0].text.strip()
+            assert len(ref_text) > 0, f"Reference generation produced empty text for input {i}"
+            assert len(test_text) > 0, f"Disaggregated generation produced empty text for input {i}"
+        
     finally:
         # Cleanup resources
         if encoder is not None:

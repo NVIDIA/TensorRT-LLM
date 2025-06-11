@@ -5,17 +5,15 @@ This example demonstrates how to set up disaggregated multimodal serving with Te
 ## ⚠️ Disclaimer
 
 **This is a Proof-of-Concept (POC) and early demonstration with several limitations:**
-
-1. **API Support**: Only OpenAI chat completion mode is supported
-2. **Model Support**: Limited to LLaVA-Next models only
-3. **Modality Support**: Image modality only (no video support yet)
-4. **Server Configuration**: Only supports 1 encoder server and 1 LLM server (though the LLM server can have multiple workers via tensor parallelism)
+1. **Model Support**: Limited to LLaVA-Next models only
+2. **Modality Support**: Image modality only (no video support yet)
+3. **Server Configuration**: Only supports 1 encoder server and 1 LLM server (though the LLM server can have multiple workers via tensor parallelism)
 
 ## Overview
 
 Disaggregated multimodal serving separates the multimodal pipeline into distinct components:
 
-- **Encoder Server**: Handles vision processing (images) using the multimodal encoder
+- **Encoder Server**: Handles vision processing (images), including pre-processing and encoding, using the multimodal encoder
 - **LLM Decoder Server**: Processes text generation using the language model
 - **Disaggregated Server**: Orchestrates requests between encoder and decoder services
 
