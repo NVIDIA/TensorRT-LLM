@@ -1318,7 +1318,7 @@ def checkPipInstall(pipeline, wheel_path)
 def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312")
 {
     def pkgName = cpu_arch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-src-" : "tensorrt-llm-release-src-"
-    pkgName += "1aa1b5b4a3daf77ff10838ab530b128cbf8dea2e.tar.gz"
+    pkgName += "8166649d033109319d7d08cf9541d8996848018f.tar.gz"
     def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${pkgName}"
 
     // Random sleep to avoid resource contention
