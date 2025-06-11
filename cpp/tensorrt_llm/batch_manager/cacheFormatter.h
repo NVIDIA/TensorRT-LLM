@@ -56,6 +56,10 @@ private:
     static constexpr int32_t kDATA_TAG{43};
 };
 
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
+
+BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
+
 // Simple cache block copy. Because it does not involve data splitting or merging, it performs best when the
 // parallel topology is completely identical, making it the preferred method.
 class CacheFormatter final : public IOFormatter

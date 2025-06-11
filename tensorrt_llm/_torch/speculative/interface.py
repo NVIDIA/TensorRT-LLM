@@ -1,7 +1,7 @@
 import copy
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Type
 
 import torch
 
@@ -15,6 +15,8 @@ class SpeculativeDecodingMode(IntEnum):
     MTP = auto()
     MTP_EAGLE = auto()
     EAGLE3 = auto()
+    EAGLE3_ONE_MODEL = auto()
+    NGRAM = auto()
     NONE = auto()
 
     def is_mtp(self):
@@ -26,19 +28,38 @@ class SpeculativeDecodingMode(IntEnum):
     def is_eagle3(self):
         return self == SpeculativeDecodingMode.EAGLE3
 
+    def is_eagle3_one_model(self):
+        return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
+
+    def is_ngram(self):
+        return self == SpeculativeDecodingMode.NGRAM
+
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
 
     def without_logits(self):
-        return self.is_mtp()
+        return self.is_mtp() or self.is_eagle3_one_model()
 
     def needs_kv_cache_rewind(self):
-        return self.is_mtp()
+        return self.is_mtp() or self.is_eagle3_one_model()
 
     def support_overlap_scheduler(self):
-        return self.is_mtp()
+        return self.is_mtp() or self.is_eagle3_one_model()
 
-    def extend_ctx(self, attention_backend: AttentionBackend):
+    def has_draft_model(self):
+        return self.is_eagle3()
+
+    def need_load_draft_weights(self):
+        """
+        Whether the draft model and target model are in the same model engine,
+        and the draft model needs to load weights from the separate checkpoint.
+        """
+        return self.is_eagle3_one_model()
+
+    def has_spec_decoder(self):
+        return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
+
+    def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
         If true, treat generation requests with draft tokens as
         chunked context requests at the kernel level. Required for
@@ -46,8 +67,9 @@ class SpeculativeDecodingMode(IntEnum):
         """
 
         # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
-        return self.is_eagle3() and not (isinstance(
-            attention_backend, TrtllmAttention) and get_sm_version() == 100)
+        return (self.is_eagle3()
+                and not (issubclass(attention_backend, TrtllmAttention)
+                         and get_sm_version() == 100)) or self.is_ngram()
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
@@ -67,6 +89,8 @@ class SpecConfig:
     spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     # The max number of draft tokens
     max_draft_tokens: int = 1024
+    # The path to the draft model
+    draft_model_path: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.spec_dec_mode = SpeculativeDecodingMode.from_string(

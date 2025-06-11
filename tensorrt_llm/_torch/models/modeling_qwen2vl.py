@@ -44,7 +44,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
     def get_rope_index(
         cls,
         model_config: PretrainedConfig,
-        input_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -256,7 +256,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
             return torch.cat(embeds, dim=1)
         return None
 
-    def _postprocess(self, input_ids: torch.LongTensor) -> torch.LongTensor:
+    def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         # NOTE: Qwen2-VL's input processor is doing all the work for fusing input_ids with mm_tokens. So, we just replace mm_tokens with expanded out-of-vocab ids
 
         masks = (input_ids == self.model_config.image_token_id) | (
@@ -269,7 +269,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
 
     def get_mrope_config(
             self,
-            input_ids: torch.LongTensor,
+            input_ids: torch.IntTensor,
             image_grid_thw: torch.LongTensor,
             video_grid_thw: torch.LongTensor,
             attention_mask: torch.Tensor,
@@ -318,12 +318,14 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         mm_processor_kwargs['do_rescale'] = False
         processed_inputs = self._preprocess(text_prompt, mm_data,
                                             mm_processor_kwargs).to(self.device)
-
-        mm_features = self._process(
-            processed_inputs.get('pixel_values', None),
-            processed_inputs.get('pixel_values_videos', None),
-            processed_inputs.get('image_grid_thw', None),
-            processed_inputs.get('video_grid_thw', None))
+        if mm_data:
+            mm_features = self._process(
+                processed_inputs.get('pixel_values', None),
+                processed_inputs.get('pixel_values_videos', None),
+                processed_inputs.get('image_grid_thw', None),
+                processed_inputs.get('video_grid_thw', None))
+        else:
+            mm_features = None
 
         input_ids = processed_inputs['input_ids']
 
@@ -397,8 +399,8 @@ class Qwen2VLModelBase(PreTrainedModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         input_embeds: Optional[torch.Tensor] = None,
         return_context_logits: bool = False,
         **kwargs,
@@ -443,12 +445,12 @@ class Qwen2VLModelBase(PreTrainedModel):
 
 
 @register_auto_model("Qwen2VLForConditionalGeneration")
-@register_input_processor(Qwen2VLInputProcessor)
+@register_input_processor(Qwen2VLInputProcessor, model_type="qwen2_vl")
 class Qwen2VLModel(Qwen2VLModelBase):
     pass
 
 
 @register_auto_model("Qwen2_5_VLForConditionalGeneration")
-@register_input_processor(Qwen2_5_VLInputProcessor)
+@register_input_processor(Qwen2_5_VLInputProcessor, model_type="qwen2_5_vl")
 class Qwen2_5_VLModel(Qwen2VLModelBase):
     pass

@@ -53,6 +53,8 @@ init_ubuntu() {
     llvm \
     libclang-rt-dev \
     libffi-dev \
+    libnuma1 \
+    libnuma-dev \
     python3-dev \
     python3-pip \
     python-is-python3 \
@@ -88,6 +90,8 @@ install_python_rockylinux() {
     llvm-toolset \
     lld \
     libffi-devel \
+    numactl \
+    numactl-devel \
     zlib-devel \
     xz-devel \
     sqlite-devel \
@@ -114,7 +118,7 @@ install_gcctoolset_rockylinux() {
 	  vim \
 	  wget \
 	  git-lfs \
-	  gcc-toolset-13 \
+	  gcc-toolset-11 \
 	  libffi-devel \
 	  -y
   dnf install \
@@ -122,7 +126,7 @@ install_gcctoolset_rockylinux() {
 	  openmpi-devel \
 	  pigz \
 	  -y
-  echo "source scl_source enable gcc-toolset-13" >> "${ENV}"
+  echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
 }
 

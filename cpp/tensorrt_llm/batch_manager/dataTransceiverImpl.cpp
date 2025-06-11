@@ -19,6 +19,9 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/batch_manager/mlaCacheFormatter.h"
+#include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace tensorrt_llm::batch_manager
@@ -38,21 +41,35 @@ DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
 [[nodiscard]] RequestInfo DataSenderImpl::recvRequestInfo()
 {
     using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
+    auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+    bool isAgent = agentConnectionManager != nullptr;
+
+    auto agentRecvFun = [&](RequestInfo& requestInfo)
+    {
+        auto const* connection = agentConnectionManager->recvConnectionAndRequestInfo(requestInfo);
+        return connection;
+    };
     Id id;
-    auto const* connection = mManager->recvConnect(DataContext{kID_TAG}, &id, sizeof(id));
-    TLLM_CHECK(id == Id::REQUEST_SEND);
-    std::uint64_t infoSize{0};
-    connection->recv(executor::kv_cache::DataContext{kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
-    std::string serializedInfo;
-    serializedInfo.resize(infoSize);
-    connection->recv(executor::kv_cache::DataContext{kINFO_TAG}, serializedInfo.data(), infoSize);
-    std::istringstream iss(serializedInfo);
-    auto info = RequestInfo::deserialize(iss);
+    RequestInfo info;
+    auto const* connection
+        = isAgent ? agentRecvFun(info) : mManager->recvConnect(DataContext{kID_TAG}, &id, sizeof(id));
+    if (!isAgent)
+    {
+        TLLM_CHECK(id == Id::REQUEST_SEND);
+        std::uint64_t infoSize{0};
+        connection->recv(executor::kv_cache::DataContext{kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
+        std::string serializedInfo;
+        serializedInfo.resize(infoSize);
+        connection->recv(executor::kv_cache::DataContext{kINFO_TAG}, serializedInfo.data(), infoSize);
+        std::istringstream iss(serializedInfo);
+        info = RequestInfo::deserialize(iss);
+    }
 
     auto requestId = info.getRequestId();
     TLLM_CHECK_WITH_INFO(
         mFormatter->inquireSupport(mSelfState.getCacheState().value(), info.getTransState().getCacheState().value()),
-        "Disagg server does not currently support these cacheState.");
+        "Disagg server does not currently support these cacheState, please check the cacheState of the context and gen "
+        "executors");
     auto peerRelativeRanks = executor::kv_cache::targetIRanks(info.getTransState().getCacheState().value(),
         mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx())
                                  .mIRanks;
@@ -137,21 +154,56 @@ void DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
 
     RequestInfo requestInfo(requestId, mSelfState);
 
-    // TODO: remove IOFormatter and make CacheFormatter new base class
-    auto* cacheFormatter = dynamic_cast<kv_cache_manager::CacheFormatter const*>(mFormatter.get());
-    if (cacheFormatter != nullptr)
+    if (!common::getEnvDisableSelectiveCacheTransfer())
     {
-        auto* cacheManager = cacheFormatter->getCacheManager();
-        auto blockRange
-            = kv_cache_manager::BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
-        requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
+        // TODO: remove IOFormatter and make CacheFormatter new base class
+        auto* cacheFormatter = dynamic_cast<kv_cache_manager::CacheFormatter const*>(mFormatter.get());
+        auto* mlaCacheFormatter = dynamic_cast<kv_cache_manager::MLACacheFormatter const*>(mFormatter.get());
+        if (cacheFormatter != nullptr)
+        {
+            auto* cacheManager = cacheFormatter->getCacheManager();
+            auto blockRange
+                = kv_cache_manager::BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
+            requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
+        }
+        else if (mlaCacheFormatter != nullptr)
+        {
+            auto* cacheManager = mlaCacheFormatter->getCacheManager();
+            auto blockRange
+                = kv_cache_manager::BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
+            requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
+        }
     }
 
-    for (auto index : mFormatter->getCounterparts(
-             mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx(), destCacheState))
+    auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+    std::optional<size_t> cacheBufferId = std::nullopt;
+    if (agentConnectionManager != nullptr)
+    {
+        cacheBufferId = agentConnectionManager->getCacheTransBufferManager()->assignBufferIndexForRecv();
+        TLLM_CHECK(cacheBufferId.has_value());
+        // memory Desp , validSegmentIdx send
+    }
+    auto counterParts = mFormatter->getCounterparts(
+        mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx(), destCacheState);
+    for (auto index : counterParts)
     {
         auto const* connection = mManager->getConnections(commState).at(index);
-        sendRequestInfo(connection, requestInfo);
+        // if Manager is agentConnectionManager, then send request info to agent
+        auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+        if (agentConnectionManager != nullptr)
+        {
+            // TODO: index -> validConnectionIdx conversion
+            auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
+            TLLM_CHECK(agentConnection != nullptr);
+            TLLM_CHECK(cacheBufferId.has_value());
+            int valideConnectionIdx = std::find(counterParts.begin(), counterParts.end(), index) - counterParts.begin();
+            const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
+                ->sendRequestAndBufferInfo(requestInfo, cacheBufferId, valideConnectionIdx);
+        }
+        else
+        {
+            sendRequestInfo(connection, requestInfo);
+        }
     }
 }
 

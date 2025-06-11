@@ -28,7 +28,8 @@ PUSH_TO_STAGING    ?= 1
 DOCKER_BUILD_OPTS  ?= --pull --load
 DOCKER_BUILD_ARGS  ?=
 DOCKER_PROGRESS    ?= auto
-CUDA_ARCHS         ?=
+PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || echo "amd64")
+CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90-real;100-real;120-real',)
 BUILD_WHEEL_OPTS   ?=
 BUILD_WHEEL_ARGS   ?= $(shell grep 'ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
 TORCH_INSTALL_TYPE ?= skip
@@ -42,7 +43,9 @@ TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | g
 GITHUB_MIRROR      ?=
 PYTHON_VERSION     ?=
 NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
-PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || echo "amd64")
+NGC_REPO           ?= nvcr.io/nvidia/tensorrt-llm
+NGC_USE_STAGING    ?= 0
+NGC_AUTO_REPO      ?= $(if $(filter 1,$(NGC_USE_STAGING)),$(NGC_STAGING_REPO),$(NGC_REPO))
 
 define add_local_user
 	docker build \
@@ -146,6 +149,9 @@ endif
 
 devel_%: STAGE = devel
 tritondevel_%: STAGE = tritondevel
+tritonrelease_%: STAGE = tritonrelease
+tritonrelease_%: DEVEL_IMAGE = tritondevel
+tritonrelease_run: WORK_DIR = /app/tensorrt_llm
 
 wheel_%: STAGE = wheel
 wheel_run: WORK_DIR = /src/tensorrt_llm
@@ -155,32 +161,37 @@ release_run: WORK_DIR = /app/tensorrt_llm
 
 # For x86_64
 jenkins_%: IMAGE_WITH_TAG = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-jenkins_%: STAGE = devel
+jenkins_%: STAGE = tritondevel
 
 # For aarch64
 jenkins-aarch64_%: IMAGE_WITH_TAG = $(shell grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-jenkins-aarch64_%: STAGE = devel
+jenkins-aarch64_%: STAGE = tritondevel
 
 # For x86_64
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell grep 'LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
-jenkins-rockylinux8_%: STAGE = devel
+jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
 jenkins-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
 
-rockylinux8_%: STAGE = devel
+rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvidia/cuda
 rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
 
 # For x86_64 and aarch64
-ubuntu22_%: STAGE = devel
+ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
 ubuntu22_%: BASE_TAG = 12.9.0-devel-ubuntu22.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0
-trtllm_%: DEVEL_IMAGE = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
+trtllm_%: DEVEL_IMAGE = $(shell \
+    if [ "$(PLATFORM)" = "amd64" ]; then \
+        grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"'; \
+    elif [ "$(PLATFORM)" = "arm64" ]; then \
+        grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"'; \
+    fi)
 trtllm_%: IMAGE_NAME = $(shell grep 'IMAGE_NAME = ' ../jenkins/BuildDockerImage.groovy | grep -o '".*"' | tr -d '"')
-trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')
+trtllm_%: IMAGE_TAG = $(shell git rev-parse --abbrev-ref HEAD | tr '/' '_')-$(PLATFORM)
 trtllm_run: WORK_DIR = /app/tensorrt_llm
 
 # This requires a docker installation with multi-platform support
@@ -192,22 +203,33 @@ ngc-devel_%: IMAGE_TAG = $(TRT_LLM_VERSION)
 ngc-devel_push: DOCKER_BUILD_ARGS = --push
 ngc-devel_push: ngc-devel_build ;
 
+ngc-devel_run:  IMAGE_NAME = $(NGC_AUTO_REPO)
+ngc-devel_pull: IMAGE_NAME = $(NGC_AUTO_REPO)
+
 ngc-release_%: STAGE = release
 ngc-release_%: DOCKER_BUILD_OPTS = --pull --load --platform linux/$(PLATFORM)
 ngc-release_%: DEVEL_IMAGE = $(NGC_STAGING_REPO)/devel:$(TRT_LLM_VERSION)
-ngc-release_%: IMAGE_NAME = nvcr.io/nvstaging/tensorrt-llm
+ngc-release_%: IMAGE_NAME = $(NGC_STAGING_REPO)
 ngc-release_%: IMAGE_TAG = $(TRT_LLM_VERSION)-$(PLATFORM)
+
+ngc-release_run:  WORK_DIR = /app/tensorrt_llm
+ngc-release_run:  IMAGE_NAME = $(NGC_AUTO_REPO)
+ngc-release_run:  IMAGE_TAG = $(TRT_LLM_VERSION)
+ngc-release_pull: IMAGE_NAME = $(NGC_AUTO_REPO)
+ngc-release_pull: IMAGE_TAG = $(TRT_LLM_VERSION)
 
 ngc-manifest_%: STAGE = release
 ngc-manifest_%: IMAGE_NAME = $(NGC_STAGING_REPO)
 ngc-manifest_%: IMAGE_TAG = $(TRT_LLM_VERSION)
 
 ngc-manifest_create:
+	docker pull $(IMAGE_WITH_TAG)-amd64
+	docker pull $(IMAGE_WITH_TAG)-arm64
 	docker manifest create $(IMAGE_WITH_TAG) \
   		--amend $(IMAGE_WITH_TAG)-amd64 \
   		--amend $(IMAGE_WITH_TAG)-arm64
 
-ngc-manifest_push:
+ngc-manifest_push: ngc-manifest_create
 	docker manifest push $(IMAGE_WITH_TAG)
 
 build: devel_build ;

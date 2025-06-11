@@ -19,22 +19,52 @@
 
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheConcatenate.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-
 #include <cstddef>
 #include <cstdint>
 #include <future>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest)
+{
+    size_t requestBlockNum = llmRequest.getRequestedBlockHashes().size();
+    constexpr SizeType32 beam{0};
+    auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
+    if (common::getEnvDisableSelectiveCacheTransfer())
+    {
+        return blockRange;
+    }
+    if (requestBlockNum < blockRange.size() && requestBlockNum > 0)
+    {
+        // handle block reuse, the prefix blocks are reused
+        // TODO(zhengd): pass the hashes directly instead of from llmRequest; use hash instead of block num
+        auto const& ids = blockRange.getBlockIds();
+        blockRange.setBlockIds({ids.end() - requestBlockNum, ids.end()});
+    }
+    return blockRange;
+}
+
+BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest)
+{
+    if (common::getEnvDisableSelectiveCacheTransfer())
+    {
+        constexpr SizeType32 beam{0};
+        return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
+    }
+    return BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
+}
 
 void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
     std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
@@ -46,17 +76,8 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
 
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
     TLLM_CHECK(!connections.empty());
-    constexpr SizeType32 beam{0};
     auto& blockManager = mCacheManager->getBlockManager();
-    size_t requestBlockNum = llmRequest.getRequestedBlockHashes().size();
-    auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId, beam);
-    if (requestBlockNum < blockRange.size() && requestBlockNum > 0)
-    {
-        // handle block reuse, the prefix blocks are reused
-        // TODO(zhengd): pass the hashes directly instead of from llmRequest; use hash instead of block num
-        auto const& ids = blockRange.getBlockIds();
-        blockRange.setBlockIds({ids.end() - requestBlockNum, ids.end()});
-    }
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
 
     auto const numPools = blockManager.getNumPools();
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
@@ -147,6 +168,13 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
             cacheBufferId, targetNum, targetBufferSize, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
         auto& bufferCoverTargetNum = std::get<1>(result);
+        auto& onlyUseDynamicBuffer = std::get<2>(result);
+        auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+        if (agentConnnecion != nullptr)
+        {
+            TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need all buffer pre-allocated");
+            TLLM_CHECK(onlyUseDynamicBuffer == false);
+        }
 
         tensorrt_llm::executor::kv_cache::splitKVCacheDispatch(
             inputKvCacheBlocks, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
@@ -270,7 +298,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
         "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
         llmRequest.getContextPhaseParams().value().getReqId());
     TLLM_CHECK(!connections.empty());
-    auto blockRange = BlockRange::fromNewlyAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId);
+    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
@@ -420,13 +448,28 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                 }
                 else
                 {
-                    cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
+                    auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+                    if (agentConnnecion != nullptr)
+                    {
+                        cacheBufferId = agentConnnecion->getCacheBufferId();
+                        TLLM_CHECK(cacheBufferId.has_value());
+                    }
+                    else
+                    {
+                        cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
+                    }
+                    TLLM_CHECK(cacheBufferId.has_value());
                     auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
                         = mCacheTransBufferManager->getOrAllocateRecvBuffers(
                             cacheBufferId, targetNum, targetBufferSize, bufferManager);
                     bufferCoverTargetNum = bufferCoverTargetNumtmp;
                     remainNoCoverTargetNum = targetNum > bufferCoverTargetNum ? targetNum - bufferCoverTargetNum : 0;
 
+                    if (agentConnnecion != nullptr)
+                    {
+                        TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need buffer pre-allocated");
+                        TLLM_CHECK(onlyUseDynamicBuffer == false);
+                    }
                     recvSplitCaches = std::move(recvSplitCachestmp);
                 }
 
@@ -576,6 +619,11 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
 
 [[nodiscard]] bool CacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const
 {
+    if (selfConfig.getDataType() != destConfig.getDataType())
+    {
+        return false;
+    }
+
     std::unordered_set<SizeType32> setVecSelf{
         selfConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), selfConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
 
@@ -595,6 +643,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
     {
         return false;
     }
+
     std::unordered_set<int> setVecDest{
         destConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), destConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
 

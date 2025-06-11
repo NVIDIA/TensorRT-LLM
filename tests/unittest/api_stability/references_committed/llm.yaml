@@ -47,15 +47,9 @@ methods:
       enable_lora:
         annotation: bool
         default: false
-      max_lora_rank:
-        annotation: Optional[int]
+      lora_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.LoraConfig]
         default: null
-      max_loras:
-        annotation: int
-        default: 4
-      max_cpu_loras:
-        annotation: int
-        default: 4
       # Prompt tuning
       enable_prompt_adapter:
         annotation: bool
@@ -80,7 +74,7 @@ methods:
       # Speculative decoding
       speculative_config:
         annotation: Union[tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_utils.MedusaDecodingConfig,
-          tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, NoneType]
+          tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, tensorrt_llm.llmapi.llm_args.NGramDecodingConfig, NoneType]
         default: null
       # generation constraints
       max_batch_size:
@@ -109,7 +103,7 @@ methods:
         annotation: bool
         default: false
       kv_cache_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConfig]
+        annotation: tensorrt_llm.llmapi.llm_args.KvCacheConfig
         default: null
     return_annotation: None
   generate:

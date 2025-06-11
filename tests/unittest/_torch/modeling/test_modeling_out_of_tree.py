@@ -40,7 +40,8 @@ class TestOutOfTree(unittest.TestCase):
 
         llm = LLM(model=model_dir,
                   kv_cache_config=kv_cache_config,
-                  max_num_tokens=2048)
+                  max_num_tokens=2048,
+                  disable_overlap_scheduler=True)
 
         prompts = [
             "Hello, my name is",

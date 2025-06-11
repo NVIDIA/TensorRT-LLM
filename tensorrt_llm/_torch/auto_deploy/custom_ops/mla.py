@@ -17,7 +17,6 @@ from .attention_interface import (
     PrepareMetadataCallable,
     SequenceInfo,
 )
-from .torch_attention import apply_rotary_pos_emb_ds
 from .triton_attention import _flattened_context_mha, _generate_mha
 
 Constant = Union[int, float, str, None]
@@ -74,25 +73,37 @@ def fused_flattened_mla_with_cache(
     # Apply RoPE
     if cos_sin_stacked.numel() > 0:
         # Extract cos and sin from freqs_cis
-        cos = cos_sin_stacked[0, ...]
-        sin = cos_sin_stacked[1, ...]
+        cos_base = cos_sin_stacked[0, ...]
+        sin_base = cos_sin_stacked[1, ...]
 
         # TODO: Use triton kernels for RoPE
         # TODO: Add yarn support
-        for idx in range(seq_len.shape[0]):
-            (
-                q_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-                k_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-            ) = apply_rotary_pos_emb_ds(
-                q_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
-                k_pe[seq_start[idx] : seq_start[idx] + seq_len[idx], ...],
+        for i in range(seq_len.shape[0]):
+            start = seq_start[i]
+            length = seq_len[i]
+
+            # build position_ids
+            if s == 1:
+                idx = (input_pos[i] + length - 1).item()
+                pos_ids = torch.tensor(idx, device=cos_base.device)
+            else:
+                pos_ids = torch.arange(input_pos[i], input_pos[i] + length, device=cos_base.device)
+
+            cos = cos_base[pos_ids]  # [..., 1, head_dim]
+            sin = sin_base[pos_ids]
+            q_slice = q_pe[start : start + length]
+            k_slice = k_pe[start : start + length]
+
+            q_rot, k_rot = torch.ops.rope.torch_apply_rope_with_qk_interleaving(
+                q_slice,
+                k_slice,
                 cos,
                 sin,
-                torch.arange(input_pos[idx] + seq_len[idx])[-1]
-                if s == 1
-                else torch.arange(input_pos[idx] + seq_len[idx]),
                 -2,
             )
+
+            q_pe[start : start + length] = q_rot
+            k_pe[start : start + length] = k_rot
 
     # Create query_states, key_states
     query_states = torch.cat((q_nope, q_pe), dim=-1)  # [b*s,n,d]

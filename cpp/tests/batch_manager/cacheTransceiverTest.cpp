@@ -31,6 +31,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -419,7 +420,7 @@ protected:
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
         if (isSender)
         {
-            auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mManager, llmRequest->mRequestId);
+            auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
             for (auto& block : blockRange)
             {
                 // fill cache with tokens (= request length), for reuse test
@@ -432,7 +433,7 @@ protected:
             auto future = mRequester->requestAndReceiveAsync(*llmRequest);
             future.get();
             TLLM_CUDA_CHECK(cudaDeviceSynchronize());
-            auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mManager, llmRequest->mRequestId);
+            auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
             for (auto& block : blockRange)
             {
                 std::vector<uint8_t> bytes(block.getSizeInBytes());
@@ -684,12 +685,14 @@ protected:
         {
             return;
         }
-        else if (tensorrt_llm::common::getEnvUseMPIKvCache() || tensorrt_llm::common::getEnvUseUCXKvCache())
+        else if (tensorrt_llm::common::getEnvUseMPIKvCache() || tensorrt_llm::common::getEnvUseUCXKvCache()
+            || tensorrt_llm::common::getEnvUseNixlKvCache())
         {
-            int maxNumTokens = 1024;
+            int maxNumTokens = 2048;
             mCacheTransBufferManager = std::make_unique<CacheTransBufferManager>(mManager.get(), maxNumTokens);
             bool isUcx = tensorrt_llm::common::getEnvUseUCXKvCache();
-            TLLM_LOG_INFO("Enable %s KV cache transport.", isUcx ? "UCX" : "MPI");
+            bool isNixl = tensorrt_llm::common::getEnvUseNixlKvCache();
+            TLLM_LOG_INFO("Enable %s KV cache transport.", isUcx ? "UCX" : isNixl ? "NIXL" : "MPI");
 
             if (isUcx)
             {
@@ -708,6 +711,15 @@ protected:
                 std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)();
                 *(void**) (&makeUcxConnectionManager) = load_sym(WrapperLibHandle, "makeUcxConnectionManager");
                 mConnectionManager = makeUcxConnectionManager();
+            }
+            else if (isNixl)
+            {
+                constexpr auto port = 22345;
+
+                setenv("TRTLLM_NIXL_PORT", std::to_string(port).c_str(), 1);
+
+                mConnectionManager
+                    = std::make_unique<texec::kv_cache::AgentConnectionManager>(mCacheTransBufferManager.get());
             }
             else
             {
@@ -736,7 +748,7 @@ protected:
             std::vector<int> contextRankVec(mContextRankSize);
             std::iota(contextRankVec.begin(), contextRankVec.end(), 0);
 
-            if (isUcx)
+            if (isUcx || isNixl)
             {
                 auto commState = mConnectionManager->getCommState();
                 namespace su = tensorrt_llm::executor::serialize_utils;
@@ -839,7 +851,7 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
-        auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mManager, llmRequest->mRequestId);
+        auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
         int blockIdx = 0;
         for (auto& block : blockRange)
         {
@@ -875,7 +887,7 @@ protected:
 
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 
-        auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mManager, llmRequest->mRequestId);
+        auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
         for (auto& block : blockRange)
         {
             verifyBlockData(block, blockIdx, llmRequest->getPromptLen());
@@ -1191,7 +1203,8 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
         int requestId = 0;
         for (auto len : {30, 10, 60, 30, 60, 10})
         {
-            requests.emplace_back(makeLlmRequestWithDP(len, requestId++, requestId % contextTp));
+            requests.emplace_back(makeLlmRequestWithDP(len, requestId, requestId % contextTp));
+            requestId++;
         }
         std::vector<std::future<void>> contextFutures;
         std::vector<std::future<void>> generationFutures;
@@ -1204,7 +1217,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
             {
                 for (int i = 0; i < requests.size(); i++)
                 {
-                    if (i % mTpSize == mTpRank)
+                    if ((i) % mTpSize == mTpRank)
                     {
                         // round robin
                         contextRequests.push_back(requests[i]);
@@ -1227,7 +1240,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
             {
                 for (int i = 0; i < requests.size(); i++)
                 {
-                    if (i % mTpSize == mTpRank)
+                    if ((i) % mTpSize == mTpRank)
                     {
                         generationRequests.push_back(requests[i]);
                     }
