@@ -438,6 +438,7 @@ void DecoderXQAImplPrecompiled::runDispatchBuffer(
 
 #define SUPPORT_RETURN_FALSE(X)                                                                                        \
     {                                                                                                                  \
+        TLLM_LOG_DEBUG("XQA is not used. Reason: %s", X);                                                              \
         return false;                                                                                                  \
     }
 
@@ -522,8 +523,17 @@ bool DecoderXQAImplPrecompiled::shouldUse(XQAParams const& xqaParams, bool forCo
     }
 
     XQAKernelList const* xqa_kernel = getXQAKernels(mRunner->mDataType, tensorrt_llm::common::getSMVersion());
-    return xqa_kernel->supportConfig(xqaParams)
-        && xqa_kernel->mayHavePerfGain(xqaParams, mRunner->mMultiProcessorCount);
+    bool supportConfig = xqa_kernel->supportConfig(xqaParams);
+    if (!supportConfig)
+    {
+        SUPPORT_RETURN_FALSE("supportConfig");
+    }
+    bool mayHavePerfGain = xqa_kernel->mayHavePerfGain(xqaParams, mRunner->mMultiProcessorCount);
+    if (!mayHavePerfGain)
+    {
+        SUPPORT_RETURN_FALSE("mayHavePerfGain");
+    }
+    return true;
 }
 
 #undef SUPPORT_RETURN_FALSE
