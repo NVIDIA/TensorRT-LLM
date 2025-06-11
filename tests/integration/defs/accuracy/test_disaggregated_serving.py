@@ -83,6 +83,7 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
         yaml.dump(gen_server_config, f)
 
     args = LlmArgs.from_kwargs(model=model_name,
+                               backend="pytorch",
                                tensor_parallel_size=tensor_parallel_size)
 
     trtllm_serve_path = "trtllm-serve"
@@ -211,9 +212,9 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
 
+    @pytest.mark.skip_device_not_contain(["H200"])
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
-        pytest.skip("https://nvbugs/5297821")
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
         disaggregated_server_config = {

@@ -68,6 +68,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
         attn_page_size=config.attn_page_size,  # Now passed directly as AutoDeploy parameter
         tensor_parallel_size=config.world_size,
         tokenizer=factory.init_tokenizer() if config.customize_tokenizer else None,
+        checkpoint_device=config.checkpoint_device,
     )
 
     return llm

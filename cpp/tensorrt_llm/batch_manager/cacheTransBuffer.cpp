@@ -327,7 +327,7 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> CacheTransBuf
     TLLM_LOG_DEBUG("getOrAllocateBuffers bufferCoverTargetNum:%d", bufferCoverTargetNum);
     if (bufferId.has_value())
     {
-        TLLM_CHECK(static_cast<size_t>(bufferId.value()) < mSendBufferCount);
+        TLLM_CHECK(static_cast<size_t>(bufferId.value()) < concurrenceResource.mBuffers.size());
         TLLM_CHECK(concurrenceResource.mBufferIndexFlag[bufferId.value()] == 1);
 
         for (int i = 0; i < targetNum; i++)

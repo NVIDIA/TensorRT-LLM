@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cuda.h>
 #include <optional>
+#include <vector>
 
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
@@ -45,20 +47,40 @@ public:
     explicit TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunnerOptions const& options);
 
     [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
-        std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim);
+        std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
+        std::optional<int32_t> configIndex = std::nullopt);
 
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
         int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a, void const* sfA, void const* b,
         void const* sfB, void const* perTokensSfA, void const* perTokensSfB, float const* scaleC,
         float const* scaleGateC, void* c, void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens,
         int32_t const* ctaIdxXyToBatchIdx, int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
-        void* workspace, CUstream stream, int device);
+        void* workspace, CUstream stream, int device, std::optional<int32_t> configIndex = std::nullopt);
 
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
-        void const* b, void const* sfB, void* c, void* outSfC, void* workspace, CUstream stream, int device);
+        void const* b, void const* sfB, void* c, void* outSfC, void* workspace, CUstream stream, int device,
+        std::optional<int32_t> configIndex = std::nullopt);
 
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* b,
-        float const* scaleC, float const* scaleGateC, void* c, void* workspace, CUstream stream, int device);
+        float const* scaleC, float const* scaleGateC, void* c, void* workspace, CUstream stream, int device,
+        std::optional<int32_t> configIndex = std::nullopt);
+
+    // Get the list of configs that passed the validation based on the constructor options
+    [[nodiscard]] std::vector<int32_t> getPassingConfigIndices() const
+    {
+        return mPassingConfigIndices;
+    }
+
+    // Get the list of config indices that are valid for the given problem shape
+    [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t m, int32_t n, int32_t k,
+        std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches,
+        int32_t maxNumCtasInBatchDim) const;
+
+    // Get a default config index that is valid for the given problem shape
+    // This will be used as the fallback config if using auto-tuning
+    [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t m, int32_t n, int32_t k,
+        std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches,
+        int32_t maxNumCtasInBatchDim) const;
 
 private:
     void selectGemmConfig(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
@@ -66,8 +88,8 @@ private:
 
 private:
     TrtllmGenBatchedGemmRunnerOptions mOptions;
-    std::optional<int> mSelectedConfigIndex;
     std::vector<int32_t> mPassingConfigIndices;
+    std::optional<int32_t> mSelectedConfigIndex;
 };
 } // namespace kernels
 } // namespace tensorrt_llm

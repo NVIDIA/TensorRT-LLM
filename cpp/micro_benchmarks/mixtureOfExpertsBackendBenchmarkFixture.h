@@ -298,13 +298,20 @@ public:
     using WeightType = typename TypeTuple_::WeightType;
     using OutputType = typename TypeTuple_::OutputType;
     constexpr static bool INT4 = std::is_same_v<WeightType, cutlass::uint4b_t>;
-    constexpr static bool FP4 = std::is_same_v<DataType, SafeFP4>;
-    constexpr static bool FP8 = std::is_same_v<DataType, SafeFP8>;
-    constexpr static bool INT_QUANT = !std::is_same_v<DataType, WeightType>;
-    using InputType = std::conditional_t<FP4, OutputType, DataType>;
-    using WeightStorage = std::conditional_t<INT_QUANT || FP4, uint8_t, WeightType>;
-    constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || FP4) ? 2 : 1;
+    constexpr static bool NVFP4 = std::is_same_v<DataType, SafeFP4> && std::is_same_v<WeightType, SafeFP4>;
+    constexpr static bool FP8 = std::is_same_v<DataType, SafeFP8> && std::is_same_v<WeightType, SafeFP8>;
+    constexpr static bool WFP4AFP8 = std::is_same_v<WeightType, SafeFP4> && std::is_same_v<DataType, SafeFP8>;
+    constexpr static bool INT_QUANT = !std::is_same_v<DataType, WeightType>
+        && (std::is_same_v<WeightType, cutlass::uint4b_t> || std::is_same_v<WeightType, uint8_t>);
+    constexpr static bool ANY_FP4 = NVFP4 || WFP4AFP8;
+    using InputType = std::conditional_t<NVFP4, OutputType, DataType>;
+    using WeightStorage = std::conditional_t<INT_QUANT || ANY_FP4, uint8_t, WeightType>;
+    constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || ANY_FP4) ? 2 : 1;
     int const BASE_HIDDEN_SIZE = 64 / sizeof(WeightType) * WEIGHT_ELEM_PER_BYTE;
+
+    constexpr static int64_t FP4_VECTOR_SIZE = NVFP4
+        ? tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
+        : tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize;
 
     std::vector<BufferManager::IBufferPtr> managed_buffers;
     int* mSelectedExperts{};
@@ -316,12 +323,12 @@ public:
 
     constexpr static nvinfer1::DataType toDTypeID()
     {
-        if (FP8)
+        if (FP8 || WFP4AFP8)
             return nvinfer1::DataType::kFP8;
-        if (FP4)
+        if (NVFP4)
             return nvinfer1::DataType::kFP4;
         if (INT_QUANT && INT4)
-            return nvinfer1::DataType::kINT4; // Hack to distinguish int4, use unsigned
+            return nvinfer1::DataType::kINT4;
         if (INT_QUANT)
             return nvinfer1::DataType::kINT8;
         if (std::is_same_v<DataType, float>)
@@ -331,9 +338,29 @@ public:
 #ifdef ENABLE_BF16
         if (std::is_same_v<DataType, nv_bfloat16>)
             return nvinfer1::DataType::kBF16;
-#else
-        TLLM_THROW("Unrecognised format");
 #endif
+        TLLM_THROW("Unrecognised format");
+    };
+
+    constexpr static nvinfer1::DataType toWTypeID()
+    {
+        if (FP8)
+            return nvinfer1::DataType::kFP8;
+        if (NVFP4 || WFP4AFP8)
+            return nvinfer1::DataType::kFP4;
+        if (INT_QUANT && INT4)
+            return nvinfer1::DataType::kINT4;
+        if (INT_QUANT)
+            return nvinfer1::DataType::kINT8;
+        if (std::is_same_v<DataType, float>)
+            return nvinfer1::DataType::kFLOAT;
+        if (std::is_same_v<DataType, half>)
+            return nvinfer1::DataType::kHALF;
+#ifdef ENABLE_BF16
+        if (std::is_same_v<DataType, nv_bfloat16>)
+            return nvinfer1::DataType::kBF16;
+#endif
+        TLLM_THROW("Unrecognised format");
     };
 
     template <class T>
@@ -345,7 +372,7 @@ public:
         }
         else if constexpr (std::is_same_v<T, SafeFP4>)
         {
-            return nvinfer1::DataType::kINT64;
+            return nvinfer1::DataType::kFP4;
         }
         else if constexpr (std::is_same_v<T, uint8_t>)
         {
@@ -380,10 +407,10 @@ public:
         static_assert(!FP8, "FP8 Tests enabled on unsupported CUDA version");
 #endif
 #ifndef ENABLE_FP4
-        static_assert(!FP4, "FP4 Tests enabled on unsupported CUDA version");
+        static_assert(!ANY_FP4, "FP4 Tests enabled on unsupported CUDA version");
 #endif
         bool should_skip_unsupported_fp8 = getSMVersion() < 89 && FP8;
-        bool should_skip_unsupported_fp4 = (getSMVersion() < 100 || getSMVersion() >= 120) && FP4;
+        bool should_skip_unsupported_fp4 = (getSMVersion() < 100 || getSMVersion() >= 120) && ANY_FP4;
         return should_skip_unsupported_fp8 || should_skip_unsupported_fp4;
     }
 
@@ -496,8 +523,9 @@ public:
         mGatedMultiplier = mIsGated ? 2 : 1;
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
-        size_t workspace_size = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK,
-            mActType, {}, mUseLora, /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, mUsePrequantScale);
+        size_t workspace_size
+            = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, {},
+                mUseLora, /*use_deepseek_fp8_block_scale=*/false, /*min_latency_mode=*/false, mUsePrequantScale);
 
         mWorkspace = allocBuffer<char>(workspace_size);
         size_t const expert_matrix_size = mNumExperts * mHiddenSize * mInterSize;
@@ -528,20 +556,19 @@ public:
 
             mQuantParams = QuantParams::FP8(mExpertFP8Scale1, mExpertFP8Scale2, mExpertFP8Scale3);
         }
-        else if constexpr (FP4)
+        else if constexpr (ANY_FP4)
         {
             mExpertFP4ActScale1 = allocBuffer<float>(1);
-            mExpertFP4WeightSf1 = allocBuffer<ElementSF>(num_experts * gated_inter * mHiddenSize
-                / tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize);
+            mExpertFP4WeightSf1 = allocBuffer<ElementSF>(num_experts * gated_inter * mHiddenSize / FP4_VECTOR_SIZE);
             mExpertFP4GlobalScale1 = allocBuffer<float>(num_experts);
 
             mExpertFP4ActScale2 = allocBuffer<float>(1);
-            mExpertFP4WeightSf2 = allocBuffer<ElementSF>(num_experts * mInterSize * mHiddenSize
-                / tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize);
+            mExpertFP4WeightSf2 = allocBuffer<ElementSF>(num_experts * mInterSize * mHiddenSize / FP4_VECTOR_SIZE);
             mExpertFP4GlobalScale2 = allocBuffer<float>(num_experts);
 
-            mQuantParams = QuantParams::FP4(mExpertFP4ActScale1, mExpertFP4WeightSf1, mExpertFP4GlobalScale1,
-                mExpertFP4ActScale2, mExpertFP4WeightSf2, mExpertFP4GlobalScale2);
+            auto func = NVFP4 ? QuantParams::FP4 : QuantParams::FP8MXFP4;
+            mQuantParams = func(mExpertFP4ActScale1, mExpertFP4WeightSf1, mExpertFP4GlobalScale1, mExpertFP4ActScale2,
+                mExpertFP4WeightSf2, mExpertFP4GlobalScale2);
         }
 
         mSelectedExperts = allocBuffer<int>(mTotalTokens * mK);
@@ -737,7 +764,7 @@ public:
             mExpertWeight1, mExpertBias1, mActType, mExpertWeight2, mExpertBias2, mQuantParams, mTotalTokens,
             mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
             parallelism_config, mUseLora, mLoraParams,
-            /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
+            /*use_deepseek_fp8_block_scale=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
     }
 
     void runBenchmark(benchmark::State& state);
@@ -775,6 +802,7 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     state.counters["act_fn"] = (int) mActType;
     state.counters["routing_config"] = (int) routing_config;
     state.counters["dtype"] = (int) toDTypeID();
+    state.counters["wtype"] = (int) toWTypeID();
 
     std::stringstream ss;
     ss << "Experts,K,Hidden,Inter,TP,EP,Rank,Tokens,Bias,Scale,Actfn,Tactic,Routing=";

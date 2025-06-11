@@ -187,7 +187,7 @@ def test_nemotron_h_correctness():
     nemotron_h = NemotronHForCausalLM(model_config).to(device)
 
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    weights = load_weights(model_dir, mapping=mapping)
+    weights = load_weights(model_dir)
     nemotron_h.load_weights(weights)
 
     text_prompts = [
@@ -406,6 +406,10 @@ def test_nemotron_h_correctness():
                                    rtol=0.0)
 
     kv_cache_manager.shutdown()
+
+    # clear memory before next test
+    del nemotron_h
+    torch.cuda.empty_cache()
 
 
 # TODO: once LLM API supports context and generation logits, use it in above test and remove this one
