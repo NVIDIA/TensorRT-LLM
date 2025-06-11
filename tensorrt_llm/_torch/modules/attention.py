@@ -233,6 +233,7 @@ class Attention(nn.Module):
         lora_params: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
+        attention_sinks: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -276,6 +277,8 @@ class Attention(nn.Module):
             out_scale_sf = self.o_proj.input_scale
 
         q, k, v = self.convert_qkv(q, k, v)
+        if attention_sinks is not None:
+            assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
         attn_output = self.attn.forward(
             q,
             k,
@@ -286,7 +289,8 @@ class Attention(nn.Module):
             attention_mask=attention_mask,
             mrope_config=mrope_config,
             attention_window_size=attention_window_size,
-            attention_mask_data=attention_mask_data)
+            attention_mask_data=attention_mask_data,
+            attention_sinks=attention_sinks)
         hidden_states = attn_output
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,

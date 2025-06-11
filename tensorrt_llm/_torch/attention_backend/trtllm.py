@@ -180,6 +180,7 @@ class TrtllmAttentionWrapper:
         spec_decoding_position_offsets: Optional[torch.Tensor] = None,
         spec_decoding_packed_mask: Optional[torch.Tensor] = None,
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
+        attention_sinks: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -215,6 +216,7 @@ class TrtllmAttentionWrapper:
             mla_context_paged_kv (torch.Tensor): The paged KV cache for MLA context, for kv cache reuse/chunked context.
             mla_context_kv_cache_block_offsets (torch.Tensor): The block offsets for the paged KV cache for MLA context, for kv cache reuse/chunked context.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
+            attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -251,6 +253,7 @@ class TrtllmAttentionWrapper:
         self.mla_context_paged_kv = mla_context_paged_kv
         self.mla_context_kv_cache_block_offsets = mla_context_kv_cache_block_offsets
         self.softmax_stats_tensor = softmax_stats_tensor
+        self.attention_sinks = attention_sinks
 
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
@@ -432,6 +435,7 @@ class TrtllmAttentionWrapper:
             self.latent_cache,
             self.q_pe,
             self.block_ids_per_seq,
+            self.attention_sinks,
             is_fused_qkv,
             update_kv_cache,
             self.predicted_tokens_per_seq,
@@ -1091,6 +1095,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         softmax_stats_tensor: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
+        attention_sinks: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert isinstance(
@@ -1162,6 +1167,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             spec_decoding_packed_mask=metadata.spec_decoding_packed_mask,
             spec_decoding_generation_lengths=metadata.
             spec_decoding_generation_lengths,
+            attention_sinks=attention_sinks,
         )
         out_dtype = None
         if out_scale is not None:
