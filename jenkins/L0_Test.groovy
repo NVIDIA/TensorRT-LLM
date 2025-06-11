@@ -549,6 +549,23 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 values:
                                 - "core"
                 nodeSelector: ${selectors}
+                initContainers:
+                - name: init-container
+                  image: urm.nvidia.com/docker/alpine:latest
+                  command: ["/bin/sh", "-c"]
+                  args:
+                  - |
+                    echo "预拉取 TensorRT-LLM 镜像以避免超时..."
+                    if command -v docker >/dev/null 2>&1; then
+                      echo "Docker 可用，正在拉取镜像..."
+                      echo "拉取 ${image}..."
+                      docker pull ${image} || echo "拉取失败，将在运行时重试"
+                    else
+                      echo "初始化容器中 Docker 不可用，跳过预拉取"
+                    fi
+                    echo "初始化容器完成"
+                  securityContext:
+                    privileged: true
                 containers:
                   ${containerConfig}
                     env:
