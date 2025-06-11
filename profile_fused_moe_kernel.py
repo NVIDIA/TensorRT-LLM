@@ -3,55 +3,49 @@ import torch
 import numpy as np
 from typing import List, Tuple, Dict
 
-from tensorrt_llm._torch.modules.fused_moe import CutlassFusedMoE, DefaultMoeRoutingMethod
+from tensorrt_llm._torch.modules.fused_moe import DefaultMoeRoutingMethod
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.mapping import Mapping
 
 
-def setup_cutlass_fused_moe(
+def setup_fused_moe_kernel_inputs(
+    num_tokens: int,
     hidden_size: int,
     intermediate_size: int, 
     num_experts: int,
+    num_activated_experts: int,
     top_k: int,
     dtype: torch.dtype = torch.bfloat16
-) -> Tuple[CutlassFusedMoE, Dict]:
-    """Setup CutlassFusedMoE with specified dimensions and return weights."""
-    
-    routing_method = DefaultMoeRoutingMethod(top_k=top_k)
-    mapping = Mapping()
-    mapping.rank = 0
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List]:
+    """Setup inputs for the torch.ops.trtllm.fused_moe kernel."""
     
     torch.cuda.set_device(0)
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
     
-    # Create weights for all experts
-    weights = {}
-    for expert_id in range(num_experts):
-        # FC1: w1 (gate) and w3 (up) projections
-        w1_weight = torch.randn((intermediate_size, hidden_size), dtype=dtype).cuda()
-        w3_weight = torch.randn((intermediate_size, hidden_size), dtype=dtype).cuda()
-        # FC2: w2 (down) projection  
-        w2_weight = torch.randn((hidden_size, intermediate_size), dtype=dtype).cuda()
-        
-        weights[f"{expert_id}.w1.weight"] = w1_weight
-        weights[f"{expert_id}.w2.weight"] = w2_weight
-        weights[f"{expert_id}.w3.weight"] = w3_weight
+    # Input tensor
+    x = torch.randn((num_tokens, hidden_size), dtype=dtype).cuda()
     
-    # Create fused MoE module
-    fused_moe = CutlassFusedMoE(
-        num_experts=num_experts,
-        routing_method=routing_method,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        dtype=dtype,
-        reduce_results=True,
-        model_config=ModelConfig(mapping=mapping),
-    )
-    fused_moe.load_weights([weights])
-    fused_moe.cuda()
+    # Create routing method and apply it to get expert selections and scales
+    routing_method = DefaultMoeRoutingMethod(top_k=top_k)
+    router_logits = create_routing_logits(num_tokens, num_experts, num_activated_experts, top_k, dtype)
     
-    return fused_moe, weights
+    token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+    
+    # For the kernel, token_selected_slots is the same as token_selected_experts in simple case
+    token_selected_slots = token_selected_experts
+    
+    # Create expert weights 
+    # w3_w1_weight: concatenated w3 and w1 weights [num_experts, 2*intermediate_size, hidden_size]
+    w3_w1_weight = torch.randn((num_experts, 2 * intermediate_size, hidden_size), dtype=dtype).cuda()
+    
+    # w2_weight: down projection weights [num_experts, hidden_size, intermediate_size]  
+    w2_weight = torch.randn((num_experts, hidden_size, intermediate_size), dtype=dtype).cuda()
+    
+    # Quantization scales (empty for non-quantized)
+    quant_scales = []
+    
+    return x, token_selected_slots, token_final_scales, w3_w1_weight, w2_weight, quant_scales
 
 
 def create_routing_logits(seq_len: int, num_experts: int, num_activated_experts: int, top_k: int, dtype: torch.dtype) -> torch.Tensor:
@@ -73,54 +67,103 @@ def create_routing_logits(seq_len: int, num_experts: int, num_activated_experts:
     return router_logits
 
 
-def profile_moe_configuration(
+def profile_fused_moe_kernel(
     test_name: str,
     num_tokens: int,
-    hidden_size: int,  # k dimension
-    intermediate_size: int,  # m dimension for FC1
+    hidden_size: int,
+    intermediate_size: int,
     num_experts: int,
     num_activated_experts: int,
     top_k: int,
     num_warmup: int = 10,
     num_iterations: int = 100
 ) -> float:
-    """Profile a specific MoE configuration and return average time in ms."""
+    """Profile the torch.ops.trtllm.fused_moe kernel directly."""
     
     print(f"\nProfiling: {test_name}")
     print(f"  Tokens: {num_tokens}, Hidden: {hidden_size}, Intermediate: {intermediate_size}")
     print(f"  Experts: {num_experts}, Activated: {num_activated_experts}, TopK: {top_k}")
     
-    # Setup MoE module
-    fused_moe, _ = setup_cutlass_fused_moe(
+    # Setup kernel inputs
+    x, token_selected_slots, token_final_scales, w3_w1_weight, w2_weight, quant_scales = setup_fused_moe_kernel_inputs(
+        num_tokens=num_tokens,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
+        num_activated_experts=num_activated_experts,
         top_k=top_k,
         dtype=torch.bfloat16
     )
     
-    # Create input tensors
-    x = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16).cuda()
-    router_logits = create_routing_logits(num_tokens, num_experts, num_activated_experts, top_k, torch.bfloat16)
+    output_dtype = torch.bfloat16
+    
+    # Kernel parameters
+    tp_size = 1
+    tp_rank = 0
+    ep_size = 1
+    ep_rank = 0
+    cluster_size = 1
+    cluster_rank = 0
+    use_deepseek_fp8_block_scale = False
+    use_w4a8_group_scaling = False
+    min_latency_mode = False
+    tune_max_num_tokens = 8192
     
     # Warmup
     with torch.inference_mode():
         for _ in range(num_warmup):
-            _ = fused_moe.forward(x, router_logits)
+            _ = torch.ops.trtllm.fused_moe(
+                x,
+                token_selected_slots,
+                token_final_scales,
+                w3_w1_weight,
+                w2_weight,
+                output_dtype,
+                quant_scales=quant_scales,
+                input_sf=None,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                cluster_size=cluster_size,
+                cluster_rank=cluster_rank,
+                use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+                use_w4a8_group_scaling=use_w4a8_group_scaling,
+                min_latency_mode=min_latency_mode,
+                tune_max_num_tokens=tune_max_num_tokens,
+            )
     
     torch.cuda.synchronize()
     
-    # Timing using CUDA events for more accurate GPU timing
+    # Timing using CUDA events
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
-    
     
     with torch.inference_mode():
         start_event.record()
         for _ in range(num_iterations):
-            _ = fused_moe.forward(x, router_logits)
+            _ = torch.ops.trtllm.fused_moe(
+                x,
+                token_selected_slots,
+                token_final_scales,
+                w3_w1_weight,
+                w2_weight,
+                output_dtype,
+                quant_scales=quant_scales,
+                input_sf=None,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                cluster_size=cluster_size,
+                cluster_rank=cluster_rank,
+                use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+                use_w4a8_group_scaling=use_w4a8_group_scaling,
+                min_latency_mode=min_latency_mode,
+                tune_max_num_tokens=tune_max_num_tokens,
+            )
         end_event.record()
-
+    
     end_event.synchronize()
     total_time = start_event.elapsed_time(end_event)  # Total time in ms
     avg_time = total_time / num_iterations
@@ -132,20 +175,14 @@ def profile_moe_configuration(
 
 
 def main():
-    """Main profiling function that replicates the benchmark setup."""
+    """Main profiling function for the fused_moe kernel."""
     
-    print("CutlassFusedMoE Profiling - Qwen3 235B Configuration")
-    print("=" * 60)
-    
-    # Test configurations based on the benchmark
-    # Qwen3 235B parameters: hidden_size=7168, intermediate_size=18432 for full model
-    # But the benchmark shows smaller dimensions, so using those
+    print("torch.ops.trtllm.fused_moe Kernel Profiling - Qwen3 235B Configuration")
+    print("=" * 80)
     
     test_configs = []
     
     # Define base configurations for different TP/EP combinations
-    # Each config corresponds to BOTH FC1 and FC2 in their benchmark since we test the fused MoE
-    # Note: Their FC1 m dimension shows w1+w3 concatenated (2 * intermediate_size)
     tp_ep_configs = [
         # TP1_EP8: Our intermediate_size=1536, their FC1 shows 3072x4096 (w1+w3 concat), FC2 shows 4096x1536
         {'tp': 1, 'ep': 8, 'hidden_size': 4096, 'intermediate_size': 1536, 'num_experts': 16, 'top_k': 1},
@@ -168,7 +205,6 @@ def main():
     ]
     
     # Generate all test configurations
-    # Note: Each of our tests corresponds to BOTH FC1 and FC2 from their benchmark
     for tp_ep in tp_ep_configs:
         for token_config in token_configs:
             num_tokens = token_config['tokens']
@@ -179,16 +215,16 @@ def main():
             else:
                 num_activated_experts = tp_ep['num_experts']
             
-            # Single MoE configuration that includes both FC1 and FC2
+            # Single kernel test configuration
             test_configs.append({
-                'test_name': f'Qwen3_235B_TP{tp_ep["tp"]}_EP{tp_ep["ep"]}_MoE_tokens{num_tokens}',
+                'test_name': f'Kernel_Qwen3_235B_TP{tp_ep["tp"]}_EP{tp_ep["ep"]}_MoE_tokens{num_tokens}',
                 'num_tokens': num_tokens,
                 'hidden_size': tp_ep['hidden_size'],
                 'intermediate_size': tp_ep['intermediate_size'],
                 'num_experts': tp_ep['num_experts'],
                 'num_activated_experts': num_activated_experts,
                 'top_k': tp_ep['top_k'],
-                'benchmark_fc1_dims': f"{tp_ep['intermediate_size']}x{tp_ep['hidden_size']}",
+                'benchmark_fc1_dims': f"{tp_ep['intermediate_size']*2}x{tp_ep['hidden_size']}",
                 'benchmark_fc2_dims': f"{tp_ep['hidden_size']}x{tp_ep['intermediate_size']}"
             })
     
@@ -198,7 +234,7 @@ def main():
         # Filter out display-only fields for the function call
         profile_config = {k: v for k, v in config.items() 
                          if k not in ['benchmark_fc1_dims', 'benchmark_fc2_dims']}
-        avg_time = profile_moe_configuration(**profile_config)
+        avg_time = profile_fused_moe_kernel(**profile_config)
         results.append({
             'testName': config['test_name'],
             'numTokens': config['num_tokens'],
@@ -214,16 +250,16 @@ def main():
     
     # Print results table
     print("\n" + "=" * 100)
-    print("CUTLASS FUSED MOE PROFILING RESULTS")
+    print("FUSED MOE KERNEL PROFILING RESULTS")
     print("=" * 100)
-    print("NOTE: Each test corresponds to BOTH FC1 and FC2 from the benchmark (fused together)")
+    print("NOTE: This directly profiles torch.ops.trtllm.fused_moe kernel (FC1 + FC2 fused)")
     print("-" * 100)
-    print(f"{'Tokens':<8} {'Test Name':<35} {'Hidden':<8} {'Intermediate':<12} {'Experts':<8} {'Activated':<10} {'TopK':<6} {'Time(ms)':<10} {'Maps to Benchmark':<25}")
+    print(f"{'Tokens':<8} {'Test Name':<45} {'Hidden':<8} {'Intermediate':<12} {'Experts':<8} {'Activated':<10} {'TopK':<6} {'Time(ms)':<10} {'Maps to Benchmark':<25}")
     print("-" * 100)
     
     for result in results:
         benchmark_note = f"FC1({result['benchmark_fc1_dims']}) + FC2({result['benchmark_fc2_dims']})"
-        print(f"{result['numTokens']:<8} {result['testName']:<35} {result['hidden_size']:<8} {result['intermediate_size']:<12} {result['numExperts']:<8} {result['numActivatedExperts']:<10} {result['topK']:<6} {result['time_ms']:<10.4f} {benchmark_note:<25}")
+        print(f"{result['numTokens']:<8} {result['testName']:<45} {result['hidden_size']:<8} {result['intermediate_size']:<12} {result['numExperts']:<8} {result['numActivatedExperts']:<10} {result['topK']:<6} {result['time_ms']:<10.4f} {benchmark_note:<25}")
 
 
 if __name__ == "__main__":
