@@ -16,19 +16,16 @@
 
 #include "tensorrt_llm/runtime/gptDecoder.h"
 
-#include "tensorrt_llm/kernels/decodingKernels.h"
-#include "tensorrt_llm/kernels/speculativeDecoding/externalDraftTokensKernels.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 #include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
 
-#include <memory>
-
 #include <NvInferRuntime.h>
+
+#include <memory>
 
 namespace tle = tensorrt_llm::executor;
 namespace tl = tensorrt_llm::layers;
-namespace tksd = tensorrt_llm::kernels::speculative_decoding;
 
 using namespace tensorrt_llm::runtime;
 
@@ -382,8 +379,7 @@ void prepareExplicitDraftTokensInput(DecodingInput const& inputs, std::shared_pt
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void prepareLookaheadInputs(
-    DecodingInput const& inputs, size_t maxBatchSize, std::shared_ptr<tl::DecodingInputs>& baseInputs)
+void prepareLookaheadInputs(DecodingInput const& inputs, std::shared_ptr<tl::DecodingInputs>& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -526,7 +522,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     }
     else if (decodingMode.isLookahead() && input.lookaheadInputs)
     {
-        prepareLookaheadInputs(input, maxBatchSize, forwardParams);
+        prepareLookaheadInputs(input, forwardParams);
         forwardParams->localBatchSize = input.batchSize;
     }
     else if (decodingMode.isExternalDraftTokens())
