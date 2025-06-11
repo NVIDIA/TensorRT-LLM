@@ -237,8 +237,7 @@ class TestLlama3_1NemotronNano8Bv1(CliFlowAccuracyTestHarness):
     def test_fp8_prequantized(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
-            f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1-FP8"
-        )
+            f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1-FP8")
 
         self.run(tasks=[MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8,

@@ -1139,7 +1139,7 @@ class TestLlama3_1NemotronNano8Bv1(LlmapiAccuracyTestHarness):
             task = GPQADiamond(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
-            
+
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
     def test_fp8_prequantized(self):
         model_path = f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1-FP8"
