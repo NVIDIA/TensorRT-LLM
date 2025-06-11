@@ -130,18 +130,6 @@ class KVCacheManager(BaseResourceManager):
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
     ) -> None:
-        if not isinstance(kv_cache_config, KvCacheConfigCpp):
-            # NOTE: There is a difference between
-            # tensorrt_llm.bindings.KvCacheConfig(KvCacheConfigCpp) and
-            # tensorrt_llm.bindings.executor.KvCacheConfig
-            # TODO: Remove this conversion in the future.
-            assert isinstance(kv_cache_config, ExecutorKvCacheConfig), (
-                "Only ExecutorKvCacheConfig can be converted to KvCacheConfigCpp"
-            )
-            kv_cache_config = KvCacheConfigCpp(kv_cache_config)
-            logger.warning(
-                "kv_cache_config is not a tensorrt_llm.bindings.KvCacheConfig, "
-                "converting it to a tensorrt_llm.bindings.KvCacheConfig")
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
@@ -208,10 +196,24 @@ class KVCacheManager(BaseResourceManager):
         # Calculate blocks per window using appropriate method
         if is_vswa:
             # VSWA case: use C++ implementation for variable window sizes
+            # model config check
             if model_config is None:
                 raise ValueError(
                     "model_config is required for VSWA (Variable Sliding Window Attention)"
                 )
+            # kv cache config check
+            if not isinstance(kv_cache_config, KvCacheConfigCpp):
+                # NOTE: There is a difference between
+                # tensorrt_llm.bindings.KvCacheConfig(KvCacheConfigCpp) and
+                # tensorrt_llm.bindings.executor.KvCacheConfig
+                # calculate_max_num_blocks_from_cpp only accepts KvCacheConfigCpp
+                assert isinstance(kv_cache_config, ExecutorKvCacheConfig), (
+                    "Only ExecutorKvCacheConfig can be converted to KvCacheConfigCpp"
+                )
+                kv_cache_config = KvCacheConfigCpp(kv_cache_config)
+                logger.warning(
+                    "kv_cache_config is not a tensorrt_llm.bindings.KvCacheConfig, "
+                    "converting it to a tensorrt_llm.bindings.KvCacheConfig")
             blocks_per_window = self.calculate_max_num_blocks_from_cpp(
                 kv_cache_config=kv_cache_config,
                 model_config=model_config,
@@ -503,24 +505,30 @@ class KVCacheManager(BaseResourceManager):
         assert max_atten_window_upper_bound > 0, "Impossibe to fit in any sequence in kvCache"
         return max_atten_window_upper_bound
 
-    def get_cache_indices(self, request: LlmRequest) -> List[int]:
-        assert len(self.max_attention_window_vec
-                   ) == 1, "Only support one attention window for now"
-        max_attention_window = max(self.max_attention_window_vec)
+    def get_cache_indices(self,
+                          request: LlmRequest,
+                          window_size: Optional[int] = None) -> List[int]:
+        if window_size is None:
+            if len(self.max_attention_window_vec) > 1:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+
         result = self.impl.get_cache_block_ids(request.py_request_id,
-                                               max_attention_window)
+                                               window_size)
         assert len(result) == 1
         return result[0]
 
     def get_batch_cache_indices(
         self,
         request_ids: List[int],
-    ) -> Dict[int, List[int]]:
-        assert len(self.max_attention_window_vec
-                   ) == 1, "Only support one attention window for now"
-        max_attention_window = max(self.max_attention_window_vec)
-        result = self.impl.get_batch_cache_block_ids(request_ids,
-                                                     max_attention_window)
+        window_size: Optional[int] = None,
+    ) -> List[List[int]]:
+        if window_size is None:
+            if len(self.max_attention_window_vec) > 1:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+
+        result = self.impl.get_batch_cache_block_ids(request_ids, window_size)
         for i in range(len(result)):
             assert (len(result[i])) == 1
             result[i] = result[i][0]
