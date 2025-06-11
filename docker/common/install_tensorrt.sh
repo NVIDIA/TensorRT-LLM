@@ -95,7 +95,7 @@ install_rockylinux_requirements() {
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
         "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
         "libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}"; do
-        wget -q "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
+        wget -q --timeout=180 --tries=3 "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
     done
 
     # Remove old packages
