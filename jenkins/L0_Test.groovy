@@ -2009,28 +2009,26 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
     def testConfigs = [
         "NGC Devel Image amd64": [
             name: "NGC-Devel-Image-amd64-Sanity-Test",
-            gpuType: "A10",
             k8sArch: "amd64",
             wheelInstalled: false,
             config: VANILLA_CONFIG,
         ],
         "NGC Devel Image arm64": [
             name: "NGC-Devel-Image-arm64-Sanity-Test",
-            gpuType: "GH200",
             k8sArch: "arm64",
             wheelInstalled: false,
             config: LINUX_AARCH64_CONFIG,
         ],
         "NGC Release Image amd64": [
             name: "NGC-Release-Image-amd64-Sanity-Test",
-            gpuType: "A10",
+            gpuType: "a10",
             k8sArch: "amd64",
             wheelInstalled: true,
             config: VANILLA_CONFIG,
         ],
         "NGC Release Image arm64": [
             name: "NGC-Release-Image-arm64-Sanity-Test",
-            gpuType: "GH200",
+            gpuType: "gh200",
             k8sArch: "arm64",
             wheelInstalled: true,
             config: LINUX_AARCH64_CONFIG,
