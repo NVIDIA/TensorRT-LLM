@@ -61,7 +61,7 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
     base.write(output_file, encoding="UTF-8", xml_declaration=True)
 
 
-def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
+def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
     pynvml.nvmlInit()
@@ -69,6 +69,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
     test_root = tests_path()
     dry_run = False
     passed = True
+
+    nodeid = request.node.nodeid
+    test_prefix = nodeid.split('/')[0]
 
     num_workers = 1
 
@@ -117,12 +120,8 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
                               f'results-sub-unittests-{case_fn}.xml')
 
     command = [
-        '-m',
-        'pytest',
-        ignore_opt,
-        "-v",
-        "--timeout=1600",
-        "--timeout-method=thread",
+        '-m', 'pytest', ignore_opt, "-v", "--timeout=1600",
+        "--timeout-method=thread", f"--test-prefix={test_prefix}"
     ]
 
     if dry_run:
