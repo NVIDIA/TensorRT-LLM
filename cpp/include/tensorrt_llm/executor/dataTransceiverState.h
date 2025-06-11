@@ -52,7 +52,9 @@ public:
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2)
         : mModelConfig(std::move(modelConfig))
         , mParallelConfig{worldConfig.getTensorParallelism(), worldConfig.getPipelineParallelism(),
-              worldConfig.enableAttentionDP(), worldConfig.getTensorParallelRank(), worldConfig.getTensorParallelism()}
+              worldConfig.enableAttentionDP(),
+              worldConfig.enableAttentionDP() ? worldConfig.getTensorParallelRank() : 0,
+              worldConfig.enableAttentionDP() ? worldConfig.getTensorParallelism() : 0}
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
@@ -63,7 +65,8 @@ public:
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
         int DPrank = 0, int DPsize = 0)
         : mModelConfig{std::move(nbKvHeadPerLayer), sizePerHead, tokensPerBlock}
-        , mParallelConfig{tensorParallelism, pipelineParallelism, enableAttentionDP, DPrank, DPsize}
+        , mParallelConfig{tensorParallelism, pipelineParallelism, enableAttentionDP, enableAttentionDP ? DPrank : 0,
+              enableAttentionDP ? DPsize : 0}
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
