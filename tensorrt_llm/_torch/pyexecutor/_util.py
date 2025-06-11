@@ -7,7 +7,6 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
@@ -539,30 +538,26 @@ def instantiate_sampler(engine: PyTorchModelEngine,
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         return TorchStarAttentionSampler(max_seq_len=engine.max_seq_len)
-    trtllm_sampler = pytorch_backend_config.enable_trtllm_sampler
-    early_stop = not engine.model.model_config.is_generation
-    has_spec_dec = engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
-    )
-    if sum([early_stop, trtllm_sampler, has_spec_dec]) > 1:
-        msg = f"Only one can be True: {[early_stop, trtllm_sampler, has_spec_dec]=}"
-        raise ValueError(msg)
-
-    if trtllm_sampler:
+    if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
+    ):
+        sampler_args = create_torch_sampler_args(
+            engine,
+            executor_config,
+            mixed_sampler=pytorch_backend_config.mixed_sampler)
+        return get_spec_decoder(engine.spec_config, sampler_args)
+    if pytorch_backend_config.enable_trtllm_sampler:
         decoding_mode = get_decoding_mode(executor_config)
         return TRTLLMSampler(executor_config, engine.model, engine.dtype,
                              mapping, decoding_mode,
                              pytorch_backend_config.disable_overlap_scheduler)
-    if early_stop:
+    if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
     sampler_args = create_torch_sampler_args(
         engine,
         executor_config,
         mixed_sampler=pytorch_backend_config.mixed_sampler)
-    if has_spec_dec:
-        return get_spec_decoder(engine.spec_config, sampler_args)
-    else:
-        return TorchSampler(sampler_args)
+    return TorchSampler(sampler_args)
 
 
 def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
