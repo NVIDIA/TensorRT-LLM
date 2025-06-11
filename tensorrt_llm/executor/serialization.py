@@ -90,7 +90,8 @@ BASE_ZMQ_CLASSES = {
     "tensorrt_llm.executor.utils": ["ErrorResponse", "WorkerCommIpcAddrs"],
     "tensorrt_llm.executor.worker": [
         "GenerationExecutorWorker", "worker_main", "PackedResponses",
-        "ResponseList", "PyResultsList", "ResponseList.deserialize"
+        "ResponseList", "PyResultsList", "ResponseList.deserialize",
+        "PostprocInputsPyParams", "PackedPostprocInputs"
     ],
     "tensorrt_llm.llmapi.llm_args": [
         "_ModelFormatKind", "_ParallelConfig", "CalibConfig",

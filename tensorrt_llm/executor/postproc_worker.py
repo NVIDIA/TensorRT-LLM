@@ -184,14 +184,27 @@ class PostprocWorker:
             if is_final:
                 self._records.pop(client_id)
 
+        from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse
         while not self._to_stop.is_set():
             batch = []
             inputs: Optional[List[PostprocWorker.Input]
                              | PostprocWorker.
                              Input] = await self._pull_pipe.get_async()
 
-            if not isinstance(inputs, list):
-                inputs = [inputs]
+            # if not isinstance(inputs, list):
+            #     inputs = [inputs]
+            unpacked_res = []
+            for response, py_result, sampling_params, postproc_params, streaming in zip(
+                    inputs[0]._response_list._responses,
+                    inputs[0]._py_params_list.py_result_list,
+                    inputs[0]._py_params_list._sampling_params_list,
+                    inputs[0]._py_params_list._postproc_params_list,
+                    inputs[0]._py_params_list._streaming_list):
+                unpacked_res.append(
+                    PostprocWorker.Input(LlmResponse(response, py_result),
+                                         sampling_params, postproc_params,
+                                         streaming))
+            inputs = unpacked_res
 
             for inp in inputs:
                 if inp is None:

@@ -914,7 +914,24 @@ class AwaitResponseHelper:
         if postproc_batches:
             for wid, batch in enumerate(postproc_batches):
                 if batch:
-                    self.worker.postproc_queues[wid].put(batch)
+                    response_list = []
+                    py_result_list = []
+                    sampling_params_list = []
+                    postproc_params_list = []
+                    streaming_list = []
+                    for r in batch:
+                        response_list.append(r.rsp._response)
+                        py_result_list.append(r.rsp._py_result)
+                        sampling_params_list.append(r.sampling_params)
+                        postproc_params_list.append(r.postproc_params)
+                        streaming_list.append(r.streaming)
+                    response_list = ResponseList(response_list)
+                    py_params_list = PostprocInputsPyParams(
+                        py_result_list, sampling_params_list,
+                        postproc_params_list, streaming_list)
+                    packed_postproc_inputs = PackedPostprocInputs(
+                        response_list, py_params_list)
+                    self.worker.postproc_queues[wid].put(packed_postproc_inputs)
 
         if rsp_batch:
             response_list = ResponseList([r._response for r in rsp_batch])
@@ -959,6 +976,35 @@ class PackedResponses:
 
     def __setstate__(self, state):
         self._response_list, self._py_result_list = state
+
+
+class PostprocInputsPyParams:
+
+    def __init__(self, py_result_list, sampling_params_list,
+                 postproc_params_list, streaming_list):
+        self.py_result_list = py_result_list
+        self._sampling_params_list = sampling_params_list
+        self._postproc_params_list = postproc_params_list
+        self._streaming_list = streaming_list
+
+    def __getstate__(self):
+        return self.py_result_list, self._sampling_params_list, self._postproc_params_list, self._streaming_list
+
+    def __setstate__(self, state):
+        self.py_result_list, self._sampling_params_list, self._postproc_params_list, self._streaming_list = state
+
+
+class PackedPostprocInputs:
+
+    def __init__(self, response_list, py_params_list):
+        self._response_list = response_list
+        self._py_params_list = py_params_list
+
+    def __getstate__(self):
+        return self._response_list, self._py_params_list
+
+    def __setstate__(self, state):
+        self._response_list, self._py_params_list = state
 
 
 def _get_params_for_first_rsp(

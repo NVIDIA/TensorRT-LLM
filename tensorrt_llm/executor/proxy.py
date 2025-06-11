@@ -1,6 +1,5 @@
 import atexit
 import concurrent.futures
-import itertools
 import threading
 import time
 import weakref
@@ -21,7 +20,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             print_colored, print_colored_debug)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import PostprocWorkerConfig
+from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
@@ -180,18 +179,19 @@ class GenerationExecutorProxy(GenerationExecutor):
                     res, ErrorResponse):
                 self._results.pop(client_id)
 
-        if not isinstance(res[0], PostprocWorker.Output):
+        if isinstance(res[0], PostprocWorker.Output):
+            pass
+        else:
             unpacked_res = []
             assert len(res[0]._response_list._responses) == len(
                 res[0]._py_result_list._py_results), \
                 "Response list and PyResult list should have the same length"
-            for response, py_result in itertools.zip_longest(
-                    res[0]._response_list._responses,
-                    res[0]._py_result_list._py_results):
+            for response, py_result in zip(res[0]._response_list._responses,
+                                           res[0]._py_result_list._py_results):
                 unpacked_res.append(LlmResponse(response, py_result))
             res = unpacked_res
-        else:
-            res = res if isinstance(res, list) else [res]
+
+        # res = res if isinstance(res, list) else [res]
 
         for i in res:
             global_tracer().log_instant("IPC.get")

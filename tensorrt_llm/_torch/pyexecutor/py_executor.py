@@ -2036,7 +2036,7 @@ class PyExecutor:
 
                 responses = {}
                 for res in responses_list:
-                    for response, py_result, req_id in itertools.zip_longest(
+                    for response, py_result, req_id in zip(
                             res._response_list._responses,
                             res._py_result_list._py_results, res._req_id_list):
                         responses[req_id] = LlmResponse(response, py_result)
