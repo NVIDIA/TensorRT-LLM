@@ -749,7 +749,7 @@ class PyExecutor:
                                     "cpu", non_blocking=True)
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
-                            sample_state.logits_host = logits_host
+                            sample_state.host.logits = logits_host
                             self._update_request_states(scheduled_batch)
 
                     if self.enable_iter_perf_stats:
@@ -788,8 +788,9 @@ class PyExecutor:
                         )
                         if logits is not None:
                             logits_host = torch.from_numpy(logits)
-                            sample_state.logits_host = logits_host
-                            sample_state.logits = logits_host.to(self.device_id)
+                            sample_state.host.logits = logits_host
+                            sample_state.device.logits = logits_host.to(
+                                self.device_id)
                     else:
                         torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
                         sample_state.sampler_event.synchronize()
@@ -802,13 +803,13 @@ class PyExecutor:
                         self.send_handles[
                             prev_microbatch_id] = self.dist.isend_object(
                                 (
-                                    sample_state.logits_host.numpy() if
+                                    sample_state.host.logits.numpy() if
                                     self._need_return_logits(scheduled_batch) or
                                     (self._need_return_log_probs(
-                                        scheduled_batch)
-                                     and sample_state.log_probs is not None)
+                                        scheduled_batch) and
+                                     sample_state.host.log_probs is not None)
                                     else None,
-                                    sample_state.log_probs,
+                                    sample_state.host.log_probs,
                                     sample_state.host,
                                 ),
                                 dest=self.dist.next_pp_rank,

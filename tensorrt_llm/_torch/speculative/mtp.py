@@ -319,7 +319,6 @@ class MTPSampler(TorchSampler):
         for request in scheduled_requests.context_requests:
             request.py_draft_tokens = [1] * self.draft_len
         return SampleStateMTP(scheduled_requests=scheduled_requests,
-                              logits=model_outputs['logits'],
                               device=device,
                               host=host,
                               sampler_event=sampler_event)

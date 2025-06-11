@@ -30,6 +30,8 @@ from .scheduler import ScheduledRequests
 @dataclass(frozen=True, kw_only=True)
 class SampleStateTensors:
     new_tokens: torch.Tensor
+    logits: torch.Tensor | None = None
+    log_probs: torch.Tensor | None = None
 
     def values(self):
         return vars(self).values()
@@ -38,9 +40,6 @@ class SampleStateTensors:
 @dataclass(kw_only=True, frozen=True)
 class SampleState:
     scheduled_requests: ScheduledRequests
-
-    logits: torch.Tensor | None = None
-    log_probs: torch.Tensor | None = None
 
     device: SampleStateTensors = None
     host: SampleStateTensors = None
@@ -84,7 +83,7 @@ class EarlyStopSampler(Sampler):
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
             if request.py_return_context_logits:
-                logits = state.logits[idx]
+                logits = state.host.logits[idx]
                 if logits.ndim == 1:
                     # For BERT: Add axis to be compatible with LogitsStorage
                     # (LogitsStorage will interpret this dim as the prompt_len which
@@ -261,12 +260,12 @@ class TorchSampler(Sampler):
                       count: int):
         current_slice = seq_slice(request, beam, size=count)
         if request.py_return_generation_logits:
-            assert state.logits is not None
-            current_logits = state.logits[current_slice]
+            assert state.host.logits is not None
+            current_logits = state.host.logits[current_slice]
             request.py_result.append_generation_logits(current_logits)
         if request.py_return_log_probs:
-            assert state.log_probs is not None
-            log_probs = state.log_probs[current_slice]
+            assert state.host.log_probs is not None
+            log_probs = state.host.log_probs[current_slice]
             current_tokens = state.host.new_tokens[current_slice]
 
             token_log_probs = [{
@@ -343,10 +342,10 @@ class TorchSampler(Sampler):
         return SampleState(
             scheduled_requests=scheduled_requests,
             device=SampleStateTensors(new_tokens=new_tokens_device),
-            host=SampleStateTensors(new_tokens=new_tokens_host),
-            sampler_event=sampler_event,
-            log_probs=log_probs,
-            logits=gen_logits)
+            host=SampleStateTensors(new_tokens=new_tokens_host,
+                                    log_probs=log_probs,
+                                    logits=gen_logits),
+            sampler_event=sampler_event)
 
     def _process_requests(self,
                           requests: list[LlmRequest],
@@ -415,7 +414,7 @@ class TorchStarAttentionSampler(TorchSampler):
         if state.sampler_event:
             state.sampler_event.synchronize()
         new_tokens_list = state.host.new_tokens.tolist()
-        logits = state.logits
+        logits = state.host.logits
 
         for request in state.scheduled_requests.context_requests:
             if request.state == LlmRequestState.GENERATION_IN_PROGRESS:
@@ -440,14 +439,12 @@ class SampleStateTensorsHostTRTLLM(SampleStateTensors):
     finished_sum: torch.Tensor
     finish_reasons: torch.Tensor
     sequence_lengths: torch.Tensor
-    log_probs: torch.Tensor
-    cum_log_probs: torch.Tensor
+    cum_log_probs: torch.Tensor | None = None
 
 
 @dataclass(kw_only=True, frozen=True)
 class SampleStateTRTLLM(SampleState):
     host: SampleStateTensorsHostTRTLLM
-    device: SampleStateTensors
 
 
 class TRTLLMSampler(Sampler):
@@ -610,8 +607,8 @@ class TRTLLMSampler(Sampler):
         sequence_lengths = self.algs.decoder_state.sequence_lengths.to(
             'cpu', non_blocking=True)
 
-        log_probs = torch.empty([0], dtype=torch.float, device='cpu')
-        cum_log_probs = torch.empty([0], dtype=torch.float, device='cpu')
+        log_probs = None
+        cum_log_probs = None
         if any(request.py_return_log_probs
                for request in scheduled_requests.all_requests):
             log_probs = self.algs.decoder_state.log_probs.to('cpu',
@@ -633,7 +630,6 @@ class TRTLLMSampler(Sampler):
         sampler_event.record()
 
         return SampleStateTRTLLM(scheduled_requests=scheduled_requests,
-                                 logits=model_outputs["logits"],
                                  device=device,
                                  host=host,
                                  sampler_event=sampler_event)
@@ -681,6 +677,7 @@ class TRTLLMSampler(Sampler):
                                           step=step)
 
                     if request.py_return_log_probs:
+                        assert state.host.log_probs is not None
                         # NOTE: Log probs with drafting has not been tested yet.
                         begin_log_probs_offset = request.prompt_len if request.sampling_config.beam_width == 1 else 0
                         current_token = seq_len - request.prompt_len - len(
@@ -695,6 +692,7 @@ class TRTLLMSampler(Sampler):
                         })
 
                 if num_new_tokens[beam] > 0 and request.py_return_log_probs:
+                    assert state.host.cum_log_probs is not None
                     cum_log_probs.append(
                         state.host.cum_log_probs[seq_slot * beam_width +
                                                  beam].item())
