@@ -79,6 +79,7 @@ public:
 private:
     BaseKVCacheManager* mCacheManager{};
     CacheTransBufferManager* mCacheTransBufferManager;
+    KvCacheMeasureHelper kvCacheMeasureHelper{common::getEnvKVCacheTransferOutputPath()};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
