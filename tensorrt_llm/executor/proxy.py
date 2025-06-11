@@ -21,7 +21,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             print_colored, print_colored_debug)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import PostprocWorker, PostprocWorkerConfig
+from .postproc_worker import PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
