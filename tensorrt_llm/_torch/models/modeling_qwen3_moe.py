@@ -15,9 +15,9 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE, MoE,
-                                 Qwen3MoeRoutingMethod,
-                                 RenormalizeMoeRoutingMethod, RoutingMethodType,
-                                 create_moe)
+                                 RenormalizeMoeRoutingMethod,
+                                 RenormalizeNaiveMoeRoutingMethod,
+                                 RoutingMethodType, create_moe)
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..utils import disable_fp4_allgather
@@ -63,8 +63,8 @@ class Qwen3Gate(nn.Module):
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
-        if self.routing_method_type == RoutingMethodType.Qwen3:
-            return Qwen3MoeRoutingMethod(top_k=self.top_k)
+        if self.routing_method_type == RoutingMethodType.RenormalizeNaive:
+            return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k)
         elif self.routing_method_type == RoutingMethodType.Renormalize:
             return RenormalizeMoeRoutingMethod(top_k=self.top_k)
         else:
@@ -221,7 +221,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
@@ -319,8 +319,8 @@ class Qwen3MoEModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.Tensor:

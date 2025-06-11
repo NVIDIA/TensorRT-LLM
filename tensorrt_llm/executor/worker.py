@@ -373,6 +373,7 @@ class GenerationExecutorWorker(GenerationExecutor):
         prompt_tuning_config = None
         multimodal_embedding = None
         mrope_config = None
+        multimodal_input = None
         if request.multimodal_embedding is not None:
             multimodal_embedding = request.multimodal_embedding
         if request.prompt_adapter_request is not None:
@@ -387,6 +388,13 @@ class GenerationExecutorWorker(GenerationExecutor):
 
         if request.mrope_config is not None:
             mrope_config = tllm.MropeConfig(**request.mrope_config)
+
+        if request.multimodal_input is not None:
+            multimodal_input = tllm.MultimodalInput(
+                multimodal_hashes=request.multimodal_input.multimodal_hashes,
+                multimodal_positions=request.multimodal_input.
+                multimodal_positions,
+                multimodal_lengths=request.multimodal_input.multimodal_lengths)
 
         context_phase_params = None
         request_type = tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
@@ -453,6 +461,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
+                multimodal_input=multimodal_input,
                 multimodal_embedding=multimodal_embedding,
                 mrope_config=mrope_config,
                 logits_post_processor_name=(
@@ -601,7 +610,7 @@ def worker_main(
     cpus = os.sched_getaffinity(pid)
     if cpus:
         logger.warning(
-            f"Found worker process {pid} was bound to {cpus}, this may harm"
+            f"Found worker process {pid} was bound to {cpus}, this may harm "
             "performance.", )
         logger.warning(f"Will clear the cpu affinity")
         clear_sched_affinity(pid)

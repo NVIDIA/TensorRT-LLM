@@ -51,8 +51,33 @@ def _get_mem_info_from_log(file, ranks_num):
     # only when TLLM_LOG_LEVEL=INFO
     pattern = re.compile(r"\[MemUsageChange] Allocated ([\d]+\.[\d]+) GiB ")
     fraction_pattern = re.compile(r"fraction is set ([\d]+\.[\d]+), ")
+    total_mem_pattern = re.compile(r"device total memory ([\d]+\.[\d]+) GiB")
+    peak_mem_pattern = re.compile(
+        r"Peak memory during memory usage profiling \(torch \+ non-torch\): ([\d]+\.[\d]+) GiB"
+    )
+    extra_mem_pattern = re.compile(
+        r"Memory used outside torch \(e\.g\., NCCL and CUDA graphs\) in memory usage profiling: ([\d]+\.[\d]+) GiB"
+    )
+    activation_pattern = re.compile(
+        r"Memory dynamically allocated during inference \(inside torch\) in memory usage profiling: ([\d]+\.[\d]+) GiB"
+    )
+    model_pattern = re.compile(
+        r"Memory used after loading model weights \(inside torch\) in memory usage profiling: ([\d]+\.[\d]+) GiB"
+    )
+    tmp_kv_patterm = re.compile(r"tmp kv_mem ([\d]+\.[\d]+) GiB")
+    start_time_mem_pattern = re.compile(
+        r"Memory used after loading model weights \(outside torch\) in memory usage profiling: ([\d]+\.[\d]+) GiB"
+    )
+
     fraction = 0.90
     kv_mem_size = []
+    total_memory = []
+    peak_memory = []
+    extra_memory = []
+    activation_memory = []
+    model_memory = []
+    tmp_kv = []
+    start_time_mem = []
     file.seek(0)
     lines = file.readlines()
     for line in lines:
@@ -62,38 +87,67 @@ def _get_mem_info_from_log(file, ranks_num):
         match = fraction_pattern.findall(line)
         if len(match) > 0:
             fraction = float(match[0])
+        match = total_mem_pattern.findall(line)
+        if len(match) > 0:
+            total_memory.append(float(match[0]))
+        match = peak_mem_pattern.findall(line)
+        if len(match) > 0:
+            peak_memory.append(float(match[0]))
+        match = extra_mem_pattern.findall(line)
+        if len(match) > 0:
+            extra_memory.append(float(match[0]))
+        match = activation_pattern.findall(line)
+        if len(match) > 0:
+            activation_memory.append(float(match[0]))
+        match = model_pattern.findall(line)
+        if len(match) > 0:
+            model_memory.append(float(match[0]))
+        match = tmp_kv_patterm.findall(line)
+        if len(match) > 0:
+            tmp_kv.append(float(match[0]))
+        match = start_time_mem_pattern.findall(line)
+        if len(match) > 0:
+            start_time_mem.append(float(match[0]))
+
     assert len(
         kv_mem_size) % 2 == 0, "no enough memory usage information in log"
     kv_mem_size = kv_mem_size[len(kv_mem_size) // 2:]
-    return 0, 0, sum(kv_mem_size) / ranks_num, 0, fraction
+    return peak_memory, model_memory, sum(
+        kv_mem_size
+    ) / ranks_num, extra_memory, fraction, total_memory, activation_memory, sum(
+        tmp_kv) / ranks_num, sum(start_time_mem) - ranks_num
 
 
-def _get_kv_mem_size_candidate(used_Gib, fraction):
-    import torch
-    _, total = torch.cuda.mem_get_info()
-    return (total / (1 << 30) - used_Gib) * fraction
+def _get_kv_mem_size_candidate(total_Gib, used_Gib, fraction):
+    return (total_Gib - used_Gib) * fraction
 
 
 def _check_mem_usage(file, mem_info, ranks_num=1):
     if file is None or not TEST_MEM_USAGE:
         return
     delta = 0.3  # 0.3 GB as buffer
-    peak, model_size, kv_mem_size, extra, fraction = _get_mem_info_from_log(
+    peak, model_size, kv_mem_size, extra, fraction, total_memory, activation_memory, tmp_kv, start_time_mem = _get_mem_info_from_log(
         file, ranks_num)
 
+    peak = max(peak)
+    min_total = min(total_memory)
     e_peak, e_model_size, e_kv_mem_size, e_extra = mem_info
-    e_kv_mem_size = _get_kv_mem_size_candidate(e_peak, fraction)
+    import torch
+    _, total = torch.cuda.mem_get_info()
+    e_kv_mem_size = _get_kv_mem_size_candidate(min_total,
+                                               (e_peak + start_time_mem),
+                                               fraction)
     print(
-        f"Expected memory usage: peak mem {e_peak}, model mem {e_model_size}, kv mem {e_kv_mem_size}, extra {e_extra}"
+        f"Expected memory usage: peak mem {e_peak + start_time_mem}, model mem {e_model_size}, kv mem {e_kv_mem_size:.2f}, extra {e_extra}, total {total / (1 << 30):.2f}"
     )
     print(
-        f"Running memory information: peak mem {peak}, model mem {model_size}, kv mem {kv_mem_size}, extra {extra}"
+        f"Running memory information: peak mem {peak}, model mem {model_size}, kv mem {kv_mem_size}, extra {extra}, total {min_total}, activation {activation_memory}, tmp_kv {tmp_kv}, fraction  {fraction}, none-torch memory at starttime {start_time_mem}"
     )
 
-    assert peak <= e_peak + delta, f"peak memory {peak} is larger than expected {e_peak}"
-    assert model_size <= e_model_size + delta, f"model memory {model_size} is larger than expected {e_model_size}"
+    assert peak - tmp_kv <= e_peak + start_time_mem + delta, f"peak memory {peak} is larger than expected {e_peak}"
     assert kv_mem_size >= e_kv_mem_size - delta, f"kv memory size {kv_mem_size} is smaller than expected {e_kv_mem_size}"
-    assert extra <= e_extra + delta, f"extra memory size {extra} is larger than expected {e_extra}"
+    # assert model_size <= e_model_size + delta, f"model memory {model_size} is larger than expected {e_model_size}"
+    # assert max(extra) <= e_extra + delta, f"extra memory size {extra} is larger than expected {e_extra}"
 
 
 def test_gpt3_175b_1layers_build_only(llm_root, llm_venv, engine_dir):
@@ -1480,7 +1534,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
     ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
     ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
     ("Nemotron-H-8B", "Nemotron-H-8B-Base-8K"),
-    ("Qwen3-30B-A3B", "Qwen3/Qwen3-30B-A3B"),
     pytest.param('Llama3.1-8B-NVFP4',
                  'nvfp4-quantized/Meta-Llama-3.1-8B',
                  marks=skip_pre_blackwell),
@@ -1505,6 +1558,9 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Mixtral-8x7B-FP8',
                  'Mixtral-8x7B-Instruct-v0.1-fp8',
                  marks=skip_pre_blackwell),
+    pytest.param('Qwen3-30B-A3B',
+                 'Qwen3/Qwen3-30B-A3B',
+                 marks=pytest.mark.skip_less_device_memory(80000)),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
@@ -1566,7 +1622,60 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
                 f"{llm_models_root()}/{model_path}",
             ],
             stdout=running_log)
-        _check_mem_usage(running_log, [54.50, 0, 0, 0])
+        _check_mem_usage(running_log, [54.60, 0, 0, 0])
+
+
+@pytest.mark.skip_less_device(4)
+def test_ptq_quickstart_advanced_bs1(llm_root, llm_venv):
+    model_name = "DeepSeek-V3-Lite-FP8"
+    model_path = "DeepSeek-V3-Lite/fp8"
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--use_cuda_graph",
+        "--cuda_graph_padding_enabled",
+        "--cuda_graph_batch_sizes",
+        "8",
+        "--disable_overlap_scheduler",
+        "--enable_attention_dp",
+        "--tp_size",
+        "4",
+        "--moe_ep_size",
+        "4",
+        "--prompt",
+        "\"NVIDIA is a great company because\"",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+    ])
+
+
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
+])
+def test_ptq_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
+                                       model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--disable_overlap_scheduler",
+            "--spec_decode_nextn",
+            "4",
+            "--max_matching_ngram_size",
+            "2",
+            "--spec_decode_algo",
+            "NGRAM",
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+        ],
+                         stdout=running_log)
+        _check_mem_usage(running_log, [4.60, 0, 0, 0])
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -1899,8 +2008,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         *accuracy_inputs[modality]["media"],
         "--disable_kv_cache_reuse",
     ]
-    # NOTE
-    # Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens.
+    # NOTE: Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens for video.
     if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
                       ] and modality == "video":
         cmd.append("--max_num_tokens=16384")

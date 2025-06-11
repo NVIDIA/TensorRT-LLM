@@ -18,7 +18,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.h"
-#include "tensorrt_llm/runtime/moeLoadBalancer.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
 
 using namespace tensorrt_llm::runtime;
 
@@ -317,6 +317,8 @@ protected:
         auto param = GetParam();
         TLLM_CUDA_CHECK(cudaSetDevice(0));
         mLoadBalancer = std::make_unique<MoeLoadBalancer>(param.epRank, param.epSize, param.layerUpdatesPerIter);
+
+        mLoadBalancer->setUseGpuMemcpy(true);
 
         // Create multiple MoE layers
         createLayers(param);
