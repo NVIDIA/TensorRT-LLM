@@ -37,23 +37,23 @@ th::Tensor dsv3_fused_a_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b
     auto const data_type = mat_a.scalar_type();
     constexpr int kHdIn = 7168;
     constexpr int kHdOut = 2112;
-    constexpr int kLiteHdIn = 2560;
-    constexpr int kLiteHdOut = 576;
     std::vector<int64_t> output_size = {num_tokens, hd_out};
     th::Tensor out = th::empty(output_size, mat_a.options().dtype(out_dtype_));
 
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
-    TORCH_CHECK(hd_in == kHdIn || hd_in == kLiteHdIn, "hd_in must be 7168 or 2560");
-    TORCH_CHECK(hd_out == kHdOut || hd_out == kLiteHdOut, "hd_out must be 2112 or 576");
-    TORCH_CHECK(data_type == at::kBFloat16, "input tensor must be bfloat16");
-    TORCH_CHECK(out_dtype_ == at::kBFloat16, "output tensor must be bfloat16");
     TORCH_CHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1); // Row-major
     TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
     TORCH_CHECK(!bias.has_value(), "bias is not support yet");
     auto const sm = tensorrt_llm::common::getSMVersion();
     if (sm >= 90)
     {
-        if (num_tokens >= 1 && num_tokens <= 16 && hd_in == kHdIn && hd_out == kHdOut)
+        bool use_custom_kernel = false;
+        if (num_tokens >= 1 && num_tokens <= 16 && hd_in == kHdIn && hd_out == kHdOut && data_type == torch::kBFloat16
+            && out_dtype_ == torch::kBFloat16)
+        {
+            use_custom_kernel = true;
+        }
+        if (use_custom_kernel)
         {
             auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
             if (num_tokens <= 8)

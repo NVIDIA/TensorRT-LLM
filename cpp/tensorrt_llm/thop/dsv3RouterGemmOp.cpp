@@ -76,22 +76,21 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     auto const data_type = mat_a.scalar_type();
     constexpr int kNumExperts = 256;
     constexpr int kHiddenDim = 7168;
-    constexpr int kLiteNumExperts = 72;
-    constexpr int kLiteHiddenDim = 2560;
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
     th::Tensor out = th::empty(output_size, mat_a.options().dtype(out_dtype_));
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
-    TORCH_CHECK(num_experts == kNumExperts || num_experts == kLiteNumExperts, "num_experts must be 256 or 72");
-    TORCH_CHECK(hidden_dim == kHiddenDim || hidden_dim == kLiteHiddenDim, "hidden_dim must be 7168 or 2560");
-    TORCH_CHECK(data_type == torch::kBFloat16, "input tensor must be bfloat16");
-    TORCH_CHECK(out_dtype_ == torch::kFloat32, "output tensor must be float32");
     TORCH_CHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1); // Row-major
     TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
     TORCH_CHECK(!bias.has_value(), "bias is not support yet");
-
     auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
+    bool use_custom_kernel = false;
+    if (num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts && hidden_dim == kHiddenDim
+        && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32)
+    {
+        use_custom_kernel = true;
+    }
 
-    if (num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts && hidden_dim == kHiddenDim)
+    if (use_custom_kernel)
     {
         LoopUnroller<1, 16, kNumExperts, kHiddenDim>::unroll(num_tokens,
             reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
