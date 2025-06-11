@@ -30,7 +30,7 @@ def create_kv_cache_manager():
     max_batch_size = 1
     mapping = Mapping()
     return KVCacheManager(
-        kv_cache_config=global_kvcache_config._to_pybind(),
+        kv_cache_config=global_kvcache_config,
         kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.
         SELF,
         num_layers=num_layers,
