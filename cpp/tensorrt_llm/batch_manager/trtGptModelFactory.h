@@ -19,7 +19,6 @@
 
 #include "tensorrt_llm/batch_manager/trtGptModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelInflightBatching.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -79,7 +78,6 @@ public:
                 = TrtGptModelInflightBatching::executorConfigIsValid(modelConfig, executorConfig)
                 ? executorConfig
                 : TrtGptModelInflightBatching::fixExecutorConfig(modelConfig, executorConfig);
-
             bool const ctxGenFusion = modelType == TrtGptModelType::InflightFusedBatching;
             return std::make_shared<TrtGptModelInflightBatching>(
                 logger, modelConfig, worldConfig, rawEngine, ctxGenFusion, fixedExecutorConfig, isLeaderInOrchMode);
