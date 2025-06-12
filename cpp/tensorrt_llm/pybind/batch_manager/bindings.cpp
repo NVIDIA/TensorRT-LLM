@@ -360,6 +360,8 @@ void initBindings(pybind11::module_& m)
             py::arg("enable_kv_cache_reuse") = false)
         .def("create_response", &tb::LlmRequest::createResponse, py::arg("use_fast_logits") = false,
             py::arg("mpi_world_rank") = 0)
+        .def("create_result", &tb::LlmRequest::createResult, py::arg("use_fast_logits") = false,
+            py::arg("mpi_world_rank") = 0)
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"));

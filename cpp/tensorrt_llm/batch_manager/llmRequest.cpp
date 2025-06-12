@@ -39,8 +39,16 @@ runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool
 
 template class GenericLlmRequest<runtime::ITensor::SharedPtr>;
 
-/// Note that there is some dependency on the order of operations in this method. Modify with care!
 std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits, int32_t mpiWorldRank)
+{
+    auto requestId = isChild() ? mParentRequestId : mRequestId;
+    auto response = executor::Response(requestId, std::move(createResult(useFastLogits, mpiWorldRank)), mClientId);
+
+    return response;
+}
+
+/// Note that there is some dependency on the order of operations in this method. Modify with care!
+executor::Result createResult(bool useFastLogits = false, int32_t mpiWorldRank = 0)
 {
     TLLM_CHECK(!isDisaggContextCompleteState());
     if (!(isFinished() || (mIsStreaming && mState == LlmRequestState::kGENERATION_IN_PROGRESS)))
@@ -192,11 +200,6 @@ std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits,
 
     // Update position of last sent response
     setMaxSentTokenLen(maxNbTokens);
-
-    auto requestId = isChild() ? mParentRequestId : mRequestId;
-    auto response = executor::Response(requestId, std::move(result), mClientId);
-
-    return response;
 }
 
 void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,

@@ -2328,6 +2328,8 @@ public:
     /// @return An optional Response
     std::optional<executor::Response> createResponse(bool useFastLogits = false, int32_t mpiWorldRank = 0);
 
+    executor::Result createResult(bool useFastLogits = false, int32_t mpiWorldRank = 0);
+
     void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, SizeType32 vocabSizePadded,
         std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false);
 

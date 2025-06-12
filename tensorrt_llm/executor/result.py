@@ -16,7 +16,7 @@ from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue
 from ..sampling_params import LogprobParams, SamplingParams
-from .utils import ErrorResponse, has_event_loop, is_llm_response
+from .utils import ErrorResponse, has_event_loop
 
 if TYPE_CHECKING:
     from .executor import GenerationExecutor
@@ -282,7 +282,11 @@ class GenerationResultBase:
                 if self._background_error_handler is not None and (
                         handler := self._background_error_handler()):
                     handler(response.error)
-        elif is_llm_response(response):
+        elif isinstance(response, ErrorResponse):
+            if self._background_error_handler is not None and (
+                    handler := self._background_error_handler()):
+                handler(response.error_msg)
+        elif hasattr(response, "request_id"):
             if response.has_error():
                 if self._background_error_handler is not None and (
                         handler := self._background_error_handler()):
@@ -318,10 +322,6 @@ class GenerationResultBase:
             if self._background_error_handler and (
                     handler := self._background_error_handler()):
                 handler()
-        elif isinstance(response, ErrorResponse):
-            if self._background_error_handler is not None and (
-                    handler := self._background_error_handler()):
-                handler(response.error_msg)
         else:
             raise ValueError(f"Unknown response type: {response}")
 

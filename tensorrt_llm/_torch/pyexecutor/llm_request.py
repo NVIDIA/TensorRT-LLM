@@ -219,25 +219,18 @@ class LlmResult:
 class LlmResponse:
     """LlmResponse wraps `bindings.executor.Response` but detour some features to Python implementation"""
 
-    def __init__(self, response: tensorrt_llm.bindings.executor.Response,
-                 py_result: PyResult):
-        self._response = response
-        self._py_result = py_result
+    def __init__(self,
+                 request_id: int,
+                 error: str = None,
+                 result: LlmResult = None,
+                 client_id: int = None):
+        self.request_id = request_id
+        self.error = error
+        self.result = result
+        self.client_id = client_id
 
-    def __getstate__(self):
-        return self._response, self._py_result
-
-    def __setstate__(self, state):
-        self._response, self._py_result = state
-
-    @property
-    def result(self) -> tensorrt_llm.bindings.executor.Result:
-        return LlmResult(
-            self._response.result,
-            self._py_result)  # LlmResult masquerades bindings.executor.Result
-
-    def __getattr__(self, item):
-        return getattr(self._response, item)
+    def has_error(self):
+        return self.error is not None
 
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
@@ -269,6 +262,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             **kwargs)
         self.py_client_id = client_id
         self.py_request_id = self.request_id
+        self.py_llm_request_type = self.llm_request_type
         self.py_end_id = self.end_id
         self.py_prompt_len = self.prompt_len
         self.py_orig_prompt_len = self.orig_prompt_len
@@ -299,6 +293,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   return_generation_logits,
                                   exclude_last_generation_logits)
 
+    def is_generation_only_request(self):
+        return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+
     def get_tokens(self, beam: int) -> int:
         return self.py_tokens[beam]
 
@@ -314,9 +311,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self,
             use_fast_logits=False,
             mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
-        response = super().create_response(use_fast_logits, mpi_world_rank)
-        return LlmResponse(response,
-                           self.py_result) if response is not None else None
+        return LlmResponse(
+            request_id=self.py_request_id,
+            result=LlmResult(
+                super().create_result(use_fast_logits, mpi_world_rank),
+                self.py_result),
+            client_id=self.py_client_id,
+        )
 
     @property
     def is_dummy(self):
