@@ -16,8 +16,7 @@ class SeqSlotManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
         for llm_req in scheduled_batch.all_requests():
-            if ((llm_req.is_context_init_state or llm_req.py_is_draft) and llm_req.seq_slot is None) or \
-                llm_req.is_disagg_generation_transmission_complete:
+            if llm_req.seq_slot is None or llm_req.is_disagg_generation_transmission_complete:
                 llm_req.seq_slot = self.slot_manager.add_slot(
                     llm_req.request_id)
 
