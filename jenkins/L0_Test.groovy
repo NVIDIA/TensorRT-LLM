@@ -91,6 +91,61 @@ TESTER_MEMORY = "96Gi"
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 
+def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
+    withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+        def remote = [
+            ip           : cluster.ip,
+            host         : cluster.host,
+            user         : "${pipeline.USERNAME}",
+            passwd       : "${pipeline.PASSWORD}",
+            password     : "${pipeline.PASSWORD}",
+            allowAnyHosts: true,
+        ]
+
+        Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client rsync")
+        pipeline.stage('Submit Test Results') {
+            sh "mkdir -p ${stageName}"
+            Utils.exec(
+                pipeline,
+                script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}/results/results.xml ${stageName}/",)
+            sh "ls ${stageName}"
+            echo "Upload test results."
+            sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
+            trtllm_utils.uploadArtifacts(
+                "results-${stageName}.tar.gz",
+                "${UPLOAD_PATH}/test-results/"
+            )
+            junit(testResults: "${stageName}/results*.xml")
+        }
+    }
+}
+
+//TODO: consolidate slurm related code for both multi nodes and single nodes
+def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String nodeName){
+    withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+        def remote = [
+            ip           : cluster.ip,
+            host         : cluster.host,
+            user         : "${pipeline.USERNAME}",
+            passwd       : "${pipeline.PASSWORD}",
+            password     : "${pipeline.PASSWORD}",
+            allowAnyHosts: true,
+        ]
+
+        Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
+        pipeline.stage('Clean up SLURM Agent Resources') {
+            Utils.exec(
+                pipeline,
+                timeout: false,
+                script: Utils.sshUserCmd(
+                    remote,
+                    "rm -rf /home/svc_tensorrt/bloom/scripts/${jobUID}"
+                )
+            )
+        }
+    }
+}
+
 def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def remote = [
@@ -208,6 +263,221 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     } finally {
         cleanUpNodeResources(pipeline, cluster, nodeName)
         CloudManager.destroyNode(nodeName)
+    }
+}
+
+def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=2, skipInstallWheel=false, cpver="cp312")
+{
+    SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
+    SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
+
+    def jobUID = "${cluster.host}-multi_node_test-${UUID.randomUUID().toString()}"
+
+    try {
+        // Run ssh command to start node in desired cluster via SLURM
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'svc_tensorrt',
+                usernameVariable: 'USERNAME',
+                passwordVariable: 'PASSWORD'
+            ),
+            usernamePassword(
+                credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+                usernameVariable: 'GITLAB_API_USER',
+                passwordVariable: 'GITLAB_API_TOKEN'
+            ),
+            string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
+        ]) {
+            def remote = [
+                    ip           : cluster.ip,
+                    host         : cluster.host,
+                    user         : "${pipeline.USERNAME}",
+                    passwd       : "${pipeline.PASSWORD}",
+                    password     : "${pipeline.PASSWORD}",
+                    allowAnyHosts: true,
+            ]
+            Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
+            def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
+            def tarName = BUILD_CONFIGS[config][TARNAME]
+            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            def resourcePathNode = "/tmp/"
+            def llmSrcNode = "${resourcePathNode}TensorRT-LLM/src"
+            def isAarch64 = config.contains("aarch64")
+            def pytestTestTimeout = "7200"
+            def testDBListCmd = getMakoOptsCmd(pipeline, remote, testList, llmSrcNode, stageName)
+            Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' ssh -oStrictHostKeyChecking=no ${remote.user}@${remote.host} 'mkdir ${jobWorkspace}'",)
+
+            def coverageConfigFile = "${jobWorkspace}/.coveragerc"
+            coverageConfigDestPath = Utils.createTempLocation(pipeline, "./.coveragerc")
+            // generate multi node run script
+            pipeline.writeFile(file: coverageConfigDestPath, text: """[run]
+branch = True
+data_file = ${jobWorkspace}/.coverage.${stageName}
+[paths]
+source =
+    ${llmSrcNode}/tensorrt_llm/
+    ---wheel_path---/tensorrt_llm/
+            """)
+            Utils.exec(pipeline, script: "chmod +w ${coverageConfigDestPath}", returnStdout: true)
+            stage('Prepare Testing') {
+                scriptRunDestPath = Utils.createTempLocation(pipeline, "./slurm_run.sh")
+                pipeline.writeFile(file: scriptRunDestPath, text: """#!/bin/bash
+cd /tmp
+testListPath="$jobWorkspace/${testList}.txt"
+testFilesPath="/tmp/single_test_files"
+resultsPath="$jobWorkspace/results"
+mkdir -p "\$testFilesPath"
+mkdir -p "\$resultsPath"
+if [ \$SLURM_LOCALID -eq 0 ]; then
+    wget -nv $llmTarfile
+    tar -zxf $tarName
+    which python3
+    python3 --version
+    apt-get install -y libffi-dev
+    nvidia-smi
+    cd $llmSrcNode && pip3 install --retries 1 -r requirements-dev.txt
+    cd $resourcePathNode &&  pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
+    git config --global --add safe.directory "*"
+    gpuUuids=\$(nvidia-smi -q | grep "GPU UUID" | awk '{print \$4}' | tr '\n' ',' || true)
+    echo "HOST_NODE_NAME = \$HOST_NODE_NAME ; GPU_UUIDS = =\$gpuUuids ; STAGE_NAME = $stageName"
+    makoOpts=\$($testDBListCmd)
+    makoOptsJson="{"
+    first=1
+    while IFS='=' read -r key value; do
+        [[ -z "\$key" || -z "\$value" ]] && continue
+
+        key=\$(echo "\$key" | xargs)
+        value=\$(echo "\$value" | xargs)
+
+        lower_val=\$(echo "\$value" | tr '[:upper:]' '[:lower:]')
+        if [[ "\$lower_val" == "true" || "\$lower_val" == "false" ]]; then
+            json_value=\$lower_val
+        elif [[ "\$value" == "None" ]]; then
+            json_value=null
+        else
+            json_value="\\\"\$value\\\""
+        fi
+
+        if [ \$first -eq 1 ]; then
+            first=0
+        else
+            makoOptsJson+=","
+        fi
+
+        makoOptsJson+="\\\"\$key\\\":\$json_value"
+    done <<< "\$makoOpts"
+    makoOptsJson+="}"
+    echo "Test DB Mako opts: \$makoOptsJson"
+    pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7
+    testDBPath="$llmSrcNode/tests/integration/test_lists/test-db"
+    testListPath="$jobWorkspace/${testList}.txt"
+    trt-test-db -d \$testDBPath --context $testList --test-names --output \$testListPath --match \"\$makoOptsJson\"
+    touch install_lock.lock
+else
+    while [ ! -f install_lock.lock ]; do
+        sleep 5
+    done
+fi
+testList="${testList}_${splitId}"
+export __LUNOWUD=\"-thread_pool_size=$TESTER_CORES\"
+export CPP_TEST_TIMEOUT_OVERRIDDEN=7200
+export LLM_ROOT=$llmSrcNode
+export LLM_MODELS_ROOT=$MODEL_CACHE_DIR
+export UCX_TLS=^gdr_copy
+cd $llmSrcNode/tests/integration/defs
+testCmdLines=(
+    \"$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch\"
+    \"pytest\"
+    \"-vvv\"
+    \"--timeout=$pytestTestTimeout\"
+    \"--test-list=\$testListPath\"
+    \"--rootdir $llmSrcNode/tests/integration/defs\"
+    \"--test-prefix=$stageName\"
+    \"--output-dir=$jobWorkspace/\"
+    \"--csv=\$resultsPath/report.csv\"
+    \"--junit-xml \$resultsPath/results.xml\"
+    \"-o junit_logging=out-err\"
+)
+if [ "$perfMode" = "true" ]; then
+    testCmdLines+=(
+        \"--perf\"
+        \"--perf-log-formats csv\"
+        \"--perf-log-formats yaml\"
+    )
+fi
+trtllmWhlPath=\$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
+trtllmWhlPath=\$(echo "\$trtllmWhlPath" | sed 's/[[:space:]]+/_/g')
+echo "TRTLLM WHEEL PATH: \$trtllmWhlPath"
+sed -i "s|---wheel_path---|\${trtllmWhlPath}|g" "$coverageConfigFile"
+testCmdLines+=(
+    \"--cov=$llmSrcNode/examples/\"
+    \"--cov=$llmSrcNode/tensorrt_llm/\"
+    \"--cov=\$trtllmWhlPath/tensorrt_llm/\"
+    \"--cov-report=\"
+    \"--cov-config=$coverageConfigFile\"
+)
+containerPipLLMLibPath=\$(pip3 show tensorrt_llm | grep \"Location\" | awk -F \":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}')
+containerPipLLMLibPath=\$(echo "\$containerPipLLMLibPath" | sed 's/[[:space:]]+/_/g')
+containerLDLibPath=\$LD_LIBRARY_PATH
+containerLDLibPath=\$(echo "\$containerLDLibPath" | sed 's/[[:space:]]+/_/g')
+if [[ "\$containerLDLibPath" != *"\$containerPipLLMLibPath"* ]]; then
+  containerLDLibPath="\$containerPipLLMLibPath:\$containerLDLibPath"
+  containerLDLibPath="\${containerLDLibPath%:}"
+fi
+export LD_LIBRARY_PATH=\$containerLDLibPath
+echo "Library Path:"
+echo "\$LD_LIBRARY_PATH"
+env | sort
+fullCmd="\${testCmdLines[*]}"
+echo "Running: \$testCase"
+echo "Full Command: \$fullCmd"
+eval "\$fullCmd"
+                """)
+                Utils.exec(pipeline, script: "chmod +x ${scriptRunDestPath}", returnStdout: true)
+                println("Selected Cluster: ${cluster.name}")
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${scriptRunDestPath} ${remote.user}@${remote.host}:${jobWorkspace}/slurm_run.sh",)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${coverageConfigDestPath} ${remote.user}@${remote.host}:${coverageConfigFile}",)
+
+                // generate multi node job launch script
+                def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
+                def mounts = "/home/scratch.trt_llm_data:/scratch.trt_llm_data,/home/svc_tensorrt/bloom/scripts:/home/svc_tensorrt/bloom/scripts"
+                def scriptRun = "/home/svc_tensorrt/bloom/scripts/${jobUID}/slurm_run.sh"
+                def scriptLaunch = "/home/svc_tensorrt/bloom/scripts/${jobUID}/slurm_launch.sh"
+                def srunCmdLines = [
+                    "srun",
+                    "-A oberon-gb-ci",
+                    "--exclusive",
+                    "--container-image=${container}",
+                    "--container-workdir=/scratch.trt_llm_data",
+                    "--container-mounts=${mounts}",
+                    "--partition=gb200nvl-ci",
+                    "--nodes=2",
+                    "--ntasks=8",
+                    "--ntasks-per-node=4",
+                    "--gpus-per-node=4",
+                    "--mpi=pmix",
+                    scriptRun
+                ]
+                scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
+                pipeline.writeFile(file: scriptLaunchDestPath, text: """${srunCmdLines.join(" ")}""")
+                Utils.exec(pipeline, script: "chmod +x ${scriptLaunchDestPath}", returnStdout: true)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${scriptLaunchDestPath} ${remote.user}@${remote.host}:${scriptLaunch}",)
+            }
+            stage('Run Test') {
+                def scriptLaunch = "/home/svc_tensorrt/bloom/scripts/${jobUID}/slurm_launch.sh"
+                Utils.exec(
+                    pipeline,
+                    timeout: false,
+                    script: Utils.sshUserCmd(
+                        remote,
+                        """bash ${scriptLaunch}"""
+                    )
+                )
+            }
+        }
+    } finally {
+        uploadResults(pipeline, cluster, jobUID, stageName)
+        cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID)
     }
 }
 
@@ -763,6 +1033,78 @@ def getMakoOpts(getMakoScript, makoArgs=[]) {
     echo "Test DB Mako opts: ${makoOptsJson}"
 
     return makoOptsJson
+}
+
+def getGPUChipMappingPathOnNode(pipeline, remote) {
+    def mapFileName = "gpu_chip_mapping.json"
+    def chipInfoJsonPath = "/home/svc_tensorrt/bloom/scripts/${mapFileName}"
+    withCredentials([
+        usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD'),
+        // Add the withCredentials step to access gpu-chip-mapping file
+        file(credentialsId: 'gpu-chip-mapping', variable: 'GPU_CHIP_MAPPING')
+    ]) {
+        def gpuChipMapContent = readFile GPU_CHIP_MAPPING
+        destPath = Utils.createTempLocation(pipeline, mapFileName)
+        pipeline.writeFile(file: destPath, text: gpuChipMapContent)
+        Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${destPath} ${remote.user}@${remote.host}:${chipInfoJsonPath}",)
+    }
+    return chipInfoJsonPath
+}
+
+def getMakoOptsCmd(pipeline, remote, testContext, llmSrc, stageName) {
+    def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
+    def makoArgs = []
+    def isPostMerge = stageName.contains("Post-Merge")
+    makoArgs += [isPostMerge ? "stage=post_merge" : "stage=pre_merge"]
+    // Determine the backend type based on keywords in stageName
+    if (stageName.contains("-PyTorch-")) {
+        // If stageName contains "-PyTorch-", add "backend=pytorch" to makoArgs
+        // At this point, only tests with backend=pytorch or unspecified backend will be run
+        makoArgs += ["backend=pytorch"]
+    } else if (stageName.contains("-TensorRT-")) {
+        // If stageName contains "-TensorRT-", add "backend=tensorrt" to makoArgs
+        // At this point, only tests with backend=tensorrt or unspecified backend will be run
+        makoArgs += ["backend=tensorrt"]
+    } else if (stageName.contains("-CPP-")) {
+        // If stageName contains "-CPP-", add "backend=cpp" to makoArgs
+        // At this point, only tests with backend=cpp or unspecified backend will be run
+        makoArgs += ["backend=cpp"]
+    } else if (stageName.contains("-Triton-")) {
+        // If stageName contains "-Triton-", add "backend=triton" to makoArgs
+        // At this point, only tests with backend=triton or unspecified backend will be run
+        makoArgs += ["backend=triton"]
+    } else {
+        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", or "-Triton-", do not add any backend
+        // At this point, all tests will be run
+        // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
+    }
+    if (stageName.contains("-DeepSeek-")) {
+        makoArgs += ["auto_trigger=deepseek"]
+    } else {
+        makoArgs += ["auto_trigger=others"]
+    }
+    // We want to save a map for the Mako opts
+    def makoOpts = [:]
+    def turtleOutput = ""
+
+    // Echo the command
+    // NOTE: We redirect stderr to stdout so that we can capture
+    //  both stderr and stdout streams with the 'returnStdout' flag
+    //  in sh command.
+    def listMakoCmd = [
+        "python3",
+        scriptPath,
+        "--device 0"].join(" ")
+
+    if (makoArgs) {
+        def makoOptArgs = makoArgs.collect { "--mako-opt " + it }
+        listMakoCmd += " " + makoOptArgs.join(" ")
+    }
+    def pathChipMappingFile = getGPUChipMappingPathOnNode(pipeline, remote)
+    println pathChipMappingFile
+    listMakoCmd = [listMakoCmd, "--chip-mapping-file ${pathChipMappingFile}"].join(" ")
+    listMakoCmd = [listMakoCmd, "2>&1"].join(" ")
+    return listMakoCmd
 }
 
 def renderTestDB(testContext, llmSrc, stageName) {
@@ -1600,6 +1942,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
+    multiNodesSBSAConfigs = [
+        "GB200-4_GPUs-2_Nodes-PyTorch-[Post-Merge]-1": ["gb200-4-gpus", "l0_gb200_multi_nodes", 1, 1, 4, 2],
+    ]
+    fullSet += multiNodesSBSAConfigs.keySet()
+
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), {
             runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3])
@@ -1617,6 +1964,20 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1)
         }]]}
         parallelJobs += parallelSlurmJobs
+
+        // Add SBSA multi node Slurm jobs
+        parallelMultiNodesSBSAJobs = multiNodesSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), {
+            def config = LINUX_AARCH64_CONFIG
+            if (key.contains("single-device")) {
+                config = SINGLE_DEVICE_CONFIG
+            }
+            if (key.contains("llvm")) {
+                config = LLVM_CONFIG
+            }
+            runLLMTestlistOnSlurm_MultiNodes(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1)
+        }]]}
+
+        parallelJobs += parallelMultiNodesSBSAJobs
     }
 
     docBuildSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10")
