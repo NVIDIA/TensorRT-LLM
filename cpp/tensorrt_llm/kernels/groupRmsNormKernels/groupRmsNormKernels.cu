@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <numeric>
 
 #include "tensorrt_llm/common/envUtils.h"
@@ -777,6 +778,13 @@ int getComputeCapabilityMajor()
 
 bool prefer_base_kernel(int batch, int base_warps, float scheduling_efficiency_ratio)
 {
+    static std::map<std::tuple<int, int, float>, bool> cache;
+    auto key = std::make_tuple(batch, base_warps, scheduling_efficiency_ratio);
+    if (cache.find(key) != cache.end())
+    {
+        return cache[key];
+    }
+
     int sm_major = getComputeCapabilityMajor();
     bool found_match = false;
     for (auto const& [known_model, model] : gpu_models)
@@ -787,7 +795,8 @@ bool prefer_base_kernel(int batch, int base_warps, float scheduling_efficiency_r
                 + model.scheduling_efficiency_ratio * scheduling_efficiency_ratio + model.intercept;
             p = 1.0f / (1.0f + std::exp(-p));
             found_match = true;
-            return p > 0.5f;
+            cache[key] = p > 0.5f;
+            return cache[key];
         }
     }
     if (!found_match)
@@ -796,6 +805,7 @@ bool prefer_base_kernel(int batch, int base_warps, float scheduling_efficiency_r
             "GroupRMSNorm: Failed to find heuristic for GPU compute capability %d. Falling back to the base kernel.",
             sm_major);
     }
+    cache[key] = true;
     return true;
 }
 
