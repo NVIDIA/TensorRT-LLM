@@ -18,6 +18,8 @@ from torch._ops import OpOverloadPacket
 from torch.export import Dim
 from torch.fx import Node
 
+from tensorrt_llm._utils import nvtx_range
+
 
 @dataclass
 class CacheConfig:
@@ -375,13 +377,14 @@ class SequenceInfo:
         self.reset()
         self.nest_sequences([[1]] * self.max_batch_size)
 
+    @nvtx_range("ad_update_position_ids")
     def _update_position_ids(self) -> None:
-        # set new position_ids as new tensor from input_pos and seq_len via torch.arange
         position_ids_list = [
-            torch.arange(in_pos, in_pos + seq_len, dtype=torch.long)
+            num
             for in_pos, seq_len in zip(self.input_positions, self.sequence_lengths)
+            for num in range(in_pos, in_pos + seq_len)
         ]
-        self.position_ids = torch.cat(position_ids_list, dim=0).to(self.device)
+        self.position_ids = torch.tensor(position_ids_list, dtype=torch.long).to(self.device)
 
         # use [b,1] shape to indicate generate-only batch, otherwise use [1,total_len]
         if self.is_generate:
@@ -389,6 +392,7 @@ class SequenceInfo:
         else:
             self.position_ids = self.position_ids.view(1, -1)
 
+    @nvtx_range("ad_nest_sequences")
     def nest_sequences(self, input_ids: Sequence[Sequence[int]]) -> None:
         """Create and store a flattened list of input_ids from the provided list of sequences.
 
@@ -400,11 +404,12 @@ class SequenceInfo:
         self.seq_len[: len(seq_lens)].copy_(torch.tensor(seq_lens), non_blocking=True)
 
         # set new input_ids as new tensor from flattened input_ids
-        ids_tnsr_list = [
-            lst.detach() if isinstance(lst, torch.Tensor) else torch.tensor(lst, dtype=torch.int)
+        ids_list = [
+            val
             for lst in input_ids
+            for val in (lst.detach().tolist() if isinstance(lst, torch.Tensor) else lst)
         ]
-        self.input_ids = torch.cat(ids_tnsr_list, dim=0).to(self.device)
+        self.input_ids = torch.tensor(ids_list, dtype=torch.int).to(self.device)
 
         # set derivative properties
         self._sequence_lengths = seq_lens
@@ -422,6 +427,7 @@ class SequenceInfo:
         t_squeezed = t_nested.squeeze(1) if self.is_generate else t_nested.squeeze(0)
         return list(torch.split(t_squeezed, self.sequence_lengths))
 
+    @nvtx_range("ad_update_pos")
     def update_pos(self, seq_len: Union[torch.Tensor, List[int], int], reset: bool = False) -> None:
         """Update the starting position for each sequence in the cache.
 
@@ -439,6 +445,7 @@ class SequenceInfo:
         # update position_ids
         self._update_position_ids()
 
+    @nvtx_range("ad_assign_cache_loc")
     def assign_cache_loc(self, page_assignments: Sequence[Sequence[int]]) -> None:
         """Set the cache location and pages_per_seq tensors from page assignments."""
         cache_loc_flat = torch.tensor(
