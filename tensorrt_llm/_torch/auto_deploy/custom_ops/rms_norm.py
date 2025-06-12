@@ -41,7 +41,7 @@ def _(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 
 @torch.library.custom_op("auto_deploy::rms_norm_triton", mutates_args=())
 def triton_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Custom operator for FlashInfer RMSNorm implementation.
+    """Custom operator for Triton RMSNorm implementation.
 
     Args:
         input: Input tensor to normalize.
@@ -49,7 +49,7 @@ def triton_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> tor
         eps: Small constant for numerical stability.
 
     Returns:
-        Normalized and scaled tensor using FlashInfer implementation.
+        Normalized and scaled tensor using Triton implementation.
     """
     return rms_norm(input, weight, eps)
 
