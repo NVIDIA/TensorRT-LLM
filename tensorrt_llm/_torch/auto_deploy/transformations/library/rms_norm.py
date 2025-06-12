@@ -11,33 +11,31 @@ from ...utils.pattern_matcher import register_pattern
 from .._graph import canonicalize_graph
 
 
-def _rms_norm_pattern(
-    hidden_states: torch.Tensor, weight: torch.Tensor, eps: float
-) -> torch.Tensor:
+def _rms_norm_pattern(data: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Implements the RMSNorm pattern for pattern matching.
 
     Args:
-        hidden_states: Input tensor to normalize.
+        data: Input tensor to normalize.
         weight: Scaling weights for the normalized output.
         eps: Small constant for numerical stability.
 
     Returns:
         Normalized and scaled tensor.
     """
-    input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)
-    variance = hidden_states.pow(2).mean(-1, keepdim=True)
-    hidden_states = hidden_states * torch.rsqrt(variance + eps)
-    return weight * hidden_states.to(input_dtype)
+    input_dtype = data.dtype
+    data = data.to(torch.float32)
+    variance = data.pow(2).mean(-1, keepdim=True)
+    data = data * torch.rsqrt(variance + eps)
+    return weight * data.to(input_dtype)
 
 
 def _rms_norm_replacement(
-    hidden_states: torch.Tensor, weight: torch.Tensor, eps: float, backend: str
+    data: torch.Tensor, weight: torch.Tensor, eps: float, backend: str
 ) -> torch.Tensor:
-    """Replacement function that uses the FlashInfer RMSNorm implementation.
+    """Backend-specific rms_norm implementation.
 
     Args:
-        hidden_states: Input tensor to normalize.
+        data: Input tensor to normalize.
         weight: Scaling weights for the normalized output.
         eps: Small constant for numerical stability.
         backend: Backend to use for RMSNorm computation ("flashinfer" or "triton").
@@ -49,11 +47,14 @@ def _rms_norm_replacement(
         "flashinfer": torch.ops.auto_deploy.rms_norm_flashinfer,
         "triton": torch.ops.auto_deploy.rms_norm_triton,
     }
-    return BACKEND_OPS[backend.lower()](hidden_states, weight, eps)
+    assert backend.lower() in list(BACKEND_OPS.keys()), (
+        f"Invalid backend: {backend}, must be one of {list(BACKEND_OPS.keys())}"
+    )
+    return BACKEND_OPS[backend.lower()](data, weight, eps)
 
 
-def match_rms_norm_with_pm(gm: GraphModule, backend: str = "triton") -> GraphModule:
-    """Matches and replaces RMSNorm patterns in the graph with FlashInfer implementation.
+def match_rms_norm(gm: GraphModule, backend: str = "triton") -> GraphModule:
+    """Matches and replaces RMSNorm patterns in the graph with FlashInfer or Triton implementation.
 
     This function sets up pattern matching to identify RMSNorm operations in the graph
     and replaces them with optimized implementations. It uses dummy tensors to register
@@ -66,10 +67,11 @@ def match_rms_norm_with_pm(gm: GraphModule, backend: str = "triton") -> GraphMod
     Returns:
         Transformed graph module with optimized RMSNorm operations.
     """
-    ad_logger.info("Starting RMSNorm pattern matching...")
     VALID_BACKENDS = {"flashinfer", "triton"}
     if backend.lower() not in VALID_BACKENDS:
         raise ValueError(f"Invalid backend, must be one of {VALID_BACKENDS}, got {backend}")
+    ad_logger.info(f"Starting RMSNorm pattern matching with backend: {backend}")
+
     graph = gm.graph
     patterns = PatternMatcherPass()
 

@@ -150,15 +150,17 @@ def resize_kv_cache(
 
     free_mem_ratio specifies the fraction of available memory to occupy.
     """
+
+    def _to_mb(bytes: int) -> int:
+        return bytes // 1024 // 1024
+
     ad_logger.info(f"Free memory ratio: {free_mem_ratio}")
     free_mem, total_mem = torch.cuda.mem_get_info()
-    ad_logger.info(
-        f"Free memory (MB): {free_mem // 1024 // 1024} , Total memory (MB): {total_mem // 1024 // 1024}"
-    )
+    ad_logger.info(f"Free memory (MB): {_to_mb(free_mem)} , Total memory (MB): {_to_mb(total_mem)}")
     current_cache_size = cm.current_cache_size_bytes()
     current_num_pages = cm.info.num_pages
     ad_logger.info(
-        f"Current cache size (MB): {current_cache_size // 1024 // 1024}, Current num pages: {current_num_pages}"
+        f"Current cache size (MB): {_to_mb(current_cache_size)}, Current num pages: {current_num_pages}"
     )
 
     if free_mem_ratio == 0.0:
@@ -169,13 +171,13 @@ def resize_kv_cache(
         # Let's run a forward pass to get the memory usage
         cm.info._set_max_num_tokens_sample()
         free_mem_pre, _ = torch.cuda.mem_get_info()
-        ad_logger.info(f"Free memory before forward pass (MB): {free_mem_pre // 1024 // 1024}")
+        ad_logger.info(f"Free memory before forward pass (MB): {_to_mb(free_mem_pre)}")
         egm(*cm.args)
         free_mem_post, _ = torch.cuda.mem_get_info()
-        ad_logger.info(f"Free memory after forward pass (MB): {free_mem_post // 1024 // 1024}")
+        ad_logger.info(f"Free memory after forward pass (MB): {_to_mb(free_mem_post)}")
 
         memory_for_forward_pass = free_mem_pre - free_mem_post
-        ad_logger.info(f"Memory for forward pass (MB): {memory_for_forward_pass // 1024 // 1024}")
+        ad_logger.info(f"Memory for forward pass (MB): {_to_mb(memory_for_forward_pass)}")
 
         new_cache_size = free_mem_post * free_mem_ratio + current_cache_size
         new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
