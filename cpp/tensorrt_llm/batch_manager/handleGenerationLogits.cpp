@@ -137,8 +137,10 @@ void HandleGenerationLogits::operator()(DecoderInputBuffers& inputBuffers, Reque
         }
         if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
         {
-            TLLM_CHECK(genRuntimeBuffers);
+            TLLM_CHECK(draftBuffers);
             auto& medusaLogitsHeads = draftBuffers->predictedDraftLogits.at(seqSlot);
+            TLLM_CHECK(genRuntimeBuffers);
+            TLLM_CHECK(genRuntimeBuffers->mMedusaBuffers);
             setupMedusaLogits(medusaLogitsHeads, genRuntimeBuffers->mMedusaBuffers->medusaLogitsDevice,
                 modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen(), logitsIndex, draftLength);
         }
