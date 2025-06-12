@@ -1398,7 +1398,9 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
     // the max attention window).
     // - The sequence did not switch to cyclic kv-cache during generation phase.
     //  A sequence is cyclic if its *minimum window size* is crossed, even if other window sizes were not reached.
-    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.isCyclic();
+    // - The sequence is not a dummy request.
+    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.isCyclic()
+        && !llmRequest->isDummyRequest();
     for (auto& [_, manager] : mWindowBlockManagers)
     {
         if (storeBlocksForReuse)
@@ -1950,7 +1952,7 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
 {
     auto const requestId = llmRequest.mRequestId;
     auto& sequence = getSequence(requestId);
-    if (mEnableBlockReuse && !sequence.isCyclic())
+    if (mEnableBlockReuse && !sequence.isCyclic() && !llmRequest.isDummyRequest())
     {
         mBlockManager.storeContextBlocks(sequence, llmRequest);
     }

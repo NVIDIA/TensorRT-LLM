@@ -344,6 +344,7 @@ class KVCacheManager(BaseResourceManager):
                                  sampling_params._get_sampling_config()),
                              is_streaming=False,
                              encoder_input_tokens=encoder_input_tokens)
+            req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
                 self.impl.add_sequence(req_id, token_num, beam_width, req)
