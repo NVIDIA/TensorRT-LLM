@@ -195,6 +195,8 @@ public:
             launch_config.hStream = params.stream;
             launch_config.sharedMemBytes = kernelMeta.mSharedMemBytes;
 
+            printf("mSharedMemBytes %d\n", kernelMeta.mSharedMemBytes);
+
             // Debug info.
             TLLM_LOG_DEBUG("TRTLLM-Gen launch info: kernelName = %s", kernelMeta.mFuncName);
             TLLM_LOG_DEBUG(
