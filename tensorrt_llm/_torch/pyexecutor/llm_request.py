@@ -282,6 +282,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_cuda_graph_dummy = False
         self.py_lora_task_layer_module_configs = None
 
+        self.py_tokens = super().get_tokens()
+
         self.py_return_log_probs = return_log_probs
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
@@ -296,6 +298,17 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   return_log_probs, return_context_logits,
                                   return_generation_logits,
                                   exclude_last_generation_logits)
+
+    def get_tokens(self, beam: int) -> int:
+        return self.py_tokens[beam]
+
+    def get_last_tokens(self, beam: int) -> int:
+        return self.py_tokens[beam][-1]
+
+    def add_new_token(self, token: int, beam: int) -> int:
+        self.py_tokens[beam].append(token)
+        # sync to C++ side
+        return super().add_new_token(token, beam)
 
     def create_response(
             self,
