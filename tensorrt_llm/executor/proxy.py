@@ -172,6 +172,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                 event_loop = event_loop or queue.loop
             else:
                 queue.put(res)
+
             if (is_llm_response(res) and res.result.is_final) or isinstance(
                     res, ErrorResponse):
                 self._results.pop(client_id)
