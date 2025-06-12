@@ -1156,6 +1156,7 @@ class FusedMoE(nn.Module):
         expert_count = self.num_experts
         # gather router info
         max_num_token = max(all_rank_num_tokens)
+        '''
         token_selected_experts = torch.nn.functional.pad(
             token_selected_experts,
             (0, 0, 0, max_num_token - token_selected_experts.shape[0]),
@@ -1176,6 +1177,11 @@ class FusedMoE(nn.Module):
         alltoall_info, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
             gathered_target_rank_ids, None, gathered_token_selected_experts,
             gathered_token_final_scales, max_num_token, expert_count, top_k,
+            self.ep_rank, self.ep_size)
+        '''
+
+        alltoall_info, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
+            token_selected_experts, token_final_scales, self.alltoall_workspace, max_num_token, expert_count, top_k,
             self.ep_rank, self.ep_size)
 
         if not self.use_postquant_alltoall:

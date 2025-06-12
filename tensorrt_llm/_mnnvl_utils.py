@@ -313,6 +313,33 @@ class MnnvlMoe:
         return token_target_rank_ids
 
     @staticmethod
+    def mnnvl_moe_alltoallv_prepare_without_allgather(expert_ids: torch.Tensor,
+                                    scales: torch.Tensor,
+                                    workspace: torch.Tensor
+                                    max_token_count_per_rank: int,
+                                    ep_rank: int,
+                                    ep_size: int,
+                                    expert_count: int,
+                                    top_k: int):
+        prepared_local_experts, prepared_local_scales, local_send_rank_count_cumsum, \
+        local_send_rank_indices, local_recv_rank_count_cumsum, local_recv_rank_indices, \
+        backward_local_recv_rank_indices\
+            = torch.ops.trtllm.moe_prepare(expert_ids, scales, workspace, max_token_count_per_rank, 
+                                           ep_rank, ep_size, expert_count, top_k)
+
+        local_token_allocation_count = max_token_count_per_rank * ep_size
+        # Looks like we don't need this.
+        local_gather_indices = None
+
+        alltoall_info = MoEAlltoallInfo(
+            local_gather_indices, local_send_rank_count_cumsum,
+            local_send_rank_indices, local_recv_rank_count_cumsum,
+            local_recv_rank_indices, backward_local_recv_rank_indices,
+            local_token_allocation_count)
+
+        return alltoall_info, prepared_local_experts, prepared_local_scales
+
+    @staticmethod
     def mnnvl_moe_alltoallv_prepare(gathered_target_rank_ids: torch.Tensor,
                                     real_rank_token_count_cumsum: torch.Tensor,
                                     gathered_expert_ids: torch.Tensor,
