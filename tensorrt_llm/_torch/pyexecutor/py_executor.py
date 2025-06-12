@@ -909,7 +909,7 @@ class PyExecutor:
 
                     if self.is_ngram:
                         self.sampler.prepare_forward(scheduled_batch,
-                                                     sample_state, iter_stats)
+                                                     sample_state)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1002,9 +1002,6 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
-                if self.is_ngram:
-                    self._prepare_draft_requests()
-
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
                 )
 
@@ -1061,11 +1058,6 @@ class PyExecutor:
                         self._handle_first_token_response(scheduled_batch)
 
                     previous_tensors_device = self.previous_batch and self.previous_batch.sample_state.device
-
-                    if self.is_ngram and self.previous_batch is not None:
-                        self.sampler.prepare_forward(
-                            scheduled_batch, self.previous_batch.sample_state,
-                            iter_stats)
 
                     batch_outputs = self._forward_step(scheduled_batch,
                                                        previous_tensors_device)

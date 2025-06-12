@@ -168,12 +168,13 @@ def setup_llm(args):
             pytorch_eagle_weights_path=args.eagle_model_dir,
             eagle3_one_model=args.use_one_model)
     elif spec_decode_algo == "NGRAM":
+        assert args.disable_overlap_scheduler, "`--disable_overlap_scheduler` must be set for NGram now."
         spec_config = NGramDecodingConfig(
             prompt_lookup_num_tokens=args.spec_decode_nextn,
             max_matching_ngram_size=args.max_matching_ngram_size,
             is_keep_all=True,
             is_use_oldest=True,
-            is_public_pool=False,
+            is_public_pool=True,
         )
     else:
         spec_config = None

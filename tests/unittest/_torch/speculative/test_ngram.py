@@ -13,11 +13,11 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
 
 
+# TODO: add disable_overlap_scheduler=False
 # TODO: add attn_backend="FLASHINFER"
 @pytest.mark.parametrize(
     "disable_overlap_scheduler,use_cuda_graph,attn_backend",
-    [[True, False, "TRTLLM"], [False, False, "TRTLLM"], [True, True, "TRTLLM"],
-     [False, True, "TRTLLM"]])
+    [[True, False, "TRTLLM"], [True, True, "TRTLLM"]])
 def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
                      attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
