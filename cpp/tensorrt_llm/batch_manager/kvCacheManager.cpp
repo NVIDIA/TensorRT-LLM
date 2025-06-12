@@ -1215,7 +1215,7 @@ void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAm
     }
 }
 
-void WindowBlockManager::storeBlocks(
+std::vector<BlockPtr> WindowBlockManager::storeBlocks(
     std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds)
 {
     TLLM_LOG_DEBUG(
