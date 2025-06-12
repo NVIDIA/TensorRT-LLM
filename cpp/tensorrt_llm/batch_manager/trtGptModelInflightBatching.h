@@ -264,8 +264,8 @@ private:
     void createDecoder(std::optional<executor::DecodingMode> const& decodingModeOpt);
     void createBuffers(executor::DecodingConfig const& decodingConfig,
         std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs);
-    std::unique_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig,
-        SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, KvCacheType kvCacheType = KvCacheType::kSELF);
+    std::unique_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType,
+        uint64_t freePrimaryMemBytes, uint64_t freeSecondaryMemBytes, size_t extraCostMemory);
     void createRnnStateManager();
     void createCustomAllReduceWorkspace();
     void createRuntimePerfKnobsTensor(executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
@@ -358,12 +358,14 @@ private:
         return static_cast<bool>(mGuidedDecoder);
     }
 
+    using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
     /// @brief Based on the KV-cache manager's capacity and configuration, we adjust the maximum supported attention
     /// window.
     ///
-    /// @param numPrimaryBlocks The number of blocks in the kv-cache's primary pool.
-    /// @param numTokensPerBlock The number of tokens per kv-cache block.
-    void adjustMaxAttentionWindow(SizeType32 numPrimaryBlocks, SizeType32 numTokensPerBlock);
+    /// @param blocksPerWindow map of window size to number of blocks.
+    /// @return pair of new blocks per window and new maxAttentionWindowVec
+    [[nodiscard]] std::pair<BlocksPerWindow, std::vector<SizeType32>> clampWindowSizesToFitAtLeastOneSequence(
+        BlocksPerWindow const& blocksPerWindow);
 
     /// @brief Change the speculative decoding mode.
     void changeSpecDecMode(ScheduledRequests const& scheduledRequests);

@@ -294,7 +294,7 @@
    "test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]": 81.43792725296225,
    "test_e2e.py::test_ptp_quickstart_advanced_eagle3[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]": 109.26379436196294,
    "test_e2e.py::test_ptp_quickstart_advanced_mixed_precision": 80.88908524392173,
-   "test_e2e.py::test_ptq_quickstart_advanced_mtp[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]": 99.42739840806462,
+   "test_e2e.py::test_ptp_quickstart_advanced_mtp[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]": 99.42739840806462,
    "test_unittests.py::test_unittests_v2[unittest/_torch/speculative/test_eagle3.py]": 317.8708840459585,
    "accuracy/test_cli_flow.py::TestLlama7B::test_auto_dtype": 402.75543826818466,
    "examples/test_bert.py::test_llm_bert_general[compare_hf-disable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:1-pp:1-float32-BertModel-bert/bert-base-uncased]": 111.17977902293205,

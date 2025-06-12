@@ -13,7 +13,8 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
-from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
+from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
+                                     AllReduceStrategy)
 from tensorrt_llm.mapping import Mapping
 
 from ...models.modeling_utils import QuantConfig
@@ -658,6 +659,7 @@ class Linear(nn.Module):
         skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
+        allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
     ):
         from ..distributed import AllReduce
 
@@ -694,7 +696,9 @@ class Linear(nn.Module):
         self.in_features = local_in_features
         self.out_features = local_out_features
 
-        self.all_reduce = AllReduce(self.mapping) if reduce_output else None
+        self.all_reduce = AllReduce(
+            mapping=self.mapping,
+            strategy=allreduce_strategy) if reduce_output else None
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm

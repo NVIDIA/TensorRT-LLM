@@ -6,7 +6,7 @@ from .common import ReduceOp, get_rank_world_size, is_ompi
 try:
     from ....mapping import Mapping
     from ...distributed import AllReduce, allgather
-    from ...modules.linear import AllReduceFusionOp, AllReduceParams
+    from ...modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
 
     def trtllm_allgather(tensor, dim, sizes=None):
         rank, world_size = get_rank_world_size()
@@ -17,7 +17,7 @@ try:
         rank, world_size = get_rank_world_size()
         assert op == ReduceOp.SUM, "TRT-LLM all reduce only supports SUM op."
         p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
-        torch_op = AllReduce(p_config)
+        torch_op = AllReduce(mapping=p_config, strategy=AllReduceStrategy.AUTO)
         return torch_op(tensor, all_reduce_params=all_reduce_params)
 
     @torch.library.custom_op(

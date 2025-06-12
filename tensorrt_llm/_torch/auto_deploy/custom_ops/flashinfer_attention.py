@@ -404,7 +404,7 @@ class FlashInferAttention(AttentionDescriptor):
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
         )
         if attn_mask is not None or dropout_p != 0.0 or not is_causal:
-            ad_logger.warning(
+            ad_logger.debug(
                 "Unsupported attention arguments for "
                 f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
             )

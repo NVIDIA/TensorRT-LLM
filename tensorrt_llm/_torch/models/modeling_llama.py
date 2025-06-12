@@ -282,7 +282,10 @@ class Llama4MoE(nn.Module):
                              quant_config=None)
 
         self.mapping = model_config.mapping
-        self.all_reduce = AllReduce(self.mapping)
+        self.all_reduce = AllReduce(
+            mapping=model_config.mapping,
+            strategy=model_config.allreduce_strategy,
+        )
         self.moe_event = [torch.cuda.Event(), torch.cuda.Event()]
         self.aux_stream = aux_stream
 
@@ -414,7 +417,8 @@ class Llama4DecoderLayer(DecoderLayer):
                                                 dtype=config.torch_dtype)
 
         self.mapping = model_config.mapping
-        self.all_reduce = AllReduce(self.mapping)
+        self.all_reduce = AllReduce(mapping=model_config.mapping,
+                                    strategy=model_config.allreduce_strategy)
         self.next_layer_layernorm: RMSNorm = None
         self.next_attn: LlamaAttention = None
 
@@ -625,7 +629,7 @@ class Eagle3LlamaAttention(LlamaAttention):
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
-        )
+            allreduce_strategy=model_config.allreduce_strategy)
 
 
 class Eagle3LlamaDecoderLayer(DecoderLayer):
@@ -1057,12 +1061,14 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                 trust_remote_code=True,
                 attn_backend=model_config.attn_backend,
                 moe_backend=model_config.moe_backend,
-                mapping=model_config.mapping)
-            draft_config.spec_config = model_config.spec_config
-            draft_config.max_num_tokens = model_config.max_num_tokens
-            draft_config.moe_max_num_tokens = model_config.moe_max_num_tokens
+                mapping=model_config.mapping,
+                spec_config=model_config.spec_config,
+                max_num_tokens=model_config.max_num_tokens,
+                moe_max_num_tokens=model_config.moe_max_num_tokens)
+
             draft_config.quant_config.kv_cache_quant_algo = \
                 model_config.quant_config.kv_cache_quant_algo
+
             self.draft_model = Eagle3LlamaForCausalLM(
                 draft_config, model_config.pretrained_config.num_hidden_layers)
             self.spec_worker = get_spec_worker(model_config.spec_config,

@@ -248,12 +248,6 @@ def launch_server(host: str,
     default=None,
     help="Server role. Specify this value only if running in disaggregated mode."
 )
-@click.option(
-    "--trust_remote_code",
-    type=bool,
-    default=False,
-    help="Whether to trust remote code.",
-)
 def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           log_level: str, backend: str, max_beam_width: int,
           max_batch_size: int, max_num_tokens: int, max_seq_len: int,

@@ -20,7 +20,7 @@ import psutil
 import pytest
 from defs.common import (convert_weights, quantize_data,
                          test_multi_lora_support, venv_check_call)
-from defs.conftest import skip_pre_ada
+from defs.conftest import skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
 
 
@@ -58,6 +58,7 @@ def mistral_example_root(llm_venv):
         check_call(" ".join(install_cmd), shell=True, env=llm_venv._new_env)
 
 
+@skip_post_blackwell  #nvbug 5298661
 @pytest.mark.parametrize(
     "run_type",
     ['inference', 'summarization_long', 'chunked_summarization_long'])
