@@ -50,6 +50,11 @@ class Eagle3Config(SpecConfig):
 
 
 class Eagle3ResourceManager(BaseResourceManager):
+    """
+    Eagle3 needs to save the hidden states for the draft model. When using
+    Eagle3TwoModel, there will be two model engines, one for the target model
+    and one for the draft model. Use this class to manage the hidden states.
+    """
 
     def __init__(self, config: Eagle3Config, dtype: torch.dtype,
                  hidden_size: int, max_num_requests: int, max_seq_len: int,
@@ -115,7 +120,7 @@ class Eagle3SpecMetadata(SpecMetadata):
     max_num_tokens: int = 0
     dtype: torch.dtype = torch.bfloat16
     is_draft_model: bool = False
-    apply_eagle3_fc: bool = False
+    is_first_draft: bool = False
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
 
     def __post_init__(self):
@@ -174,7 +179,7 @@ class Eagle3SpecMetadata(SpecMetadata):
             hidden_states_read_indices, dtype=torch.long, pin_memory=True)
         self.hidden_states_write_indices_host = torch.tensor(
             hidden_states_write_indices, dtype=torch.long, pin_memory=True)
-        self.apply_eagle3_fc = True if is_first_draft and self.is_draft_model else False
+        self.is_first_draft = is_first_draft and self.is_draft_model
         if self.is_draft_model:
             self.eagle3_resource_manager.is_first_draft = False
 
@@ -202,15 +207,10 @@ class Eagle3SpecMetadata(SpecMetadata):
                                          0, token_idx, to_save)
                 break
 
-    def get_hidden_states(
-        self,
-        preprocess_func: Optional[callable] = None,
-    ):
+    def get_hidden_states(self):
         hidden_states = self.eagle3_resource_manager.hidden_states[
             self.hidden_states_read_indices[:self.num_tokens], :]
-        if self.apply_eagle3_fc and preprocess_func is not None:
-            hidden_states = preprocess_func(hidden_states)
-        else:
+        if not self.is_first_draft:
             hidden_states = hidden_states[:, :self.hidden_size]
         return hidden_states
 

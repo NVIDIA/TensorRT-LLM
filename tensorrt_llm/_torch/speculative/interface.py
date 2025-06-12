@@ -51,15 +51,20 @@ class SpeculativeDecodingMode(IntEnum):
     def has_draft_model(self):
         return self.is_eagle3()
 
+    def needs_kv_cache_recompute(self):
+        """
+        Whether the draft model needs to recompute the kv cache.
+        If true, the 1st draft model forward will recompute the kv cache for
+        the accepted draft tokens.
+        """
+        return self.is_eagle3()
+
     def need_load_draft_weights(self):
         """
         Whether the draft model and target model are in the same model engine,
         and the draft model needs to load weights from the separate checkpoint.
         """
         return self.is_eagle3_one_model()
-
-    def has_draft_model_engine(self):
-        return self.is_eagle3()
 
     def has_spec_decoder(self):
         return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
@@ -122,8 +127,6 @@ class SpecMetadata:
     max_num_requests: int
     # The max number of draft tokens.
     max_draft_tokens: int
-    # The number of context sequences in the batch.
-    num_context: int = 0
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
     # Whether CUDA graph is enabled.
