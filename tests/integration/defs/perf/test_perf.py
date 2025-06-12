@@ -57,10 +57,13 @@ MODEL_PATH_DICT = {
     "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
     "llama_v3.2_1b": "llama-3.2-models/Llama-3.2-1B",
     "llama_v3.1_nemotron_nano_8b": "Llama-3.1-Nemotron-Nano-8B-v1",
+    "llama_v3.1_nemotron_nano_8b_fp8": "Llama-3.1-Nemotron-Nano-8B-v1-FP8",
     "llama_v3.3_nemotron_super_49b":
     "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
-    "llama_v3.1_nemotron_ultra_253b":
-    "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1",
+    "llama_v3.3_nemotron_super_49b_fp8":
+    "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8",
+    "llama_v3.1_nemotron_ultra_253b_fp8":
+    "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
     # "llama_30b": "llama-models/llama-30b-hf",
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
@@ -73,6 +76,12 @@ MODEL_PATH_DICT = {
     "deepseek_v3_lite_nvfp4": "DeepSeek-V3-Lite/nvfp4_moe_only",
     "qwen2_7b_instruct": "Qwen2-7B-Instruct",
     "qwen_14b_chat": "Qwen-14B-Chat",
+    "qwen3_8b": "Qwen3-8B",
+    "qwen3_8b_fp8": "Qwen3-8B-FP8",
+    "qwen3_30b_a3b": "Qwen3-30B-A3B",
+    "qwen3_30b_a3b_fp8": "Qwen3-30B-A3B-FP8",
+    "qwen3_235b_a22b": "Qwen3-235B-A22B",
+    "qwen3_235b_a22b_fp8": "Qwen3-235B-A22B-FP8",
     "starcoder2_3b": "starcoder2-3b",
     "starcoder_15b": "starcoder2-15b",
     "t5": "t5-small",  # not supported for trtllm-bench build config
@@ -107,10 +116,14 @@ HF_MODEL_PATH = {
     "llama_v3.1_70b_hf": "meta-llama/Llama-3.1-70B",
     "llama_v3.1_405b_hf": "meta-llama/Llama-3.1-405B",
     "llama_v3.1_nemotron_nano_8b_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+    "llama_v3.1_nemotron_nano_8b_fp8_hf":
+    "nvidia/Llama-3.1-Nemotron-Nano-8B-v1-FP8",
     "llama_v3.3_nemotron_super_49b_hf":
     "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
-    "llama_v3.1_nemotron_ultra_253b_hf":
-    "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
+    "llama_v3.3_nemotron_super_49b_fp8_hf":
+    "nvidia/Llama-3_3-Nemotron-Super-49B-v1-FP8",
+    "llama_v3.1_nemotron_ultra_253b_fp8_hf":
+    "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
     "mixtral_8x7b_v0.1_hf": "mistralai/Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct_hf": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistral_7b_v0.1_hf": "mistralai/Mistral-7B-v0.1",
@@ -125,7 +138,10 @@ LORA_MODEL_PATH = {
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
-    "llama_v3.3_nemotron_super_49b"
+    "llama_v3.3_nemotron_super_49b",
+    "llama_v3.3_nemotron_super_49b_fp8",
+    "llama_v3.1_nemotron_ultra_253b",
+    "llama_v3.1_nemotron_ultra_253b_fp8",
 }
 
 
@@ -1161,6 +1177,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if self._config.backend == "pytorch":
             import yaml
             config = get_model_yaml_config(self._config.to_string())
+            print_info(f"pytorch model config: {config}")
             with open('extra-llm-api-config.yml', 'w') as f:
                 yaml.dump(config, f, default_flow_style=False)
             benchmark_cmd += [
