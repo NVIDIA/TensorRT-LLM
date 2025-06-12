@@ -124,33 +124,45 @@ decoder_batch::Output createDecoderOutputs(SizeType32 batchSize, SizeType32 maxB
     return outputs;
 }
 
-std::vector<decoder_batch::Request> prepareRequests(SizeType32 batchSize, SizeType32 maxNewTokens,
+decoder_batch::Request prepareRequest(SizeType32 batchIdx, SizeType32 maxNewTokens,
     std::vector<SizeType32> const& inputLengths, std::vector<SizeType32> const& generatedTokensPerSteps,
     std::vector<SizeType32> const& acceptedTokensPerStep, TokenIdType inputTokenId, TokenIdType expectedTokenId,
     TokenIdType endId, BufferManager const& manager)
 {
     auto const& stream = manager.getStream();
 
+    auto shape = ITensor::makeShape({inputLengths[batchIdx]});
+    auto input = manager.gpu(shape, TRTDataType<SizeType32>::value);
+    kernels::invokeFill(*input, inputTokenId, stream);
+
+    decoder_batch::Request request(std::move(input), inputLengths[batchIdx], maxNewTokens, endId);
+    if (generatedTokensPerSteps[batchIdx] > 1)
+    {
+        TokenIdType constexpr tokenToReject{1};
+        TLLM_CHECK(tokenToReject != expectedTokenId);
+        // fill with tokens to reject
+        std::vector<TokenIdType> draftTokens(generatedTokensPerSteps[batchIdx] - 1, tokenToReject);
+        // fill with tokens to accept
+        std::fill(draftTokens.begin(), draftTokens.begin() + acceptedTokensPerStep[batchIdx], expectedTokenId);
+        request.draftTokens = manager.copyFrom(draftTokens, MemoryType::kGPU);
+        request.generatedTokensPerEngineStep = generatedTokensPerSteps[batchIdx];
+    }
+
+    return request;
+}
+
+std::vector<decoder_batch::Request> prepareRequests(SizeType32 batchSize, SizeType32 maxNewTokens,
+    std::vector<SizeType32> const& inputLengths, std::vector<SizeType32> const& generatedTokensPerSteps,
+    std::vector<SizeType32> const& acceptedTokensPerStep, TokenIdType inputTokenId, TokenIdType expectedTokenId,
+    TokenIdType endId, BufferManager const& manager)
+{
     std::vector<decoder_batch::Request> requests;
     requests.reserve(batchSize);
+
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
-        auto shape = ITensor::makeShape({inputLengths[batchIdx]});
-        auto input = manager.gpu(shape, TRTDataType<SizeType32>::value);
-        kernels::invokeFill(*input, inputTokenId, stream);
-
-        requests.emplace_back(std::move(input), inputLengths[batchIdx], maxNewTokens, endId);
-        if (generatedTokensPerSteps[batchIdx] > 1)
-        {
-            TokenIdType constexpr tokenToReject{1};
-            TLLM_CHECK(tokenToReject != expectedTokenId);
-            // fill with tokens to reject
-            std::vector<TokenIdType> draftTokens(generatedTokensPerSteps[batchIdx] - 1, tokenToReject);
-            // fill with tokens to accept
-            std::fill(draftTokens.begin(), draftTokens.begin() + acceptedTokensPerStep[batchIdx], expectedTokenId);
-            requests.back().draftTokens = manager.copyFrom(draftTokens, MemoryType::kGPU);
-            requests.back().generatedTokensPerEngineStep = generatedTokensPerSteps[batchIdx];
-        }
+        requests.emplace_back(prepareRequest(batchIdx, maxNewTokens, inputLengths, generatedTokensPerSteps, acceptedTokensPerStep,
+            inputTokenId, expectedTokenId, endId, manager));
     }
 
     return requests;
