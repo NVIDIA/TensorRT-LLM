@@ -40,6 +40,7 @@
 #include "tensorrt_llm/batch_manager/promptTuningBuffers.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
+#include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/batch_manager/transformerBuffers.h"
 #include "tensorrt_llm/batch_manager/updateDecoderBuffers.h"
 #include "tensorrt_llm/batch_manager/utils/debugUtils.h"
