@@ -16,6 +16,7 @@ from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..speculative import SpecMetadata
 from ..utils import Fp4QuantizedTensor, get_model_extra_attrs
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
@@ -228,6 +229,7 @@ class Attention(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -271,6 +273,12 @@ class Attention(nn.Module):
             out_scale_sf = self.o_proj.input_scale
 
         q, k, v = self.convert_qkv(q, k, v)
+        use_spec_dec = (
+            spec_metadata.use_spec_dec
+            and spec_metadata.spec_dec_mode.require_multi_query_attn_kernel(
+                get_attention_backend(
+                    self.attn_backend))) if spec_metadata is not None else False
+        # print("attention.py use_spec_dec", use_spec_dec)
         attn_output = self.attn.forward(
             q,
             k,
@@ -280,7 +288,14 @@ class Attention(nn.Module):
             out_scale_sf=out_scale_sf,
             attention_mask=attention_mask,
             mrope_config=mrope_config,
-            attention_window_size=attention_window_size)
+            attention_window_size=attention_window_size,
+            use_spec_dec=use_spec_dec,
+            spec_decoding_position_offsets=spec_metadata.
+            spec_decoding_position_offsets if use_spec_dec else None,
+            spec_decoding_packed_mask=spec_metadata.spec_decoding_packed_mask
+            if use_spec_dec else None,
+            spec_decoding_generation_lengths=spec_metadata.
+            spec_decoding_generation_lengths if use_spec_dec else None)
         hidden_states = attn_output
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,
