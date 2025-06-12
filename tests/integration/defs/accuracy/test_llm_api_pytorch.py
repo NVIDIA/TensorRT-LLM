@@ -1230,6 +1230,19 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_fp8_tp8(self):
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+        with LLM(f"{llm_models_root()}/Nemotron-H-8B-Reasoning-128K-FP8",
+                 kv_cache_config=kv_cache_config,
+                 tensor_parallel_size=8) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+
 
 class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
