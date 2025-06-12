@@ -1,5 +1,6 @@
 from typing import Tuple
 
+from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -50,12 +51,20 @@ def calc_engine_setting(
         Tuple[int, int]: Tuple containing engine configuration information for
         engine build (max_num_tokens, max_batch_size).
     """
+    print(f"{kv_cache_gpu_mem_fraction=}")
     byte_per_elem = BYTES_PER_ELEM.get(quant_config.quant_algo, 2)
     byte_per_kv_elem = BYTES_PER_ELEM.get(quant_config.kv_cache_quant_algo, 2)
 
     # Each GPU in TP group has at least 1 kv head
     adjusted_num_kv_heads = max(tp_size, model_config.num_key_value_heads)
-    byte_per_token = 2 * model_config.num_hidden_layers * adjusted_num_kv_heads \
+    # TODO: change num_hidden_layers to num_attention_layers
+    # TODO: Add estimation for mamba cache memory
+    if is_nemotron_hybrid(model_config):
+        num_attention_layers = model_config.hybrid_override_pattern.count("*")
+    else:
+        num_attention_layers = model_config.num_hidden_layers
+    logger.info(f"Number of attention layers: {num_attention_layers}")
+    byte_per_token = 2 * num_attention_layers * adjusted_num_kv_heads \
         * model_config.head_size * byte_per_kv_elem / (1024 ** 3)
 
     # Number of GPU used for this run.
@@ -63,6 +72,7 @@ def calc_engine_setting(
     # Total engine size.
     engine_size = model_config.param_count * byte_per_elem / (1024**3)
     total_gpu_memory = get_device_memory() * n_gpus
+    total_gpu_memory = 24.0 * n_gpus
     # Available memory to allocate KV cache.
     available_memory = total_gpu_memory - engine_size
     logger.info(f"Estimated engine size: {engine_size:.2f} GB")
@@ -74,7 +84,34 @@ def calc_engine_setting(
     kv_cache_max_tokens = kv_cache_memory / byte_per_token
     kv_cache_max_requests = kv_cache_max_tokens / (target_input_len +
                                                    target_output_len)
+
+    total_seq_len = target_input_len + target_output_len
+
+    if is_nemotron_hybrid(model_config):
+        num_mamba_layers = model_config.hybrid_override_pattern.count("M")
+        conv_dim = model_config.mamba_config.d_inner + 2 * model_config.mamba_config.n_groups * model_config.mamba_config.d_state
+        num_conv_state_elements = num_mamba_layers * conv_dim * (
+            model_config.mamba_config.d_conv - 1)
+        num_ssm_state_elements = num_mamba_layers * model_config.mamba_config.n_heads * model_config.mamba_config.head_dim * model_config.mamba_config.d_state
+        print(f"{num_conv_state_elements=}")
+        print(f"{num_ssm_state_elements=}")
+        byte_per_state_elem = BYTES_PER_ELEM.get(quant_config.quant_algo, 2)
+        byte_per_mamba_cache = byte_per_state_elem * (
+            num_conv_state_elements + num_ssm_state_elements) / (1024**3)
+
+        kv_cache_gpu_mem_fraction *= kv_cache_gpu_mem_fraction
+    else:
+        byte_per_mamba_cache = 0
+
+    kv_cache_max_requests = available_memory * kv_cache_gpu_mem_fraction / (
+        byte_per_token * total_seq_len + byte_per_mamba_cache)
+
+    print(
+        f"cache memory estimation: {(byte_per_mamba_cache + total_seq_len * byte_per_token)*kv_cache_max_requests:.2f} GB"
+    )
+
     logger.info(f"Estimated total KV cache memory: {kv_cache_memory:.2f} GB")
+    logger.info(f"Estimated kv cache max tokens: {kv_cache_max_tokens:.2f}")
     logger.info("Estimated max number of requests in KV cache memory: "
                 f"{kv_cache_max_requests:.2f}")
 
@@ -158,6 +195,7 @@ def finetune_setting(
 
     # Fine-tune the max num tokens.
     # Set min to 2048 to ensure Ctx/Gen overlap efficiency
+    logger.info(f"Estimated max num tokens (before fine-tune): {raw_token}")
     if raw_token < 4096:
         max_token = max(2048, 256 * math.ceil(raw_token / 256))
     elif raw_token < 8192:

@@ -14,6 +14,8 @@ import os
 import json
 import struct
 
+from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
+
 
 def parse_safetensors_file_metadata(model_path, filename):
 
@@ -111,6 +113,29 @@ def get_safetensors_metadata(model_name_or_path):
         return huggingface_hub.get_safetensors_metadata(model_name_or_path)
 
 
+class MambaConfig(BaseModel):
+    d_model: int = Field(
+        validation_alias=AliasChoices("d_model", "hidden_size", "n_embd"))
+    d_state: int = Field(
+        validation_alias=AliasChoices("d_state", "ssm_state_size"))
+    d_conv: int = Field(validation_alias=AliasChoices("d_conv", "conv_kernel"))
+    expand: int
+    n_groups: int
+    head_dim: int = Field(
+        validation_alias=AliasChoices("head_dim", "mamba_head_dim"))
+    d_inner: int = Field(default=None)
+    n_heads: int = Field(default=None)
+
+    @model_validator(mode="after")
+    def set_values_if_none(self):
+        """ Set the values if cannot get values from HF config.json. """
+        if not self.d_inner:
+            self.d_inner = self.d_model * self.expand
+        if not self.n_heads:
+            self.n_heads = self.d_inner // self.head_dim
+        return self
+
+
 class ModelConfig(BaseModel):
     """ Model specific configurations. The parameters are needed in engine
         setting calculation.
@@ -161,6 +186,8 @@ class ModelConfig(BaseModel):
                    None] = Field(default="float16",
                                  validation_alias=AliasChoices(
                                      "dtype", "torch_dtype"))
+    hybrid_override_pattern: Optional[str] = Field(default=None)
+    mamba_config: Optional[MambaConfig] = Field(default=None)
 
     @model_validator(mode="after")
     def set_values_if_none(self):
@@ -189,8 +216,14 @@ class ModelConfig(BaseModel):
     @classmethod
     def from_hf(cls, model_hf_name, hf_model_path):
         model_name_or_path = hf_model_path or model_hf_name
-        hf_config = AutoConfig.from_pretrained(
-            model_name_or_path, trust_remote_code=True).to_dict()
+        hf_config = AutoConfig.from_pretrained(model_name_or_path,
+                                               trust_remote_code=True)
         param_count = cls.get_param_count(model_hf_name, hf_model_path)
 
-        return cls(name=model_hf_name, param_count=param_count, **hf_config)
+        mamba_config = MambaConfig(
+            **hf_config.to_dict()) if is_nemotron_hybrid(hf_config) else None
+
+        return cls(name=model_hf_name,
+                   param_count=param_count,
+                   mamba_config=mamba_config,
+                   **hf_config.to_dict())
