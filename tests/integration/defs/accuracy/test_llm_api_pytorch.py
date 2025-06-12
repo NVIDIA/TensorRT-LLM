@@ -30,6 +30,24 @@ from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             LlmapiAccuracyTestHarness)
 
 
+class TestKanana_Instruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "kanana-1.5-2.1b-instruct-2505"
+    MODEL_PATH = f"{llm_models_root()}/kanana-1.5-2.1b-instruct-2505"
+
+    @pytest.mark.skip_not_contain(["H20", "H100"])
+    def test_auto_dtype(self):
+        "RCCA: https://nvbugspro.nvidia.com/bug/5310520"
+        pytorch_config = dict(duse_cuda_graph=True,
+                              cuda_graph_padding_enabled=True,
+                              cuda_graph_max_batch_size=384)
+        with LLM(self.MODEL_PATH, **pytorch_config,
+                 enable_attention_dp=True) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
