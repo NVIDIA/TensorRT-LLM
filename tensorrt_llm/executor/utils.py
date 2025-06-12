@@ -140,3 +140,7 @@ class WorkerCommIpcAddrs(NamedTuple):
     result_queue_addr: tuple[str, Optional[bytes]]
     stats_queue_addr: tuple[str, Optional[bytes]]
     kv_cache_events_queue_addr: tuple[str, Optional[bytes]]
+
+
+def is_llm_response(instance):
+    return hasattr(instance, "result")

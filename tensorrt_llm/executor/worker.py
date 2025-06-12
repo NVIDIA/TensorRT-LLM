@@ -39,7 +39,7 @@ from .request import (CancellingRequest, GenerationRequest, LoRARequest,
 from .result import (GenerationResult, IterationResult, LogProbsResult,
                      ResponseWrapper, compute_logprobs)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    WorkerCommIpcAddrs, has_event_loop)
+                    WorkerCommIpcAddrs, has_event_loop, is_llm_response)
 
 __all__ = [
     "GenerationExecutorWorker",
@@ -994,8 +994,9 @@ def _send_rsp(
 
     # Eliminate the finished GenerationRequest instances timely, which may
     # take considerable memory.
-    if response.has_error() or response.result.is_final:
-        worker._pop_result(response.client_id)
+    if is_llm_response(response):
+        if response.has_error() or response.result.is_final:
+            worker._pop_result(response.client_id)
     elif isinstance(response, ErrorResponse):
         worker._pop_result(response.client_id)
     else:
