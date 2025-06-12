@@ -119,8 +119,9 @@ SizeType32 HandleContextLogits::operator()(DecoderInputBuffers& inputBuffers, Re
 
         if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
         {
-            TLLM_CHECK(medusaBuffers);
+            TLLM_CHECK(draftBuffers);
             auto& medusaLogitsHeads = draftBuffers->predictedDraftLogits.at(seqSlot);
+            TLLM_CHECK(medusaBuffers);
             setupMedusaLogits(medusaLogitsHeads, medusaBuffers->medusaLogitsDevice,
                 modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen(), logitsIndex - numDecoderLogits,
                 numDecoderLogits);
