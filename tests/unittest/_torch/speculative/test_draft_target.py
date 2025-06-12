@@ -54,7 +54,10 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
 
     llm_ref = LLM(model=target_model_dir,
                   max_batch_size=max_batch_size,
-                  pytorch_backend_config=pytorch_config,
+                  disable_overlap_scheduler=True,
+                  use_cuda_graph=use_cuda_graph,
+                  attn_backend=attn_backend,
+                  cuda_graph_batch_sizes=[1],
                   kv_cache_config=kv_cache_config)
 
     results_ref = llm_ref.generate(prompts, sampling_params)
