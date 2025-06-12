@@ -319,8 +319,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         TLLM_CHECK_WITH_INFO(
             !blockManager.isVariableWindow(), "Rewinding KV cache blocks for variable SWA models isn't supported");
         auto const maxBlocksPerSeq = blockManager.getMaxBlockPerSeqWhenSingleWindowSize();
-        auto const isUseOneMoreBlock = kv_cache_manager::BlockManager::isUseOneMoreBlock(
-            getMaxAttentionWindow(), getMaxSequenceLen(), getMaxBeamWidth());
+        auto const isUseOneMoreBlock = kv_cache_manager::BlockManager::isUseOneMoreBlock();
 
         // TODO(oargov): VGQA is not supported, assume all layers have the same num_kv_heads
         TLLM_CHECK_WITH_INFO(
@@ -577,19 +576,6 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
 
     auto const tokensPerBlock = mModelConfig.getTokensPerBlock();
     auto const kvDtype = mModelConfig.getKvDataType();
-
-    bool enableCyclicKvCache = false;
-    for (SizeType32 maxAttenWin : getMaxAttentionWindowVec())
-    {
-        if (maxAttenWin != getMaxSequenceLen())
-        {
-            enableCyclicKvCache = true;
-            break;
-        }
-    }
-    // Below assertion should be removed once SWA/VSWA is no longer cyclic.
-    TLLM_CHECK_WITH_INFO(
-        getMaxBeamWidth() == 1 || !enableCyclicKvCache, "Can't support cyclic kv cache with beam search.");
 
     // init KV cache block manager
     auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = mModelConfig.getNumKvHeadsPerLayerLocalRange(
