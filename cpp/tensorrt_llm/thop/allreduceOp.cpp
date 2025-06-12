@@ -621,14 +621,12 @@ private:
 
     AllReduceStrategyType getRuntimeStrategy(size_t seq_len, size_t size)
     {
-        static char* force_nccl_all_reduce_strategy_char = std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY");
-        bool force_nccl_all_reduce_strategy = (force_nccl_all_reduce_strategy_char != nullptr);
         AllReduceStrategyType runtime_strategy;
         if (mStrategy == AllReduceStrategyType::UB)
         {
             runtime_strategy = AllReduceStrategyType::UB;
         }
-        else if (force_nccl_all_reduce_strategy || mStrategy == AllReduceStrategyType::NCCL)
+        else if (mStrategy == AllReduceStrategyType::NCCL)
         {
             runtime_strategy = AllReduceStrategyType::NCCL;
         }
@@ -936,10 +934,7 @@ private:
 
     bool isUsingLowPrecision(size_t message_size) const noexcept
     {
-        static char* force_low_precision_allreduce_strategy_char
-            = std::getenv("FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY");
-        bool force_low_precision = (force_low_precision_allreduce_strategy_char != nullptr)
-            || (mStrategy == AllReduceStrategyType::LOWPRECISION);
+        bool force_low_precision = mStrategy == AllReduceStrategyType::LOWPRECISION;
 
 #ifdef ENABLE_FP8
         // Use LowPrecision if PCIe and p2p support and message size is larger than 2MB
