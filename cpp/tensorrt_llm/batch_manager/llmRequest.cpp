@@ -42,13 +42,16 @@ template class GenericLlmRequest<runtime::ITensor::SharedPtr>;
 std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits, int32_t mpiWorldRank)
 {
     auto requestId = isChild() ? mParentRequestId : mRequestId;
-    auto response = executor::Response(requestId, std::move(createResult(useFastLogits, mpiWorldRank)), mClientId);
-
-    return response;
+    auto result = createResult(useFastLogits, mpiWorldRank);
+    if (result.has_value())
+    {
+        return executor::Response(requestId, std::move(result), mClientId);
+    }
+    return std::nullopt;
 }
 
 /// Note that there is some dependency on the order of operations in this method. Modify with care!
-executor::Result LlmRequest::createResult(bool useFastLogits, int32_t mpiWorldRank)
+std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int32_t mpiWorldRank)
 {
     TLLM_CHECK(!isDisaggContextCompleteState());
     if (!(isFinished() || (mIsStreaming && mState == LlmRequestState::kGENERATION_IN_PROGRESS)))
