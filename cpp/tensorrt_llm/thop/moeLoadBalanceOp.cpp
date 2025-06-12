@@ -20,12 +20,14 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
+#include <c10/core/Allocator.h>     // for c10::DataPtr
+#include <c10/core/StorageImpl.h>   // for c10::StorageImpl and use_byte_size_t()
 #include <c10/cuda/CUDAStream.h>
-#include <torch/extension.h>
+#include <c10/util/intrusive_ptr.h> // for c10::make_intrusive#include <torch/extension.h>
 #include <vector>
 
 #include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.h"
-#include "tensorrt_llm/runtime/moeLoadBalancer.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
 
 namespace torch_ext
 {
@@ -109,6 +111,43 @@ torch::Tensor moeLoadBalanceRouting(
     return tokenRoutedSlotIds;
 }
 
+void migrateToManaged(at::Tensor& tensor)
+{
+    TORCH_CHECK(tensor.device().is_cuda(), "only support CUDA Tensor");
+
+    // 1) compute total bytes
+    size_t byte_size = tensor.numel() * tensor.element_size();
+
+    // 2) allocate UVM
+    void* managed_ptr = nullptr;
+    cudaError_t err = cudaMallocManaged(&managed_ptr, byte_size);
+    TORCH_CHECK(err == cudaSuccess, "cudaMallocManaged failed");
+
+    // 3) advise to place on current GPU
+    int cur_dev;
+    TLLM_CUDA_CHECK(cudaGetDevice(&cur_dev));
+    TLLM_CUDA_CHECK(cudaMemAdvise(managed_ptr, byte_size, cudaMemAdviseSetPreferredLocation, cur_dev));
+    TLLM_CUDA_CHECK(cudaMemAdvise(managed_ptr, byte_size, cudaMemAdviseSetAccessedBy, cur_dev));
+    TLLM_CUDA_CHECK(cudaMemAdvise(managed_ptr, byte_size, cudaMemAdviseSetAccessedBy, cudaCpuDeviceId));
+
+    // 4) copy old data to UVM
+    TLLM_CUDA_CHECK(cudaMemcpy(managed_ptr, tensor.data_ptr(), byte_size, cudaMemcpyDeviceToDevice));
+
+    // 5) use new DataPtr/StorageImpl to construct storage
+    //    here managed_ptr is data，and also context，use cudaFree as deleter
+    c10::DataPtr dp(
+        managed_ptr, managed_ptr, [](void* ptr) { cudaFree(ptr); }, tensor.device());
+    auto allocator = c10::GetAllocator(tensor.device().type());
+    auto storage_impl = c10::make_intrusive<c10::StorageImpl>(c10::StorageImpl::use_byte_size_t(), byte_size,
+        std::move(dp), allocator,
+        /*resizable=*/false);
+    at::Storage new_storage(storage_impl);
+
+    // Finally replace tensor's storage，offset = 0，shape and stride kept unchanged
+    tensor.set_(new_storage,
+        /*storage_offset=*/0, tensor.sizes().vec(), tensor.strides().vec());
+}
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -153,4 +192,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("moe_load_balance_routing", &torch_ext::moeLoadBalanceRouting);
+}
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def("migrate_to_managed(Tensor tensor) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("migrate_to_managed", &torch_ext::migrateToManaged);
 }

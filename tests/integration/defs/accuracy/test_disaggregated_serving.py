@@ -83,6 +83,7 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
         yaml.dump(gen_server_config, f)
 
     args = LlmArgs.from_kwargs(model=model_name,
+                               backend="pytorch",
                                tensor_parallel_size=tensor_parallel_size)
 
     trtllm_serve_path = "trtllm-serve"
@@ -173,6 +174,7 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
         disaggregated_server.wait()
 
 
+@pytest.mark.timeout(3600)
 class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
@@ -207,13 +209,14 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.timeout(3600)
+@pytest.mark.skip_less_device_memory(140000)
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
 
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
-        pytest.skip("https://nvbugs/5297821")
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
         disaggregated_server_config = {
@@ -240,6 +243,7 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.timeout(3600)
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"

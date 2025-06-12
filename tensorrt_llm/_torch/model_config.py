@@ -8,6 +8,8 @@ import transformers
 
 from tensorrt_llm import logger
 from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -23,18 +25,13 @@ class MoeLoadBalancerConfig:
                                                                   repr=False)
     layer_updates_per_iter: int = 0
 
-    num_experts: Optional[int] = field(default=None, init=False)
     ep_rank: Optional[int] = field(default=None, init=False)
     ep_size: Optional[int] = field(default=None, init=False)
 
-    def setup(self, num_experts: int, ep_rank: int, ep_size: int) -> None:
-        self.num_experts = num_experts
+    def setup(self, ep_rank: int, ep_size: int) -> None:
         self.ep_rank = ep_rank
         self.ep_size = ep_size
-        if self.num_slots is None:
-            self.num_slots = self.num_experts
-        assert self.num_slots >= self.num_experts
-        assert self.num_slots % self.ep_size == 0
+        assert self.num_slots is not None
 
     @property
     def num_local_slots(self) -> int:
@@ -49,17 +46,13 @@ class MoeLoadBalancerConfig:
         return self.slot_start + self.num_local_slots
 
     def get_layer_initial_global_assignments(self, layer_idx: int) -> List[int]:
-        if self.initial_global_assignments is None:
-            return [(ep_rank * self.num_experts // self.ep_size + i) %
-                    self.num_experts for ep_rank in range(self.ep_size)
-                    for i in range(self.num_local_slots)]
-        else:
+        if self.initial_global_assignments is not None:
             assert layer_idx in self.initial_global_assignments
             assert len(
                 self.initial_global_assignments[layer_idx]) == self.num_slots
-            assert set(self.initial_global_assignments[layer_idx]) == set(
-                range(self.num_experts))
             return self.initial_global_assignments[layer_idx]
+        else:
+            return None
 
 
 @dataclass(kw_only=True)
@@ -86,6 +79,7 @@ class ModelConfig(Generic[TConfig]):
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
+    allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
@@ -114,6 +108,24 @@ class ModelConfig(Generic[TConfig]):
                                               "architectures"):
             self.is_generation = self.is_generation_model(
                 self.pretrained_config.architectures)
+
+        def get_all_reduce_strategy(strategy: str = "AUTO"):
+            maps = {
+                "AUTO": AllReduceStrategy.AUTO,
+                "NCCL": AllReduceStrategy.NCCL,
+                "UB": AllReduceStrategy.UB,
+                "MINLATENCY": AllReduceStrategy.MIN_LATENCY,
+                "ONESHOT": AllReduceStrategy.ONESHOT,
+                "TWOSHOT": AllReduceStrategy.TWOSHOT,
+                "LOWPRECISION": AllReduceStrategy.LOWPRECISION,
+                "MNNVL": AllReduceStrategy.MNNVL
+            }
+            key = strategy.upper()
+            return maps[key] if key in maps else AllReduceStrategy.AUTO
+
+        if isinstance(self.allreduce_strategy, str):
+            self.allreduce_strategy = get_all_reduce_strategy(
+                self.allreduce_strategy)
 
     @property
     def fuse_pos_embd(self):
