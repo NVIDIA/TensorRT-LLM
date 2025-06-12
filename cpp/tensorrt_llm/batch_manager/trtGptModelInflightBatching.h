@@ -18,10 +18,8 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
-#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -37,6 +35,18 @@ class GptDecoderBatched;
 class AllReduceBuffers;
 class NcclCommunicator;
 class SpeculativeDecodingMode;
+
+namespace decoder
+{
+class DecoderState;
+} // namespace decoder
+
+namespace decoder_batch
+{
+class Input;
+class Output;
+} // namespace decoder_batch
+
 } // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::mpi
@@ -57,6 +67,7 @@ namespace rnn_state_manager
 {
 class RnnStateManager;
 } // namespace rnn_state_manager
+
 class SequenceSlotManager;
 class DecoderStepAsyncSend;
 class DecoderSlotAsyncSend;

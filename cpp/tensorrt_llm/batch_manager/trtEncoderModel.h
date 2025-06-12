@@ -17,7 +17,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "trtGptModel.h"
