@@ -8,7 +8,6 @@ from typing import Any, Callable, List, NamedTuple, Optional
 from strenum import StrEnum
 
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.bindings.executor import Response
 from tensorrt_llm.llmapi.utils import print_colored_debug
 
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
@@ -141,11 +140,3 @@ class WorkerCommIpcAddrs(NamedTuple):
     result_queue_addr: tuple[str, Optional[bytes]]
     stats_queue_addr: tuple[str, Optional[bytes]]
     kv_cache_events_queue_addr: tuple[str, Optional[bytes]]
-
-
-def is_llm_response(instance):
-    from tensorrt_llm._torch.pyexecutor.llm_request import \
-        LlmResponse as PyLlmResponse
-
-    from .result import ResponseWrapper
-    return isinstance(instance, (Response, PyLlmResponse, ResponseWrapper))

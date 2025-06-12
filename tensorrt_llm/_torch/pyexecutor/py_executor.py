@@ -1936,7 +1936,7 @@ class PyExecutor:
             self._terminate_request(request)
             error_responses[req_id] = LlmResponse(
                 request_id=req_id,
-                error=error_msg,
+                error_msg=error_msg,
                 client_id=request.py_client_id)
         self.active_requests.clear()
         self._enqueue_responses(error_responses)

@@ -221,16 +221,16 @@ class LlmResponse:
 
     def __init__(self,
                  request_id: int,
-                 error: str = None,
+                 error_msg: str = None,
                  result: LlmResult = None,
                  client_id: int = None):
         self.request_id = request_id
-        self.error = error
+        self.error_msg = error_msg
         self.result = result
         self.client_id = client_id
 
     def has_error(self):
-        return self.error is not None
+        return self.error_msg is not None
 
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):

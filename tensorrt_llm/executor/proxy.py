@@ -24,8 +24,7 @@ from .postproc_worker import PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
-                    create_mpi_comm_session, get_spawn_proxy_process_env,
-                    is_llm_response)
+                    create_mpi_comm_session, get_spawn_proxy_process_env)
 from .worker import GenerationExecutorWorker, worker_main
 
 __all__ = [
@@ -172,8 +171,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                 event_loop = event_loop or queue.loop
             else:
                 queue.put(res)
-
-            if (is_llm_response(res) and res.result.is_final) or isinstance(
+            if (hasattr(res, "result") and res.result.is_final) or isinstance(
                     res, ErrorResponse):
                 self._results.pop(client_id)
 
