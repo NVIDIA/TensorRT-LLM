@@ -106,3 +106,7 @@ default pre-merge set:
 
 Both options accept any stage name defined in `jenkins/L0_Test.groovy`. Being
 selective keeps CI turnaround fast and conserves hardware resources.
+
+### Avoiding unnecessary `--disable-fail-fast` usage
+
+Avoid habitually using `--disable-fail-fast` as it wastes scarce hardware resources. The CI system automatically reuses successful test stages when commits remain unchanged, and subsequent `/bot run` commands only retry failed stages. Overusing `--disable-fail-fast` keeps failed pipelines consuming resources (like DGX-H100s), increasing queue backlogs and reducing team efficiency.
