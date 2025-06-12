@@ -12,7 +12,7 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
     LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
 }
 
-// UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 // UPLOAD_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_MergeRequest_PR/5934"
 UPLOAD_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/2080"
 LLM_ROOT = "llm"
@@ -34,7 +34,7 @@ BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
 
 UPLOAD_PATH = env.uploadPath ?: "sw-tensorrt-artifacts"
-ARTIFACT_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/2052"
+ARTIFACT_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/2080"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 

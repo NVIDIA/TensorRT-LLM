@@ -1409,7 +1409,7 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
 
     def wheelName = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 *.whl').trim()
     echo "uploading ${wheelName} to ${cpu_arch}/${wheel_path}"
-    trtllm_utils.uploadArtifacts("tensorrt_llm/build/${wheelName}",  "${UPLOAD_PATH}/${cpu_arch}/${wheel_path}")
+    // trtllm_utils.uploadArtifacts("tensorrt_llm/build/${wheelName}",  "${UPLOAD_PATH}/${cpu_arch}/${wheel_path}")
 
     if (reinstall_dependencies == true) {
         // Test installation in the new environment
