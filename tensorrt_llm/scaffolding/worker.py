@@ -57,14 +57,6 @@ def add_attr_if_not_none(obj, attr, candidate_values):
             return
 
 
-# a list of sampling parameters supported by the OpenAI Completions API
-OPENAI_COMPLETIONS_PARAMS = [
-    "best_of", "echo", "frequency_penalty", "logit_bias", "num_logprobs",
-    "max_tokens", "n", "presence_penalty", "seed", "stop", "stream",
-    "stream_options", "suffix", "temperature", "top_p", "user"
-]
-
-
 # Worker for standard openai api
 class OpenaiWorker(Worker):
 
@@ -81,14 +73,24 @@ class OpenaiWorker(Worker):
             "model": self.model,
             "prompt": task.input_str,
         }
-
-        for param_name in OPENAI_COMPLETIONS_PARAMS:
-            param_value = getattr(task, param_name, None)
-
-            if param_name == "num_logprobs":
-                param_name = "logprobs"
-
-            add_param_if_not_none(params, param_name, [param_value])
+        add_param_if_not_none(params, "best_of", [task.best_of])
+        add_param_if_not_none(params, "echo", [task.echo])
+        add_param_if_not_none(params, "frequency_penalty",
+                              [task.frequency_penalty])
+        add_param_if_not_none(params, "logit_bias", [task.logit_bias])
+        add_param_if_not_none(params, "logprobs", [task.num_logprobs])
+        add_param_if_not_none(params, "max_tokens", [task.max_tokens])
+        add_param_if_not_none(params, "n", [task.n])
+        add_param_if_not_none(params, "presence_penalty",
+                              [task.presence_penalty])
+        add_param_if_not_none(params, "seed", [task.seed])
+        add_param_if_not_none(params, "stop", [task.stop])
+        add_param_if_not_none(params, "stream", [task.stream])
+        add_param_if_not_none(params, "stream_options", [task.stream_options])
+        add_param_if_not_none(params, "suffix", [task.suffix])
+        add_param_if_not_none(params, "temperature", [task.temperature])
+        add_param_if_not_none(params, "top_p", [task.top_p])
+        add_param_if_not_none(params, "user", [task.user])
 
         return params
 
