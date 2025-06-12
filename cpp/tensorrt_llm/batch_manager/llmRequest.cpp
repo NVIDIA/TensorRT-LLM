@@ -203,6 +203,7 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
 
     // Update position of last sent response
     setMaxSentTokenLen(maxNbTokens);
+    return result;
 }
 
 void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
