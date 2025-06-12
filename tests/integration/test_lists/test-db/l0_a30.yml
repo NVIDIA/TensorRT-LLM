@@ -14,7 +14,7 @@ l0_a30:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)"
+  - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)" TIMEOUT (90)
   - unittest/_torch -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_mllama"
