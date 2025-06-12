@@ -8,11 +8,12 @@ This page explains how TensorRT‑LLM's CI is organized and how individual tests
 3. [Unit tests](#unit-tests)
 4. [Jenkins stage names](#jenkins-stage-names)
 5. [Finding the stage for a test](#finding-the-stage-for-a-test)
-6. [Triggering CI politely](#triggering-ci-politely)
+6. [Waiving tests](#waiving-tests)
+7. [Triggering CI Best Practices](#triggering-ci-best-practices)
 
 ## CI pipelines
 
-Pull requests do not start testing by themselves. Developers trigger the CI by commenting `/bot run` (optionally with arguments) on the pull request. That kicks off the **merge-request pipeline**, which runs unit tests and integration tests whose YAML entries specify `stage: pre_merge`. Once a pull request is merged, a separate **post-merge pipeline** runs every test marked `post_merge` across all supported GPU configurations.
+Pull requests do not start testing by themselves. Developers trigger the CI by commenting `/bot run` (optionally with arguments) on the pull request (see [Pull Request Template](../../../.github/pull_request_template.md) for more details). That kicks off the **merge-request pipeline** (defined in `jenkins/L0_MergeRequest.groovy`), which runs unit tests and integration tests whose YAML entries specify `stage: pre_merge`. Once a pull request is merged, a separate **post-merge pipeline** (defined in `jenkins/L0_Test.groovy`) runs every test marked `post_merge` across all supported GPU configurations.
 
 `stage` tags live in the YAML files under `tests/integration/test_lists/test-db/`. Searching those files for `stage: pre_merge` shows exactly which tests the merge-request pipeline covers.
 
@@ -66,7 +67,28 @@ To run the same tests on your pull request, comment:
 
 This executes the same tests that run post-merge for this hardware/backend.
 
-## Triggering CI politely
+## Waiving tests
+
+Sometimes a test is known to fail due to a bug or unsupported feature. Instead
+of removing it from the YAML test lists, add the test name to
+`tests/integration/test_lists/waives.txt`. Every CI run passes this file to
+pytest via `--waives-file`, so the listed tests are skipped automatically.
+
+Each line contains the fully qualified test name followed by an optional
+`SKIP (reason)` marker. A `full:GPU_TYPE/` prefix restricts the waive to a
+specific hardware family. Example:
+
+```text
+examples/test_openai.py::test_llm_openai_triton_1gpu SKIP (https://nvbugspro.nvidia.com/bug/4963654)
+full:GH200/examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct] SKIP (arm is not supported)
+```
+
+Changes to `waives.txt` should include a bug link or brief explanation so other
+developers understand why the test is disabled.
+
+## Triggering CI Best Practices
+
+### Triggering Post-merge tests
 
 When you only need to verify a handful of post-merge tests, avoid the heavy
 `/bot run --post-merge` command. Instead, specify exactly which stages to run:
