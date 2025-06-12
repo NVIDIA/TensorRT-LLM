@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import pytest
-
-from tests.unittest.utils.llm_data import llm_models_root
+from utils.cpp_paths import llm_root  # noqa: F401
+from utils.llm_data import llm_models_root
 
 # Constants for test configuration
 _DEFAULT_NUM_REQUESTS = 3
@@ -22,11 +22,12 @@ _PREPARE_DATASET_SCRIPT_PATH = "benchmarks/cpp/prepare_dataset.py"
 
 class TestPrepareDatasetLora:
     """
-    Test suite for prepare_dataset.py CLI tool LoRA metadata generation functionality.
+    Test suite for prepare_dataset.py CLI tool LoRA metadata generation
+    functionality.
 
-    This test class validates that the prepare_dataset.py script correctly generates
-    LoRA request metadata when LoRA-specific parameters are provided. It covers both
-    fixed task ID and random task ID scenarios.
+    This test class validates that the prepare_dataset.py script correctly
+    generates LoRA request metadata when LoRA-specific parameters are provided.
+    It covers both fixed task ID and random task ID scenarios.
     """
 
     @pytest.fixture
@@ -34,8 +35,8 @@ class TestPrepareDatasetLora:
         """
         Create a temporary LoRA directory structure for testing.
 
-        Creates a temporary directory with subdirectories for each test task ID,
-        simulating the expected LoRA adapter directory structure.
+        Creates a temporary directory with subdirectories for each test task
+        ID, simulating the expected LoRA adapter directory structure.
 
         Returns:
             str: Path to the temporary LoRA directory
@@ -111,7 +112,8 @@ class TestPrepareDatasetLora:
 
     def _run_prepare_dataset(self, llm_root: Path, **kwargs) -> str:
         """
-        Execute prepare_dataset.py with specified parameters and capture output.
+        Execute prepare_dataset.py with specified parameters and capture
+        output.
 
         Args:
             llm_root: Path to the TensorRT-LLM root directory
@@ -170,16 +172,19 @@ class TestPrepareDatasetLora:
         # Validate task ID range if specified
         if task_id_range:
             min_id, max_id = task_id_range
-            assert min_id <= task_id <= max_id, f"Task ID {task_id} out of range [{min_id}, {max_id}]"
+            assert min_id <= task_id <= max_id, (
+                f"Task ID {task_id} out of range [{min_id}, {max_id}]")
 
         # Validate structure
         expected_name = f"lora_{task_id}"
         expected_path = os.path.join(expected_lora_dir, str(task_id))
 
-        assert lora_request["lora_name"] == expected_name, \
-            f"Expected LoRA name '{expected_name}', got '{lora_request['lora_name']}'"
-        assert lora_request["lora_path"] == expected_path, \
-            f"Expected LoRA path '{expected_path}', got '{lora_request['lora_path']}'"
+        assert lora_request["lora_name"] == expected_name, (
+            f"Expected LoRA name '{expected_name}', "
+            f"got '{lora_request['lora_name']}'")
+        assert lora_request["lora_path"] == expected_path, (
+            f"Expected LoRA path '{expected_path}', "
+            f"got '{lora_request['lora_path']}'")
 
     @pytest.mark.parametrize("test_params", [
         pytest.param({
@@ -216,7 +221,8 @@ class TestPrepareDatasetLora:
 
         # Validate LoRA requests
         for i, item in enumerate(json_data):
-            assert "lora_request" in item, f"Missing 'lora_request' in JSON entry {i} for {description}"
+            assert "lora_request" in item, (
+                f"Missing 'lora_request' in JSON entry {i} for {description}")
             self._validate_lora_request(item["lora_request"],
                                         temp_lora_dir,
                                         task_id_range=rand_task_id)

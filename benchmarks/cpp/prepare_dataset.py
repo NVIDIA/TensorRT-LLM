@@ -31,7 +31,7 @@ class RootArgs(BaseModel):
     task_id: int
     std_out: bool
     rand_task_id: Optional[Tuple[int, int]]
-    lora_dir: str = "loras"
+    lora_dir: Optional[str] = None
 
     @field_validator('tokenizer')
     def get_tokenizer(cls,
@@ -76,8 +76,8 @@ class RootArgs(BaseModel):
               help="Random LoRA Tasks")
 @click.option("--lora-dir",
               type=str,
-              default="loras",
-              help="Directory containing LoRA adapters (default: loras)")
+              default=None,
+              help="Directory containing LoRA adapters")
 @click.option("--log-level",
               default="info",
               type=click.Choice(['info', 'debug']),
