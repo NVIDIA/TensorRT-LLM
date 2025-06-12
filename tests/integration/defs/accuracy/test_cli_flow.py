@@ -224,13 +224,24 @@ class TestLlama3_3NemotronSuper49Bv1(CliFlowAccuracyTestHarness):
                  quant_algo=QuantAlgo.FP8)
 
 
-class TestNemotronNano(CliFlowAccuracyTestHarness):
+class TestLlama3_1NemotronNano8Bv1(CliFlowAccuracyTestHarness):
     MODEL_NAME = "nvidia/Llama-3.1-Nemotron-Nano-8B-v1"
     MODEL_PATH = f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1"
     EXAMPLE_FOLDER = "models/core/llama"
 
     def test_auto_dtype(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], dtype='auto')
+
+    @skip_pre_hopper
+    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    def test_fp8_prequantized(self, mocker):
+        mocker.patch.object(
+            self.__class__, "MODEL_PATH",
+            f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1-FP8")
+
+        self.run(tasks=[MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.FP8,
+                 kv_cache_quant_algo=QuantAlgo.FP8)
 
 
 class TestNemotronUltra(CliFlowAccuracyTestHarness):

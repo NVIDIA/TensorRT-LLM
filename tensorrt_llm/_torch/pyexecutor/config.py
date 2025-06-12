@@ -86,6 +86,7 @@ class PyTorchConfig:
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
+    allreduce_strategy: str = "AUTO"
 
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [

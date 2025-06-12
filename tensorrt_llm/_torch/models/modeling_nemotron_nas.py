@@ -44,7 +44,7 @@ def _create_linear_from_configs(model_config: ModelConfig[PretrainedConfig],
         gather_output=True,
         quant_config=model_config.get_quant_config(),
         skip_create_weights_in_init=model_config.skip_create_weights_in_init,
-    )
+        allreduce_strategy=model_config.allreduce_strategy)
 
 
 class NemotronNASAttention(Attention):
