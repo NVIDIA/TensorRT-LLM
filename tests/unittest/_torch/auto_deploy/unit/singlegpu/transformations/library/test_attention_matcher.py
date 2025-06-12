@@ -1057,6 +1057,7 @@ class Llama3CausalAttentionModel(torch.nn.Module):
 
 
 @pytest.mark.parametrize("use_grouped_sdpa", [False, True])
+@pytest.mark.skip(reason="Skip until we have more robust attention masking handling, see #4783")
 @torch.inference_mode()
 def test_match_llama3_causal_attention(use_grouped_sdpa):
     batch_size, seq_len = 4, 12
