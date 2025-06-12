@@ -128,7 +128,7 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
             tp_size=tensor_parallel_size,
             rank=rank,
         )
-        ar = AllReduce(mapping, strategy=AllReduceStrategy.UB)
+        ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -220,7 +220,7 @@ def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
             tp_size=tensor_parallel_size,
             rank=rank,
         )
-        ar = AllReduce(mapping, strategy=AllReduceStrategy.UB)
+        ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
@@ -605,7 +605,7 @@ def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
             tp_size=tensor_parallel_size,
             rank=rank,
         )
-        ar = AllReduce(mapping, strategy=AllReduceStrategy.UB)
+        ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
@@ -692,9 +692,9 @@ class UBMMAddModel(nn.Module):
             tp_size=tp_size,
             rank=rank,
         )
-        self.ar_0 = AllReduce(mapping).cuda()
-        self.ar_1 = AllReduce(mapping).cuda()
-        self.ar_2 = AllReduce(mapping).cuda()
+        self.ar_0 = AllReduce(mapping=mapping).cuda()
+        self.ar_1 = AllReduce(mapping=mapping).cuda()
+        self.ar_2 = AllReduce(mapping=mapping).cuda()
         self.norm0 = RMSNorm(hidden_size=hidden_size, eps=eps,
                              dtype=dtype).cuda()
         self.norm1 = RMSNorm(hidden_size=hidden_size, eps=eps,
