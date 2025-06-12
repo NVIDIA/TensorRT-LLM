@@ -708,7 +708,8 @@ public:
     //! \brief Store blocks in cached blocks.
     //! \param blockKeys Key of each block.
     //! \param blockIds Id of each block.
-    void storeBlocks(std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds);
+    std::vector<BlockPtr> storeBlocks(
+        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds);
 
     //! \brief Store block in cached blocks.
     //! \param blockKey Key of the block.
