@@ -224,7 +224,19 @@ public:
         std::optional<at::Tensor> const& dDqSfsA, std::optional<at::Tensor> const& dDqSfsB,
         std::optional<at::Tensor> const& scaleC, int64_t configIndex)
     {
-
+        // If configIndex is not provided, use the default valid config index
+        if (configIndex == -1)
+        {
+            int64_t b = mat1.size(0);
+            int64_t m = mat1.size(1);
+            int64_t n = mat2.size(1);
+            int64_t k = mat1.size(2);
+            int32_t const numTokens = 0;
+            int32_t const maxNumCtasInBatchDim = 0;
+            std::vector<int32_t> const batchedTokens(b, m);
+            configIndex
+                = mRunner->getDefaultValidConfigIndex(m, n, k, batchedTokens, numTokens, b, maxNumCtasInBatchDim);
+        }
         return fp8_batched_gemm_sm100(mat1, mat2, mTileSize, mUseDeepSeekFp8, mLowLatencyKernel, mEpilogueTileM,
             dDqSfsA, dDqSfsB, scaleC, mOutDtypeArg, *mRunner, configIndex);
     }
@@ -238,17 +250,6 @@ public:
         std::vector<int32_t> const batchedTokens(numBatches, m);
 
         return mRunner->getValidConfigIndices(m, n, k, batchedTokens, numTokens, numBatches, maxNumCtasInBatchDim);
-    }
-
-    int64_t getDefaultValidConfigIndex(int64_t numBatches, int64_t m, int64_t n, int64_t k) const
-    {
-        // numTokens and maxNumCtasInBatchDim are not used for static batching
-        int32_t const numTokens = 0;
-        int32_t const maxNumCtasInBatchDim = 0;
-
-        std::vector<int32_t> const batchedTokens(numBatches, m);
-
-        return mRunner->getDefaultValidConfigIndex(m, n, k, batchedTokens, numTokens, numBatches, maxNumCtasInBatchDim);
     }
 
 private:
@@ -271,6 +272,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.class_<torch_ext::FP8BatchedGemmRunner>("FP8BatchedGemmRunner")
         .def(torch::init<at::ScalarType, bool, bool, int64_t, int64_t>())
         .def("get_valid_configs", &torch_ext::FP8BatchedGemmRunner::getValidConfigs)
-        .def("get_default_valid_config", &torch_ext::FP8BatchedGemmRunner::getDefaultValidConfigIndex)
         .def("run_batched_gemm", &torch_ext::FP8BatchedGemmRunner::runBatchedGemm);
 }
