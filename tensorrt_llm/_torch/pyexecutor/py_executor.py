@@ -2052,7 +2052,7 @@ class PyExecutor:
             request.decoding_iter = request.py_decoding_iter
             response = request.create_response(False, self.dist.rank)
             request_done = False
-            if response and response.result:
+            if response.has_result():
                 request_done = response.result.is_final
                 new_responses.update({req_id: response})
             if request_done:

@@ -232,6 +232,9 @@ class LlmResponse:
     def has_error(self):
         return self.error_msg is not None
 
+    def has_result(self):
+        return self.result._result
+
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     """LlmRequest wraps `bindings.internal.batch_manager.LlmRequest`
