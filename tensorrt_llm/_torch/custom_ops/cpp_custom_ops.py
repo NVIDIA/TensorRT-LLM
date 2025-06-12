@@ -367,3 +367,29 @@ def _register_fake():
         pad_slot_id: int,
     ) -> None:
         pass
+
+    @torch.library.register_fake("trtllm::allgather_list")
+    def _(input_list, sizes, group):
+        assert len(input_list) > 0
+
+        def create_output_tensor(i):
+            shape = list(i.shape)
+            if sizes is None:
+                shape[0] *= len(group)
+            else:
+                shape[0] = sum(sizes)
+            return i.new_empty(shape)
+
+        return [create_output_tensor(i) for i in input_list]
+
+    @torch.library.register_fake("trtllm::reducescatter")
+    def _(input, sizes, group):
+        import tensorrt_llm
+        local_rank = tensorrt_llm.mpi_rank()
+
+        shape = list(input.shape)
+        if sizes is None:
+            shape[0] = shape[0] // len(group)
+        else:
+            shape[0] = sizes[local_rank]
+        return input.new_empty(shape)
