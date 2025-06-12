@@ -512,3 +512,18 @@ class EnvVarsContextManager:
         for var_name in self._env_vars.keys():
             if var_name not in self._original_vars:
                 os.environ.pop(var_name)
+
+
+# Check a certain percentage of elements in two tensors are within a tolerance
+def check_accuracy(a, b, atol, rtol, percent):
+    assert a.shape == b.shape
+    assert a.dtype == b.dtype
+    a = a.to(torch.float32)
+    b = b.to(torch.float32)
+    left = torch.abs(a - b)
+    right = atol + rtol * torch.abs(b)
+    count = torch.sum(left > right)
+    mismatch_percent = count / a.numel()
+    if not (mismatch_percent < 1 - percent):
+        raise Exception("Mismatch percentage is %f for rtol %f" %
+                        (mismatch_percent, rtol))

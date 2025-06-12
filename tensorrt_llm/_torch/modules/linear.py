@@ -111,7 +111,10 @@ def copy_weight(dst: Parameter, src: torch.Tensor):
     dst.data.copy_(src)
 
 
-def load_weights_vanilla_helper(module: Linear, weights: List[Dict]):
+def load_weights_vanilla_helper(module: Linear,
+                                weights: List[Dict],
+                                weight_transform=lambda x: x,
+                                bias_transform=lambda x: x):
     assert len(weights) == 1
     device = torch.device('cuda')
 
@@ -127,17 +130,20 @@ def load_weights_vanilla_helper(module: Linear, weights: List[Dict]):
             weight.T.to(torch.int8).contiguous().cpu(), weight_dtype,
             activation_dtype).cuda().contiguous()
 
-    copy_weight(module.weight, weight)
+    copy_weight(module.weight, weight_transform(weight))
 
     if module.bias is not None:
         bias = load_weight_shard(weights[0]['bias'], module.tp_size,
                                  module.tp_rank, module.tp_mode, device)
-        copy_weight(module.bias, bias)
+        copy_weight(module.bias, bias_transform(bias))
 
 
 def load_weights_fused_qkv_helper(
-        module: Linear,
-        weights: List[Dict]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    module: Linear,
+    weights: List[Dict],
+    weight_transform=lambda x: x,
+    bias_transform=lambda x: x
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert len(weights) == 3
     device = torch.device('cuda')
 
@@ -155,14 +161,17 @@ def load_weights_fused_qkv_helper(
                                    module.tp_rank, module.tp_mode, device)
         v_bias = load_weight_shard(weights[2]['bias'], module.tp_size,
                                    module.tp_rank, module.tp_mode, device)
-        copy_weight(module.bias, torch.cat((q_bias, k_bias, v_bias)))
+        copy_weight(module.bias,
+                    bias_transform(torch.cat((q_bias, k_bias, v_bias))))
 
-    return (q_weight, k_weight, v_weight)
+    return tuple(map(weight_transform, (q_weight, k_weight, v_weight)))
 
 
 def load_weights_fused_gate_up_helper(
         module: Linear,
-        weights: List[Dict]) -> tuple[torch.Tensor, torch.Tensor]:
+        weights: List[Dict],
+        weight_transform=lambda x: x,
+        bias_transform=lambda x: x) -> tuple[torch.Tensor, torch.Tensor]:
     assert len(weights) == 2
     device = torch.device('cuda')
 
@@ -175,8 +184,9 @@ def load_weights_fused_gate_up_helper(
                                       module.tp_rank, module.tp_mode, device)
         up_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
                                     module.tp_rank, module.tp_mode, device)
-        copy_weight(module.bias, torch.cat((up_bias, gate_bias)))
-    return (gate_weight, up_weight)
+        copy_weight(module.bias, bias_transform(torch.cat(
+            (gate_bias, up_bias))))
+    return tuple(map(weight_transform, (gate_weight, up_weight)))
 
 
 def get_weight_dtype_and_id(module: Linear) -> tuple[torch.dtype, int]:
@@ -1516,11 +1526,23 @@ class Linear(nn.Module):
         if not skip_create_weights_in_init:
             self.create_weights()
 
+    def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
+        if quant_config is None or not quant_config.layer_quant_mode.has_any_quant(
+                exclude_kv_cache=True):
+            return UnquantizedLinearMethod()
+        if quant_config.layer_quant_mode.has_fp8_qdq():
+            return FP8QDQLinearMethod()
+        if quant_config.layer_quant_mode.has_fp8_block_scales():
+            return FP8BlockScalesLinearMethod()
+        if quant_config.layer_quant_mode.has_nvfp4():
+            return NVFP4LinearMethod()
+        raise ValueError(f'unsupported quant mode: {quant_config.quant_mode}')
+
     def create_weights(self):
         if self._weights_created:
             return
 
-        self.quant_method = get_quant_method(self.quant_config)
+        self.quant_method = self.get_quant_method(self.quant_config)
         self.quant_method.create_weights(self, self.in_features,
                                          self.out_features, self.has_bias,
                                          self.dtype)
