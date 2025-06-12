@@ -45,7 +45,7 @@ std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits,
     auto result = createResult(useFastLogits, mpiWorldRank);
     if (result.has_value())
     {
-        return executor::Response(requestId, result, mClientId);
+        return executor::Response(requestId, result.value(), mClientId);
     }
     return std::nullopt;
 }
