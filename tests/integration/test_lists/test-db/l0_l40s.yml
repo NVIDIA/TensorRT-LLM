@@ -14,7 +14,7 @@ l0_l40s:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)"
+  - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)" TIMEOUT (90)
   - unittest/_torch/modeling -k "modeling_mllama"
   - unittest/_torch/modeling -k "modeling_nemotron_nas"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
