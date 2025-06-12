@@ -1126,12 +1126,26 @@ class TestLlama3_3NemotronSuper49Bv1(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
-class TestNemotronNano(LlmapiAccuracyTestHarness):
+class TestLlama3_1NemotronNano8Bv1(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Llama-3.1-Nemotron-Nano-8B-v1"
     MODEL_PATH = f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1"
 
     def test_auto_dtype(self):
         with LLM(self.MODEL_PATH) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    def test_fp8_prequantized(self):
+        model_path = f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1-FP8"
+        with LLM(model_path) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
