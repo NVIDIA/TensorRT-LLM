@@ -206,7 +206,6 @@ def setup_llm(args):
               enable_chunked_prefill=args.enable_chunked_prefill,
               speculative_config=spec_config,
               trust_remote_code=args.trust_remote_code,
-              gather_context_logits=args.return_context_logits,
               gather_generation_logits=args.return_generation_logits)
 
     sampling_params = SamplingParams(
