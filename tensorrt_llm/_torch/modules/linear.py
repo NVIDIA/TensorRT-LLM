@@ -764,7 +764,7 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         left_scale = load_weight_shard(weights[0]['weight_scale'],
                                        module.tp_size, module.tp_rank,
                                        module.tp_mode, device).contiguous()
-        right_scale = load_weight_shard(weights[0]['weight_scale'],
+        right_scale = load_weight_shard(weights[1]['weight_scale'],
                                         module.tp_size, module.tp_rank,
                                         module.tp_mode, device).contiguous()
 
