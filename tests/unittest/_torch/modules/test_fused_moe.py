@@ -13,7 +13,7 @@ from _torch.helpers import (per_block_cast_to_fp8, per_block_cast_to_fp8_e8m0,
                             per_token_cast_to_fp8_e8m0)
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
-from utils.util import (getSMVersion, skip_neither_ada_nor_hopper_unittest,
+from utils.util import (check_accuracy, skip_neither_ada_nor_hopper_unittest,
                         skip_non_hopper_unittest, skip_pre_blackwell,
                         skip_pre_hopper)
 
@@ -43,20 +43,6 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
-
-
-def check_accuracy(a, b, atol, rtol, percent):
-    assert a.shape == b.shape
-    assert a.dtype == b.dtype
-    a = a.to(torch.float32)
-    b = b.to(torch.float32)
-    left = torch.abs(a - b)
-    right = atol + rtol * torch.abs(b)
-    count = torch.sum(left > right)
-    mismatch_percent = count / a.numel()
-    if not (mismatch_percent < 1 - percent):
-        raise Exception("Mismatch percentage is %f for rtol %f" %
-                        (mismatch_percent, rtol))
 
 
 @pytest.mark.parametrize(
@@ -1016,14 +1002,10 @@ def test_fused_moe_w4afp8(dtype):
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
+@skip_pre_hopper
 @pytest.mark.parametrize("experts", [8, 128, 512])
 @pytest.mark.parametrize("fp8_activation", [True, False])
 def test_fused_moe_triton_mxfp4(experts, fp8_activation):
-
-    if getSMVersion() < 90:
-        pytest.skip(
-            "TritonFusedMoE with MXFP4 weights is only supported on Hopper+")
-
     dtype = torch.bfloat16
     SEQ_LEN = 8
     HIDDEN_SIZE = 256
