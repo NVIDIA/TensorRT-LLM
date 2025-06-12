@@ -459,8 +459,10 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_3NemotronSuper49Bv1::test_auto_dtyp
 accuracy/test_llm_api_pytorch.py::TestLlama3_3NemotronSuper49Bv1::test_fp8_prequantized_tp2
 accuracy/test_cli_flow.py::TestLlama3_3NemotronSuper49Bv1::test_auto_dtype_tp2
 accuracy/test_cli_flow.py::TestLlama3_3NemotronSuper49Bv1::test_fp8_prequantized_tp2
-accuracy/test_llm_api_pytorch.py::TestNemotronNano::test_auto_dtype
-accuracy/test_cli_flow.py::TestNemotronNano::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestLlama3_1NemotronNano8Bv1::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestLlama3_1NemotronNano8Bv1::test_fp8_prequantized
+accuracy/test_cli_flow.py::TestLlama3_1NemotronNano8Bv1::test_auto_dtype
+accuracy/test_cli_flow.py::TestLlama3_1NemotronNano8Bv1::test_fp8_prequantized
 accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_auto_dtype[tp8ep4-cuda_graph=True]
 accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized[tp8ep4-cuda_graph=True]
 accuracy/test_cli_flow.py::TestNemotronUltra::test_auto_dtype[tp8-cuda_graph=True]
@@ -506,7 +508,7 @@ test_e2e.py::test_ptp_quickstart_advanced[Llama3.2-11B-BF16-llama-3.2-models/Lla
 test_e2e.py::test_ptp_quickstart_advanced[Nemotron4_4B-BF16-nemotron/Minitron-4B-Base]
 test_e2e.py::test_ptp_quickstart_advanced[Nemotron-H-8B-Nemotron-H-8B-Base-8K]
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B]
-test_e2e.py::test_ptq_quickstart_advanced_ngram[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
+test_e2e.py::test_ptp_quickstart_advanced_ngram[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
 test_e2e.py::test_ptp_quickstart_advanced_8gpus[Llama3.1-70B-BF16-llama-3.1-model/Meta-Llama-3.1-70B]
 test_e2e.py::test_ptp_quickstart_advanced_8gpus[Llama3.1-70B-FP8-llama-3.1-model/Llama-3.1-70B-Instruct-FP8]
 test_e2e.py::test_ptp_quickstart_advanced_8gpus[Llama3.1-405B-FP8-llama-3.1-model/Llama-3.1-405B-Instruct-FP8]
@@ -577,7 +579,6 @@ disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_t
 disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8]
-disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_nixl[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8]

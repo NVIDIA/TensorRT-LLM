@@ -20,6 +20,7 @@ from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+import torch
 
 # isort: off
 import tensorrt as trt
@@ -3880,6 +3881,7 @@ class AllReduceStrategy(IntEnum):
     ONESHOT = 4
     TWOSHOT = 5
     LOWPRECISION = 6
+    MNNVL = 7
 
 
 class AllReduceFusionOp(IntEnum):
@@ -4834,6 +4836,7 @@ class RopeEmbeddingUtils:
     def create_fake_weight(dim: int, dtype=np.half):
         return np.random.rand(dim).astype(dtype)
 
+    # Note: When not using deepseek_yarn, make sure to set mscale_all_dim to 0.0.
     @staticmethod
     def create_sinusoidal_positions_yarn(
             num_pos: int,
@@ -4846,24 +4849,19 @@ class RopeEmbeddingUtils:
             mscale: float = 1.0,
             mscale_all_dim: float = 1.0,
             duplicate_data: bool = True,
-            dtype=np.float32):
+            dtype=torch.float32):
 
         # Copy from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/modeling_deepseek.py
         # Inverse dim formula to find dim based on number of rotations
-        def yarn_find_correction_dim(num_rotations,
-                                     dim,
-                                     base=10000,
-                                     max_position_embeddings=2048):
+        def yarn_find_correction_dim(num_rotations, dim, base,
+                                     max_position_embeddings):
             return (dim * math.log(max_position_embeddings /
                                    (num_rotations * 2 * math.pi))) / (
                                        2 * math.log(base))
 
         # Find dim range bounds based on rotations
-        def yarn_find_correction_range(low_rot,
-                                       high_rot,
-                                       dim,
-                                       base=10000,
-                                       max_position_embeddings=2048):
+        def yarn_find_correction_range(low_rot, high_rot, dim, base,
+                                       max_position_embeddings):
             low = math.floor(
                 yarn_find_correction_dim(low_rot, dim, base,
                                          max_position_embeddings))
@@ -4876,7 +4874,7 @@ class RopeEmbeddingUtils:
                 high = dim - 1
             return low, high  # Clamp values just in case
 
-        def yarn_get_mscale(scale=1, mscale=1):
+        def yarn_get_mscale(scale, mscale):
             if scale <= 1:
                 return 1.0
             return 0.1 * mscale * math.log(scale) + 1.0
@@ -4885,13 +4883,13 @@ class RopeEmbeddingUtils:
             if min == max:
                 max += 0.001  # Prevent singularity
 
-            linear_func = (np.arange(dim, dtype=dtype) - min) / (max - min)
-            ramp_func = np.clip(linear_func, 0, 1)
+            linear_func = (torch.arange(dim, dtype=dtype) - min) / (max - min)
+            ramp_func = torch.clamp(linear_func, 0, 1)
             return ramp_func
 
-        freq_extra = 1.0 / (base**(np.arange(0, dim, 2, dtype=dtype) / dim))
-        freq_inter = 1.0 / (scaling_factor *
-                            base**(np.arange(0, dim, 2, dtype=dtype) / dim))
+        pos_freqs = base**(torch.arange(0, dim, 2, dtype=dtype) / dim)
+        freq_extra = 1.0 / pos_freqs
+        freq_inter = 1.0 / (scaling_factor * pos_freqs)
 
         low, high = yarn_find_correction_range(
             beta_fast,
@@ -4900,28 +4898,23 @@ class RopeEmbeddingUtils:
             base,
             original_max_position_embeddings,
         )
-        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high,
-                                                    dim // 2).astype(dtype)
+        inv_freq_mask = (1 - yarn_linear_ramp_mask(low, high, dim // 2))
         inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
-        sinusoid_inp = np.expand_dims(np.einsum("i , j -> i j",
-                                                np.arange(num_pos, dtype=dtype),
-                                                inv_freq,
-                                                dtype=dtype),
-                                      axis=-1)
+        t = torch.arange(num_pos, dtype=dtype)
+        sinusoid_inp = torch.einsum("i,j -> ij", t, inv_freq).unsqueeze(-1)
 
         _mscale = float(
             yarn_get_mscale(scaling_factor, mscale) /
             yarn_get_mscale(scaling_factor, mscale_all_dim))
 
         if duplicate_data:
-            emb = np.concatenate((sinusoid_inp, sinusoid_inp), axis=-2)
+            emb = torch.cat((sinusoid_inp, sinusoid_inp), dim=-2)
         else:
             emb = sinusoid_inp
 
-        concat = np.concatenate((np.cos(emb) * _mscale, np.sin(emb) * _mscale),
-                                axis=-1)
-
-        return inv_freq, concat.reshape((1, -1)).astype(dtype)
+        concat = torch.cat((torch.cos(emb) * _mscale, torch.sin(emb) * _mscale),
+                           dim=-1)
+        return inv_freq.numpy(), concat.reshape((1, -1)).to(dtype).numpy()
 
     @staticmethod
     def rotate_every_two(tensor: Tensor) -> Tensor:

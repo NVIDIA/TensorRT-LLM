@@ -160,6 +160,7 @@ def _clean_up_checks(gm: fx.GraphModule):
         torch.ops.aten._assert_scalar,
         torch.ops.aten.sym_constrain_range,
         torch.ops.aten.sym_constrain_range_for_size,
+        torch.ops.aten._assert_tensor_metadata,
         # torch.ops.aten._functional_sym_constrain_range,
         # torch.ops.aten._functional_sym_constrain_range_for_size
     }
