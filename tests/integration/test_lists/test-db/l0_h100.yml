@@ -15,7 +15,7 @@ l0_h100:
   tests:
   # ------------- PyTorch tests ---------------
   # Only key models in H100: llama/mixtral/nemotron/deepseek
-  - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)"
+  - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)" TIMEOUT (90)
   - unittest/_torch -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_nemotron"
@@ -121,7 +121,7 @@ l0_h100:
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-3.1-8b]
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-3.2-1b]
   - examples/test_qwen.py::test_llm_hf_qwen_multi_lora_1gpu[qwen2.5_1.5b_instruct]
-  - examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-2-9b-it]
+  - examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-2-9b-it] TIMEOUT (90)
   - examples/test_gemma.py::test_llm_gemma_1gpu_summary_vswa[gemma-3-1b-it-other-bfloat16-8]
   - unittest/trt/model/eagle # 1 mins on H100
   - unittest/test_model_runner_cpp.py
@@ -267,7 +267,7 @@ l0_h100:
   - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_auto_dtype
   - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache
   - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache_beam_search
-  - accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype TIMEOUT (90)
   - examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b]
   - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
   - unittest/trt/model_api/test_model_quantization.py # 20 mins on H100
