@@ -129,9 +129,7 @@ def add_llm_args(parser):
     parser.add_argument('--return_generation_logits',
                         default=False,
                         action='store_true')
-    parser.add_argument('--logprobs',
-                        default=False,
-                        action='store_true')
+    parser.add_argument('--logprobs', default=False, action='store_true')
     return parser
 
 
@@ -218,8 +216,7 @@ def setup_llm(args):
         top_p=args.top_p,
         return_context_logits=args.return_context_logits,
         return_generation_logits=args.return_generation_logits,
-        logprobs=args.logprobs
-    )
+        logprobs=args.logprobs)
     return llm, sampling_params
 
 
@@ -238,7 +235,9 @@ def main():
         if args.return_context_logits:
             print(f"[{i}] Context logits: {output.context_logits}")
         if args.return_generation_logits:
-            print(f"[{i}] Generation logits: {output.outputs[0].generation_logits}")
+            print(
+                f"[{i}] Generation logits: {output.outputs[0].generation_logits}"
+            )
         if args.logprobs:
             print(f"[{i}] Logprobs: {output.outputs[0].logprobs}")
 

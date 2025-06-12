@@ -95,7 +95,8 @@ def test_generate_with_return_logits(disable_overlap_scheduler: bool,
         for output in llm.generate(prompts, sampling_params=sampling_params):
             if gather_context_logits:
                 assert output.context_logits is not None
-                expected_len = len(prompts[0].split()) if disable_overlap_scheduler else len(prompts[0].split()) + 1
+                expected_len = len(prompts[0].split(
+                )) if disable_overlap_scheduler else len(prompts[0].split()) + 1
                 assert expected_len == output.context_logits.shape[0]
             else:
                 assert output.context_logits is None
@@ -163,7 +164,8 @@ def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
                                    streaming=True)):
             if gather_context_logits:
                 assert output.context_logits is not None
-                expected_len = len(prompts[0].split()) if disable_overlap_scheduler else len(prompts[0].split()) + 1
+                expected_len = len(prompts[0].split(
+                )) if disable_overlap_scheduler else len(prompts[0].split()) + 1
                 assert expected_len == output.context_logits.shape[0]
             else:
                 assert output.context_logits is None
