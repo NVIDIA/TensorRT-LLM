@@ -118,15 +118,24 @@ class LogProbStorage:
         self.log_probs = [[] for _ in range(self.beam_width)]
         self.cum_log_probs = [0 for _ in range(self.beam_width)]
 
-    def append(self, new_probs: list[TokenLogprobs]):
+    def append(self,
+               new_probs: list[TokenLogprobs],
+               cum_log_probs: Optional[list[float]] = None):
+        """
+        new_probs: [beam_width, num_tokens]
+        cum_log_probs: [beam_width]
+        """
         if self.beam_width == -1:
             self._init(new_probs)
 
         assert len(new_probs) == self.beam_width, "Beam width mismatch"
-        for idx, probs in enumerate(new_probs):
-            self.log_probs[idx].extend(probs)
-            self.cum_log_probs[idx] += sum(
-                next(iter(prob.values())).logprob for prob in probs)
+        for beam_idx, probs in enumerate(new_probs):
+            self.log_probs[beam_idx].extend(probs)
+            if cum_log_probs is not None:
+                self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
+            else:
+                self.cum_log_probs[beam_idx] += sum(
+                    next(iter(prob.values())).logprob for prob in probs)
 
 
 class PyResult:
@@ -157,9 +166,11 @@ class PyResult:
         if self._generation_logits:
             self._generation_logits.append(generation_logits)
 
-    def append_log_probs(self, log_probs: list[TokenLogprobs]):
+    def append_log_probs(self,
+                         log_probs: list[TokenLogprobs],
+                         cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
-            self._log_probs.append(log_probs)
+            self._log_probs.append(log_probs, cum_log_probs)
 
     @property
     def context_logits(self) -> torch.Tensor | None:
@@ -250,7 +261,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         super().__init__(
             *args,
             client_id=client_id,
-            return_log_probs=False,
+            return_log_probs=return_log_probs,
             return_context_logits=False,
             return_generation_logits=False,
             stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)

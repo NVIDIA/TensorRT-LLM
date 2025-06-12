@@ -17,7 +17,7 @@ import os
 import subprocess
 
 import pytest
-from defs.conftest import skip_no_hopper
+from defs.conftest import skip_arm, skip_no_hopper
 from defs.trt_test_alternative import check_call, popen
 
 from tensorrt_llm.logger import logger
@@ -533,6 +533,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
 
 
 @skip_no_hopper
+@skip_arm
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -559,6 +560,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
 
 
 @skip_no_hopper
+@skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
@@ -584,6 +586,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
 
 
 @skip_no_hopper
+@skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
