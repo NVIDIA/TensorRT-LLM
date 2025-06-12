@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -228,6 +229,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     dtype: torch.dtype = torch.bfloat16
     # The index of the batche inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
+    spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    spec_decoding_packed_mask: Optional[torch.Tensor] = None
+    spec_decoding_generation_lengths: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         if self.num_layers == 1:
@@ -248,6 +252,25 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             dtype=torch.int,
             device='cuda',
         )
+        self.spec_decoding_position_offsets = torch.empty(
+            [self.max_num_requests, self.max_draft_tokens + 1],
+            dtype=torch.int,
+            device='cuda',
+        )
+
+        self.spec_decoding_packed_mask = torch.empty(
+            [
+                self.max_num_requests, self.max_draft_tokens + 1,
+                math.ceil(self.max_draft_tokens / 32)
+            ],
+            dtype=torch.int,
+            device='cuda',
+        )
+        self.spec_decoding_generation_lengths = torch.empty(
+            [self.max_num_requests],
+            dtype=torch.int,
+            device='cuda',
+        )
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
@@ -263,6 +286,22 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
         self.num_tokens -= (self.num_generations) * self.max_draft_tokens
+        position_offset = torch.arange(self.max_draft_tokens + 1,
+                                       dtype=torch.int,
+                                       device='cpu',
+                                       pin_memory=True)
+        dummy_idx = torch.arange(self.max_draft_tokens + 1)
+        spec_decoding_packed_mask = torch.pow(2, dummy_idx + 1) - 1
+
+        self.spec_decoding_position_offsets.copy_(position_offset,
+                                                  non_blocking=True)
+        self.spec_decoding_packed_mask[:, :, 0].copy_(spec_decoding_packed_mask,
+                                                      non_blocking=True)
+
+        spec_decoding_generation_length = torch.full((num_seqs, ),
+                                                     self.max_draft_tokens + 1)
+        self.spec_decoding_generation_lengths[:num_seqs].copy_(
+            spec_decoding_generation_length, non_blocking=True)
 
     def maybe_capture_hidden_states(
             self,
@@ -315,6 +354,12 @@ class Eagle3OneModelWorker(nn.Module):
         position_ids = position_ids.squeeze(0)
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+
+        # print("eagle3.py Eagle3OneModelWorker prepare_1st_drafter_inputs",
+        #       "num_contexts", num_contexts, "num_gens",
+        #       num_gens, "accepted_tokens", accepted_tokens, "input_ids",
+        #       len(input_ids), input_ids)
+
         inputs = self.prepare_1st_drafter_inputs(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -324,11 +369,13 @@ class Eagle3OneModelWorker(nn.Module):
             attn_metadata=attn_metadata,
             spec_metadata=spec_metadata,
             draft_model=draft_model)
+        # print(f"eagle3.py draft_loop step -1 input", inputs)
 
         # Predict draft tokens
         next_draft_tokens = []
         for i in range(self.max_draft_tokens):
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+            spec_metadata.use_spec_dec = False
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
                                  (self.max_draft_tokens + 1)).long()
@@ -369,6 +416,7 @@ class Eagle3OneModelWorker(nn.Module):
             # support attention dp
             if spec_metadata.all_rank_num_tokens is not None:
                 spec_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
+            # print(f"eagle3.py draft_loop step {i} input_ids", new_draft_token)
             inputs = {
                 "input_ids": new_draft_token,
                 "position_ids": position_ids,
@@ -377,6 +425,7 @@ class Eagle3OneModelWorker(nn.Module):
                 "spec_metadata": spec_metadata,
             }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+        # print(f"eagle3.py draft_loop next_draft_tokens", next_draft_tokens)
 
         # restore attn_metadata to support cuda graph
         if attn_metadata.is_cuda_graph:
@@ -390,6 +439,8 @@ class Eagle3OneModelWorker(nn.Module):
             num_accepted_tokens - 1].unsqueeze(1)
         next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
                                        dim=1)
+
+        spec_metadata.use_spec_dec = True
 
         return {
             'logits': raw_logits,
@@ -422,7 +473,6 @@ class Eagle3OneModelWorker(nn.Module):
 
         # Do greedy sampling for the input logits
         target_tokens = torch.argmax(logits, dim=-1)
-
         # context
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
 
@@ -435,7 +485,8 @@ class Eagle3OneModelWorker(nn.Module):
         num_accepted_tokens[num_contexts:] += torch.cumprod((
             draft_tokens == gen_target_tokens[:, :self.max_draft_tokens]).int(),
                                                             dim=-1).sum(1)
-
+        # print("eagle3.py sample_and_accept_draft_tokens num_accepted_tokens",
+        #       num_accepted_tokens)
         return accepted_tokens, num_accepted_tokens
 
     def draft_decoder(
@@ -503,6 +554,9 @@ class Eagle3OneModelWorker(nn.Module):
 
         # get draft inputs
         input_ids = torch.concat([input_ids_ctx, input_ids_gen], dim=0)
+
+        # set use_spec_dec = true for attention.py
+        spec_metadata.use_spec_dec = True
 
         return {
             "input_ids": input_ids,

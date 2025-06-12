@@ -88,6 +88,12 @@ class SpeculativeDecodingMode(IntEnum):
                 and not (isinstance(attention_backend, TrtllmAttention)
                          and get_sm_version() == 100)) or self.is_ngram()
 
+    def require_multi_query_attn_kernel(
+            self, attention_backend: Type[AttentionBackend]):
+        return (self.is_eagle3_one_model()
+                and issubclass(attention_backend, TrtllmAttention)
+                and get_sm_version() < 100)
+
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
         if name is None:
@@ -173,6 +179,8 @@ class SpecMetadata:
     num_extra_kv_tokens: Optional[int] = 0  # Number of layers in target model
     # The number of layers
     num_layers: int = 0
+
+    use_spec_dec: bool = False
 
     def prepare(self):
         """
