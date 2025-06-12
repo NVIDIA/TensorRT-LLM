@@ -1299,10 +1299,11 @@ std::tuple<TRITONBACKEND_Response*, bool, TRITONSERVER_Error*, int64_t> ModelIns
                     processStats(OutputFieldsNames::firstTokenTime, timingStats.firstTokenTime);
                     processStats(OutputFieldsNames::lastTokenTime, timingStats.lastTokenTime);
 
-                    auto const& specDecStats = result.requestPerfMetrics.value().speculativeDecoding;
-                    processStats(OutputFieldsNames::acceptanceRate, specDecStats.acceptanceRate);
-                    processStats(OutputFieldsNames::totalAcceptedDraftTokens, specDecStats.totalAcceptedDraftTokens);
-                    processStats(OutputFieldsNames::totalDraftTokens, specDecStats.totalDraftTokens);
+                    auto const& specDecodingStats = result.requestPerfMetrics.value().speculativeDecoding;
+                    processStats(OutputFieldsNames::acceptanceRate, specDecodingStats.acceptanceRate);
+                    processStats(
+                        OutputFieldsNames::totalAcceptedDraftTokens, specDecodingStats.totalAcceptedDraftTokens);
+                    processStats(OutputFieldsNames::totalDraftTokens, specDecodingStats.totalDraftTokens);
                 }
             }
         }

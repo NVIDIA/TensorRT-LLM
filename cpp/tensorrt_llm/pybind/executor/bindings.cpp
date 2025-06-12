@@ -159,7 +159,7 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("cross_kv_cache_stats", &tle::IterationStats::crossKvCacheStats)
         .def_readwrite("static_batching_stats", &tle::IterationStats::staticBatchingStats)
         .def_readwrite("inflight_batching_stats", &tle::IterationStats::inflightBatchingStats)
-        .def_readwrite("specdec_stats", &tle::IterationStats::specDecStats)
+        .def_readwrite("specdec_stats", &tle::IterationStats::specDecodingStats)
         .def("to_json_str",
             [](tle::IterationStats const& iterationStats)
             { return tle::JsonSerialization::toJsonStr(iterationStats); });

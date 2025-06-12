@@ -518,25 +518,36 @@ def instantiate_sampler(model_engine: PyTorchModelEngine,
                         mapping: Mapping):
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
-        sampler = TorchStarAttentionSampler(
-            max_seq_len=model_engine.max_seq_len)
-    elif model_engine.spec_config is not None and model_engine.spec_config.spec_dec_mode.has_spec_decoder(
-    ):
-        sampler = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
-                                   spec_config=model_engine.spec_config)
-    elif pytorch_backend_config.enable_trtllm_sampler:
-        decoding_mode = get_decoding_mode(executor_config)
-        sampler = TRTLLMSampler(
-            executor_config, model_engine.model, model_engine.dtype, mapping,
-            decoding_mode, pytorch_backend_config.disable_overlap_scheduler)
-    elif not model_engine.model.model_config.is_generation:
-        # NOTE: choose sampler based on model type
-        sampler = EarlyStopSampler()
-    else:
-        sampler = TorchSampler(
+        return TorchStarAttentionSampler(max_seq_len=model_engine.max_seq_len)
+
+    spec_config = model_engine.spec_config
+    if spec_config is not None and spec_config.spec_dec_mode.has_spec_decoder():
+        return get_spec_decoder(
             max_seq_len=model_engine.max_seq_len,
-            mixed_sampler=pytorch_backend_config.mixed_sampler)
-    return sampler
+            spec_config=model_engine.spec_config,
+            disable_overlap_scheduler=pytorch_backend_config.
+            disable_overlap_scheduler,
+        )
+
+    if pytorch_backend_config.enable_trtllm_sampler:
+        return TRTLLMSampler(
+            executor_config=executor_config,
+            model=model_engine.model,
+            model_dtype=model_engine.dtype,
+            mapping=mapping,
+            decoding_mode=get_decoding_mode(executor_config),
+            disable_overlap_scheduler=pytorch_backend_config.
+            disable_overlap_scheduler,
+        )
+
+    if not model_engine.model.model_config.is_generation:
+        # NOTE: choose sampler based on model type
+        return EarlyStopSampler()
+
+    return TorchSampler(
+        max_seq_len=model_engine.max_seq_len,
+        mixed_sampler=pytorch_backend_config.mixed_sampler,
+    )
 
 
 def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:

@@ -265,8 +265,8 @@ public:
 
     // SpecDecodingStats
     static SpecDecodingStats deserializeSpecDecodingStats(std::istream& is);
-    static void serialize(SpecDecodingStats const& specDecStats, std::ostream& os);
-    static size_t serializedSize(SpecDecodingStats const& specDecStats);
+    static void serialize(SpecDecodingStats const& specDecodingStats, std::ostream& os);
+    static size_t serializedSize(SpecDecodingStats const& specDecodingStats);
 
     // IterationStats
     static IterationStats deserializeIterationStats(std::vector<char>& buffer);
