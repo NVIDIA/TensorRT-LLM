@@ -651,6 +651,21 @@ trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch 
 
 ```
 
+### Quantize model to fp4
+
+To quantize a model and use it in PyTorch backend, we need to use modelOpt to quantize the model. You can follow the scripts:
+
+```bash
+git clone https://github.com/NVIDIA/TensorRT-Model-Optimizer.git
+pushd TensorRT-Model-Optimizer
+pip install -e .
+
+./examples/llm_ptq/scripts/huggingface_example.sh --model Qwen3-235B-A22B/ --quant nvfp4 --export_fmt hf
+popd
+```
+
+The checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-30B-A3B_nvfp4_hf/`.
+
 ### Benchmark
 
 To run the benchmark, we suggest using the `trtllm-bench` tool. Please refer to the following script on B200:
