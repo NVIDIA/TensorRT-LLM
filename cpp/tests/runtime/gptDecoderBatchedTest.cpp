@@ -78,16 +78,11 @@ std::shared_ptr<tb::LlmRequest> createLlmRequest(SizeType32 batchSlot, SizeType3
     return std::move(request);
 }
 
-void newRequests(std::vector<SizeType32> const& inputLengths, std::vector<SizeType32> const& generatedTokensPerSteps,
-    std::vector<SizeType32> const& acceptedTokensPerStep, TokenIdType inputTokenId, TokenIdType expectedTokenId,
-    TensorPtr const& batchSlots, std::vector<SamplingConfig> const& allSamplingConfigs, nvinfer1::DataType logitsType,
-    ModelConfig const& modelConfig, WorldConfig const& worldConfig, tle::DecodingConfig const& decodingConfig,
-    GptDecoderBatched& decoder, CudaStream const& runtimeStream, SizeType32 maxSequenceLength, SizeType32 maxNewTokens,
-    SizeType32 endId, tb::DecoderInputBuffers& inputBuffers, decoder::DecoderState& decoderState)
+std::vector<std::shared_ptr<tb::LlmRequest>> createLlmRequests(std::vector<SizeType32> const& inputLengths,
+    std::vector<SizeType32> const& generatedTokensPerSteps, std::vector<SizeType32> const& acceptedTokensPerStep,
+    TokenIdType inputTokenId, TokenIdType expectedTokenId, TensorPtr const& batchSlots,
+    std::vector<SamplingConfig> const& allSamplingConfigs, SizeType32 maxNewTokens, SizeType32 endId)
 {
-    auto const& decoderStream = *decoder.getDecoderStream();
-    auto const bufferManager = BufferManager{std::make_shared<CudaStream>(runtimeStream.get())};
-
     auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots);
     auto const localBatchSize = batchSlots->getSize();
 
@@ -100,6 +95,20 @@ void newRequests(std::vector<SizeType32> const& inputLengths, std::vector<SizeTy
             allSamplingConfigs[batchSlot], endId);
         requests.emplace_back(std::move(llmReq));
     }
+
+    return requests;
+}
+
+void newRequests(std::vector<std::shared_ptr<tb::LlmRequest>> const& requests, TensorPtr const& batchSlots,
+    nvinfer1::DataType logitsType, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    tle::DecodingConfig const& decodingConfig, GptDecoderBatched& decoder, CudaStream const& runtimeStream,
+    SizeType32 maxSequenceLength, tb::DecoderInputBuffers& inputBuffers, decoder::DecoderState& decoderState)
+{
+    auto const& decoderStream = *decoder.getDecoderStream();
+    auto const bufferManager = BufferManager{std::make_shared<CudaStream>(runtimeStream.get())};
+
+    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots);
+    auto const localBatchSize = batchSlots->getSize();
 
     tb::CreateNewDecoderRequests createNewDecoderRequests(false, false, false);
     auto [lookaheadPrompt, lookaheadAlgoConfigs] = createNewDecoderRequests.createDecoderRequests(requests,
@@ -348,9 +357,10 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     auto outputs = createDecoderOutputs(
         batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths, *decoderState.getSequenceLengths(), manager);
 
-    newRequests(inputLengths, generatedTokensPerSteps, acceptedTokensPerStep, inputTokenId, expectedTokenId,
-        inputBuffers.setupBatchSlots, samplingConfigs, dataType, modelConfig, worldConfig, decodingConfig, decoder,
-        *streamPtr, maxSeqLength, maxNewTokens, endId, inputBuffers, decoderState);
+    auto requests = createLlmRequests(inputLengths, generatedTokensPerSteps, acceptedTokensPerStep, inputTokenId,
+        expectedTokenId, inputBuffers.setupBatchSlots, samplingConfigs, maxNewTokens, endId);
+    newRequests(requests, inputBuffers.setupBatchSlots, dataType, modelConfig, worldConfig, decodingConfig, decoder,
+        *streamPtr, maxSeqLength, inputBuffers, decoderState);
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;
@@ -393,9 +403,10 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     checkSequenceLengths(*decoderState.getSequenceLengths(), expectedLengths, manager);
 
     TensorPtr batchSlotsView = ITensor::slice(inputBuffers.setupBatchSlots, 0, 1);
-    newRequests(inputLengths, generatedTokensPerSteps, acceptedTokensPerStep, inputTokenId, expectedTokenId,
-        batchSlotsView, samplingConfigs, dataType, modelConfig, worldConfig, decodingConfig, decoder, *streamPtr,
-        maxSeqLength, maxNewTokens, endId, inputBuffers, decoderState);
+    requests = createLlmRequests(inputLengths, generatedTokensPerSteps, acceptedTokensPerStep, inputTokenId,
+        expectedTokenId, batchSlotsView, samplingConfigs, maxNewTokens, endId);
+    newRequests(requests, batchSlotsView, dataType, modelConfig, worldConfig, decodingConfig, decoder, *streamPtr,
+        maxSeqLength, inputBuffers, decoderState);
     EXPECT_FALSE(getFinished(*decoderState.getFinishedSum(), samplingConfigs, manager)[0]);
 }
 
@@ -497,9 +508,10 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
         TensorPtr const newBatchSlot = ITensor::slice(inputBuffers.setupBatchSlots, batchIdx, 1);
-        newRequests(inputLengths, generatedTokensPerSteps, acceptedTokensPerStep, inputTokenId, expectedTokenId,
-            newBatchSlot, samplingConfigs, dataType, modelConfig, worldConfig, decodingConfig, decoder, *streamPtr,
-            maxSeqLength, maxNewTokens, endId, inputBuffers, decoderState);
+        auto requests = createLlmRequests(inputLengths, generatedTokensPerSteps, acceptedTokensPerStep, inputTokenId,
+            expectedTokenId, newBatchSlot, samplingConfigs, maxNewTokens, endId);
+        newRequests(requests, newBatchSlot, dataType, modelConfig, worldConfig, decodingConfig, decoder, *streamPtr,
+            maxSeqLength, inputBuffers, decoderState);
 
         auto activeSlots = std::vector<SizeType32>(batchIdx + 1);
         std::iota(activeSlots.begin(), activeSlots.end(), 0);
@@ -641,9 +653,10 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     auto batchSlotsRange = BufferRange<SizeType32>(*inputBuffers.setupBatchSlots);
     std::iota(batchSlotsRange.begin(), batchSlotsRange.end(), 0);
 
-    newRequests(inputLengths, generatedTokensPerSteps, acceptedTokensPerStep, inputTokenId, expectedTokenId,
-        inputBuffers.setupBatchSlots, samplingConfigs, dataType, modelConfig, worldConfig, decodingConfig, decoder,
-        *streamPtr, maxSeqLength, maxNewTokens, endId, inputBuffers, decoderState);
+    auto requests = createLlmRequests(inputLengths, generatedTokensPerSteps, acceptedTokensPerStep, inputTokenId,
+        expectedTokenId, inputBuffers.setupBatchSlots, samplingConfigs, maxNewTokens, endId);
+    newRequests(requests, inputBuffers.setupBatchSlots, dataType, modelConfig, worldConfig, decodingConfig, decoder,
+        *streamPtr, maxSeqLength, inputBuffers, decoderState);
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;
