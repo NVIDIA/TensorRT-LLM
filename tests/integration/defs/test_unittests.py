@@ -70,8 +70,11 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     dry_run = False
     passed = True
 
-    nodeid = request.node.nodeid
-    test_prefix = nodeid.split('/')[0]
+    my_test_prefix = request.config.getoption("--test-prefix")
+    if my_test_prefix:
+        test_prefix = f"{my_test_prefix}/unittests"
+    else:
+        test_prefix = ""
 
     num_workers = 1
 
@@ -121,8 +124,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     command = [
         '-m', 'pytest', ignore_opt, "-v", "--timeout=1600",
-        "--timeout-method=thread", f"--test-prefix={test_prefix}"
+        "--timeout-method=thread"
     ]
+    if test_prefix:
+        command += [f"--test-prefix={test_prefix}"]
 
     if dry_run:
         command += ['--collect-only']
