@@ -231,7 +231,7 @@ def buildImage(config, imageKeyToTag)
 
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${tmpTag}"
 
-    def dependentTag = tag.replace("${arch}-${target}-", "${arch}-${dependent.target}-")
+    def dependentTag = tag.replace("${arch}-${target}-", "${arch}-devel-")
 
     def imageWithTag = "${IMAGE_NAME}/${makefileStage}:${tag}"
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.makefileStage}:${dependentTag}"
