@@ -1718,19 +1718,21 @@ def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
                                      dir="./",
                                      delete=True,
                                      delete_on_close=True) as running_log:
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-            "--spec_decode_algo",
-            "NGRAM",
-            "--spec_decode_nextn",
-            "4",
-            "--max_matching_ngram_size",
-            "2",
-            "--use_cuda_graph",
-        ],
-                         stdout=running_log)
+        llm_venv.run_cmd(
+            [
+                str(example_root / "quickstart_advanced.py"),
+                "--model_dir",
+                f"{llm_models_root()}/{model_path}",
+                "--spec_decode_algo",
+                "NGRAM",
+                "--spec_decode_nextn",
+                "4",
+                "--max_matching_ngram_size",
+                "2",
+                "--use_cuda_graph",
+                "--disable_overlap_scheduler",  # TODO: remove this after it is supported.
+            ],
+            stdout=running_log)
         _check_mem_usage(running_log, [27.0, 0, 0, 0])
 
 
