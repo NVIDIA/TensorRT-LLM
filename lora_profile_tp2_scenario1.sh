@@ -24,7 +24,7 @@ NUM_LAYERS=32
 MAX_LORA_RANK=8
 NUM_LORA_MODS=7
 EOS_ID=2
-NUM_REQUESTS=20
+NUM_REQUESTS=2
 
 # Fixed TP=2
 TP=2
@@ -125,8 +125,7 @@ mkdir -p ${EG_DIR}/profiles/scenario1-no-lora-engine-tp-${TP}
 
 # Run with nsys profiling
 nsys profile \
-    --trace=nvtx,cuda \
-    --nvtx-domain-include="TensorRT*,nvtx3-cpp" \
+    --trace=nvtx,cuda,osrt \
     --cuda-graph-trace=graph \
     --force-overwrite=true \
     --output=${EG_DIR}/profiles/scenario1-no-lora-engine-tp-${TP}/gpt_manager_scenario1_tp2 \
