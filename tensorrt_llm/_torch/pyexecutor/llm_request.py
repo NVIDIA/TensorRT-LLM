@@ -232,9 +232,6 @@ class LlmResponse:
     def has_error(self):
         return self.error_msg is not None
 
-    def has_result(self):
-        return self.result._result
-
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     """LlmRequest wraps `bindings.internal.batch_manager.LlmRequest`
@@ -314,13 +311,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self,
             use_fast_logits=False,
             mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
+        result = super().create_result(use_fast_logits, mpi_world_rank)
         return LlmResponse(
             request_id=self.py_request_id,
-            result=LlmResult(
-                super().create_result(use_fast_logits, mpi_world_rank),
-                self.py_result),
-            client_id=self.py_client_id,
-        )
+            result=LlmResult(result, self.py_result),
+            client_id=self.py_client_id) if result is not None else None
 
     @property
     def is_dummy(self):
