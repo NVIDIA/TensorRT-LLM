@@ -114,22 +114,21 @@ class AttentionBlock(Attention):
         hidden_states = self.norm(hidden_states)
 
         attention_window_size = self.sliding_window
-        return super().forward(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            attention_mask=attention_mask,
-            all_reduce_params=all_reduce_params,
-            lora_params=lora_params,
-            attention_window_size=attention_window_size,
-            #    attention_sinks=self.sinks.data,
-            **kwargs)
+        return super().forward(position_ids=position_ids,
+                               hidden_states=hidden_states,
+                               attn_metadata=attn_metadata,
+                               attention_mask=attention_mask,
+                               all_reduce_params=all_reduce_params,
+                               lora_params=lora_params,
+                               attention_window_size=attention_window_size,
+                               attention_sinks=self.sinks.data,
+                               **kwargs)
 
     def load_weights(self, weights: Dict):
         sinks = weights[0]['sinks'][self.num_heads *
                                     self.tp_rank:self.num_heads *
                                     (self.tp_rank + 1)]
-        self.sinks.data = sinks.to(torch.float32)
+        self.sinks.data = sinks.to(torch.float32).to("cuda")
 
 
 class MLPBlock(torch.nn.Module):
