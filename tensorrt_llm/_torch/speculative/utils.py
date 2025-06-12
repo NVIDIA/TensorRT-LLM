@@ -52,7 +52,7 @@ def get_spec_resource_manager(spec_config, model_config, max_num_requests):
     return None
 
 
-def get_spec_decoder(max_seq_len, spec_config, disable_overlap_scheduler):
+def get_spec_decoder(max_seq_len, spec_config):
     if spec_config.spec_dec_mode.is_mtp():
         return MTPSampler(max_seq_len, spec_config)
     elif spec_config.spec_dec_mode.is_eagle3():
@@ -60,7 +60,7 @@ def get_spec_decoder(max_seq_len, spec_config, disable_overlap_scheduler):
     elif spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelDecoder(max_seq_len, spec_config)
     elif spec_config.spec_dec_mode.is_ngram():
-        return NGramSampler(max_seq_len, spec_config, disable_overlap_scheduler)
+        return NGramSampler(max_seq_len, spec_config)
     else:
         return None
 

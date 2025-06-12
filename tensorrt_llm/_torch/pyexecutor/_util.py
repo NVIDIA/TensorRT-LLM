@@ -522,11 +522,8 @@ def instantiate_sampler(model_engine: PyTorchModelEngine,
 
     spec_config = model_engine.spec_config
     if spec_config is not None and spec_config.spec_dec_mode.has_spec_decoder():
-        return get_spec_decoder(
-            max_seq_len=model_engine.max_seq_len,
-            spec_config=model_engine.spec_config,
-            disable_overlap_scheduler=pytorch_backend_config.
-            disable_overlap_scheduler)
+        return get_spec_decoder(max_seq_len=model_engine.max_seq_len,
+                                spec_config=model_engine.spec_config)
 
     if pytorch_backend_config.enable_trtllm_sampler:
         decoding_mode = get_decoding_mode(executor_config)
