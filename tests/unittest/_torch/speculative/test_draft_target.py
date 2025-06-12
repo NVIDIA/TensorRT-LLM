@@ -17,7 +17,7 @@ from utils.llm_data import llm_models_root
                          [[False, "TRTLLM"], [True, "TRTLLM"]])
 def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 31:
+    if total_mem_gb < 60:
         pytest.skip("Not enough memory to load target model")
 
     models_path = llm_models_root()
@@ -30,8 +30,8 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
     )
     max_batch_size = 1
 
-    target_model_dir = f"{models_path}/llama-3.2-models/Llama-3.2-1B"
-    draft_model_dir = f"{models_path}/llama-3.2-models/Llama-3.2-1B"
+    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+    draft_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
     draft_len = 4
     spec_config = DraftTargetDecodingConfig(
