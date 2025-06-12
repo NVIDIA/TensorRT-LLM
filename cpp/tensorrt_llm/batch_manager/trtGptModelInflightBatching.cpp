@@ -563,6 +563,7 @@ void TrtGptModelInflightBatching::adjustMaxAttentionWindow(SizeType32 numPrimary
         // TODO(nhaber): This is problematic, as createBuffers edits the state of trtGptModelInflightBatching, but what
         // if there are different window values for cross+self etc. in encoder+decoder scenario...
         createBuffers(mDecodingConfig, mAdditionalModelOutputs);
+        createDecoder(mDecodingConfig.getDecodingMode());
     }
 }
 
