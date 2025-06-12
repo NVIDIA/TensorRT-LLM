@@ -245,20 +245,32 @@ async def async_request_openai_chat_completions(
 
     async with aiohttp.ClientSession(trust_env=True,
                                      timeout=AIOHTTP_TIMEOUT) as session:
-        content = [{"type": "text", "text": request_func_input.prompt}]
         payload = {
             "model": request_func_input.model_name \
                 if request_func_input.model_name else request_func_input.model,
             "messages": [
-                {
-                    "role": "user",
-                    "content": content
-                },
             ],
             "temperature": 0.0,
             "max_completion_tokens": request_func_input.output_len,
             "stream": streaming,
         }
+
+        if isinstance(request_func_input.prompt, list) and all(
+            [isinstance(i, int) for i in request_func_input.prompt]):
+            payload["prompt_token_ids"] = request_func_input.prompt
+        else:
+            assert isinstance(
+                request_func_input.prompt,
+                str), "Prompt must be a string or a list of integers"
+            payload["messages"].append({
+                "role":
+                "user",
+                "content": [{
+                    "type": "text",
+                    "text": request_func_input.prompt
+                }]
+            })
+
         if streaming:
             payload["stream_options"] = {"include_usage": True}
         if request_func_input.ignore_eos:
@@ -320,6 +332,9 @@ async def async_request_openai_chat_completions(
                         data = json.loads(content.decode())
                         output.generated_text = data["choices"][0]["message"][
                             "content"]
+                        output.output_tokens = data["usage"][
+                            "completion_tokens"]
+                        output.itl = []
                         output.latency = time.perf_counter() - st
                         output.ttft = -1
 
