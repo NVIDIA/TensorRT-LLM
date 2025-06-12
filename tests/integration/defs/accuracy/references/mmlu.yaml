@@ -115,6 +115,9 @@ deepseek-ai/DeepSeek-V3-Lite:
   - accuracy: 71.40
   - quant_algo: NVFP4
     accuracy: 70.60
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 70.60
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 71.27
   - spec_dec_algo: MTP
