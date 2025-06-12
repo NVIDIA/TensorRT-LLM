@@ -54,7 +54,7 @@ from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
 from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op
-from ...utils.pattern_matcher import Match, PatternMatcherPass, register_pattern
+from ...utils.pattern_matcher import ADPatternMatcherPass, Match, register_ad_pattern
 from .._graph import canonicalize_graph
 
 
@@ -121,7 +121,7 @@ def _explicit_not_interleaved(match: Match) -> bool:
 
 def match_rope_pattern(gm: GraphModule) -> GraphModule:
     graph = gm.graph
-    patterns = PatternMatcherPass()
+    patterns = ADPatternMatcherPass()
 
     # dummy shapes: can be arbitrary
     batch_size = 8
@@ -141,7 +141,7 @@ def match_rope_pattern(gm: GraphModule) -> GraphModule:
         torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
         torch.randn(batch_size, seq_len, head_dim // 2, device="meta", dtype=torch.float16),
     ]
-    register_pattern(
+    register_ad_pattern(
         search_fn=_explicit_rope_pattern,
         replace_fn=_explicit_rope_repl,
         patterns=patterns,
@@ -150,7 +150,7 @@ def match_rope_pattern(gm: GraphModule) -> GraphModule:
         scalar_workaround={"unsqueeze_dim": 1},
         extra_check=_explicit_not_interleaved,
     )
-    register_pattern(
+    register_ad_pattern(
         search_fn=_interleaved_rope_pattern,
         replace_fn=_interleaved_rope_repl,
         patterns=patterns,
@@ -162,7 +162,7 @@ def match_rope_pattern(gm: GraphModule) -> GraphModule:
         },
         scalar_workaround={"unsqueeze_dim": 1},
     )
-    register_pattern(
+    register_ad_pattern(
         search_fn=_complex_rope_pattern,
         replace_fn=_complex_rope_repl,
         patterns=patterns,
