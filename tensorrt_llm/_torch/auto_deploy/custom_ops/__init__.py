@@ -8,6 +8,7 @@ from .fused_moe import *
 from .linear import *
 from .mla import *
 from .quant import *
+from .rms_norm import *
 from .rope import *
 from .torch_attention import *
 from .torch_rope import *
