@@ -1140,9 +1140,12 @@ class PyTorchModelEngine(ModelEngine):
                     0] - num_ctx_tokens
                 inputs['position_ids'][0, num_ctx_tokens:] += (
                     self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
-                inputs['attn_metadata'].kv_lens_cuda[
-                    num_ctx_requests:num_seqs] += (
-                        self.previous_kv_lens_offsets_cuda[:num_gen_requests])
+                if hasattr(inputs['attn_metadata'], 'kv_lens_cuda'):
+                    # FlashInferAttentionMetadata has no such member `kv_lens_cuda`.
+                    inputs['attn_metadata'].kv_lens_cuda[
+                        num_ctx_requests:num_seqs] += (
+                            self.
+                            previous_kv_lens_offsets_cuda[:num_gen_requests])
 
         return inputs
 
