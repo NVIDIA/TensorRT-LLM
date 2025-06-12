@@ -18,6 +18,7 @@
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
+#include "tensorrt_llm/batch_manager/scheduledBlocksManager.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
