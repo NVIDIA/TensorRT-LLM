@@ -27,7 +27,6 @@ def get_model_yaml_config(model_label: str) -> dict:
             dict: yaml config
         """
     base_config = {
-        'enable_attention_dp': True,
         'print_iter_log': True,
         'use_cuda_graph': True,
         'cuda_graph_padding_enabled': True,
@@ -43,6 +42,7 @@ def get_model_yaml_config(model_label: str) -> dict:
                 'deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:1-maxnt:8192-input_output_len:1000,2000-quant:nvfp4-reqs:10-ep:4-tp:8-gpus:8'
             ],
             'config': {
+                'enable_attention_dp': True,
                 'use_cuda_graph': True,
                 'speculative_config': {
                     'decoding_type': 'MTP',
@@ -57,6 +57,7 @@ def get_model_yaml_config(model_label: str) -> dict:
                 'deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-quant:nvfp4-reqs:49152-con:3072-ep:8-gpus:8'
             ],
             'config': {
+                'enable_attention_dp': True,
                 'cuda_graph_padding_enabled': True,
                 'cuda_graph_batch_sizes':
                 [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]
@@ -67,6 +68,7 @@ def get_model_yaml_config(model_label: str) -> dict:
             'patterns':
             'deepseek_r1-bench-pytorch-float16-maxbs:128-maxnt:1127-input_output_len:1000,2000-quant:fp8-reqs:5120-con:1024-ep:8-gpus:8',
             'config': {
+                'enable_attention_dp': True,
                 'cuda_graph_batch_sizes': [128]
             }
         },
