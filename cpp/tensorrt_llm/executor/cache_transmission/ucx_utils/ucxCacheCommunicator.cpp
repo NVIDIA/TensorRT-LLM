@@ -106,7 +106,8 @@ UcxConnectionManager::UcxConnectionManager()
     try
     {
         TLLM_CUDA_CHECK(cudaGetDevice(&mDevice));
-        mUcxCtx = ucxx::createContext({{"RNDV_PIPELINE_ERROR_HANDLING", "y"}}, ucxx::Context::defaultFeatureFlags);
+        mUcxCtx = ucxx::createContext(
+            {{"RNDV_PIPELINE_ERROR_HANDLING", "y"}}, UCP_FEATURE_TAG | UCP_FEATURE_AM | UCP_FEATURE_RMA);
         int device = mDevice;
         try
         {
