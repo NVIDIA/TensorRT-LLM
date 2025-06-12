@@ -1601,7 +1601,7 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
 @pytest.mark.parametrize("model_name,model_path", [
     ("DeepSeek-V3-Lite-BF16", "DeepSeek-V3-Lite/bf16"),
 ])
-def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
+def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
                                      model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
@@ -1626,7 +1626,7 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
 
 
 @pytest.mark.skip_less_device(4)
-def test_ptq_quickstart_advanced_bs1(llm_root, llm_venv):
+def test_ptp_quickstart_advanced_bs1(llm_root, llm_venv):
     model_name = "DeepSeek-V3-Lite-FP8"
     model_path = "DeepSeek-V3-Lite/fp8"
     print(f"Testing {model_name}.")
@@ -1653,7 +1653,7 @@ def test_ptq_quickstart_advanced_bs1(llm_root, llm_venv):
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
 ])
-def test_ptq_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
+def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
                                        model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
