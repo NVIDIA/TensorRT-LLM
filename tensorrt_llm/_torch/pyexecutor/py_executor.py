@@ -180,6 +180,8 @@ class PyExecutor:
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
+        # [DO NOT Merge] hacky way to let GC run less often
+        gc.set_threshold(20000)
 
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
