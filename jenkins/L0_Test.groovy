@@ -2082,7 +2082,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                     // }
                     sh "env | sort"
                     def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
-                    runLLMBuildFromPackage(pipeline, cpuArch, cpuArch == AARCH64_TRIPLE, "imageTest/")
+                    runLLMBuildFromPackage(pipeline, cpuArch, false, "imageTest/")
                 })
             }
         }
