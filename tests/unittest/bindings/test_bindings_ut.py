@@ -541,21 +541,21 @@ def test_SamplingConfig_pickle():
 
 def test_KvCache_events_binding():
     stream = torch.cuda.Stream()
+    max_sequence_length = 10
     kwargs = {
         'num_kv_heads_per_layer': [1, 1],
         'size_per_head':
         128,
         'tokens_per_block':
         64,
-        'blocks_in_primary_pool':
-        1000,
-        'blocks_in_secondary_pool':
-        10000,
+        'blocks_per_window': {
+            max_sequence_length: (1000, 10000)
+        },
         'max_num_sequences':
         1,
         'max_beam_width':
         1,
-        'max_attention_window_vec': [10],
+        'max_attention_window_vec': [max_sequence_length],
         'temp_attention_window_inputs':
         None,
         'dtype':
@@ -565,7 +565,7 @@ def test_KvCache_events_binding():
         'stream':
         stream.cuda_stream,
         'max_sequence_length':
-        10,
+        max_sequence_length,
         'enable_block_reuse':
         True,
         'onboard_blocks':

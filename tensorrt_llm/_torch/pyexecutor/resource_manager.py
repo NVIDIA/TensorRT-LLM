@@ -206,8 +206,10 @@ class KVCacheManager(BaseResourceManager):
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
             'tokens_per_block': tokens_per_block,
-            'blocks_in_primary_pool': self.blocks_in_primary_pool,
-            'blocks_in_secondary_pool': self.blocks_in_secondary_pool,
+            'blocks_per_window': {
+                self.max_attention_window:
+                (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
+            },
             'max_num_sequences': max_batch_size,
             'max_beam_width': 1,  # TODO: more than 1 beam?
             'max_attention_window_vec': [self.max_attention_window],
