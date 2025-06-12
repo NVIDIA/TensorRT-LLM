@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -58,6 +59,8 @@ void setPagedKVCacheForMLAHelper(torch::Tensor& output, torch::Tensor const& k, 
     auto const* k_pe_ptr = static_cast<T const*>(k_pe.data_ptr());
     auto const* cu_seq_lens_ptr = cu_seq_lens.data_ptr<int64_t>();
 
+    // cudaMemset is faster than torch::zeros
+    TLLM_CUDA_CHECK(cudaMemsetAsync(output_ptr, 0, output.numel() * torch::elementSize(output.scalar_type()), stream));
     tensorrt_llm::kernels::invokeMLASetPagedKV<T>(output_ptr, k_ptr, v_ptr, k_pe_ptr, num_requests, cu_seq_lens_ptr,
         max_input_seq_len, num_heads, kv_dim, rope_dim, kv_cache_tokens_per_block, kv_token_stride, stream);
 }
@@ -266,9 +269,6 @@ torch::Tensor setPagedKVCacheForMLA(torch::Tensor& output, torch::Tensor const& 
     CHECK_INPUT(cu_seq_lens, torch::kInt64);
     TORCH_CHECK(cu_seq_lens.dim() == 1);
     TORCH_CHECK(cu_seq_lens.size(0) >= num_requests + 1);
-
-    // cudaMemset is faster than torch::zeros
-    cudaMemset(output.data_ptr(), 0, output.numel() * torch::elementSize(output_dtype));
 
     if (output_dtype == torch::kFloat16)
     {
