@@ -400,12 +400,12 @@ struct KernelParams
         // The stride elements.
         auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, isK);
 
-        // The maximum headDim of K and V.
+        // The headDim.
         // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
-        int32_t headDim{std::max(options.mHeadDimQk, options.mHeadDimV)};
+        int32_t headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
         if (isPagedKv(options.mQkvLayout) || isContiguousKv(options.mQkvLayout))
         {
-            headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
+            headDim = std::max(options.mHeadDimQk, options.mHeadDimV);
         }
 
         // For K, the cute layout: (numKeys, headDim, ((numHeadsQPerKv, numHeadsKv),
@@ -438,7 +438,7 @@ struct KernelParams
         // The stride elements.
         auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, isK);
 
-        // The maximum headDim of K and V.
+        // The headDim.
         // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
         int32_t headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
         if (isPagedKv(options.mQkvLayout) || isContiguousKv(options.mQkvLayout))
