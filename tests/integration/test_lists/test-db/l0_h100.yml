@@ -119,7 +119,7 @@ l0_h100:
       - '*h100*'
       linux_distribution_name: ubuntu*
     terms:
-      stage: pre_merge
+      stage: post_merge
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
