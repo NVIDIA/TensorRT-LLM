@@ -1,3 +1,24 @@
+"""Lookup Jenkins stage names for integration tests and vice versa.
+
+This helper parses ``jenkins/L0_Test.groovy`` and the YAML files under
+``tests/integration/test_lists/test-db`` to provide a bidirectional mapping
+between test names and Jenkins stage names. When ``--tests`` or ``--test-list``
+options are used, each value is treated as a substring pattern. Any test whose
+fully qualified name contains the pattern will be matched. If the pattern
+corresponds exactly to a test name, it naturally matches that test as well.
+
+Example usage::
+
+   python scripts/test_to_stage_mapping.py --tests \
+       "triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]"
+   python scripts/test_to_stage_mapping.py --tests gpt_ib_ptuning
+   python scripts/test_to_stage_mapping.py --stages A100X-Triton-Python-[Post-Merge]-1
+
+Tests can also be provided via ``--test-list`` pointing to either a plain text
+file or a YAML list file. Quote individual test names on the command line so the
+shell does not interpret ``[`` and ``]`` characters.
+"""
+
 import argparse
 import os
 import re
@@ -76,6 +97,15 @@ class StageQuery:
                         yaml_stage_tests[yml][stage].append(t)
         return test_map, yaml_stage_tests
 
+    def search_tests(self, pattern: str):
+        parts = pattern.split()
+        result = []
+        for test in self.test_map:
+            name = test.lower()
+            if all(p.lower() in name for p in parts):
+                result.append(test)
+        return result
+
     def tests_to_stages(self, tests):
         result = set()
         for t in tests:
@@ -104,14 +134,14 @@ def main():
     parser = argparse.ArgumentParser(
         description='Map Jenkins stages to tests and vice versa.')
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--tests',
-                       nargs='+',
-                       help='List of test names to look up')
+    group.add_argument(
+        '--tests',
+        nargs='+',
+        help='One or more test name patterns to resolve to Jenkins stages')
     group.add_argument(
         '--test-list',
         help=
-        'File containing test names, either newline-separated .txt file or a bulleted .yml/.yaml file'
-    )
+        'File with test name patterns, either newline separated or a YAML list')
     group.add_argument('--stages',
                        nargs='+',
                        help='List of stage names to look up')
@@ -126,11 +156,16 @@ def main():
     query = StageQuery(groovy, db_dir)
 
     if args.tests or args.test_list:
-        tests = []
+        patterns = []
         if args.tests:
-            tests.extend(args.tests)
+            patterns.extend(args.tests)
         if args.test_list:
-            tests.extend(_load_tests_file(args.test_list))
+            patterns.extend(_load_tests_file(args.test_list))
+
+        collected = []
+        for pat in patterns:
+            collected.extend(query.search_tests(pat))
+        tests = sorted(set(collected))
         stages = query.tests_to_stages(tests)
         for s in stages:
             print(s)
