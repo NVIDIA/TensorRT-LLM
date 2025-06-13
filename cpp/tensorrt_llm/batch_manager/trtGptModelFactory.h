@@ -73,16 +73,18 @@ public:
         TLLM_LOG_INFO("Rank %d is using GPU %d", rank, device);
         TLLM_CUDA_CHECK(cudaSetDevice(device));
 
-        auto optionalParams = batch_manager::TrtGptModelOptionalParams(executorConfig, isLeaderInOrchMode);
-
         if ((modelType == TrtGptModelType::InflightBatching) || (modelType == TrtGptModelType::InflightFusedBatching))
         {
-            TrtGptModelOptionalParams const& fixedOptionalParams
-                = TrtGptModelInflightBatching::optionalParamsAreValid(modelConfig, optionalParams)
-                ? optionalParams
-                : TrtGptModelInflightBatching::fixOptionalParams(modelConfig, optionalParams);
-            return std::make_shared<TrtGptModelInflightBatching>(logger, modelConfig, worldConfig, rawEngine,
-                (modelType == TrtGptModelType::InflightFusedBatching), fixedOptionalParams);
+            executor::ExecutorConfig const& fixedExecutorConfig
+                = TrtGptModelInflightBatching::executorConfigIsValid(modelConfig, executorConfig)
+                ? executorConfig
+                : TrtGptModelInflightBatching::fixExecutorConfig(modelConfig, executorConfig);
+
+            auto optionalParams = batch_manager::TrtGptModelOptionalParams(fixedExecutorConfig, isLeaderInOrchMode);
+
+            bool const ctxGenFusion = modelType == TrtGptModelType::InflightFusedBatching;
+            return std::make_shared<TrtGptModelInflightBatching>(
+                logger, modelConfig, worldConfig, rawEngine, ctxGenFusion, optionalParams);
         }
 
         throw std::runtime_error("Invalid modelType in trtGptModelFactory");

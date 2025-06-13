@@ -202,10 +202,10 @@ public:
         return mIterCounter;
     }
 
-    [[nodiscard]] static bool optionalParamsAreValid(
-        runtime::ModelConfig const& modelConfig, TrtGptModelOptionalParams const& optionalParams);
-    [[nodiscard]] static TrtGptModelOptionalParams fixOptionalParams(
-        runtime::ModelConfig const& modelConfig, TrtGptModelOptionalParams const& optionalParams);
+    [[nodiscard]] static bool executorConfigIsValid(
+        runtime::ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig);
+    [[nodiscard]] static executor::ExecutorConfig fixExecutorConfig(
+        runtime::ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig);
 
     void prepareDisaggGenInitRequests(RequestList const& activeRequests, RequestVector& newGenReques);
     void checkDisaggGenTransferStatus(RequestList const& activeRequests);
