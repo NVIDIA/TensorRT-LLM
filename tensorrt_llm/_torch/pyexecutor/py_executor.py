@@ -909,7 +909,7 @@ class PyExecutor:
 
                     if self.is_ngram:
                         self.sampler.prepare_forward(scheduled_batch,
-                                                     sample_state, iter_stats)
+                                                     sample_state)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
