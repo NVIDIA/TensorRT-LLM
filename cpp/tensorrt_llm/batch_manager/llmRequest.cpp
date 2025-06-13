@@ -52,7 +52,7 @@ std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits,
 }
 
 void LlmRequest::createSerializedResult(
-    std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits = false, int32_t mpiWorldRank = 0)
+    std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits = false, int32_t mpiWorldRank)
 {
     auto result = createResult(useFastLogits, mpiWorldRank);
     if (result.has_value())
@@ -61,8 +61,8 @@ void LlmRequest::createSerializedResult(
         executor::serialize_utils::serialize(result.value(), oStream);
         auto str = oStream.str();
         serializedResult.resize(str.size());
-        std::copy(serializedResult.begin(), str.begin(), str.end());
-        isFinal = result.isFinal;
+        std::copy(str.begin(), str.end(), serializedResult.begin());
+        isFinal = result.value().isFinal;
     }
 }
 
