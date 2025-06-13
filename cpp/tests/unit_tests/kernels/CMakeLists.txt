@@ -12,7 +12,15 @@
 add_gtest(banRepeatNGramsKernelsTest banRepeatNGramsKernelsTest.cpp)
 add_gtest(decodingKernelsTest decodingKernelTest.cpp)
 add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
-add_gtest(mixtureOfExpertsTest mixtureOfExpertsTest.cu)
+add_gtest(mixtureOfExpertsTest mixtureOfExpertsTest.cu) # currently only support
+                                                        # internal-cutlass lib
+                                                        # version
+
+# Temporary opend-sourced version. Will be daleted when open-sourced moe_gemm
+# support MXFP4
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  add_gtest(mixtureOfExpertsOssTest mixtureOfExpertsOssTest.cu)
+endif()
 add_gtest(ropeTest ropeTest.cu)
 add_gtest(shiftKCacheKernelTest shiftKCacheKernelTest.cu)
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
@@ -26,6 +34,9 @@ if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
   add_gtest(allReduceKernelTest allReduce/allReduceKernelTest.cu)
   add_gtest(allReduceFusionTest allReduce/allReduceFusionTest.cu)
   # add_gtest(gemmAllReduceTest allReduce/gemmAllReduceTest.cu)
+  # if(USING_OSS_CUTLASS_ALLREDUCE_GEMM) target_link_libraries(gemmAllReduceTest
+  # PRIVATE ar_gemm_src) target_compile_definitions(gemmAllReduceTest PRIVATE
+  # USING_OSS_CUTLASS_ALLREDUCE_GEMM) endif()
 endif()
 
 add_gtest(

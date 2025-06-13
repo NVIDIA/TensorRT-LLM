@@ -1803,11 +1803,10 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
             "--use_relaxed_acceptance_for_thinking",
             "--relaxed_topk=10",
             "--relaxed_delta=0.5",
+            "--enable_attention_dp",
         ],
                          stdout=running_log)
         _check_mem_usage(running_log, [85.6, 0, 0, 0], 8)
-    # TODO: relaxed acceptance is incompatible with attention dp
-    # "--enable_attention_dp"
 
 
 @pytest.mark.skip_less_device_memory(80000)

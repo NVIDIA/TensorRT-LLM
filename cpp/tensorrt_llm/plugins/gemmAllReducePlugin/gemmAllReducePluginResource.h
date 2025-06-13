@@ -1,12 +1,11 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,19 +16,29 @@
 #pragma once
 
 #include "NvInferPlugin.h"
+
+#if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
+#else
 #include "allreduce_gemm_runner.h"
+#endif
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 
-using namespace tensorrt_llm::kernels::cutlass_kernels;
 using namespace nvinfer1;
 
 namespace tensorrt_llm::plugins
 {
+
+#if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+namespace cutlass_kernels = ::tensorrt_llm::kernels::opened_cutlass_kernels;
+#else
+namespace cutlass_kernels = ::tensorrt_llm::kernels::cutlass_kernels;
+#endif
 class GemmAllReducePersistentWorkspace : public IPluginResource
 {
 public:
-    GemmAllReducePersistentWorkspace(std::shared_ptr<PersistentWorkspaceInterface> workspace)
+    GemmAllReducePersistentWorkspace(std::shared_ptr<cutlass_kernels::PersistentWorkspaceInterface> workspace)
         : mWorkspace(workspace)
     {
     }
@@ -67,7 +76,7 @@ public:
         }
     }
 
-    std::shared_ptr<PersistentWorkspaceInterface> mWorkspace;
+    std::shared_ptr<cutlass_kernels::PersistentWorkspaceInterface> mWorkspace;
 };
 
 } // namespace tensorrt_llm::plugins

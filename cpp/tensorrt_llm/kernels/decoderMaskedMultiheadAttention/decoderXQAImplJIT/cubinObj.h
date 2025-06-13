@@ -58,12 +58,17 @@ public:
         return mInitialized;
     }
 
-    XQAKernelType getKernelType() const
+    [[nodiscard]] XQAKernelType getKernelType() const
     {
         return mKernelType;
     }
 
 private:
+    [[nodiscard]] CUfunction kernel() const
+    {
+        return reinterpret_cast<CUfunction>(mKernel);
+    }
+
     static constexpr char const* kFuncName = "kernel_mha";
     static constexpr char const* kSmemName = "smemSize";
     static constexpr char const* kKernelTypeName = "kernelType";
@@ -73,8 +78,8 @@ private:
     // Fields below are undefined prior to initialize() call.
     bool mInitialized;
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
-    CUmodule mModule;
-    CUfunction mFunction;
+    CUlibrary mLibrary;
+    CUkernel mKernel;
     unsigned int mSharedMemBytes;
     XQAKernelType mKernelType;
 };

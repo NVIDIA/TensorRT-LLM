@@ -10,7 +10,6 @@ import pytest
 import torch
 import zmq
 
-import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
@@ -430,8 +429,7 @@ def ResponsePostprocessWorker_worker_task(pull_pipe_addr, push_pipe_addr,
         pull_pipe_addr=pull_pipe_addr,
         push_pipe_addr=push_pipe_addr,
         tokenizer_dir=tokenizer_dir,
-        record_creator=ResponsePostprocessWorker_record_creator,
-        BASE_ZMQ_CLASSES=serialization.BASE_ZMQ_CLASSES)
+        record_creator=ResponsePostprocessWorker_record_creator)
     worker.start()
 
 

@@ -173,7 +173,7 @@ l0_dgx_h100:
       - '*h100*'
       linux_distribution_name: ubuntu*
     terms:
-      stage: pre_merge
+      stage: post_merge
       backend: tensorrt
       auto_trigger: others
   tests:

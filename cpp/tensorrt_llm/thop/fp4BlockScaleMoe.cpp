@@ -50,28 +50,42 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
         TORCH_CHECK(routing_bias.value().dim() == 1, "routing_bias must be 1D.");
         TORCH_CHECK(routing_bias.value().sizes()[0] == num_experts, "routing_bias has incorrect shape.");
     }
-    TORCH_CHECK(top_k == 8, "Current routing kernel only supports top_k=8.");
-    if (topk_group.has_value())
-    {
-        TORCH_CHECK(topk_group.value() == 4, "Current routing kernel only supports topk_group=4.");
-    }
-    TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
+
     if (n_group.has_value())
     {
+        TORCH_CHECK(static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3,
+            "Routing kernel with groups implies DeepSeekV3 routing method.");
+        TORCH_CHECK(topk_group.has_value(), "if n_group is given, topk_group must be given");
         TORCH_CHECK(num_experts % n_group.value() == 0, "num_experts must be divisible by n_group");
-    }
-    TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
-    // This check ensures we have enough experts in the selected groups to handle the top_k routing
-    if (topk_group.has_value() && n_group.has_value())
-    {
+        TORCH_CHECK(top_k <= 8, "Current routing kernel (with groups) only supports top_k<=8.");
+        TORCH_CHECK(topk_group.value() <= 4, "Current routing kernel only (with groups) supports topk_group<=4.");
+        TORCH_CHECK(topk_group.value() <= n_group.value(), "n_group must not be smaller than topk_group.");
+        // This check ensures we have enough experts in the selected groups to handle the top_k routing
         TORCH_CHECK(top_k < (topk_group.value() * num_experts / n_group.value()),
             "top_k must be less than total number of experts in selected groups");
     }
+    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize
+        || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::RenormalizeNaive)
+    {
+        TORCH_CHECK(top_k == 8, "Current routing kernel (no groups, renormalize) only supports top_k=8.");
+    }
+    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4)
+    {
+        TORCH_CHECK(top_k == 1, "Current routing kernel (no groups, Llama4) only supports top_k=1.");
+    }
+
+    TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
+    TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
+
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoERunnerArgs args;
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
 
     // setup args
+    // note: the assumption is that output data type is always Bfloat16 (the default)
+    auto const routing_bias_dtype
+        = routing_bias.has_value() ? routing_bias.value().scalar_type() : at::ScalarType::BFloat16;
     args.mDtypeElt = btg::Dtype::E2m1;
+    args.mDtypeExpW = routing_bias_dtype == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
     args.routing_logits = routing_logits.data_ptr();
     args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
     args.hidden_states = hidden_states.data_ptr();
@@ -106,7 +120,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     at::Tensor permuted_idx_to_token_idx
         = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     at::Tensor expert_weights = at::detail::empty_cuda(
-        {args.num_tokens, args.top_k}, at::ScalarType::BFloat16, routing_logits.device(), std::nullopt);
+        {args.num_tokens, args.top_k}, routing_bias_dtype, routing_logits.device(), std::nullopt);
     at::Tensor expert_indexes = at::detail::empty_cuda(
         {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     at::Tensor expert_count_histogram = at::detail::empty_cuda({((num_experts * 2 + 255) / 256) * 256},

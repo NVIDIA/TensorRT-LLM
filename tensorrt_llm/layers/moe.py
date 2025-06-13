@@ -47,7 +47,7 @@ from .linear import RowLinear
 from .mlp import MLP, GatedMLP
 
 activation_str_to_int_map = {
-    # [WARNING] Keep the below in sync with cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h
+    # [WARNING] Keep the below in sync with cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
     "gelu": 0,
     "gelu_new": 0,
     "relu": 1,

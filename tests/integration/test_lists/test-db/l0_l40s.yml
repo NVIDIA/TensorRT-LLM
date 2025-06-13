@@ -41,7 +41,7 @@ l0_l40s:
       - '*l40s*'
       linux_distribution_name: ubuntu*
     terms:
-      stage: pre_merge
+      stage: post_merge
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
