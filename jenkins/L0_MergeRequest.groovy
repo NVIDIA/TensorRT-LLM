@@ -100,6 +100,8 @@ def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
+def TRITON_FILE_CHANGED = "triton_file_changed"
+@Field
 def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 @Field
 def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
@@ -121,6 +123,7 @@ def testFilter = [
     (EXTRA_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((EXTRA_STAGE_LIST), null)?.tokenize(',')),
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_PYTORCH_FILE_CHANGED): false,
+    (TRITON_FILE_CHANGED): false,
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
@@ -332,6 +335,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
         echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(TRITON_FILE_CHANGED)] = getTritonFileChanged(pipeline, testFilter, globalVars)
         testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
     })
@@ -639,6 +643,38 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         pipeline.echo("Detect multi-GPU related files changed.")
     }
     return relatedFileChanged
+}
+
+def getTritonFileChanged(pipeline, testFilter, globalVars) {
+    if (env.alternativeTRT || testFilter[(IS_POST_MERGE)]) {
+        pipeline.echo("Force run Triton tests.")
+        return true
+    }
+    def tritonList = [
+        "triton_backend/",
+        "test/integration/defs/triton_server/"
+    ]
+
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+
+    if (!changedFileList || changedFileList.isEmpty()) {
+        return false
+    }
+
+    def result = false
+    for (file in changedFileList) {
+        for (prefix in tritonList) {
+            if (file.startsWith(prefix)) {
+                pipeline.echo("Found Triton file: ${file}")
+                result = true
+                break
+            }
+        }
+        if (result) {
+            break
+        }
+    }
+    return result
 }
 
 def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
