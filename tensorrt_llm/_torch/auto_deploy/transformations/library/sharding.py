@@ -258,9 +258,9 @@ def column_row_shard(
 
     # acceptable attention nodes between sharded GEMMs
     shardable_attention_nodes = {
-        torch.ops.attention.scaled_dot_product_attention,
-        torch.ops.attention.grouped_sdpa,
-        torch.ops.attention.bsnd_grouped_sdpa,
+        torch.ops.auto_deploy.torch_attention_sdpa,
+        torch.ops.auto_deploy.torch_attention_grouped_sdpa,
+        torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa,
     }
 
     # This is a heuristic. Basically, we assume those are okay to shard if we also encounter an

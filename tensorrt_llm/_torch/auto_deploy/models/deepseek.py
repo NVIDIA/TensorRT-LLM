@@ -53,7 +53,7 @@ def deepseek_v3_attention(
     # Use custom op to capture mla. This does not handle KV cache
     # as passing transformers Cache into a custom op is throwing an error.
     # Would not be an issue, cause we intend to replace mla op with our implementation further along the pipeline
-    attn_output = torch.ops.deepseek.fused_mla(
+    attn_output = torch.ops.auto_deploy.deepseek_fused_mla(
         q_nope,
         q_pe,
         kv,
