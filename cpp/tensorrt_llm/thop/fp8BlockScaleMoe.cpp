@@ -267,7 +267,6 @@ private:
     std::unique_ptr<RunnerType> mRunner;
 
     btg::Dtype mDtypeElt{btg::Dtype::E4m3}; // FP8 runner so hard-coded
-    btg::Dtype mDtypeOut{btg::Dtype::Bfloat16};
     bool mUseDeepSeekFp8{true};             // Always true for BlockScaleMoe
     int64_t mTileTokensDim;
 };
