@@ -19,7 +19,6 @@
 #include "encoderBuffers.h"
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
@@ -42,7 +41,7 @@ namespace tensorrt_llm::batch_manager
 TrtEncoderModel::TrtEncoderModel(runtime::ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     runtime::RawEngine const& rawEngine, std::shared_ptr<nvinfer1::ILogger> logger,
     executor::ExecutorConfig const& executorConfig)
-    : TrtGptModel(modelConfig, worldConfig, TrtGptModelOptionalParams(executorConfig, false))
+    : TrtGptModel(modelConfig, worldConfig, executorConfig)
     , mModelConfig{modelConfig}
     , mWorldConfig{worldConfig}
     , mDevice{runtime::utils::initDevice(worldConfig)}

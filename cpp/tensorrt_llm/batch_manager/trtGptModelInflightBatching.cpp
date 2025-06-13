@@ -42,7 +42,6 @@
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/batch_manager/transformerBuffers.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/batch_manager/updateDecoderBuffers.h"
 #include "tensorrt_llm/batch_manager/utils/debugUtils.h"
 #include "tensorrt_llm/batch_manager/utils/inflightBatchingUtils.h"
@@ -136,7 +135,7 @@ executor::ExecutorConfig TrtGptModelInflightBatching::fixExecutorConfig(
 TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer1::ILogger> logger,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig, RawEngine const& rawEngine, bool ctxGenFusion,
     executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode)
-    : TrtGptModel(modelConfig, worldConfig, TrtGptModelOptionalParams(executorConfig, isLeaderInOrchMode))
+    : TrtGptModel(modelConfig, worldConfig, executorConfig)
     , mModelConfig(modelConfig)
     , mWorldConfig(worldConfig)
     , mDevice{runtime::utils::initDevice(worldConfig)}
