@@ -17,6 +17,8 @@ class DebugFeatures(enum.IntEnum):
     DUMPTENSOR = 1
 
 
+# A context container which contains the running states, such as the layer structures,
+# log folder, hooks to run, is pre_forward or after forward, etc.
 class DebuggerContext:
 
     def __init__(self, dest_folder=None):
@@ -109,13 +111,20 @@ class DebuggerContext:
 
     def do_actions(self, module, tensors, actions):
         for k, a in actions.items():
-            if k(module, tensors):
+            if k.filter(module, tensors):
                 a(module, tensors, self)
 
 
+class Filter:
+
+    def __init__(self):
+        pass
+
+    def filter(self, module: nn.Module, debug_ctx: DebuggerContext):
+        raise NotImplementedError("Need to implement filter interface.")
+
+
 debug_ctx = None
-input_tensor_names = []
-tensor_counter = 0
 
 
 def get_current_debug_ctx():
@@ -128,6 +137,239 @@ def set_current_debug_ctx(ctx):
     debug_ctx = ctx
 
 
+# The hook is registered to module with torch.nn.modules.module.register_module_forward_pre_hook.
+# This hook will be executed before module's forward is called.
+# It will record module tree into debugCtx and call debugCtx's do_actions function
+# to execute all hooks registered to debugCtx on current module.
+def module_pre_forward(module: nn.Module, input: torch.Tensor):
+    debug_ctx = get_current_debug_ctx()
+    debug_ctx.mark_in_pre_forward(True)
+    name = module.name if hasattr(module, "name") else module.__class__.__name__
+    debug_ctx.get_current_modules_tree().append(name)
+    if len(debug_ctx.get_module_indices_tree()) == 0:
+        debug_ctx.get_module_indices_tree().append(0)
+
+    if len(debug_ctx.get_current_modules_tree()) >= len(
+            debug_ctx.get_module_indices_tree()):
+        debug_ctx.get_module_indices_tree().append(0)
+
+    debug_ctx.get_module_indices_tree()[
+        len(debug_ctx.get_current_modules_tree()) -
+        1] = debug_ctx.get_module_indices_tree()[
+            len(debug_ctx.get_current_modules_tree()) - 1] + 1
+    debug_ctx.do_actions(module, input, debug_ctx.get_pre_forward_action())
+    return input
+
+
+# The hook is registered to module with torch.nn.modules.module.register_module_forward_hook.
+# This hook will be executed before module's forward is called.
+# It will record module tree into debugCtx and call debugCtx's do_actions function
+# to execute all hooks registered to debugCtx on current module.
+def module_after_forward(module: nn.Module, input: torch.Tensor,
+                         output: torch.Tensor):
+    debug_ctx = get_current_debug_ctx()
+    debug_ctx.mark_in_pre_forward(False)
+    debug_ctx.do_actions(module, [input, output],
+                         debug_ctx.get_after_forward_action())
+    debug_ctx.get_current_modules_tree().pop(-1)
+    debug_ctx.get_module_indices_tree().pop(-1)
+    return output
+
+
+# The function style to interface to enable debugger on all classes inherit from nn.Module.
+# Example:
+#       model_config = ModelConfig(pretrained_config=llama_config,
+#                                   attn_backend=backend)
+#       llama = LlamaForCausalLM(model_config).to(dtype).to(device)
+#       llama.load_weights(hf_llama.state_dict())
+#       with torch.inference_mode():
+#           enable_debug_all_modules(r"tensor_dump"):
+#           attn_metadata.prepare()
+#           logits = llama.forward(input_ids=input_ids,
+#                                   position_ids=position_ids,
+#                                   attn_metadata=attn_metadata)
+#
+# Note: this method need user to disable debug by calling disable_debug_all_modules
+def enable_debug_all_modules(dest_folder: Optional[str] = None, ):
+    assert get_current_debug_ctx() is None, ""
+    debug_ctx = DebuggerContext(dest_folder)
+    set_current_debug_ctx(debug_ctx)
+
+    debug_ctx.get_current_modules_tree.clear()
+    debug_ctx.get_module_indices_tree().clear()
+    # parse env
+
+    if debug_ctx.module_forward_pre_hook_handle is None:
+        debug_ctx.module_forward_pre_hook_handle = torch.nn.modules.module.register_module_forward_pre_hook(
+            module_pre_forward)
+    if debug_ctx.module_forward_hook_handle is None:
+        debug_ctx.module_forward_hook_handle = torch.nn.modules.module.register_module_forward_hook(
+            module_after_forward)
+
+    # TODO: Use ENV to enable debug features
+    features: DebugFeatures = DebugFeatures.DUMPTENSOR
+    if features | DebugFeatures.DUMPTENSOR:
+        register_tensor_dump_hook(debug_ctx)
+
+
+def disable_debug_all_modules():
+    assert get_current_debug_ctx() is not None, ""
+    debug_ctx.clear_state()
+    set_current_debug_ctx(None)
+
+
+# The context manager style interface to enable debugger on all classes inherit from nn.Module.
+# Example:
+#       model_config = ModelConfig(pretrained_config=llama_config,
+#                                   attn_backend=backend)
+#       llama = LlamaForCausalLM(model_config).to(dtype).to(device)
+#       llama.load_weights(hf_llama.state_dict())
+#        with torch.inference_mode() and debugger_addon_all_modules(r"tensor_dump"):
+#            attn_metadata.prepare()
+#            logits = llama.forward(input_ids=input_ids,
+#                                   position_ids=position_ids,
+#                                   attn_metadata=attn_metadata)
+@contextmanager
+def debugger_addon_all_modules(dest_folder: Optional[str] = None):
+    try:
+        enable_debug(dest_folder, filter)
+    finally:
+        disable_debug()
+
+
+# The hook is registered to module with module.register_forward_pre_hook.
+# This hook will be executed before module's forward is called.
+# It will record module tree into debugCtx and call debugCtx's do_actions function
+# to execute all hooks registered to debugCtx on current module.
+def pre_forward(module: nn.Module, args, kwargs):
+    name = module.name if hasattr(module, "name") else module.__class__.__name__
+    debug_ctx = get_current_debug_ctx()
+    assert debug_ctx is not None, "DebugContext instance shall not be None."
+    debug_ctx.mark_in_pre_forward(True)
+    debug_ctx.get_current_modules_tree().append(name)
+    if len(debug_ctx.get_module_indices_tree()) == 0:
+        debug_ctx.get_module_indices_tree().append(0)
+
+    if len(debug_ctx.get_current_modules_tree()) >= len(
+            debug_ctx.get_module_indices_tree()):
+        debug_ctx.get_module_indices_tree().append(0)
+
+    debug_ctx.get_module_indices_tree()[
+        len(debug_ctx.get_current_modules_tree()) -
+        1] = debug_ctx.get_module_indices_tree()[
+            len(debug_ctx.get_current_modules_tree()) - 1] + 1
+    debug_ctx.do_actions(module, args, debug_ctx.get_pre_forward_action())
+    return None
+
+
+# The hook is registered to module with module.register_forward_hook.
+# This hook will be executed after module's forward is called.
+# It will remove module from debugCtx and call debugCtx's do_actions function
+# to execute all hooks registered to debugCtx on current module.
+def after_forward(module: nn.Module, args, kwargs, output):
+    debug_ctx = get_current_debug_ctx()
+    debug_ctx.mark_in_pre_forward(False)
+    debug_ctx.do_actions(module, [args, output],
+                         debug_ctx.get_after_forward_action())
+    name = module.name if hasattr(module, "name") else module.__class__.__name__
+    old_name = debug_ctx.get_current_modules_tree().pop(-1)
+    assert name == old_name, "module mismatch"
+
+    debug_ctx.get_module_indices_tree().pop(-1)
+    debug_ctx.tensor_counter = 0
+    return None
+
+
+# The function style to interface to enable debugger on model.
+# If filter is provided, it will be used to filter out satisfied module to register hook.
+# If filter is not provided, all modules will be registered with hooks.
+# Example:
+#       model_config = ModelConfig(pretrained_config=llama_config,
+#                                   attn_backend=backend)
+#       llama = LlamaForCausalLM(model_config).to(dtype).to(device)
+#       llama.load_weights(hf_llama.state_dict())
+#       with torch.inference_mode():
+#           enable_debug(llama, r"tensor_dump"):
+#           attn_metadata.prepare()
+#           logits = llama.forward(input_ids=input_ids,
+#                                   position_ids=position_ids,
+#                                   attn_metadata=attn_metadata)
+#
+# Note: this method need user to disable debug by calling disable_debug
+def enable_debug(model, dest_folder: Optional[str] = None, filter=None):
+    debug_ctx = get_current_debug_ctx()
+    assert debug_ctx is None, "DebugContext shall be None when enable debugger context."
+    debug_ctx = DebuggerContext(dest_folder)
+    set_current_debug_ctx(debug_ctx)
+
+    debug_ctx.get_current_modules_tree().clear()
+    debug_ctx.get_module_indices_tree().clear()
+    for name, submodule in model.named_modules():
+        if name == "":
+            continue
+
+        if submodule not in debug_ctx.forward_hook_handles:
+            do_hook = filter(submodule) if filter is not None else True
+            if do_hook:
+                debug_ctx.forward_hook_handles[
+                    submodule] = submodule.register_forward_hook(
+                        after_forward, with_kwargs=True, always_call=True)
+
+        if submodule not in debug_ctx.forward_pre_hook_handles:
+            do_hook = filter(submodule) if filter is not None else True
+            if do_hook:
+                debug_ctx.forward_pre_hook_handles[
+                    submodule] = submodule.register_forward_pre_hook(
+                        pre_forward, with_kwargs=True)
+
+    # TODO: Use ENV to enable debug features
+    features: DebugFeatures = DebugFeatures.DUMPTENSOR
+    if features | DebugFeatures.DUMPTENSOR:
+        register_tensor_dump_hook(debug_ctx)
+
+
+# The function style to interface to disable debugger on model.
+def disable_debug():
+    debug_ctx = get_current_debug_ctx()
+    assert debug_ctx is not None, "DebugContext shall be None when enable debugger context."
+    debug_ctx.clear_state()
+    for _, handler in debug_ctx.forward_hook_handles.items():
+        handler.remove()
+
+    for _, handler in debug_ctx.forward_pre_hook_handles.items():
+        handler.remove()
+
+    debug_ctx.forward_hook_handles.clear()
+    debug_ctx.forward_pre_hook_handles.clear()
+    set_current_debug_ctx(None)
+
+
+# The context manager style interface to enable debugger on model.
+# If filter is provided, it will be used to filter out satisfied module to register hook.
+# If filter is not provided, all modules will be registered with hooks.
+# Example:
+#       model_config = ModelConfig(pretrained_config=llama_config,
+#                                   attn_backend=backend)
+#       llama = LlamaForCausalLM(model_config).to(dtype).to(device)
+#       llama.load_weights(hf_llama.state_dict())
+#        with torch.inference_mode() and debugger_addon(llama, r"tensor_dump"):
+#            attn_metadata.prepare()
+#            logits = llama.forward(input_ids=input_ids,
+#                                   position_ids=position_ids,
+#                                   attn_metadata=attn_metadata)
+@contextmanager
+def debugger_addon(model, dest_folder: Optional[str] = None, filter=None):
+    try:
+        enable_debug(model, dest_folder, filter)
+        yield model
+    finally:
+        disable_debug()
+
+
+input_tensor_names = []
+tensor_counter = 0
+
+
 def get_forward_arg_names(module: nn.Module):
     if hasattr(module, "forward"):
         forward_func = module.forward
@@ -136,6 +378,19 @@ def get_forward_arg_names(module: nn.Module):
         return args
 
     return None
+
+
+# Below is one hook for dump tensors.
+# Normally, if you want implement one hook, you need to implement one filter by
+# inheriting from base class Filter and one function which defines what to do,
+# such as dump data, modify data, inject actions, etc.
+class DumpTensorFilter(Filter):
+
+    def __init__(self):
+        pass
+
+    def filter(self, module: nn.Module, debug_ctx: DebuggerContext):
+        return True
 
 
 def dump_tensor(module: nn.Module, data_tensor, debug_ctx: DebuggerContext):
@@ -174,7 +429,7 @@ def dump_tensor(module: nn.Module, data_tensor, debug_ctx: DebuggerContext):
 
     def dump_tensor_data(t):
         file_path = get_dump_file_path(t)
-        print(f"Saving tensor data to {file_path}")
+        # print(f"Saving tensor data to {file_path}")
         torch.save(t, file_path)
 
     def dump(t):
@@ -190,148 +445,7 @@ def dump_tensor(module: nn.Module, data_tensor, debug_ctx: DebuggerContext):
     input_tensor_names.clear()
 
 
-def module_pre_forward(module: nn.Module, input: torch.Tensor):
-    debug_ctx = get_current_debug_ctx()
-    debug_ctx.mark_in_pre_forward(True)
-    name = module.name if hasattr(module, "name") else module.__class__.__name__
-    debug_ctx.get_current_modules_tree().append(name)
-    if len(debug_ctx.get_module_indices_tree()) == 0:
-        debug_ctx.get_module_indices_tree().append(0)
-
-    if len(debug_ctx.get_current_modules_tree()) >= len(
-            debug_ctx.get_module_indices_tree()):
-        debug_ctx.get_module_indices_tree().append(0)
-
-    debug_ctx.get_module_indices_tree()[
-        len(debug_ctx.get_current_modules_tree()) -
-        1] = debug_ctx.get_module_indices_tree()[
-            len(debug_ctx.get_current_modules_tree()) - 1] + 1
-    debug_ctx.do_actions(module, input, debug_ctx.get_pre_forward_action())
-    return input
-
-
-def module_after_forward(module: nn.Module, input: torch.Tensor,
-                         output: torch.Tensor):
-    debug_ctx = get_current_debug_ctx()
-    debug_ctx.mark_in_pre_forward(False)
-    debug_ctx.do_actions(module, [input, output],
-                         debug_ctx.get_after_forward_action())
-    debug_ctx.get_current_modules_tree().pop(-1)
-    debug_ctx.get_module_indices_tree().pop(-1)
-    return output
-
-
-def register_tensor_dump_hook():
-    filter = lambda _1, _2: True
-    debug_ctx = get_current_debug_ctx()
+def register_tensor_dump_hook(debug_ctx):
     assert debug_ctx is not None, ""
-    debug_ctx.register_pre_forward_action(filter, dump_tensor)
-    debug_ctx.register_after_forward_action(filter, dump_tensor)
-
-
-def enable_debug(dest_folder: Optional[str] = None, ):
-    assert get_current_debug_ctx() is None, ""
-    debug_ctx = DebuggerContext(dest_folder)
-    set_current_debug_ctx(debug_ctx)
-
-    debug_ctx.get_current_modules_tree.clear()
-    debug_ctx.get_module_indices_tree().clear()
-    # parse env
-
-    if debug_ctx.module_forward_pre_hook_handle is None:
-        debug_ctx.module_forward_pre_hook_handle = torch.nn.modules.module.register_module_forward_pre_hook(
-            module_pre_forward)
-    if debug_ctx.module_forward_hook_handle is None:
-        debug_ctx.module_forward_hook_handle = torch.nn.modules.module.register_module_forward_hook(
-            module_after_forward)
-
-    # TODO: Use ENV to enable debug features
-    features: DebugFeatures = DebugFeatures.DUMPTENSOR
-    if features | DebugFeatures.DUMPTENSOR:
-        register_tensor_dump_hook()
-
-
-def disable_debug(features: DebugFeatures = DebugFeatures.DUMPTENSOR):
-    get_current_debug_ctx().clear_state()
-    set_current_debug_ctx(None)
-
-
-def pre_forward(module: nn.Module, args, kwargs):
-    name = module.name if hasattr(module, "name") else module.__class__.__name__
-    debug_ctx = get_current_debug_ctx()
-    assert debug_ctx is not None, "DebugContext instance shall not be None."
-    debug_ctx.mark_in_pre_forward(True)
-    debug_ctx.get_current_modules_tree().append(name)
-    if len(debug_ctx.get_module_indices_tree()) == 0:
-        debug_ctx.get_module_indices_tree().append(0)
-
-    if len(debug_ctx.get_current_modules_tree()) >= len(
-            debug_ctx.get_module_indices_tree()):
-        debug_ctx.get_module_indices_tree().append(0)
-
-    debug_ctx.get_module_indices_tree()[
-        len(debug_ctx.get_current_modules_tree()) -
-        1] = debug_ctx.get_module_indices_tree()[
-            len(debug_ctx.get_current_modules_tree()) - 1] + 1
-    debug_ctx.do_actions(module, args, debug_ctx.get_pre_forward_action())
-    return None
-
-
-def after_forward(module: nn.Module, args, kwargs, output):
-    debug_ctx = get_current_debug_ctx()
-    debug_ctx.mark_in_pre_forward(False)
-    debug_ctx.do_actions(module, [args, output],
-                         debug_ctx.get_after_forward_action())
-    name = module.name if hasattr(module, "name") else module.__class__.__name__
-    old_name = debug_ctx.get_current_modules_tree().pop(-1)
-    assert name == old_name, "module mismatch"
-
-    debug_ctx.get_module_indices_tree().pop(-1)
-    debug_ctx.tensor_counter = 0
-    return None
-
-
-@contextmanager
-def debugger_addon(model, dest_folder: Optional[str] = None, filter=None):
-    debug_ctx = get_current_debug_ctx()
-    assert debug_ctx is None, "DebugContext shall be None when enable debugger context."
-    debug_ctx = DebuggerContext(dest_folder)
-    set_current_debug_ctx(debug_ctx)
-
-    try:
-        debug_ctx.get_current_modules_tree().clear()
-        debug_ctx.get_module_indices_tree().clear()
-        for name, submodule in model.named_modules():
-            if name == "":
-                continue
-
-            if submodule not in debug_ctx.forward_hook_handles:
-                do_hook = filter(submodule) if filter is not None else True
-                if do_hook:
-                    debug_ctx.forward_hook_handles[
-                        submodule] = submodule.register_forward_hook(
-                            after_forward, with_kwargs=True, always_call=True)
-
-            if submodule not in debug_ctx.forward_pre_hook_handles:
-                do_hook = filter(submodule) if filter is not None else True
-                if do_hook:
-                    debug_ctx.forward_pre_hook_handles[
-                        submodule] = submodule.register_forward_pre_hook(
-                            pre_forward, with_kwargs=True)
-
-        # TODO: Use ENV to enable debug features
-        features: DebugFeatures = DebugFeatures.DUMPTENSOR
-        if features | DebugFeatures.DUMPTENSOR:
-            register_tensor_dump_hook()
-        yield model
-    finally:
-        debug_ctx.clear_state()
-        for _, handler in debug_ctx.forward_hook_handles.items():
-            handler.remove()
-
-        for _, handler in debug_ctx.forward_pre_hook_handles.items():
-            handler.remove()
-
-        debug_ctx.forward_hook_handles.clear()
-        debug_ctx.forward_pre_hook_handles.clear()
-        set_current_debug_ctx(None)
+    debug_ctx.register_pre_forward_action(DumpTensorFilter(), dump_tensor)
+    debug_ctx.register_after_forward_action(DumpTensorFilter(), dump_tensor)
