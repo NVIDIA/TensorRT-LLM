@@ -16,6 +16,7 @@ from defs.trt_test_alternative import popen
 from transformers import AutoTokenizer
 
 from tensorrt_llm import logger
+from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
                                                 DisaggregatedParams)
 from tensorrt_llm.serve.router import (KvCacheAwareRouter,
@@ -78,7 +79,9 @@ class BasicWorkerTester:
     async def new_session(self):
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
             total=self.req_timeout_secs))
-        await self.wait_for_servers_ready(session)
+        await OpenAIDisaggServer.wait_for_all_servers_ready(
+            session, self.ctx_servers, self.gen_servers,
+            self.server_start_timeout_secs)
         return session
 
     async def send_request(self, session: aiohttp.ClientSession, url: str,
@@ -136,47 +139,6 @@ class BasicWorkerTester:
                     del block["tokens"]
             events.append(event)
         return events
-
-    async def check_server_ready(self, session: aiohttp.ClientSession,
-                                 server_url: str) -> bool:
-        try:
-            async with session.get(server_url + "/health") as response:
-                return response.status == 200
-        except Exception:
-            return False
-
-    async def wait_for_servers_ready(self, session: aiohttp.ClientSession):
-
-        async def are_servers_ready(session: aiohttp.ClientSession):
-            context_ready = all([
-                await self.check_server_ready(session, url)
-                for url in self.ctx_servers
-            ])
-            if not context_ready:
-                return False
-            generation_ready = all([
-                await self.check_server_ready(session, url)
-                for url in self.gen_servers
-            ])
-            return generation_ready
-
-        async def check_all_servers_ready(session: aiohttp.ClientSession):
-            iter = 0
-            while not await are_servers_ready(session):
-                wait_time = 3
-                logger.info(
-                    f"Context and generation servers are not ready. Waiting ({iter})..."
-                )
-                await asyncio.sleep(wait_time)
-                iter += 1
-
-        try:
-            await asyncio.wait_for(check_all_servers_ready(session),
-                                   timeout=self.server_start_timeout_secs)
-        except asyncio.CancelledError:
-            raise TimeoutError(
-                "Timeout waiting for context and generation servers to be ready"
-            )
 
 
 class ConditionalWorkerTester(BasicWorkerTester):
@@ -531,6 +493,9 @@ def background_workers(llm_venv, config_file: str, num_ranks: int = None):
             logger.error("-------- Worker output --------")
             logger.error(log_file.read())
             raise
+        finally:
+            proc.terminate()
+            proc.wait()
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],

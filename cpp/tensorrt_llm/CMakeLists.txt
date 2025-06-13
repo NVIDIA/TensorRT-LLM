@@ -199,7 +199,6 @@ set(TRTLLM_LINK_LIBS
     fpA_intB_gemm_src
     # moe_gemm_src
     fb_gemm_src
-    ar_gemm_src
     gemm_swiglu_sm90_src
     cutlass_src
     layers_src
@@ -208,10 +207,31 @@ set(TRTLLM_LINK_LIBS
     userbuffers_src
     ${DECODER_SHARED_TARGET_0}
     ${DECODER_SHARED_TARGET_1})
+if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} low_latency_gemm_src)
+  message(STATUS "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")
+endif()
+
+if(USING_OSS_CUTLASS_FP4_GEMM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} fp4_gemm_src)
+  message(STATUS "USING_OSS_CUTLASS_FP4_GEMM")
+endif()
+
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} moe_gemm_src)
+  message(STATUS "USING_OSS_CUTLASS_MOE_GEMM")
+endif()
+
+if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ar_gemm_src)
+  message(STATUS "USING_OSS_CUTLASS_ALLREDUCE_GEMM")
+endif()
 
 if(ENABLE_MULTI_DEVICE)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})
 endif()
+
+message("TRTLLM_LINK_LIBS: ${TRTLLM_LINK_LIBS}")
 
 if(NOT WIN32) # Unix-like compilers
   set(UNDEFINED_FLAG "-Wl,--no-undefined")

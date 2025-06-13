@@ -691,6 +691,11 @@ int AttentionOp::getHeadSize(bool checkInit) const
 size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq, int32_t input_seq_length,
     int32_t cross_kv_length, int32_t max_num_tokens) const noexcept
 {
+    if (max_num_tokens == 0)
+    {
+        return 0;
+    }
+
     int const local_hidden_units_qo = mNumAttnHeads * getHeadSize();
     int const local_hidden_units_kv = mNumAttnKVHeads * getHeadSize();
 
@@ -771,6 +776,11 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
 size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t max_num_seq,
     int32_t max_attention_window_size, int32_t max_num_tokens) const noexcept
 {
+    if (max_num_tokens == 0)
+    {
+        return 0;
+    }
+
     auto const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
     int const batch_beam = max_num_seq;
 

@@ -12,7 +12,6 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
-import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
 from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
@@ -596,11 +595,7 @@ def worker_main(
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
-    BASE_ZMQ_CLASSES: Dict = serialization.BASE_ZMQ_CLASSES,
 ) -> None:
-    # The base classes for ZMQ serialization. Passed through from the parent process to ensure
-    # that children processes include any classes added at runtime (such as those from `register_approved_ipc_class`).
-    serialization.BASE_ZMQ_CLASSES = BASE_ZMQ_CLASSES
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
                         "green")
@@ -696,11 +691,12 @@ def worker_main(
         assert isinstance(proxy_result_queue, tuple)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
-                postproc_worker_main, result_queues[i].address,
+                postproc_worker_main,
+                result_queues[i].address,
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
-                serialization.BASE_ZMQ_CLASSES)
+            )
             postprocess_worker_futures.append(fut)
 
     # Error handling in the Worker/MPI process

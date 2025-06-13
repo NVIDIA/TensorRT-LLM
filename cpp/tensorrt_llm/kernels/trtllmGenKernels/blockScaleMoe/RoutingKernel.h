@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,10 @@
 
 #pragma once
 
+#include "IntFastDiv.h"
+
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
+
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <tensorrt_llm/common/cudaUtils.h>
@@ -37,7 +40,6 @@ namespace tg = batchedGemm::trtllm::gen;
 
 struct Data
 {
-    tg::Dtype mDtypeElt{tg::Dtype::Bfloat16};
     tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
     bool mUsePdl{false};
 
@@ -97,11 +99,11 @@ struct Data
     int32_t* mPtrPermutedIdxToExpandedIdx{nullptr};
 };
 
-template <typename Type_, typename TypeExpW_, bool UsePdl_>
+template <typename TypeExpW_, bool UseGroups_, bool UsePdl_>
 struct KernelParams
 {
-    using Type = Type_;
     using TypeExpW = TypeExpW_;
+    static constexpr bool UseGroups = UseGroups_;
     static constexpr bool UsePdl = UsePdl_;
 
     int32_t* mPtrExpertIdx;
@@ -120,15 +122,14 @@ struct KernelParams
     TypeExpW* mPtrExpertWeights;
     TypeExpW const* mPtrRoutingWeights;
     TypeExpW const* mPtrRoutingBias;
-    Type const* mPtrIn;
-    float* mPtrScores;
+    float const* mPtrScores;
 
     int32_t mHiddenDim;
     int32_t mNumExperts;
     int32_t mNumExpertGroups;
     int32_t mNumExpertsPerGroup;
     int32_t mNumLimitedGroups;
-    int32_t mTopK;
+    trtllm::dev::IntFastDiv mTopK;
     int32_t mPaddingLog2;
     int32_t mLocalExpertsStartIdx;
     int32_t mLocalExpertsStrideLog2;
@@ -157,7 +158,6 @@ struct KernelParams
         params.mPtrExpertWeights = (TypeExpW*) data.mPtrExpertWeights;
         params.mPtrRoutingWeights = (TypeExpW*) data.mPtrRoutingWeights;
         params.mPtrRoutingBias = (TypeExpW*) data.mPtrRoutingBias;
-        params.mPtrIn = (Type*) data.mPtrIn;
         params.mPtrScores = data.mPtrScores;
 
         params.mHiddenDim = data.mHiddenDim;
@@ -165,7 +165,7 @@ struct KernelParams
         params.mNumExpertGroups = data.mNumExpertGroups;
         params.mNumExpertsPerGroup = data.mNumExperts / data.mNumExpertGroups;
         params.mNumLimitedGroups = data.mNumLimitedGroups;
-        params.mTopK = data.mTopK;
+        params.mTopK = trtllm::dev::IntFastDiv(data.mTopK);
         params.mPaddingLog2 = data.mPaddingLog2;
         params.mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
         params.mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
@@ -251,10 +251,9 @@ struct Data
     int32_t mNumLocalExperts;
 };
 
-template <typename Type_, typename TypeExpW_, bool UsePdl_>
+template <typename TypeExpW_, bool UsePdl_>
 struct KernelParams
 {
-    using Type = Type_;
     using TypeExpW = TypeExpW_;
     static constexpr bool UsePdl = UsePdl_;
 

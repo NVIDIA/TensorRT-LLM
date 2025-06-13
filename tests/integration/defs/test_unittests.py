@@ -61,7 +61,7 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
     base.write(output_file, encoding="UTF-8", xml_declaration=True)
 
 
-def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
+def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
     pynvml.nvmlInit()
@@ -69,6 +69,12 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
     test_root = tests_path()
     dry_run = False
     passed = True
+
+    my_test_prefix = request.config.getoption("--test-prefix")
+    if my_test_prefix:
+        test_prefix = f"{my_test_prefix}/unittests"
+    else:
+        test_prefix = ""
 
     num_workers = 1
 
@@ -114,16 +120,14 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
     if len(case_fn) > 80:
         case_fn = case_fn[:80]
     output_xml = os.path.join(output_dir,
-                              f'sub-results-unittests-{case_fn}.xml')
+                              f'results-sub-unittests-{case_fn}.xml')
 
     command = [
-        '-m',
-        'pytest',
-        ignore_opt,
-        "-v",
-        "--timeout=1600",
-        "--timeout-method=thread",
+        '-m', 'pytest', ignore_opt, "-v", "--timeout=1600",
+        "--timeout-method=thread"
     ]
+    if test_prefix:
+        command += [f"--test-prefix={test_prefix}"]
 
     if dry_run:
         command += ['--collect-only']

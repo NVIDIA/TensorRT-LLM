@@ -231,7 +231,9 @@ def create_py_executor(executor_config: ExecutorConfig,
                 pytorch_backend_config,
                 batch_size=executor_config.max_batch_size,
                 max_num_tokens=executor_config.max_num_tokens,
-                max_seq_len=model_engine.max_seq_len,
+                # Note: The draft model engine will infer its own max_seq_len.
+                # We'll stop drafting when we hit the max.
+                max_seq_len=executor_config.max_seq_len,
                 mapping=mapping,
                 attn_runtime_features=attn_runtime_features,
                 dist=dist,
@@ -258,9 +260,6 @@ def create_py_executor(executor_config: ExecutorConfig,
     executor_config.max_seq_len = max_seq_len
     executor_config.max_num_tokens = model_engine.max_num_tokens
     spec_config = model_engine.spec_config
-    if not model_engine.model.model_config.is_generation:
-        #NOTE: non-generation models do not have kv cache
-        executor_config.pytorch_backend_config.use_kv_cache = False
 
     if executor_config.enable_chunked_context:
         chunk_unit_size = executor_config.tokens_per_block
@@ -308,7 +307,8 @@ def create_py_executor(executor_config: ExecutorConfig,
     resources = {}
     estimating_kv_cache = False
     kv_cache_creator = None
-    if executor_config.pytorch_backend_config.use_kv_cache:
+    if model_engine.model.model_config.is_generation:
+        #NOTE: non-generation models do not have kv cache
         kv_cache_creator = KvCacheCreator(executor_config=executor_config,
                                           model_engine=model_engine,
                                           draft_model_engine=draft_model_engine,

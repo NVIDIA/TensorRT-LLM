@@ -15,11 +15,15 @@
  */
 
 #include "cutlass_extensions/gemm_configs.h"
-#include "fp4_gemm.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "tensorrt_llm/thop/userbuffersTensor.h"
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/fp4_gemm.h"
+#else
+#include "fp4_gemm.h"
+#endif
 
 #include <ATen/cuda/EmptyTensor.h>
 #include <ATen/native/cuda/Resize.h>
@@ -33,8 +37,13 @@
 #include <vector>
 
 namespace tkc = tensorrt_llm::cutlass_extensions;
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
+using tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunner;
+using tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunnerInterface;
+#else
 using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunner;
 using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunnerInterface;
+#endif
 
 namespace torch_ext
 {

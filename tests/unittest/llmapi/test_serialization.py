@@ -11,12 +11,13 @@ class TestClass:
 
 def test_serialization_allowed_class():
     obj = TestClass("test")
-    serialization.register_approved_ipc_class(TestClass)
+    serialization.register_approved_class(TestClass)
     module = TestClass.__module__
-    assert module in serialization.BASE_ZMQ_CLASSES
-    assert "TestClass" in serialization.BASE_ZMQ_CLASSES[module]
+    assert module in serialization.BASE_EXAMPLE_CLASSES
+    assert "TestClass" in serialization.BASE_EXAMPLE_CLASSES[module]
     a = serialization.dumps(obj)
-    b = serialization.loads(a, approved_imports=serialization.BASE_ZMQ_CLASSES)
+    b = serialization.loads(a,
+                            approved_imports=serialization.BASE_EXAMPLE_CLASSES)
     assert type(obj) == type(b) and obj.name == b.name
 
 
@@ -36,14 +37,16 @@ def test_serialization_disallowed_class():
 def test_serialization_basic_object():
     obj = {"test": "test"}
     a = serialization.dumps(obj)
-    b = serialization.loads(a, approved_imports=serialization.BASE_ZMQ_CLASSES)
+    b = serialization.loads(a,
+                            approved_imports=serialization.BASE_EXAMPLE_CLASSES)
     assert obj == b
 
 
 def test_serialization_complex_object_allowed_class():
     obj = torch.tensor([1, 2, 3])
     a = serialization.dumps(obj)
-    b = serialization.loads(a, approved_imports=serialization.BASE_ZMQ_CLASSES)
+    b = serialization.loads(a,
+                            approved_imports=serialization.BASE_EXAMPLE_CLASSES)
     assert torch.all(obj == b)
 
 

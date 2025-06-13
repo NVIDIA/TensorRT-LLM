@@ -117,10 +117,19 @@ void DecoderXQARunner::run(
     return getImplFromXQAParams(xqa_params, false)->run(xqa_params, kv_cache_buffer, stream);
 }
 
-DecoderXQARunner::Resource* DecoderXQARunner::getResourceGlobal()
+std::shared_ptr<DecoderXQARunnerResource> DecoderXQARunner::getResourceGlobal()
 {
-    static DecoderXQARunner::Resource sResource;
-    return &sResource;
+    static std::mutex sMutex;
+    static std::weak_ptr<DecoderXQARunnerResource> sResource;
+    std::lock_guard<std::mutex> lock(sMutex);
+    auto ret = sResource.lock();
+    if (ret != nullptr)
+    {
+        return ret;
+    }
+    ret = std::make_shared<DecoderXQARunnerResource>();
+    sResource = ret;
+    return ret;
 }
 
 template void DecoderXQARunner::run(
@@ -129,17 +138,17 @@ template void DecoderXQARunner::run(
     XQAParams const& xqa_params, KVBlockArray const& kv_block_array, cudaStream_t const& stream);
 
 //// DecoderXQARunner::Resource
-DecoderXQARunner::Resource::Resource()
+DecoderXQARunnerResource::DecoderXQARunnerResource()
     : mCubinObjRegistry(std::make_unique<jit::CubinObjRegistry>())
 {
 }
 
-DecoderXQARunner::Resource::Resource(DecoderXQARunner::Resource const& other)
+DecoderXQARunnerResource::DecoderXQARunnerResource(DecoderXQARunnerResource const& other)
     : mCubinObjRegistry(other.mCubinObjRegistry->clone())
 {
 }
 
-DecoderXQARunner::Resource& DecoderXQARunner::Resource::operator=(DecoderXQARunner::Resource const& other)
+DecoderXQARunnerResource& DecoderXQARunnerResource::operator=(DecoderXQARunnerResource const& other)
 {
     if (this == &other)
     {
@@ -149,17 +158,17 @@ DecoderXQARunner::Resource& DecoderXQARunner::Resource::operator=(DecoderXQARunn
     return *this;
 }
 
-DecoderXQARunner::Resource::Resource(void const* buffer, size_t buffer_size)
+DecoderXQARunnerResource::DecoderXQARunnerResource(void const* buffer, size_t buffer_size)
     : mCubinObjRegistry(std::make_unique<jit::CubinObjRegistry>(buffer, buffer_size))
 {
 }
 
-size_t DecoderXQARunner::Resource::getSerializationSize() const noexcept
+size_t DecoderXQARunnerResource::getSerializationSize() const noexcept
 {
     return mCubinObjRegistry->getSerializationSize();
 }
 
-void DecoderXQARunner::Resource::serialize(void* buffer, size_t buffer_size) const noexcept
+void DecoderXQARunnerResource::serialize(void* buffer, size_t buffer_size) const noexcept
 {
     mCubinObjRegistry->serialize(buffer, buffer_size);
 }

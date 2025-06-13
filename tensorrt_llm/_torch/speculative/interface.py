@@ -28,6 +28,9 @@ class SpeculativeDecodingMode(IntEnum):
     def is_eagle3(self):
         return self == SpeculativeDecodingMode.EAGLE3
 
+    def use_one_engine(self):
+        return self.is_mtp() or self.is_eagle3_one_model()
+
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
 

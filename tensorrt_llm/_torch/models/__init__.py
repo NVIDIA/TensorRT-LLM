@@ -5,6 +5,7 @@ from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
+from .modeling_gemma3vl import Gemma3Model
 from .modeling_hyperclovax import HCXVisionForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
@@ -31,6 +32,7 @@ __all__ = [
     "DeepseekV3ForCausalLM",
     "Gemma3ForCausalLM",
     "HCXVisionForCausalLM",
+    "Gemma3Model",
     "LlamaForCausalLM",
     "LlavaNextModel",
     "MistralForCausalLM",
