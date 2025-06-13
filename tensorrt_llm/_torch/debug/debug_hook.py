@@ -36,13 +36,16 @@ class DebuggerContext:
         self.log_folder = dest_folder
         self.is_forward_pre = True
         self.dump_style: DumpStyle = DumpStyle.BINARY
-        self._init_log_folder()
+        self.log_folder_inited: bool = False
 
     def set_log_folder(self, log_folder):
         self.log_folder = log_folder
-        self._init_log_folder()
+        self.log_folder_inited = False
 
     def _init_log_folder(self):
+        if self.log_folder_inited:
+            return
+
         if self.log_folder is None:
             import os
             pwd = os.getcwd()
@@ -54,8 +57,10 @@ class DebuggerContext:
         p = Path(self.log_folder) / f"rank{rank}"
         self.log_folder = p.absolute()
         p.mkdir(parents=True, exist_ok=True)
+        self.log_folder_inited = True
 
     def get_log_folder(self):
+        self._init_log_folder()
         return self.log_folder
 
     def check_in_pre_forward(self):
@@ -208,9 +213,9 @@ def enable_debug_all_modules(dest_folder: Optional[str] = None, ):
             module_after_forward)
 
     # TODO: Use ENV to enable debug features
-    features: DebugFeatures = DebugFeatures.DUMPTENSOR
-    if features | DebugFeatures.DUMPTENSOR:
-        register_tensor_dump_hook(debug_ctx)
+    # features: DebugFeatures = DebugFeatures.DUMPTENSOR
+    # if features | DebugFeatures.DUMPTENSOR:
+    #     register_tensor_dump_hook(debug_ctx)
 
 
 def disable_debug_all_modules():
@@ -326,9 +331,9 @@ def enable_debug(model, dest_folder: Optional[str] = None, filter=None):
                         pre_forward, with_kwargs=True)
 
     # TODO: Use ENV to enable debug features
-    features: DebugFeatures = DebugFeatures.DUMPTENSOR
-    if features | DebugFeatures.DUMPTENSOR:
-        register_tensor_dump_hook(debug_ctx)
+    # features: DebugFeatures = DebugFeatures.DUMPTENSOR
+    # if features | DebugFeatures.DUMPTENSOR:
+    #     register_tensor_dump_hook(debug_ctx)
 
 
 # The function style to interface to disable debugger on model.
@@ -449,7 +454,8 @@ def dump_tensor(module: nn.Module, data_tensor, debug_ctx: DebuggerContext):
     input_tensor_names.clear()
 
 
-def register_tensor_dump_hook(debug_ctx):
+def register_tensor_dump_hook():
+    debug_ctx = get_current_debug_ctx()
     assert debug_ctx is not None, ""
     debug_ctx.register_pre_forward_action(DumpTensorFilter(), dump_tensor)
     debug_ctx.register_after_forward_action(DumpTensorFilter(), dump_tensor)
