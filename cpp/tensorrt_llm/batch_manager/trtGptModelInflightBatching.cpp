@@ -85,47 +85,52 @@ namespace texe = tensorrt_llm::executor;
 namespace tensorrt_llm::batch_manager
 {
 
-bool TrtGptModelInflightBatching::optionalParamsAreValid(
-    ModelConfig const& modelConfig, TrtGptModelOptionalParams const& optionalParams)
+bool TrtGptModelInflightBatching::executorConfigIsValid(
+    ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig)
 {
-    // Make sure logic in this function matches fixOptionalParams
-    if (optionalParams.kvCacheConfig.enableBlockReuse)
+    // Make sure logic in this function matches fixExecutorConfig
+    if (executorConfig.getKvCacheConfig().getEnableBlockReuse())
     {
         if (!modelConfig.getPagedContextFMHA())
         {
             return false;
         }
-    }
-    // Context logits cannot be returned for reused tokens, so disable reuse
-    if (modelConfig.computeContextLogits())
-    {
-        return false;
+        // Context logits cannot be returned for reused tokens, so disable reuse
+        if (modelConfig.computeContextLogits())
+        {
+            return false;
+        }
     }
     return true;
 }
 
-TrtGptModelOptionalParams TrtGptModelInflightBatching::fixOptionalParams(
-    ModelConfig const& modelConfig, TrtGptModelOptionalParams const& optionalParams)
+executor::ExecutorConfig TrtGptModelInflightBatching::fixExecutorConfig(
+    ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig)
 {
-    // Make sure logic in this function matches optionalParamsAreValid
-    auto fixedOptionalParams = TrtGptModelOptionalParams(optionalParams);
-    if (fixedOptionalParams.kvCacheConfig.enableBlockReuse)
+    // Make sure logic in this function matches executorConfigIsValid
+    if (executorConfig.getKvCacheConfig().getEnableBlockReuse())
     {
+        auto kvCacheConfig = executorConfig.getKvCacheConfig();
+
         if (!modelConfig.getPagedContextFMHA())
         {
             TLLM_LOG_WARNING(
-                "Fix optionalParams : KV cache reuse disabled because model was not built with paged context FMHA "
+                "Fixing executorConfig: KV cache reuse disabled because model was not built with paged context FMHA "
                 "support");
-            fixedOptionalParams.kvCacheConfig.enableBlockReuse = false;
+            kvCacheConfig.setEnableBlockReuse(false);
         }
+        if (modelConfig.computeContextLogits())
+        {
+            TLLM_LOG_WARNING(
+                "Fixing executorConfig: KV cache reuse disabled because model was built to return context logits");
+            kvCacheConfig.setEnableBlockReuse(false);
+        }
+
+        auto fixedExecutorConfig = executor::ExecutorConfig(executorConfig);
+        fixedExecutorConfig.setKvCacheConfig(kvCacheConfig);
+        return fixedExecutorConfig;
     }
-    if (modelConfig.computeContextLogits())
-    {
-        TLLM_LOG_WARNING(
-            "Fix optionalParams : KV cache reuse disabled because model was built to return context logits");
-        fixedOptionalParams.kvCacheConfig.enableBlockReuse = false;
-    }
-    return fixedOptionalParams;
+    return executorConfig;
 }
 
 TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer1::ILogger> logger,
