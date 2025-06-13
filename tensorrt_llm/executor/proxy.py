@@ -161,37 +161,37 @@ class GenerationExecutorProxy(GenerationExecutor):
             if (res := self.result_queue.get()) is None:
                 return False  # shutdown the thread
 
-            async_queues = []
-            event_loop = None
+        async_queues = []
+        event_loop = None
 
-            def process_res(res):
-                client_id = res.client_id
-                nonlocal event_loop
-                nonlocal async_queues
+        def process_res(res):
+            client_id = res.client_id
+            nonlocal event_loop
+            nonlocal async_queues
 
-                queue = self._results[client_id].queue
-                if isinstance(queue, _SyncQueue):
-                    queue.put_nowait(res)
-                    async_queues.append(queue)
-                    # all the loops are identical
-                    event_loop = event_loop or queue.loop
-                else:
-                    queue.put(res)
+            queue = self._results[client_id].queue
+            if isinstance(queue, _SyncQueue):
+                queue.put_nowait(res)
+                async_queues.append(queue)
+                # all the loops are identical
+                event_loop = event_loop or queue.loop
+            else:
+                queue.put(res)
 
-                if (is_llm_response(res) and res.result.is_final) or isinstance(
-                        res, ErrorResponse):
-                    self._results.pop(client_id)
+            if (is_llm_response(res) and res.result.is_final) or isinstance(
+                    res, ErrorResponse):
+                self._results.pop(client_id)
 
-            res = res if isinstance(res, list) else [res]
+        res = res if isinstance(res, list) else [res]
 
-            for i in res:
-                global_tracer().log_instant("IPC.get")
-                if i is None:
-                    return False
-                process_res(i)
+        for i in res:
+            global_tracer().log_instant("IPC.get")
+            if i is None:
+                return False
+            process_res(i)
 
-            if async_queues:
-                _SyncQueue.notify_many(event_loop, async_queues)
+        if async_queues:
+            _SyncQueue.notify_many(event_loop, async_queues)
 
         return True  # success
 

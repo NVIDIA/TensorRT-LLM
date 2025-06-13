@@ -943,7 +943,7 @@ class BaseLlmArgs(BaseModel):
         description="The parser to separate reasoning content from output.",
         alias="_reasoning_parser")
 
-    garbage_collection_gen0_threshold: Optional[int] = Field(
+    garbage_collection_gen0_threshold: int = Field(
         default=20000,
         description=
         "Threshold for Python garbage collection of generation 0 objects."

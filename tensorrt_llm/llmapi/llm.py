@@ -136,7 +136,6 @@ class LLM:
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
                 **kwargs)
-            print(f"LLM.args: {self.args.__dict__}")
 
         except Exception as e:
             logger.error(
