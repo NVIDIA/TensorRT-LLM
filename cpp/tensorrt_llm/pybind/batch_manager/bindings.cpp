@@ -36,6 +36,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
 #include <torch/extension.h>
+#include <tuple>
 
 namespace py = pybind11;
 namespace tb = tensorrt_llm::batch_manager;
@@ -368,7 +369,7 @@ void initBindings(pybind11::module_& m)
                 std::vector<char> serialized_result;
                 bool is_final = false;
                 self.createSerializedResult(serialized_result, is_final, use_fast_logits, mpi_world_rank);
-                return py::str(serialized_result.data(), serialized_result.size()), is_final;
+                return std::make_tuple < (py::str(serialized_result.data(), serialized_result.size()), is_final);
             })
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
