@@ -37,6 +37,7 @@ import yaml
 from _pytest.mark import ParameterSet
 
 from tensorrt_llm.bindings import ipc_nvls_supported
+from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
 from .perf.gpu_clock_lock import GPUClockLock
 from .perf.session_data_writer import SessionDataWriter
@@ -1809,6 +1810,19 @@ def skip_by_device_count(request):
         if expected_count > int(device_count):
             pytest.skip(
                 f'Device count {device_count} is less than {expected_count}')
+
+
+@pytest.fixture(autouse=True)
+def skip_by_mpi_world_size(request):
+    "fixture for skip less device count"
+    if request.node.get_closest_marker('skip_less_mpi_world_size'):
+        mpi_world_size = get_mpi_world_size()
+        expected_count = request.node.get_closest_marker(
+            'skip_less_mpi_world_size').args[0]
+        if expected_count > int(mpi_world_size):
+            pytest.skip(
+                f'MPI world size {mpi_world_size} is less than {expected_count}'
+            )
 
 
 @pytest.fixture(autouse=True)
