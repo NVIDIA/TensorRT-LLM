@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@emma/add_open_driver', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -434,7 +434,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def hasMultipleGPUs = (gpuCount > 1)
         def memorySize = "${TESTER_MEMORY}"
         def storageSize = "300Gi"
-        def driverVersion = Constants.DEFAULT_NVIDIA_DRIVER_VERSION
+        def driverVersion = type.contains("rtx-pro-6000") ? Constants.DEFAULT_OPEN_NVIDIA_DRIVER_VERSION : Constants.DEFAULT_NVIDIA_DRIVER_VERSION
         def cpuCount = "${TESTER_CORES}"
 
         // Multi-GPU only supports DGX-H100 and DGX-H200 due to the hardware stability.
@@ -1594,6 +1594,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H200-8_GPUs-PyTorch-[Post-Merge]-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
+        "RTXPro6000-4_GPUs-Pytorch-DeepSeek-[Post-Merge]-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000_1", 1, 2, 4],
+        "RTXPro6000-4_GPUs-Pytorch-DeepSeek-[Post-Merge]-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000_1", 2, 2, 4],
     ]
 
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
