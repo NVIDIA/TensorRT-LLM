@@ -88,7 +88,11 @@ BASE_ZMQ_CLASSES = {
         "Logprob", "LogProbsResult", "ResponseWrapper"
     ],
     "tensorrt_llm.executor.utils": ["ErrorResponse", "WorkerCommIpcAddrs"],
-    "tensorrt_llm.executor.worker": ["GenerationExecutorWorker", "worker_main"],
+    "tensorrt_llm.executor.worker": [
+        "GenerationExecutorWorker", "worker_main", "PackedResponses",
+        "ResponseList", "PyResultsList", "ResponseList.deserialize",
+        "PostprocInputsPyParams", "PackedPostprocInputs"
+    ],
     "tensorrt_llm.llmapi.llm_args": [
         "_ModelFormatKind", "_ParallelConfig", "CalibConfig",
         "CapacitySchedulerPolicy", "KvCacheConfig", "LookaheadDecodingConfig",
@@ -114,6 +118,7 @@ BASE_ZMQ_CLASSES = {
     "torch._utils": ["_rebuild_tensor_v2"],
     "torch.storage": ["_load_from_bytes"],
     "transformers.tokenization_utils_fast": ["PreTrainedTokenizerFast"],
+    "transformers.models.llama.tokenization_llama_fast": ["LlamaTokenizerFast"],
     "tokenizers": ["Tokenizer", "AddedToken"],
     "tokenizers.models": ["Model"],
 }
