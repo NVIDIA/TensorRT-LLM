@@ -278,10 +278,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
+    (IMAGE_KEY_TO_TAG): [:],
 ]
 
 String getShortenedJobName(String path)
@@ -294,6 +297,7 @@ String getShortenedJobName(String path)
         "L1_Custom": "l1-cus",
         "L1_Nightly": "l1-nt",
         "L1_Stable": "l1-stb",
+        "BuildDockerImageSanityTest": "l0-sanity",
     ]
     def parts = path.split('/')
     // Apply nameMapping to the last part (jobName)
@@ -544,6 +548,17 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 values:
                                 - "core"
                 nodeSelector: ${selectors}
+                initContainers:
+                - name: init-container
+                  image: urm.nvidia.com/docker/alpine:latest
+                  command: ["/bin/sh", "-c"]
+                  args:
+                  - |
+                    echo "预拉取镜像..."
+                    docker pull ${image} || echo "拉取失败"
+                    echo "初始化完成"
+                  securityContext:
+                    privileged: true
                 containers:
                   ${containerConfig}
                     env:
@@ -575,7 +590,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                 ${pvcVolume}
         """.stripIndent(),
     ]
-
+    println "podConfig: ${podConfig}"
     return podConfig
 }
 
@@ -1312,7 +1327,9 @@ def checkPipInstall(pipeline, wheel_path)
 
 def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312")
 {
-    def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${linuxPkgName}"
+    def pkgName = cpu_arch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-src-" : "tensorrt-llm-release-src-"
+    pkgName += "ad99a08fa2685a98c1a608c66e60a6955ac3cc95.tar.gz"
+    def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${pkgName}"
 
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
@@ -1326,10 +1343,11 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
         sh "#!/bin/bash \n" + "yum remove -y libcudnn*"
     }
     sh "pwd && ls -alh"
+
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
 
     sh "env | sort"
-    sh "tar -zvxf ${linuxPkgName}"
+    sh "tar -zvxf ${pkgName}"
 
     // Check for prohibited files in the package
     sh '''
@@ -1391,7 +1409,7 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
 
     def wheelName = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 *.whl').trim()
     echo "uploading ${wheelName} to ${cpu_arch}/${wheel_path}"
-    trtllm_utils.uploadArtifacts("tensorrt_llm/build/${wheelName}",  "${UPLOAD_PATH}/${cpu_arch}/${wheel_path}")
+    // trtllm_utils.uploadArtifacts("tensorrt_llm/build/${wheelName}",  "${UPLOAD_PATH}/${cpu_arch}/${wheel_path}")
 
     if (reinstall_dependencies == true) {
         // Test installation in the new environment
@@ -1995,6 +2013,84 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     return parallelJobsFiltered
 }
 
+
+
+def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
+    def testConfigs = [
+        "NGC Devel Image amd64": [
+            name: "NGC-Devel-Image-amd64-Sanity-Test",
+            k8sArch: "amd64",
+            wheelInstalled: false,
+            config: VANILLA_CONFIG,
+        ],
+        "NGC Devel Image arm64": [
+            name: "NGC-Devel-Image-arm64-Sanity-Test",
+            k8sArch: "arm64",
+            wheelInstalled: false,
+            config: LINUX_AARCH64_CONFIG,
+        ],
+        "NGC Release Image amd64": [
+            name: "NGC-Release-Image-amd64-Sanity-Test",
+            gpuType: "a10",
+            k8sArch: "amd64",
+            wheelInstalled: true,
+            config: VANILLA_CONFIG,
+        ],
+        "NGC Release Image arm64": [
+            name: "NGC-Release-Image-arm64-Sanity-Test",
+            gpuType: "gh200",
+            k8sArch: "arm64",
+            wheelInstalled: true,
+            config: LINUX_AARCH64_CONFIG,
+        ],
+    ]
+    // Update testConfigs image field using the map from globalVars
+    testConfigs.each { key, config ->
+        if (globalVars[IMAGE_KEY_TO_TAG] && globalVars[IMAGE_KEY_TO_TAG][key]) {
+            config.image = globalVars[IMAGE_KEY_TO_TAG][key]
+        }
+    }
+    // Filter out all configs that don't have image set
+    testConfigs = testConfigs.findAll { key, config ->
+        return config.image != null
+    }
+
+    echo "Filtered test configs with images:"
+    println testConfigs
+
+    def testJobs = testConfigs.collectEntries { key, values -> [values.name, {
+        if (values.wheelInstalled) {
+            stage(values.name) {
+                echo "Run ${values.name} sanity test."
+                imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
+                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                    sh "env | sort"
+                    // withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                    //     sh "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}"
+                    // }
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name , 1, 1, true, null)
+                })
+            }
+        } else {
+            stage(values.name) {
+                imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
+                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                    // withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                    //     sh "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}"
+                    // }
+                    sh "env | sort"
+                    def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
+                    runLLMBuildFromPackage(pipeline, cpuArch, false, "imageTest/")
+                })
+            }
+        }
+    }]}
+
+    return testJobs
+}
+
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("", "agent")
@@ -2041,6 +2137,9 @@ pipeline {
             steps
             {
                 script {
+                    if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
+                        return
+                    }
                     launchTestListCheck(this)
                 }
             }
@@ -2048,7 +2147,11 @@ pipeline {
         stage("Test") {
             steps {
                 script {
-                    parallelJobs = launchTestJobs(this, testFilter)
+                    if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
+                        parallelJobs = launchTestJobsForImagesSanityCheck(this, globalVars)
+                    } else {
+                        parallelJobs = launchTestJobs(this, testFilter)
+                    }
 
                     singleGpuJobs = parallelJobs
                     dgxJobs = [:]

@@ -25,6 +25,9 @@ LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefi
 
 LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
+TRIGGER_TYPE = env.triggerType ?: "manual"
+RUN_SANITY_CHECK = env.runSanityCheck ?: false
+
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
@@ -37,10 +40,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
+    (IMAGE_KEY_TO_TAG): [:],
 ]
 
 @Field
@@ -183,6 +189,27 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 }
 
 
+def prepareWheelFromBuildStage(makefileStage, arch) {
+    if (TRIGGER_TYPE == "manual") {
+        echo "Trigger type is manual, skip preparing wheel from build stage"
+        return ""
+    }
+
+    if (!makefileStage || !arch) {
+        echo "Error: makefileStage and arch are required parameters"
+        return ""
+    }
+
+    if (makefileStage != "release") {
+        echo "prepareWheelFromBuildStage: ${makefileStage} is not release"
+        return ""
+    }
+
+    def wheelScript = 'scripts/get_wheel_from_package.py'
+    def wheelArgs = "--arch ${arch} --upload_path " + env.uploadPath
+    return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
+}
+
 def buildImage(config, imageKeyToTag)
 {
     def target = config.target
@@ -204,7 +231,7 @@ def buildImage(config, imageKeyToTag)
     def customImageWithTag = "${IMAGE_NAME}/${makefileStage}:${customTag}"
 
     if (target == "ngc-release") {
-        if (params.triggerType == "post-merge") {
+        if (TRIGGER_TYPE == "post-merge") {
             echo "Use NGC artifacts for post merge build"
             dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
             imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
@@ -269,6 +296,7 @@ def buildImage(config, imageKeyToTag)
             }
         }
 
+        args += prepareWheelFromBuildStage(makefileStage, arch)
         // Avoid the frequency of OOM issue when building the wheel
         if (target == "trtllm") {
             if (arch == "x86_64") {
@@ -412,8 +440,8 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        echo "Build ${key} failed."
                         catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            echo "Build ${key} failed."
                             throw e
                         }
                     }
@@ -426,6 +454,17 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     //pipeline.failFast = params.enableFailFast
     pipeline.parallel buildJobs
 
+}
+
+
+def getCommonParameters()
+{
+    return [
+        'gitlabSourceRepoHttpUrl': LLM_REPO,
+        'gitlabCommit': env.gitlabCommit,
+        'artifactPath': ARTIFACT_PATH,
+        'uploadPath': UPLOAD_PATH,
+    ]
 }
 
 
@@ -492,6 +531,110 @@ pipeline {
                     archiveArtifacts artifacts: 'imageKeyToTag.json', fingerprint: true
                     retry(3) {
                         trtllm_utils.uploadArtifacts("imageKeyToTag.json", "${UPLOAD_PATH}/")
+                    }
+                }
+            }
+        }
+        stage("Wait for build jobs finish") {
+            when {
+                expression {
+                    RUN_SANITY_CHECK
+                }
+            }
+            steps {
+                script {
+                    collectResultPodSpec = createKubernetesPodConfig("agent")
+                    trtllm_utils.launchKubernetesPod(this, collectResultPodSpec, "alpine", {
+                        // Install wget
+                        trtllm_utils.llmExecStepWithRetry(this, script: "apk add --no-cache wget")
+
+                        // Poll for build artifacts
+                        def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
+                        def requiredFiles = [
+                            "TensorRT-LLM-GH200.tar.gz",
+                            "tensorrt-llm-release-src-",
+                            "tensorrt-llm-sbsa-release-src-",
+                            "TensorRT-LLM.tar.gz"
+                        ]
+                        def maxWaitMinutes = 180
+                        def pollIntervalSeconds = 60
+
+                        echo "Waiting for build artifacts..."
+                        echo "Required files: ${requiredFiles}"
+
+                        def startTime = System.currentTimeMillis()
+                        def maxWaitMs = maxWaitMinutes * 60 * 1000
+
+                        while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
+                            def missingFiles = []
+
+                            try {
+                                trtllm_utils.llmExecStepWithRetry(this, script: "wget ${artifactBaseUrl} -O index.html", allowStepFailed: true)
+                                def indexContent = sh(script: "cat index.html 2>/dev/null || echo ''", returnStdout: true).trim()
+
+                                for (file in requiredFiles) {
+                                    if (!indexContent.contains(file)) {
+                                        missingFiles.add(file)
+                                    }
+                                }
+
+                                sh(script: "rm -f index.html", returnStdout: false)
+
+                            } catch (Exception e) {
+                                echo "Error checking artifacts: ${e.message}"
+                                missingFiles = requiredFiles.clone()
+                                sh(script: "rm -f index.html", returnStdout: false)
+                            }
+
+                            if (missingFiles.isEmpty()) {
+                                echo "All build artifacts are ready!"
+                                return
+                            }
+
+                            def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                            echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
+                            echo "Missing files: ${missingFiles}"
+                            sleep(pollIntervalSeconds)
+                        }
+
+                        def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                        error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
+                    })
+                }
+            }
+        }
+        stage("Sanity Check") {
+            when {
+                expression {
+                    RUN_SANITY_CHECK
+                }
+            }
+            steps {
+                script {
+                    globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
+                    def parameters = getCommonParameters()
+                    parameters += [
+                        'enableFailFast': false,
+                        'branch': LLM_BRANCH,
+                        'globalVars': globalVarsJson,
+                        // 'dockerImage': globalVars[IMAGE_KEY_TO_TAG]['NGC Devel Image amd64'],
+                        'dockerImage': 'urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505292346-4931',
+                    ]
+
+                    echo "trigger BuildDockerImageSanityTest job, params: ${parameters}"
+
+                    def status = ""
+                    def jobName = "/LLM/helpers/BuildDockerImageSanityTest"
+                    def handle = build(
+                        job: jobName,
+                        parameters: trtllm_utils.toBuildParameters(parameters),
+                        propagate: false,
+                    )
+                    status = handle.getBuildResult().toString()
+
+                    if (status != "SUCCESS") {
+                        error "Downstream job did not succeed"
                     }
                 }
             }
