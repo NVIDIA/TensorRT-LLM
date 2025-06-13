@@ -12,7 +12,6 @@ from openai.types.chat import \
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated, Required, TypedDict
 
-from tensorrt_llm.executor.serialization import register_approved_ipc_class
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 
@@ -20,14 +19,6 @@ from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-    def __init_subclass__(cls, **kwargs):
-        """
-        This method is called when a class inherits from OpenAIBaseModel.
-        """
-        # Register subclass as an approved class for deserialization across IPC boundaries.
-        super().__init_subclass__(**kwargs)
-        register_approved_ipc_class(cls)
 
 
 class StreamOptions(OpenAIBaseModel):
