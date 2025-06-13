@@ -55,14 +55,14 @@ struct KernelParams
     // TMA descriptor for V scaling factor.
     CUtensorMap tmaVSf_;
 
+    // grid dimensions, these might differ from actual grid the kernel is launched with
+    // for persistent kernels on Hopper GPUs.
+    int32_t logicalGridDimX, logicalGridDimY, logicalGridDimZ;
+
     // The output pointer (used by STG for last tile).
     void* ptrO;
     // The output SF pointer (used for FP4 output).
     void* ptrSfO;
-
-    // grid dimensions, these might differ from actual grid the kernel is launched with
-    // for persistent kernels on Hopper GPUs.
-    int32_t logicalGridDimX, logicalGridDimY, logicalGridDimZ;
 
     // The cumulative sequence lengths for Q.
     int32_t const* ptrCumSeqLensQ;
