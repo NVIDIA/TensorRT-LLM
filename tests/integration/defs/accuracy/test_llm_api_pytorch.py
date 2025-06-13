@@ -795,8 +795,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, False, False, True),
                            (True, False, True, True), (True, True, True, True)])
     @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM"])
     def test_nvfp4(self, fp8kv, attention_dp, cuda_graph, overlap_scheduler,
-                   torch_compile, mtp_nextn):
+                   torch_compile, mtp_nextn, moe_backend):
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
@@ -808,14 +809,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             use_cuda_graph=cuda_graph,
             torch_compile_enabled=torch_compile,
             torch_compile_fullgraph=True,
+            moe_backend=moe_backend,
         )
-
+        mtp_config = None
         if mtp_nextn > 0:
-            model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp"
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        else:
-            model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only"
-            mtp_config = None
 
         quant_config = QuantConfig()
         quant_config.quant_algo = QuantAlgo.NVFP4
@@ -823,7 +821,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_config["kv_cache_dtype"] = "fp8"
 
-        llm = LLM(model_path,
+        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
                   kv_cache_config=kv_cache_config,
                   **pytorch_config,
                   quant_config=quant_config,
@@ -858,9 +856,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
     @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM"])
     def test_nvfp4_4gpus(self, fp8kv, attention_dp, cuda_graph,
                          overlap_scheduler, tp_size, pp_size, ep_size,
-                         torch_compile, mtp_nextn):
+                         torch_compile, mtp_nextn, moe_backend):
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
@@ -873,14 +872,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             use_cuda_graph=cuda_graph,
             torch_compile_enabled=torch_compile,
             torch_compile_fullgraph=True,
+            moe_backend=moe_backend,
         )
 
+        mtp_config = None
         if mtp_nextn > 0:
-            model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp"
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        else:
-            model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only"
-            mtp_config = None
 
         quant_config = QuantConfig()
         quant_config.quant_algo = QuantAlgo.NVFP4
@@ -888,7 +885,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             pytorch_config["kv_cache_dtype"] = "fp8"
 
-        llm = LLM(model_path,
+        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,

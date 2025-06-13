@@ -23,6 +23,13 @@ deepseek-ai/DeepSeek-V3-Lite:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 63.71
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 63.71
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 63.71
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 64.74
   - quant_algo: FP8_BLOCK_SCALES
