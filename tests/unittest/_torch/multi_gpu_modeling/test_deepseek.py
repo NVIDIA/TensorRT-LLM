@@ -9,7 +9,7 @@ from utils.util import getSMVersion
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 
@@ -67,9 +67,8 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
         use_cuda_graph=False,
         kv_cache_dtype="auto",
         attn_backend=backend,
-        moe_max_num_tokens=moe_max_num_tokens,
     )
-
+    moe_config = MoeConfig(moe_max_num_tokens=moe_max_num_tokens)
     model_dir = str(llm_models_root() / model_name / model_path[quant])
 
     assert Path(model_dir).exists()
@@ -78,6 +77,7 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
               tensor_parallel_size=tp_size,
               enable_chunked_prefill=False,
               **pytorch_config,
+              moe_config=moe_config,
               moe_expert_parallel_size=-1,
               moe_tensor_parallel_size=-1,
               enable_attention_dp=enable_attention_dp,

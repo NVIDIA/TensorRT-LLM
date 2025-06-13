@@ -1459,6 +1459,26 @@ class LoadFormat(Enum):
     DUMMY = 1
 
 
+class MoeConfig(BaseModel):
+    """
+    Configuration for MoE.
+
+    """
+    moe_backend: str = Field(default='CUTLASS',
+                             description="MoE backend to use.")
+
+    moe_max_num_tokens: Optional[int] = Field(
+        default=None,
+        description=
+        "If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used."
+    )
+
+    moe_load_balancer: Optional[Union[object, str]] = Field(
+        default=None,
+        description="Configuration for MoE load balancing.",
+        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+
+
 class TorchLlmArgs(BaseLlmArgs):
 
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
@@ -1492,22 +1512,11 @@ class TorchLlmArgs(BaseLlmArgs):
     disable_overlap_scheduler: bool = Field(
         default=False, description="Disable the overlap scheduler.")
 
-    moe_max_num_tokens: Optional[int] = Field(
-        default=None,
-        description=
-        "If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used."
-    )
-
-    moe_load_balancer: Optional[Union[object, str]] = Field(
-        default=None,
-        description="Configuration for MoE load balancing.",
-        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+    moe_config: MoeConfig = Field(default=MoeConfig(),
+                                  description="MoE config.")
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.")
-
-    moe_backend: str = Field(default='CUTLASS',
-                             description="MoE backend to use.")
 
     mixed_sampler: bool = Field(
         default=False,
