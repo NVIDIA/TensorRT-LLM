@@ -1,5 +1,4 @@
 import argparse
-import sys
 
 
 def parse_diff(diff):
@@ -33,15 +32,21 @@ def merge_waive_list(cur_list, main_list, remove_lines):
     print(merged)
     return merged
 
+
 def write_waive_list(waive_list, output_file):
     with open(output_file, 'w') as f:
         for line in waive_list:
             f.write(line)
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cur-waive-list', required=True, help='Current waive list')
-    parser.add_argument('--latest-waive-list', required=True, help='Latest waive list')
+    parser.add_argument('--cur-waive-list',
+                        required=True,
+                        help='Current waive list')
+    parser.add_argument('--latest-waive-list',
+                        required=True,
+                        help='Latest waive list')
     parser.add_argument('--diff', required=True, help='Diff of the waive list')
     parser.add_argument('--output-file', required=True, help='Output file')
 

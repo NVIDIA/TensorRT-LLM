@@ -393,7 +393,7 @@ def mergeWaiveList(pipeline)
         python3 mergeWaiveList.py \
         --cur-waive-list=cur_waives.txt \
         --latest-waive-list=latest_waives.txt \
-        --diff='${diff}' \
+        --diff=${diff} \
         --output-file=waives.txt
     """
 }
