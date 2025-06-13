@@ -151,6 +151,7 @@ class MMLU(Evaluator):
         self.num_fewshot = num_fewshot
 
     def dowload_dataset(self):
+        import os
         import tarfile
         from tempfile import TemporaryDirectory
 
@@ -159,12 +160,17 @@ class MMLU(Evaluator):
         self.tempdir = TemporaryDirectory()
         workspace = self.tempdir.name
 
-        response = requests.get(self.DATASET_URL)
+        response = requests.get(self.DATASET_URL, timeout=60)
         with open(f"{workspace}/data.tar", "wb") as f:
             f.write(response.content)
 
         with tarfile.open(f"{workspace}/data.tar") as tar:
-            tar.extractall(path=workspace, filter=tarfile.data_filter)
+            for member in tar.getmembers():
+                member_path = os.path.abspath(f"{workspace}/{member.name}")
+                if not member_path.startswith(workspace):
+                    raise ValueError(
+                        f"Insecure member found in tar file: {member.name}")
+                tar.extract(member, path=workspace, filter=tarfile.data_filter)
 
         return f"{workspace}/data"
 
