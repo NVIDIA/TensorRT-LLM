@@ -684,7 +684,6 @@ class LLM:
         return_logits = self.args.gather_generation_logits or (
             self._on_trt_backend and self.args.build_config
             and self.args.build_config.gather_context_logits)
-        executor_config.garbage_collection_gen0_threshold = self.args.garbage_collection_gen0_threshold
 
         self._executor = self._executor_cls.create(
             self._engine_dir,
@@ -700,7 +699,9 @@ class LLM:
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
             is_llm_executor=True,
-            lora_config=self.args.lora_config)
+            lora_config=self.args.lora_config,
+            garbage_collection_gen0_threshold=self.args.
+            garbage_collection_gen0_threshold)
 
     @property
     def _on_trt_backend(self) -> bool:

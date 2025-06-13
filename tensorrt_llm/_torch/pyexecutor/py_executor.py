@@ -171,7 +171,7 @@ class PyExecutor:
                  max_draft_tokens: int = 0,
                  kv_cache_transceiver: KvCacheTransceiver = None,
                  draft_model_engine: Optional[ModelEngine] = None,
-                 garbage_collection_gen0_threshold: Optional[int] = 20000,
+                 garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()

@@ -44,6 +44,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         worker_cls: type = GenerationExecutorWorker,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None,
     ) -> None:
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
@@ -86,15 +87,14 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.model_world_size = model_world_size
 
-        print(f"worker_kwargs: {worker_kwargs}")
-        print(f"{worker_kwargs['executor_config'].__dict__}")
-        self.garbage_collection_gen0_threshold = worker_kwargs[
-            'executor_config'].garbage_collection_gen0_threshold
+        self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
 
         worker_kwargs = dict(**worker_kwargs,
                              worker_queues=self._setup_queues(),
                              postproc_worker_config=postproc_worker_config,
-                             is_llm_executor=False)
+                             is_llm_executor=False,
+                             garbage_collection_gen0_threshold=self.
+                             garbage_collection_gen0_threshold)
 
         if "log_level" not in worker_kwargs:
             worker_kwargs["log_level"] = logger.level
