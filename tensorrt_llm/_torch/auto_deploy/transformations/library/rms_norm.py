@@ -7,7 +7,7 @@ from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch.fx import GraphModule
 
 from ...utils.logger import ad_logger
-from ...utils.pattern_matcher import register_pattern
+from ...utils.pattern_matcher import register_ad_pattern
 from .._graph import canonicalize_graph
 
 
@@ -95,7 +95,7 @@ def match_rms_norm(gm: GraphModule, backend: str = "triton") -> GraphModule:
 
     # Register patterns for each configuration
     for input_dtype, weight_dtype in configs:
-        register_pattern(
+        register_ad_pattern(
             search_fn=_rms_norm_pattern,
             replace_fn=partial(_rms_norm_replacement, backend=backend),
             patterns=patterns,
