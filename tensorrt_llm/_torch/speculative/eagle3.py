@@ -354,12 +354,6 @@ class Eagle3OneModelWorker(nn.Module):
         position_ids = position_ids.squeeze(0)
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-
-        # print("eagle3.py Eagle3OneModelWorker prepare_1st_drafter_inputs",
-        #       "num_contexts", num_contexts, "num_gens",
-        #       num_gens, "accepted_tokens", accepted_tokens, "input_ids",
-        #       len(input_ids), input_ids)
-
         inputs = self.prepare_1st_drafter_inputs(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -369,7 +363,6 @@ class Eagle3OneModelWorker(nn.Module):
             attn_metadata=attn_metadata,
             spec_metadata=spec_metadata,
             draft_model=draft_model)
-        # print(f"eagle3.py draft_loop step -1 input", inputs)
 
         # Predict draft tokens
         next_draft_tokens = []
@@ -416,7 +409,6 @@ class Eagle3OneModelWorker(nn.Module):
             # support attention dp
             if spec_metadata.all_rank_num_tokens is not None:
                 spec_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
-            # print(f"eagle3.py draft_loop step {i} input_ids", new_draft_token)
             inputs = {
                 "input_ids": new_draft_token,
                 "position_ids": position_ids,
@@ -425,7 +417,6 @@ class Eagle3OneModelWorker(nn.Module):
                 "spec_metadata": spec_metadata,
             }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
-        # print(f"eagle3.py draft_loop next_draft_tokens", next_draft_tokens)
 
         # restore attn_metadata to support cuda graph
         if attn_metadata.is_cuda_graph:
@@ -485,8 +476,6 @@ class Eagle3OneModelWorker(nn.Module):
         num_accepted_tokens[num_contexts:] += torch.cumprod((
             draft_tokens == gen_target_tokens[:, :self.max_draft_tokens]).int(),
                                                             dim=-1).sum(1)
-        # print("eagle3.py sample_and_accept_draft_tokens num_accepted_tokens",
-        #       num_accepted_tokens)
         return accepted_tokens, num_accepted_tokens
 
     def draft_decoder(

@@ -22,6 +22,7 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
+from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -61,8 +62,8 @@ class Llama4Attention(Attention):
             is_neox=False,
         ) if self.use_rope else None
         self.use_qk_norm = use_qk_norm
-
-        if model_config.attn_backend != "TRTLLM":
+        self.attn_backend = model_config.attn_backend
+        if self.attn_backend != "TRTLLM":
             # TODO: support chunked attention for other backends.
             # This is safe to do because we limit seqlen to 8k for
             # non TRTLLM backends.
@@ -149,8 +150,8 @@ class Llama4Attention(Attention):
         mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         skip_attn_scaling: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
     ):
-
         qkv = self.qkv_proj(hidden_states)
 
         q, k, v = qkv, None, None
@@ -163,13 +164,26 @@ class Llama4Attention(Attention):
             out_scale = self.o_proj.inv_input_scale
 
         q, k, v = self.convert_qkv(q, k, v)
-        attn_output = self.attn.forward(q,
-                                        k,
-                                        v,
-                                        attn_metadata,
-                                        out_scale=out_scale,
-                                        attention_mask=attention_mask,
-                                        mrope_config=mrope_config)
+        use_spec_dec = (
+            spec_metadata.use_spec_dec
+            and spec_metadata.spec_dec_mode.require_multi_query_attn_kernel(
+                get_attention_backend(
+                    self.attn_backend))) if spec_metadata is not None else False
+        attn_output = self.attn.forward(
+            q,
+            k,
+            v,
+            attn_metadata,
+            out_scale=out_scale,
+            attention_mask=attention_mask,
+            mrope_config=mrope_config,
+            use_spec_dec=use_spec_dec,
+            spec_decoding_position_offsets=spec_metadata.
+            spec_decoding_position_offsets if use_spec_dec else None,
+            spec_decoding_packed_mask=spec_metadata.spec_decoding_packed_mask
+            if use_spec_dec else None,
+            spec_decoding_generation_lengths=spec_metadata.
+            spec_decoding_generation_lengths if use_spec_dec else None)
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
@@ -186,6 +200,7 @@ class Llama4Attention(Attention):
         mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert lora_params is None, "LORA is not supported for Llama4Attention"
@@ -198,12 +213,19 @@ class Llama4Attention(Attention):
                 mrope_config=mrope_config,
                 all_reduce_params=all_reduce_params,
                 lora_params=lora_params,
+                spec_metadata=spec_metadata,
                 **kwargs,
             )
         else:
-            return self._forward_nope(position_ids, hidden_states,
-                                      attn_metadata, attention_mask,
-                                      mrope_config, all_reduce_params)
+            return self._forward_nope(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                attention_mask=attention_mask,
+                mrope_config=mrope_config,
+                all_reduce_params=all_reduce_params,
+                skip_attn_scaling=False,  # default value
+                spec_metadata=spec_metadata)
 
 
 class LlamaAttention(Attention):
@@ -463,6 +485,7 @@ class Llama4DecoderLayer(DecoderLayer):
             all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.PRE_MOE_FUSION or self.mapping.tp_size == 1
                 or self.enable_attention_dp)),
+            spec_metadata=spec_metadata,
             **kwargs,
         )
 
