@@ -22,7 +22,8 @@ def setup_fused_moe_kernel_inputs(
     top_k: int,
     tp_size: int,
     ep_size: int,
-    dtype: torch.dtype = torch.bfloat16
+    dtype: torch.dtype = torch.bfloat16,
+    use_nvfp4: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List, int, Mapping]:
     """Setup inputs for the torch.ops.trtllm.fused_moe kernel."""
     
@@ -59,15 +60,79 @@ def setup_fused_moe_kernel_inputs(
     # For the kernel, token_selected_slots is the same as token_selected_experts in simple case
     token_selected_slots = token_selected_experts
     
-    # Create expert weights for this rank
-    # w3_w1_weight: concatenated w3 and w1 weights [num_experts_per_rank, 2*intermediate_size_per_rank, hidden_size_per_rank]
-    w3_w1_weight = torch.randn((num_experts_per_rank, 2 * intermediate_size_per_rank, hidden_size_per_rank), dtype=dtype).cuda()
-    
-    # w2_weight: down projection weights [num_experts_per_rank, hidden_size_per_rank, intermediate_size_per_rank]  
-    w2_weight = torch.randn((num_experts_per_rank, hidden_size_per_rank, intermediate_size_per_rank), dtype=dtype).cuda()
-    
-    # Quantization scales (empty for non-quantized)
-    quant_scales = []
+    # Create expert weights based on quantization mode
+    if use_nvfp4:
+        print(f"  Debug: num_experts_per_rank={num_experts_per_rank}, hidden_size={hidden_size}, intermediate_size={intermediate_size}")
+        print(f"  Debug: hidden_size_per_rank={hidden_size_per_rank}, intermediate_size_per_rank={intermediate_size_per_rank}")
+        # NVFP4 quantization: weights are packed into int64, scales are packed into int32
+        # Weight dimensions: [num_experts_per_rank, 2*intermediate_size_per_rank, hidden_size_per_rank // 16]
+        # because we pack 16 fp4 values into each int64
+        w3_w1_weight = torch.randint(
+            0, 2**63-1, 
+            (num_experts_per_rank, 2 * intermediate_size_per_rank, hidden_size_per_rank // 16), 
+            dtype=torch.int64
+        ).cuda()
+        
+        w2_weight = torch.randint(
+            0, 2**63-1,
+            (num_experts_per_rank, hidden_size_per_rank, intermediate_size_per_rank // 16), 
+            dtype=torch.int64
+        ).cuda()
+        
+        # Create NVFP4 quantization scales (6 tensors as per CutlassFusedMoe)
+        # fc1_act_global: scalar
+        fc1_act_global = torch.tensor(2.0, dtype=torch.float32).cuda()
+        
+        # fc1_weight_block: As per error message: (num_experts_per_rank, inter_size * 2, hidden_size // 4 // block_scale_vector_size)
+        # block_scale_vector_size = 16 for NVFP4
+        fc1_weight_block_shape = (
+            num_experts_per_rank, 
+            intermediate_size_per_rank * 2,  
+            max(1, hidden_size_per_rank // 4 // 16)   # Ensure at least 1 element
+        )
+        fc1_weight_block = torch.randint(
+            0, 2**31-1, 
+            fc1_weight_block_shape, 
+            dtype=torch.int32
+        ).cuda()
+        
+        # fc1_global: 1D tensor [num_experts_per_rank]  
+        fc1_global = torch.ones(num_experts_per_rank, dtype=torch.float32).cuda()
+        
+        # fc2_act_global: scalar
+        fc2_act_global = torch.tensor(2.0, dtype=torch.float32).cuda()
+        
+        # fc2_weight_block: As per error message: (num_experts_per_rank, hidden_size, inter_size // 4 // block_scale_vector_size)
+        # block_scale_vector_size = 16 for NVFP4
+        fc2_weight_block_shape = (
+            num_experts_per_rank, 
+            hidden_size_per_rank,  
+            max(1, intermediate_size_per_rank // 4 // 16)  # Ensure at least 1 element
+        )
+        fc2_weight_block = torch.randint(
+            0, 2**31-1,
+            fc2_weight_block_shape, 
+            dtype=torch.int32
+        ).cuda()
+        
+        # fc2_global: 1D tensor [num_experts_per_rank]
+        fc2_global = torch.ones(num_experts_per_rank, dtype=torch.float32).cuda()
+        
+        # Package the 6 quantization scales
+        quant_scales = [
+            fc1_act_global,
+            fc1_weight_block, 
+            fc1_global,
+            fc2_act_global,
+            fc2_weight_block,
+            fc2_global
+        ]
+        
+    else:
+        # BF16 mode: standard weights
+        w3_w1_weight = torch.randn((num_experts_per_rank, 2 * intermediate_size_per_rank, hidden_size_per_rank), dtype=dtype).cuda()
+        w2_weight = torch.randn((num_experts_per_rank, hidden_size_per_rank, intermediate_size_per_rank), dtype=dtype).cuda()
+        quant_scales = []
     
     return x, token_selected_slots, token_final_scales, w3_w1_weight, w2_weight, quant_scales, actual_activated_experts, mapping
 
@@ -114,11 +179,13 @@ def profile_fused_moe_kernel(
     ep_size: int,
     nsys_mode: bool = False,
     num_warmup: int = 10,
-    num_iterations: int = 100
+    num_iterations: int = 100,
+    use_nvfp4: bool = False
 ) -> float:
     """Profile the torch.ops.trtllm.fused_moe kernel directly."""
     
-    print(f"\nProfiling: {test_name}")
+    quant_mode = "NVFP4" if use_nvfp4 else "BF16"
+    print(f"\nProfiling: {test_name} ({quant_mode})")
     print(f"  Tokens: {num_tokens}, Hidden: {hidden_size}, Intermediate: {intermediate_size}")
     
     # Setup kernel inputs
@@ -130,7 +197,8 @@ def profile_fused_moe_kernel(
         top_k=top_k,
         tp_size=tp_size,
         ep_size=ep_size,
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
+        use_nvfp4=use_nvfp4
     )
     
     print(f"  Experts: {num_experts}, Activated: {actual_activated_experts}, TopK: {top_k}")
@@ -155,8 +223,51 @@ def profile_fused_moe_kernel(
     
     # Warmup
     if num_warmup > 0:
-        for _ in range(num_warmup):
-            _ = torch.ops.trtllm.fused_moe(
+        for i in range(num_warmup):
+            try:
+                _ = torch.ops.trtllm.fused_moe(
+                    x,
+                    token_selected_slots,
+                    token_final_scales,
+                    w3_w1_weight,
+                    w2_weight,
+                    output_dtype,
+                    quant_scales=quant_scales,
+                    input_sf=None,
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                    ep_size=ep_size,
+                    ep_rank=ep_rank,
+                    # cluster_size=cluster_size,
+                    # cluster_rank=cluster_rank,
+                    use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+                    use_w4a8_group_scaling=use_w4a8_group_scaling,
+                    min_latency_mode=min_latency_mode,
+                    tune_max_num_tokens=tune_max_num_tokens,
+                )
+                torch.cuda.synchronize()
+                # Check for CUDA errors
+                if torch.cuda.is_available():
+                    current_device = torch.cuda.current_device()
+                    if hasattr(torch.cuda, 'get_device_name'):
+                        device_name = torch.cuda.get_device_name(current_device)
+            except Exception as e:
+                print(f"  ERROR during warmup iteration {i}: {e}")
+                raise
+        
+        torch.cuda.synchronize()
+    
+    # Timing using CUDA events
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    if nsys_mode:
+        nvtx_range = nvtx.range_start(test_name)
+    
+    start_event.record()
+    for i in range(num_iterations):
+        try:
+            output = torch.ops.trtllm.fused_moe(
                 x,
                 token_selected_slots,
                 token_final_scales,
@@ -176,38 +287,25 @@ def profile_fused_moe_kernel(
                 min_latency_mode=min_latency_mode,
                 tune_max_num_tokens=tune_max_num_tokens,
             )
-        
-        torch.cuda.synchronize()
-    
-    # Timing using CUDA events
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    
-    if nsys_mode:
-        nvtx_range = nvtx.range_start(test_name)
-    
-    start_event.record()
-    for _ in range(num_iterations):
-        _ = torch.ops.trtllm.fused_moe(
-            x,
-            token_selected_slots,
-            token_final_scales,
-            w3_w1_weight,
-            w2_weight,
-            output_dtype,
-            quant_scales=quant_scales,
-            input_sf=None,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            # cluster_size=cluster_size,
-            # cluster_rank=cluster_rank,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4a8_group_scaling=use_w4a8_group_scaling,
-            min_latency_mode=min_latency_mode,
-            tune_max_num_tokens=tune_max_num_tokens,
-        )
+            
+            # Check output validity
+            if torch.isnan(output).any() or torch.isinf(output).any():
+                print(f"  WARNING: Invalid output detected at iteration {i} (NaN or Inf values)")
+                print(f"  Output shape: {output.shape}, dtype: {output.dtype}")
+                print(f"  Has NaN: {torch.isnan(output).any()}, Has Inf: {torch.isinf(output).any()}")
+                
+            # Detailed check for first iteration
+            if i == 0:
+                print(f"  First iteration output check:")
+                print(f"    Shape: {output.shape}, dtype: {output.dtype}")
+                print(f"    Min: {output.min().item():.6f}, Max: {output.max().item():.6f}")
+                print(f"    Mean: {output.mean().item():.6f}, Std: {output.std().item():.6f}")
+                if use_nvfp4:
+                    print(f"    NVFP4 mode - checking for reasonable output range")
+                
+        except Exception as e:
+            print(f"  ERROR during timing iteration {i}: {e}")
+            raise
     end_event.record()
     
     if nsys_mode:
@@ -241,11 +339,15 @@ Example usage:
     )
     parser.add_argument('--nsys', action='store_true', 
                        help='Enable nsys profiling mode (no warmup, 1 iteration, NVTX markers, CUDA profiler start/stop)')
+    parser.add_argument('--nvfp4', action='store_true',
+                       help='Enable NVFP4 quantization mode (default: BF16)')
     args = parser.parse_args()
     
     nsys_mode = args.nsys
+    use_nvfp4 = args.nvfp4
     
-    print("torch.ops.trtllm.fused_moe Kernel Profiling - Qwen3 235B Configuration")
+    quant_mode = "NVFP4" if use_nvfp4 else "BF16"
+    print(f"torch.ops.trtllm.fused_moe Kernel Profiling - Qwen3 235B Configuration ({quant_mode})")
     print("=" * 80)
     if nsys_mode:
         print("NSYS PROFILING MODE ENABLED")
@@ -253,6 +355,12 @@ Example usage:
         print("- Single iteration per test")
         print("- NVTX markers for timeline analysis")
         print("- CUDA profiler start/stop for precise kernel capture")
+        print("=" * 80)
+    if use_nvfp4:
+        print("NVFP4 QUANTIZATION MODE ENABLED")
+        print("- Weights quantized to FP4 and packed into int64")
+        print("- Quantization scales provided for kernel")
+        print("- Weight dimensions adjusted for packing")
         print("=" * 80)
     
     test_configs = []
@@ -276,9 +384,19 @@ Example usage:
     for tp_ep in tp_ep_configs:
         for num_tokens in token_configs:
             
+            # Check NVFP4 compatibility: intermediate_size_per_rank must be divisible by 64
+            if use_nvfp4:
+                intermediate_size_per_rank = tp_ep['intermediate_size'] // tp_ep['tp']
+                hidden_size_per_rank = tp_ep['hidden_size'] // tp_ep['tp']
+                # Both dimensions need to be divisible by 64 for NVFP4 weight block scales
+                if (intermediate_size_per_rank % 64 != 0) or (hidden_size_per_rank % 64 != 0):
+                    print(f"Skipping TP{tp_ep['tp']}_EP{tp_ep['ep']} for NVFP4: intermediate_size_per_rank={intermediate_size_per_rank}, hidden_size_per_rank={hidden_size_per_rank} (not divisible by 64)")
+                    continue
+            
             # Single kernel test configuration
+            test_name_suffix = f'_NVFP4' if use_nvfp4 else ''
             test_configs.append({
-                'test_name': f'Kernel_Qwen3_235B_TP{tp_ep["tp"]}_EP{tp_ep["ep"]}_MoE_tokens{num_tokens}',
+                'test_name': f'Kernel_Qwen3_235B_TP{tp_ep["tp"]}_EP{tp_ep["ep"]}_MoE_tokens{num_tokens}{test_name_suffix}',
                 'num_tokens': num_tokens,
                 'hidden_size': tp_ep['hidden_size'],
                 'intermediate_size': tp_ep['intermediate_size'],
@@ -286,6 +404,7 @@ Example usage:
                 'top_k': tp_ep['top_k'],
                 'tp_size': tp_ep['tp'],
                 'ep_size': tp_ep['ep'],
+                'use_nvfp4': use_nvfp4,
                 'benchmark_fc1_dims': f"{tp_ep['intermediate_size']*2}x{tp_ep['hidden_size']}",
                 'benchmark_fc2_dims': f"{tp_ep['hidden_size']}x{tp_ep['intermediate_size']}"
             })
@@ -318,7 +437,9 @@ Example usage:
     results.sort(key=lambda x: (x['numTokens'], x['topK'], x['testName']))
     
     # Export to CSV in benchmark format
-    csv_filename = "fused_moe_kernel_profiling_results_nsys.csv" if nsys_mode else "fused_moe_kernel_profiling_results.csv"
+    suffix = "_nsys" if nsys_mode else ""
+    suffix += "_nvfp4" if use_nvfp4 else "_bf16"
+    csv_filename = f"fused_moe_kernel_profiling_results{suffix}.csv"
     with open(csv_filename, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         
@@ -350,9 +471,11 @@ Example usage:
     
     # Print results table
     print("\n" + "=" * 100)
-    print("FUSED MOE KERNEL PROFILING RESULTS")
+    print(f"FUSED MOE KERNEL PROFILING RESULTS ({quant_mode})")
     print("=" * 100)
     print("NOTE: This directly profiles torch.ops.trtllm.fused_moe kernel (FC1 + FC2 fused)")
+    if use_nvfp4:
+        print("NOTE: Using NVFP4 quantization with packed weights and quantization scales")
     print("-" * 100)
     print(f"{'Tokens':<8} {'Test Name':<45} {'Hidden':<8} {'Intermediate':<12} {'Experts':<8} {'TopK':<6} {'Time(ms)':<10} {'Maps to Benchmark':<25}")
     print("-" * 100)
