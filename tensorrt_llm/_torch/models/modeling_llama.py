@@ -1293,9 +1293,9 @@ class Eagle3LlamaForCausalLM(DecoderModelForCausalLM[Eagle3LlamaDraftModel,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
-        hidden_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        hidden_states = self.apply_eagle3_fc(spec_metadata.get_hidden_states())
         output, _ = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
