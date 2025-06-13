@@ -1277,6 +1277,7 @@ std::vector<BlockPtr> WindowBlockManager::storeBlocks(
     {
         mEventManager->enqueueStoredEvent(storedBlocks);
     }
+    return storedBlocks;
 }
 
 void WindowBlockManager::storeBlock(BlockKey const& blockKey, KVCacheBlock::IdType blockId, BlockPtr const& prevBlock)
