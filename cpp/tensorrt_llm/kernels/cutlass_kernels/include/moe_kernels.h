@@ -697,10 +697,10 @@ private:
         OutputType* const final_output, int64_t const* const expert_first_token_offset,
         WeightType const* const fc2_expert_weights, ScaleBiasType const* const fc2_expert_biases,
         float const* const token_topk_unpermuted_scales, int const* const expanded_source_row_to_expanded_dest_row,
-        int const* const expert_for_source_row, int64_t const* const num_valid_tokens_ptr, int64_t const num_rows,
-        int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const inter_size,
-        int const num_experts_per_node, int64_t const k, MOEParallelismConfig parallelism_config,
-        QuantParams& quant_params, cudaStream_t stream);
+        int const* const expanded_dest_row_to_expanded_source_row, int const* const expert_for_source_row,
+        int64_t const* const num_valid_tokens_ptr, int64_t const num_rows, int64_t const expanded_num_rows,
+        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node, int64_t const k,
+        MOEParallelismConfig parallelism_config, QuantParams& quant_params, cudaStream_t stream);
 
     T const* applyPrequantScale(void* smoothed_act, void const* permuted_data, void const* prequant_scales,
         int64_t const* num_valid_tokens_ptr, int64_t const expanded_num_rows, int64_t const seq_len, bool const use_awq,
