@@ -11,7 +11,7 @@ import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
-from .._utils import mpi_rank, nvtx_range_debug
+from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
@@ -86,6 +86,11 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.model_world_size = model_world_size
 
+        print(f"worker_kwargs: {worker_kwargs}")
+        print(f"{worker_kwargs['executor_config'].__dict__}")
+        self.garbage_collection_gen0_threshold = worker_kwargs[
+            'executor_config'].garbage_collection_gen0_threshold
+
         worker_kwargs = dict(**worker_kwargs,
                              worker_queues=self._setup_queues(),
                              postproc_worker_config=postproc_worker_config,
@@ -152,40 +157,41 @@ class GenerationExecutorProxy(GenerationExecutor):
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
-        if (res := self.result_queue.get()) is None:
-            return False  # shutdown the thread
+        with customized_gc_thresholds(self.garbage_collection_gen0_threshold):
+            if (res := self.result_queue.get()) is None:
+                return False  # shutdown the thread
 
-        async_queues = []
-        event_loop = None
+            async_queues = []
+            event_loop = None
 
-        def process_res(res):
-            client_id = res.client_id
-            nonlocal event_loop
-            nonlocal async_queues
+            def process_res(res):
+                client_id = res.client_id
+                nonlocal event_loop
+                nonlocal async_queues
 
-            queue = self._results[client_id].queue
-            if isinstance(queue, _SyncQueue):
-                queue.put_nowait(res)
-                async_queues.append(queue)
-                # all the loops are identical
-                event_loop = event_loop or queue.loop
-            else:
-                queue.put(res)
+                queue = self._results[client_id].queue
+                if isinstance(queue, _SyncQueue):
+                    queue.put_nowait(res)
+                    async_queues.append(queue)
+                    # all the loops are identical
+                    event_loop = event_loop or queue.loop
+                else:
+                    queue.put(res)
 
-            if (is_llm_response(res) and res.result.is_final) or isinstance(
-                    res, ErrorResponse):
-                self._results.pop(client_id)
+                if (is_llm_response(res) and res.result.is_final) or isinstance(
+                        res, ErrorResponse):
+                    self._results.pop(client_id)
 
-        res = res if isinstance(res, list) else [res]
+            res = res if isinstance(res, list) else [res]
 
-        for i in res:
-            global_tracer().log_instant("IPC.get")
-            if i is None:
-                return False
-            process_res(i)
+            for i in res:
+                global_tracer().log_instant("IPC.get")
+                if i is None:
+                    return False
+                process_res(i)
 
-        if async_queues:
-            _SyncQueue.notify_many(event_loop, async_queues)
+            if async_queues:
+                _SyncQueue.notify_many(event_loop, async_queues)
 
         return True  # success
 

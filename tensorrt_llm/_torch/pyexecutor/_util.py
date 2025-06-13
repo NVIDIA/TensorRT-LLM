@@ -509,7 +509,9 @@ def create_py_executor_instance(
                       if spec_config is not None else 0,
                       kv_cache_transceiver=kv_cache_transceiver,
                       draft_model_engine=draft_model_engine,
-                      start_worker=start_worker)
+                      start_worker=start_worker,
+                      garbage_collection_gen0_threshold=executor_config.
+                      garbage_collection_gen0_threshold)
 
 
 def instantiate_sampler(model_engine: PyTorchModelEngine,

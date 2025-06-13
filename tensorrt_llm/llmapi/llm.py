@@ -136,6 +136,7 @@ class LLM:
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
                 **kwargs)
+            print(f"LLM.args: {self.args.__dict__}")
 
         except Exception as e:
             logger.error(
@@ -683,6 +684,7 @@ class LLM:
         return_logits = self.args.gather_generation_logits or (
             self._on_trt_backend and self.args.build_config
             and self.args.build_config.gather_context_logits)
+        executor_config.garbage_collection_gen0_threshold = self.args.garbage_collection_gen0_threshold
 
         self._executor = self._executor_cls.create(
             self._engine_dir,
