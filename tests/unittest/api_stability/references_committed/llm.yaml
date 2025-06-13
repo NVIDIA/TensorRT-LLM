@@ -105,9 +105,6 @@ methods:
       kv_cache_config:
         annotation: tensorrt_llm.llmapi.llm_args.KvCacheConfig
         default: null
-      allreduce_strategy:
-        annotation: Optional[Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT', 'LOWPRECISION', 'MNNVL']]
-        default: AUTO
     return_annotation: None
   generate:
     parameters:

@@ -124,10 +124,6 @@ When verifying and receiving draft tokens, there are two ways:
   python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N --use_relaxed_acceptance_for_thinking --relaxed_topk 15 --relaxed_delta 0.5
   ```
 
-  Note: There are still compatibility issues between relaxed acceptance and attention_dp. These two flags cannot be enabled at the same time for now.
-
-
-
 ### Long context support
 DeepSeek-V3 model can support up to 128k context length. The following shows how to benchmark 64k and 128k input_seq_length using trtllm-bench on B200.
 To avoid OOM (out of memory) error, you need to adjust the values of "--max_batch_size", "--max_num_tokens" and "--kv_cache_free_gpu_mem_fraction".
