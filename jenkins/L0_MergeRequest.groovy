@@ -337,6 +337,67 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     })
 }
 
+def getMergeRequestOneFileChangesGitlab(pipeline, filePath) {
+    withCredentials([
+        usernamePassword(
+            credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+            usernameVariable: 'GITLAB_API_USER',
+            passwordVariable: 'GITLAB_API_TOKEN'
+        ),
+        string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+    ]) {
+        def diff = ""
+        def pageId = 0
+        while(true) {
+            pageId += 1
+            def rawDataJson = pipeline.sh(
+                script: """
+                    curl --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+                         --url "https://${DEFAULT_GIT_URL}/api/v4/projects/${env.gitlabMergeRequestTargetProjectId}/merge_requests/${env.gitlabMergeRequestIid}/diffs?page=${pageId}&per_page=20"
+                """,
+                returnStdout: true
+            )
+            def rawDataList = readJSON text: rawDataJson, returnPojo: true
+            rawDataList.each { rawData ->
+                if (rawData.get("new_path") == filePath || rawData.get("old_path") == filePath) {
+                    diff = rawData.get("diff")
+                    break
+                }
+            }
+            if (!rawDataList || diff != "") { break }
+        }
+        pipeline.echo("The change of ${filePath} is: ${diff}")
+        return diff
+    }
+}
+
+def mergeWaiveList(pipeline)
+{
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        return
+    }
+
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/${env.gitlabMergeRequestLastCommit}/tests/integration/test_lists/waives.txt -O cur_waives.txt")
+    sh "cat cur_waives.txt"
+
+    branch = "main"
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/refs/heads/${branch}/tests/integration/test_lists/waives.txt -O latest_waives.txt")
+    sh "cat latest_waives.txt"
+
+    def diff = getMergeRequestOneFileChangesGitlab(pipeline, "tests/integration/test_lists/waives.txt")
+    echo "diff: ${diff}"
+
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/${env.gitlabMergeRequestLastCommit}/jenkins/mergeWaiveList.py")
+    sh """
+        python3 mergeWaiveList.py \
+        --cur-waive-list=cur_waives.txt \
+        --latest-waive-list=latest_waives.txt \
+        --diff='${diff}' \
+        --output-file=waives.txt
+    """
+}
+
 def launchReleaseCheck(pipeline)
 {
     stages = {
@@ -1142,6 +1203,7 @@ pipeline {
             {
                 script {
                     setupPipelineEnvironment(this, testFilter, globalVars)
+                    mergeWaiveList(this)
                     println globalVars
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                     echo "enableFailFast is: ${enableFailFast}"
