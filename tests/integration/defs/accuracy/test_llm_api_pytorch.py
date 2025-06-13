@@ -687,7 +687,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_device_not_contain(["H100", "H200"])
+    @pytest.mark.skip_device_not_contain(["H100", "H200", "6000"])
     @parametrize_with_ids(
         "torch_compile",
         [False, pytest.param(True, marks=skip_device_contain_gb200)])
