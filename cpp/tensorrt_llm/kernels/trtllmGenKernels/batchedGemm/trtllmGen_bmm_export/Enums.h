@@ -39,6 +39,31 @@ enum class AllReduceAlgo : uint32_t
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+enum class MatrixLayout
+{
+    // K-major layout (default). [Mn, K]
+    MajorK = 0,
+    // M-major for A and N-major for B. [K, Mn]
+    MajorMn,
+    // Layout is blocked along the K dimension as seen in the diagram below. [K / blockK, Mn, blockK]
+    // where blockK is fixed at 128B
+    //
+    //         ├──────────────  K  ──────────────┤
+    //  ┬  ┬   ├──── K block ───┤
+    //  │  │   │ 0   1   2   3  ║ 32  33  34  35 │
+    //  │ CTA0 │ 4   5   6   7  ║ 36  37  38  39 │
+    //  │  │   │ 8   9   10  11 ║ 40  41  42  43 │
+    //  │  ┴   │ 12  13  14  15 ║ 44  45  46  47 │
+    //  M  ┬   ├────────────────║────────────────┤
+    //  │  │   │ 16  17  18  19 ║ 48  49  50  51 │
+    //  │ CTA1 │ 20  21  22  23 ║ 52  53  54  55 │
+    //  │  │   │ 24  25  26  27 ║ 56  57  58  59 │
+    //  ┴  ┴   │ 28  29  30  31 ║ 60  61  62  63 │
+    BlockMajorK
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 enum class SplitK : uint32_t
 {
     // No split-k is needed. I.e. mNumSlicesForSplitK == 1.
@@ -50,6 +75,20 @@ enum class SplitK : uint32_t
     // All CTAs in one CGA calculate partial sums. Then send the results to the smem of
     // the last CTA in the CGA, which sums them up and writes to gmem.
     Dsmem,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+enum class BiasType : uint32_t
+{
+    // No bias.
+    None = 0,
+    // One bias value per N of the output tensor.
+    M = 1,
+    // One bias value per row M of the output tensor.
+    N = 2,
+    // One bias value for each element of the output tensor.
+    Mn = 3,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -77,6 +116,23 @@ SPLIT_K_FUNCTION(Gmem)
 SPLIT_K_FUNCTION(Dsmem)
 
 #undef SPLIT_K_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper functions to check the Bias type.
+
+#define BIAS_TYPE_FUNCTION(Mode)                                                                                       \
+    inline bool isBiasType##Mode(BiasType type)                                                                        \
+    {                                                                                                                  \
+        return (type == BiasType::Mode);                                                                               \
+    }
+
+BIAS_TYPE_FUNCTION(None)
+BIAS_TYPE_FUNCTION(N)
+BIAS_TYPE_FUNCTION(M)
+BIAS_TYPE_FUNCTION(Mn)
+
+#undef BIAS_TYPE_FUNCTION
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
