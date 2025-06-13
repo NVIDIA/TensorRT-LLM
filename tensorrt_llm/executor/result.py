@@ -4,7 +4,7 @@ import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
 from typing import (TYPE_CHECKING, Any, Callable, List, Literal, NamedTuple,
-                    Optional, TypeAlias, Union)
+                    Optional, TypeAlias, Union, Tuple)
 from weakref import WeakMethod
 
 import torch
@@ -83,8 +83,11 @@ class CompletionOutput:
     Attributes:
         length (int): The number of generated tokens.
         token_ids_diff (List[int]): Newly generated token ids.
-        logprobs_diff (List[float]): Logprobs of newly generated tokens.
-        text_diff (str): Newly generated tokens.
+
+    Accessors:
+        token_ids_diff_safe(int) -> Tuple[List[int], int]: Newly generated token ids since the given length.
+        logprobs_diff_safe(int) -> Tuple[List[float], int]: Logprobs of newly generated tokens since the given length.
+        text_diff_safe(int) -> Tuple[str, int]: Newly generated tokens since the given length.
     """
     index: int
     text: str = ""
@@ -112,17 +115,18 @@ class CompletionOutput:
     def length(self) -> int:
         return len(self.token_ids)
 
-    @property
-    def text_diff(self) -> str:
-        return self.text[self._last_text_len:]
+    def text_diff_safe(self, last_text_len) -> Tuple[str, int]:
+        return self.text[last_text_len:], len(self.text)
+
+    def logprobs_diff_safe(self, last_logprobs_len) -> Tuple[List[float], int]:
+        return self.logprobs[last_logprobs_len:], len(self.logprobs)
+
+    def token_ids_diff_safe(self, last_token_ids_len) -> Tuple[List[int], int]:
+        return self.logprobs[last_token_ids_len:], len(self.logprobs)
 
     @property
     def token_ids_diff(self) -> List[int]:
         return self.token_ids[self._last_token_ids_len:]
-
-    @property
-    def logprobs_diff(self) -> List[float]:
-        return self.logprobs[self._last_logprobs_len:]
 
 
 class GenerationResultBase:

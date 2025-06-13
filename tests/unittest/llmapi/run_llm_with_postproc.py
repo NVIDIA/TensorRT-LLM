@@ -46,7 +46,7 @@ def perform_faked_oai_postprocess(rsp: GenerationResultBase,
         if finish_reason_sent[i]:
             continue
 
-        delta_text = output.text_diff
+        delta_text, args.last_text_len = output.text_diff_safe(args.last_text_len)
         delta_message = DeltaMessage(content=delta_text)
 
         choice = ChatCompletionResponseStreamChoice(index=i,

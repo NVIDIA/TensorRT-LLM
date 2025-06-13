@@ -71,8 +71,10 @@ class LlmServer:
                                               sampling_params=sampling_params)
 
             async def stream_results() -> AsyncGenerator[bytes, None]:
+                last_text_len: int = 0
                 async for output in promise:
-                    yield output.outputs[0].text_diff.encode("utf-8")
+                    text_diff, last_text_len = output.outputs[0].text_diff_safe(last_text_len)
+                    yield text_diff.encode("utf-8")
 
             if streaming:
                 return StreamingResponse(stream_results())
