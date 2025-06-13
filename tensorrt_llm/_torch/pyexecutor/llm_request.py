@@ -216,7 +216,10 @@ class LlmResult:
     def __getattr__(self, item):
         if item in self.py_result_properties:
             return getattr(self._py_result, item)
-        return object.__getattribute__(self, item)
+        if item == 'is_final':
+            return object.__getattribute__(self, 'is_final')
+        result = object.__getattribute__(self, '_result')
+        return getattr(result, item)
 
 
 class LlmResponse:
@@ -319,7 +322,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         return LlmResponse(
             request_id=self.py_request_id,
             result=LlmResult(result, self.py_result, is_final),
-            client_id=self.py_client_id) if result is not None else None
+            client_id=self.py_client_id) if len(result) > 0 else None
 
     @property
     def is_dummy(self):
