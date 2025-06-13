@@ -1262,6 +1262,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
 {
     cacheErrorAndUploadResult(stageName, {
+        echo "Skip this stage ${stageName} for ${platform}."
         runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver)
     }, {
         if (testFilter[(DEBUG_MODE)]) {
@@ -1299,7 +1300,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         // Copy CPP test result
         sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
         sh "ls ${stageName}/ -all"
-    })
+    }, true)
 }
 
 
@@ -1596,7 +1597,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
     ]
 
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
+    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, A30, "amd64", values[4] ?: 1, key.contains("Perf")), {
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -1995,6 +1996,45 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     return parallelJobsFiltered
 }
 
+def getCommonParameters()
+{
+    return [
+        'gitlabSourceRepoHttpUrl': env.gitlabSourceRepoHttpUrl,
+        'gitlabCommit': env.gitlabCommit,
+        'artifactPath': env.artifactPath,
+        'uploadPath': env.uploadPath,
+    ]
+}
+
+def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
+{
+    if (jenkinsUrl == "" && env.localJobCredentials) {
+        jenkinsUrl = env.JENKINS_URL
+        credentials = env.localJobCredentials
+    }
+    def status = ""
+    if (jenkinsUrl != "") {
+        def jobPath = trtllm_utils.resolveFullJobName(jobName).replace('/', '/job/').substring(1)
+        def handle = triggerRemoteJob(
+            job: "${jenkinsUrl}${jobPath}/",
+            auth: CredentialsAuth(credentials: credentials),
+            parameters: trtllm_utils.toRemoteBuildParameters(parameters),
+            pollInterval: 60,
+            abortTriggeredJob: true,
+        )
+        status = handle.getBuildResult().toString()
+    } else {
+        def handle = build(
+            job: jobName,
+            parameters: trtllm_utils.toBuildParameters(parameters),
+            propagate: false,
+        )
+        echo "Triggered job: ${handle.absoluteUrl}"
+        status = handle.result
+    }
+    return status
+}
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("", "agent")
@@ -2041,6 +2081,10 @@ pipeline {
             steps
             {
                 script {
+                    if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
+                        echo "This check is not needed for multi-GPU tests."
+                        return
+                    }
                     launchTestListCheck(this)
                 }
             }
@@ -2060,7 +2104,9 @@ pipeline {
                         dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
                     }
 
-                    if (singleGpuJobs.size() > 0) {
+                    if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
+                        echo "This job only runs multi-GPU tests."
+                    } else if (singleGpuJobs.size() > 0) {
                         singleGpuJobs.failFast = params.enableFailFast
                         parallel singleGpuJobs
                     } else {
@@ -2068,9 +2114,50 @@ pipeline {
                     }
 
                     if (dgxJobs.size() > 0) {
-                        stage(testPhase2StageName) {
-                            dgxJobs.failFast = params.enableFailFast
-                            parallel dgxJobs
+                        if (env.remoteMultiGpuTestJobName && !(env.JOB_NAME ==~ /.*Multi-GPU.*/)) {
+                            echo "This job will trigger a remote multi-GPU test job: ${env.remoteMultiGpuTestJobName}."
+                            stage(testPhase2StageName + " Remote Run") {
+                                parameters = getCommonParameters()
+
+                                String testFilterJson = writeJSON returnText: true, json: testFilter
+                                String globalVarsJson = writeJSON returnText: true, json: globalVars
+                                parameters += [
+                                    'enableFailFast': env.enableFailFast,
+                                    'testFilter': testFilterJson,
+                                    'dockerImage': env.dockerImage,
+                                    'wheelDockerImagePy310': env.wheelDockerImagePy310,
+                                    'wheelDockerImagePy312': env.wheelDockerImagePy312,
+                                    'globalVars': globalVarsJson,
+                                ]
+
+                                if (env.alternativeTRT) {
+                                    parameters += [
+                                        'alternativeTRT': env.alternativeTRT,
+                                    ]
+                                }
+
+                                if (env.testPhase2StageName) {
+                                    parameters += [
+                                        'testPhase2StageName': env.testPhase2StageName,
+                                    ]
+                                }
+
+                                echo "trigger x86_64 test job, params: ${parameters}"
+
+                                def status = triggerJob(
+                                    env.remoteMultiGpuTestJobName,
+                                    parameters,
+                                )
+
+                                if (status != "SUCCESS") {
+                                    error "Downstream job did not succeed"
+                                }
+                            }
+                        } else {
+                            stage(testPhase2StageName) {
+                                dgxJobs.failFast = params.enableFailFast
+                                parallel dgxJobs
+                            }
                         }
                     }
                 }
