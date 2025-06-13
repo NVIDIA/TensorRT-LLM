@@ -1128,111 +1128,6 @@ class PyTorchModelEngine(ModelEngine):
                         self.previous_kv_lens_offsets_cuda[:num_gen_requests])
         return inputs
 
-    def _prepare_draft_tp_inputs(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager: KVCacheManager,
-            attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata] = None,
-            new_tensors_device: Optional[Dict[str, torch.Tensor]] = None):
-        """
-        A simplified version of _prepare_tp_inputs for draft model.
-        Only support generation requests and with overlap scheduler enabled.
-        """
-        generation_requests = scheduled_requests.generation_requests
-        num_seqs = len(generation_requests)
-        num_tokens = num_seqs
-
-        num_cached_tokens_per_seq = []
-        request_ids = []
-        prompt_lengths = []
-        position_ids = []
-        sequence_lengths = [1] * num_seqs
-        for request in generation_requests:
-            past_seen_token_num = request.max_beam_num_tokens
-            num_cached_tokens_per_seq.append(past_seen_token_num)
-            request_ids.append(request.py_request_id)
-            prompt_lengths.append(request.py_prompt_len)
-            position_ids.append(past_seen_token_num)
-
-        # position_ids
-        position_ids = torch.tensor(position_ids,
-                                    dtype=torch.int,
-                                    pin_memory=True)
-        self.position_ids_cuda[:num_tokens].copy_(position_ids,
-                                                  non_blocking=True)
-
-        # gather_ids
-        gather_ids = list(range(num_seqs))
-        self.gather_ids_cuda[:num_seqs].copy_(torch.tensor(gather_ids,
-                                                           dtype=torch.int,
-                                                           pin_memory=True),
-                                              non_blocking=True)
-
-        # attention metadata
-        if not attn_metadata.is_cuda_graph:
-            # Assumes seq lens do not change between CUDA graph invocations.
-            attn_metadata.seq_lens = torch.tensor(
-                sequence_lengths,
-                dtype=torch.int,
-                pin_memory=True,
-            )
-        attn_metadata.num_contexts = 0
-        attn_metadata.request_ids = request_ids
-        attn_metadata.prompt_lens = prompt_lengths
-        attn_metadata.kv_cache_params = KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=self.spec_config.num_extra_kv_tokens)
-        attn_metadata.kv_cache_manager = kv_cache_manager
-        attn_metadata.prepare()
-
-        # speculative decoding metadata
-        spec_metadata.num_generations = num_seqs
-        spec_metadata.request_ids = request_ids
-        spec_metadata.num_tokens = num_seqs
-        spec_metadata.seq_lens = sequence_lengths
-        spec_metadata.gather_ids = self.gather_ids_cuda[:num_seqs]
-        spec_metadata.prepare()
-
-        inputs = {
-            'attn_metadata': attn_metadata,
-            'input_ids': new_tensors_device.new_tokens[:num_tokens],
-            'position_ids': self.position_ids_cuda[:num_tokens].unsqueeze(0),
-            'inputs_embeds': None,
-            'multi_modal_data': None,
-            'mrope_config': None,
-            'spec_metadata': spec_metadata
-        }
-
-        # support attention dp
-        if self.enable_attention_dp:
-            if spec_metadata is not None:
-                all_rank_num_tokens = self.dist.tp_allgather([
-                    attn_metadata.num_tokens, spec_metadata.num_tokens,
-                    len(sequence_lengths)
-                ])
-                attn_all_rank_num_tokens = [
-                    item[0] for item in all_rank_num_tokens
-                ]
-                spec_all_rank_num_tokens = [
-                    item[1] for item in all_rank_num_tokens
-                ]
-                all_rank_num_seqs = [item[2] for item in all_rank_num_tokens]
-                attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
-                spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
-                spec_metadata.all_rank_num_seqs = all_rank_num_seqs
-            else:
-                all_rank_num_tokens = self.dist.tp_allgather(
-                    attn_metadata.num_tokens)
-                attn_metadata.all_rank_num_tokens = all_rank_num_tokens
-
-        num_generation_tokens = len(generation_requests)
-        self.iter_states['num_ctx_requests'] = 0
-        self.iter_states['num_ctx_tokens'] = 0
-        self.iter_states['num_generation_tokens'] = num_generation_tokens
-        return inputs, None
-
     def _prepare_tp_inputs(
             self,
             scheduled_requests: ScheduledRequests,
@@ -2086,11 +1981,6 @@ class PyTorchModelEngine(ModelEngine):
                     scheduled_requests, kv_cache_manager, attn_metadata)
             else:
                 assert False, f'Unsupport cp_type {cp_type}'
-        elif self.is_draft_model and new_tensors_device is not None:
-            return self._prepare_draft_tp_inputs(scheduled_requests,
-                                                 kv_cache_manager,
-                                                 attn_metadata, spec_metadata,
-                                                 new_tensors_device)
         else:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,
