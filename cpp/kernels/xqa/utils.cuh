@@ -984,6 +984,52 @@ __device__ inline uint32_t clock32()
     return ret;
 }
 
+template <uint32_t nbBufs, Scope producerScope = Scope::CTA, Scope consumerScope = Scope::CTA>
+struct BarWaiter
+{
+    MBarrierPair<producerScope, consumerScope> (*bars)[nbBufs];
+    uint32_t idx;
+    uint32_t idxBuf;
+    bool skipBarWait = false;
+
+    __device__ inline BarWaiter(MBarrierPair<producerScope, consumerScope> (&bars)[nbBufs], uint32_t idx)
+        : bars{&bars}
+        , idx{idx}
+        , idxBuf{idx % nbBufs}
+    {
+    }
+
+    __device__ inline bool testWait()
+    {
+        bool const parity = toParity<nbBufs>(idx);
+        skipBarWait = bar().produced.test_wait_parity(parity);
+        return skipBarWait;
+    }
+
+    __device__ inline BarWaiter next(uint32_t step = 1)
+    {
+        return BarWaiter{*bars, idx + step};
+    }
+
+    __device__ inline void wait()
+    {
+        if (!skipBarWait)
+        {
+            bar().produced.wait_parity(toParity<nbBufs>(idx));
+        }
+    }
+
+    __device__ inline MBarrierPair<producerScope, consumerScope>& bar()
+    {
+        return (*bars)[idxBuf];
+    }
+
+    __device__ inline void consumed()
+    {
+        bar().consumed.arrive();
+    }
+};
+
 class Timer
 {
 public:
