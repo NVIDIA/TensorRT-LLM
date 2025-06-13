@@ -14,7 +14,7 @@ l0_l40s:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)"
+  - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)" TIMEOUT (90)
   - unittest/_torch/modeling -k "modeling_mllama"
   - unittest/_torch/modeling -k "modeling_nemotron_nas"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
@@ -50,7 +50,7 @@ l0_l40s:
   - unittest/trt/attention/test_gpt_attention.py -k "partition2"
   - unittest/trt/attention/test_gpt_attention.py -k "partition3"
   - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
-  - unittest/trt/quantization # 18 mins
+  - unittest/trt/quantization TIMEOUT (60)
   - unittest/trt/functional # 37 mins
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_fp8
   - accuracy/test_cli_flow.py::TestLlama3_1_8B::test_fp8_rowwise_meta_recipe
@@ -59,7 +59,7 @@ l0_l40s:
   - accuracy/test_llm_api.py::TestLlama3_1_8B::test_fp8_rowwise
   - examples/test_llama.py::test_llm_llama_v2_lora_1gpu[chinese-llama-2-lora-13b-llama-v2-13b-hf-lora_fp16-base_fp16]
   - examples/test_llama.py::test_llm_llama_v3_dora_1gpu[commonsense-llama-v3-8b-dora-r32-llama-v3-8b-hf-base_fp16]
-  - examples/test_llama.py::test_llm_llama_v1_1gpu_kv_cache_reuse_with_prompt_table[llama-7b]
+  - examples/test_llama.py::test_llm_llama_v1_1gpu_kv_cache_reuse_with_prompt_table[llama-7b] TIMEOUT (60)
   - examples/test_phi.py::test_llm_phi_lora_1gpu[Phi-3-mini-4k-instruct-ru-lora-Phi-3-mini-4k-instruct-lora_fp16-base_fp16]
   - examples/test_nemotron_nas.py::test_nemotron_nas_summary_1gpu[DeciLM-7B]
   - examples/test_gpt.py::test_llm_gpt_starcoder_lora_1gpu[peft-lora-starcoder2-15b-unity-copilot-starcoder2-lora_fp16-base_fp16]
