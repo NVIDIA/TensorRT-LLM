@@ -568,7 +568,7 @@ public:
 
             auto func = NVFP4 ? QuantParams::FP4 : QuantParams::FP8MXFP4;
             mQuantParams = func(mExpertFP4ActScale1, mExpertFP4WeightSf1, mExpertFP4GlobalScale1, mExpertFP4ActScale2,
-                mExpertFP4WeightSf2, mExpertFP4GlobalScale2);
+                mExpertFP4WeightSf2, mExpertFP4GlobalScale2, false, false);
         }
 
         mSelectedExperts = allocBuffer<int>(mTotalTokens * mK);

@@ -295,6 +295,9 @@ protected:
     bool mUseLora = false;
     bool mUsePrequantScale = false;
 
+    // Run tests with per-expert act scale
+    bool mUsePerExpertActScale = true;
+
     bool mIsGated = false;
     int64_t mGatedMultiplier = 1;
     int64_t mGroupSize = -1;
@@ -469,12 +472,12 @@ protected:
         {
             // FP4 uses the same logic as FP8 to generate the global scales
             mExpertFPXScale1 = allocBuffer<float>(mNumExperts);
-            mExpertFPXScale2 = allocBuffer<float>(1);
+            mExpertFPXScale2 = allocBuffer<float>(mNumExperts); // mNumExperts or 1
             mExpertFPXScale3 = allocBuffer<float>(mNumExperts);
 
             if (ANY_FP4)
             {
-                mExpertFP4ActGlobalScale1 = allocBuffer<float>(1);
+                mExpertFP4ActGlobalScale1 = allocBuffer<float>(mNumExperts); // mNumExperts or 1
                 mExpertFP4WeightGlobalScale1 = allocBuffer<float>(mNumExperts);
                 mExpertFP4WeightGlobalScale2 = allocBuffer<float>(mNumExperts);
             }
@@ -651,23 +654,37 @@ protected:
         float scaleAct1 = getFPXActScalar(max_input);
 
         float maxFC1Output = calcMLPVal(max_input, maxIndex) / maxW2;
-        float scaleAct2 = getFPXActScalar(maxFC1Output);
+
+        std::vector<float> scales_1;
+        std::vector<float> scales_2;
+        std::vector<float> scales_3;
+        if (mUsePerExpertActScale)
+        {
+            scales_2 = std::vector<float>(mNumExperts);
+            for (int i = 0; i < mNumExperts; i++)
+            {
+                float maxExpertOutput = calcMLPVal(max_input, i) / applyExpertShift(mExpertWDiag2, i);
+                float scaleAct2 = getFPXActScalar(maxExpertOutput);
+                scales_2[i] = scaleAct2;
+            }
+        }
+        else
+        {
+            float scaleAct2 = getFPXActScalar(maxFC1Output);
+            scales_2 = std::vector<float>(mNumExperts, scaleAct2);
+        }
 
         ASSERT_NE(mExpertFPXScale1, nullptr);
         ASSERT_NE(mExpertFPXScale2, nullptr);
         ASSERT_NE(mExpertFPXScale3, nullptr);
 
-        std::vector<float> scales_1;
-        std::vector<float> scales_2;
-        std::vector<float> scales_3;
         if (ANY_FP4)
         {
             std::vector<float> scale_global_w1(mNumExperts);
             std::vector<float> scale_global_w2(mNumExperts);
 
-            std::vector<float> scales_0(1, scaleAct1);
+            std::vector<float> scales_0(mUsePerExpertActScale && NVFP4 ? mNumExperts : 1, scaleAct1);
             scales_1 = std::vector<float>(mNumExperts);
-            scales_2 = std::vector<float>(1, scaleAct2);
             scales_3 = std::vector<float>(mNumExperts);
 
             for (int i = 0; i < mNumExperts; i++)
@@ -681,7 +698,7 @@ protected:
 
                 // TODO Per expert scaling factors
                 scales_1[i] = 1.f / (scaleAct1 * scaleW1);
-                scales_3[i] = 1.f / (scaleAct2 * scaleW2);
+                scales_3[i] = 1.f / (scales_2[i] * scaleW2);
             }
 
             ASSERT_NE(mExpertFP4ActGlobalScale1, nullptr);
@@ -699,8 +716,17 @@ protected:
             mFP8WeightScalar1 = scaleW1;
             mFP8WeightScalar2 = scaleW2;
             scales_1 = std::vector<float>(mNumExperts, 1.f / (scaleW1 * scaleAct1));
-            scales_2 = std::vector<float>(1, scaleAct2);
-            scales_3 = std::vector<float>(mNumExperts, 1.f / (scaleW2 * scaleAct2));
+            scales_3 = std::vector<float>(mNumExperts);
+
+            for (int i = 0; i < mNumExperts; i++)
+            {
+                scales_3[i] = 1.f / (scaleW2 * scales_2[i]);
+            }
+        }
+
+        if (!mUsePerExpertActScale)
+        {
+            scales_2.resize(1);
         }
 
         check_cuda_error(cudaMemcpyAsync(mExpertFPXScale1, scales_1.data(), scales_1.size() * sizeof(float),
@@ -879,6 +905,10 @@ protected:
             ep_scale_1 = mExpertFPXScale1 + experts_per_node * parallelism_config.ep_rank;
             ep_scale_3 = mExpertFPXScale3 + experts_per_node * parallelism_config.ep_rank;
         }
+        if (mUsePerExpertActScale)
+        {
+            ep_scale_2 = mExpertFPXScale2 + experts_per_node * parallelism_config.ep_rank;
+        }
 
         // Slice weights for TP
         void* scale_1 = ep_scale_1;
@@ -1025,18 +1055,22 @@ protected:
         else if (FP8)
         {
             ASSERT_TRUE(scale1_ptr && scale2_ptr && scale3_ptr);
-            quant_params = QuantParams::FP8(static_cast<float const*>(scale1_ptr),
-                static_cast<float const*>(scale2_ptr), static_cast<float const*>(scale3_ptr));
+            quant_params
+                = QuantParams::FP8(static_cast<float const*>(scale1_ptr), static_cast<float const*>(scale2_ptr),
+                    static_cast<float const*>(scale3_ptr), nullptr, nullptr, mUsePerExpertActScale);
         }
         else if (ANY_FP4)
         {
             ASSERT_TRUE(mExpertFP4ActGlobalScale1);
             ASSERT_TRUE(mFP4ScalingFactorsW1 && mFP4ScalingFactorsW2);
             ASSERT_TRUE(scale1_ptr && scale2_ptr && scale3_ptr);
+            auto fc1_sf_offset = mUsePerExpertActScale && NVFP4
+                ? mNumExperts / parallelism_config.ep_size * parallelism_config.ep_rank
+                : 0;
             auto constructor = NVFP4 ? &QuantParams::FP4 : &QuantParams::FP8MXFP4;
-            quant_params
-                = constructor(mExpertFP4ActGlobalScale1, mFP4ScalingFactorsW1, static_cast<float const*>(scale1_ptr),
-                    static_cast<float const*>(scale2_ptr), mFP4ScalingFactorsW2, static_cast<float const*>(scale3_ptr));
+            quant_params = constructor(mExpertFP4ActGlobalScale1 + fc1_sf_offset, mFP4ScalingFactorsW1,
+                static_cast<float const*>(scale1_ptr), static_cast<float const*>(scale2_ptr), mFP4ScalingFactorsW2,
+                static_cast<float const*>(scale3_ptr), mUsePerExpertActScale && NVFP4, mUsePerExpertActScale);
         }
 
         if constexpr (WEIGHT_FP4)
@@ -1450,6 +1484,19 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteNoBias)
 {
     this->mUseBias = false;
     this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, PermuteSingletonScale)
+{
+    if (!this->ANY_FPX)
+    {
+        GTEST_SKIP() << "Only FPX cares about per-expert act scale";
+        return;
+    }
+    this->mUsePerExpertActScale = false;
+    this->BasicPermuteTest(1);
     this->BasicPermuteTest(2);
     this->BasicPermuteTest(3);
 }
