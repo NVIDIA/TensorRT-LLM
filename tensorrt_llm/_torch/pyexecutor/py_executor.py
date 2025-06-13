@@ -895,7 +895,8 @@ class PyExecutor:
 
                 finished_requests = []
 
-                if scheduled_batch.batch_size > 0:
+                if scheduled_batch.batch_size > 0 or (
+                        self.enable_attention_dp and self.dist.tp_size > 1):
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
