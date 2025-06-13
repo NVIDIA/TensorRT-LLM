@@ -251,7 +251,7 @@ class TestNemotronUltra(CliFlowAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("cuda_graph", [False, True])
     @pytest.mark.parametrize("tp_size,pp_size", [(8, 1)], ids=["tp8"])
     def test_auto_dtype(self, cuda_graph, tp_size, pp_size):
