@@ -77,6 +77,15 @@ def get_model_yaml_config(model_label: str) -> dict:
                 'cuda_graph_batch_sizes':
                 [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]
             },
+        },
+        'deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:2048-maxnt:8192-input_output_len:256,256-num_reqs:200-gpus:1':
+        {
+            'pytorch_backend_config': {
+                'print_iter_log': True,
+                'use_cuda_graph': True,
+                'cuda_graph_padding_enabled': True,
+                'cuda_graph_batch_sizes': [1, 512, 1024, 2048]
+            }
         }
     }
     # get model name from model_label
