@@ -362,6 +362,14 @@ void initBindings(pybind11::module_& m)
             py::arg("mpi_world_rank") = 0)
         .def("create_result", &tb::LlmRequest::createResult, py::arg("use_fast_logits") = false,
             py::arg("mpi_world_rank") = 0)
+        .def("create_serialized_result",
+            [](tb::LlmRequest& self, bool use_fast_logits = false, int mpi_world_rank = 0)
+            {
+                std::vector<char> serialized_result;
+                bool is_final = False;
+                self.createSerializedResult(serialized_result, is_final, use_fast_logits, mpi_world_rank);
+                return py::str(serialized_result.data(), serialized_result.size()), is_final;
+            })
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"));

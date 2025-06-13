@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 
 namespace tensorrt_llm::batch_manager
@@ -48,6 +49,21 @@ std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits,
         return executor::Response(requestId, result.value(), mClientId);
     }
     return std::nullopt;
+}
+
+void LlmRequest::createSerializedResult(
+    std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits = false, int32_t mpiWorldRank = 0)
+{
+    auto result = createResult(useFastLogits, mpiWorldRank);
+    if (result.has_value())
+    {
+        std::ostringstream oStream;
+        executor::serialize_utils::serialize(result.value(), oStream);
+        auto str = oStream.str();
+        serializedResult.resize(str.size());
+        std::copy(serializedResult.begin(), str.begin(), str.end());
+        isFinal = result.isFinal;
+    }
 }
 
 /// Note that there is some dependency on the order of operations in this method. Modify with care!
@@ -204,6 +220,15 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
     // Update position of last sent response
     setMaxSentTokenLen(maxNbTokens);
     return result;
+}
+
+bool LlmRequest::createSerializedResult(std::string& serializedResult, bool useFastLogits, int32_t mpiWorldRank)
+{
+    auto result = createResult(useFastLogits, mpiWorldRank);
+    if (result.has_value())
+    {
+        executor::serialize
+    }
 }
 
 void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
