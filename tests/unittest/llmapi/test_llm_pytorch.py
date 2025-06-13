@@ -304,3 +304,53 @@ def test_codellama_fp8_with_bf16_lora() -> None:
                                lora_request=lora_requests)
 
         assert len(outputs) == 2
+
+
+@skip_gpu_memory_less_than_80gb
+def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
+    from tensorrt_llm._torch.llm import LLM
+
+    model_dir = f"{llm_models_root()}/Bielik-11B-v2.2-Instruct"
+
+    target_modules = ['attn_q', 'attn_k', 'attn_v']
+
+    # Set up temporary directory for LoRA adapters
+    with tempfile.TemporaryDirectory() as lora_dir:
+        print("Creating dummy LoRAs...")
+
+        model = AutoModelForCausalLM.from_pretrained(model_dir,
+                                                     torch_dtype=torch.bfloat16,
+                                                     device_map="auto")
+        hf_modules = ["q_proj", "k_proj", "v_proj"]
+        peft_lora_config = PeftLoraConfig(r=8,
+                                          target_modules=hf_modules,
+                                          bias="none",
+                                          task_type="CAUSAL_LM")
+        lora_paths = []
+        for i in range(2):
+            lora_model = get_peft_model(model, peft_lora_config)
+            for param in lora_model.parameters():
+                param.data.zero_()
+            lora_path = f"{lora_dir}/lora_{i}"
+            lora_model.save_pretrained(lora_path)
+            lora_paths.append(lora_path)
+
+        trtllm_lora_config = LoraConfig(lora_dir=lora_paths,
+                                        lora_target_modules=target_modules,
+                                        max_lora_rank=8)
+        llm = LLM(model_dir, lora_config=trtllm_lora_config)
+
+        prompts = [
+            "Kim był Mikołaj Kopernik i z czego zasłynął?",
+            "Gdzie znajduje się stolica Polski?",
+        ]
+        lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
+        lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
+        lora_requests = [lora_req1, lora_req2]
+        sampling_params = SamplingParams(max_tokens=200)
+
+        outputs = llm.generate(prompts,
+                               sampling_params,
+                               lora_request=lora_requests)
+
+        assert len(outputs) == 2
