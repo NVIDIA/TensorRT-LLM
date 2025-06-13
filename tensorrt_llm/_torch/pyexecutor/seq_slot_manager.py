@@ -1,5 +1,3 @@
-import itertools
-
 from .llm_request import LlmRequest
 from .resource_manager import BaseResourceManager, SlotManager
 from .scheduler import ScheduledRequests
@@ -17,10 +15,8 @@ class SeqSlotManager(BaseResourceManager):
         return 1
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
-        for llm_req in itertools.chain(scheduled_batch.context_requests,
-                                       scheduled_batch.generation_requests):
-            if (llm_req.is_context_init_state and llm_req.seq_slot is None) or \
-                llm_req.is_disagg_generation_transmission_complete:
+        for llm_req in scheduled_batch.all_requests():
+            if llm_req.seq_slot is None or llm_req.is_disagg_generation_transmission_complete:
                 llm_req.seq_slot = self.slot_manager.add_slot(
                     llm_req.request_id)
 
