@@ -645,8 +645,7 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
             expert_logits, routing_bias, hidden_states, hidden_states_scale,
             gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales,
             num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
-            num_experts, routed_scaling, tile_tokens_dim,
-            routing_method_type)
+            num_experts, routed_scaling, tile_tokens_dim, routing_method_type)
 
     output_dequant_actual = output.to(torch.float)
     #
