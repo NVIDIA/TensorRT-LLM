@@ -446,7 +446,7 @@ accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype
 full:B200/examples/test_gemma.py::test_llm_gemma_1gpu_summary_vswa[gemma-3-1b-it-other-bfloat16-8] SKIP (https://nvbugs/5292737)
 full:B200/accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype SKIP (https://nvbugs/5295470)
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4 SKIP (https://nvbugs/5340905)
-accuracy/test_llm_api_pytorch.py::TestNemotronNano::test_auto_dtype SKIP (https://nvbugs/5340905)
+accuracy/test_llm_api_pytorch.py::TestLlama3_1NemotronNano8Bv1::test_auto_dtype SKIP (https://nvbugs/5340905)
 accuracy/test_cli_flow.py::TestNemotronUltra::test_auto_dtype[tp8-cuda_graph=True] SKIP (https://nvbugs/5340905)
 disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5340905)
 disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5340905)
