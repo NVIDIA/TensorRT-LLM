@@ -44,6 +44,7 @@ pyzmq
 fastapi==0.115.4
 uvicorn
 setuptools<80
+setuptools-scm
 ordered-set
 peft
 einops
