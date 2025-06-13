@@ -947,30 +947,32 @@ std::vector<Response> Executor::Impl::awaitResponses(std::optional<std::chrono::
 {
     TLLM_CHECK_WITH_INFO(!mShutdownCalled, "Shutdown called");
     checkParallelApiUsage(__func__);
-    std::vector<Response> responses;
     std::unique_lock<std::mutex> lck(mResponsesMtx);
-    auto pred = [&mShutdown = mShutdown, &resp = this->mResponses]() -> bool { return !resp.empty() || mShutdown; };
-    auto storeResponses = [this, &resp = this->mResponses, &responses]()
+    auto pred = [this]() -> bool { return !mResponses.empty() || mShutdown; };
+    auto storeResponses = [this]()
     {
-        for (auto it = resp.cbegin(); it != resp.cend();)
+        std::vector<Response> responses;
+        for (auto it = mResponses.begin(); it != mResponses.end();)
         {
             responses.insert(responses.end(), it->second.begin(), it->second.end());
             addTerminatedReqId(it->second, it->first);
-            resp.erase(it++);
+            it = mResponses.erase(it);
         }
+        return responses;
     };
 
+    std::vector<Response> responses;
     if (timeout)
     {
         if (mResponsesCv.wait_for(lck, timeout.value(), pred))
         {
-            storeResponses();
+            responses = storeResponses();
         }
     }
     else
     {
         mResponsesCv.wait(lck, pred);
-        storeResponses();
+        responses = storeResponses();
     }
     return responses;
 }
@@ -980,15 +982,16 @@ std::vector<Response> Executor::Impl::awaitResponses(
 {
     TLLM_CHECK_WITH_INFO(!mShutdownCalled, "Shutdown called");
     checkParallelApiUsage(__func__);
-    std::vector<Response> responses;
     std::unique_lock<std::mutex> lck(mResponsesMtx);
-    auto pred = [&mShutdown = mShutdown, &resp = this->mResponses, reqId]() -> bool
-    { return (resp.find(reqId) != resp.end() && !resp.at(reqId).empty()) || mShutdown; };
-    auto storeIdResponse = [this, &resp = this->mResponses, &responses, reqId]()
+    auto pred = [this, reqId]() -> bool
+    { return (mResponses.find(reqId) != mResponses.end() && !mResponses.at(reqId).empty()) || mShutdown; };
+    auto storeIdResponse = [this, reqId]()
     {
-        responses.swap(resp.at(reqId));
-        resp.erase(reqId);
+        std::vector<Response> responses;
+        responses.swap(mResponses.at(reqId));
+        mResponses.erase(reqId);
         addTerminatedReqId(responses, reqId);
+        return responses;
     };
 
     // We don't process a terminated request again. Terminated request is defined as a response
@@ -1005,17 +1008,18 @@ std::vector<Response> Executor::Impl::awaitResponses(
         return {Response(reqId, err)};
     }
 
+    std::vector<Response> responses;
     if (timeout)
     {
         if (mResponsesCv.wait_for(lck, timeout.value(), pred))
         {
-            storeIdResponse();
+            responses = storeIdResponse();
         }
     }
     else
     {
         mResponsesCv.wait(lck, pred);
-        storeIdResponse();
+        responses = storeIdResponse();
     }
     return responses;
 }
@@ -1025,26 +1029,27 @@ std::vector<std::vector<Response>> Executor::Impl::awaitResponses(
 {
     TLLM_CHECK_WITH_INFO(!mShutdownCalled, "Shutdown called");
     checkParallelApiUsage(__func__);
-    std::vector<std::vector<Response>> v(requestIds.size());
+    std::vector<std::vector<Response>> responses;
+    responses.reserve(requestIds.size());
     if (timeout)
     {
         auto const start_time = std::chrono::high_resolution_clock::now();
-        for (unsigned i = 0; i < v.size(); ++i)
+        for (auto const requestId : requestIds)
         {
             auto const elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::high_resolution_clock::now() - start_time);
-            v[i] = awaitResponses(requestIds[i],
-                timeout.value() > elapsed_ms ? timeout.value() - elapsed_ms : std::chrono::milliseconds{0});
+            responses.emplace_back(awaitResponses(
+                requestId, timeout.value() > elapsed_ms ? timeout.value() - elapsed_ms : std::chrono::milliseconds{0}));
         }
     }
     else
     {
-        for (unsigned i = 0; i < v.size(); ++i)
+        for (auto const requestId : requestIds)
         {
-            v[i] = awaitResponses(requestIds[i]);
+            responses.emplace_back(awaitResponses(requestId));
         }
     }
-    return v;
+    return responses;
 }
 
 SizeType32 Executor::Impl::getNumResponsesReady(std::optional<IdType> const& optId) const
@@ -1663,7 +1668,7 @@ void Executor::Impl::terminateActiveRequests(RequestList& activeRequests, std::s
         }
 
         // Remove from the requestList
-        activeRequests.erase(it++);
+        it = activeRequests.erase(it);
     }
 }
 

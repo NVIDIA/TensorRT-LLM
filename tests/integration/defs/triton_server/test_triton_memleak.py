@@ -70,6 +70,7 @@ def test_llama_v3_8b_rss_increasement(
     inflight_batcher_llm_client_root,
     tensorrt_llm_llama_example_root,
     llama_v3_8b_model_root,
+    tensorrt_llm_example_root,
     llm_backend_venv,
 ):
     if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
@@ -83,7 +84,8 @@ def test_llama_v3_8b_rss_increasement(
 
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build engine
-    ENGINE_PATH = prepare_llama_v3_8b_engine(tensorrt_llm_llama_example_root,
+    ENGINE_PATH = prepare_llama_v3_8b_engine(tensorrt_llm_example_root,
+                                             tensorrt_llm_llama_example_root,
                                              llama_v3_8b_model_root,
                                              workers=1)
 
