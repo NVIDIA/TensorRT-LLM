@@ -191,9 +191,9 @@ class CompletionRequest(OpenAIBaseModel):
 
     # doc: begin-completion-extra-params
     add_special_tokens: bool = Field(
-        default=True,
+        default=False,
         description=(
-            "If true (the default), special tokens (e.g. BOS) will be added to "
+            "If true (default is false), special tokens (e.g. BOS) will be added to "
             "the prompt."),
     )
     response_format: Optional[ResponseFormat] = Field(
