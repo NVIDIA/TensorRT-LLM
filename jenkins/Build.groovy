@@ -685,20 +685,33 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
     parallelJobs.failFast = enableFailFast
 
     if (cpu_arch == X86_64_TRIPLE && !reuseArtifactPath) {
-        def key = "Build with build type Debug"
-        parallelJobs += [
-        (key): {
-            script {
-                trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build", k8s_cpu), "trt-llm", {
-                    stage(key) {
-                        stage("[${key}] Run") {
-                            echoNodeAndGpuInfo(pipeline, key)
-                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --benchmarks --micro_benchmarks")
-                        }
+        def debugBuilds = [
+            [
+                key: "Build with build type Debug",
+                extra_args: ""
+            ],
+            [
+                key: "Build with build type Debug and closed source internal_cutlass_kernels",
+                extra_args: "-D 'USING_OSS_CUTLASS_MOE_GEMM=OFF;USING_OSS_CUTLASS_LOW_LATENCY_GEMM=OFF'"
+            ]
+        ]
+
+        debugBuilds.each { build ->
+            parallelJobs += [
+                (build.key): {
+                    script {
+                        trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build", k8s_cpu), "trt-llm", {
+                            stage(build.key) {
+                                stage("[${build.key}] Run") {
+                                    echoNodeAndGpuInfo(pipeline, build.key)
+                                    buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --benchmarks --micro_benchmarks ${build.extra_args}")
+                                }
+                            }
+                        })
                     }
-                })
-            }
-        }]
+                }
+            ]
+        }
     }
 
     stage("Build") {
