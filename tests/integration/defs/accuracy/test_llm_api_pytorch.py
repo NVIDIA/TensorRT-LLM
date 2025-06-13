@@ -30,6 +30,24 @@ from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             LlmapiAccuracyTestHarness)
 
 
+class TestKanana_Instruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "kanana-1.5-2.1b-instruct-2505"
+    MODEL_PATH = f"{llm_models_root()}/kanana-1.5-2.1b-instruct-2505"
+
+    @pytest.mark.skip_not_contain(["H20", "H100"])
+    def test_auto_dtype(self):
+        "RCCA: https://nvbugspro.nvidia.com/bug/5310520"
+        pytorch_config = dict(duse_cuda_graph=True,
+                              cuda_graph_padding_enabled=True,
+                              cuda_graph_max_batch_size=384)
+        with LLM(self.MODEL_PATH, **pytorch_config,
+                 enable_attention_dp=True) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
@@ -333,6 +351,17 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
     def test_fp8_rowwise(self):
         quant_config = QuantConfig(QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.2-3B"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-3B"
+    EXAMPLE_FOLDER = "models/core/llama"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -1218,6 +1247,19 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    def test_fp8_tp8(self):
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+        with LLM(f"{llm_models_root()}/Nemotron-H-8B-Reasoning-128K-FP8",
+                 kv_cache_config=kv_cache_config,
+                 tensor_parallel_size=8) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
