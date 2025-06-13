@@ -13,8 +13,7 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 }
 
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
-// UPLOAD_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_MergeRequest_PR/5934"
-UPLOAD_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/2080"
+
 LLM_ROOT = "llm"
 
 LLM_BRANCH = env.gitlabBranch ?: params.branch
@@ -32,9 +31,6 @@ RUN_SANITY_CHECK = env.runSanityCheck ?: false
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
-
-UPLOAD_PATH = env.uploadPath ?: "sw-tensorrt-artifacts"
-ARTIFACT_PATH = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/2080"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 
@@ -226,12 +222,9 @@ def buildImage(config, imageKeyToTag)
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
     def makefileStage = config.makefileStage
 
-    def tmpTag = "ad99a08-main-225" // TODO: remove this
-    // def tmpTag = LLM_DEFAULT_TAG
+    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
 
-    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${tmpTag}"
-
-    def dependentTag = tag.replace("${arch}-${target}-", "${arch}-devel-")
+    def dependentTag = tag.replace("${arch}-${target}-", "${arch}-${dependent.target}-")
 
     def imageWithTag = "${IMAGE_NAME}/${makefileStage}:${tag}"
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.makefileStage}:${dependentTag}"
@@ -247,7 +240,6 @@ def buildImage(config, imageKeyToTag)
         imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
         imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
     }
-    return // TODO: remove this
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
 
@@ -553,9 +545,10 @@ pipeline {
                 script {
                     collectResultPodSpec = createKubernetesPodConfig("agent")
                     trtllm_utils.launchKubernetesPod(this, collectResultPodSpec, "alpine", {
-                        // 安装wget工具
+                        // Install wget
                         trtllm_utils.llmExecStepWithRetry(this, script: "apk add --no-cache wget")
-                        // 轮询检查构建产物文件是否存在
+
+                        // Poll for build artifacts
                         def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
                         def requiredFiles = [
                             "TensorRT-LLM-GH200.tar.gz",
@@ -566,9 +559,8 @@ pipeline {
                         def maxWaitMinutes = 180
                         def pollIntervalSeconds = 60
 
-                        echo "开始等待构建产物文件..."
-                        echo "需要等待的文件: ${requiredFiles}"
-                        echo "检查路径: ${artifactBaseUrl}"
+                        echo "Waiting for build artifacts..."
+                        echo "Required files: ${requiredFiles}"
 
                         def startTime = System.currentTimeMillis()
                         def maxWaitMs = maxWaitMinutes * 60 * 1000
@@ -577,41 +569,36 @@ pipeline {
                             def missingFiles = []
 
                             try {
-                                // 只下载一次目录索引
                                 trtllm_utils.llmExecStepWithRetry(this, script: "wget ${artifactBaseUrl} -O index.html", allowStepFailed: true)
                                 def indexContent = sh(script: "cat index.html 2>/dev/null || echo ''", returnStdout: true).trim()
 
-                                // 检查所有需要的文件
                                 for (file in requiredFiles) {
                                     if (!indexContent.contains(file)) {
                                         missingFiles.add(file)
                                     }
                                 }
 
-                                // 删除index文件
                                 sh(script: "rm -f index.html", returnStdout: false)
 
                             } catch (Exception e) {
-                                echo "检查构建产物时出错: ${e.message}"
-                                // 如果出错，假设所有文件都缺失
+                                echo "Error checking artifacts: ${e.message}"
                                 missingFiles = requiredFiles.clone()
-                                // 确保删除可能存在的index文件
                                 sh(script: "rm -f index.html", returnStdout: false)
                             }
 
                             if (missingFiles.isEmpty()) {
-                                echo "所有构建产物文件都已就绪!"
+                                echo "All build artifacts are ready!"
                                 return
                             }
 
                             def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                            echo "等待中... (已等待 ${elapsedMinutes.intValue()} 分钟)"
-                            echo "缺失的文件: ${missingFiles}"
+                            echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
+                            echo "Missing files: ${missingFiles}"
                             sleep(pollIntervalSeconds)
                         }
 
                         def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                        error "等待构建产物超时 (${elapsedMinutes.intValue()} 分钟)，部分文件仍未就绪"
+                        error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
                     })
                 }
             }
@@ -654,85 +641,3 @@ pipeline {
         }
     } // stages
 } // pipeline
-
-
-// {
-//     dockerImage=urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/devel:x86_64-ngc-devel-torch_skip-a1db409-github-pr-4939-169,
-//     uploadPath=sw-tensorrt-generic/llm-artifacts/LLM/PipelineMonitor/L0_MergeRequest_PR/109,
-//     gitlabCommit=8166649d033109319d7d08cf9541d8996848018f,
-//     artifactPath=sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge/2052,
-//     gitlabSourceRepoHttpUrl=https://gitlab-master.nvidia.com/ftp/GitHubSync/TensorRT-LLM.git,
-//     branch=github-pr-4656,
-//     enableFailFast=false,
-//     globalVars={
-//         "github_pr_api_url":"https://api.github.com/repos/NVIDIA/TensorRT-LLM/pulls/4656",
-//         "cached_changed_file_list":null,
-//         "action_info":{
-//             "trigger_info":"Triggered by <a href=\"https://github.com/NVIDIA/TensorRT-LLM/pull/4656#issuecomment-2957879424\" target=\"_blank\">GitHub Pull Request #4656<\/a>, Comment User: <a href=\"https://github.com/ZhanruiSunCh\" target=\"_blank\">ZhanruiSunCh<\/a><br/>Git Commit: c232874b151882b47a5017cc5344685cb2c668e6<br/><br/>",
-//             "parents":[
-//                 {
-//                     "name":"LLM/helpers/PR_Github",
-//                     "url":"https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/helpers/job/PR_Github/8225/",
-//                     "build_number":"8225"
-//                 },
-//                 {
-//                     "name":"LLM/PipelineMonitor/L0_MergeRequest_PR",
-//                     "url":"https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/PipelineMonitor/job/L0_MergeRequest_PR/109/",
-//                     "build_number":"109"
-//                 },
-//                 {
-//                     "name":"LLM/helpers/BuildDockerImages",
-//                     "url":"https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/helpers/job/BuildDockerImages/198/",
-//                     "build_number":"198"
-//                 }
-//             ]
-//         },
-//         "image_key_to_tag":{
-//             "NGC Devel Image amd64":"urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/devel:x86_64-ngc-devel-torch_skip-a1db409-github-pr-4939-169",
-//             "NGC Release Image amd64":"urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:x86_64-ngc-release-torch_skip-a1db409-github-pr-4939-169",
-//             "NGC Devel Image arm64":"urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/devel:sbsa-ngc-devel-torch_skip-a1db409-github-pr-4939-169",
-//             "NGC Release Image arm64":"urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:sbsa-ngc-release-torch_skip-a1db409-github-pr-4939-169"
-//         }
-//     },
-//     targetArch=aarch64-linux-gnu
-// }
-// [
-//     gitlabSourceRepoHttpUrl: 'https://gitlab-master.nvidia.com/ftp/tekit.git',
-//     gitlabCommit: 'b6261862419c33d6ce2313aff1e7116067d6037d',
-//     artifactPath: 'sw-tensorrt-generic/llm-artifacts/LLM/release-0.20/L0_PostMerge/35',
-//     uploadPath: 'sw-tensorrt-generic/llm-artifacts/LLM/release-0.20/L0_PostMerge/35',
-//     enableFailFast: false,
-//     testFilter: [
-//         "reuse_stage_list": null,
-//         "skip_test": false,
-//         "stage_list": null,
-//         "gpu_type": null,
-//         "test_backend": null,
-//         "post_merge": true,
-//         "add_multi_gpu_test": false,
-//         "only_multi_gpu_test": false,
-//         "disable_multi_gpu_test": false,
-//         "extra_stage": null,
-//         "multi_gpu_file_changed": true,
-//         "only_pytorch_file_changed": false,
-//         "debug": false,
-//         "auto_trigger_tag_list": []
-//     ],
-//     dockerImage: 'urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505292346-4931',
-//     wheelDockerImagePy310: 'urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310-trt10.10.0.31-skip-tritondevel-202505292346-4931',
-//     wheelDockerImagePy312: 'urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312-trt10.10.0.31-skip-tritondevel-202505292346-4931',
-//     globalVars: [
-//         "github_pr_api_url": null,
-//         "cached_changed_file_list": null,
-//         "action_info": [
-//             "trigger_info": "Started by GitLab push by Yanchao Lu<br/>Git Commit: b6261862419c33d6ce2313aff1e7116067d6037d<br/><br/>",
-//             "parents": [
-//                 [
-//                     "name": "LLM/release-0.20/L0_PostMerge",
-//                     "url": "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/release-0.20/job/L0_PostMerge/35/",
-//                     "build_number": "35"
-//                 ]
-//             ]
-//         ]
-//     ]
-// ]
