@@ -25,7 +25,6 @@
 #include "tensorrt_llm/kernels/communicationKernels/mnnvlTwoShotAllreduceKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
