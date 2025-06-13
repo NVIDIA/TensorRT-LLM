@@ -222,15 +222,6 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
     return result;
 }
 
-bool LlmRequest::createSerializedResult(std::string& serializedResult, bool useFastLogits, int32_t mpiWorldRank)
-{
-    auto result = createResult(useFastLogits, mpiWorldRank);
-    if (result.has_value())
-    {
-        executor::serialize
-    }
-}
-
 void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
     SizeType32 vocabSizePadded, std::optional<SizeType32> maxEncoderInputLen, bool enableKVCacheReuse)
 {
