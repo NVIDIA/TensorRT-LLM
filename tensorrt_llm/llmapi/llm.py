@@ -184,10 +184,10 @@ class LLM:
 
             self._build_model()
 
-        except Exception as e:
+        except Exception:
             if self.mpi_session is not None:
                 self.mpi_session.shutdown()
-            raise e
+            raise
 
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
