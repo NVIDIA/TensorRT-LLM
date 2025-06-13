@@ -206,7 +206,7 @@ class LlmResult:
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs'))
 
     def __init__(self,
-                 result: str,
+                 result: bytes,
                  py_result: PyResult,
                  is_final: bool = False):
         self._result = result

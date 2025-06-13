@@ -369,8 +369,7 @@ void initBindings(pybind11::module_& m)
                 std::vector<char> serialized_result;
                 bool is_final = false;
                 self.createSerializedResult(serialized_result, is_final, use_fast_logits, mpi_world_rank);
-                std::string str(serialized_result.begin(), serialized_result.end());
-                return std::make_tuple(str, is_final);
+                return std::make_tuple(py::bytes(serialized_result.data(), serialized_result.size()), , is_final);
             })
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
