@@ -1816,7 +1816,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         // Extra PyTorch CUDA 12.8 install
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 12.8 install Start ######"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
                         }
 
                         def libEnv = []
