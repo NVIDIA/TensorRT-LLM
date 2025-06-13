@@ -149,14 +149,14 @@ def run_disaggregated_test(example_dir,
                       stdout=output_workers,
                       stderr=subprocess.STDOUT,
                       env=env,
-                      cwd=cwd),
+                      cwd=cwd) as workers_proc,
                 # Start server
                 open('output_disagg.log', 'w') as output_disagg,
                 popen(server_cmd,
                       stdout=output_disagg,
                       stderr=subprocess.STDOUT,
                       env=env,
-                      cwd=cwd)):
+                      cwd=cwd) as server_proc):
             client_dir = f"{example_dir}/clients"
             for _ in range(num_iters):
                 client_cmd = [
@@ -222,6 +222,11 @@ def run_disaggregated_test(example_dir,
         with open('output_disagg.log', 'r') as f:
             logger.error(f.read())
         raise
+    finally:
+        server_proc.terminate()
+        workers_proc.terminate()
+        server_proc.wait()
+        workers_proc.wait()
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
