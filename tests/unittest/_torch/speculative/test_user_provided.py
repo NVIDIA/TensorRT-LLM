@@ -7,7 +7,8 @@ import torch
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm.llmapi import KvCacheConfig, NGramDecodingConfig
+from tensorrt_llm._torch.speculative.ngram import NGramConfig, NGramPoolManager
+from tensorrt_llm.llmapi import KvCacheConfig, UserProvidedDecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
@@ -16,10 +17,9 @@ from utils.llm_data import llm_models_root
 # TODO: Add cuda graph enabled tests.
 # Cuda graph cannot currently be enabled for ngram because cuda graph requires
 # spec metadata and ngram does not have it.
-# @pytest.mark.skip(reason="https://nvbugs/5324239")
 @pytest.mark.parametrize("use_cuda_graph,attn_backend",
                          [[False, "TRTLLM"], [False, "FLASHINFER"]])
-def test_llama_ngram(use_cuda_graph: bool, attn_backend: str):
+def test_llama_user_provided(use_cuda_graph: bool, attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 31:
         pytest.skip("Not enough memory to load target model")
@@ -45,18 +45,28 @@ def test_llama_ngram(use_cuda_graph: bool, attn_backend: str):
     target_model_dir = f"{models_path}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
     draft_len = 4
-    spec_config = NGramDecodingConfig(
+
+    ngram_config = NGramConfig(
         prompt_lookup_num_tokens=draft_len,
         max_matching_ngram_size=draft_len,
         is_keep_all=True,
         is_use_oldest=True,
         is_public_pool=True,
     )
+
+    spec_config = UserProvidedDecodingConfig(max_draft_len=draft_len)
+
+    extra_resource_managers = {
+        "spec_resource_manager":
+        NGramPoolManager(config=ngram_config, max_num_requests=max_batch_size)
+    }
+
     llm_spec = LLM(model=target_model_dir,
                    max_batch_size=max_batch_size,
                    **pytorch_config,
                    kv_cache_config=kv_cache_config,
-                   speculative_config=spec_config)
+                   speculative_config=spec_config,
+                   extra_resource_managers=extra_resource_managers)
 
     prompts = [
         "The capital of France is", "The president of the United States is"

@@ -11,6 +11,7 @@ import tensorrt_llm
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
+from tensorrt_llm.llmapi.llm_args import UserProvidedDecodingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -191,13 +192,13 @@ def create_py_executor(executor_config: ExecutorConfig,
     has_draft_model_engine = False
     if spec_config is not None:
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
-    has_ngram_drafter = isinstance(spec_config, NGramConfig)
+    has_speculative_draft_tokens = has_draft_model_engine or isinstance(
+        spec_config, (NGramConfig, UserProvidedDecodingConfig))
 
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=executor_config.enable_chunked_context,
         cache_reuse=executor_config.kv_cache_config.enable_block_reuse,
-        has_speculative_draft_tokens=has_draft_model_engine
-        or has_ngram_drafter,
+        has_speculative_draft_tokens=has_speculative_draft_tokens,
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
@@ -322,8 +323,13 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     # resource managers for speculative decoding
     if spec_config is not None:
-        spec_resource_manager = get_spec_resource_manager(
-            spec_config, model_engine.model.config, model_engine.batch_size * 2)
+        if isinstance(spec_config, UserProvidedDecodingConfig):
+            spec_resource_manager = pytorch_backend_config.extra_resource_managers.pop(
+                "spec_resource_manager")
+        else:
+            spec_resource_manager = get_spec_resource_manager(
+                spec_config, model_engine.model.config,
+                model_engine.batch_size * 2)
         if spec_resource_manager is not None:
             resources["spec_resource_manager"] = spec_resource_manager
 

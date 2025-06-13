@@ -4,7 +4,7 @@ from typing import List
 from ordered_set import OrderedSet
 
 from ..pyexecutor.llm_request import LlmRequest
-from ..pyexecutor.resource_manager import BaseResourceManager
+from ..pyexecutor.resource_manager import BaseDraftTokenManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpeculativeDecodingMode
 
@@ -36,7 +36,7 @@ class NGramConfig(SpecConfig):
         pass
 
 
-class NGramPoolManager(BaseResourceManager):
+class NGramPoolManager(BaseDraftTokenManager):
     """
     This class maintains the pattern-matches pairs for NGram drafter.
 
@@ -97,7 +97,7 @@ class NGramPoolManager(BaseResourceManager):
             assert num_rejected_tokens >= 0
 
             # Generate draft tokens
-            draft_tokens = self._get_draft_tokens(
+            draft_tokens = self.get_draft_tokens(
                 request.get_tokens()[0],
                 request.request_id,
                 request.py_end_id,
@@ -108,6 +108,10 @@ class NGramPoolManager(BaseResourceManager):
             if draft_tokens is not None:
                 pad_length = self.max_num_draft_tokens - len(draft_tokens)
                 draft_tokens.extend([request.py_end_id] * pad_length)
+            else:
+                draft_tokens = [request.py_end_id] * self.max_num_draft_tokens
+                # draft_tokens = []
+
             request.py_draft_tokens = draft_tokens
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
@@ -150,7 +154,7 @@ class NGramPoolManager(BaseResourceManager):
                 output += str(match) + ", "
             logger.debug(output)
 
-    def _get_draft_tokens(
+    def get_draft_tokens(
         self,
         prefix: list[int],
         request_id: int,

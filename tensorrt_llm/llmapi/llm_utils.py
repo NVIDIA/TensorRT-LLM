@@ -32,7 +32,8 @@ from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
 from .llm_args import (CalibConfig, EagleDecodingConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MTPDecodingConfig, NGramDecodingConfig, _ModelFormatKind,
+                       MTPDecodingConfig, NGramDecodingConfig,
+                       UserProvidedDecodingConfig, _ModelFormatKind,
                        _ModelWrapper, _ParallelConfig, get_model_format,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
@@ -871,6 +872,7 @@ __all__ = [
     'MedusaDecodingConfig',
     'MTPDecodingConfig',
     'NGramDecodingConfig',
+    'UserProvidedDecodingConfig',
     'ContextChunkingPolicy',
     'CapacitySchedulerPolicy',
     'BuildConfig',

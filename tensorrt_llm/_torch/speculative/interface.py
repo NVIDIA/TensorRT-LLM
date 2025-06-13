@@ -17,6 +17,7 @@ class SpeculativeDecodingMode(IntEnum):
     EAGLE3 = auto()
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
+    USER_PROVIDED = auto()
     NONE = auto()
 
     def is_mtp(self):
@@ -36,6 +37,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
+
+    def is_user_provided(self):
+        return self == SpeculativeDecodingMode.USER_PROVIDED
 
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
@@ -72,7 +76,8 @@ class SpeculativeDecodingMode(IntEnum):
         # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
         return (self.is_eagle3()
                 and not (issubclass(attention_backend, TrtllmAttention)
-                         and get_sm_version() == 100)) or self.is_ngram()
+                         and get_sm_version() == 100)
+                ) or self.is_ngram() or self.is_user_provided()
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
