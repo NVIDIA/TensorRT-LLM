@@ -117,6 +117,7 @@ full:B200_PCIe/examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-f
 full:B200_PCIe/accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp4_plugin SKIP (Disable for Blackwell OOM)
 full:B200_PCIe/examples/test_commandr.py::test_llm_commandr_v01_single_gpu_summary[disable_weight_only] SKIP (Disable for Blackwell OOM)
 full:B200_PCIe/unittest/llmapi/test_llm_models.py -m "not (part0 or part1)"  SKIP (Disable for Blackwell OOM)
+full:B200_PCIe/unittest/_torch/thop/test_w4a16_gemm.py::TestW4A16Gemm SKIP
 
 full:B200/examples/test_llama.py::test_llm_llama_v2_1gpu_auto_parallel[llama-v2-7b-hf] SKIP (Disable for Blackwell)
 full:B200/examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-enable_gemm_plugin] SKIP (Disable for Blackwell)
