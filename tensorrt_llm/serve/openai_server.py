@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import AsyncGenerator, AsyncIterator, List, Optional, Tuple
+from typing import Any, AsyncGenerator, AsyncIterator, List, Optional
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -316,76 +316,74 @@ class OpenAIServer:
 
     async def openai_completion(self, request: CompletionRequest, raw_request: Request) -> Response:
 
-        def merge_promises(
-            promises: List[RequestOutput],
-            postproc_params_collections: List[Optional[PostprocParams]]
-        ) -> AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]:
-            outputs = asyncio.Queue()
-            finished = [False] * len(promises)
+        async def completion_response(promise, postproc_params):
+            response = await promise
+            if not self.postproc_worker_enabled:
+                pp_result: CompletionResponse
+                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                pp_result = post_processor(response, args)
+            else:
+                pp_result = response.outputs[0]._postprocess_result
+            return pp_result
 
-            async def producer(i: int, promise: RequestOutput, postproc_params: Optional[PostprocParams]):
-                async for output in promise:
-                    await outputs.put((output, postproc_params))
-                finished[i] = True
-
-            _tasks = [
-                asyncio.create_task(producer(i, promise, postproc_params))
-                for i, (promise, postproc_params) in enumerate(zip(promises, postproc_params_collections))
-            ]
-
-            async def consumer():
-                while not all(finished) or not outputs.empty():
-                    item = await outputs.get()
-                    yield item
-                await asyncio.gather(*_tasks)
-
-            return consumer()
-
-        async def create_completion_generator(
-                generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]):
-            async for request_output, postproc_params in generator:
-                if not self.postproc_worker_enabled:
-                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                    pp_result = post_processor(request_output, args)
-                else:
-                    pp_result = request_output.outputs[0]._postprocess_result
-                for pp_res in pp_result:
-                    yield pp_res
-            yield "data: [DONE]\n\n"
-
-        async def create_completion_response(
-                generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]], disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> CompletionResponse:
+        def merge_completion_responses(responses: List[CompletionResponse], disaggregated_params: Optional[LlmDisaggregatedParams] = None):
             all_choices: List[CompletionResponseChoice] = []
             all_prompt_token_ids: List[List[int]] = []
             num_prompt_tokens = num_gen_tokens = 0
-            async for request_output, postproc_params in generator:
-                pp_result: CompletionResponse
-                if not self.postproc_worker_enabled:
-                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                    pp_result = post_processor(request_output, args)
-                else:
-                    pp_result = request_output.outputs[0]._postprocess_result
-
-                choices, usage = pp_result.choices, pp_result.usage
+            for rsp in responses:
+                choices, usage = rsp.choices, rsp.usage
                 all_choices.extend(choices)
                 num_prompt_tokens += usage.prompt_tokens
                 num_gen_tokens += usage.completion_tokens
                 #Include prompt token ids for context-only requests
                 if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
-                    all_prompt_token_ids.append(request_output.prompt_token_ids)
+                    all_prompt_token_ids.append(rsp.prompt_token_ids)
 
             usage_info = UsageInfo(
                 prompt_tokens=num_prompt_tokens,
                 completion_tokens=num_gen_tokens,
                 total_tokens=num_gen_tokens + num_prompt_tokens,
             )
-            response = CompletionResponse(
+            merged_rsp = CompletionResponse(
                 model=self.model,
                 choices=all_choices,
                 usage=usage_info,
                 prompt_token_ids=all_prompt_token_ids,
             )
-            return response
+            return merged_rsp
+
+        async def completion_generator(promise: RequestOutput, params: Optional[PostprocParams]):
+            async for output in promise:
+                if not self.postproc_worker_enabled:
+                    post_processor, args = params.post_processor, params.postproc_args
+                    pp_result = post_processor(output, args)
+                else:
+                    pp_result = output.outputs[0]._postprocess_result
+                for pp_res in pp_result:
+                    yield pp_res
+
+        async def merge_generators(generators: List[AsyncIterator[Any]]):
+            result_queue = asyncio.Queue()
+            finished = [False] * len(generators)
+
+            async def producer(generator: AsyncIterator[Any], idx: int):
+                async for output in generator:
+                    await result_queue.put(output)
+                finished[idx] = True
+
+            tasks = [
+                asyncio.create_task(producer(generator, idx)) for idx, generator in enumerate(generators)
+            ]
+
+            while not all(finished) or not result_queue.empty():
+                output = await result_queue.get()
+                yield output
+            await asyncio.gather(*tasks)
+
+        async def generator_wrapper(generator: AsyncIterator[Any]):
+            async for output in generator:
+                yield output
+            yield "data: [DONE]\n\n"
 
         try:
             check_multiple_response(request.n, self.llm.args.backend)
@@ -423,15 +421,16 @@ class OpenAIServer:
                 promises.append(promise)
                 postproc_params_collection.append(None if self.postproc_worker_enabled else postproc_params)
 
-            generator = merge_promises(promises, postproc_params_collection)
             if request.stream:
-                response_generator = create_completion_generator(
-                    generator)
-                return StreamingResponse(content=response_generator,
+                generators = [completion_generator(promise, params)
+                              for promise, params in zip(promises, postproc_params_collection)]
+                response_generator = merge_generators(generators) if len(promises) > 1 else generators[0]
+                return StreamingResponse(content=generator_wrapper(response_generator),
                                             media_type="text/event-stream")
             else:
-                response = await create_completion_response(
-                    generator, disaggregated_params)
+                rsps = await asyncio.gather(*[completion_response(promise, params)
+                                              for promise, params in zip(promises, postproc_params_collection)])
+                response = merge_completion_responses(rsps, disaggregated_params) if len(rsps) > 1 else rsps[0]
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server
