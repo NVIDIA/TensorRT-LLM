@@ -198,7 +198,7 @@ trtllm-bench --model $model_name throughput --dataset $dataset_file --backend py
 ```
 
 *v0.20 PLEASE READ*:
-The data collected for the v0.19 benchmarks was run with the following file:
+The data collected for the v0.20 benchmarks was run with the following file:
 
 `llm_options.yml`
 ```yaml
@@ -207,34 +207,7 @@ The data collected for the v0.19 benchmarks was run with the following file:
   cuda_graph_padding_enabled: true
 ```
 
-HOWEVER, this resulted in the unintended consequence of disabling cuda graphs, due to how the pytorch backend config options are handled. We would recommend users to run with the following options if they want to enable cuda graphs:
-
-`llm_options.yml`
-```yaml
- pytorch_backend_config:
-  enable_overlap_scheduler: true
-  use_cuda_graph: true
-  cuda_graph_padding_enabled: true
-  cuda_graph_batch_sizes:
-  - 1
-  - 2
-  - 4
-  - 8
-  - 16
-  - 32
-  - 64
-  - 128
-  - 256
-  - 384
-  - 512
-  - 1024
-  - 2048
-  - 4096
-  - 8192
-  print_iter_log: true
-```
-
-or, if they want to dsiable cuda graphs:
+However, this resulted in the unintended consequence of disabling cuda graphs, due to how the pytorch backend config options are handled. We would recommend users to run with the following file to explicitly turn off cuda graphs: 
 
 `llm_options.yml`
 ```yaml
