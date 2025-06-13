@@ -268,7 +268,7 @@ class MMLU(Evaluator):
                   default=False,
                   help="Whether to apply chat template.")
     @click.option("--system_prompt",
-                  type=Optional[str],
+                  type=str,
                   default=None,
                   help="System prompt.")
     @click.option("--max_input_length",

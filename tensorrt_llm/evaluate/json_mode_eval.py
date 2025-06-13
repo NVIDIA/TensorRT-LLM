@@ -29,14 +29,19 @@ from .interface import Evaluator
 class JsonModeEval(Evaluator):
 
     def __init__(self,
-                 dataset_path: str = "NousResearch/json-mode-eval",
+                 dataset_path: Optional[str] = None,
                  num_samples: Optional[int] = None,
                  random_seed: int = 0,
-                 apply_chat_template: bool = False,
+                 apply_chat_template: bool = True,
                  system_prompt: Optional[str] = None):
+        if not apply_chat_template:
+            raise ValueError(
+                f"{self.__class__.__name__} requires apply_chat_template=True.")
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt)
+        if dataset_path is None:
+            dataset_path = "NousResearch/json-mode-eval"
         self.data = datasets.load_dataset(dataset_path,
                                           split="train",
                                           trust_remote_code=True)
@@ -75,7 +80,7 @@ class JsonModeEval(Evaluator):
     @click.command("json_mode_eval")
     @click.option("--dataset_path",
                   type=str,
-                  default="NousResearch/json-mode-eval",
+                  default=None,
                   help="The path to JSON Mode Eval dataset. "
                   "If unspecified, the dataset is downloaded from HF hub.")
     @click.option(
@@ -88,12 +93,8 @@ class JsonModeEval(Evaluator):
                   type=int,
                   default=0,
                   help="Random seed for dataset processing.")
-    @click.option("--apply_chat_template",
-                  is_flag=True,
-                  default=False,
-                  help="Whether to apply chat template.")
     @click.option("--system_prompt",
-                  type=Optional[str],
+                  type=str,
                   default=None,
                   help="System prompt.")
     @click.option("--max_input_length",
@@ -106,8 +107,8 @@ class JsonModeEval(Evaluator):
                   help="Maximum generation length.")
     @click.pass_context
     @staticmethod
-    def command(ctx, dataset_path: str, num_samples: int, random_seed: int,
-                apply_chat_template: bool, system_prompt: Optional[str],
+    def command(ctx, dataset_path: Optional[str], num_samples: int,
+                random_seed: int, system_prompt: Optional[str],
                 max_input_length: int, max_output_length: int) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
@@ -116,7 +117,7 @@ class JsonModeEval(Evaluator):
         evaluator = JsonModeEval(dataset_path,
                                  num_samples=num_samples,
                                  random_seed=random_seed,
-                                 apply_chat_template=apply_chat_template,
+                                 apply_chat_template=True,
                                  system_prompt=system_prompt)
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
