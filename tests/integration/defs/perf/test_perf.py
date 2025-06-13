@@ -1160,6 +1160,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if self._config.backend == "pytorch":
             import yaml
             config = get_model_yaml_config(self._config.to_string())
+            print_info(f'pytorch config: {config}')
             with open('extra-llm-api-config.yml', 'w') as f:
                 yaml.dump(config, f, default_flow_style=False)
             benchmark_cmd += [
