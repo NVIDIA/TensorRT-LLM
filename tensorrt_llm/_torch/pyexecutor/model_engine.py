@@ -1170,11 +1170,13 @@ class PyTorchModelEngine(ModelEngine):
                                               non_blocking=True)
 
         # attention metadata
-        attn_metadata.seq_lens = torch.tensor(
-            sequence_lengths,
-            dtype=torch.int,
-            pin_memory=True,
-        )
+        if not attn_metadata.is_cuda_graph:
+            # Assumes seq lens do not change between CUDA graph invocations.
+            attn_metadata.seq_lens = torch.tensor(
+                sequence_lengths,
+                dtype=torch.int,
+                pin_memory=True,
+            )
         attn_metadata.num_contexts = 0
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
