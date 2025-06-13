@@ -20,6 +20,7 @@ from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import LLM
+from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
@@ -232,7 +233,7 @@ class OpenAIServer:
             nvtx_mark("generation ends")
 
         async def create_chat_response(
-                promise: RequestOutput, postproc_params: PostprocParams) -> ChatCompletionResponse:
+                promise: RequestOutput, postproc_params: PostprocParams, disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
             await promise.aresult()
             if self.postproc_worker_enabled:
                 chat_response =promise.outputs[0]._postprocess_result
@@ -241,7 +242,8 @@ class OpenAIServer:
                 chat_response = post_processor(promise, args)
 
             # Add prompt_tokens_ids to the response
-            chat_response.prompt_token_ids = promise.prompt_token_ids
+            if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
+                chat_response.prompt_token_ids = promise.prompt_token_ids
             return chat_response
 
         try:
@@ -304,7 +306,7 @@ class OpenAIServer:
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
-                response = await create_chat_response(promise, postproc_params)
+                response = await create_chat_response(promise, postproc_params, disaggregated_params)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server
@@ -352,7 +354,7 @@ class OpenAIServer:
             yield "data: [DONE]\n\n"
 
         async def create_completion_response(
-                generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]) -> CompletionResponse:
+                generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]], disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> CompletionResponse:
             all_choices: List[CompletionResponseChoice] = []
             all_prompt_token_ids: List[List[int]] = []
             num_prompt_tokens = num_gen_tokens = 0
@@ -368,7 +370,9 @@ class OpenAIServer:
                 all_choices.extend(choices)
                 num_prompt_tokens += usage.prompt_tokens
                 num_gen_tokens += usage.completion_tokens
-                all_prompt_token_ids.append(request_output.prompt_token_ids)
+                #Include prompt token ids for context-only requests
+                if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
+                    all_prompt_token_ids.append(request_output.prompt_token_ids)
 
             usage_info = UsageInfo(
                 prompt_tokens=num_prompt_tokens,
@@ -427,7 +431,7 @@ class OpenAIServer:
                                             media_type="text/event-stream")
             else:
                 response = await create_completion_response(
-                    generator)
+                    generator, disaggregated_params)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server

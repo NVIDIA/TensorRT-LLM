@@ -1061,12 +1061,14 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                 trust_remote_code=True,
                 attn_backend=model_config.attn_backend,
                 moe_backend=model_config.moe_backend,
-                mapping=model_config.mapping)
-            draft_config.spec_config = model_config.spec_config
-            draft_config.max_num_tokens = model_config.max_num_tokens
-            draft_config.moe_max_num_tokens = model_config.moe_max_num_tokens
+                mapping=model_config.mapping,
+                spec_config=model_config.spec_config,
+                max_num_tokens=model_config.max_num_tokens,
+                moe_max_num_tokens=model_config.moe_max_num_tokens)
+
             draft_config.quant_config.kv_cache_quant_algo = \
                 model_config.quant_config.kv_cache_quant_algo
+
             self.draft_model = Eagle3LlamaForCausalLM(
                 draft_config, model_config.pretrained_config.num_hidden_layers)
             self.spec_worker = get_spec_worker(model_config.spec_config,
