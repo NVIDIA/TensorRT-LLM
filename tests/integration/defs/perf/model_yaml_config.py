@@ -78,7 +78,7 @@ def get_model_yaml_config(model_label: str) -> dict:
                 [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]
             },
         },
-        'deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:2048-maxnt:8192-input_output_len:256,256-num_reqs:200-gpus:1':
+        'deepseek_v3_lite_nvfp4-bench-pytorch-streaming-float4-maxbs:2048-maxnt:8192-input_output_len:256,256-reqs:200':
         {
             'pytorch_backend_config': {
                 'print_iter_log': True,
