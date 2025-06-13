@@ -31,6 +31,11 @@ def get_model_yaml_config(model_label: str) -> dict:
         'use_cuda_graph': True,
         'cuda_graph_padding_enabled': True,
     }
+    if 'kv_cache_dtype' in model_label:
+        base_config.update({
+            'kv_cache_dtype':
+            model_label.split('kv_cache_dtype:')[1].split('-')[0]
+        })
 
     # Pattern-based configurations for models matching specific substrings
     # This allows for flexible configuration of models based on naming patterns

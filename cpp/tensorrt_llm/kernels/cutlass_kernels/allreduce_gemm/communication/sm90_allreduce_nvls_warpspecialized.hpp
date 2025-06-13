@@ -40,7 +40,7 @@ public:
     static constexpr int VecWidth = 128 / sizeof_bits_v<ElementT>; // multimem has max vec instructions
     static constexpr int MaxRanksPerCollective = 8;
 
-    static constexpr bool is_m_major = cutlass::is_same_v<LayoutD_, cutlass::layout::ColumnMajor>;
+    static constexpr bool is_m_major = std::is_same_v<LayoutD_, cutlass::layout::ColumnMajor>;
 
     static constexpr auto get_reduce_tile()
     {
@@ -73,26 +73,28 @@ public:
 
     struct Arguments
     {
-        ElementT* multicast_ptr_aux = nullptr; // for MC instructions
-        ElementT** ipc_ptr_aux = nullptr;      // for UC instructions
+        ElementT* multicast_ptr_D = nullptr; // for MC instructions
+        ElementT* multicast_ptr_out = nullptr;
+        ElementT** ipc_ptr_D = nullptr;      // for UC instructions
+        ElementT** ipc_ptr_out = nullptr;
         StrideMNL stride;
         typename SystemBarrier::Params barrier_params;
         typename SystemBarrier::Params barrier_params_final_sync;
         int rank;
         int world_size;
-        bool switch_reduction;
     };
 
     struct Params
     {
-        ElementT* multicast_ptr_aux = nullptr;
-        ElementT* ipc_ptr_aux[MaxRanksPerCollective];
+        ElementT* multicast_ptr_D = nullptr;
+        ElementT* multicast_ptr_out = nullptr;
+        ElementT* ipc_ptr_D[MaxRanksPerCollective];
+        ElementT* ipc_ptr_out[MaxRanksPerCollective];
         StrideMNL stride;
         typename SystemBarrier::Params barrier_params;
         typename SystemBarrier::Params barrier_params_final_sync;
         int rank;
         int world_size;
-        bool switch_reduction;
         Layout<Shape<int, int>> tile_layout;
     };
 
@@ -108,19 +110,17 @@ public:
         auto tile_layout = make_layout(make_shape(m_tiles, n_tiles));
 
         Params params;
-        params.multicast_ptr_aux = args.multicast_ptr_aux;
-        if (args.ipc_ptr_aux != nullptr)
+        params.multicast_ptr_D = args.multicast_ptr_D;
+        params.multicast_ptr_out = args.multicast_ptr_out;
+        for (int i = 0; i < args.world_size; i++)
         {
-            for (int i = 0; i < args.world_size; i++)
-            {
-                params.ipc_ptr_aux[i] = args.ipc_ptr_aux[i];
-            }
+            params.ipc_ptr_D[i] = (args.ipc_ptr_D != nullptr) ? args.ipc_ptr_D[i] : nullptr;
+            params.ipc_ptr_out[i] = (args.ipc_ptr_out != nullptr) ? args.ipc_ptr_out[i] : nullptr;
         }
         params.stride = args.stride;
         params.barrier_params = args.barrier_params, params.barrier_params_final_sync = args.barrier_params_final_sync;
         params.rank = args.rank;
         params.world_size = args.world_size;
-        params.switch_reduction = args.switch_reduction;
         params.tile_layout = tile_layout;
         return params;
     }
@@ -220,13 +220,99 @@ public:
     CUTLASS_DEVICE void gather_reduce_broadcast(
         ProblemShapeMNKL const& problem_shape, TileCoordMNKL const& tile_coord, int thread_idx)
     {
-        if (params_ptr->switch_reduction)
+        // Switch reductions are self-inclusive so will generate more NVL traffic than unicast based AR.
+        // Therefore unicast AR is faster when GPUs=2.
+        if (params_ptr->world_size > 2)
         {
             allreduce_in_switch(problem_shape, tile_coord, thread_idx);
         }
         else
         {
-            allreduce_in_sm(problem_shape, tile_coord, thread_idx);
+            allreduce_2gpus(problem_shape, tile_coord, thread_idx);
+        }
+    }
+
+    template <class ProblemShapeMNKL, class TileCoordMNKL>
+    CUTLASS_DEVICE void allreduce_2gpus(
+        ProblemShapeMNKL const& problem_shape, TileCoordMNKL const& tile_coord, int thread_idx)
+    {
+        auto [M, N, K, L] = problem_shape;
+        auto [m, n, k, l] = tile_coord;
+
+        if (!tile_valid(m, n) || params_ptr->world_size == 1)
+        {
+            return; // nothing to do
+        }
+
+        int const tile_index = params_ptr->tile_layout(m, n);
+        SystemBarrier::wait_eq_reset(
+            params_ptr->barrier_params, thread_idx, tile_index, params_ptr->rank, params_ptr->world_size);
+
+        sync_threads();
+
+        Tensor mD0 = make_tensor(
+            params_ptr->ipc_ptr_D[params_ptr->rank], make_layout(make_shape(M, N, L), params_ptr->stride)); // (M,N,L)
+        Tensor gD0 = local_tile(mD0, take<0, 2>(TileShape{}), make_coord(m, n, l)); // (TILE_M,TILE_N)
+        Tensor gD0_red = flat_divide(gD0, ReduceTile{}); // (RED_TILE_M,RED_TILE_N,RED_M,RED_N)
+
+        Tensor mD1 = make_tensor(params_ptr->ipc_ptr_D[params_ptr->rank ^ 1],
+            make_layout(make_shape(M, N, L), params_ptr->stride));                  // (M,N,L)
+        Tensor gD1 = local_tile(mD1, take<0, 2>(TileShape{}), make_coord(m, n, l)); // (TILE_M,TILE_N)
+        Tensor gD1_red = flat_divide(gD1, ReduceTile{}); // (RED_TILE_M,RED_TILE_N,RED_M,RED_N)
+
+        Tensor mOut = make_tensor(
+            params_ptr->ipc_ptr_out[params_ptr->rank], make_layout(make_shape(M, N, L), params_ptr->stride)); // (M,N,L)
+        Tensor gOut = local_tile(mOut, take<0, 2>(TileShape{}), make_coord(m, n, l)); // (TILE_M,TILE_N)
+        Tensor gOut_red = flat_divide(gOut, ReduceTile{}); // (RED_TILE_M,RED_TILE_N,RED_M,RED_N)
+
+        Tensor coordD = make_identity_tensor(shape(mD0));
+        Tensor pD = local_tile(coordD, take<0, 2>(TileShape{}), make_coord(m, n, l)); // (TILE_M,TILE_N)
+        Tensor pD_red = flat_divide(pD, ReduceTile{}); // (RED_TILE_M,RED_TILE_N,RED_M,RED_N)
+
+        using CopyAtomG2R = Copy_Atom<UniversalCopy<AlignedArray<ElementT, VecWidth>>, ElementT>;
+
+        auto tiled_cpy = make_AR_tiled_copy<CopyAtomG2R>();
+        auto thread_cpy = tiled_cpy.get_slice(thread_idx);
+
+        Tensor tGR_pD = thread_cpy.partition_S(pD_red);     // ((Atom,AtomNum),TiledCopy_M,TiledCopy_N,RED_M,RED_N)
+        Tensor tGR_gD0 = thread_cpy.partition_S(gD0_red);   // ((Atom,AtomNum),TiledCopy_M,TiledCopy_N,RED_M,RED_N)
+        Tensor tGR_gD1 = thread_cpy.partition_S(gD1_red);   // ((Atom,AtomNum),TiledCopy_M,TiledCopy_N,RED_M,RED_N)
+        Tensor tRG_gOut = thread_cpy.partition_D(gOut_red); // ((Atom,AtomNum),TiledCopy_M,TiledCopy_N,RED_M,RED_N)
+
+        // Allocate intermediate registers for a single subtile
+        auto Vec = coalesce(Layout<Shape<_1, Int<VecWidth>>, Stride<Int<VecWidth>, _1>>{});
+        Tensor tGR_rD0_vec = zipped_divide(make_fragment_like(tGR_gD0(_, _, _, 0, 0)), Vec); // (Vec, Rest...)
+        Tensor tGR_rD1_vec = zipped_divide(make_fragment_like(tGR_gD1(_, _, _, 0, 0)), Vec); // (Vec, Rest...)
+
+        // reduce subtile loop
+        CUTLASS_PRAGMA_UNROLL
+        for (int red_n = 0; red_n < size<3>(gD0_red); ++red_n)
+        {
+            // reduce subtile loop
+            CUTLASS_PRAGMA_UNROLL
+            for (int red_m = 0; red_m < size<2>(gD0_red); ++red_m)
+            {
+                Tensor tGR_pD_vec = zipped_divide(tGR_pD(_, _, _, red_m, red_n), Vec);
+                Tensor tGR_gD0_vec = zipped_divide(tGR_gD0(_, _, _, red_m, red_n), Vec);
+                Tensor tGR_gD1_vec = zipped_divide(tGR_gD1(_, _, _, red_m, red_n), Vec);
+                Tensor tRG_gOut_vec = zipped_divide(tRG_gOut(_, _, _, red_m, red_n), Vec);
+
+                auto pred_fn
+                    = [&](auto const&... coords) { return elem_less(tGR_pD_vec(_0{}, coords...), problem_shape); };
+
+                // Read from self.
+                cute::copy_if(CopyAtomG2R{}, pred_fn, tGR_gD0_vec, tGR_rD0_vec);
+                // Read from remote.
+                cute::copy_if(CopyAtomG2R{}, pred_fn, tGR_gD1_vec, tGR_rD1_vec);
+                // Reduce
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < size(tGR_rD0_vec); i++)
+                {
+                    tGR_rD0_vec(i) += tGR_rD1_vec(i);
+                }
+                // store to self.
+                cute::copy_if(CopyAtomG2R{}, pred_fn, tGR_rD0_vec, tRG_gOut_vec);
+            }
         }
     }
 
@@ -262,9 +348,9 @@ public:
         sync_threads();
 
         // Setup tensors
-        Tensor mD_mc = make_tensor(
-            params_ptr->multicast_ptr_aux, make_layout(make_shape(M, N, L), params_ptr->stride)); // (M,N,L)
-        Tensor gD_mc = local_tile(mD_mc, take<0, 2>(TileShape{}), make_coord(m, n, l));           // (TILE_M,TILE_N)
+        Tensor mD_mc
+            = make_tensor(params_ptr->multicast_ptr_D, make_layout(make_shape(M, N, L), params_ptr->stride)); // (M,N,L)
+        Tensor gD_mc = local_tile(mD_mc, take<0, 2>(TileShape{}), make_coord(m, n, l)); // (TILE_M,TILE_N)
         Tensor gD_mc_red = flat_divide(gD_mc, ReduceTile{}); // (RED_TILE_M,RED_TILE_N,RED_M,RED_N)
 
         // Predication tensor
@@ -286,10 +372,8 @@ public:
         Tensor tRG_gD = thread_r2g.partition_D(gD_mc_red); // ((Atom,AtomNum),TiledCopy_M,TiledCopy_N,RED_M,RED_N)
 
         // Allocate intermediate registers for a single subtile
-        Tensor tGR_rD = make_fragment_like(tGR_gD(_, _, _, 0, 0)); // ((G2R,G2R_V),G2R_M,G2R_N)
-
-        // problem shape bounds check
-        auto pred_fn = [&](auto const&... coords) { return elem_less(tGR_pD(coords...), problem_shape); };
+        auto Vec = coalesce(Layout<Shape<_1, Int<VecWidth>>, Stride<Int<VecWidth>, _1>>{});
+        Tensor tGR_rD_vec = zipped_divide(make_fragment_like(tGR_gD(_, _, _, 0, 0)), Vec); // (Vec, Rest...)
 
         // reduce subtile loop
         CUTLASS_PRAGMA_UNROLL
@@ -299,117 +383,16 @@ public:
             CUTLASS_PRAGMA_UNROLL
             for (int red_m = 0; red_m < size<2>(gD_mc_red); ++red_m)
             {
+                Tensor tGR_gD_vec = zipped_divide(tGR_gD(_, _, _, red_m, red_n), Vec);
+                Tensor tRG_gD_vec = zipped_divide(tRG_gD(_, _, _, red_m, red_n), Vec);
+                Tensor tGR_pD_vec = zipped_divide(tGR_pD(_, _, _, red_m, red_n), Vec);
+                // problem shape bounds check
+                auto pred_fn
+                    = [&](auto const&... coords) { return elem_less(tGR_pD_vec(_0{}, coords...), problem_shape); };
                 // load-reduce in switch
-                cute::copy_if(CopyAtomG2R{}, pred_fn, tGR_gD(_, _, _, red_m, red_n), tGR_rD);
+                cute::copy_if(CopyAtomG2R{}, pred_fn, tGR_gD_vec, tGR_rD_vec);
                 // store switch multicast
-                cute::copy_if(CopyAtomR2G{}, pred_fn, tGR_rD, tRG_gD(_, _, _, red_m, red_n));
-            }
-        }
-    }
-
-    template <class ProblemShapeMNKL, class TileCoordMNKL>
-    CUTLASS_DEVICE void allreduce_in_sm(
-        ProblemShapeMNKL const& problem_shape, TileCoordMNKL const& tile_coord, int thread_idx)
-    {
-        if constexpr (OneShot)
-        {
-            return; // Nothing to do.
-        }
-
-        auto [M, N, K, L] = problem_shape;
-        auto [m, n, k, l] = tile_coord;
-
-        if (!tile_valid(m, n) || params_ptr->world_size == 1)
-        {
-            return; // nothing to do
-        }
-
-        int tile_index = params_ptr->tile_layout(m, n);
-
-        // Wait for the tile to be ready across all ranks
-        SystemBarrier::wait_eq_reset(
-            params_ptr->barrier_params, thread_idx, tile_index, params_ptr->rank, params_ptr->world_size);
-
-        if (!should_process_tile(m, n))
-        {
-            return; // nothing to do
-        }
-
-        sync_threads();
-
-        // load/store in ring-order to reduce NVL bus contention
-        auto get_step_D_ptr = [&](int step) CUTLASS_LAMBDA_FUNC_INLINE
-        {
-            int rank = params_ptr->rank + step + 1;
-            if (rank >= params_ptr->world_size)
-            {
-                rank -= params_ptr->world_size;
-            }
-            return params_ptr->ipc_ptr_aux[rank];
-        };
-
-        // Setup tensors
-        Tensor mD0 = make_tensor(get_step_D_ptr(0), make_layout(make_shape(M, N, L), params_ptr->stride)); // (M,N,L)
-        Tensor gD0 = local_tile(mD0, take<0, 2>(TileShape{}), make_coord(m, n, l)); // (TILE_M,TILE_N)
-        Tensor gD0_red = flat_divide(gD0, ReduceTile{}); // (RED_TILE_M,RED_TILE_N,RED_M,RED_N)
-
-        // Predication tensor
-        Tensor coordD = make_identity_tensor(shape(mD0));
-        Tensor pD = local_tile(coordD, take<0, 2>(TileShape{}), make_coord(m, n, l)); // (CTA_M,CTA_N)
-        Tensor pD_red = flat_divide(pD, ReduceTile{}); // (RED_TILE_M,RED_TILE_N,RED_M,RED_N)
-
-        using CopyAtomG2R = Copy_Atom<UniversalCopy<AlignedArray<ElementT, VecWidth>>, ElementT>;
-
-        auto tiled_g2r = make_AR_tiled_copy<CopyAtomG2R>();
-        auto thread_g2r = tiled_g2r.get_slice(thread_idx);
-
-        Tensor tGR_pD = thread_g2r.partition_S(pD_red);   // ((Atom,AtomNum),TiledCopy_M,TiledCopy_N,RED_M,RED_N)
-        Tensor tGR_gD0 = thread_g2r.partition_S(gD0_red); // ((Atom,AtomNum),TiledCopy_M,TiledCopy_N,RED_M,RED_N)
-
-        // Allocate intermediate registers for a single subtile
-        Tensor tGR_rD0_mn = make_fragment_like(tGR_gD0(_, _, _, 0, 0)); // ((G2R,G2R_V),G2R_M,G2R_N)
-        Tensor tGR_rD1_mn = make_fragment_like(tGR_gD0(_, _, _, 0, 0)); // ((G2R,G2R_V),G2R_M,G2R_N)
-
-        // partition ptr offset
-        auto gmem_offset = static_cast<ptrdiff_t>(tGR_gD0.data() - get_step_D_ptr(0));
-
-        // problem shape bounds check
-        auto pred_fn = [&](auto const&... coords) CUTLASS_LAMBDA_FUNC_INLINE
-        { return elem_less(tGR_pD(coords...), problem_shape); };
-
-        // reduce subtile loop
-        CUTLASS_PRAGMA_UNROLL
-        for (int red_n = 0; red_n < size<3>(gD0_red); ++red_n)
-        {
-            // reduce subtile loop
-            CUTLASS_PRAGMA_UNROLL
-            for (int red_m = 0; red_m < size<2>(gD0_red); ++red_m)
-            {
-                // init tGR_rD0 with first iteration to prevent filling with zeros
-                cute::copy_if(CopyAtomG2R{}, pred_fn, tGR_gD0(_, _, _, red_m, red_n), tGR_rD0_mn);
-
-                // load D tile from each rank and accumulate.
-                for (int step = 1; step < params_ptr->world_size; ++step)
-                {
-                    Tensor tGR_gD = make_tensor(get_step_D_ptr(step) + gmem_offset, tGR_gD0.layout());
-
-                    // Load D tile
-                    cute::copy_if(CopyAtomG2R{}, pred_fn, tGR_gD(_, _, _, red_m, red_n), tGR_rD1_mn);
-
-                    // Reduce
-                    CUTLASS_PRAGMA_UNROLL
-                    for (int i = 0; i < size(tGR_rD0_mn); i++)
-                    {
-                        tGR_rD0_mn(i) += tGR_rD1_mn(i);
-                    }
-                }
-
-                // store D tile to each rank.
-                for (int step = 0; step < params_ptr->world_size; ++step)
-                {
-                    Tensor tRG_gD = make_tensor(get_step_D_ptr(step) + gmem_offset, tGR_gD0.layout());
-                    cute::copy_if(CopyAtomG2R{}, pred_fn, tGR_rD0_mn, tRG_gD(_, _, _, red_m, red_n));
-                }
+                cute::copy_if(CopyAtomR2G{}, pred_fn, tGR_rD_vec, tRG_gD_vec);
             }
         }
     }

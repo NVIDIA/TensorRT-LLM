@@ -1524,9 +1524,6 @@ class TorchLlmArgs(BaseLlmArgs):
     kv_cache_dtype: str = Field(default="auto",
                                 description="Data type for KV cache.")
 
-    use_kv_cache: bool = Field(default=True,
-                               description="Whether to use KV cache.")
-
     enable_iter_perf_stats: bool = Field(
         default=False, description="Enable iteration performance statistics.")
 
@@ -1649,7 +1646,6 @@ class TorchLlmArgs(BaseLlmArgs):
             mixed_sampler=self.mixed_sampler,
             enable_trtllm_sampler=self.enable_trtllm_sampler,
             kv_cache_dtype=self.kv_cache_dtype,
-            use_kv_cache=self.use_kv_cache,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             enable_iter_req_stats=self.enable_iter_req_stats,
             print_iter_log=self.print_iter_log,
