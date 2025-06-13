@@ -398,7 +398,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     }
 
     mCapacityScheduler = std::make_unique<CapacityScheduler>(getMaxNumSequences(),
-        optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), mKvCacheManager != nullptr, mNumMicroBatches > 1);
+        optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), mKvCacheManager != nullptr,
+        mWorldConfig.isPipelineParallel());
 
     mMicroBatchScheduler = std::make_unique<MicroBatchScheduler>(ctxChunkConfig, maxContextLength);
 
