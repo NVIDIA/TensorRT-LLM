@@ -307,14 +307,17 @@ class MNNVLAllReduce(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
-        self.enable_mnnvl = (os.environ.get("TRTLLM_MNNVL_AR_ENABLED",
-                                            "0") == "1"
-                             and dtype in [torch.bfloat16, torch.float32]
-                             and (not mapping.has_cp()))
+        assert (
+            dtype in MNNVLAllReduce.get_supported_dtypes()
+            and (not mapping.has_cp())
+        ), "MNNVL all reduce only supports dtype {MNNVLAllReduce.get_supported_dtypes()} and without cp."
 
-        if self.enable_mnnvl:
-            self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
-                self.mapping, dtype)
+        self.mcast_buffer_mnnvl, self.buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = get_allreduce_mnnvl_workspace(
+            self.mapping, dtype)
+
+    @staticmethod
+    def get_supported_dtypes():
+        return (torch.bfloat16, torch.float32)
 
     def forward(
         self,
@@ -330,7 +333,7 @@ class MNNVLAllReduce(nn.Module):
         Returns:
             Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
         """
-        if not self.enable_mnnvl or input.numel() > self.max_num_elements_mnnvl:
+        if input.numel() > self.max_num_elements_mnnvl:
             return None
 
         fusion_op = all_reduce_params.fusion_op
@@ -411,27 +414,27 @@ class AllReduce(nn.Module):
             For the reference implementation for each pattern, please refer to the following unit test:
             https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/multi_gpu/test_allreduce.py
 
-            The LOWPRECISION strategy can be selected either by directly specifying it in the constructor
-            or by setting the environment variable FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY when using
-            the AUTO strategy.
+            The LOWPRECISION strategy can be selected either by directly specifying it in the constructor.
         """
 
         self.mapping = mapping
         self.workspace = None
         self.strategy = strategy
+        self.mnnvl_allreduce = None
 
-        self.force_low_precision_env = os.environ.get(
-            "FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY")
         if self.mapping.tp_size > 1:
             # When Strategy is UB, it is guaranteed that the workspace is not used.
             if self.strategy != AllReduceStrategy.UB:
-                if self.strategy == AllReduceStrategy.LOWPRECISION or self.force_low_precision_env is not None:
+                if self.strategy == AllReduceStrategy.LOWPRECISION:
                     allocate_low_presicion_allreduce_workspace(self.mapping)
                 self.workspace = get_allreduce_workspace(self.mapping)
 
             # Initialize MNNVL AllReduce if needed
-            self.mnnvl_allreduce = MNNVLAllReduce(mapping,
-                                                  dtype) if dtype else None
+            if self.strategy == AllReduceStrategy.MNNVL and (
+                    dtype and dtype in MNNVLAllReduce.get_supported_dtypes()
+            ) and (not self.mapping.has_cp()):
+                self.mnnvl_allreduce = MNNVLAllReduce(self.mapping,
+                                                      dtype) if dtype else None
 
     def forward(
         self,

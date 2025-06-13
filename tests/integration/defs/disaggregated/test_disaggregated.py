@@ -106,6 +106,10 @@ def get_test_config(test_desc, example_dir, test_root):
          ),
         "deepseek_v3_lite_bf16_conditional":
         (2, f"{test_configs_root}/disagg_config_conditional_deepseek_v3.yaml"),
+        "deepseek_v3_lite_fp8_tp1_two_mtp":
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_two_mtp.yaml"
+         ),
     }
 
     if test_desc not in config_map:
@@ -145,14 +149,14 @@ def run_disaggregated_test(example_dir,
                       stdout=output_workers,
                       stderr=subprocess.STDOUT,
                       env=env,
-                      cwd=cwd),
+                      cwd=cwd) as workers_proc,
                 # Start server
                 open('output_disagg.log', 'w') as output_disagg,
                 popen(server_cmd,
                       stdout=output_disagg,
                       stderr=subprocess.STDOUT,
                       env=env,
-                      cwd=cwd)):
+                      cwd=cwd) as server_proc):
             client_dir = f"{example_dir}/clients"
             for _ in range(num_iters):
                 client_cmd = [
@@ -218,6 +222,11 @@ def run_disaggregated_test(example_dir,
         with open('output_disagg.log', 'r') as f:
             logger.error(f.read())
         raise
+    finally:
+        server_proc.terminate()
+        workers_proc.terminate()
+        server_proc.wait()
+        workers_proc.wait()
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -806,5 +815,27 @@ def test_disaggregated_deepseek_v3_lite_bf16_conditional(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_conditional",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_tp1_two_mtp",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
