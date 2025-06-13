@@ -2,11 +2,16 @@ import time
 import torch
 import numpy as np
 import csv
+import argparse
 from typing import List, Tuple, Dict
 
 from tensorrt_llm._torch.modules.fused_moe import DefaultMoeRoutingMethod
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.mapping import Mapping
+
+
+import torch.cuda.nvtx as nvtx
+
 
 
 def setup_fused_moe_kernel_inputs(
@@ -96,6 +101,8 @@ def create_routing_logits(seq_len: int, num_experts: int, top_k: int, dtype: tor
     return router_logits, actual_activated_experts
 
 
+
+@torch.inference_mode()
 def profile_fused_moe_kernel(
     test_name: str,
     num_tokens: int,
@@ -105,6 +112,7 @@ def profile_fused_moe_kernel(
     top_k: int,
     tp_size: int,
     ep_size: int,
+    nsys_mode: bool = False,
     num_warmup: int = 10,
     num_iterations: int = 100
 ) -> float:
@@ -127,6 +135,12 @@ def profile_fused_moe_kernel(
     
     print(f"  Experts: {num_experts}, Activated: {actual_activated_experts}, TopK: {top_k}")
     
+    # Adjust parameters for nsys mode
+    if nsys_mode:
+        num_warmup = 0
+        num_iterations = 1
+        print(f"  NSYS Mode: No warmup, 1 iteration")
+    
     output_dtype = torch.bfloat16
     
     # Kernel parameters from mapping
@@ -140,7 +154,7 @@ def profile_fused_moe_kernel(
     tune_max_num_tokens = 8192
     
     # Warmup
-    with torch.inference_mode():
+    if num_warmup > 0:
         for _ in range(num_warmup):
             _ = torch.ops.trtllm.fused_moe(
                 x,
@@ -162,37 +176,42 @@ def profile_fused_moe_kernel(
                 min_latency_mode=min_latency_mode,
                 tune_max_num_tokens=tune_max_num_tokens,
             )
-    
-    torch.cuda.synchronize()
+        
+        torch.cuda.synchronize()
     
     # Timing using CUDA events
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     
-    with torch.inference_mode():
-        start_event.record()
-        for _ in range(num_iterations):
-            _ = torch.ops.trtllm.fused_moe(
-                x,
-                token_selected_slots,
-                token_final_scales,
-                w3_w1_weight,
-                w2_weight,
-                output_dtype,
-                quant_scales=quant_scales,
-                input_sf=None,
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                ep_size=ep_size,
-                ep_rank=ep_rank,
-                # cluster_size=cluster_size,
-                # cluster_rank=cluster_rank,
-                use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-                use_w4a8_group_scaling=use_w4a8_group_scaling,
-                min_latency_mode=min_latency_mode,
-                tune_max_num_tokens=tune_max_num_tokens,
-            )
-        end_event.record()
+    if nsys_mode:
+        nvtx_range = nvtx.range_start(test_name)
+    
+    start_event.record()
+    for _ in range(num_iterations):
+        _ = torch.ops.trtllm.fused_moe(
+            x,
+            token_selected_slots,
+            token_final_scales,
+            w3_w1_weight,
+            w2_weight,
+            output_dtype,
+            quant_scales=quant_scales,
+            input_sf=None,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            # cluster_size=cluster_size,
+            # cluster_rank=cluster_rank,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4a8_group_scaling=use_w4a8_group_scaling,
+            min_latency_mode=min_latency_mode,
+            tune_max_num_tokens=tune_max_num_tokens,
+        )
+    end_event.record()
+    
+    if nsys_mode:
+        nvtx.range_end(nvtx_range)
     
     end_event.synchronize()
     total_time = start_event.elapsed_time(end_event)  # Total time in ms
@@ -207,8 +226,34 @@ def profile_fused_moe_kernel(
 def main():
     """Main profiling function for the fused_moe kernel."""
     
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='Profile fused MoE kernel',
+        epilog='''
+Example usage:
+  Regular profiling:
+    python profile_fused_moe_kernel.py
+    
+  NSYS profiling:
+    nsys profile -o moe_cutlass_kernels -t nvtx,cuda -c cudaProfilerApi -f true python profile_fused_moe_kernel.py --nsys
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('--nsys', action='store_true', 
+                       help='Enable nsys profiling mode (no warmup, 1 iteration, NVTX markers, CUDA profiler start/stop)')
+    args = parser.parse_args()
+    
+    nsys_mode = args.nsys
+    
     print("torch.ops.trtllm.fused_moe Kernel Profiling - Qwen3 235B Configuration")
     print("=" * 80)
+    if nsys_mode:
+        print("NSYS PROFILING MODE ENABLED")
+        print("- No warmup iterations")
+        print("- Single iteration per test")
+        print("- NVTX markers for timeline analysis")
+        print("- CUDA profiler start/stop for precise kernel capture")
+        print("=" * 80)
     
     test_configs = []
     
@@ -247,10 +292,13 @@ def main():
     
     # Run profiling for each configuration
     results = []
+    if nsys_mode:  
+        torch.cuda.profiler.start()
     for config in test_configs:
         # Filter out display-only fields for the function call
         profile_config = {k: v for k, v in config.items() 
                          if k not in ['benchmark_fc1_dims', 'benchmark_fc2_dims']}
+        profile_config['nsys_mode'] = nsys_mode
         avg_time = profile_fused_moe_kernel(**profile_config)
         results.append({
             'testName': config['test_name'],
@@ -263,12 +311,14 @@ def main():
             'benchmark_fc1_dims': config['benchmark_fc1_dims'],
             'benchmark_fc2_dims': config['benchmark_fc2_dims']
         })
+    if nsys_mode:
+        torch.cuda.profiler.stop()
     
     # Sort results to match benchmark order: tokens -> TP config
     results.sort(key=lambda x: (x['numTokens'], x['topK'], x['testName']))
     
     # Export to CSV in benchmark format
-    csv_filename = "fused_moe_kernel_profiling_results.csv"
+    csv_filename = "fused_moe_kernel_profiling_results_nsys.csv" if nsys_mode else "fused_moe_kernel_profiling_results.csv"
     with open(csv_filename, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         
