@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@dev-yuanjingx-add_gb200_multi_node_slurm_config', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -266,6 +266,22 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     }
 }
 
+def getNodeArgsFromStageName(String stageName) {
+    def taskConfig = parseMultiNodeTaskConfigFromStageName(stageName)
+    if (taskConfig) {
+        int gpu_count = taskConfig.system_gpu_count.toInteger()
+        int node_count = taskConfig.node_count.toInteger()
+        int gpu_per_node = ((gpu_count / node_count) as BigDecimal).setScale(0, BigDecimal.ROUND_CEILING).intValue()
+        return [
+            "--nodes=${node_count}",
+            "--ntasks=${gpu_count}",
+            "--ntasks-per-node=${gpu_per_node}",
+            "--gpus-per-node=${gpu_per_node}",
+        ].join(" ")
+    }
+    return null
+}
+
 def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=2, skipInstallWheel=false, cpver="cp312")
 {
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
@@ -276,6 +292,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
     try {
         // Run ssh command to start node in desired cluster via SLURM
         withCredentials([
+
             usernamePassword(
                 credentialsId: 'svc_tensorrt',
                 usernameVariable: 'USERNAME',
@@ -304,29 +321,30 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
             def llmSrcNode = "${resourcePathNode}TensorRT-LLM/src"
             def isAarch64 = config.contains("aarch64")
             def pytestTestTimeout = "7200"
-            def testDBListCmd = getMakoOptsCmd(pipeline, remote, testList, llmSrcNode, stageName)
-            def makoArgs = getMakoArgsFromStageName(stageName, true)
-            def makoOptsJson = transformMakoArgsToJson(makoArgs)
-            Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' ssh -oStrictHostKeyChecking=no ${remote.user}@${remote.host} 'mkdir ${jobWorkspace}'",)
 
-            def coverageConfigFile = "${jobWorkspace}/.coveragerc"
-            coverageConfigDestPath = Utils.createTempLocation(pipeline, "./.coveragerc")
-            // generate multi node run script
-            pipeline.writeFile(file: coverageConfigDestPath, text: """[run]
-branch = True
-data_file = ${jobWorkspace}/.coverage.${stageName}
-[paths]
-source =
-    ${llmSrcNode}/tensorrt_llm/
-    ---wheel_path---/tensorrt_llm/
-            """)
-            Utils.exec(pipeline, script: "chmod +w ${coverageConfigDestPath}", returnStdout: true)
             stage('Prepare Testing') {
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' ssh -oStrictHostKeyChecking=no ${remote.user}@${remote.host} 'mkdir ${jobWorkspace}'",)
+                def makoArgs = getMakoArgsFromStageName(stageName, true)
+                // TODO: currently the options will only be processed if the first
+                // line is "Mako options:", maybe we can make it more generic, which
+                // if the line cannot be split by "=", just ignore that line.
+                def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
+                def coverageConfigFile = "${jobWorkspace}/.coveragerc"
+                coverageConfigDestPath = Utils.createTempLocation(pipeline, "./.coveragerc")
+                // generate multi node run script
+                pipeline.writeFile(file: coverageConfigDestPath, text: """[run]
+    branch = True
+    data_file = ${jobWorkspace}/.coverage.${stageName}
+    [paths]
+    source =
+        ${llmSrcNode}/tensorrt_llm/
+        ---wheel_path---/tensorrt_llm/
+                """)
+                Utils.exec(pipeline, script: "chmod +w ${coverageConfigDestPath}", returnStdout: true)
                 scriptRunDestPath = Utils.createTempLocation(pipeline, "./slurm_run.sh")
                 pipeline.writeFile(file: scriptRunDestPath, text: """#!/bin/bash
 cd /tmp
 testListPath="$jobWorkspace/${testList}.txt"
-testFilesPath="/tmp/single_test_files"
 resultsPath="$jobWorkspace/results"
 mkdir -p "\$resultsPath"
 if [ \$SLURM_LOCALID -eq 0 ]; then
@@ -344,7 +362,7 @@ if [ \$SLURM_LOCALID -eq 0 ]; then
     pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7
     testDBPath="$llmSrcNode/tests/integration/test_lists/test-db"
     testListPath="$jobWorkspace/${testList}.txt"
-    trt-test-db -d \$testDBPath --context $testList --test-names --output \$testListPath --match \"\$makoOptsJson\"
+    trt-test-db -d \$testDBPath --context $testList --test-names --output \$testListPath --match '${makoOptsJson}'
     touch install_lock.lock
 else
     while [ ! -f install_lock.lock ]; do
@@ -416,23 +434,23 @@ eval "\$fullCmd"
                 def mounts = "/home/scratch.trt_llm_data:/scratch.trt_llm_data,/home/svc_tensorrt/bloom/scripts:/home/svc_tensorrt/bloom/scripts"
                 def scriptRun = "/home/svc_tensorrt/bloom/scripts/${jobUID}/slurm_run.sh"
                 def scriptLaunch = "/home/svc_tensorrt/bloom/scripts/${jobUID}/slurm_launch.sh"
-                def srunCmdLines = [
-                    "srun",
-                    "-A oberon-gb-ci",
+                String taskArgs = getNodeArgsFromStageName(stageName)
+
+                if (taskArgs == null) {
+                    error "Invalid multinode task stage name is set"
+                }
+
+                taskArgs =  [
+                    taskArgs,
                     "--exclusive",
                     "--container-image=${container}",
                     "--container-workdir=/scratch.trt_llm_data",
                     "--container-mounts=${mounts}",
-                    "--partition=gb200nvl-ci",
-                    "--nodes=2",
-                    "--ntasks=8",
-                    "--ntasks-per-node=4",
-                    "--gpus-per-node=4",
-                    "--mpi=pmix",
-                    scriptRun
-                ]
+                ].join(" ")
+
+                def srunCmd = SlurmConfig.generateMultiNodeCommand(partition, taskArgs, scriptRun)
                 scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
-                pipeline.writeFile(file: scriptLaunchDestPath, text: """${srunCmdLines.join(" ")}""")
+                pipeline.writeFile(file: scriptLaunchDestPath, text: """${srunCmd}""")
                 Utils.exec(pipeline, script: "chmod +x ${scriptLaunchDestPath}", returnStdout: true)
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${scriptLaunchDestPath} ${remote.user}@${remote.host}:${scriptLaunch}",)
             }
@@ -449,8 +467,8 @@ eval "\$fullCmd"
             }
         }
     } finally {
-        uploadResults(pipeline, cluster, jobUID, stageName)
-        cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID)
+        //uploadResults(pipeline, cluster, jobUID, stageName)
+        //cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID)
     }
 }
 
@@ -967,7 +985,7 @@ def transformMakoArgsToJson(optList) {
 
     // Print and return the Test DB Query as a JSON string
     echo "Test DB Mako opts: ${makoOptsJson}"
-    return 
+    return makoOptsJson
 }
 
 def getMakoOpts(getMakoScript, makoArgs=[]) {
@@ -1083,6 +1101,19 @@ def getMakoOptsCmd(pipeline, remote, testContext, llmSrc, stageName) {
     return listMakoCmd
 }
 
+def parseMultiNodeTaskConfigFromStageName(String stageName) {
+    def taskConfig = null
+    def matcher = (stageName =~ /([^-]+)-(\d+)_GPUs-(\d+)_Nodes/)
+    if (matcher.find()) {
+        taskConfig = [
+            gpu: "${matcher.group(1)}",
+            system_gpu_count: "${matcher.group(2)}",
+            node_count: "${matcher.group(3)}"
+        ]
+    }
+    return taskConfig
+}
+
 def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     def makoArgs = []
     def isPostMerge = stageName.contains("Post-Merge")
@@ -1116,11 +1147,11 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     }
 
     if (parseSysinfo) {
-        def matcher = (stageName =~ /([^-]+)-(\d+)_GPUs/)
-        if (matcher.find()) {
+        def taskConfig = parseMultiNodeTaskConfigFromStageName(stageName)
+        if (taskConfig) {
             makoArgs += [
-                "gpu=${matcher.group(1)}",
-                "system_gpu_count=${matcher.group(2)}"
+                "gpu=${taskConfig.gpu}",
+                "system_gpu_count=${taskConfig.system_gpu_count}"
             ]
         }
     }
@@ -1934,7 +1965,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
-        "GB200-8_GPUs-2_Nodes-PyTorch-[Post-Merge]-1": ["gb200-8-gpus", "l0_gb200_multi_nodes", 1, 1, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-[Post-Merge]-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 1, 8, 2],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
