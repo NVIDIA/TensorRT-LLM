@@ -114,6 +114,7 @@ class ZeroMqQueue:
             return False
 
     def put(self, obj: Any):
+        self.setup_lazily()
         with nvtx_range_debug("send", color="blue", category="IPC"):
             if self.use_hmac_encryption:
                 # Send pickled data with HMAC appended
