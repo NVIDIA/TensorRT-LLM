@@ -33,7 +33,8 @@ from ..distributed import Distributed
 from ..speculative.drafter import Drafter
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse, executor_request_to_llm_request)
+                          LlmResponse, create_dummy_requests,
+                          executor_request_to_llm_request)
 from .model_engine import ModelEngine
 from .sampler import Sampler, SampleState, SampleStateTensors, TorchSampler
 from .scheduler import RequestScheduler, ScheduledRequests
@@ -1563,17 +1564,16 @@ class PyExecutor:
             ])
 
         if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
-            llm_request = self.kv_cache_manager.add_dummy_requests(
+            llm_request = create_dummy_requests(
                 request_ids=[0],
                 is_gen=not self.has_context_request,
-                prepare_resource=not self.has_context_request,
                 max_num_draft_tokens=self.max_draft_len,
+                is_cross_kv=self.kv_cache_manager.is_cross_kv,
             )[0]
             llm_request.is_attention_dp_dummy = True
-            spec_resource_manager = self.resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER)
-            if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests([0])
+            # If there is no context request, we need to prepare resources for the dummy request
+            if not self.has_context_request:
+                self.resource_manager.prepare_dummy_resources([llm_request])
             self.active_requests.append(llm_request)
 
     @nvtx_range("_prepare_disagg_gen_init")

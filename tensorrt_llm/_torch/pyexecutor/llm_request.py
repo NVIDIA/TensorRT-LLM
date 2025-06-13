@@ -6,6 +6,7 @@ import torch
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
+from tensorrt_llm.sampling_params import SamplingParams
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
 '''
@@ -476,3 +477,48 @@ def executor_request_to_llm_request(
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None))
     return llm_request
+
+
+def create_dummy_requests(
+    request_ids: List[int],
+    # Note that token_nums should be past_kv_len + input_len (without
+    # spec decoding). The draft tokens will be added in this function,
+    # so we don't need to take care of it in the caller. When preparing
+    # token_nums, we should not take the draft tokens into account, so
+    # don't use the kv_cache_manager.max_seq_len, which includes both
+    # extra tokens and draft tokens.
+    token_nums: Optional[List[int]] = None,
+    is_gen: bool = False,
+    max_num_draft_tokens: int = 0,
+    is_cross_kv: bool = False,
+    use_mrope: bool = False,
+):
+    requests = []
+    for i, req_id in enumerate(request_ids):
+        sampling_params = SamplingParams()
+        # Here 1+max_num_draft_tokens is used to extend the prompt length to
+        # a non-zero number to skip illegal memory access issue in MLA kernel
+        # during warmup.
+        token_num = token_nums[
+            i] if token_nums is not None else 1 + max_num_draft_tokens
+        encoder_input_tokens = [1] * token_num if is_cross_kv else None
+        # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
+        mrope_position_deltas = torch.zeros(
+            1, device="cuda", dtype=torch.int32) if use_mrope else None
+        req = LlmRequest(request_id=req_id,
+                         max_new_tokens=1,
+                         input_tokens=[1] * token_num,
+                         sampling_config=SamplingConfig(
+                             sampling_params._get_sampling_config()),
+                         is_streaming=False,
+                         mrope_position_deltas=mrope_position_deltas,
+                         encoder_input_tokens=encoder_input_tokens)
+        req.is_dummy_request = True
+        req.paged_kv_block_ids = []
+        if is_gen:
+            req.state = LlmRequestState.GENERATION_IN_PROGRESS
+            req.prompt_len = token_num - 1
+            req.py_draft_tokens = [1] * max_num_draft_tokens
+        req.py_prompt_len = req.prompt_len
+        requests.append(req)
+    return requests
