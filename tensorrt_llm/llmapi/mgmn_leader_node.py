@@ -35,7 +35,7 @@ def stop_server_main():
     queue = ZeroMqQueue((get_spawn_proxy_process_ipc_addr_env(), None),
                         use_hmac_encryption=False,
                         is_server=False,
-                        socket_type=zmq.PUSH)
+                        socket_type=zmq.PAIR)
 
     try:
         print_colored_debug(

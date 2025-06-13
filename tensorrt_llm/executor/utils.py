@@ -1,6 +1,9 @@
 import asyncio
 import concurrent.futures
 import os
+import sys
+import threading
+import traceback
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from typing import Any, Callable, List, NamedTuple, Optional
@@ -8,11 +11,12 @@ from typing import Any, Callable, List, NamedTuple, Optional
 from strenum import StrEnum
 
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.llmapi.utils import print_colored_debug
+from tensorrt_llm.llmapi.utils import enable_llm_debug, print_colored_debug
 
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.utils import print_colored_debug
+from ..logger import logger
 
 
 class LlmLauncherEnvs(StrEnum):
@@ -144,3 +148,22 @@ class WorkerCommIpcAddrs(NamedTuple):
 
 def is_llm_response(instance):
     return hasattr(instance, "result")
+
+
+def print_alive_threads():
+    assert enable_llm_debug(
+    ), "print_alive_threads must be called with enable_llm_debug() enabled"
+
+    # Print all alive threads for debugging
+    alive_threads = [t for t in threading.enumerate() if t.is_alive()]
+    logger.info(
+        f'All alive threads after shutdown: {[t.name for t in alive_threads]}\n',
+        "red")
+    for t in alive_threads:
+        logger.info(f'Thread {t.name} (daemon={t.daemon}) is still alive')
+        # Get the stack trace for this thread
+        stack = sys._current_frames().get(t.ident)
+        if stack is not None:
+            logger.info(f'Stack trace for thread {t.name}:')
+            traceback.print_stack(stack, file=sys.stdout)
+            logger.info('')
