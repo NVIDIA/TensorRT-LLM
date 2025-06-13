@@ -36,7 +36,6 @@
 namespace tensorrt_llm::executor::kv_cache
 {
 
-// 文件锁RAII管理类
 class FileLock
 {
 private:
@@ -62,7 +61,6 @@ public:
         if (locked_)
             return true;
 
-        // 创建锁文件目录（如果不存在）
         size_t pos = lockFile_.find_last_of('/');
         if (pos != std::string::npos)
         {
@@ -121,14 +119,14 @@ static std::string getAvailableIP()
         if (ifa->ifa_addr == nullptr)
             continue;
 
-        std::string ucxInterface = common::getEnvUCXInterface();
-        if (!ucxInterface.empty() && strcmp(ifa->ifa_name, ucxInterface.c_str()) != 0)
+        std::string nixlInterface = common::getEnvNixlInterface();
+        if (!nixlInterface.empty() && strcmp(ifa->ifa_name, nixlInterface.c_str()) != 0)
         {
             continue;
         }
 
         // Skip the loopback interface
-        if (ucxInterface.empty() && (strncmp(ifa->ifa_name, "docker", 6) == 0 || strcmp(ifa->ifa_name, "lo") == 0))
+        if (nixlInterface.empty() && (strncmp(ifa->ifa_name, "docker", 6) == 0 || strcmp(ifa->ifa_name, "lo") == 0))
         {
             continue;
         }
@@ -141,8 +139,8 @@ static std::string getAvailableIP()
             char address_buffer[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
 
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s", ifa->ifa_name,
-                address_buffer);
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** NIXL    Interface: %s IP Address: %s",
+                ifa->ifa_name, address_buffer);
             ip = address_buffer;
             break;
         }
@@ -150,7 +148,7 @@ static std::string getAvailableIP()
     if (ifa == nullptr)
     {
         TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
-            "UCX   No valid IP address found please set correct UCX interface with env variable TRTLLM_UCX_INTERFACE");
+            "UCX   No valid IP address found please set correct NIXL interface with env variable TRTLLM_UCX_INTERFACE");
     }
 
     freeifaddrs(ifaddr);
