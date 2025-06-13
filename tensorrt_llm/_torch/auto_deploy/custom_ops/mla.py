@@ -221,7 +221,7 @@ class MultiHeadLatentAttention(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.deepseek.fused_mla
+        return torch.ops.auto_deploy.torch_attention_deepseek_fused_mla
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:

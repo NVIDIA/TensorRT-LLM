@@ -168,7 +168,7 @@ def _paged_context_mha(
     )
 
 
-@torch.library.custom_op("attention::fused_mha_with_paged_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_attention_fused_mha_with_paged_cache", mutates_args=())
 def fused_mha_with_paged_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -415,8 +415,7 @@ def _flattened_context_mha_rope_fusion(
         num_stages=2,
     )
 
-
-@torch.library.custom_op("attention::fused_flattened_mha_with_cache_rope_fusion", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_attention_fused_flattened_mha_with_cache_rope_fusion", mutates_args=())
 def fused_flattened_mha_with_cache_rope_fusion(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -541,7 +540,7 @@ def _context_mha(
     )
 
 
-@torch.library.custom_op("attention::fused_mha_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_attention_fused_mha_with_cache", mutates_args=())
 def fused_mha_with_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -593,7 +592,7 @@ def fused_mha_fake(
     return torch.empty_like(q.contiguous())
 
 
-@torch.library.custom_op("attention::fused_flattened_mha_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_attention_fused_flattened_mha_with_cache", mutates_args=())
 def fused_flattened_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,

@@ -70,7 +70,7 @@ PytorchExportedProgramAdapterImpl.add_outputs_metadata = add_outputs_metadata
 CUSTOM_OPS = (
     torch.ops.dist.all_reduce.default,
     torch.ops.aten.slice.Tensor,
-    torch.ops.attention.fused_mha_with_cache.default,
+    torch.ops.auto_deploy.triton_attention_fused_mha_with_cache.default,
     torch.ops.linear.fused_linear_all_reduce.default,
     torch.ops.linear.simple.default,
     torch.ops.aten.split_with_sizes.default,
