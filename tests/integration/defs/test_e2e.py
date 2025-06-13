@@ -2195,7 +2195,10 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
 @pytest.mark.parametrize("model_path", [
     pytest.param('llama-3.3-models/Llama-3.3-70B-Instruct',
                  marks=skip_pre_hopper),
-    pytest.param('Llama-4-Maverick-17B-128E-Instruct', marks=skip_pre_hopper),
+    pytest.param('llama4-models/Llama-4-Maverick-17B-128E-Instruct',
+                 marks=skip_pre_hopper),
+    pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
+    pytest.param('Qwen3/Qwen3-235B-A22B', marks=skip_pre_hopper),
 ])
 def test_ptp_quickstart_advanced_llama_2nodes(llm_root, llm_venv, model_path):
     print(f"Testing {model_path}.")
