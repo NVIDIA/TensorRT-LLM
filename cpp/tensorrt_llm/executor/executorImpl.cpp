@@ -514,10 +514,10 @@ std::shared_ptr<Model> Executor::Impl::createEncoderModel(runtime::RawEngine con
     runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
     ExecutorConfig const& executorConfig)
 {
-    auto optionalParams = batch_manager::TrtGptModelOptionalParams{};
-    optionalParams.schedulerConfig = executorConfig.getSchedulerConfig();
+    auto fixedExecutorConfig = ExecutorConfig{};
+    fixedExecutorConfig.setSchedulerConfig(executorConfig.getSchedulerConfig());
     return std::make_shared<batch_manager::TrtEncoderModel>(
-        modelConfig, worldConfig, rawEngine, std::make_shared<runtime::TllmLogger>(), optionalParams);
+        modelConfig, worldConfig, rawEngine, std::make_shared<runtime::TllmLogger>(), fixedExecutorConfig);
 }
 
 void Executor::Impl::setOrchLeaderComm(
