@@ -1,12 +1,11 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,7 +15,6 @@
  */
 
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
-#include "fp4_gemm.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
@@ -26,6 +24,18 @@
 #include "tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.h"
 #include "tensorrt_llm/plugins/lowLatencyGemmSwigluPlugin/lowLatencyGemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.h"
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/fp4_gemm.h"
+#else
+#include "fp4_gemm.h"
+#endif
+#if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
+using GemmAllReduceImplInterface = tensorrt_llm::kernels::opened_cutlass_kernels::GemmAllReduceImplInterface;
+#else
+#include "allreduce_gemm_runner.h"
+using GemmAllReduceImplInterface = tensorrt_llm::kernels::cutlass_kernels::GemmAllReduceImplInterface;
+#endif
 
 #include <cstddef>
 
@@ -373,9 +383,14 @@ template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmC
     std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp8RowwiseGemmRunnerInterface>, GemmIdCore,
     GemmIdCoreHash>;
 
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
+template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
+    std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunnerInterface>, GemmIdCore, GemmIdCoreHash>;
+#else
 template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
     std::shared_ptr<tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunnerInterface>, GemmIdCore,
     GemmIdCoreHash>;
+#endif
 
 template class GemmPluginProfiler<LowLatencyGemmPluginProfiler::Config, LowLatencyGemmRunnerPtr, GemmIdCore,
     GemmIdCoreHash>;
@@ -383,7 +398,7 @@ template class GemmPluginProfiler<LowLatencyGemmPluginProfiler::Config, LowLaten
 template class GemmPluginProfiler<LowLatencyGemmSwigluPluginProfiler::Config, LowLatencyGemmSwigluRunnerPtr, GemmIdCore,
     GemmIdCoreHash>;
 
-template class GemmPluginProfiler<tensorrt_llm::kernels::cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig,
-    std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::GemmAllReduceImplInterface>, GemmIdCore, GemmIdCoreHash>;
+template class GemmPluginProfiler<GemmAllReduceImplInterface::LaunchConfig, std::shared_ptr<GemmAllReduceImplInterface>,
+    GemmIdCore, GemmIdCoreHash>;
 
 } // namespace tensorrt_llm::plugins

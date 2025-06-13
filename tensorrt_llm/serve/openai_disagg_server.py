@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 import asyncio
 import copy
-import logging
 import os
 import signal
 from contextlib import asynccontextmanager
@@ -19,6 +18,7 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.llmapi.disagg_utils import (ConditionalDisaggConfig,
                                               MetadataServerConfig,
                                               RouterConfig)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
@@ -28,8 +28,6 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ErrorResponse)
 from tensorrt_llm.serve.router import KvCacheAwareRouter, create_router
 from tensorrt_llm.version import __version__ as VERSION
-
-logging.basicConfig(level=logging.INFO)
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 10  # seconds.
@@ -73,18 +71,18 @@ class OpenAIDisaggServer:
                 connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, keepalive_timeout=300),
                 timeout=aiohttp.ClientTimeout(total=req_timeout_secs))
 
-            logging.info("Waiting for context and generation servers to be ready")
+            logger.info("Waiting for context and generation servers to be ready")
             await self.wait_for_servers_ready(server_start_timeout_secs)
 
             if self.metadata_server:
-                logging.info("Starting server monitoring via metadata service")
+                logger.info("Starting server monitoring via metadata service")
                 await self.ctx_router.start_server_monitoring()
                 await self.gen_router.start_server_monitoring()
 
             yield
 
             if self.metadata_server:
-                logging.info("Stopping server monitoring via metadata service")
+                logger.info("Stopping server monitoring via metadata service")
                 await self.ctx_router.stop_server_monitoring()
                 await self.gen_router.stop_server_monitoring()
 
@@ -170,12 +168,12 @@ class OpenAIDisaggServer:
 
     async def _handle_exception(self, exception):
         if isinstance(exception, CppExecutorError):
-            logging.exception(exception)
+            logger.error(exception)
             signal.raise_signal(signal.SIGINT)
         elif isinstance(exception, HTTPException):
             raise exception  # Re-raise HTTP exceptions properly
         else:
-            logging.exception(exception)
+            logger.error(exception)
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
     async def _send_context_request(self, ctx_server: str, ctx_req: Union[CompletionRequest, ChatCompletionRequest]):
@@ -184,7 +182,7 @@ class OpenAIDisaggServer:
         ctx_req.stream = False
         ctx_req.stream_options = None
 
-        logging.info("Sending request to ctx server: %s", ctx_server)
+        logger.debug("Sending request to ctx server: %s", ctx_server)
         try:
             if isinstance(ctx_req, ChatCompletionRequest):
                 ctx_response = await self.send_chat_request(ctx_server, ctx_req)
@@ -256,7 +254,7 @@ class OpenAIDisaggServer:
             # Pick a generation server if haven't reserved one, and send request
             if gen_server is None:
                 gen_server, _ = await self.gen_router.get_next_server(req)
-            logging.info("Sending request to gen server: %s", gen_server)
+            logger.debug("Sending request to gen server: %s", gen_server)
 
             if not req.stream:
                 try:
@@ -308,7 +306,7 @@ class OpenAIDisaggServer:
                             yield line
                             await asyncio.sleep(0)
                 except Exception as e:
-                    logging.error(f"Unexpected error in stream: {e}")
+                    logger.error(f"Unexpected error in stream: {e}")
                     raise
 
     async def create_completion_generator(self, url: str, request: CompletionRequest):
@@ -335,7 +333,7 @@ class OpenAIDisaggServer:
 
                 response_dict = await response.json()
                 if not response.ok:
-                    logging.error(f"Received failed response {response_dict}")
+                    logger.error(f"Received failed response {response_dict}")
                     response.raise_for_status()
                 return response_type(**response_dict)
 
@@ -345,26 +343,39 @@ class OpenAIDisaggServer:
     async def send_chat_request(self, url: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
         return await self.send_request(url, request, "/v1/chat/completions", ChatCompletionResponse, self.create_chat_generator)
 
-    async def check_server_ready(self, server_url: str) -> bool:
+    @classmethod
+    async def check_server_ready(cls, session: aiohttp.ClientSession, server_url: str) -> bool:
         try:
-            async with self.session.get(server_url+"/health") as response:
+            async with session.get(server_url+"/health") as response:
                 return response.status == 200
         except Exception:
             return False
 
-    async def wait_for_servers_ready(self, server_start_timeout_secs: int = 180):
-        async def are_servers_ready():
-            context_ready = all([await self.check_server_ready(url) for url in self.ctx_servers])
-            generation_ready = all([await self.check_server_ready(url) for url in self.gen_servers])
-            return context_ready and generation_ready
+    @classmethod
+    async def wait_for_all_servers_ready(cls, session: aiohttp.ClientSession,
+                                         ctx_servers: list[str],
+                                         gen_servers: list[str],
+                                         server_start_timeout_secs: int = 180):
+        async def get_unready_servers(servers: list[str]) -> list[str]:
+            servers_ready = await asyncio.gather(*[cls.check_server_ready(session, server) for server in servers])
+            return [server for server, ready in zip(servers, servers_ready) if not ready]
 
         async def check_all_servers_ready():
-            while not await are_servers_ready():
+            iter = 0
+            unready_servers = await get_unready_servers(ctx_servers + gen_servers)
+            while len(unready_servers) > 0:
                 wait_time = 3
-                logging.info("Context and generation servers are not ready. Waiting...")
+                logger.info(
+                    f"[{iter}] Servers are not ready. Waiting for {unready_servers}..."
+                )
                 await asyncio.sleep(wait_time)
-
+                iter += 1
+                unready_servers = await get_unready_servers(unready_servers)
         try:
             await asyncio.wait_for(check_all_servers_ready(), timeout=server_start_timeout_secs)
         except asyncio.CancelledError:
             raise TimeoutError("Timeout waiting for context and generation servers to be ready")
+        logger.info("Context and generation servers are ready")
+
+    async def wait_for_servers_ready(self, server_start_timeout_secs: int = 180):
+        await self.wait_for_all_servers_ready(self.session, self.ctx_servers, self.gen_servers, server_start_timeout_secs)

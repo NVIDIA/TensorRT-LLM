@@ -50,14 +50,23 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
     TORCH_CHECK(routing_bias.dim() == 1, "routing_bias must be 1D.");
     TORCH_CHECK(routing_bias.sizes()[0] == num_experts, "routing_bias has incorrect shape.");
 
-    TORCH_CHECK(top_k == 8 || top_k == 1, "Current routing kernel only supports top_k=1,8.");
-    TORCH_CHECK(topk_group == 4, "Current routing kernel only supports topk_group=4.");
+    if (n_group <= 0 || topk_group <= 0)
+    {
+        TORCH_CHECK(top_k == 1, "Current routing kernel (no groups) only supports top_k=1.");
+    }
+    else
+    {
+        TORCH_CHECK(top_k <= 8, "Current routing kernel (with groups) only supports top_k<=8.");
+        TORCH_CHECK(topk_group <= 4, "Current routing kernel (with groups) only supports topk_group<=4.");
+        TORCH_CHECK(topk_group <= n_group, "n_group must not be smaller than topk_group.");
+        TORCH_CHECK(num_experts % n_group == 0, "num_experts must be divisible by n_group");
+        // This check ensures we have enough experts in the selected groups to handle the top_k routing
+        TORCH_CHECK(top_k < (topk_group * num_experts / n_group),
+            "top_k must be less than total number of experts in selected groups");
+    }
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
-    TORCH_CHECK(num_experts % n_group == 0, "num_experts must be divisible by n_group");
     TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
-    // This check ensures we have enough experts in the selected groups to handle the top_k routing
-    TORCH_CHECK(top_k < (topk_group * num_experts / n_group),
-        "top_k must be less than total number of experts in selected groups");
+
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoERunnerArgs args;
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
 

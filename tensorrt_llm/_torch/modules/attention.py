@@ -595,12 +595,14 @@ class MLA(nn.Module):
 
         self.rope_fusion = self.mha.support_fused_rope()
         self.support_fused_qkv = self.mha.support_fused_qkv()
-        self.rotary_emb = RotaryEmbedding(
-            pos_embd_params.rope,
-            head_dim=self.qk_rope_head_dim,
-            is_neox=pos_embd_params.is_neox,
-        )
+        self.rotary_emb = None
         self.apply_rotary_emb = not self.rope_fusion
+        if self.apply_rotary_emb:
+            self.rotary_emb = RotaryEmbedding(
+                pos_embd_params.rope,
+                head_dim=self.qk_rope_head_dim,
+                is_neox=pos_embd_params.is_neox,
+            )
 
         if not config.skip_create_weights_in_init:
             self.create_weights()
@@ -739,8 +741,7 @@ class MLA(nn.Module):
 
             attn_output_context = self.forward_context(q_ctx, compressed_kv_ctx,
                                                        k_pe_ctx, attn_metadata,
-                                                       latent_cache_ctx,
-                                                       position_ids)
+                                                       latent_cache_ctx)
         else:
             attn_output_context = None
 
@@ -836,47 +837,15 @@ class MLA(nn.Module):
     def forward_context_with_cached_kv(
         self,
         q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        position_ids: Optional[torch.IntTensor] = None,
     ) -> torch.Tensor:
+        assert latent_cache is not None
         trtllm_attention = cast(TrtllmAttention, self.mha)
-        # split current q into q_nope and q_pe
-        q_nope, q_pe = q.view([
-            -1, self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim
-        ]).split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        # apply rope to current q_pe and k_pe
-        assert position_ids is not None
-        assert position_ids.dim() == 1 or (position_ids.dim() == 2
-                                           and position_ids.shape[0] == 1)
-        assert self.rotary_emb is not None
-        assert self.rotary_emb.head_dim == self.qk_rope_head_dim
-        assert q_pe.shape[0] == k_pe.shape[0]
-        q_pe = q_pe.contiguous().view(-1,
-                                      self.num_heads * self.qk_rope_head_dim)
-        q_pe, k_pe = self.rotary_emb(
-            position_ids[..., :attn_metadata.num_ctx_tokens], [q_pe, k_pe])
-        k_pe = k_pe.contiguous()
-
-        # build q for attention op
-        q_view = q.view(-1, self.num_heads,
-                        self.qk_nope_head_dim + self.qk_rope_head_dim)
-        q_view[:, :,
-               self.qk_nope_head_dim:] = q_pe.view(-1, self.num_heads,
-                                                   self.qk_rope_head_dim)
-        q = q_view.view(
-            -1,
-            self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim))
-        assert q.is_contiguous()
-
-        # append paged kv cache for mla
-        trtllm_attention.append_paged_kv_cache_for_mla(
-            compressed_kv,
-            k_pe,
-            attn_metadata,
-        )
+        # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
+        trtllm_attention.mla_rope_append_paged_kv_assign_q(
+            q, latent_cache, attn_metadata)
 
         # copy full_compressed_kv and full_k_pe from paged kv cache
         full_compressed_kv, full_k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
@@ -903,10 +872,10 @@ class MLA(nn.Module):
                                        self.qk_nope_head_dim)
         full_v = full_v.view(-1, self.num_heads, self.v_head_dim)
 
-        # build full_k and full_v
+        # build paged_full_kv
         tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
-        # paged kv cache should be initialized to 0 to avoid NaN
-        paged_full_kv = torch.zeros([
+        # paged_full_kv will be initialized to 0 in the kernel to avoid NaN
+        paged_full_kv = torch.empty([
             attn_metadata.num_contexts, 2,
             (attn_metadata.max_ctx_kv_len + tokens_per_block - 1) //
             tokens_per_block, self.num_heads, tokens_per_block,
@@ -921,6 +890,13 @@ class MLA(nn.Module):
             full_k_pe,
             attn_metadata,
         )
+
+        # release pytorch activation memory
+        full_compressed_kv = None
+        full_k_pe = None
+        full_kv = None
+        full_k_nope = None
+        full_v = None
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Currently we use BF16 MHA for context phase
@@ -947,14 +923,13 @@ class MLA(nn.Module):
         k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
         latent_cache: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.IntTensor] = None,
     ) -> torch.Tensor:
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
             if trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
                 return self.forward_context_with_cached_kv(
-                    q, compressed_kv, k_pe, attn_metadata, position_ids)
+                    q, latent_cache, attn_metadata)
         return self.forward_context_default(q, compressed_kv, k_pe,
                                             attn_metadata, latent_cache)
 
