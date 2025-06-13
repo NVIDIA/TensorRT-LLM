@@ -113,9 +113,9 @@ class MTPHiddenStatesManager(BaseResourceManager):
             self.mtp_relaxed_delta_pool[free_slot_id] = 0.
         self.slot_manager.remove_slot(request.request_id)
 
-    def add_dummy_requests(self, request_ids: List[int]):
-        for rid in request_ids:
-            self.slot_manager.add_slot(rid)
+    def prepare_dummy_resources(self, dummy_requests: List[LlmRequest]):
+        for req in dummy_requests:
+            self.slot_manager.add_slot(req.py_request_id)
 
     def shutdown(self):
         pass
