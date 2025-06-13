@@ -213,7 +213,8 @@ class LlmResult:
     def __getattr__(self, item):
         if item in self.py_result_properties:
             return getattr(self._py_result, item)
-        return getattr(self._result, item)
+        result = object.__getattribute__(self, '_result')
+        return getattr(result, item)
 
 
 class LlmResponse:
