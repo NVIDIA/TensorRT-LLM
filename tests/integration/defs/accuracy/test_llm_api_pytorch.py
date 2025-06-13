@@ -266,7 +266,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     def test_guided_decoding(self):
         llm = LLM(self.MODEL_PATH,
                   guided_decoding_backend="xgrammar",
-                  disable_overlap_scheduler=True)
+                  disable_overlap_scheduler=True,
+                  use_cuda_graph=True)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
@@ -276,6 +277,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         llm = LLM(self.MODEL_PATH,
                   guided_decoding_backend="xgrammar",
                   disable_overlap_scheduler=True,
+                  use_cuda_graph=True,
                   tensor_parallel_size=2,
                   pipeline_parallel_size=2)
         with llm:
