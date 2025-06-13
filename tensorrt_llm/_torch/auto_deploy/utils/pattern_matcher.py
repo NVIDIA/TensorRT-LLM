@@ -4,7 +4,6 @@ Utilities for registering and applying Torch-Inductor FX-based pattern matchers.
 Work with `torch._inductor.pattern_matcher` in PyTorch ≥ 2.7.0.
 """
 
-
 import contextlib
 import inspect
 import itertools
@@ -16,7 +15,6 @@ from typing import Any, Callable, Iterable, NoReturn, Optional, Union
 import torch
 import torch.fx
 import torch.utils._pytree as pytree
-
 from torch._inductor import lowering
 from torch._inductor.pattern_matcher import (
     CallFunction,
@@ -33,7 +31,6 @@ from torch._inductor.pattern_matcher import (
 from torch.fx import GraphModule
 
 from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
-
 
 
 @contextlib.contextmanager
@@ -79,7 +76,6 @@ class _WrapperModule(torch.nn.Module):
 
     def forward(self, *args, **kwargs):
         return self.fn(*args, **kwargs)
-
 
 
 def _trace_to_gm(fn: Callable, args: Sequence[torch.Tensor]) -> GraphModule:
