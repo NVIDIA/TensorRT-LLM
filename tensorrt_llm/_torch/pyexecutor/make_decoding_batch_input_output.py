@@ -102,6 +102,7 @@ class MakeDecodingBatchInputOutput:
             decoder_input_buffers: Decoder input buffers
             decoder_state: Current decoder state
             max_num_sequences: Maximum number of sequences to process
+            cache_indirections: Cache indirections
 
         Returns:
             Tuple of (DecoderBatchInput, DecoderBatchOutput)

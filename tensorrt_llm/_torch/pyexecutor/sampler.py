@@ -535,8 +535,9 @@ class TRTLLMSampler(Sampler):
             DecoderState(dtype=self.logits_datatype,
                          buffer_manager=buffer_manager),
             "cache_indirections": [
-                torch.empty((self.executor_config.max_beam_width *
-                             self.max_attention_window, ),
+                torch.empty((self.executor_config.max_batch_size,
+                             self.executor_config.max_beam_width,
+                             self.max_attention_window),
                             dtype=torch.int,
                             device='cuda') for _ in range(2)
             ]
