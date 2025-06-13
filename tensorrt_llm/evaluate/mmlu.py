@@ -153,12 +153,19 @@ class MMLU(Evaluator):
     def dowload_dataset(self):
         import tarfile
         from tempfile import TemporaryDirectory
-        from urllib.request import urlretrieve
+
+        import requests
+
         self.tempdir = TemporaryDirectory()
         workspace = self.tempdir.name
-        urlretrieve(self.DATASET_URL, filename=f"{workspace}/data.tar")
+
+        response = requests.get(self.DATASET_URL)
+        with open(f"{workspace}/data.tar", "wb") as f:
+            f.write(response.content)
+
         with tarfile.open(f"{workspace}/data.tar") as tar:
-            tar.extractall(path=workspace)
+            tar.extractall(path=workspace, filter=tarfile.data_filter)
+
         return f"{workspace}/data"
 
     def format_subject(self, subject):
