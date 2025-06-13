@@ -278,7 +278,6 @@ class Attention(nn.Module):
             and spec_metadata.spec_dec_mode.require_multi_query_attn_kernel(
                 get_attention_backend(
                     self.attn_backend))) if spec_metadata is not None else False
-        # print("attention.py use_spec_dec", use_spec_dec)
         attn_output = self.attn.forward(
             q,
             k,
