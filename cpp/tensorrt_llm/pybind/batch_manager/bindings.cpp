@@ -366,7 +366,7 @@ void initBindings(pybind11::module_& m)
             [](tb::LlmRequest& self, bool use_fast_logits = false, int mpi_world_rank = 0)
             {
                 std::vector<char> serialized_result;
-                bool is_final = False;
+                bool is_final = false;
                 self.createSerializedResult(serialized_result, is_final, use_fast_logits, mpi_world_rank);
                 return py::str(serialized_result.data(), serialized_result.size()), is_final;
             })
