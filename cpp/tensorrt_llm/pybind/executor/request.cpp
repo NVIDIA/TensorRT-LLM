@@ -781,10 +781,9 @@ void initRequestBindings(pybind11::module_& m)
         {
             std::istream is(&x);
             return tle::serialize_utils::deserialize<tle::Result>(is);
-        })
+        });
 
-        auto responseGetstate
-        = [](tle::Response const& self)
+    auto responseGetstate = [](tle::Response const& self)
     { return py::make_tuple(self.getRequestId(), self.getResult(), self.getClientId()); };
 
     auto responseSetstate = [](py::tuple const& state)
