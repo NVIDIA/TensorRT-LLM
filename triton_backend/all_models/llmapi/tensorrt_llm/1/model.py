@@ -157,6 +157,7 @@ class TritonPythonModel:
                     )
             return
 
+    # This seems to be boilerplate code, can we extact them out?
     def _init_engine(self):
         """
         Initialize the LLM engine in a separate thread running the AsyncIO event loop.
@@ -313,6 +314,9 @@ class TritonPythonModel:
                 raise pb_utils.TritonModelException(
                     "Streaming is only supported in decoupled mode.")
             # Generate the response.
+            # TODO(Caron): add max_tokens=32, return_context_logits=True to sampling_params
+            sampling_params["max_tokens"] = 32
+            sampling_params["return_context_logits"] = True
             response_iterator = self._llm_engine.generate_async(
                 prompt, SamplingParams(**sampling_params), streaming)
 
@@ -419,6 +423,9 @@ class TritonPythonModel:
         text_output = [
             output.text.encode("utf-8") for output in request_output.outputs
         ]
+        # TODO(Caron): print the logits of the context instead of output.text for BERT
+        # however CompletionOutput doesn't seem to have context_logits field
+        print(request_output.outputs[0].context_logits)
 
         response.append(
             pb_utils.Tensor("text_output",

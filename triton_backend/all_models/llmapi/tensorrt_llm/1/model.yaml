@@ -1,7 +1,7 @@
 # ======= TRTLLM Model Configurations =======
 # The below configurations are used to initialize the LLM model
 # Check tensorrt_llm.llmapi.LLM for more details
-model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+model: textattack/bert-base-uncased-yelp-polarity
 backend: "pytorch"
 
 # Parallel Configurations
