@@ -305,6 +305,8 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
             def isAarch64 = config.contains("aarch64")
             def pytestTestTimeout = "7200"
             def testDBListCmd = getMakoOptsCmd(pipeline, remote, testList, llmSrcNode, stageName)
+            def makoArgs = getMakoArgsFromStageName(stageName, true)
+            def makoOptsJson = transformMakoArgsToJson(makoArgs)
             Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' ssh -oStrictHostKeyChecking=no ${remote.user}@${remote.host} 'mkdir ${jobWorkspace}'",)
 
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
@@ -326,7 +328,6 @@ cd /tmp
 testListPath="$jobWorkspace/${testList}.txt"
 testFilesPath="/tmp/single_test_files"
 resultsPath="$jobWorkspace/results"
-mkdir -p "\$testFilesPath"
 mkdir -p "\$resultsPath"
 if [ \$SLURM_LOCALID -eq 0 ]; then
     wget -nv $llmTarfile
@@ -340,34 +341,6 @@ if [ \$SLURM_LOCALID -eq 0 ]; then
     git config --global --add safe.directory "*"
     gpuUuids=\$(nvidia-smi -q | grep "GPU UUID" | awk '{print \$4}' | tr '\n' ',' || true)
     echo "HOST_NODE_NAME = \$HOST_NODE_NAME ; GPU_UUIDS = =\$gpuUuids ; STAGE_NAME = $stageName"
-    makoOpts=\$($testDBListCmd)
-    makoOptsJson="{"
-    first=1
-    while IFS='=' read -r key value; do
-        [[ -z "\$key" || -z "\$value" ]] && continue
-
-        key=\$(echo "\$key" | xargs)
-        value=\$(echo "\$value" | xargs)
-
-        lower_val=\$(echo "\$value" | tr '[:upper:]' '[:lower:]')
-        if [[ "\$lower_val" == "true" || "\$lower_val" == "false" ]]; then
-            json_value=\$lower_val
-        elif [[ "\$value" == "None" ]]; then
-            json_value=null
-        else
-            json_value="\\\"\$value\\\""
-        fi
-
-        if [ \$first -eq 1 ]; then
-            first=0
-        else
-            makoOptsJson+=","
-        fi
-
-        makoOptsJson+="\\\"\$key\\\":\$json_value"
-    done <<< "\$makoOpts"
-    makoOptsJson+="}"
-    echo "Test DB Mako opts: \$makoOptsJson"
     pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7
     testDBPath="$llmSrcNode/tests/integration/test_lists/test-db"
     testListPath="$jobWorkspace/${testList}.txt"
@@ -956,9 +929,49 @@ def generateStageFailTestResultXml(stageName, subName, failureLog, resultPath) {
         </failure></testcase></testsuite></testsuites>"""
 }
 
+def transformMakoArgsToJson(optList) {
+    def makoOpts = [:]
+    def startedMakoOpts = false
+    def param = null
+    def value = null
+    optList.each { val ->
+        if (startedMakoOpts) {
+            // Handle case where value is missing
+            param = null
+            value = null
+            try {
+                (param, value) = val.split("=")
+            } catch (ArrayIndexOutOfBoundsException ex) {
+                param = val.split("=")[0]
+                value = null
+            }
+
+            // Try to convert nulls, booleans, and floats into the correct type
+            if (value != null) {
+                if (value.toLowerCase() == "none") {
+                    echo "Converted mako param '${param}' value '${value}' to 'null'"
+                    value = null
+                } else if (value.toLowerCase() in ["true", "false"]) {
+                    echo "Converted mako param '${param}' value '${value}' to Boolean '${value.toBoolean()}'"
+                    value = value.toBoolean()
+                }
+            }
+            makoOpts[(param)] = value
+        }
+        if (val.equals("Mako options:")) {
+            startedMakoOpts = true
+        }
+    }
+
+    def makoOptsJson = JsonOutput.toJson(makoOpts)
+
+    // Print and return the Test DB Query as a JSON string
+    echo "Test DB Mako opts: ${makoOptsJson}"
+    return 
+}
+
 def getMakoOpts(getMakoScript, makoArgs=[]) {
     // We want to save a map for the Mako opts
-    def makoOpts = [:]
     def turtleOutput = ""
 
     // Echo the command
@@ -993,44 +1006,7 @@ def getMakoOpts(getMakoScript, makoArgs=[]) {
     // Split each line of turtle output into a list
     def turtleOutList = turtleOutput.split("\n")
 
-    // Extract the mako opts
-    def startedMakoOpts = false
-    def param = null
-    def value = null
-    turtleOutList.each { val ->
-        if (startedMakoOpts) {
-            // Handle case where value is missing
-            param = null
-            value = null
-            try {
-                (param, value) = val.split("=")
-            } catch (ArrayIndexOutOfBoundsException ex) {
-                param = val.split("=")[0]
-                value = null
-            }
-
-            // Try to convert nulls, booleans, and floats into the correct type
-            if (value != null) {
-                if (value.toLowerCase() == "none") {
-                    echo "Converted mako param '${param}' value '${value}' to 'null'"
-                    value = null
-                } else if (value.toLowerCase() in ["true", "false"]) {
-                    echo "Converted mako param '${param}' value '${value}' to Boolean '${value.toBoolean()}'"
-                    value = value.toBoolean()
-                }
-            }
-            makoOpts[(param)] = value
-        }
-        if (val.equals("Mako options:")) {
-            startedMakoOpts = true
-        }
-    }
-
-    // Finally, convert the query to a json string
-    def makoOptsJson = JsonOutput.toJson(makoOpts)
-
-    // Print and return the Test DB Query as a JSON string
-    echo "Test DB Mako opts: ${makoOptsJson}"
+    def makoOptsJson = transformMakoArgsToJson(turtleOutput)
 
     return makoOptsJson
 }
@@ -1107,8 +1083,7 @@ def getMakoOptsCmd(pipeline, remote, testContext, llmSrc, stageName) {
     return listMakoCmd
 }
 
-def renderTestDB(testContext, llmSrc, stageName) {
-    def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
+def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     def makoArgs = []
     def isPostMerge = stageName.contains("Post-Merge")
     makoArgs += [isPostMerge ? "stage=post_merge" : "stage=pre_merge"]
@@ -1139,6 +1114,22 @@ def renderTestDB(testContext, llmSrc, stageName) {
     } else {
         makoArgs += ["auto_trigger=others"]
     }
+
+    if (parseSysinfo) {
+        def matcher = (stageName =~ /([^-]+)-(\d+)_GPUs/)
+        if (matcher.find()) {
+            makoArgs += [
+                "gpu=${matcher.group(1)}",
+                "system_gpu_count=${matcher.group(2)}"
+            ]
+        }
+    }
+
+    return makoArgs
+}
+
+def renderTestDB(testContext, llmSrc, stageName) {
+    def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
 
     def makoOpts = getMakoOpts(scriptPath, makoArgs)
 
@@ -1943,7 +1934,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
-        "GB200-4_GPUs-2_Nodes-PyTorch-[Post-Merge]-1": ["gb200-4-gpus", "l0_gb200_multi_nodes", 1, 1, 4, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-[Post-Merge]-1": ["gb200-8-gpus", "l0_gb200_multi_nodes", 1, 1, 8, 2],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 

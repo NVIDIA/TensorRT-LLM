@@ -3,8 +3,8 @@ l0_gb200_multi_nodes:
 - condition:
     ranges:
       system_gpu_count:
-        gte: 4
-        lte: 4
+        gte: 8
+        lte: 8
     wildcards:
       gpu:
       - '*gb200*'
