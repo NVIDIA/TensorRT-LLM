@@ -8,8 +8,6 @@ l0_gb200_multi_nodes:
     wildcards:
       gpu:
       - '*gb200*'
-      linux_distribution_name: ubuntu*
-      cpu: aarch64
     terms:
       stage: post_merge
       backend: pytorch
