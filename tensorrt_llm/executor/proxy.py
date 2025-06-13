@@ -385,6 +385,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()
 
+    def is_shutdown(self) -> bool:
+        return self.doing_pre_shutdown
+
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """
             Low-level API to the executor. Return a "future" GenerationResult
