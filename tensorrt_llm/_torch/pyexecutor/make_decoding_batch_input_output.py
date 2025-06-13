@@ -83,27 +83,26 @@ class MakeDecodingBatchInputOutput:
         # Create decoder batch input
         decoding_input = DecoderBatchInput(logits_vec, max_active_decoder_steps)
         decoding_input.batch_slots = batch_slots
-        decoding_input.cache_indirection = cache_indirection_input
 
         return decoding_input
 
     def __call__(
-            self, context_requests: List[LlmRequest],
-            generation_requests: List[LlmRequest], decoder_buffers,
-            decoder_input_buffers, decoder_state, model_config,
-            max_num_sequences: int
+        self, context_requests: List[LlmRequest],
+        generation_requests: List[LlmRequest],
+        decoder_buffer_logits: list[torch.Tensor], decoder_input_buffers,
+        decoder_state, max_num_sequences: int,
+        cache_indirections: List[torch.Tensor]
     ) -> Tuple[DecoderBatchInput, DecoderBatchOutput]:
         """Create decoder batch inputs and outputs for the given requests.
 
         Args:
             context_requests: List of context requests
             generation_requests: List of generation requests
-            decoder_buffers: Decoder buffers
+            decoder_buffer_logits: Decoder buffer logits
             decoder_input_buffers: Decoder input buffers
             decoder_state: Current decoder state
-            model_config: Model configuration
             max_num_sequences: Maximum number of sequences to process
-            fused_runtime_buffers: Optional fused runtime buffers
+            cache_indirections: Cache indirections
 
         Returns:
             Tuple of (DecoderBatchInput, DecoderBatchOutput)
@@ -126,14 +125,14 @@ class MakeDecodingBatchInputOutput:
 
         # Create decoder batch inputs
         decoding_input = self.create_decoder_batch_inputs(
-            active_slots, decoder_state, decoder_buffers.logits,
-            max_num_sequences, decoder_input_buffers.forward_batch_slots,
-            decoder_buffers.cache_indirection_input)
+            active_slots, decoder_state, decoder_buffer_logits,
+            max_num_sequences, decoder_input_buffers.forward_batch_slots)
         decoding_input.generation_steps = generation_steps
+        decoding_input.cache_indirection = cache_indirections[0]
 
-        # Handle speculative decoding modes
-        if model_config.speculative_decoding_mode.has_draft_logits:
-            decoding_input.predicted_draft_logits = decoder_buffers.draft_buffers.predicted_draft_logits
+        # TODO: Handle speculative decoding modes
+        # if model_config.speculative_decoding_mode.has_draft_logits:
+        #     decoding_input.predicted_draft_logits = decoder_buffers.draft_buffers.predicted_draft_logits
 
         # TODO: fused_runtime_buffers is not created in the pytorch framework.
         # if model_config.speculative_decoding_mode.is_explicit_draft_tokens:
@@ -151,6 +150,6 @@ class MakeDecodingBatchInputOutput:
 
         # Create decoder batch output
         decoding_output = DecoderBatchOutput()
-        decoding_output.cache_indirection = decoder_buffers.cache_indirection_output
+        decoding_output.cache_indirection = cache_indirections[1]
 
         return decoding_input, decoding_output
