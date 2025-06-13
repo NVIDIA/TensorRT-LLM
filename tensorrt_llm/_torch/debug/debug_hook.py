@@ -178,6 +178,7 @@ def module_after_forward(module: nn.Module, input: torch.Tensor,
 
 # The function style to interface to enable debugger on all classes inherit from nn.Module.
 # Example:
+#       from tensorrt_llm._torch.debug.debug_hook import enable_debug_all_modules
 #       model_config = ModelConfig(pretrained_config=llama_config,
 #                                   attn_backend=backend)
 #       llama = LlamaForCausalLM(model_config).to(dtype).to(device)
@@ -220,6 +221,7 @@ def disable_debug_all_modules():
 
 # The context manager style interface to enable debugger on all classes inherit from nn.Module.
 # Example:
+#       from tensorrt_llm._torch.debug.debug_hook import debugger_addon_all_modules
 #       model_config = ModelConfig(pretrained_config=llama_config,
 #                                   attn_backend=backend)
 #       llama = LlamaForCausalLM(model_config).to(dtype).to(device)
@@ -284,6 +286,7 @@ def after_forward(module: nn.Module, args, kwargs, output):
 # If filter is provided, it will be used to filter out satisfied module to register hook.
 # If filter is not provided, all modules will be registered with hooks.
 # Example:
+#       from tensorrt_llm._torch.debug.debug_hook import enable_debug
 #       model_config = ModelConfig(pretrained_config=llama_config,
 #                                   attn_backend=backend)
 #       llama = LlamaForCausalLM(model_config).to(dtype).to(device)
@@ -348,6 +351,7 @@ def disable_debug():
 # If filter is provided, it will be used to filter out satisfied module to register hook.
 # If filter is not provided, all modules will be registered with hooks.
 # Example:
+#       from tensorrt_llm._torch.debug.debug_hook import debugger_addon
 #       model_config = ModelConfig(pretrained_config=llama_config,
 #                                   attn_backend=backend)
 #       llama = LlamaForCausalLM(model_config).to(dtype).to(device)
