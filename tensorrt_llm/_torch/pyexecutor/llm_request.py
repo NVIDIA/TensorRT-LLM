@@ -205,16 +205,18 @@ class LlmResult:
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs'))
 
-    def __init__(self, result: tensorrt_llm.bindings.executor.Result,
-                 py_result: PyResult):
+    def __init__(self,
+                 result: str,
+                 py_result: PyResult,
+                 is_final: bool = False):
         self._result = result
         self._py_result = py_result
+        self.is_final = is_final
 
     def __getattr__(self, item):
         if item in self.py_result_properties:
             return getattr(self._py_result, item)
-        result = object.__getattribute__(self, '_result')
-        return getattr(result, item)
+        return getattr(self, item)
 
 
 class LlmResponse:
@@ -312,10 +314,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self,
             use_fast_logits=False,
             mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
-        result = super().create_result(use_fast_logits, mpi_world_rank)
+        result, is_final = super().create_serialized_result(
+            use_fast_logits, mpi_world_rank)
         return LlmResponse(
             request_id=self.py_request_id,
-            result=LlmResult(result, self.py_result),
+            result=LlmResult(result, self.py_result, is_final),
             client_id=self.py_client_id) if result is not None else None
 
     @property
