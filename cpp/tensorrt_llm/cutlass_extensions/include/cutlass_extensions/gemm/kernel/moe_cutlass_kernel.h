@@ -36,7 +36,7 @@
 #include "cutlass_extensions/tile_interleaved_layout.h"
 #include "cutlass_extensions/weight_only_quant_op.h"
 
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_tma_warp_specialized_traits.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_tma_warp_specialized_traits.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 

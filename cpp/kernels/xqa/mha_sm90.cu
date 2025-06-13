@@ -937,7 +937,7 @@ CUBIN_EXPORT __global__
 #endif
 
             __syncwarp();
-            // the release semantics of arrive does not work for async consumers like gmma/utcmma. additional fence is
+            // the release semantics of arrive does not work for async consumers like gmma. additional fence is
             // needed.
             asm volatile("fence.proxy.async.shared::cta;\n");
             unused(xBar.produced.arrive());
@@ -1298,7 +1298,7 @@ CUBIN_EXPORT __global__
             smem.qBar.consumed.arrive_and_wait();
             QCvt::store(threadIdx.x, smem.q, f16QData);
 #endif
-            // the release semantics of arrive does not work for async consumers like gmma/utcmma. additional fence is
+            // the release semantics of arrive does not work for async consumers like gmma. additional fence is
             // needed.
             asm volatile("fence.proxy.async.shared::cta;\n");
             unused(smem.qBar.produced.arrive());
