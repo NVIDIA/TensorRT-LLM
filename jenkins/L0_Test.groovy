@@ -102,7 +102,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             allowAnyHosts: true,
         ]
 
-        Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client rsync")
+        Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
         pipeline.stage('Submit Test Results') {
             sh "mkdir -p ${stageName}"
             Utils.exec(
@@ -292,18 +292,11 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
     try {
         // Run ssh command to start node in desired cluster via SLURM
         withCredentials([
-
             usernamePassword(
                 credentialsId: 'svc_tensorrt',
                 usernameVariable: 'USERNAME',
                 passwordVariable: 'PASSWORD'
-            ),
-            usernamePassword(
-                credentialsId: 'svc_tensorrt_gitlab_read_api_token',
-                usernameVariable: 'GITLAB_API_USER',
-                passwordVariable: 'GITLAB_API_TOKEN'
-            ),
-            string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
+            )
         ]) {
             def remote = [
                     ip           : cluster.ip,
@@ -330,17 +323,19 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 // if the line cannot be split by "=", just ignore that line.
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
                 def coverageConfigFile = "${jobWorkspace}/.coveragerc"
+                // generate coverage rc
                 coverageConfigDestPath = Utils.createTempLocation(pipeline, "./.coveragerc")
-                // generate multi node run script
                 pipeline.writeFile(file: coverageConfigDestPath, text: """[run]
-    branch = True
-    data_file = ${jobWorkspace}/.coverage.${stageName}
-    [paths]
-    source =
-        ${llmSrcNode}/tensorrt_llm/
-        ---wheel_path---/tensorrt_llm/
+branch = True
+data_file = ${jobWorkspace}/.coverage.${stageName}
+[paths]
+source =
+    ${llmSrcNode}/tensorrt_llm/
+    ---wheel_path---/tensorrt_llm/
                 """)
                 Utils.exec(pipeline, script: "chmod +w ${coverageConfigDestPath}", returnStdout: true)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${coverageConfigDestPath} ${remote.user}@${remote.host}:${coverageConfigFile}",)
+                // generate multi node run script
                 scriptRunDestPath = Utils.createTempLocation(pipeline, "./slurm_run.sh")
                 pipeline.writeFile(file: scriptRunDestPath, text: """#!/bin/bash
 cd /tmp
@@ -427,7 +422,6 @@ eval "\$fullCmd"
                 Utils.exec(pipeline, script: "chmod +x ${scriptRunDestPath}", returnStdout: true)
                 println("Selected Cluster: ${cluster.name}")
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${scriptRunDestPath} ${remote.user}@${remote.host}:${jobWorkspace}/slurm_run.sh",)
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${coverageConfigDestPath} ${remote.user}@${remote.host}:${coverageConfigFile}",)
 
                 // generate multi node job launch script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
@@ -1029,78 +1023,6 @@ def getMakoOpts(getMakoScript, makoArgs=[]) {
     return makoOptsJson
 }
 
-def getGPUChipMappingPathOnNode(pipeline, remote) {
-    def mapFileName = "gpu_chip_mapping.json"
-    def chipInfoJsonPath = "/home/svc_tensorrt/bloom/scripts/${mapFileName}"
-    withCredentials([
-        usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD'),
-        // Add the withCredentials step to access gpu-chip-mapping file
-        file(credentialsId: 'gpu-chip-mapping', variable: 'GPU_CHIP_MAPPING')
-    ]) {
-        def gpuChipMapContent = readFile GPU_CHIP_MAPPING
-        destPath = Utils.createTempLocation(pipeline, mapFileName)
-        pipeline.writeFile(file: destPath, text: gpuChipMapContent)
-        Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${destPath} ${remote.user}@${remote.host}:${chipInfoJsonPath}",)
-    }
-    return chipInfoJsonPath
-}
-
-def getMakoOptsCmd(pipeline, remote, testContext, llmSrc, stageName) {
-    def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
-    def makoArgs = []
-    def isPostMerge = stageName.contains("Post-Merge")
-    makoArgs += [isPostMerge ? "stage=post_merge" : "stage=pre_merge"]
-    // Determine the backend type based on keywords in stageName
-    if (stageName.contains("-PyTorch-")) {
-        // If stageName contains "-PyTorch-", add "backend=pytorch" to makoArgs
-        // At this point, only tests with backend=pytorch or unspecified backend will be run
-        makoArgs += ["backend=pytorch"]
-    } else if (stageName.contains("-TensorRT-")) {
-        // If stageName contains "-TensorRT-", add "backend=tensorrt" to makoArgs
-        // At this point, only tests with backend=tensorrt or unspecified backend will be run
-        makoArgs += ["backend=tensorrt"]
-    } else if (stageName.contains("-CPP-")) {
-        // If stageName contains "-CPP-", add "backend=cpp" to makoArgs
-        // At this point, only tests with backend=cpp or unspecified backend will be run
-        makoArgs += ["backend=cpp"]
-    } else if (stageName.contains("-Triton-")) {
-        // If stageName contains "-Triton-", add "backend=triton" to makoArgs
-        // At this point, only tests with backend=triton or unspecified backend will be run
-        makoArgs += ["backend=triton"]
-    } else {
-        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", or "-Triton-", do not add any backend
-        // At this point, all tests will be run
-        // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
-    }
-    if (stageName.contains("-DeepSeek-")) {
-        makoArgs += ["auto_trigger=deepseek"]
-    } else {
-        makoArgs += ["auto_trigger=others"]
-    }
-    // We want to save a map for the Mako opts
-    def makoOpts = [:]
-    def turtleOutput = ""
-
-    // Echo the command
-    // NOTE: We redirect stderr to stdout so that we can capture
-    //  both stderr and stdout streams with the 'returnStdout' flag
-    //  in sh command.
-    def listMakoCmd = [
-        "python3",
-        scriptPath,
-        "--device 0"].join(" ")
-
-    if (makoArgs) {
-        def makoOptArgs = makoArgs.collect { "--mako-opt " + it }
-        listMakoCmd += " " + makoOptArgs.join(" ")
-    }
-    def pathChipMappingFile = getGPUChipMappingPathOnNode(pipeline, remote)
-    println pathChipMappingFile
-    listMakoCmd = [listMakoCmd, "--chip-mapping-file ${pathChipMappingFile}"].join(" ")
-    listMakoCmd = [listMakoCmd, "2>&1"].join(" ")
-    return listMakoCmd
-}
-
 def parseMultiNodeTaskConfigFromStageName(String stageName) {
     def taskConfig = null
     def matcher = (stageName =~ /([^-]+)-(\d+)_GPUs-(\d+)_Nodes/)
@@ -1161,6 +1083,7 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
 
 def renderTestDB(testContext, llmSrc, stageName) {
     def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
+    def makoArgs = getMakoArgsFromStageName(stageName)
 
     def makoOpts = getMakoOpts(scriptPath, makoArgs)
 
