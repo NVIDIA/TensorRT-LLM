@@ -144,6 +144,8 @@ class MultimodalEngineBuilder:
             build_qwen2_audio_engine(args)
         elif args.model_type == "pixtral":
             build_pixtral_engine(args)
+        elif args.model_type == "florence2":
+            build_florence2_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
@@ -1738,3 +1740,101 @@ def build_pixtral_engine(args):
         max_batch_size=args.max_batch_size,
         engine_name=f"model.engine",
         dtype=torch.bfloat16)
+
+
+def build_florence2_engine(args):
+    processor = AutoProcessor.from_pretrained(args.model_path)
+
+    raw_image = Image.new("RGB", [10, 10])  # dummy image
+    prompt = "<OD>"
+    inputs = processor(raw_image, prompt, return_tensors="pt").to(args.device, torch.float16)
+    pixel_values = inputs["pixel_values"]
+
+    class Florence2VisionWrapper(torch.nn.Module):
+        def __init__(
+            self,
+            vision_tower,
+            image_projection,
+            image_proj_norm,
+            image_pos_embed,
+            image_feature_source,
+            visual_temporal_embed,
+        ):
+            super().__init__()
+            self.vision_tower = vision_tower
+            self.image_proj_norm = image_proj_norm
+            self.image_pos_embed = image_pos_embed
+            self.image_projection = image_projection
+            self.visual_temporal_embed = visual_temporal_embed
+            self.image_feature_source = image_feature_source
+
+        def forward(self, pixel_values):
+            assert len(pixel_values.shape) == 4, f"invalid image shape {pixel_values.shape}"
+            batch_size, _, _, _ = pixel_values.shape
+            T = 1
+            x = self.vision_tower.forward_features_unpool(pixel_values)
+
+            # image_pos_embed
+            x = x.view(batch_size * T, -1, x.shape[-1])
+            num_tokens = x.shape[-2]
+            h, w = int(num_tokens**0.5), int(num_tokens**0.5)
+            assert h * w == num_tokens, "Only support square feature maps for now"
+            x = x.view(batch_size * T, h, w, x.shape[-1])
+            pos_embed = self.image_pos_embed(x)
+            x = x + pos_embed
+            x = x.view(batch_size, T * h * w, x.shape[-1])
+
+            # visual_temporal_embed
+            visual_temporal_embed = self.visual_temporal_embed(
+                x.view(batch_size, T, -1, x.shape[-1])[:, :, 0]
+            )
+            x = x.view(batch_size, T, -1, x.shape[-1]) + visual_temporal_embed.view(
+                1, T, 1, x.shape[-1]
+            )
+
+            x_feat_dict = {}
+
+            spatial_avg_pool_x = x.view(batch_size, T, -1, x.shape[-1]).mean(dim=2)
+            x_feat_dict["spatial_avg_pool"] = spatial_avg_pool_x
+
+            temporal_avg_pool_x = x.view(batch_size, T, -1, x.shape[-1]).mean(dim=1)
+            x_feat_dict["temporal_avg_pool"] = temporal_avg_pool_x
+
+            x = x.view(batch_size, T, -1, x.shape[-1])[:, -1]
+            x_feat_dict["last_frame"] = x
+
+            new_x = []
+            for _image_feature_source in self.image_feature_source:
+                if _image_feature_source not in x_feat_dict:
+                    raise ValueError(
+                        "invalid image feature source: {}".format(_image_feature_source)
+                    )
+                new_x.append(x_feat_dict[_image_feature_source])
+
+            x = torch.cat(new_x, dim=1)
+
+            x = x @ self.image_projection
+            x = self.image_proj_norm(x)
+
+            return x
+
+    model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=torch.float16)
+
+    wrapper = Florence2VisionWrapper(
+        model.vision_tower,
+        model.image_projection,
+        model.image_proj_norm,
+        model.image_pos_embed,
+        model.image_feature_source,
+        model.visual_temporal_embed,
+    )
+    wrapper.to(args.device)
+
+    export_onnx(wrapper, pixel_values, f"{args.output_dir}/onnx")
+    build_trt_engine(
+        args.model_type,
+        [pixel_values.shape[1], pixel_values.shape[2], pixel_values.shape[3]],  # [3, H, W]
+        f"{args.output_dir}/onnx",
+        args.output_dir,
+        args.max_batch_size,
+    )
