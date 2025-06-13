@@ -861,6 +861,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         architectures = model_config.pretrained_config.architectures
         model_config.pretrained_config = model_config.pretrained_config.text_config
         model_config.pretrained_config.architectures = architectures
+        super().__init__(Llama4Model(model_config), model_config)
 
     def forward(
         self,
