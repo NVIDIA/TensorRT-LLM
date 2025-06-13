@@ -62,16 +62,20 @@ Manually searching YAML and Groovy files can be tedious.  The helper script
 
 ```bash
 python scripts/test_to_stage_mapping.py --tests "triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]"
+python scripts/test_to_stage_mapping.py --tests gpt_ib_ptuning
 python scripts/test_to_stage_mapping.py --stages A100X-Triton-Python-[Post-Merge]-1
 python scripts/test_to_stage_mapping.py --test-list my_tests.txt
 python scripts/test_to_stage_mapping.py --test-list my_tests.yml
 ```
 
-The first command prints the Jenkins stages that run the specified tests.  The
-second lists every test executed in the given stage.  When providing tests on
-the command line, quote each test string so the shell does not interpret the
-`[` and `]` characters as globs.  Alternatively, store the tests in a
-newline‑separated text file or a YAML list and supply it with `--test-list`.
+The first two commands print the Jenkins stages that run the specified tests or
+patterns. Patterns are matched by substring, so partial test names are
+supported out of the box. The third lists every test executed in the given stage. When
+providing tests on the command line, quote each test string so the shell does
+not interpret the `[` and `]` characters as globs. Alternatively, store the
+tests in a newline‑separated text file or a YAML list and supply it with
+`--test-list`.
+
 
 To run the same tests on your pull request, comment:
 
