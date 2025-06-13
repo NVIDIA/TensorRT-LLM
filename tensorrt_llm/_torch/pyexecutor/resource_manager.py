@@ -664,8 +664,8 @@ class KVCacheManager(BaseResourceManager):
         max_seq_len: int,
     ) -> Tuple[Dict[int, Tuple[int, int]], int, List[int]]:
         """
-        Validate and adjust attention windows against their upper bounds.
-        It will change the self.max_attention_window_vec inside the function.
+        Validate and adjust attention windows against their upper bounds if needed.
+        If there is no adjustment, the returned max_attention_window_vec will be the same as the input.
 
         Args:
             max_attention_window_vec: List of attention window sizes
