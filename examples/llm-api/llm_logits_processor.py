@@ -15,7 +15,6 @@ from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
 # This simple callback will output a specific token at each step irrespective of prompt.
 # Refer to ../bindings/executor/example_logits_processor.py for a more
 # sophisticated callback that generates JSON structured output.
-# Please also refer to sampling_params.py for adding subclass to the approved class list for deserialization
 class MyLogitsProcessor(LogitsProcessor):
 
     def __init__(self, allowed_token_id: int):

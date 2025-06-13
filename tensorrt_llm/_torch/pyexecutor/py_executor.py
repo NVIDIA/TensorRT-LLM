@@ -33,7 +33,7 @@ from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
                           LlmRequestState, executor_request_to_llm_request)
 from .model_engine import ModelEngine
-from .sampler import Sampler, SampleState, SampleStateTensors
+from .sampler import Sampler, SampleState, SampleStateTensors, TorchSampler
 from .scheduler import ScheduledRequests
 
 # Environment variable to specify iteration ranges for profiling start/stop.
@@ -1087,11 +1087,11 @@ class PyExecutor:
                     # This is necessary because _forward_step updates the state before _update_requests is executed.
                     scheduled_batch.chunked_requests = [
                         r for r in scheduled_batch.context_requests
-                        if r.get_context_remaining_length() != 0
+                        if r.context_remaining_length != 0
                     ]
                     scheduled_batch.context_requests = [
                         r for r in scheduled_batch.context_requests
-                        if r.get_context_remaining_length() == 0
+                        if r.context_remaining_length == 0
                     ]
 
                     if self.enable_iter_perf_stats:
@@ -1421,8 +1421,9 @@ class PyExecutor:
             ctx_blocks_list = [0] * (block_size +
                                      self.dist.cp_config['cp_anchor_size'])
 
-            req = executor_request_to_llm_request(req_id, exe_req,
-                                                  ctx_blocks_list)
+            req = executor_request_to_llm_request(
+                req_id, exe_req, self._should_exclude_last_generation_logits(),
+                ctx_blocks_list)
             req.gen_iters = 0
             req.ctx_iters = 0
             req.ctx_blocks = ctx_blocks
@@ -1446,7 +1447,9 @@ class PyExecutor:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')
         else:
             return [
-                executor_request_to_llm_request(req_item.id, req_item.request)
+                executor_request_to_llm_request(
+                    req_item.id, req_item.request,
+                    self._should_exclude_last_generation_logits())
                 for req_item in new_requests
             ]
 
@@ -1505,6 +1508,10 @@ class PyExecutor:
                 max_num_draft_tokens=self.max_draft_tokens,
             )[0]
             llm_request.is_attention_dp_dummy = True
+            spec_resource_manager = self.resource_manager.get_resource_manager(
+                'spec_resource_manager')
+            if spec_resource_manager is not None:
+                spec_resource_manager.add_dummy_requests([0])
             self.active_requests.append(llm_request)
 
     @nvtx_range("_prepare_disagg_gen_init")
@@ -1633,7 +1640,7 @@ class PyExecutor:
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
                 request.move_to_next_context_chunk()
-            if request.get_context_remaining_length() == 0:
+            if request.context_remaining_length == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
 
     def _update_request_states_star_attention(
@@ -2119,3 +2126,19 @@ class PyExecutor:
         for req in chain(scheduled_requests.context_requests,
                          scheduled_requests.generation_requests):
             self.inflight_req_ids.erase(req.request_id)
+
+    def _should_exclude_last_generation_logits(self) -> bool:
+        # When overlap scheduler is enabled then when starting to handle a new prompt,
+        # sample_async is called twice before the first call to update_requests:
+        # - 1st time as a context request that handles on the 1st generated token
+        # - 2nd time as a generation request that handles on the 2nd generated token.
+        # and only after these two calls the sampler's update_request method is called.
+        # So in a sampler that works by the expected flow of handling the logits in
+        # sample_async (TorchSampler is an anomaly that instead does that on
+        # update_requests), every update_request doesn't handle the newest token, but one
+        # before it. Since all these calls work on the same request object, then its
+        # logits storage contains the logits of both the token update_requests should work
+        # on, and also its next token. Thus, excluding the last generation logits from any
+        # getter is required, when not using TorchSampler.
+        return not self.disable_overlap_scheduler and not isinstance(
+            self.sampler, TorchSampler)

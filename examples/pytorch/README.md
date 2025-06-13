@@ -51,6 +51,7 @@ python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --mo
 |   `BertForSequenceClassification`    | BERT-based                                                   | `textattack/bert-base-uncased-yelp-polarity`                 |    L     |
 |       `DeepseekV3ForCausalLM`        | DeepSeek-V3                                                  | `deepseek-ai/DeepSeek-V3 `                                   |    L     |
 |         `Gemma3ForCausalLM`          | Gemma3                                                       | `google/gemma-3-1b-it`                                       |    L     |
+|`HCXVisionForCausalLM`| HyperCLOVAX-SEED-Vision | `naver-hyperclovax/HyperCLOVAX-SEED-Vision-Instruct-3B` | L + V |
 |          `LlavaLlamaModel`           | VILA                                                         | `Efficient-Large-Model/NVILA-8B`                             |  L + V   |
 | `LlavaNextForConditionalGeneration`  | LLaVA-NeXT                                                   | `llava-hf/llava-v1.6-mistral-7b-hf`                          |  L + V   |
 |          `LlamaForCausalLM`          | Llama 3 <br> Llama 3.1 <br> Llama 2 <br> LLaMA               | `meta-llama/Meta-Llama-3.1-70B`                              |    L     |

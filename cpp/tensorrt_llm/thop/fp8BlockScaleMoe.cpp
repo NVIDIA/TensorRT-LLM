@@ -38,23 +38,36 @@ torch::Tensor fp8_block_scale_moe_runner(torch::Tensor const& routing_logits, to
     TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float, "routing_logits must be float.");
     TORCH_CHECK(routing_logits.dim() == 2, "routing_logits must be 2D.");
     TORCH_CHECK(routing_logits.sizes()[1] == num_experts, "routing_logits has incorrect shape.");
-    TORCH_CHECK(routing_bias.scalar_type() == at::ScalarType::BFloat16, "routing_bias must be bfloat16.");
+    TORCH_CHECK(
+        routing_bias.scalar_type() == at::ScalarType::BFloat16 || routing_bias.scalar_type() == at::ScalarType::Float,
+        "routing_bias must be bfloat16 or float.");
     TORCH_CHECK(routing_bias.dim() == 1, "routing_bias must be 1D.");
     TORCH_CHECK(routing_bias.sizes()[0] == num_experts, "routing_bias has incorrect shape.");
 
-    TORCH_CHECK(top_k == 8, "Current routing kernel only supports top_k=8.");
-    TORCH_CHECK(topk_group == 4, "Current routing kernel only supports topk_group=4.");
+    if (n_group <= 0 || topk_group <= 0)
+    {
+        TORCH_CHECK(top_k == 1, "Current routing kernel (no groups) only supports top_k=1.");
+    }
+    else
+    {
+        TORCH_CHECK(top_k <= 8, "Current routing kernel (with groups) only supports top_k<=8.");
+        TORCH_CHECK(topk_group <= 4, "Current routing kernel (with groups) only supports topk_group<=4.");
+        TORCH_CHECK(topk_group <= n_group, "n_group must not be smaller than topk_group.");
+        TORCH_CHECK(num_experts % n_group == 0, "num_experts must be divisible by n_group");
+        // This check ensures we have enough experts in the selected groups to handle the top_k routing
+        TORCH_CHECK(top_k < (topk_group * num_experts / n_group),
+            "top_k must be less than total number of experts in selected groups");
+    }
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
-    TORCH_CHECK(num_experts % n_group == 0, "num_experts must be divisible by n_group");
     TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
-    // This check ensures we have enough experts in the selected groups to handle the top_k routing
-    TORCH_CHECK(top_k < (topk_group * num_experts / n_group),
-        "top_k must be less than total number of experts in selected groups");
+
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoERunnerArgs args;
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
 
     // setup args
+    // note: the assumption is that output data type is always Bfloat16 (the default)
     args.mDtypeElt = btg::Dtype::E4m3;
+    args.mDtypeExpW = routing_bias.scalar_type() == at::ScalarType::BFloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
     args.routing_logits = routing_logits.data_ptr<float>();
     args.routing_bias = routing_bias.data_ptr();
     args.hidden_states = hidden_states.data_ptr();
@@ -88,7 +101,7 @@ torch::Tensor fp8_block_scale_moe_runner(torch::Tensor const& routing_logits, to
     at::Tensor permuted_idx_to_token_idx
         = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     at::Tensor expert_weights = at::detail::empty_cuda(
-        {args.num_tokens, args.top_k}, at::ScalarType::BFloat16, routing_logits.device(), std::nullopt);
+        {args.num_tokens, args.top_k}, routing_bias.scalar_type(), routing_logits.device(), std::nullopt);
     at::Tensor expert_indexes = at::detail::empty_cuda(
         {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     at::Tensor expert_count_histogram = at::detail::empty_cuda({2 * 256},

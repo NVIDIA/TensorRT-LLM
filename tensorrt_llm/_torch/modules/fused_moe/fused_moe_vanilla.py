@@ -69,7 +69,8 @@ class VanillaMoE(nn.ModuleList):
         self.mapping = model_config.mapping
         self.parallel_size = self.mapping.tp_size
 
-        self.all_reduce = AllReduce(self.mapping)
+        self.all_reduce = AllReduce(mapping=self.mapping,
+                                    strategy=model_config.allreduce_strategy)
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
@@ -135,7 +136,7 @@ class VanillaMoE(nn.ModuleList):
 
         self.has_any_quant = False
         self.has_fp8_qdq = False
-        self.has_fp8_block_scales = False
+        self.has_deepseek_fp8_block_scales = False
         self.has_nvfp4 = False
         gate_up_proj_shape = (
             self.expert_size_per_partition,
@@ -212,7 +213,7 @@ class VanillaMoE(nn.ModuleList):
                     requires_grad=False,
                 )
             elif qc.layer_quant_mode.has_fp8_block_scales():
-                self.has_fp8_block_scales = True
+                self.has_deepseek_fp8_block_scales = True
 
                 self.gate_up_proj_weight = nn.Parameter(
                     torch.empty(

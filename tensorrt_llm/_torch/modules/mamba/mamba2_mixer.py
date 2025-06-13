@@ -88,15 +88,14 @@ class Mamba2Mixer(nn.Module):
         self.is_paged_state = False
 
         # in_proj
-        self.in_proj = Linear(
-            d_model,
-            d_in_proj,
-            bias=bias,
-            dtype=dtype,
-            mapping=self.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            quant_config=config.get_quant_config(),
-        )
+        self.in_proj = Linear(d_model,
+                              d_in_proj,
+                              bias=bias,
+                              dtype=dtype,
+                              mapping=self.mapping,
+                              tensor_parallel_mode=TensorParallelMode.COLUMN,
+                              quant_config=config.get_quant_config(),
+                              allreduce_strategy=config.allreduce_strategy)
 
         # conv1d, reuse Linear to store weights since it has support for TP > 1 already
         self.conv1d = Linear(
@@ -108,7 +107,7 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-        )
+            allreduce_strategy=config.allreduce_strategy)
 
         # A
         self.A = nn.Parameter(
@@ -138,26 +137,20 @@ class Mamba2Mixer(nn.Module):
         )
 
         # out_proj
-        self.out_proj = Linear(
-            d_inner,
-            d_model,
-            bias=bias,
-            dtype=dtype,
-            mapping=self.mapping,
-            tensor_parallel_mode=TensorParallelMode.ROW,
-            quant_config=config.get_quant_config(),
-        )
+        self.out_proj = Linear(d_inner,
+                               d_model,
+                               bias=bias,
+                               dtype=dtype,
+                               mapping=self.mapping,
+                               tensor_parallel_mode=TensorParallelMode.ROW,
+                               quant_config=config.get_quant_config(),
+                               allreduce_strategy=config.allreduce_strategy)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-
-        # warm up does not prepare resources, there are two warmup requests
-        is_warmup = attn_metadata.kv_cache_manager is None or attn_metadata.request_ids == [
-            0
-        ]
 
         # calculate split size
         num_contexts = attn_metadata.num_contexts
@@ -167,11 +160,18 @@ class Mamba2Mixer(nn.Module):
         split_gen = sum_seq[-1] - split_ctx
         split_size = [split_ctx, split_gen]
 
-        # handle warm up request
-        if not is_warmup:
-            state_indices = attn_metadata.kv_cache_manager.get_state_indices()
-            split_indices = torch.split(state_indices,
-                                        [num_contexts, num_generations])
+        state_indices = attn_metadata.kv_cache_manager.get_state_indices()
+
+        # warm up does not prepare resources, so no relevant state indices
+        is_warmup = state_indices.numel() == 0
+        if is_warmup:
+            # in this case, assume batch takes first indices in mamba cache
+            state_indices = torch.arange(num_contexts + num_generations,
+                                         device=state_indices.device,
+                                         dtype=state_indices.dtype)
+
+        split_indices = torch.split(state_indices,
+                                    [num_contexts, num_generations])
 
         split_seq_lens = torch.split(attn_metadata.seq_lens,
                                      [num_contexts, num_generations])
@@ -200,16 +200,11 @@ class Mamba2Mixer(nn.Module):
         out = []
         for req_type in batch:
 
-            if not is_warmup:
-                indices = split_indices[req_type].to(torch.device("cuda"))
-                conv_states = attn_metadata.kv_cache_manager.get_conv_states(
-                    self.layer_idx)
-                ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
-                    self.layer_idx)
-            else:
-                indices = None
-                conv_states = None
-                ssm_states = None
+            indices = split_indices[req_type].to(torch.device("cuda"))
+            conv_states = attn_metadata.kv_cache_manager.get_conv_states(
+                self.layer_idx)
+            ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
+                self.layer_idx)
 
             z, xbc, dt = torch.split(
                 split_zxbcdt[req_type],
@@ -278,8 +273,7 @@ class Mamba2Mixer(nn.Module):
                 y = rearrange(y, "b l h p -> (b l) (h p)")
 
                 # copy new ssm state
-                if not is_warmup:
-                    ssm_states[indices] = current_ssm_states
+                ssm_states[indices] = current_ssm_states
 
             # decode
             else:

@@ -8,7 +8,6 @@ import torch
 from pydantic import BaseModel
 
 from tensorrt_llm.bindings import executor as tllme
-from tensorrt_llm.executor.serialization import register_approved_ipc_class
 
 
 @dataclass(slots=True, kw_only=True)
@@ -71,14 +70,6 @@ class LogitsProcessor(ABC):
             client_id (int, optional): An optional client id.
         """
         pass  # noqa
-
-    def __init_subclass__(cls, **kwargs):
-        """
-        This method is called when a class inherits from LogitsProcessor.
-        """
-        # Register subclass as an approved class for deserialization across IPC boundaries.
-        super().__init_subclass__(**kwargs)
-        register_approved_ipc_class(cls)
 
 
 class BatchedLogitsProcessor(ABC):

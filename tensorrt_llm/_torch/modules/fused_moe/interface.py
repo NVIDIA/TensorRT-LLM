@@ -78,7 +78,8 @@ class MoE(nn.Module):
         self.parallel_size = self.mapping.tp_size
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
-        self.all_reduce = AllReduce(self.mapping)
+        self.all_reduce = AllReduce(mapping=self.mapping,
+                                    strategy=model_config.allreduce_strategy)
 
     @abstractmethod
     def create_weights(self):
@@ -112,7 +113,7 @@ class MoE(nn.Module):
         )
 
     @property
-    def has_fp8_block_scales(self):
+    def has_deepseek_fp8_block_scales(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_block_scales(
         )

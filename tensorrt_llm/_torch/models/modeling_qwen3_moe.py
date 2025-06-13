@@ -15,9 +15,9 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE, MoE,
-                                 Qwen3MoeRoutingMethod,
-                                 RenormalizeMoeRoutingMethod, RoutingMethodType,
-                                 create_moe)
+                                 RenormalizeMoeRoutingMethod,
+                                 RenormalizeNaiveMoeRoutingMethod,
+                                 RoutingMethodType, create_moe)
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..utils import disable_fp4_allgather
@@ -63,8 +63,8 @@ class Qwen3Gate(nn.Module):
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
-        if self.routing_method_type == RoutingMethodType.Qwen3:
-            return Qwen3MoeRoutingMethod(top_k=self.top_k)
+        if self.routing_method_type == RoutingMethodType.RenormalizeNaive:
+            return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k)
         elif self.routing_method_type == RoutingMethodType.Renormalize:
             return RenormalizeMoeRoutingMethod(top_k=self.top_k)
         else:
@@ -89,7 +89,8 @@ class Qwen3MoE(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.mapping = model_config.mapping
-        self.allreduce = AllReduce(self.mapping)
+        self.allreduce = AllReduce(mapping=model_config.mapping,
+                                   strategy=model_config.allreduce_strategy)
         self.enable_alltoall = Qwen3MoE.should_enable_alltoall(
             model_config, self.top_k)
         if self.enable_alltoall:
@@ -202,7 +203,8 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
 
-        self.allreduce = AllReduce(self.mapping)
+        self.allreduce = AllReduce(mapping=model_config.mapping,
+                                   strategy=model_config.allreduce_strategy)
         self.next_layer_layernorm: RMSNorm = None
 
         self.fusion_config = EagerFusionConfig()
