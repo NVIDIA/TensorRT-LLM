@@ -80,11 +80,9 @@ public:
                 ? executorConfig
                 : TrtGptModelInflightBatching::fixExecutorConfig(modelConfig, executorConfig);
 
-            auto optionalParams = batch_manager::TrtGptModelOptionalParams(fixedExecutorConfig, isLeaderInOrchMode);
-
             bool const ctxGenFusion = modelType == TrtGptModelType::InflightFusedBatching;
             return std::make_shared<TrtGptModelInflightBatching>(
-                logger, modelConfig, worldConfig, rawEngine, ctxGenFusion, optionalParams);
+                logger, modelConfig, worldConfig, rawEngine, ctxGenFusion, fixedExecutorConfig, isLeaderInOrchMode);
         }
 
         throw std::runtime_error("Invalid modelType in trtGptModelFactory");

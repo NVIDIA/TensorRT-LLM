@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -144,7 +145,7 @@ public:
 
     TrtGptModelInflightBatching(std::shared_ptr<nvinfer1::ILogger> logger, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, runtime::RawEngine const& rawEngine, bool ctxGenFusion,
-        TrtGptModelOptionalParams const& optionalParams = TrtGptModelOptionalParams());
+        executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode);
 
     ~TrtGptModelInflightBatching() override;
 

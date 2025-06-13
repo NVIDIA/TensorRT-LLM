@@ -1,4 +1,4 @@
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
+#include "tensorrt_llm/batch_manager/trtGptModelInflightBatching.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
@@ -6,7 +6,6 @@
 #include "tests/utils/common.h"
 #include "tests/utils/engines.h"
 #include "tests/utils/executorUtils.h"
-#include <tensorrt_llm/batch_manager/trtGptModelInflightBatching.h>
 
 #include "gtest/gtest.h"
 
@@ -92,18 +91,18 @@ std::unique_ptr<DecoderTestShared<TLogits>> SetupDecoderTest(TrivialConstantDeco
     modelConfig.setPagedContextFMHA(true);
 
     auto const worldConfig = runtime::WorldConfig();
-    auto optionalParams = batch_manager::TrtGptModelOptionalParams{};
-    auto kvCacheConfig = batch_manager::kv_cache_manager::KvCacheConfig{};
+    auto kvCacheConfig = executor::KvCacheConfig{};
+    kvCacheConfig.setMaxTokens(DecoderTestShared<TLogits>::kKvCacheMaxTokens);
 
-    kvCacheConfig.maxTokens = DecoderTestShared<TLogits>::kKvCacheMaxTokens;
-    optionalParams.kvCacheConfig = kvCacheConfig;
+    auto const executorConfig
+        = tensorrt_llm::executor::ExecutorConfig(params.maxBeamWidth, executor::SchedulerConfig(), kvCacheConfig, true,
+            true, 1, 1, executor::BatchingType::kINFLIGHT, params.maxBatchSize, params.maxNumTokens, std::nullopt,
+            std::nullopt, std::nullopt, std::nullopt, false, 1, std::nullopt, executor::ExtendedRuntimePerfKnobConfig(),
+            std::nullopt, 0, executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds, std::nullopt, std::nullopt);
+
     auto model = std::make_shared<batch_manager::TrtGptModelInflightBatching>(
-        logger, modelConfig, worldConfig, engine, false, optionalParams);
-    auto const executorConfig = tensorrt_llm::executor::ExecutorConfig(params.maxBeamWidth, executor::SchedulerConfig(),
-        executor::KvCacheConfig{}, true, true, 1, 1, executor::BatchingType::kINFLIGHT, params.maxBatchSize,
-        params.maxNumTokens, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, 1, std::nullopt,
-        executor::ExtendedRuntimePerfKnobConfig(), std::nullopt, 0,
-        executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds, std::nullopt, std::nullopt);
+        logger, modelConfig, worldConfig, engine, false, executorConfig, false);
+
     return std::make_unique<DecoderTestShared<TLogits>>(
         logger, rng, std::make_shared<executor::Executor>(model, executorConfig), randomLogits);
 }
