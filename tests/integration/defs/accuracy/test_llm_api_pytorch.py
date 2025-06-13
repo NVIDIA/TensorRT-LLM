@@ -1445,3 +1445,22 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
             task = GPQADiamond(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+
+class TestBielik11BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "speakleash/Bielik-11B-v2.2-Instruct"
+
+    def test_auto_dtype(self):
+        with LLM(f"{llm_models_root()}/Bielik-11B-v2.2-Instruct") as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    def test_fp8(self):
+        with LLM(f"{llm_models_root()}/Bielik-11B-v2.2-Instruct-FP8") as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
