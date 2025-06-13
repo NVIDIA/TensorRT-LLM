@@ -179,6 +179,16 @@ get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 add_subdirectory(${3RDPARTY_DIR}/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
 
+# LLGuidance dependency
+set(LLG_DIR ${3RDPARTY_DIR}/llguidance)
+set(LLG_LIB_PATH ${3RDPARTY_DIR}/llguidance/target/release/libllguidance.a)
+add_custom_command(
+  OUTPUT "${LLG_LIB_PATH}"
+  WORKING_DIRECTORY "${LLG_DIR}/parser"
+  COMMAND cargo build --release
+  COMMENT "Building LLGuidance static library")
+add_custom_target(build_llguidance ALL DEPENDS "${LLG_LIB_PATH}")
+
 # include as system to suppress warnings
 include_directories(
   SYSTEM
