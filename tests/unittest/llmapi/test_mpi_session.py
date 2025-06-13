@@ -1,6 +1,7 @@
 import os
 import subprocess  # nosec B404
 import sys
+import threading
 from subprocess import PIPE, Popen
 from typing import Literal
 
@@ -9,7 +10,7 @@ import pytest
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.llmapi.mpi_session import (MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
-                                             find_free_port, split_mpi_env)
+                                             split_mpi_env)
 
 
 def task0():
@@ -56,31 +57,39 @@ def run_client(server_addr, values_to_process):
 @pytest.mark.parametrize("task_type", ["submit", "submit_sync"])
 def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
-    os.environ['TLLM_SPAWN_PROXY_PROCESS'] = "1"
-    os.environ[
-        'TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] = f"tcp://127.0.0.1:{find_free_port()}"
-
-    command = [
-        "mpirun", "--allow-run-as-root", "-np", "2", "trtllm-llmapi-launch",
-        "python3", "_run_mpi_comm_task.py", "--task_type", task_type
-    ]
+    command = ["bash", "_test_remote_mpi_session.sh", task_type]
     print(' '.join(command))
     with Popen(command,
                env=os.environ,
                stdout=PIPE,
                stderr=PIPE,
                bufsize=1,
+               start_new_session=True,
                universal_newlines=True) as process:
-        # Process both stdout and stderr in real-time
-        for line in process.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
 
-        for line in process.stderr:
-            sys.stderr.write(line)
-            sys.stderr.flush()
+        # Function to read from a stream and write to output
+        def read_stream(stream, output_stream):
+            for line in stream:
+                output_stream.write(line)
+                output_stream.flush()
 
+        # Create threads to read stdout and stderr concurrently
+        stdout_thread = threading.Thread(target=read_stream,
+                                         args=(process.stdout, sys.stdout))
+        stderr_thread = threading.Thread(target=read_stream,
+                                         args=(process.stderr, sys.stderr))
+
+        # Start both threads
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # Wait for the process to complete
         return_code = process.wait()
+
+        # Wait for both threads to finish reading
+        stdout_thread.join()
+        stderr_thread.join()
+
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, command)
 
