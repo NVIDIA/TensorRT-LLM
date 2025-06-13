@@ -46,7 +46,7 @@ public:
 
     TrtEncoderModel(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         runtime::RawEngine const& rawEngine, std::shared_ptr<nvinfer1::ILogger> logger,
-        TrtGptModelOptionalParams const& optionalParams);
+        executor::ExecutorConfig const& executorConfig);
 
     ~TrtEncoderModel() override;
 
