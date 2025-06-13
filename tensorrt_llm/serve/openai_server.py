@@ -17,6 +17,7 @@ from transformers import AutoConfig, AutoProcessor
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
+from tensorrt_llm.executor.result import IterationResult
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import LLM
@@ -198,8 +199,18 @@ class OpenAIServer:
 
     async def get_iteration_stats(self) -> JSONResponse:
         stats = []
-        async for stat in self.llm.get_stats_async(2):
-            stats.append(stat)
+        enable_iter_perf_stats = self.llm.pytorch_backend_config.enable_iter_perf_stats
+        if not enable_iter_perf_stats:
+            return stats
+        iter_perf_latest_stats_size = self.llm.pytorch_backend_config.iter_perf_latest_stats_size
+        if iter_perf_latest_stats_size is not None:
+            iter_result = self.llm.get_stats_async(2)
+            if isinstance(iter_result, IterationResult):
+                for stat in iter_result.get_latest(iter_perf_latest_stats_size):
+                    stats.append(stat)
+        else:
+            async for stat in self.llm.get_stats_async(2):
+                stats.append(stat)
         return JSONResponse(content=stats)
 
     async def get_kv_cache_events(self) -> JSONResponse:
