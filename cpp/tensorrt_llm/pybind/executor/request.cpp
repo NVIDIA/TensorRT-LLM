@@ -30,6 +30,7 @@
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <sstream>
 
 #include <optional>
 #include <vector>
@@ -779,7 +780,7 @@ void initRequestBindings(pybind11::module_& m)
     m.def("deserialize_result",
         [](std::string& x)
         {
-            std::istream is(&x);
+            std::istringstream is(x);
             return tle::serialize_utils::deserialize<tle::Result>(is);
         });
 
