@@ -233,17 +233,18 @@ class LlamaAttention(Attention):
 class Llama4MoE(nn.Module):
 
     def __init__(
-            self,
-            *,
-            num_experts: int,
-            top_k: int,
-            hidden_size: int,
-            intermediate_size: int,
-            shared_expert_intermediate_size: int,
-            aux_stream: torch.cuda.Stream,
-            dtype: Optional[torch.dtype] = None,
-            tune_max_num_tokens: int = 8192,
-            model_config: ModelConfig = ModelConfig(),
+        self,
+        *,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        shared_expert_intermediate_size: int,
+        aux_stream: torch.cuda.Stream,
+        dtype: Optional[torch.dtype] = None,
+        tune_max_num_tokens: int = 8192,
+        model_config: ModelConfig = ModelConfig(),
+        layer_idx: Optional[int] = None,
     ):
         from tensorrt_llm._torch.distributed import AllReduce
 
@@ -273,7 +274,8 @@ class Llama4MoE(nn.Module):
             False,  # In both low latency and max-throughput scenarios, FusedMoE needs not to do allreduce inside op.
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             model_config=model_config,
-            apply_router_weight_on_input=True)
+            apply_router_weight_on_input=True,
+            layer_idx=layer_idx)
 
         self.router = Linear(hidden_size,
                              num_experts,
@@ -403,7 +405,8 @@ class Llama4DecoderLayer(DecoderLayer):
                 shared_expert_intermediate_size=config.intermediate_size,
                 model_config=model_config,
                 aux_stream=aux_stream,
-                dtype=config.torch_dtype)
+                dtype=config.torch_dtype,
+                layer_idx=layer_idx)
 
             # self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp(
             # )
