@@ -197,7 +197,7 @@ def fp4_linear(
     )
     with autotune():
         output = torch.ops.trtllm.nvfp4_gemm(
-            x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, False, input.dtype
+            x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, input.dtype
         )
 
     if bias is not None:

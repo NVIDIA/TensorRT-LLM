@@ -519,7 +519,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         output = torch.ops.trtllm.nvfp4_gemm(act_fp4, module.weight, act_sf,
                                              module.weight_scale, module.alpha,
-                                             False, module.dtype)
+                                             module.dtype)
         if bias is not None:
             output = output + bias
         return output
@@ -629,6 +629,121 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.alpha, alpha)
 
 
+class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        module.scaling_vector_size = 32
+        assert module.in_features % module.scaling_vector_size == 0, f"in_features {module.in_features} must be divisible by scaling_vector_size {module.scaling_vector_size}"
+        # Quantized weights
+        module.weight = Parameter(torch.empty(
+            [module.out_features, module.in_features // 2],
+            dtype=fp4_utils.float4_e2m1x2),
+                                  requires_grad=False)
+
+        # FP8 per-block scaling factors. dtype must be aligned with SF_DTYPE
+        # Padding is required. See computeSFSize in quantization.h
+        nrows = fp4_utils.pad_up(module.out_features, 128)
+        ncols = fp4_utils.pad_up(
+            module.in_features // module.scaling_vector_size, 4)
+        module.weight_scale = Parameter(torch.empty(
+            [nrows * ncols], dtype=fp4_utils.float4_sf_dtype),
+                                        requires_grad=False)
+
+        if bias:
+            module.bias = Parameter(torch.empty((out_features), dtype=dtype),
+                                    requires_grad=False)
+        else:
+            module.register_parameter("bias", None)
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        fp8_input, input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
+            input)
+        input_scale = input_scale.to(torch.float32)
+        nrows = fp4_utils.pad_up(input.shape[0], 128)
+        ncols = fp4_utils.pad_up(input.shape[1] // module.scaling_vector_size,
+                                 4)
+        # 01111111 is 2^(127 - 127) = 1 in E8M0
+        module.fake_act_scale = torch.empty(
+            [nrows * ncols], dtype=torch.uint8,
+            device=fp8_input.device).fill_(127).view(fp4_utils.float4_sf_dtype)
+        output = torch.ops.trtllm.w4a8_mxfp4_fp8_gemm(fp8_input, module.weight,
+                                                      module.fake_act_scale,
+                                                      module.weight_scale,
+                                                      input_scale, module.dtype)
+        if bias is not None:
+            output = output + bias
+        return output
+
+    def load_weight_scales(self,
+                           weights: List[Dict],
+                           tp_size: int = 1,
+                           tp_rank: int = 0,
+                           tp_mode: Optional[TensorParallelMode] = None):
+        # For concatenated weights (qkv_proj / up_gate_proj), the global scaling factors and input scaling factors should be shared.
+        weight_scale = []
+        device = torch.device("cuda")
+        for w in weights:
+            if "weight_scale" in w:
+                ws = load_weight_shard(w["weight_scale"],
+                                       tp_size,
+                                       tp_rank,
+                                       tp_mode,
+                                       device=device).contiguous()
+                # Should be E8M0 for MXFP4
+                assert ws.dtype == torch.uint8
+                weight_scale.append(ws.view(fp4_utils.float4_sf_dtype))
+        return weight_scale
+
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
+        load_weights_vanilla_helper(module, weights)
+
+        weight_scale = self.load_weight_scales(weights,
+                                               tp_size=module.tp_size,
+                                               tp_rank=module.tp_rank,
+                                               tp_mode=module.tp_mode)
+        assert len(weights) == 1
+        weight_scale = weight_scale[0]
+        # Swizzle weight scale
+        weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+            weight_scale)
+        copy_weight(module.weight_scale, weight_scale)
+
+    def load_weights_fused_qkv_linear(self, module: Linear,
+                                      weights: List[Dict]):
+        q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
+            module, weights)
+        fused_weight = torch.cat((q_weight, k_weight, v_weight))
+        copy_weight(module.weight, fused_weight)
+
+        weight_scale = self.load_weight_scales(weights,
+                                               tp_size=module.tp_size,
+                                               tp_rank=module.tp_rank,
+                                               tp_mode=module.tp_mode)
+        weight_scale = torch.cat(weight_scale, 0)
+        weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+            weight_scale)
+        copy_weight(module.weight_scale, weight_scale)
+
+    def load_weights_fused_gate_up_linear(self, module: Linear,
+                                          weights: List[Dict]):
+        gate_weight, up_weight = load_weights_fused_gate_up_helper(
+            module, weights)
+        fused_weight = torch.cat((gate_weight, up_weight))
+        copy_weight(module.weight, fused_weight)
+
+        weight_scale = self.load_weight_scales(weights,
+                                               tp_size=module.tp_size,
+                                               tp_rank=module.tp_rank,
+                                               tp_mode=module.tp_mode)
+        # Swizzle weight scales after concatenation
+        weight_scale = torch.cat(weight_scale, 0)
+        weight_scale = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+            weight_scale)
+        copy_weight(module.weight_scale, weight_scale)
+
+
 def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config is None or not quant_config.layer_quant_mode.has_any_quant(
             exclude_kv_cache=True):
@@ -639,6 +754,8 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
         return FP8BlockScalesLinearMethod()
     if quant_config.layer_quant_mode.has_nvfp4():
         return NVFP4LinearMethod()
+    if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
+        return W4A8MXFP4FP8LinearMethod()
     raise ValueError(f'unsupported quant mode: {quant_config.quant_mode}')
 
 
