@@ -73,10 +73,12 @@ def parse_disagg_config_file(yaml_config_file: str):
 
 def extract_disagg_cfg(hostname: str = 'localhost',
                        port: int = 8000,
-                       context_servers: dict = dict(),
-                       generation_servers: dict = dict(),
+                       context_servers: Optional[dict] = None,
+                       generation_servers: Optional[dict] = None,
                        conditional_disagg_config: Optional[dict] = None,
                        **kwargs: Any) -> DisaggServerConfig:
+    context_servers = context_servers or {}
+    generation_servers = generation_servers or {}
 
     # If parameters are specified outside the context_severs and generation_servers sections,
     # make sure they match
@@ -94,12 +96,13 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                 # Inherit the value from the top-level
                 servers[key] = value
 
+    ctx_router_config = extract_router_config(context_servers)
+    gen_router_config = extract_router_config(generation_servers)
+
     server_configs = extract_ctx_gen_cfgs(
         type="ctx", **context_servers) + extract_ctx_gen_cfgs(
             type="gen", **generation_servers)
 
-    ctx_router_config = extract_router_config(context_servers)
-    gen_router_config = extract_router_config(generation_servers)
     ctx_router_config.server_role = ServerRole.CONTEXT
     gen_router_config.server_role = ServerRole.GENERATION
 
@@ -158,7 +161,7 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
 
 def extract_router_config(server_cfg: dict) -> RouterConfig:
 
-    args = server_cfg.get("router", {})
+    args = server_cfg.pop("router", {})
     router_type = args.pop("type", "round_robin")
 
     # add fields that are not specific to router
