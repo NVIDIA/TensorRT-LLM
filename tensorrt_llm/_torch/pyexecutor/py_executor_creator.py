@@ -231,7 +231,9 @@ def create_py_executor(executor_config: ExecutorConfig,
                 pytorch_backend_config,
                 batch_size=executor_config.max_batch_size,
                 max_num_tokens=executor_config.max_num_tokens,
-                max_seq_len=model_engine.max_seq_len,
+                # Note: The draft model engine will infer its own max_seq_len.
+                # We'll stop drafting when we hit the max.
+                max_seq_len=executor_config.max_seq_len,
                 mapping=mapping,
                 attn_runtime_features=attn_runtime_features,
                 dist=dist,
