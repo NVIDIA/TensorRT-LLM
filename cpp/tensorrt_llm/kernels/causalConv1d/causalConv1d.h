@@ -1,5 +1,9 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Adapted from https://github.com/state-spaces/mamba/blob/main/csrc/selective_scan/selective_scan.h
+ * and https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/static_switch.h
+ * Copyright (c) 2023, Tri Dao.
+ *
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
