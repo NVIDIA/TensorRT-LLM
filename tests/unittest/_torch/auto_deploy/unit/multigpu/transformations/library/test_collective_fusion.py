@@ -26,8 +26,8 @@ class MLPAllReduce(nn.Module):
         self.linear2 = cls(4 * in_features, out_features, bias=bias)
 
     def forward(self, x):
-        y = F.relu(torch.ops.dist.all_reduce(self.linear1(x)))
-        return torch.ops.dist.all_reduce(self.linear2(y))
+        y = F.relu(torch.ops.auto_deploy.torch_dist_all_reduce(self.linear1(x)))
+        return torch.ops.auto_deploy.torch_dist_all_reduce(self.linear2(y))
 
 
 def _run_job(
@@ -58,7 +58,7 @@ def _run_job(
 
     def check_transformed_graph(gm):
         return any(is_op(n, op_expected) for n in gm.graph.nodes) and not any(
-            is_op(n, torch.ops.dist.all_reduce) for n in gm.graph.nodes
+            is_op(n, torch.ops.auto_deploy.torch_dist_all_reduce) for n in gm.graph.nodes
         )
 
     # now run the test

@@ -68,7 +68,7 @@ PytorchExportedProgramAdapterImpl.add_outputs_metadata = add_outputs_metadata
 
 # TODO(yudong): make custom_ops configurable
 CUSTOM_OPS = (
-    torch.ops.dist.all_reduce.default,
+    torch.ops.auto_deploy.torch_dist_all_reduce.default,
     torch.ops.aten.slice.Tensor,
     torch.ops.auto_deploy.triton_attention_fused_mha_with_cache.default,
     torch.ops.linear.fused_linear_all_reduce.default,
