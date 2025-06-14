@@ -9,14 +9,15 @@ corresponds exactly to a test name, it naturally matches that test as well.
 
 Example usage::
 
-   python scripts/test_to_stage_mapping.py --tests \
+   python scripts/test_to_stage_mapping.py --tests \\
        "triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]"
    python scripts/test_to_stage_mapping.py --tests gpt_ib_ptuning
-   python scripts/test_to_stage_mapping.py --stages A100X-Triton-Python-[Post-Merge]-1
+   python scripts/test_to_stage_mapping.py --stages \\
+       A100X-Triton-Python-[Post-Merge]-1
 
 Tests can also be provided via ``--test-list`` pointing to either a plain text
-file or a YAML list file. Quote individual test names on the command line so the
-shell does not interpret ``[`` and ``]`` characters.
+file or a YAML list file. Quote individual test names on the command line so
+the shell does not interpret ``[`` and ``]`` characters.
 """
 
 import argparse
@@ -81,6 +82,7 @@ class StageQuery:
                 if key == 'version' or entries is None:
                     continue
                 for entry in entries:
+                    # Extract stage type
                     stage = entry.get(
                         'terms',
                         entry.get('condition', {}).get('terms',
@@ -90,10 +92,24 @@ class StageQuery:
                                                                {}).get('stage')
                     if stage is None:
                         continue
+
+                    # Extract backend
+                    backend = entry.get(
+                        'terms',
+                        entry.get('condition', {}).get('terms',
+                                                       {})).get('backend')
+                    if backend is None:
+                        condition_terms = entry.get('condition',
+                                                    {}).get('terms', {})
+                        backend = condition_terms.get('backend')
+                    # Default to empty string if no backend specified
+                    if backend is None:
+                        backend = ''
+
                     tests = entry.get('tests', [])
                     yml = os.path.basename(path)
                     for t in tests:
-                        test_map[t].append((yml, stage))
+                        test_map[t].append((yml, stage, backend))
                         yaml_stage_tests[yml][stage].append(t)
         return test_map, yaml_stage_tests
 
@@ -109,12 +125,19 @@ class StageQuery:
     def tests_to_stages(self, tests):
         result = set()
         for t in tests:
-            for yml, stage_type in self.test_map.get(t, []):
+            for yml, stage_type, backend in self.test_map.get(t, []):
                 for s in self.yaml_to_stages.get(yml, []):
                     if stage_type == 'post_merge' and 'Post-Merge' not in s:
                         continue
                     if stage_type == 'pre_merge' and 'Post-Merge' in s:
                         continue
+
+                    # Filter by backend if specified
+                    if backend and backend != '':
+                        backend_upper = backend.upper()
+                        if backend_upper not in s.upper():
+                            continue
+
                     result.add(s)
         return sorted(result)
 
@@ -125,8 +148,30 @@ class StageQuery:
             if not yml:
                 continue
             stage_type = 'post_merge' if 'Post-Merge' in s else 'pre_merge'
-            result.update(
-                self.yaml_stage_tests.get(yml, {}).get(stage_type, []))
+
+            # Determine expected backend from stage name
+            expected_backend = None
+            stage_upper = s.upper()
+            if 'PYTORCH' in stage_upper:
+                expected_backend = 'pytorch'
+            elif 'CPP' in stage_upper:
+                expected_backend = 'cpp'
+            elif 'TENSORRT' in stage_upper:
+                expected_backend = 'tensorrt'
+            elif 'TRITON' in stage_upper:
+                expected_backend = 'triton'
+
+            # Get all tests for yml/stage_type, then filter by backend
+            all_tests = self.yaml_stage_tests.get(yml, {}).get(stage_type, [])
+            for test in all_tests:
+                # Check if test's backend matches stage's expected backend
+                test_mappings = self.test_map.get(test, [])
+                for test_yml, test_stage, test_backend in test_mappings:
+                    if (test_yml == yml and test_stage == stage_type
+                            and (expected_backend is None
+                                 or test_backend == expected_backend)):
+                        result.add(test)
+                        break
         return sorted(result)
 
 
