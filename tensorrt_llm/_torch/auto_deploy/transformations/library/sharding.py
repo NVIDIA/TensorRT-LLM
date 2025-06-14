@@ -168,8 +168,8 @@ def _insert_sharded_matmul(
 
     # figure out the right dist op
     dist_lookup = {
-        0: (torch.ops.dist.all_gather, -1),
-        1: (torch.ops.dist.all_reduce,),
+        0: (torch.ops.auto_deploy.torch_dist_all_gather, -1),
+        1: (torch.ops.auto_deploy.torch_dist_all_reduce,),
     }
     fn_dist, *dist_args = dist_lookup[dim]
 
@@ -424,7 +424,7 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
         base_size = bmm_batch_size // world_size
         remainder = bmm_batch_size % world_size
 
-        # NOTE: our torch.ops.dist.all_gather doesn't support uneven splits at the moment.
+        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather doesn't support uneven splits at the moment.
         if remainder:
             ad_logger.warning(
                 f"BMM batch size {bmm_batch_size} is not divisible by world size {world_size}. "
@@ -451,7 +451,7 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
         # Add all_gather node after BMM to collect results
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
-                torch.ops.dist.all_gather,
+                torch.ops.auto_deploy.torch_dist_all_gather,
                 args=(node, 0),  # Gather along batch dimension (0)
             )
             node.replace_all_uses_with(gather_node)
