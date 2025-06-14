@@ -22,7 +22,7 @@ from .triton_attention import _flattened_context_mha, _generate_mha
 Constant = Union[int, float, str, None]
 
 
-@torch.library.custom_op("attention::fused_flattened_mla_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_attention_fused_flattened_mla_with_cache", mutates_args=())
 def fused_flattened_mla_with_cache(
     # Q, K, V
     q_nope: torch.Tensor,
@@ -225,7 +225,7 @@ class MultiHeadLatentAttention(AttentionDescriptor):
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.attention.fused_flattened_mla_with_cache
+        return torch.ops.auto_deploy.triton_attention_fused_flattened_mla_with_cache
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
