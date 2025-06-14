@@ -71,7 +71,8 @@ public:
     {
     }
 
-    std::tuple<TensorPtr, std::vector<runtime::decoder_batch::Request>, std::vector<runtime::SamplingConfig>>
+    std::tuple<TensorPtr, std::vector<runtime::SamplingConfig>, std::vector<runtime::ITensor::SharedConstPtr>,
+        std::vector<executor::LookaheadDecodingConfig>>
     operator()(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
         runtime::BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
@@ -113,8 +114,9 @@ private:
     static void newRequestEagle(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
         runtime::ModelConfig const& modelConfig, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream);
 
-    [[nodiscard]] std::vector<runtime::decoder_batch::Request> createDecoderRequests(
-        RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
+    [[nodiscard]] std::tuple<std::vector<runtime::ITensor::SharedConstPtr>,
+        std::vector<executor::LookaheadDecodingConfig>>
+    createDecoderRequests(RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
         executor::DecodingConfig const& decodingConfig, runtime::decoder::DecoderState& decoderState,
         runtime::BufferManager const& bufferManager, nvinfer1::DataType logitsType,
         runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
