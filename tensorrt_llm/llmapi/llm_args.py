@@ -943,6 +943,12 @@ class BaseLlmArgs(BaseModel):
         description="The parser to separate reasoning content from output.",
         alias="_reasoning_parser")
 
+    garbage_collection_gen0_threshold: int = Field(
+        default=20000,
+        description=
+        "Threshold for Python garbage collection of generation 0 objects."
+        "Lower values trigger more frequent garbage collection.")
+
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
         default=None,

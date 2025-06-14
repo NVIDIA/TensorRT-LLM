@@ -58,6 +58,7 @@ class GenerationExecutorWorker(GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
@@ -116,9 +117,14 @@ class GenerationExecutorWorker(GenerationExecutor):
                 return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
                                      executor_config)
             args = {
-                "executor_config": executor_config,
-                "checkpoint_dir": executor_config.hf_model_dir,
-                "engine_dir": executor_config.trt_engine_dir,
+                "executor_config":
+                executor_config,
+                "checkpoint_dir":
+                executor_config.hf_model_dir,
+                "engine_dir":
+                executor_config.trt_engine_dir,
+                "garbage_collection_gen0_threshold":
+                garbage_collection_gen0_threshold,
             }
             if executor_config.backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
@@ -595,6 +601,7 @@ def worker_main(
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
+    garbage_collection_gen0_threshold: Optional[int] = None,
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -721,7 +728,8 @@ def worker_main(
             batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
-            lora_config=lora_config)
+            lora_config=lora_config,
+            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
