@@ -1,10 +1,14 @@
 import tempfile
 
+import pydantic_core
 import pytest
 import yaml
 
 import tensorrt_llm.bindings.executor as tle
+from tensorrt_llm._torch.llm import LLM as TorchLLM
+from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.llmapi.llm_args import *
+from tensorrt_llm.llmapi.utils import print_traceback_on_error
 
 from .test_llm import llama_model_path
 
@@ -216,3 +220,123 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.cuda_graph_batch_sizes == TorchLlmArgs._generate_cuda_graph_batch_sizes(
             128, True)
         assert args.cuda_graph_max_batch_size == 128
+
+
+class TestTrtLlmArgs:
+
+    def test_dynamic_setattr(self):
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            args = LlmArgs(model=llama_model_path, invalid_arg=1)
+
+        with pytest.raises(ValueError):
+            args = LlmArgs(model=llama_model_path)
+            args.invalid_arg = 1
+
+
+class TestTorchLlmArgs:
+
+    @print_traceback_on_error
+    def test_runtime_sizes(self):
+        llm = TorchLLM(
+            llama_model_path,
+            max_beam_width=4,
+            max_num_tokens=256,
+            max_seq_len=128,
+            max_batch_size=8,
+        )
+
+        assert llm.args.max_beam_width == 4
+        assert llm.args.max_num_tokens == 256
+        assert llm.args.max_seq_len == 128
+        assert llm.args.max_batch_size == 8
+
+        assert llm._executor_config.max_beam_width == 4
+        assert llm._executor_config.max_num_tokens == 256
+        assert llm._executor_config.max_seq_len == 128
+        assert llm._executor_config.max_batch_size == 8
+
+    def test_dynamic_setattr(self):
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            args = TorchLlmArgs(model=llama_model_path, invalid_arg=1)
+
+        with pytest.raises(ValueError):
+            args = TorchLlmArgs(model=llama_model_path)
+            args.invalid_arg = 1
+
+    def test_from_build_config(self):
+        build_config = BuildConfig(
+            max_beam_width=4,
+            max_batch_size=8,
+            max_num_tokens=256,
+        )
+        args = TorchLlmArgs.from_kwargs(model=llama_model_path,
+                                        build_config=build_config)
+
+        assert args.max_batch_size == build_config.max_batch_size
+        assert args.max_num_tokens == build_config.max_num_tokens
+        assert args.max_beam_width == build_config.max_beam_width
+
+
+class TestTrtLlmArgs:
+
+    def test_build_config_default(self):
+        args = TrtLlmArgs(model=llama_model_path)
+        # It will create a default build_config
+        assert args.build_config
+        assert args.build_config.max_beam_width == 1
+
+    def test_build_config_change(self):
+        build_config = BuildConfig(
+            max_beam_width=4,
+            max_batch_size=8,
+            max_num_tokens=256,
+        )
+        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
+        assert args.build_config.max_beam_width == build_config.max_beam_width
+        assert args.build_config.max_batch_size == build_config.max_batch_size
+        assert args.build_config.max_num_tokens == build_config.max_num_tokens
+
+    def test_LLM_with_build_config(self):
+        build_config = BuildConfig(
+            max_beam_width=4,
+            max_batch_size=8,
+            max_num_tokens=256,
+        )
+        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
+
+        assert args.build_config.max_beam_width == build_config.max_beam_width
+        assert args.build_config.max_batch_size == build_config.max_batch_size
+        assert args.build_config.max_num_tokens == build_config.max_num_tokens
+
+        assert args.max_beam_width == build_config.max_beam_width
+
+    def test_to_dict_and_from_dict(self):
+        build_config = BuildConfig(
+            max_beam_width=4,
+            max_batch_size=8,
+            max_num_tokens=256,
+        )
+        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
+        args_dict = args.to_dict()
+
+        new_args = TrtLlmArgs.from_kwargs(**args_dict)
+
+        assert new_args.to_dict() == args_dict
+
+    def test_build_config_from_engine(self):
+        build_config = BuildConfig(max_batch_size=8, max_num_tokens=256)
+        tmp_dir = tempfile.mkdtemp()
+        with LLM(model=llama_model_path, build_config=build_config) as llm:
+            llm.save(tmp_dir)
+
+        args = TrtLlmArgs(
+            model=tmp_dir,
+            # runtime values
+            max_num_tokens=16,
+            max_batch_size=4,
+        )
+        assert args.build_config.max_batch_size == build_config.max_batch_size
+        assert args.build_config.max_num_tokens == build_config.max_num_tokens
+
+        assert args.max_num_tokens == 16
+        assert args.max_batch_size == 4

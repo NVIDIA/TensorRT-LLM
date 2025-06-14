@@ -78,8 +78,8 @@ def main(model_dir: str, tp_size: int, engine_dir: Optional[str], n: int,
 
     # Simplified postprocessing configuration
     postproc_config = {
-        "_num_postprocess_workers": tp_size,
-        "_postprocess_tokenizer_dir": model_dir,
+        "num_postprocess_workers": tp_size,
+        "postprocess_tokenizer_dir": model_dir,
     }
 
     print_colored("Enabled OAI postprocessing\n", "yellow")
