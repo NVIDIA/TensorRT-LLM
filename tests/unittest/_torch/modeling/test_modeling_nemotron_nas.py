@@ -5,7 +5,8 @@ from typing import Any
 
 import torch
 from parameterized import parameterized
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.generation.utils import NEED_SETUP_CACHE_CLASSES_MAPPING
 from utils.llm_data import llm_models_root
 
@@ -371,20 +372,22 @@ class TestNemotronNAS(unittest.TestCase):
         reduce_nemotron_nas_config(mem_for_full_model, config_dict)
         if config_dict["num_hidden_layers"] <= 0:
             self.skipTest("Insufficient memory for a single NemotronNAS layer")
+
+        nemotron_nas_ckpt = llm_models_root(
+        ) / "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
         nemotron_nas_config = AutoConfig.from_pretrained(
-            llm_models_root() / "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct",
+            nemotron_nas_ckpt,
             trust_remote_code=True,
         )
+        class_ref = nemotron_nas_config.auto_map["AutoModelForCausalLM"]
         nemotron_nas_config = nemotron_nas_config.from_dict(config_dict)
         dtype = nemotron_nas_config.torch_dtype
         device = torch.device('cuda')
 
-        hf_nemotron_nas = AutoModelForCausalLM.from_pretrained(
-            llm_models_root() / "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct",
-            trust_remote_code=True,
-            device_map="meta")
-        hf_nemotron_nas = hf_nemotron_nas.__class__(nemotron_nas_config).to(
-            dtype).to(device).eval()
+        model_class = get_class_from_dynamic_module(class_ref,
+                                                    nemotron_nas_ckpt)
+        hf_nemotron_nas = model_class(nemotron_nas_config).to(dtype).to(
+            device).eval()
         # This line populates the "variable" field in the NEED_SETUP_CACHE_CLASSES_MAPPING dict
         hf_nemotron_nas._prepare_generation_config(None)
         # And this line is the only way to access the only concrete Cache class DeciLMForCausalLM accepts
