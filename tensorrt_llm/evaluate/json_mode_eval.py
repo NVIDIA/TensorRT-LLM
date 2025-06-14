@@ -12,72 +12,76 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 from typing import Iterable, List, Optional, Union
 
 import click
 import datasets
-import evaluate
+import numpy as np
 
 from .._torch import LLM as PyTorchLLM
 from ..llmapi import LLM, RequestOutput
 from ..logger import logger
-from ..sampling_params import SamplingParams
+from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .interface import Evaluator
 
 
-class CnnDailymail(Evaluator):
+class JsonModeEval(Evaluator):
 
     def __init__(self,
                  dataset_path: Optional[str] = None,
                  num_samples: Optional[int] = None,
                  random_seed: int = 0,
-                 rouge_path: Optional[str] = None,
-                 apply_chat_template: bool = False,
+                 apply_chat_template: bool = True,
                  system_prompt: Optional[str] = None):
+        if not apply_chat_template:
+            raise ValueError(
+                f"{self.__class__.__name__} requires apply_chat_template=True.")
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt)
         if dataset_path is None:
-            dataset_path = "ccdv/cnn_dailymail"
+            dataset_path = "NousResearch/json-mode-eval"
         self.data = datasets.load_dataset(dataset_path,
-                                          "3.0.0",
-                                          split="test",
+                                          split="train",
                                           trust_remote_code=True)
         self.data = self.data.shuffle(random_seed)
         if num_samples is None:
             self.num_samples = self.data.num_rows
         else:
             self.num_samples = min(num_samples, self.data.num_rows)
-        if rouge_path is None:
-            rouge_path = "rouge"
-        self.rouge = evaluate.load(rouge_path)
 
     def generate_samples(self) -> Iterable[tuple]:
         for i, sample in enumerate(self.data):
             if i >= self.num_samples:
                 break
-            prompt = sample["article"] + " TL;DR:"
-            prompt = prompt.strip().replace(" n't", "n't")
-            yield prompt, None, sample["highlights"]
+            sampling_args = {
+                "guided_decoding": GuidedDecodingParams(json=sample["schema"])
+            }
+            yield sample["prompt"], sampling_args, sample["completion"]
 
     def compute_score(self, outputs: List[RequestOutput],
                       references: List[str]) -> float:
-        for beam_idx in range(len(outputs[0].outputs)):
-            metrics = self.rouge.compute(
-                predictions=[output.outputs[0].text for output in outputs],
-                references=references)
-            logger.info(f"Beam {beam_idx} rouge scores:")
-            for key in metrics.keys():
-                logger.info(f"\t{key}: {metrics[key]*100:.3f}")
-            if beam_idx == 0:
-                rouge1 = metrics["rouge1"] * 100
-        return rouge1
+        all_corrections = []
+        for output, ref in zip(outputs, references):
+            try:
+                output_json = json.loads(output.outputs[0].text)
+            except json.JSONDecodeError:
+                all_corrections.append(False)
+                continue
+            ref_json = json.loads(ref)
+            all_corrections.append(output_json == ref_json)
 
-    @click.command("cnn_dailymail")
+        acc = np.mean(all_corrections) * 100
+        logger.info(
+            f"JSON Mode Eval accuracy: {acc:.2f} ({len(all_corrections)})")
+        return acc
+
+    @click.command("json_mode_eval")
     @click.option("--dataset_path",
                   type=str,
                   default=None,
-                  help="The path to CNN Dailymail dataset. "
+                  help="The path to JSON Mode Eval dataset. "
                   "If unspecified, the dataset is downloaded from HF hub.")
     @click.option(
         "--num_samples",
@@ -89,42 +93,31 @@ class CnnDailymail(Evaluator):
                   type=int,
                   default=0,
                   help="Random seed for dataset processing.")
-    @click.option("--rouge_path",
-                  type=str,
-                  default=None,
-                  help="The path to rouge repository."
-                  "If unspecified, the repository is downloaded from HF hub.")
-    @click.option("--apply_chat_template",
-                  is_flag=True,
-                  default=False,
-                  help="Whether to apply chat template.")
     @click.option("--system_prompt",
                   type=str,
                   default=None,
                   help="System prompt.")
     @click.option("--max_input_length",
                   type=int,
-                  default=924,
+                  default=1024,
                   help="Maximum prompt length.")
     @click.option("--max_output_length",
                   type=int,
-                  default=100,
+                  default=512,
                   help="Maximum generation length.")
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: Optional[str], num_samples: int,
-                random_seed: int, rouge_path: Optional[str],
-                apply_chat_template: bool, system_prompt: Optional[str],
+                random_seed: int, system_prompt: Optional[str],
                 max_input_length: int, max_output_length: int) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
             truncate_prompt_tokens=max_input_length)
-        evaluator = CnnDailymail(dataset_path,
+        evaluator = JsonModeEval(dataset_path,
                                  num_samples=num_samples,
                                  random_seed=random_seed,
-                                 rouge_path=rouge_path,
-                                 apply_chat_template=apply_chat_template,
+                                 apply_chat_template=True,
                                  system_prompt=system_prompt)
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()

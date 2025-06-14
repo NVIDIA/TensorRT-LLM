@@ -25,7 +25,6 @@ from .test_llm import (
     llama_v2_13b_lora_test_harness, llm_check_output,
     llm_get_stats_async_test_harness, llm_get_stats_test_harness,
     llm_test_harness, mixtral_model_name, prompts, test_llm_api_eagle,
-    tinyllama_guided_decoding_test_harness,
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
     run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
     sampling_params_for_aborting_request)
@@ -243,16 +242,6 @@ def test_llm_end2end_tp2(llm_additional_options):
     llm_check_output(llm,
                      prompts, ["D E F G H I J K"],
                      sampling_params=SamplingParams(max_tokens=8))
-
-
-@pytest.mark.gpu4
-@pytest.mark.part0
-def test_tinyllama_guided_decoding_tp2pp2():
-    pytest.skip(reason="https://nvbugs/5244006")
-    tinyllama_guided_decoding_test_harness(
-        tensor_parallel_size=2,
-        pipeline_parallel_size=2,
-        kv_cache_config=global_kv_cache_config)
 
 
 @pytest.mark.gpu4

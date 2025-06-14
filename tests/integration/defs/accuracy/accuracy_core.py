@@ -316,6 +316,24 @@ class GPQADiamond(AccuracyTask):
     EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
 
 
+class JsonModeEval(AccuracyTask):
+    DATASET = "json_mode_eval"
+    DATASET_DIR = f"{llm_models_root()}/datasets/NousResearch/json-mode-eval"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50
+    NUM_SAMPLES = 100  # Full sample
+
+    MAX_INPUT_LEN = 1024
+    MAX_OUTPUT_LEN = 512
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.JsonModeEval
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR,
+                            random_seed=0,
+                            apply_chat_template=True)
+
+
 class PassKeyRetrieval64k(AccuracyTask):
     DATASET = "passkey_retrieval_64k"
     LEVEL = 3

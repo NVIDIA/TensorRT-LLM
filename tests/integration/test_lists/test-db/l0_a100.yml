@@ -46,6 +46,7 @@ l0_a100:
   - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_smooth_quant_ootb_manage_weights
   - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_int8_gptq
   - accuracy/test_cli_flow.py::TestQwen2_7BInstruct::test_int4_awq_prequantized
+  - accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_guided_decoding
 - condition:
     ranges:
       system_gpu_count:
