@@ -155,7 +155,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
-        if (res := self.result_queue.get()) is None:
+        if (res := self.result_queue.get()) is None or res[0] is None:
             return False  # shutdown the thread
 
         async_queues = []

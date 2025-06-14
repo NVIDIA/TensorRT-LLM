@@ -111,7 +111,6 @@ class PostprocWorker:
     ) -> "DetokenizedGenerationResultBase":
         from .result import DetokenizedGenerationResultBase
         assert inp.sampling_params is not None
-        assert tokenizer is not None
         return DetokenizedGenerationResultBase(
             inp.rsp.client_id,
             sampling_params=inp.sampling_params,
@@ -185,14 +184,18 @@ class PostprocWorker:
                              | PostprocWorker.
                              Input] = await self._pull_pipe.get_async()
 
-            inputs = restore_postproc_inputs(inputs[0])
+            if inputs[0] is None:
+                self._to_stop.set()
+                yield None
+            else:
+                inputs = restore_postproc_inputs(inputs[0])
 
-            for inp in inputs:
-                if inp is None:
-                    self._to_stop.set()
-                    yield None
-                    break
-                await handle_single_input(inp, batch)
+                for inp in inputs:
+                    if inp is None:
+                        self._to_stop.set()
+                        yield None
+                        break
+                    await handle_single_input(inp, batch)
 
             yield batch
 

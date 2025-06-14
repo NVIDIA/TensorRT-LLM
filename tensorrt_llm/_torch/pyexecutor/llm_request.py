@@ -223,17 +223,12 @@ class LlmResponse:
                  py_result: PyResult):
         self._response = response
         self._py_result = py_result
-        self._has_error = response.has_error()
-        self.is_final = response.result.is_final
 
     def __getstate__(self):
-        return self._response, self._py_result, self._has_error, self.is_final
+        return self._response, self._py_result
 
     def __setstate__(self, state):
-        self._response, self._py_result, self._has_error, self.is_final = state
-
-    def has_error(self) -> bool:
-        return self._has_error
+        self._response, self._py_result = state
 
     @property
     def result(self) -> tensorrt_llm.bindings.executor.Result:

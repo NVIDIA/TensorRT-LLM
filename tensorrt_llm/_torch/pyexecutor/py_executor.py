@@ -18,14 +18,12 @@ import torch
 
 from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled, nvtx_range,
                                  trace_func)
-
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
                                             RequestStage, RequestStats,
                                             RequestType, SpecDecodingStats,
                                             StaticBatchingStats)
-
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.logger import logger
