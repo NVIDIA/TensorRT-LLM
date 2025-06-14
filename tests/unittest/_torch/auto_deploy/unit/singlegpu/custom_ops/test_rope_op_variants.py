@@ -81,7 +81,7 @@ def test_flashinfer_custom_op_and_hf_impl(dtype, atol, rtol, head_dim):
 
     # Custom op call
     positions_flat = torch.arange(batch * seq_len, device=device)
-    custom_q, custom_k = torch.ops.rope.flashinfer(
+    custom_q, custom_k = torch.ops.auto_deploy.flashinfer_rope(
         query, key, positions_flat, cos_sin_cache_expand, True
     )
 
@@ -135,7 +135,7 @@ def test_flashinfer_custom_op_and_complex_impl(dtype, atol, rtol, head_dim):
 
     # q/k of llama4 rope is interleaved
     positions_flat = torch.arange(batch * seq_len, device=device)
-    custom_q, custom_k = torch.ops.rope.flashinfer(
+    custom_q, custom_k = torch.ops.auto_deploy.flashinfer_rope(
         query, key, positions_flat, cos_sin_cache_expand, False
     )
 

@@ -1,6 +1,6 @@
 """
 This transformation defines two main RoPE (Rotary Positional Embedding) pattern matchers used
-to identify and replace RoPE subgraphs with a custom op (`torch.ops.rope.flashinfer`).
+to identify and replace RoPE subgraphs with a custom op (`torch.ops.auto_deploy.flashinfer_rope`).
 
 Supported RoPE variants:
 
@@ -398,7 +398,7 @@ def _optimize_explicit(
             rope_position_ids_cache=pos_cache,
         )
         flash_node = graph.call_function(
-            torch.ops.rope.flashinfer,
+            torch.ops.auto_deploy.flashinfer_rope,
             args=(q_node, k_node, position_ids, fused_cos_sin_to, True),
         )
 
@@ -478,7 +478,7 @@ def _optimize_complex(
             graph, q_node, batch_dim=0, seq_dim=1, rope_position_ids_cache=pos_cache
         )
         flash_node = graph.call_function(
-            torch.ops.rope.flashinfer,
+            torch.ops.auto_deploy.flashinfer_rope,
             args=(q_node, k_node, position_ids, cos_sin_flash, False),
         )
 

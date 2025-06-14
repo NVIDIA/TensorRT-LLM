@@ -254,7 +254,7 @@ def test_rope_variants(
         fn = optimize_rope
 
         def checker(gm):
-            return any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes)
+            return any(is_op(n, torch.ops.auto_deploy.flashinfer_rope) for n in gm.graph.nodes)
 
     if transformation == "match_layout":
         _ = run_test(
