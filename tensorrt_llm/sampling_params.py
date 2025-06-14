@@ -12,8 +12,7 @@ from tensorrt_llm.bindings import executor as tllme
 
 @dataclass(slots=True, kw_only=True)
 class GuidedDecodingParams:
-    """
-    Guided decoding parameters for text generation. Only one of the fields could be effective.
+    """Guided decoding parameters for text generation. Only one of the fields could be effective.
 
     Args:
         json (str, pydantic.main.BaseModel, dict, optional): The generated text is amenable to json format with additional user-specified restrictions, namely schema. Defaults to None.
@@ -21,7 +20,8 @@ class GuidedDecodingParams:
         grammar (str, optional): The generated text is amenable to the user-specified extended Backus-Naur form (EBNF) grammar. Defaults to None.
         json_object (bool): If True, the generated text is amenable to json format. Defaults to False.
         structural_tag (str, optional): The generated text is amenable to the user-specified structural tag. Defaults to None.
-    """
+    """  # noqa: E501
+
     json: Optional[Union[str, BaseModel, dict]] = None
     regex: Optional[str] = None
     grammar: Optional[str] = None
@@ -30,12 +30,10 @@ class GuidedDecodingParams:
 
     def _validate(self):
         num_guides = 0
-        for field in fields(self):
-            num_guides += bool(getattr(self, field.name))
+        for _field in fields(self):
+            num_guides += bool(getattr(self, _field.name))
         if num_guides > 1:
-            raise ValueError(
-                f"Only one guide can be used for a request, but got {num_guides}."
-            )
+            raise ValueError(f"Only one guide can be used for a request, but got {num_guides}.")
 
 
 class LogprobParams(NamedTuple):
@@ -57,16 +55,23 @@ class LogitsProcessor(ABC):
     """
 
     @abstractmethod
-    def __call__(self, req_id: int, logits: torch.Tensor,
-                 token_ids: List[List[int]], stream_ptr: Optional[int],
-                 client_id: Optional[int]) -> None:
+    def __call__(
+        self,
+        req_id: int,
+        logits: torch.Tensor,
+        token_ids: List[List[int]],
+        stream_ptr: Optional[int],
+        client_id: Optional[int],
+    ) -> None:
         """Logits processing callback. The callback is expected to inplace modify the logits.
 
         Args:
             req_id (int): Request id.
             logits (torch.Tensor): Logits tensor to be modified.
-            token_ids (List[List[int]]): Token ids produced by the request so far. The shape is beam_width * sequence_length.
-            stream_ptr (int, optional): The operation stream used by the logits tensor. Not required for PyTorch backend.
+            token_ids (List[List[int]]): Token ids produced by the request so far.
+                The shape is beam_width * sequence_length.
+            stream_ptr (int, optional): The operation stream used by the logits tensor.
+                Not required for PyTorch backend.
             client_id (int, optional): An optional client id.
         """
         pass  # noqa
@@ -82,15 +87,21 @@ class BatchedLogitsProcessor(ABC):
     """
 
     @abstractmethod
-    def __call__(self, req_ids: List[int], logits: List[torch.Tensor],
-                 token_ids: List[List[List[int]]], stream_ptr: int,
-                 client_ids: List[Optional[int]]) -> None:
+    def __call__(
+        self,
+        req_ids: List[int],
+        logits: List[torch.Tensor],
+        token_ids: List[List[List[int]]],
+        stream_ptr: int,
+        client_ids: List[Optional[int]],
+    ) -> None:
         """Batched logits processing callback. The callback is expected to inplace modify the logits.
 
         Args:
             req_ids (List[int]): A batch of request ids.
             logits (List[torch.Tensor]): A batch of the logits tensors.
-            token_ids (List[List[List[int]]]): A batch of the token ids produced by the requests so far. The shape is batch * beam_width * sequence_length.
+            token_ids (List[List[List[int]]]): A batch of the token ids produced by the requests so far.
+                The shape is batch * beam_width * sequence_length.
             stream_ptr (int): The operation stream used by the logits tensors.
             client_ids (List[Optional[int]]): A batch of optional client ids.
         """
@@ -99,21 +110,20 @@ class BatchedLogitsProcessor(ABC):
 
 @dataclass(slots=True, kw_only=True)
 class AdditionalModelOutput:
-    """
-    An additional output to gather from the model.
+    """An additional output to gather from the model.
 
     Args:
         name (str): The name of the additional output to gather from the model.
         gather_context (bool): A value indicating whether or not to gather the additional output from the context too. Defaults to False.
-    """
+    """  # noqa: E501
+
     name: str
     gather_context: bool
 
 
 @dataclass(slots=True, kw_only=True)
 class SamplingParams:
-    """
-    Sampling parameters for text generation.
+    """Sampling parameters for text generation.
 
     Usage Examples:
 
@@ -179,7 +189,8 @@ class SamplingParams:
         truncate_prompt_tokens (int, optional): If set to an integer k, will use only the last k tokens from the prompt (i.e., left truncation). Defaults to None.
         skip_special_tokens (bool): Whether to skip special tokens in the output. Defaults to True.
         spaces_between_special_tokens (bool): Whether to add spaces between special tokens in the output. Defaults to True.
-    """
+    """  # noqa: E501
+
     # [TO DEVELOPER] This class provides an interface to LLMAPI users.
     # Internally, it manages and dispatches fields to Python bindings of C++ objects, currently including:
     # (1) all fields of tllme.SamplingConfig;
@@ -194,19 +205,14 @@ class SamplingParams:
     max_tokens: int = 32
     bad: Optional[Union[str, List[str]]] = None
     bad_token_ids: Optional[List[int]] = None
-    _bad_word_ids: Optional[List[List[int]]] = field(default=None,
-                                                     init=False,
-                                                     repr=False)
+    _bad_word_ids: Optional[List[List[int]]] = field(default=None, init=False, repr=False)
     stop: Optional[Union[str, List[str]]] = None
     stop_token_ids: Optional[List[int]] = None
     include_stop_str_in_output: bool = False
-    _stop_word_ids: Optional[List[List[int]]] = field(default=None,
-                                                      init=False,
-                                                      repr=False)
+    _stop_word_ids: Optional[List[List[int]]] = field(default=None, init=False, repr=False)
 
     embedding_bias: Optional[torch.Tensor] = None
-    logits_processor: Optional[Union[LogitsProcessor,
-                                     List[LogitsProcessor]]] = None
+    logits_processor: Optional[Union[LogitsProcessor, List[LogitsProcessor]]] = None
     apply_batched_logits_processor: bool = False
 
     n: int = 1
@@ -273,25 +279,28 @@ class SamplingParams:
         self._validate()
 
     def _validate(self):
-        ''' Verify the sampling parameters.
+        """Verify the sampling parameters.
 
         This function verifies the sampling parameters in the LLM API, which
         may have stricter requirements than the Executor class of C++ runtime.
         For instance, while the greedy decoding with n > 1 is capable in the
         Executor class of C++ runtime, the LLM API disallows such combination.
-        '''
+        """
         if self.best_of < self.n:
-            raise ValueError(
-                f"best_of ({self.best_of}) cannot be less than n ({self.n})")
+            raise ValueError(f"best_of ({self.best_of}) cannot be less than n ({self.n})")
 
-        if (self.best_of > 1 and self._greedy_decoding
-                and not os.environ.get('TLLM_ALLOW_N_GREEDY_DECODING', None)):
+        if (
+            self.best_of > 1
+            and self._greedy_decoding
+            and not os.environ.get("TLLM_ALLOW_N_GREEDY_DECODING", None)
+        ):
             raise ValueError(
-                f'Greedy decoding in the LLM API does not allow multiple '
-                f'returns. Please set to best_of=1, got best_of={self.best_of}. '
-                f'Please set to best_of=1 or set an environment variable '
-                f'TLLM_ALLOW_N_GREEDY_DECODING=1 to allow best_of > 1 '
-                f'under the greedy decoding.')
+                f"Greedy decoding in the LLM API does not allow multiple "
+                f"returns. Please set to best_of=1, got best_of={self.best_of}. "
+                f"Please set to best_of=1 or set an environment variable "
+                f"TLLM_ALLOW_N_GREEDY_DECODING=1 to allow best_of > 1 "
+                f"under the greedy decoding."
+            )
 
         if self.truncate_prompt_tokens is not None and self.truncate_prompt_tokens < 1:
             raise ValueError(
@@ -303,14 +312,15 @@ class SamplingParams:
 
         # correct types as users might pass in logprob=True for Top-1 logprobs
         self.logprobs = self.logprobs and int(self.logprobs)
-        self.prompt_logprobs = self.prompt_logprobs and int(
-            self.prompt_logprobs)
+        self.prompt_logprobs = self.prompt_logprobs and int(self.prompt_logprobs)
 
     @property
     def _greedy_decoding(self) -> bool:
-        return (not self.use_beam_search
-                and (self.top_k is None or self.top_k == 1)
-                and (self.top_p is None or self.top_p == 0.0))
+        return (
+            not self.use_beam_search
+            and (self.top_k is None or self.top_k == 1)
+            and (self.top_p is None or self.top_p == 0.0)
+        )
 
     @property
     def _need_return_context_logits(self) -> bool:
@@ -320,9 +330,7 @@ class SamplingParams:
     def _need_return_generation_logits(self) -> bool:
         return self.return_generation_logits and not self._generation_logits_auto_enabled
 
-    def _setup(self,
-               tokenizer,
-               add_special_tokens: bool = False) -> 'SamplingParams':
+    def _setup(self, tokenizer, add_special_tokens: bool = False) -> "SamplingParams":
         if self.end_id is None:
             self.end_id = tokenizer.eos_token_id
             self.pad_id = tokenizer.pad_token_id
@@ -332,15 +340,13 @@ class SamplingParams:
         if self.bad is not None:
             strs = [self.bad] if isinstance(self.bad, str) else self.bad
             self._bad_word_ids = [
-                tokenizer.encode(s, add_special_tokens=add_special_tokens)
-                for s in strs
+                tokenizer.encode(s, add_special_tokens=add_special_tokens) for s in strs
             ]
 
         if self.stop is not None:
             strs = [self.stop] if isinstance(self.stop, str) else self.stop
             self._stop_word_ids = [
-                tokenizer.encode(s, add_special_tokens=add_special_tokens)
-                for s in strs
+                tokenizer.encode(s, add_special_tokens=add_special_tokens) for s in strs
             ]
 
         return self
@@ -356,7 +362,8 @@ class SamplingParams:
             if self._bad_word_ids is None:
                 raise RuntimeError(
                     f"{self.__class__.__name__}.bad ({self.bad}) is not processed by tokenizer, "
-                    "please call the setup method.")
+                    "please call the setup method."
+                )
             return words + self._bad_word_ids
 
     def _get_stop_words(self) -> List[List[int]]:
@@ -370,11 +377,11 @@ class SamplingParams:
             if self._stop_word_ids is None:
                 raise RuntimeError(
                     f"{self.__class__.__name__}.stop ({self.stop}) is not processed by tokenizer, "
-                    "please call the setup method.")
+                    "please call the setup method."
+                )
             return words + self._stop_word_ids
 
-    def _get_stop_reasons_and_words(
-            self) -> List[Tuple[Union[str, int], List[List[int]]]]:
+    def _get_stop_reasons_and_words(self) -> List[Tuple[Union[str, int], List[List[int]]]]:
         stop_reasons = []
         if self.stop_token_ids is not None:
             stop_reasons.extend(self.stop_token_ids)
@@ -400,37 +407,30 @@ class SamplingParams:
         # | Sampling    | use_beam_search | beam_width == 1        |
         # | Sampling    | n               | num_return_sequences   |
         # | Sampling    | best_of         | no corresponding param |
-        fields = {
-            f
-            for f in dir(tllme.SamplingConfig) if not f.startswith('__')
-        }
+        fields = {f for f in dir(tllme.SamplingConfig) if not f.startswith("__")}
         unmatched_params = [
-            'num_return_sequences',
-            'beam_width',
-            'n',
-            'best_of',
-            'use_beam_search',
+            "num_return_sequences",
+            "beam_width",
+            "n",
+            "best_of",
+            "use_beam_search",
         ]
-        llmapi_to_rt_param_map = {
-            f: getattr(self, f)
-            for f in fields if f not in unmatched_params
-        }
+        llmapi_to_rt_param_map = {f: getattr(self, f) for f in fields if f not in unmatched_params}
         if self.use_beam_search:
-            llmapi_to_rt_param_map['num_return_sequences'] = self.n
-            llmapi_to_rt_param_map['beam_width'] = self.best_of
+            llmapi_to_rt_param_map["num_return_sequences"] = self.n
+            llmapi_to_rt_param_map["beam_width"] = self.best_of
         else:
-            llmapi_to_rt_param_map['num_return_sequences'] = self.best_of
-            llmapi_to_rt_param_map['beam_width'] = 1
+            llmapi_to_rt_param_map["num_return_sequences"] = self.best_of
+            llmapi_to_rt_param_map["beam_width"] = 1
 
         return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
-    def _get_output_config(self,
-                           is_pytorch_backend: bool = False
-                           ) -> tllme.OutputConfig:
+    def _get_output_config(self, is_pytorch_backend: bool = False) -> tllme.OutputConfig:
         sampling_param_fields = set(dir(SamplingParams))
         fields = [
-            f for f in dir(tllme.OutputConfig)
-            if not f.startswith('__') and f in sampling_param_fields
+            f
+            for f in dir(tllme.OutputConfig)
+            if not f.startswith("__") and f in sampling_param_fields
         ]
 
         config_kwargs = {f: getattr(self, f) for f in fields}
@@ -447,8 +447,7 @@ class SamplingParams:
             return None
 
         if self.guided_decoding.json_object:
-            return tllme.GuidedDecodingParams(
-                tllme.GuidedDecodingParams.GuideType.JSON)
+            return tllme.GuidedDecodingParams(tllme.GuidedDecodingParams.GuideType.JSON)
         elif self.guided_decoding.json is not None:
             json_schema = self.guided_decoding.json
             if isinstance(json_schema, BaseModel):
@@ -456,18 +455,20 @@ class SamplingParams:
             if isinstance(json_schema, dict):
                 json_schema = json.dumps(json_schema)
             return tllme.GuidedDecodingParams(
-                tllme.GuidedDecodingParams.GuideType.JSON_SCHEMA, json_schema)
+                tllme.GuidedDecodingParams.GuideType.JSON_SCHEMA, json_schema
+            )
         elif self.guided_decoding.regex is not None:
             return tllme.GuidedDecodingParams(
-                tllme.GuidedDecodingParams.GuideType.REGEX,
-                self.guided_decoding.regex)
+                tllme.GuidedDecodingParams.GuideType.REGEX, self.guided_decoding.regex
+            )
         elif self.guided_decoding.grammar is not None:
             return tllme.GuidedDecodingParams(
-                tllme.GuidedDecodingParams.GuideType.EBNF_GRAMMAR,
-                self.guided_decoding.grammar)
+                tllme.GuidedDecodingParams.GuideType.EBNF_GRAMMAR, self.guided_decoding.grammar
+            )
         elif self.guided_decoding.structural_tag is not None:
             return tllme.GuidedDecodingParams(
                 tllme.GuidedDecodingParams.GuideType.STRUCTURAL_TAG,
-                self.guided_decoding.structural_tag)
+                self.guided_decoding.structural_tag,
+            )
         else:
             return None
