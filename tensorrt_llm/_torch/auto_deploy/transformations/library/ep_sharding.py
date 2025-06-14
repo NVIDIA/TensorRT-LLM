@@ -38,7 +38,7 @@ def ep_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
     num_moe_patterns = 0
     for node in list(gm.graph.nodes):
-        if not is_op(node, torch.ops.moe.torch_moe):
+        if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
         _insert_sharded_moe(gm, node, rank, world_size)
         num_moe_patterns += 1

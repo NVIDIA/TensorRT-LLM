@@ -131,7 +131,7 @@ def deepseek_v3_moe(self, hidden_states):
     """DeepSeekV3MoE forward function rewritten in Mixtral style to enable torch export."""
 
     selected_experts, routing_weights, *_ = self.gate(hidden_states)
-    final_hidden_states = torch.ops.moe.torch_moe(
+    final_hidden_states = torch.ops.auto_deploy.torch_moe(
         hidden_states,
         selected_experts,
         routing_weights,

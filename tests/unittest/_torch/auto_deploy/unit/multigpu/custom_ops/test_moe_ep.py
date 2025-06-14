@@ -74,7 +74,7 @@ def _run_moe_ep_test(num_experts: int, topk: int, rank: int, world_size: int):
 
     final_scales_local = final_scales * rank_mask
 
-    output_trt = torch.ops.moe.trtllm_fused_moe(
+    output_trt = torch.ops.auto_deploy.trtllm_moe_fused(
         x,
         selected_experts_local,
         final_scales_local,
