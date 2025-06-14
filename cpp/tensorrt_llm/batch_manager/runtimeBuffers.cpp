@@ -619,12 +619,6 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         {
             rnnStateBuffers->fillSlotMappings(contextRequests, rnnStateManagerPtr);
         }
-
-        if (transformerBuffers && maxBeamWidth > 1)
-        {
-            transformerBuffers->resetCacheIndirection(contextRequests, maxBeamWidth, maxAttentionWindow,
-                decoderState.getCacheIndirectionInput(), decoderState.getCacheIndirectionOutput(), manager);
-        }
     }
 
     // generation preparation loop
