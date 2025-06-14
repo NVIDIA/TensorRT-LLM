@@ -17,7 +17,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "trtGptModel.h"
@@ -47,7 +46,7 @@ public:
 
     TrtEncoderModel(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         runtime::RawEngine const& rawEngine, std::shared_ptr<nvinfer1::ILogger> logger,
-        TrtGptModelOptionalParams const& optionalParams);
+        executor::ExecutorConfig const& executorConfig);
 
     ~TrtEncoderModel() override;
 
