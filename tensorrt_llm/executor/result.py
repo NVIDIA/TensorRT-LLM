@@ -59,6 +59,11 @@ class ResponseWrapper:
         self._response = response
         self.logprobs = logprobs
 
+    @property
+    def _is_llm_response(self):
+        response = object.__getattribute__(self, '_response')
+        return isinstance(response, tllm.Response)
+
     def __getattr__(self, name):
         response = object.__getattribute__(self, '_response')
         return getattr(response, name)
