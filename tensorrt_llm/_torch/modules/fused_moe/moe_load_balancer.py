@@ -182,10 +182,11 @@ class HostMoeTensorSharer:
         offset = 0
         for name in self.names:
             for expert_id in range(self.expert_start, self.expert_end):
-                t = self.shared_tensors[(expert_id, name)]
+                t = self.shared_tensors[(expert_id, name)].contiguous().cpu()
                 data_size = t.numel() * t.element_size()
                 aligned_size = self.align_size(data_size)
-                shm.buf[offset:offset + data_size] = t.numpy().tobytes()
+                shm.buf[offset:offset + data_size] = t.flatten().view(
+                    torch.int8).numpy().tobytes()
                 dtype = t.dtype
                 tensor_shape = t.shape
                 elt_count = t.numel()

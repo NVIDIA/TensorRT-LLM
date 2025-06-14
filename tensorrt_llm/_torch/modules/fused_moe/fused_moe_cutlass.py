@@ -342,6 +342,8 @@ class CutlassFusedMoE(MoE):
                                                      token_final_scales,
                                                      token_selected_experts_for_statistic)
         x_sf = None
+        x_row = x.shape[0]
+        x_col = x.shape[1]
         if self.has_any_quant:
             if self.has_fp8_qdq:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
