@@ -210,10 +210,10 @@ def fused_mha_with_paged_cache(
     if freqs_cis is not None:
         if s == 1:
             rope_args = (freqs_cis, input_pos, "bsnd")
-            fn_rope = torch.ops.rope.apply_rope_with_input_pos
+            fn_rope = torch.ops.auto_deploy.triton_rope_with_input_pos
         else:
             rope_args = (freqs_cis, input_pos, seq_len, seq_start)
-            fn_rope = torch.ops.rope.apply_rope_on_flattened_inputs
+            fn_rope = torch.ops.auto_deploy.triton_rope_on_flattened_inputs
         q = fn_rope(q, *rope_args)
         k = fn_rope(k, *rope_args)
 
@@ -562,8 +562,8 @@ def fused_mha_with_cache(
 
     # rope embedding
     if freqs_cis is not None:
-        q = torch.ops.rope.apply_rope_with_input_pos(q, freqs_cis, input_pos, "bsnd")
-        k = torch.ops.rope.apply_rope_with_input_pos(k, freqs_cis, input_pos, "bsnd")
+        q = torch.ops.auto_deploy.triton_rope_with_input_pos(q, freqs_cis, input_pos, "bsnd")
+        k = torch.ops.auto_deploy.triton_rope_with_input_pos(k, freqs_cis, input_pos, "bsnd")
 
     # attention (assumed layout is bsnd)
     y = torch.empty_like(q)
@@ -637,10 +637,10 @@ def fused_flattened_mha_with_cache(
     if freqs_cis.numel() > 0:
         if s == 1:
             rope_args = (freqs_cis, input_pos, "bsnd")
-            fn_rope = torch.ops.rope.apply_rope_with_input_pos
+            fn_rope = torch.ops.auto_deploy.triton_rope_with_input_pos
         else:
             rope_args = (freqs_cis, input_pos, seq_len, seq_start)
-            fn_rope = torch.ops.rope.apply_rope_on_flattened_inputs
+            fn_rope = torch.ops.auto_deploy.triton_rope_on_flattened_inputs
         q = fn_rope(q, *rope_args)
         k = fn_rope(k, *rope_args)
 

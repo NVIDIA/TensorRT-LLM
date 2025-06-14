@@ -211,8 +211,8 @@ def test_triton_custom_op_and_hf_impl(layout, head_dim, dtype, atol, rtol):
     q_hf = q_f32.to(dtype)
     k_hf = k_f32.to(dtype)
 
-    q_out = torch.ops.rope.apply_rope_with_input_pos(q, cosin_cache, positions, layout)
-    k_out = torch.ops.rope.apply_rope_with_input_pos(k, cosin_cache, positions, layout)
+    q_out = torch.ops.auto_deploy.triton_rope_with_input_pos(q, cosin_cache, positions, layout)
+    k_out = torch.ops.auto_deploy.triton_rope_with_input_pos(k, cosin_cache, positions, layout)
 
     torch.testing.assert_close(q_hf, q_out, atol=atol, rtol=rtol)
     torch.testing.assert_close(k_hf, k_out, atol=atol, rtol=rtol)
