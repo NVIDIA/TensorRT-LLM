@@ -7,7 +7,8 @@ import torch
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm.llmapi import KvCacheConfig, NGramDecodingConfig
+from tensorrt_llm.llmapi import (CudaGraphConfig, KvCacheConfig,
+                                 NGramDecodingConfig)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
@@ -28,11 +29,11 @@ def test_llama_ngram(use_cuda_graph: bool, attn_backend: str):
 
     pytorch_config = dict(
         disable_overlap_scheduler=True,
-        use_cuda_graph=use_cuda_graph,
         # Only create a single CUDA graph to prevent OOM in CI
         attn_backend=attn_backend,
-        cuda_graph_batch_sizes=[1],
     )
+    cuda_graph_config = CudaGraphConfig(
+        cuda_graph_batch_sizes=[1]) if use_cuda_graph else None
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=2080)
 
@@ -56,6 +57,7 @@ def test_llama_ngram(use_cuda_graph: bool, attn_backend: str):
                    max_batch_size=max_batch_size,
                    **pytorch_config,
                    kv_cache_config=kv_cache_config,
+                   cuda_graph_config=cuda_graph_config,
                    speculative_config=spec_config)
 
     prompts = [
@@ -68,7 +70,8 @@ def test_llama_ngram(use_cuda_graph: bool, attn_backend: str):
     llm_ref = LLM(model=target_model_dir,
                   max_batch_size=max_batch_size,
                   **pytorch_config,
-                  kv_cache_config=kv_cache_config)
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config)
 
     results_ref = llm_ref.generate(prompts, sampling_params)
     generated_text_ref = [result.outputs[0].text for result in results_ref]
