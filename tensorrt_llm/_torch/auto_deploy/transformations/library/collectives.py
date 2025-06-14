@@ -24,7 +24,7 @@ def fuse_collectives(gm: GraphModule) -> GraphModule:
     lookup = {
         torch.ops.auto_deploy.torch_linear_simple: torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce,
         torch.ops.aten.linear: torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce,
-        torch.ops.quant.fp8_linear: torch.ops.quant.fused_fp8_linear_all_reduce,
+        torch.ops.auto_deploy.torch_quant_fp8_linear: torch.ops.auto_deploy.torch_quant_fused_fp8_linear_all_reduce,
     }
 
     # go through all nodes and find all_reduce nodes

@@ -79,7 +79,7 @@ def _run_job(
         (nn.Linear, "auto_deploy.trtllm_dist_fused_linear_all_reduce"),
         pytest.param(
             FP8Linear,
-            "quant.fused_fp8_linear_all_reduce",
+            "auto_deploy.torch_quant_fused_fp8_linear_all_reduce",
             marks=pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support"),
         ),
     ),
