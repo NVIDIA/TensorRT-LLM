@@ -101,6 +101,8 @@ class CutlassFusedMoE(MoE):
 
         moe_load_balancer = get_moe_load_balancer()
         self.layer_load_balancer = None
+        self.repeat_idx = 0
+        self.repeat_count = 1
 
         moe_load_balancer_config = model_config.moe_load_balancer
         init_expert_size_per_partition = moe_load_balancer_config.num_local_slots if moe_load_balancer_config else self.num_experts // self.ep_size
@@ -116,6 +118,7 @@ class CutlassFusedMoE(MoE):
             self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
             self.layer_load_balancer = moe_load_balancer.add_layer(
                 self.num_experts, top_k, self.expert_size_per_partition)
+            self.repeat_count = self.layer_load_balancer.get_repeat_count()
             loaded_initial_global_assignments = moe_load_balancer_config.get_layer_initial_global_assignments(
                 self.layer_idx)
             self.num_slots = moe_load_balancer_config.num_slots
@@ -497,13 +500,16 @@ class CutlassFusedMoE(MoE):
         else:
             all_rank_num_tokens_padded = all_rank_num_tokens
         if num_chunks == 1:
+            is_first_call = self.repeat_idx == 0
+            is_last_call = self.repeat_idx == self.repeat_count - 1
             outputs = self.forward_chunk(
                 x,
                 router_logits,
                 cutlass_min_latency_mode,
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
-                use_dp_padding=use_dp_padding)
+                use_dp_padding=use_dp_padding,
+                repeating_info=(is_first_call, is_last_call))
             outputs = self.reducescatter_or_allreduce(
                 outputs,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
@@ -546,8 +552,8 @@ class CutlassFusedMoE(MoE):
             # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
             for idx_chunk, (x, router_logits) in enumerate(
                     zip(x_list, router_logits_list)):
-                is_first_call = idx_chunk == 0
-                is_last_call = idx_chunk == num_chunks - 1
+                is_first_call = idx_chunk == 0 and self.repeat_idx == 0
+                is_last_call = idx_chunk == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1
                 if not self.enable_alltoall:
                     if idx_chunk % 2 == 0:
                         with torch.cuda.stream(self.aux_stream):
@@ -606,6 +612,7 @@ class CutlassFusedMoE(MoE):
         if self.use_dp:
             rank = self.mapping.tp_rank
             outputs = outputs[:all_rank_num_tokens[rank]]
+        self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
         return outputs
 
     def alltoall_prepare_maybe_dispatch(

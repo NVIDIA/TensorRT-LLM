@@ -3,7 +3,8 @@ from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
 from .interface import MoE, MoEWeightLoadingMode
-from .moe_load_balancer import MoeLoadBalancer
+from .moe_load_balancer import (MoeLoadBalancer,
+                                moe_load_balancer_set_repeated_for_next_layer)
 from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       DefaultMoeRoutingMethod,
                       Llama4RenormalizeMoeRoutingMethod,
@@ -19,5 +20,5 @@ __all__ = [
     "StaticMoeRoutingMethod", "DefaultMoeRoutingMethod",
     "DeepSeekV3MoeRoutingMethod", "RoutingMethodType",
     "RenormalizeMoeRoutingMethod", "MoE", "MoEWeightLoadingMode", "get_moe_cls",
-    "create_moe"
+    "create_moe", "moe_load_balancer_set_repeated_for_next_layer"
 ]
