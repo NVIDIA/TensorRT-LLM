@@ -215,7 +215,7 @@ def fused_mla_ref(
             q_slice = q_pe[start : start + length]
             k_slice = k_pe[start : start + length]
 
-            q_rot, k_rot = torch.ops.rope.torch_apply_rope_with_qk_interleaving(
+            q_rot, k_rot = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
                 q_slice,
                 k_slice,
                 cos,
@@ -340,7 +340,7 @@ def fused_mla(
 
     cos = cos[position_ids]
     sin = sin[position_ids]
-    q_pe, k_pe = torch.ops.rope.torch_apply_rope_with_qk_interleaving(q_pe, k_pe, cos, sin)
+    q_pe, k_pe = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(q_pe, k_pe, cos, sin)
 
     query_states = k_pe.new_empty(bs, num_heads, q_len, q_head_dim)
     query_states[:, :, :, :qk_nope_head_dim] = q_nope
