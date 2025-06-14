@@ -16,6 +16,7 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
+import math
 import operator
 from collections import defaultdict
 from functools import partial
@@ -71,7 +72,13 @@ def _load_hook_remove(
 
 
 def _insert_sharded_matmul(
-    gm: GraphModule, node: Node, dim: int, rank: int, world_size: int, add_dist: bool = False
+    gm: GraphModule,
+    node: Node,
+    dim: int,
+    rank: int,
+    world_size: int,
+    add_dist: bool = False,
+    min_local_shape: int = 1,
 ):
     """Replaces the matmul node with a new matmul node that accepts sharded weights.
 
@@ -83,8 +90,21 @@ def _insert_sharded_matmul(
     quantization_impl = QuantizationImpl.create(node)
 
     def split_tensor(
-        t: torch.Tensor, d: int = dim, r: int = rank, ws: int = world_size
+        t: torch.Tensor,
+        d: int = dim,
+        r: int = rank,
+        ws: int = world_size,
+        min_d_shape: int = min_local_shape,
     ) -> torch.Tensor:
+        # The local tensor shape has to be divisible by min_d_shape
+        max_split_size = t.shape[d] // min_d_shape
+        if ws > max_split_size:
+            num_groups = math.ceil(ws / max_split_size)
+            ad_logger.debug(
+                f"World size {ws} is greater than the max split size {max_split_size}. "
+                + f"Splitting tensor to {num_groups} chunks"
+            )
+            return torch.tensor_split(t, max_split_size, dim=d)[r // num_groups]
         return torch.tensor_split(t, ws, dim=d)[r]
 
     num_users = num_users_of_weight_node(node)
@@ -191,7 +211,10 @@ def _simple_shard(
 
 
 def column_row_shard(
-    gm: GraphModule, rank: int, world_size: int, simple_shard_only: bool = False
+    gm: GraphModule,
+    rank: int,
+    world_size: int,
+    simple_shard_only: bool = False,
 ) -> GraphModule:
     """A transformation to apply sharding to the model following tensor parallelism.
 
@@ -205,6 +228,9 @@ def column_row_shard(
        **all** nodes in the subgraph. The subgraph here is defined as the region between the first
        linear node to the last linear node of an identified sharding region.
     # 5. Shard the GEMM nodes or skip accordingly.
+
+    min_local_shape is the minimum size of the local tensor shard, to prevent TP parallelism
+    splitting, e.g., the individual heads into smaller shards.
     """
     ad_logger.debug("Before sharding graph: " + str(gm))
 
@@ -327,9 +353,25 @@ def column_row_shard(
 
         # If we can account for all sharded nodes, we can do a two-way shard
         # --> row_split (dim 0) + col_split (dim 1) + all_reduce
+
+        # check if we are sharding the attention block
+        if attention_nodes:
+            if len(attention_nodes) > 1:
+                # Column-row shard boundary region detection is probably wrong - there should be
+                # only one attention operation. Fall back to simple shard.
+                ad_logger.debug(f"More than one attention node: {unaccounted_nodes}")
+                _simple_shard(gm, nodes_linear, rank, world_size)
+                continue
+            # Extract head dimension. We cannot shard below the head_dim size.
+            # Assume that head_dim is the last (innermost) dimension of the tensor
+            min_local_shape = attention_nodes.pop().meta["val"].shape[-1]
+        else:
+            min_local_shape = 1
         for i, group in enumerate(nodes_linear.values()):
             for n in group:
-                _insert_sharded_matmul(gm, n, i, rank, world_size, add_dist=i > 0)
+                _insert_sharded_matmul(
+                    gm, n, i, rank, world_size, add_dist=i > 0, min_local_shape=min_local_shape
+                )
 
     # canonicalize and return
     if num_shards:
