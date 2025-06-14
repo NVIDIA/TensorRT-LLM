@@ -184,7 +184,7 @@ class MoEOpModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: Tensor of shape (batch, hidden_size)
-        Computes router logits via a gate, and then calls the MoE op via torch.moe.torch_moe.
+        Computes router logits via a gate, and then calls the MoE op via torch.ops.auto_deploy.torch_moe.
         """
 
         router_logits = self.gate(x)
@@ -197,7 +197,7 @@ class MoEOpModel(nn.Module):
         w2_list = [expert.w2 for expert in self.experts]
         w3_list = [expert.w3 for expert in self.experts]
 
-        out = torch.ops.moe.torch_moe(
+        out = torch.ops.auto_deploy.torch_moe(
             x, selected_experts, routing_weights, w1_list, w2_list, w3_list
         )
         return out

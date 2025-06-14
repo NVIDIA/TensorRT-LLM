@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from ...modules.fused_moe import MoE  # noqa: F401
 
 
-@torch.library.custom_op("moe::torch_moe", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_moe", mutates_args=())
 def torch_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -80,7 +80,7 @@ def torch_moe(
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("moe::torch_fused_moe", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_moe_fused", mutates_args=())
 def torch_fused_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -147,7 +147,7 @@ def torch_fused_moe(
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("moe::trtllm_fused_moe", mutates_args=())
+@torch.library.custom_op("auto_deploy::trtllm_moe_fused", mutates_args=())
 def trtllm_fused_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
