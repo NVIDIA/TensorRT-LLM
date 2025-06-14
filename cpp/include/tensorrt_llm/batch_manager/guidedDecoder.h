@@ -20,15 +20,28 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-
-namespace xgrammar
-{
-class GrammarMatcher;
-class GrammarCompiler;
-} // namespace xgrammar
+#include <dlpack/dlpack.h>
+#include <optional>
 
 namespace tensorrt_llm::batch_manager
 {
+
+class IGrammarMatcher
+{
+public:
+    virtual ~IGrammarMatcher() = default;
+    virtual bool AcceptToken(int32_t tokenId) = 0;
+    virtual void FillNextTokenBitmask(DLTensor* nextTokenBitmask) = 0;
+};
+
+class IGrammarMatcherFactory
+{
+public:
+    virtual ~IGrammarMatcherFactory() = default;
+    virtual std::shared_ptr<IGrammarMatcher> Create(
+        tensorrt_llm::executor::GuidedDecodingParams const& guidedDecodingParams)
+        = 0;
+};
 
 class GuidedDecoder
 {
@@ -45,8 +58,8 @@ public:
 
 private:
     executor::GuidedDecodingConfig::GuidedDecodingBackend mGuidedDecodingBackend;
-    std::vector<std::shared_ptr<xgrammar::GrammarMatcher>> mXGrammarMatchers;
-    std::shared_ptr<xgrammar::GrammarCompiler> mXGrammarCompiler;
+    std::shared_ptr<IGrammarMatcherFactory> mGrammarMatcherFactory;
+    std::vector<std::shared_ptr<IGrammarMatcher>> mGrammarMatchers;
 
     SizeType32 mMaxNumSequences;
     SizeType32 mVocabSizePadded;

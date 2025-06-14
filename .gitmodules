@@ -20,3 +20,6 @@
 [submodule "3rdparty/xgrammar"]
 	path = 3rdparty/xgrammar
 	url = https://github.com/mlc-ai/xgrammar.git
+[submodule "3rdparty/llguidance"]
+	path = 3rdparty/llguidance
+	url = https://github.com/guidance-ai/llguidance/
