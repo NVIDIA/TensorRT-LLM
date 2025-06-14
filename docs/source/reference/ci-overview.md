@@ -55,9 +55,27 @@ The array elements are: GPU type, YAML file (without extension), shard index, an
 2. Search `jenkins/L0_Test.groovy` for a stage whose YAML file matches (for example `l0_a100`) and whose name contains `[Post-Merge]` if the YAML entry uses `stage: post_merge`.
 3. The resulting stage name(s) are what you pass to Jenkins via the `stage_list` parameter when triggering a job.
 
-### Example
+### Using `test_to_stage_mapping.py`
 
-`triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]` appears in `l0_a100.yml` under `stage: post_merge` and `backend: triton`.  The corresponding Jenkins stages are `A100X-Triton-Python-[Post-Merge]-1` and `A100X-Triton-Python-[Post-Merge]-2` (two shards).
+Manually searching YAML and Groovy files can be tedious.  The helper script
+`scripts/test_to_stage_mapping.py` automates the lookup:
+
+```bash
+python scripts/test_to_stage_mapping.py --tests "triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]"
+python scripts/test_to_stage_mapping.py --tests gpt_ib_ptuning
+python scripts/test_to_stage_mapping.py --stages A100X-Triton-Python-[Post-Merge]-1
+python scripts/test_to_stage_mapping.py --test-list my_tests.txt
+python scripts/test_to_stage_mapping.py --test-list my_tests.yml
+```
+
+The first two commands print the Jenkins stages that run the specified tests or
+patterns. Patterns are matched by substring, so partial test names are
+supported out of the box. The third lists every test executed in the given stage. When
+providing tests on the command line, quote each test string so the shell does
+not interpret the `[` and `]` characters as globs. Alternatively, store the
+tests in a newline‑separated text file or a YAML list and supply it with
+`--test-list`.
+
 
 To run the same tests on your pull request, comment:
 
@@ -66,6 +84,7 @@ To run the same tests on your pull request, comment:
 ```
 
 This executes the same tests that run post-merge for this hardware/backend.
+
 
 ## Waiving tests
 
