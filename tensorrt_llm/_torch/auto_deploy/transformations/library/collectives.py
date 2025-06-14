@@ -22,8 +22,8 @@ def fuse_collectives(gm: GraphModule) -> GraphModule:
     # lookup for fused ops
     # TODO: avoid this hardcoded lookup, e.g., by generating fused ops on the fly.
     lookup = {
-        torch.ops.linear.simple: torch.ops.linear.fused_linear_all_reduce,
-        torch.ops.aten.linear: torch.ops.linear.fused_linear_all_reduce,
+        torch.ops.linear.simple: torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce,
+        torch.ops.aten.linear: torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce,
         torch.ops.quant.fp8_linear: torch.ops.quant.fused_fp8_linear_all_reduce,
     }
 

@@ -222,7 +222,7 @@ def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
     """
     lin_ops = {
         torch.ops.aten.linear,
-        torch.ops.linear.simple,
+        torch.ops.auto_deploy.torch_linear_simple,
     }
 
     if include_quantization:
