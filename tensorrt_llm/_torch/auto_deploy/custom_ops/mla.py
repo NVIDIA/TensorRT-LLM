@@ -94,7 +94,7 @@ def fused_flattened_mla_with_cache(
             q_slice = q_pe[start : start + length]
             k_slice = k_pe[start : start + length]
 
-            q_rot, k_rot = torch.ops.rope.torch_apply_rope_with_qk_interleaving(
+            q_rot, k_rot = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
                 q_slice,
                 k_slice,
                 cos,
