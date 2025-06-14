@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <numeric>
