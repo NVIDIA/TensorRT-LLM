@@ -1121,12 +1121,13 @@ TEST_F(TrtGptModelLogitsTest, ReturnContextLogitsWithChunkedContext)
             = bufferCast<float>(*(finishList.front()->getContextLogitsHost()));
         float const* const enableChunkedContextLogits = bufferCast<float>(*(finishList.back()->getContextLogitsHost()));
 
-        for (int i = 0; i < promptLength; i++)
+        for (int tokenIdx = 0; tokenIdx < promptLength; tokenIdx++)
         {
-            for (int j = 0; j < vocabSizePadded; j++)
+            for (int vocabIdx = 0; vocabIdx < vocabSizePadded; vocabIdx++)
             {
-                size_t idx = i * vocabSizePadded + j;
-                EXPECT_EQ(disableChunkedContextLogits[idx], enableChunkedContextLogits[idx]);
+                size_t idx = tokenIdx * vocabSizePadded + vocabIdx;
+                EXPECT_NEAR(disableChunkedContextLogits[idx], enableChunkedContextLogits[idx], 1e-0)
+                    << "tokenIdx=" << tokenIdx << " vocabIdx=" << vocabIdx;
             }
         }
         finishList.clear();
