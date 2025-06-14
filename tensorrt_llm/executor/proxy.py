@@ -309,14 +309,13 @@ class GenerationExecutorProxy(GenerationExecutor):
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
-                ready_signal = RuntimeError(
-                    "Executor worker died during initialization")
-                break
+                raise RuntimeError("Executor worker died during initialization")
             self._handle_background_error()
 
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
             self.mpi_session.shutdown_abort(reason=ready_signal)
-            raise ready_signal
+            raise RuntimeError(
+                "Executor worker returned error") from ready_signal
 
     def _abort_all_requests(self):
         # The results can be finished during this loop, so self._results may be changed.

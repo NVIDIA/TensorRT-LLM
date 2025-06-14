@@ -30,7 +30,7 @@ class TestOutOfTree(unittest.TestCase):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
         if not import_oot_code:
-            with self.assertRaises(ValueError):
+            with self.assertRaises(RuntimeError):
                 # estimate_max_kv_cache_tokens will create a request of max_num_tokens for forward.
                 # Default 8192 will exceed the max length of absolute positional embedding in OPT, leading to out of range indexing.
                 llm = LLM(model=model_dir,
