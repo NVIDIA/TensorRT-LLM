@@ -41,6 +41,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..attention_backend import AttentionMetadata
@@ -48,16 +49,17 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..models.modeling_utils import ModelConfig
+from ..models.modeling_utils import ModelConfig, QuantConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (CutlassFusedMoE, DeepSeekV3MoeRoutingMethod,
                                  create_moe)
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear
+from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..peft.lora.layer import LoraLayer
 from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      disable_fp4_allgather)
@@ -149,6 +151,57 @@ class DeepseekV3MTPHead(nn.Module):
         return logits
 
 
+class DeepseekV3Linear(Linear):
+    """
+    A wrapper around Linear because we may optionally use min-latency kernels depending on input shapes.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        dtype: torch.dtype = None,
+        mapping: Optional[Mapping] = None,
+        tensor_parallel_mode: Optional[TensorParallelMode] = None,
+        gather_output: bool = False,  # COLUMN parallel only
+        quant_config: Optional[QuantConfig] = None,
+        weights_loading_config: Optional[WeightsLoadingConfig] = None,
+        reduce_output: bool = True,  # ROW parallel only
+        skip_create_weights_in_init: bool = False,
+        use_custom_cublas_mm: bool = False,
+        lora: Optional[LoraLayer] = None,
+    ):
+        super().__init__(
+            in_features,
+            out_features,
+            bias,
+            dtype,
+            mapping,
+            tensor_parallel_mode,
+            gather_output,
+            quant_config,
+            weights_loading_config,
+            reduce_output,
+            skip_create_weights_in_init,
+            use_custom_cublas_mm,
+            lora,
+        )
+
+    def apply_linear(self,
+                     input,
+                     bias,
+                     lora_params: Optional[dict] | None = None,
+                     layer_idx: Optional[int] | None = None):
+        num_tokens = input.shape[0]
+        if (not self.has_any_quant) and num_tokens >= 1 and num_tokens <= 16:
+            output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
+                input, self.weight.t(), bias, None)
+        else:
+            output = super().apply_linear(input, bias, lora_params, layer_idx)
+        return output
+
+
 class DeepseekV3Attention(MLA):
 
     def __init__(
@@ -179,6 +232,16 @@ class DeepseekV3Attention(MLA):
                          dtype=config.torch_dtype,
                          config=model_config,
                          aux_stream=aux_stream)
+        self.fused_a = DeepseekV3Linear(
+            config.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim +
+            (self.q_lora_rank if not self.is_lite else 0),
+            bias=False,
+            dtype=config.torch_dtype,
+            quant_config=model_config.get_quant_config(),
+            skip_create_weights_in_init=model_config.
+            skip_create_weights_in_init,
+            use_custom_cublas_mm=True)
 
 
 class Deepseekv3RoutingImpl():
@@ -303,11 +366,10 @@ class DeepseekV3Gate(DeepSeekV3MoeRoutingMethod):
             is_fused=fuse_routing_kernel)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # router gemm
-        logits = torch.ops.trtllm.cublas_mm(hidden_states,
-                                            self.weight.t(),
-                                            bias=None,
-                                            out_dtype=torch.float32)
+        logits = torch.ops.trtllm.dsv3_router_gemm_op(hidden_states,
+                                                      self.weight.t(),
+                                                      bias=None,
+                                                      out_dtype=torch.float32)
         return logits
 
     def load_weights(self, weights: List[Dict]):
@@ -521,8 +583,8 @@ class Deepseekv3MoE(nn.Module):
                                                        do_finalize)
             return routed_output
 
-        shared_output, routed_output = maybe_execute_in_parallel(
-            _compute_shared_output, _compute_routed_output,
+        routed_output, shared_output = maybe_execute_in_parallel(
+            _compute_routed_output, _compute_shared_output,
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared], self.aux_stream)
 
@@ -797,6 +859,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         residual=residual,
                         norm_weight=self.post_attention_layernorm.weight,
                         eps=self.post_attention_layernorm.variance_epsilon,
+                        trigger_completion_at_end=False,
                     ))
             else:
                 # No fusion
@@ -823,6 +886,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                             residual=residual,
                             norm_weight=self.next_layer_layernorm.weight,
                             eps=self.next_layer_layernorm.variance_epsilon,
+                            trigger_completion_at_end=False,
                         ))
                 else:
                     assert len(hidden_states
