@@ -368,6 +368,7 @@ def throughput_command(
                                          pad_id=eos_id,
                                          n=beam_width,
                                          use_beam_search=beam_width > 1)
+        post_proc_params = None  # No detokenization
 
         # Perform warmup if requested.
         if warmup > 0:
@@ -377,6 +378,7 @@ def throughput_command(
             asyncio.run(
                 async_benchmark(llm,
                                 sampling_params,
+                                post_proc_params,
                                 warmup_dataset,
                                 False,
                                 concurrency,
@@ -391,6 +393,7 @@ def throughput_command(
             statistics = asyncio.run(
                 async_benchmark(llm,
                                 sampling_params,
+                                post_proc_params,
                                 requests,
                                 streaming,
                                 concurrency,

@@ -676,7 +676,8 @@ def temp_extra_llm_api_options_file(request):
                 "kv_cache_config": {
                     "enable_block_reuse": False,
                     "max_tokens": 40000
-                }
+                },
+                "_num_postprocess_workers": 2,
             }
 
             pytorch_backend_config = {}
