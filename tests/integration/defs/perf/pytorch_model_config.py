@@ -18,7 +18,8 @@ Model pytorch yaml config for trtllm-bench perf tests
 """
 
 
-def get_model_yaml_config(model_label: str) -> dict:
+def get_model_yaml_config(model_label: str,
+                          lora_dirs: list[str] = None) -> dict:
     """
         Return the yaml config corresponding to the model label.
         Args:
@@ -100,5 +101,21 @@ def get_model_yaml_config(model_label: str) -> dict:
             if pattern in model_label.lower():
                 base_config.update(pattern_config['config'])
                 break  # Stop checking other patterns for this config once we find a match
+
+    # lora-specific change for pytorch
+    if 'pytorch' in model_label and 'loras' in model_label:
+        lora_config = {
+            'lora_config': {
+                'lora_dir': lora_dirs if lora_dirs is not None else [],
+                'max_lora_rank': 64,
+                'lora_target_modules': ['attn_q', 'attn_k', 'attn_v'],
+                'trtllm_modules_to_hf_modules': {
+                    "attn_q": "q_proj",
+                    "attn_k": "k_proj",
+                    "attn_v": "v_proj"
+                }
+            }
+        }
+        base_config.update(lora_config)
 
     return base_config
