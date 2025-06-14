@@ -9,6 +9,7 @@ from torch.fx import Node
 
 from ..utils.cuda_graph import cuda_graph_state
 from ..utils.logger import ad_logger
+from ..utils.node_utils import extract_op_args
 from .attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -71,8 +72,7 @@ class _FlashInferPlanner:
 
         self.workspace_buffer = workspace_buffer
         # NOTE (lucaslie): flashinfer fa3 backend has accuracy issue + illegal memory access issues
-        # on H100 PCIe, see https://github.com/NVIDIA/TensorRT-LLM/pull/3686 and
-        # https://github.com/flashinfer-ai/flashinfer/issues/924
+        # on H100 PCIe, see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer,
             "NHD",
@@ -210,20 +210,21 @@ def prepare_flashinfer_metadata(
     )
 
 
+# TODO: Move the truncation of seq_len out of this custom op
+# As SequenceInfo._get_sanitized_num_sequences could break in fake mode
 @prepare_flashinfer_metadata.register_fake
 def prepare_flashinfer_metadata_fake(
     input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
 ):
+    seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
     qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
-    batch_indices = torch.empty_like(cache_loc)
-    positions = torch.empty_like(cache_loc)
     return (
         qo_indptr,  # qo_indptr
         torch.empty_like(qo_indptr),  # paged_kv_indptr
         torch.empty_like(cache_loc),  # paged_kv_indices
         torch.empty_like(seq_len),  # paged_kv_last_page_len
-        batch_indices,  # batch_indices
-        positions,  # positions
+        torch.empty_like(seq_len),  # batch_indices
+        torch.empty_like(seq_len),  # positions
     )
 
 
@@ -399,9 +400,11 @@ class FlashInferAttention(AttentionDescriptor):
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         # Double check other arguments
-        attn_mask, dropout_p, is_causal = source_attn_node.args[3:6]
+        attn_mask, dropout_p, is_causal = extract_op_args(
+            source_attn_node, "attn_mask", "dropout_p", "is_causal"
+        )
         if attn_mask is not None or dropout_p != 0.0 or not is_causal:
-            ad_logger.warning(
+            ad_logger.debug(
                 "Unsupported attention arguments for "
                 f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
             )
@@ -411,6 +414,10 @@ class FlashInferAttention(AttentionDescriptor):
             scale = source_attn_node.args[6]
         else:
             scale = source_attn_node.kwargs.get("scale", None)
+
+        if not isinstance(scale, float):
+            ad_logger.warning("Provided scale is not a float. Using default scale instead.")
+            scale = None
 
         return [
             scale,  # softmax scale

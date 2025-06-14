@@ -26,7 +26,7 @@
 #include "tensorrt_llm/runtime/loraUtils.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
-#include "tensorrt_llm/runtime/utils/sessionUtils.h"
+#include "tensorrt_llm/runtime/utils/runtimeUtils.h"
 #include "tensorrt_llm/runtime/workerPool.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -102,7 +102,8 @@ PeftCacheManager::getPageManagerConfig(PeftCacheManagerConfig const& config, run
 
     auto const tpSize = worldConfig.getTensorParallelism();
     auto const ppSize = worldConfig.getPipelineParallelism();
-    auto const numLocalLayers = modelConfig.getNbAttentionLayers(ppSize);
+    auto const ppRank = worldConfig.getPipelineParallelRank();
+    auto const numLocalLayers = modelConfig.getNbAttentionLayers(ppSize, ppRank);
     uint64_t min1dModSize = std::numeric_limits<uint64_t>::max(); // used to setup the pageWidth
     uint64_t total1dModSize = 0;
     uint64_t total1lSlots = 0; // the slots we need for each layer, summing the slots of all modules

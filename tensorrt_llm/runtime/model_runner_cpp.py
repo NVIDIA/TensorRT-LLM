@@ -500,7 +500,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
     @property
     def num_layers(self) -> int:
         return self.model_config.num_layers(
-            self.world_config.pipeline_parallelism)
+            self.world_config.pipeline_parallelism,
+            self.world_config.pipeline_parallel_rank,
+        )
 
     @property
     def max_sequence_length(self) -> int:
@@ -867,6 +869,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                     for i in range(len(batch_input_ids_list))
                 ]
         return prompt_tuning_configs
+
+    # TODO: add multimodal input for TRT engine backend
 
     def _prepare_mrope_executor(self, batch_input_ids_list, mrope: MropeParams):
         mrope_configs = len(batch_input_ids_list) * [None]

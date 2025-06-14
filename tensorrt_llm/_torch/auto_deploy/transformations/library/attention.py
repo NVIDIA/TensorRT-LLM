@@ -22,8 +22,7 @@ def match_repeat_kv(gm: GraphModule) -> GraphModule:
     """
     graph = gm.graph
 
-    # Track replacements to avoid processing nodes multiple times
-    replacements_made = False
+    num_kv_patterns = 0
 
     # Iterate through nodes in the graph
     for node in list(graph.nodes):
@@ -33,11 +32,12 @@ def match_repeat_kv(gm: GraphModule) -> GraphModule:
             if match_info:
                 ad_logger.debug(f"Found repeat_kv pattern at {node}")
                 _replace_with_repeat_kv(graph, match_info)
-                replacements_made = True
+                num_kv_patterns += 1
 
     # Clean up the graph if we made any replacements
-    if replacements_made:
+    if num_kv_patterns:
         gm = canonicalize_graph(gm)
+    ad_logger.info(f"Found {num_kv_patterns} repeat_kv patterns")
 
     return gm
 
@@ -54,7 +54,7 @@ def match_eager_attention(gm: GraphModule) -> GraphModule:
     graph = gm.graph
 
     # Track replacements to avoid processing nodes multiple times
-    replacements_made = False
+    num_eager_patterns = 0
 
     # Iterate through nodes in the graph
     for node in list(graph.nodes):
@@ -64,12 +64,12 @@ def match_eager_attention(gm: GraphModule) -> GraphModule:
             if match_info:
                 ad_logger.debug(f"Found eager attention pattern at {node}")
                 _replace_with_sdpa(graph, match_info)
-                replacements_made = True
+                num_eager_patterns += 1
 
     # Clean up the graph if we made any replacements
-    if replacements_made:
+    if num_eager_patterns:
         gm = canonicalize_graph(gm)
-
+    ad_logger.info(f"Found {num_eager_patterns} eager attention patterns")
     return gm
 
 
@@ -87,7 +87,7 @@ def match_grouped_attention(gm: GraphModule) -> GraphModule:
     graph = gm.graph
 
     # Track replacements to avoid processing nodes multiple times
-    replacements_made = False
+    num_grouped_patterns = 0
 
     # Iterate through nodes in the graph
     for node in list(graph.nodes):
@@ -97,12 +97,12 @@ def match_grouped_attention(gm: GraphModule) -> GraphModule:
             if match_info:
                 ad_logger.debug(f"Found grouped attention pattern at {node}")
                 _replace_with_grouped_sdpa(graph, match_info)
-                replacements_made = True
+                num_grouped_patterns += 1
 
     # Clean up the graph if we made any replacements
-    if replacements_made:
+    if num_grouped_patterns:
         gm = canonicalize_graph(gm)
-
+    ad_logger.info(f"Found {num_grouped_patterns} grouped attention patterns")
     return gm
 
 
@@ -120,7 +120,7 @@ def match_causal_attn_mask(gm: GraphModule) -> GraphModule:
     graph = gm.graph
 
     # Track replacements to avoid processing nodes multiple times
-    replacements_made = False
+    num_causal_patterns = 0
 
     # Iterate through nodes in the graph
     for node in list(graph.nodes):
@@ -144,20 +144,21 @@ def match_causal_attn_mask(gm: GraphModule) -> GraphModule:
 
         ad_logger.debug(f"Found causal attention mask at {node}")
 
-        # Create new arguments with None mask and is_causal=True
-        new_args = list(node.args)
-        new_args[3] = None  # Set mask to None
+        # construct the new args list with args provided to the node and the default values otherwise
+        new_args = []
+        for idx, arg in enumerate(node.target._schema.arguments):
+            # In case arg is provided to the node, use it
+            if idx < len(node.args):
+                new_args.append(node.args[idx])
+            # In case arg is not provided to the node, use the default value
+            elif arg.has_default_value:
+                new_args.append(arg.default_value)
+            else:
+                raise ValueError(f"Missing required argument: {arg.name}")
 
-        # Check if we have enough arguments to set is_causal
-        if len(new_args) > 5:
-            new_args[5] = True  # Set is_causal to True
-        else:
-            # If is_causal wasn't specified (using default value), extend args
-            while len(new_args) < 5:
-                new_args.append(
-                    node.args[len(new_args)] if len(node.args) > len(new_args) else None
-                )
-            new_args.append(True)  # Append is_causal=True
+        # Create new arguments with None mask and is_causal=True
+        new_args[3] = None  # Set mask to None
+        new_args[5] = True  # Set is_causal to True
 
         # Create new node with updated arguments
         with graph.inserting_before(node):
@@ -169,12 +170,12 @@ def match_causal_attn_mask(gm: GraphModule) -> GraphModule:
         # Replace the old node with the new one
         node.replace_all_uses_with(new_node)
 
-        replacements_made = True
+        num_causal_patterns += 1
 
     # Clean up the graph if we made any replacements
-    if replacements_made:
+    if num_causal_patterns:
         gm = canonicalize_graph(gm)
-
+    ad_logger.info(f"Found {num_causal_patterns} causal mask attention patterns")
     return gm
 
 
@@ -292,10 +293,7 @@ def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str
     Match the eager attention pattern starting from the final matmul node.
 
     The pattern is:
-    transpose -> matmul -> mul -> (optional) add -> softmax -> to -> dropout -> matmul
-
-    Or alternatively:
-    transpose -> matmul -> div -> (optional) add -> softmax -> to -> dropout -> matmul
+    transpose -> matmul -> mul/div -> (optional) add -> (optional) to -> softmax -> (optional) to -> dropout -> matmul
 
     Returns a dictionary with information about the match or None if no match.
     """
@@ -312,48 +310,57 @@ def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str
     if not is_op(dropout_node, torch.ops.aten.dropout):
         return None
 
-    # The second arg of final matmul is the value tensor
+    # The second arg of final matmul is the value tensor (possibly repeated/transformed)
     value = final_matmul_node.args[1]
 
-    # The dropout should have a to_dtype node as input
+    # The dropout should have a to_dtype node (or directly softmax) as input
     if len(dropout_node.args) < 1:
         return None
-    to_dtype_node = dropout_node.args[0]
-    if not is_op(to_dtype_node, torch.ops.aten.to):
-        return None
 
-    # The to_dtype node should have a softmax node as input
-    if len(to_dtype_node.args) < 1:
-        return None
-    softmax_node = to_dtype_node.args[0]
+    # Allow optional to_dtype node after softmax
+    to_dtype_after_softmax = dropout_node.args[0]
+    if is_op(to_dtype_after_softmax, torch.ops.aten.to):
+        if len(to_dtype_after_softmax.args) < 1:
+            return None
+        softmax_node = to_dtype_after_softmax.args[0]
+    else:
+        softmax_node = to_dtype_after_softmax
+
+    # Now we should have a softmax node
     if not is_op(softmax_node, torch.ops.aten.softmax):
         return None
 
-    # The softmax should have the right parameters (dim=-1, dtype=float32)
-    if (
-        len(softmax_node.args) < 3
-        or softmax_node.args[1] != -1
-        or softmax_node.args[2] != torch.float32
+    # The softmax should have dim=-1 (may be specified in different ways)
+    if len(softmax_node.args) < 2 or (
+        isinstance(softmax_node.args[1], int) and softmax_node.args[1] != -1
     ):
-        return None
+        # Check kwargs if not in args
+        if softmax_node.kwargs.get("dim", -1) != -1:
+            return None
 
-    # The softmax node should have an add or mul or div as input (could be either mask or no mask)
+    # The softmax node's input can be:
+    # - direct from add/mul/div
+    # - or through a to_dtype node (like to_35 in the example)
     if len(softmax_node.args) < 1:
         return None
 
+    # Handle optional to_dtype node before softmax
     prev_node = softmax_node.args[0]
+    if is_op(prev_node, torch.ops.aten.to):
+        if len(prev_node.args) < 1:
+            return None
+        prev_node = prev_node.args[0]
 
-    # Check if the pattern has an attention mask (add node)
+    # Check for attention mask pattern (add node)
     if is_op(prev_node, torch.ops.aten.add):
         add_node = prev_node
+        attn_mask = add_node.args[1]  # Second arg is the mask
 
         # The add should have a mul or div node as its first argument
-        if len(add_node.args) < 2:
+        if len(add_node.args) < 1:
             return None
 
         scaling_node = add_node.args[0]
-        attn_mask = add_node.args[1]
-
         if not (is_op(scaling_node, torch.ops.aten.mul) or is_op(scaling_node, torch.ops.aten.div)):
             return None
     elif is_op(prev_node, torch.ops.aten.mul) or is_op(prev_node, torch.ops.aten.div):
@@ -372,42 +379,34 @@ def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str
 
     # Extract the scaling factor, adjusting for division vs multiplication
     scale = scaling_node.args[1]
-    if not isinstance(scale, (float, int)):
+    # Allow for constant or tensor scale
+    if not isinstance(scale, (float, int, Node)):
         return None
 
-    # For division, we need to invert the scaling factor
-    if is_division:
+    # For division, we need to invert the scaling factor if it's a constant
+    if is_division and isinstance(scale, (float, int)):
         scale = 1.0 / scale
 
     first_matmul_node = scaling_node.args[0]
     if not is_op(first_matmul_node, torch.ops.aten.matmul):
         return None
 
-    # The first matmul should have the query and transposed key as inputs
+    # The first matmul should have the query and key transpose as inputs
     if len(first_matmul_node.args) < 2:
         return None
 
     query = first_matmul_node.args[0]
-    transpose_node = first_matmul_node.args[1]
+    transpose_key = first_matmul_node.args[1]
 
-    if not is_op(transpose_node, torch.ops.aten.transpose):
+    # Check for transpose, could be any dimensions
+    if not is_op(transpose_key, torch.ops.aten.transpose):
         return None
 
-    # The transpose should have the key and correct dimensions as input
-    if len(transpose_node.args) < 3 or transpose_node.args[1] != 2 or transpose_node.args[2] != 3:
+    # The transpose should have the key as input
+    if len(transpose_key.args) < 1:
         return None
 
-    key = transpose_node.args[0]
-
-    # Check that query, key, value have correct dimensions (batch, num_heads, seq_len, head_dim)
-    for tensor in [query, key, value]:
-        tensor_val = tensor.meta.get("val", None)
-        if tensor_val is None:
-            continue  # Skip if no metadata available
-
-        # Check that input is 4D
-        if len(tensor_val.shape) != 4:
-            return None
+    key = transpose_key.args[0]
 
     # Create the match info dictionary
     match_info = {
@@ -415,7 +414,7 @@ def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str
         "key": key,
         "value": value,
         "scale": scale,
-        "dropout_p": dropout_node.args[1],
+        "dropout_p": dropout_node.args[1] if len(dropout_node.args) > 1 else 0.0,
         "final_matmul": final_matmul_node,
     }
 
@@ -769,7 +768,7 @@ def match_attention_layout(gm: GraphModule, attention_op: Type[AttentionDescript
     }
 
     graph = gm.graph
-    replacements_made = False
+    num_bsnd_patterns = 0
 
     # Look for SDPA operations
     for sdpa_node in list(graph.nodes):
@@ -829,11 +828,13 @@ def match_attention_layout(gm: GraphModule, attention_op: Type[AttentionDescript
         # Replace the old node with the transposed output
         sdpa_node.replace_all_uses_with(output_updated)
 
-        replacements_made = True
+        num_bsnd_patterns += 1
 
     # Clean up the graph if we made any replacements
-    if replacements_made:
+    if num_bsnd_patterns:
         gm = canonicalize_graph(gm)
         ad_logger.debug(f"Transformed graph for bsnd layout: {gm}")
+
+    ad_logger.info(f"Found and matched {num_bsnd_patterns} attention layouts")
 
     return gm

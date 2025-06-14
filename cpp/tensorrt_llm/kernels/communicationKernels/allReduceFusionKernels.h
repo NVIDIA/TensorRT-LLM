@@ -135,6 +135,7 @@ struct AllReduceFusionParams
     FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
     cudaStream_t stream;
     AllReduceFusionPattern pattern;
+    bool trigger_completion_at_end = true;
 };
 
 void allreduce_fusion_op(AllReduceFusionParams const& params);

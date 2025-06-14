@@ -7,11 +7,23 @@ from torch import nn
 from tensorrt_llm.bindings.executor import FinishReason
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.decoder import DecoderState, TorchDecoder
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
+from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
+
+
+@dataclass(frozen=True, kw_only=True)
+class SampleStateTensorsMTP(SampleStateTensors):
+    new_tokens_lens: torch.Tensor
+    next_draft_tokens: torch.Tensor
+
+
+@dataclass(kw_only=True)
+class SampleStateMTP(SampleState):
+    device: SampleStateTensorsMTP
+    host: SampleStateTensorsMTP
 
 
 @dataclass
@@ -87,7 +99,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
         context_batch = scheduled_batch.context_requests
         # allocate hidden state tensors
         for req in context_batch:
-            if req.is_first_context_chunk():
+            if req.is_first_context_chunk:
                 slot_id = self.slot_manager.add_slot(req.request_id)
                 if self.use_relaxed_acceptance_for_thinking:
                     self.mtp_relaxed_delta_pool[slot_id] = 0.
@@ -204,15 +216,19 @@ class MTPSpecMetadata(SpecMetadata):
             self.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
 
 
-class MTPDecoder(TorchDecoder):
+class MTPSampler(TorchSampler):
     """
-    MTP decoder.
+    MTP sampler.
     """
+
+    SampleState = SampleStateMTP
 
     def __init__(self, max_seq_len: int, config: MTPConfig):
         super().__init__(max_seq_len, False)
         self.mapping = None
-        self.draft_len = config.num_nextn_predict_layers
+        self.draft_len = 0
+        if config is not None:
+            self.draft_len = config.num_nextn_predict_layers
 
     def _draft_meet_max_token_stop_criteria(self, request: LlmRequest,
                                             num_tokens: int, beam_idx: int):
@@ -221,21 +237,21 @@ class MTPDecoder(TorchDecoder):
             request.state = LlmRequestState.GENERATION_COMPLETE
             request.set_finished_reason(FinishReason.LENGTH, beam_idx)
 
-    def update_requests(self, decoder_state: DecoderState) -> None:
-        decoder_state.decoder_event.synchronize()
-        new_tensors_host = decoder_state.new_tensors_host
-        new_tokens_list = new_tensors_host["new_tokens_host"].tolist()
-        new_tokens_lens_list = new_tensors_host["new_tokens_lens_host"].tolist()
-        next_draft_tokens_list = new_tensors_host[
-            "next_draft_tokens_host"].tolist()
+    def update_requests(self, state: SampleStateMTP) -> None:
+        assert isinstance(state, SampleStateMTP)
+
+        state.sampler_event.synchronize()
+        new_tokens_list = state.host.new_tokens.tolist()
+        new_tokens_lens_list = state.host.new_tokens_lens.tolist()
+        next_draft_tokens_list = state.host.next_draft_tokens.tolist()
 
         idx = 0
         beam_idx = 0
-        for request in decoder_state.scheduled_requests.context_requests:
-            assert not request.py_return_context_logits, "return_context_logits not implemented for MTPDecoder"
-            assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPDecoder"
-            assert not request.py_return_log_probs, "return_log_probs not implemented for MTPDecoder"
-            if request.get_context_remaining_length() != 0:
+        for request in state.scheduled_requests.context_requests:
+            assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
+            assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
+            assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
+            if request.context_remaining_length != 0:
                 idx += 1
                 continue
 
@@ -247,15 +263,14 @@ class MTPDecoder(TorchDecoder):
                 if self._draft_meet_max_token_stop_criteria(
                         request, num_tokens, beam_idx):
                     should_stop = True
-                if not should_stop:
-                    request.py_draft_tokens = next_draft_tokens_list[idx]
+                request.py_draft_tokens = next_draft_tokens_list[idx]
                 request.py_decoding_iter += 1
             idx += 1
 
-        for request in decoder_state.scheduled_requests.generation_requests:
-            assert not request.py_return_context_logits, "return_context_logits not implemented for MTPDecoder"
-            assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPDecoder"
-            assert not request.py_return_log_probs, "return_log_probs not implemented for MTPDecoder"
+        for request in state.scheduled_requests.generation_requests:
+            assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
+            assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
+            assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 new_tokens = new_tokens_list[idx]
                 num_new_tokens = new_tokens_lens_list[idx]
@@ -270,14 +285,13 @@ class MTPDecoder(TorchDecoder):
                 if self._draft_meet_max_token_stop_criteria(
                         request, num_tokens, beam_idx):
                     should_stop = True
-                if not should_stop:
-                    request.py_draft_tokens = next_draft_tokens_list[idx]
+                request.py_draft_tokens = next_draft_tokens_list[idx]
                 request.py_rewind_len = self.draft_len - (num_new_tokens - 1)
                 request.py_decoding_iter += 1
             idx += 1
 
-    def decode_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> DecoderState:
+    def sample_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs) -> SampleStateMTP:
         # new_tokens_device: all of the accepted tokens, device tensor
         # new_tokens_lens_device: the accepted lengths, device tensor
         # next_draft_tokens_device: predicted draft tokens, device tensor
@@ -286,33 +300,29 @@ class MTPDecoder(TorchDecoder):
         new_tokens_lens_device = model_outputs['new_tokens_lens']
         next_draft_tokens_device = model_outputs['next_draft_tokens']
         next_new_tokens_device = model_outputs['next_new_tokens']
-        new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
-        new_tokens_lens_host = new_tokens_lens_device.to('cpu',
-                                                         non_blocking=True)
-        next_draft_tokens_host = next_draft_tokens_device.to('cpu',
-                                                             non_blocking=True)
 
-        decoder_event = torch.cuda.Event()
-        decoder_event.record()
-        new_tensors_device = {
-            "new_tokens_device": next_new_tokens_device,
-            "new_tokens_lens_device": new_tokens_lens_device,
-            "next_draft_tokens_device": next_draft_tokens_device,
-        }
-        new_tensors_host = {
-            "new_tokens_host": new_tokens_host,
-            "new_tokens_lens_host": new_tokens_lens_host,
-            "next_draft_tokens_host": next_draft_tokens_host,
-        }
+        device = SampleStateTensorsMTP(
+            new_tokens=next_new_tokens_device,
+            new_tokens_lens=new_tokens_lens_device,
+            next_draft_tokens=next_draft_tokens_device,
+        )
+        host = SampleStateTensorsMTP(
+            new_tokens=new_tokens_device.to('cpu', non_blocking=True),
+            new_tokens_lens=new_tokens_lens_device.to('cpu', non_blocking=True),
+            next_draft_tokens=next_draft_tokens_device.to('cpu',
+                                                          non_blocking=True),
+        )
+        sampler_event = torch.cuda.Event()
+        sampler_event.record()
         # add dummy draft tokens to context requests to prepare kv cache in advance
         # with the max draft token length
         for request in scheduled_requests.context_requests:
             request.py_draft_tokens = [1] * self.draft_len
-        return DecoderState(scheduled_requests=scheduled_requests,
-                            logits=model_outputs['logits'],
-                            new_tensors_device=new_tensors_device,
-                            new_tensors_host=new_tensors_host,
-                            decoder_event=decoder_event)
+        return SampleStateMTP(scheduled_requests=scheduled_requests,
+                              logits=model_outputs['logits'],
+                              device=device,
+                              host=host,
+                              sampler_event=sampler_event)
 
 
 class MTPWorker(nn.Module):
@@ -368,7 +378,7 @@ class MTPWorker(nn.Module):
             hidden_states, logits = mtp_layer(lm_head=lm_head,
                                               embed_tokens=embed_tokens,
                                               **draft_inputs)
-            previous_layer_draft_tokens = self.draft_decoder(logits)
+            previous_layer_draft_tokens = self.draft_sampler(logits)
             next_draft_tokens.append(previous_layer_draft_tokens)
 
             input_ids = draft_inputs["input_ids"]
@@ -393,9 +403,43 @@ class MTPWorker(nn.Module):
             'next_new_tokens': next_new_tokens
         }
 
+    def skip_forward(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        lm_head,
+        embed_tokens,
+        attn_metadata,
+        spec_metadata,
+        mtp_layers,
+    ):
+        batch_size = attn_metadata.num_seqs
+        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+        accepted_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+        next_draft_tokens = torch.empty((batch_size, mtp_num_modules),
+                                        dtype=torch.int,
+                                        device=logits.device)
+        next_new_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        return {
+            'logits': logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens
+        }
+
     def update_mtp_hidden_states(
         self,
-        input_ids: torch.LongTensor,
+        input_ids: torch.IntTensor,
         target_model_hidden_states: torch.Tensor,
         num_accepted_tokens: torch.Tensor,
         accepted_tokens: torch.Tensor,
@@ -409,7 +453,7 @@ class MTPWorker(nn.Module):
         Also update the seq_len and kv_lens in attention metadata.
 
         Args:
-            input_ids: torch.LongTensor
+            input_ids: torch.IntTensor
                 [num_tokens]
                 The input ids of all requests. Flatten.
 
@@ -603,7 +647,7 @@ class MTPWorker(nn.Module):
 
     def sample_and_accept_draft_tokens(
         self,
-        input_ids: torch.LongTensor,
+        input_ids: torch.IntTensor,
         logits: torch.Tensor,
         spec_metadata: MTPSpecMetadata,
         attn_metadata: AttentionMetadata,
@@ -615,7 +659,7 @@ class MTPWorker(nn.Module):
         for acceptance.
 
         Args:
-            input_ids: torch.LongTensor
+            input_ids: torch.IntTensor
                 [num_tokens]
                 The input ids of all requests. Flatten.
 
@@ -689,7 +733,6 @@ class MTPWorker(nn.Module):
         num_accepted_tokens = torch.ones(batch_size,
                                          dtype=torch.int,
                                          device=logits.device)
-
         if self.spec_config.use_relaxed_acceptance_for_thinking:
             mtp_relaxed_delta_pool = spec_metadata.mtp_hidden_states_manager.mtp_relaxed_delta_pool
 
@@ -751,8 +794,7 @@ class MTPWorker(nn.Module):
                                                   device=logits.device)
                 accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_sampling_and_accepted_draft_tokens_op(
                     logits, spec_metadata.draft_tokens, target_tokens_cache,
-                    accepted_tokens, num_accepted_tokens, mtp_num_modules,
-                    batch_size, num_contexts, logits.shape[-1])
+                    mtp_num_modules, batch_size, num_contexts, logits.shape[-1])
             else:
                 # Do greedy sampling for the input logits
                 target_tokens = torch.argmax(logits, dim=-1)
@@ -807,8 +849,8 @@ class MTPWorker(nn.Module):
     def prepare_drafter_inputs(
         self,
         mtp_layer_idx: int,
-        input_ids: torch.LongTensor,
-        position_ids: torch.LongTensor,
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
         previous_layer_hidden_states: torch.Tensor,
         previous_layer_draft_tokens: torch.Tensor,
         num_accepted_tokens: torch.Tensor,
@@ -822,13 +864,13 @@ class MTPWorker(nn.Module):
             mtp_layer_idx: int
                 The index number of the current MTP layer.
 
-            input_ids: torch.LongTensor
+            input_ids: torch.IntTensor
                 [num_tokens]
                 The input ids of all requests. Flatten.
                 When mtp_layer_idx == 0: num_tokens = sum(all prompts) + num_generation * (mtp_num_modules + 1)
                 When mtp_layer_idx > 0: num_tokens = sum(all prompts) + num_generation * (mtp_num_modules)
 
-            position_ids: torch.LongTensor
+            position_ids: torch.IntTensor
                 [1][num_tokens]
                 The position id of all requests. Flatten.
 
@@ -982,7 +1024,7 @@ class MTPWorker(nn.Module):
             "spec_metadata": spec_metadata,
         }
 
-    def draft_decoder(
+    def draft_sampler(
         self,
         logits: torch.Tensor,
     ):
@@ -1052,7 +1094,7 @@ class MTPEagleWorker(MTPWorker):
             hidden_states, logits = mtp_layers[0](lm_head=lm_head,
                                                   embed_tokens=embed_tokens,
                                                   **inputs)
-            new_draft_token = self.draft_decoder(logits)
+            new_draft_token = self.draft_sampler(logits)
             next_draft_tokens.append(new_draft_token)
             # update inputs
             last_tokens = torch.cumsum(
@@ -1115,8 +1157,8 @@ class MTPEagleWorker(MTPWorker):
 
     def prepare_drafter_inputs(
         self,
-        input_ids: torch.LongTensor,
-        position_ids: torch.LongTensor,
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         accepted_tokens: torch.Tensor,
         num_accepted_tokens: torch.Tensor,

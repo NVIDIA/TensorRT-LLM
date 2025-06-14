@@ -476,7 +476,10 @@ std::shared_ptr<Model> Executor::Impl::createModel(runtime::RawEngine const& raw
     {
         switch (executorConfig.getBatchingType())
         {
-        case BatchingType::kSTATIC: return batch_manager::TrtGptModelType::V1;
+        case BatchingType::kSTATIC:
+            TLLM_THROW(
+                "Static batching type is deprecated. Please use in-flight batching with "
+                "CapacitySchedulerPolicy::kSTATIC_BATCH instead.");
         case BatchingType::kINFLIGHT:
             return modelConfig.isRnnBased() ? batch_manager::TrtGptModelType::InflightBatching
                                             : batch_manager::TrtGptModelType::InflightFusedBatching;
@@ -1591,14 +1594,14 @@ std::tuple<Executor::Impl::RequestList, double> Executor::Impl::fetchNewRequests
                     }
                 }
 
-                if (newReq->getGuidedDecodingParams() && mModel->getWorldConfig().isLastPipelineParallelRank())
+                if (mModel->getWorldConfig().isLastPipelineParallelRank() && newReq->getGuidedDecodingParams())
                 {
                     TLLM_CHECK_WITH_INFO(mModel->hasGuidedDecoder(),
                         "Request is specified with GuidedDecodingParams, but GuidedDecoder is not setup. Please "
                         "provide a valid GuidedDecodingConfig to setup GuidedDecoder.");
                 }
 
-                if (newReq->hasAdditionalOutputs())
+                if (mModel->getWorldConfig().isLastPipelineParallelRank() && newReq->hasAdditionalOutputs())
                 {
                     newReq->allocAdditionalOutputs([this](std::string const& name)
                         { return mModel->getTensorDataType(name); },

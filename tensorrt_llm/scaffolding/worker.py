@@ -4,7 +4,6 @@ from typing import Callable
 import openai
 from transformers import AutoTokenizer
 
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -136,12 +135,8 @@ class TRTLLMWorker(Worker):
         max_batch_size: int = 32,
         max_num_tokens: int = 4096,
         kv_cache_free_gpu_memory_fraction: float = 0.9,
-        enable_overlap_scheduler: bool = True,
+        disable_overlap_scheduler: bool = False,
     ):
-        pytorch_backend_config = PyTorchConfig(
-            mixed_decoder=True,
-            enable_overlap_scheduler=enable_overlap_scheduler,
-        )
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction, )
 
@@ -157,7 +152,8 @@ class TRTLLMWorker(Worker):
         llm = LLM(model_dir,
                   backend=backend,
                   tokenizer=tokenizer,
-                  pytorch_backend_config=pytorch_backend_config,
+                  mixed_sampler=True,
+                  disable_overlap_scheduler=disable_overlap_scheduler,
                   kv_cache_config=kv_cache_config,
                   max_batch_size=max_batch_size,
                   max_num_tokens=max_num_tokens)

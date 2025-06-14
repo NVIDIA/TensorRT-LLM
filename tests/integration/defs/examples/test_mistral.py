@@ -13,13 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Module test_mistral test mistral examples."""
+import multiprocessing
 import platform
 
+import psutil
 import pytest
 from defs.common import (convert_weights, quantize_data,
                          test_multi_lora_support, venv_check_call)
-from defs.conftest import skip_pre_ada
+from defs.conftest import skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
+
+
+def get_optimal_jobs():
+    cpu_count = multiprocessing.cpu_count()
+    available_memory = psutil.virtual_memory().available / (1024 * 1024 * 1024)
+    memory_per_job = 4
+    memory_based_jobs = int(available_memory / memory_per_job)
+    system_load = psutil.getloadavg()[0] / cpu_count
+    if system_load > 0.7:
+        cpu_factor = 0.5
+    else:
+        cpu_factor = 0.75
+    cpu_based_jobs = max(1, int(cpu_count * cpu_factor))
+    optimal_jobs = max(1, min(cpu_based_jobs, memory_based_jobs))
+    return optimal_jobs
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -27,8 +44,9 @@ def mistral_example_root(llm_venv):
     if platform.system() != "Windows":
         # https://github.com/Dao-AILab/flash-attention/issues/345
         # No wheel for flash-attn on windows and compilation fails locally.
+        max_jobs = get_optimal_jobs()
         install_cmd = [
-            "MAX_JOBS=4",
+            f"MAX_JOBS={max_jobs}",
             "python3",
             "-m",
             "pip",
@@ -40,6 +58,7 @@ def mistral_example_root(llm_venv):
         check_call(" ".join(install_cmd), shell=True, env=llm_venv._new_env)
 
 
+@skip_post_blackwell  #nvbug 5298661
 @pytest.mark.parametrize(
     "run_type",
     ['inference', 'summarization_long', 'chunked_summarization_long'])

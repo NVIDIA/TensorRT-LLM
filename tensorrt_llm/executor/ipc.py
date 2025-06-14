@@ -37,7 +37,10 @@ class ZeroMqQueue:
         '''
         Parameters:
             address (tuple[str, Optional[bytes]], optional): The address (tcp-ip_port, hmac_auth_key) for the IPC. Defaults to None. If hmac_auth_key is None and use_hmac_encryption is False, the queue will not use HMAC encryption.
+            socket_type (int): The type of socket to use. Defaults to zmq.PAIR.
             is_server (bool): Whether the current process is the server or the client.
+            is_async (bool): Whether to use asyncio for the socket. Defaults to False.
+            name (str, optional): The name of the queue. Defaults to None.
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
         '''
 
@@ -57,10 +60,7 @@ class ZeroMqQueue:
         self.use_hmac_encryption = use_hmac_encryption
 
         # Check HMAC key condition
-        if self.use_hmac_encryption and self.is_server and self.hmac_key is not None:
-            raise ValueError(
-                "Server should not receive HMAC key when encryption is enabled")
-        elif self.use_hmac_encryption and not self.is_server and self.hmac_key is None:
+        if self.use_hmac_encryption and not self.is_server and self.hmac_key is None:
             raise ValueError(
                 "Client must receive HMAC key when encryption is enabled")
         elif not self.use_hmac_encryption and self.hmac_key is not None:
@@ -79,7 +79,7 @@ class ZeroMqQueue:
                 f"Server [{name}] bound to {self.address_endpoint} in {self.socket_type_str[socket_type]}\n",
                 "green")
 
-            if self.use_hmac_encryption:
+            if self.use_hmac_encryption and not self.hmac_key:
                 # Initialize HMAC key for pickle encryption
                 logger.info(f"Generating a new HMAC key for server {self.name}")
                 self.hmac_key = os.urandom(32)
@@ -124,6 +124,14 @@ class ZeroMqQueue:
             else:
                 # Send data without HMAC
                 self.socket.send_pyobj(obj)
+
+    def put_noblock(self, obj: Any):
+        self.setup_lazily()
+        with nvtx_range_debug("send", color="blue", category="IPC"):
+            data = pickle.dumps(obj)  # nosec B301
+            if self.use_hmac_encryption:
+                data = self._sign_data(data)
+            self.socket.send(data, flags=zmq.NOBLOCK)
 
     async def put_async(self, obj: Any):
         self.setup_lazily()

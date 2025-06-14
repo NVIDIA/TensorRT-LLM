@@ -60,9 +60,9 @@ class BertEmbeddings(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        token_type_ids: torch.LongTensor,
-        position_ids: torch.LongTensor,
+        input_ids: torch.IntTensor,
+        token_type_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
     ):
         assert input_ids is not None
         x = self.word_embeddings(input_ids)

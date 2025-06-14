@@ -63,15 +63,6 @@ public:
         SizeType32 maxTokensPerEngineStep, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
         BufferManager const& bufferManager);
 
-    //! @brief Setup buffers for ExplicitDraftTokens decoding.
-    void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) const;
-
-    //! @brief Setup buffers for Lookahead decoding.
-    void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) const;
-
-    //! @brief Setup buffers for Eagle decoding.
-    void setupEagle(EagleBuffers::Inputs eagleBuffers) const;
-
     //! @brief Disable lookahead decoding.
     void disableLookahead(RequestVector const& genRequests);
 
@@ -118,6 +109,10 @@ public:
     //! @returns [batchSize, maxBeamWidth], sequence lengths, on gpu
     [[nodiscard]] TensorPtr getSequenceLengths() const;
 
+    //! @param batchIdx index of the batch
+    //! @returns [maxBeamWidth], sequence lengths for request `batchIdx`, on gpu
+    [[nodiscard]] TensorPtr getSequenceLengths(SizeType32 batchIdx) const;
+
     //! @brief Get maxTokensPerStep tokens generated in the last forward pass
     //! @returns [maxTokensPerStep, batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
     [[nodiscard]] TensorPtr getAllNewTokens() const;
@@ -140,9 +135,7 @@ public:
     //! @returns [maxTokensPerStep, batchSize, beamWidth], finished states of type FinishedState, on gpu
     [[nodiscard]] TensorPtr getFinishedSteps() const;
 
-    [[nodiscard]] SizeType32 getActualBatchSize() const;
-
-    void setActualBatchSize(SizeType32 actualBatchSize);
+    [[nodiscard]] SizeType32 getMaxBatchSize() const;
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
 
@@ -166,7 +159,17 @@ public:
     //! @param numTokens The number of tokens for the specified request.
     void setNumDecodingEngineTokens(SizeType32 batchIdx, SizeType32 numTokens);
 
+    //! @brief Get the speculative decoding mode.
     [[nodiscard]] SpeculativeDecodingMode getSpeculativeDecodingMode() const;
+
+    //! @brief Get the explicit draft tokens buffers.
+    [[nodiscard]] ExplicitDraftTokensBuffers::Inputs const& getExplicitDraftTokensBuffers() const;
+
+    //! @brief Get the eagle buffers.
+    [[nodiscard]] EagleBuffers::Inputs const& getEagleBuffers() const;
+
+    //! @brief Get the lookahead buffers.
+    [[nodiscard]] LookaheadDecodingBuffers const& getLookaheadBuffers() const;
 
     //! @brief Workspace for beam search in streaming mode.
     [[nodiscard]] BeamSearchBuffers const& getBeamSearchBuffers() const;
@@ -178,7 +181,6 @@ public:
     [[nodiscard]] DecodingOutput& getJointDecodingOutput() const;
 
 private:
-    SizeType32 mActualBatchSize{};
     SizeType32 mMaxBatchSize{};
     SizeType32 mMaxBeamWidth{};
     SizeType32 mMaxSequenceLength{};

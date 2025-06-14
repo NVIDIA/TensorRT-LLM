@@ -1,12 +1,11 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,7 +18,6 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 #include "tensorrt_llm/plugins/common/pluginUtils.h"
 
-using namespace tensorrt_llm::kernels::cutlass_kernels;
 namespace tc = tensorrt_llm::common;
 
 namespace tensorrt_llm::plugins
@@ -71,8 +69,9 @@ std::string GemmAllReducePluginProfiler::getCacheFileName(GemmIdCore gemmId)
     return fileName.str();
 }
 
-void GemmAllReducePluginProfiler::runTactic(int m, int n, int k, GemmAllReduceImplInterface::LaunchConfig const& tactic,
-    char* workspace, cudaStream_t const& stream)
+void GemmAllReducePluginProfiler::runTactic(int m, int n, int k,
+    cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig const& tactic, char* workspace,
+    cudaStream_t const& stream)
 {
     const size_t dtype_size = tc::getDTypeSize(mType);
     char* inputA = workspace;
@@ -83,7 +82,7 @@ void GemmAllReducePluginProfiler::runTactic(int m, int n, int k, GemmAllReduceIm
     std::set<int> tpGroup = {0};
 
     // Run on single-GPU
-    GemmAllReduceImplInterface::ProblemArgs args;
+    cutlass_kernels::GemmAllReduceImplInterface::ProblemArgs args;
     args.argProblemShape(m, n, k, 1)
         .argA((void*) inputA)
         .argB((void*) inputB)
@@ -120,7 +119,8 @@ void GemmAllReducePluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k
     setTmpWorkspaceSizeInBytes(bytes);
 }
 
-std::vector<GemmAllReduceImplInterface::LaunchConfig> GemmAllReducePluginProfiler::getTactics(int m, int n, int k) const
+std::vector<cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig> GemmAllReducePluginProfiler::getTactics(
+    int m, int n, int k) const
 {
     TLLM_CHECK(mRunner != nullptr);
     return mRunner->getSupportedLaunchConfigs();

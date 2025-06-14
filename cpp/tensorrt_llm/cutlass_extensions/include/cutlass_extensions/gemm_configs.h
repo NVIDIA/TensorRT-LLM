@@ -102,8 +102,9 @@ enum class CutlassTileConfigSM90
     CtaShape128x128x128B,
     CtaShape128x256x128B,
 
-    // CTA configs for M=128
+    // CTA configs for M=256
     CtaShape256x128x128B,
+    CtaShape256x256x128B,
 };
 
 enum class CutlassTileConfigSM100
@@ -204,7 +205,9 @@ enum class TileShape
     TileShape_128x32x128,
     TileShape_128x64x128,
     TileShape_128x128x128,
-    TileShape_128x256x128
+    TileShape_128x256x128,
+    TileShape_256x128x128,
+    TileShape_256x256x128
 };
 
 template <TileShape Shape_MNK>
@@ -255,6 +258,14 @@ constexpr auto get_tile_shape()
     {
         return cute::Shape<_128, _256, _128>{};
     }
+    else if constexpr (Shape_MNK == TileShape::TileShape_256x128x128)
+    {
+        return cute::Shape<_256, _128, _128>{};
+    }
+    else if constexpr (Shape_MNK == TileShape::TileShape_256x256x128)
+    {
+        return cute::Shape<_256, _256, _128>{};
+    }
 }
 
 static auto get_tile_shape_name(TileShape Shape_MNK)
@@ -303,6 +314,14 @@ static auto get_tile_shape_name(TileShape Shape_MNK)
     {
         return "128x256x128";
     }
+    else if (Shape_MNK == TileShape::TileShape_256x128x128)
+    {
+        return "256x128x128";
+    }
+    else if (Shape_MNK == TileShape::TileShape_256x256x128)
+    {
+        return "256x256x128";
+    }
     return "Unknown shape";
 }
 
@@ -317,7 +336,8 @@ enum class ClusterShape
     ClusterShape_2x4x1,
     ClusterShape_4x4x1,
     ClusterShape_1x8x1,
-    ClusterShape_8x1x1
+    ClusterShape_8x1x1,
+    ClusterShape_4x1x1
 };
 
 static auto get_cluster_shape_name(ClusterShape Shape_MNK)
@@ -337,6 +357,10 @@ static auto get_cluster_shape_name(ClusterShape Shape_MNK)
     else if (Shape_MNK == ClusterShape::ClusterShape_2x2x1)
     {
         return "2x2x1";
+    }
+    else if (Shape_MNK == ClusterShape::ClusterShape_4x1x1)
+    {
+        return "4x1x1";
     }
     else if (Shape_MNK == ClusterShape::ClusterShape_1x8x1)
     {
@@ -368,6 +392,10 @@ constexpr auto get_cluster_shape()
     else if constexpr (Shape_MNK == ClusterShape::ClusterShape_2x2x1)
     {
         return cute::Shape<_2, _2, _1>{};
+    }
+    else if constexpr (Shape_MNK == ClusterShape::ClusterShape_4x1x1)
+    {
+        return cute::Shape<_4, _1, _1>{};
     }
     else if constexpr (Shape_MNK == ClusterShape::ClusterShape_1x8x1)
     {

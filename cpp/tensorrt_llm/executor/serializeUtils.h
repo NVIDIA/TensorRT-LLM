@@ -93,6 +93,7 @@ static_assert(hasSerializedSize<SamplingConfig>(size_t()));
 static_assert(hasSerializedSize<OutputConfig>(size_t()));
 static_assert(hasSerializedSize<AdditionalModelOutput>(size_t()));
 static_assert(hasSerializedSize<PromptTuningConfig>(size_t()));
+static_assert(hasSerializedSize<MultimodalInput>(size_t()));
 static_assert(hasSerializedSize<MropeConfig>(size_t()));
 static_assert(hasSerializedSize<LoraConfig>(size_t()));
 static_assert(hasSerializedSize<kv_cache::CommState>(size_t()));
@@ -190,6 +191,7 @@ static_assert(hasSerialize<SamplingConfig>(nullptr));
 static_assert(hasSerialize<OutputConfig>(nullptr));
 static_assert(hasSerialize<AdditionalModelOutput>(nullptr));
 static_assert(hasSerialize<PromptTuningConfig>(nullptr));
+static_assert(hasSerialize<MultimodalInput>(nullptr));
 static_assert(hasSerialize<MropeConfig>(nullptr));
 static_assert(hasSerialize<LoraConfig>(nullptr));
 static_assert(hasSerialize<ExternalDraftTokensConfig>(nullptr));
@@ -337,6 +339,10 @@ T deserialize(std::istream& is)
     {
         return Serialization::deserializePromptTuningConfig(is);
     }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::MultimodalInput>)
+    {
+        return Serialization::deserializeMultimodalInput(is);
+    }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::MropeConfig>)
     {
         return Serialization::deserializeMropeConfig(is);
@@ -352,6 +358,10 @@ T deserialize(std::istream& is)
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::kv_cache::SocketState>)
     {
         return Serialization::deserializeSocketState(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::kv_cache::AgentState>)
+    {
+        return Serialization::deserializeAgentState(is);
     }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::kv_cache::CacheState>)
     {
@@ -464,6 +474,10 @@ T deserialize(std::istream& is)
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::InflightBatchingStats>)
     {
         return Serialization::deserializeInflightBatchingStats(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::SpecDecodingStats>)
+    {
+        return Serialization::deserializeSpecDecodingStats(is);
     }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::IterationStats>)
     {

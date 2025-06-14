@@ -13,6 +13,7 @@ from typing import (TYPE_CHECKING, AsyncIterable, Generator, List, Optional,
 import numpy as np
 import torch
 
+from tensorrt_llm.inputs.multimodal import MultimodalInput
 from tensorrt_llm.logger import logger, set_level
 from tensorrt_llm.lora_manager import LoraConfig
 
@@ -35,8 +36,8 @@ from .result import GenerationResult, IterationResult
 from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
 
 if TYPE_CHECKING:
-    from .proxy import ExecutorBindingsProxy
-    from .worker import ExecutorBindingsWorker
+    from .proxy import GenerationExecutorProxy
+    from .worker import GenerationExecutorWorker
 
 __all__ = [
     "GenerationExecutor",
@@ -116,6 +117,7 @@ class GenerationExecutor(ABC):
             lora_request: Optional[LoRARequest] = None,
             prompt_adapter_request: Optional[PromptAdapterRequest] = None,
             streaming: bool = False,
+            multimodal_input: Optional[MultimodalInput] = None,
             multimodal_embedding: Optional[list] = None,
             mrope_config: Optional[dict] = None,
             kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
@@ -142,6 +144,7 @@ class GenerationExecutor(ABC):
                 lora_request=lora_request,
                 prompt_adapter_request=prompt_adapter_request,
                 streaming=streaming,
+                multimodal_input=multimodal_input,
                 multimodal_embedding=multimodal_embedding,
                 mrope_config=mrope_config,
                 kv_cache_retention_config=kv_cache_retention_config,
@@ -347,10 +350,10 @@ class GenerationExecutor(ABC):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-    ) -> Union["ExecutorBindingsProxy", "ExecutorBindingsWorker"]:
+    ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
-        from .proxy import ExecutorBindingsProxy
-        from .worker import ExecutorBindingsWorker
+        from .proxy import GenerationExecutorProxy
+        from .worker import GenerationExecutorWorker
 
         if world_size == 0:
             world_size = mpi_world_size()
@@ -385,7 +388,7 @@ class GenerationExecutor(ABC):
         if spawn_workers or (mpirun_launch and reuse_mpi_comm):
             if reuse_mpi_comm:
                 assert mpi_session is not None, "reuse_mpi_comm requires an external MPI session"
-            return ExecutorBindingsProxy(
+            return GenerationExecutorProxy(
                 worker_kwargs,
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
@@ -400,15 +403,15 @@ class GenerationExecutor(ABC):
             logger.warning(
                 "Using single process worker for TP1, this may hurt streaming generation performance."
             )
-            return ExecutorBindingsWorker(**worker_kwargs,
-                                          is_llm_executor=is_llm_executor)
+            return GenerationExecutorWorker(**worker_kwargs,
+                                            is_llm_executor=is_llm_executor)
 
         # For single-gpu case:
         # Partition the workload to multiple process for streaming performance.
         # While this requires uses to protect their entrypoint to
         # `if __name__ == "__main__":`.
         if not platform.system() == 'Windows':
-            return ExecutorBindingsProxy(
+            return GenerationExecutorProxy(
                 worker_kwargs,
                 model_world_size=model_world_size,
                 mpi_session=None,  # use mpi4py
@@ -419,7 +422,7 @@ class GenerationExecutor(ABC):
             # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
             mpi_session = ProcessPoolExecutorSession(n_workers=1,
                                                      mp_context=ctx)
-            return ExecutorBindingsProxy(
+            return GenerationExecutorProxy(
                 worker_kwargs,
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,

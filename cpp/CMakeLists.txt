@@ -43,6 +43,14 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
+       "Using open sourced Cutlass low latency gemm kernel" ON)
+option(USING_OSS_CUTLASS_FP4_GEMM "Using open sourced Cutlass fp4 gemm kernel"
+       ON)
+option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
+       ON)
+option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
+       "Using open sourced Cutlass AR gemm kernel" ON)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -109,7 +117,7 @@ set(TRTLLM_VERSION_DIR ${PROJECT_SOURCE_DIR}/../tensorrt_llm)
 set_directory_properties(PROPERTIES CMAKE_CONFIGURE_DEPENDS
                                     ${TRTLLM_VERSION_DIR}/version.py)
 execute_process(
-  COMMAND python3 -c "import version; print(version.__version__)"
+  COMMAND ${Python_EXECUTABLE} -c "import version; print(version.__version__)"
   WORKING_DIRECTORY ${TRTLLM_VERSION_DIR}
   OUTPUT_VARIABLE TRTLLM_VERSION
   RESULT_VARIABLE TRTLLM_VERSION_RESULT
@@ -373,6 +381,8 @@ print(os.path.dirname(torch.__file__),end='');"
     message(FATAL_ERROR "Torch config Error.")
   endif()
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
+  set(USE_SYSTEM_NVTX ON)
+  set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
   find_package(Torch REQUIRED)
 
   message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")

@@ -78,6 +78,7 @@ First, create a configuration file:
    cat >./extra-llm-api-config.yml<<EOF
    kv_cache_config:
        enable_block_reuse: false
+       free_gpu_memory_fraction: 0.6
    EOF
 
 Then, start the server with the configuration file:
@@ -99,7 +100,7 @@ You can query Completions API with any http clients, a typical example is OpenAI
 
 Another example uses ``curl``:
 
-.. literalinclude:: ../../../examples/serve/curl_completion_client_for_multimodal.sh
+.. literalinclude:: ../../../examples/serve/curl_chat_client_for_multimodal.sh
     :language: bash
     :linenos:
 

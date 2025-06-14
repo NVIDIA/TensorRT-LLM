@@ -40,6 +40,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 strategy,
                 fusion,
                 KeywordArg('eps'),
+                Ignored(),
                 _users=2)
             allreduce_output = CallFunction(getitem, trtllm_allreduce_default,
                                             0)
@@ -78,7 +79,8 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 all_reduce_output = torch.ops.trtllm.allreduce(
                     input, residual_in, gamma, scale, None, None,
                     mapping.tp_group, int(AllReduceStrategy.UB),
-                    int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8), eps)
+                    int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8), eps,
+                    True)
                 finalize_output = torch.ops.trtllm.userbuffers_allreduce_finalize(
                     all_reduce_output[1], False)
                 return all_reduce_output[0], scale, finalize_output
@@ -117,6 +119,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 strategy,
                 fusion,
                 KeywordArg('eps'),
+                Ignored(),
                 _users=2)
             allreduce_output = CallFunction(getitem, trtllm_allreduce_default,
                                             0)
@@ -154,7 +157,8 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 all_reduce_output = torch.ops.trtllm.allreduce(
                     input, residual_in, gamma, scale, None, None,
                     mapping.tp_group, int(AllReduceStrategy.UB),
-                    int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4), eps)
+                    int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4), eps,
+                    True)
                 finalize_output = torch.ops.trtllm.userbuffers_allreduce_finalize(
                     all_reduce_output[-1], False)
                 return all_reduce_output[0], all_reduce_output[
@@ -191,15 +195,16 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
         fusion = KeywordArg('fusion_op')
         trtllm_allreduce_default = CallFunction(
             torch.ops.trtllm.allreduce.default, input_node,
-            KeywordArg('residual_in'), KeywordArg('gamma'), Ignored(),
-            Ignored(), Ignored(), mapping.tp_group, strategy, fusion,
-            KeywordArg('eps'))
+            KeywordArg('residual_in'), KeywordArg('gamma'), KeywordArg('scale'),
+            None, Ignored(), mapping.tp_group, strategy, fusion,
+            KeywordArg('eps'), Ignored())
         convert_pattern = MultiOutputPattern([trtllm_allreduce_default])
 
         def empty_convert_supported_ar_to_ub(
             input: torch.Tensor,
             residual_in: torch.Tensor,
             gamma: torch.Tensor,
+            scale: torch.Tensor,
             fusion_op: int,
             eps: float,
         ):
@@ -209,13 +214,14 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
             input: torch.Tensor,
             residual_in: torch.Tensor,
             gamma: torch.Tensor,
+            scale: torch.Tensor,
             fusion_op: int,
             eps: float,
         ):
             input = torch.ops.trtllm.copy_to_userbuffers(input)
             all_reduce_output = torch.ops.trtllm.allreduce(
-                input, residual_in, gamma, None, None, None, mapping.tp_group,
-                int(AllReduceStrategy.UB), fusion_op, eps)
+                input, residual_in, gamma, scale, None, None, mapping.tp_group,
+                int(AllReduceStrategy.UB), fusion_op, eps, True)
             finalize_output = torch.ops.trtllm.userbuffers_allreduce_finalize(
                 all_reduce_output[-1], False)
             all_reduce_output[-1] = finalize_output
@@ -426,7 +432,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 trtllm_userbuffers_allreduce_finalize_default,
                 KeywordArg("gamma"), KeywordArg("scale"), Ignored(), Ignored(),
                 mapping.tp_group, int(AllReduceStrategy.UB),
-                KeywordArg("fusion_op"), KeywordArg("eps"))
+                KeywordArg("fusion_op"), KeywordArg("eps"), Ignored())
             ub_ar_finalize_pattern = MultiOutputPattern(
                 [trtllm_allreduce_default])
 
@@ -449,8 +455,9 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 eps: float,
             ):
                 all_reduce_output = torch.ops.trtllm.allreduce(
-                    input, sharded_residual, gamma, scale, None, None,
-                    mapping.tp_group, int(AllReduceStrategy.UB), fusion_op, eps)
+                    input, sharded_residual, gamma,
+                    scale, None, None, mapping.tp_group,
+                    int(AllReduceStrategy.UB), fusion_op, eps, True)
                 return all_reduce_output
 
             register_replacement(
@@ -471,7 +478,8 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 trtllm_userbuffers_allreduce_finalize_default,
                 KeywordArg("gamma"), Ignored(), Ignored(), Ignored(),
                 mapping.tp_group, int(AllReduceStrategy.UB),
-                int(AllReduceFusionOp.RESIDUAL_RMS_NORM), KeywordArg("eps"))
+                int(AllReduceFusionOp.RESIDUAL_RMS_NORM), KeywordArg("eps"),
+                Ignored())
             ub_ar_finalize_pattern = MultiOutputPattern(
                 [trtllm_allreduce_default])
 
@@ -492,7 +500,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 all_reduce_output = torch.ops.trtllm.allreduce(
                     input, sharded_residual, gamma, None, None, None,
                     mapping.tp_group, int(AllReduceStrategy.UB),
-                    int(AllReduceFusionOp.RESIDUAL_RMS_NORM), eps)
+                    int(AllReduceFusionOp.RESIDUAL_RMS_NORM), eps, True)
                 return all_reduce_output
 
             register_replacement(

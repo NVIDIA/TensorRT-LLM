@@ -25,7 +25,8 @@ def test_quant_mode():
     assert _tb.QuantMode.fp8_qdq().has_fp8_qdq
 
     quant_mode = _tb.QuantMode.from_description(True, True, True, True, True,
-                                                True, True, True)
+                                                True, True, True, False, False,
+                                                False, False, False, False)
     assert quant_mode.has_int4_weights
     quant_mode -= _tb.QuantMode.int4_weights()
     assert not quant_mode.has_int4_weights
@@ -337,13 +338,13 @@ def test_llm_request():
     assert llm_request.streaming
     assert llm_request.pad_id == 99
     assert llm_request.end_id == 100
-    assert llm_request.seq_slot == None
-    assert torch.equal(llm_request.prompt_embedding_table(),
+    assert llm_request.seq_slot is None
+    assert torch.equal(llm_request.prompt_embedding_table,
                        kwargs["prompt_embedding_table"])
     assert llm_request.prompt_vocab_size == 2
-    assert torch.equal(llm_request.embedding_bias(), kwargs["embedding_bias"])
-    assert torch.equal(llm_request.stop_words_list(), kwargs["stop_words_list"])
-    assert torch.equal(llm_request.bad_words_list(), kwargs["bad_words_list"])
+    assert torch.equal(llm_request.embedding_bias, kwargs["embedding_bias"])
+    assert torch.equal(llm_request.stop_words_list, kwargs["stop_words_list"])
+    assert torch.equal(llm_request.bad_words_list, kwargs["bad_words_list"])
 
     assert llm_request.get_num_tokens(0) == 3
     assert llm_request.max_beam_num_tokens == 3
@@ -434,7 +435,7 @@ def test_trt_gpt_model_optional_params():
     assert opt_params.max_beam_width == 4
 
     assert opt_params.scheduler_config.capacity_scheduler_policy == _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-    assert opt_params.scheduler_config.context_chunking_policy == None
+    assert opt_params.scheduler_config.context_chunking_policy is None
     opt_params.scheduler_config = _tb.executor.SchedulerConfig(
         _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         _tb.executor.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
@@ -540,21 +541,21 @@ def test_SamplingConfig_pickle():
 
 def test_KvCache_events_binding():
     stream = torch.cuda.Stream()
+    max_sequence_length = 10
     kwargs = {
         'num_kv_heads_per_layer': [1, 1],
         'size_per_head':
         128,
         'tokens_per_block':
         64,
-        'blocks_in_primary_pool':
-        1000,
-        'blocks_in_secondary_pool':
-        10000,
+        'blocks_per_window': {
+            max_sequence_length: (1000, 10000)
+        },
         'max_num_sequences':
         1,
         'max_beam_width':
         1,
-        'max_attention_window_vec': [10],
+        'max_attention_window_vec': [max_sequence_length],
         'temp_attention_window_inputs':
         None,
         'dtype':
@@ -564,7 +565,7 @@ def test_KvCache_events_binding():
         'stream':
         stream.cuda_stream,
         'max_sequence_length':
-        10,
+        max_sequence_length,
         'enable_block_reuse':
         True,
         'onboard_blocks':
