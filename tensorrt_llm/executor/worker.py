@@ -38,7 +38,7 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
 from .request import (CancellingRequest, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import (GenerationResult, IterationResult, LogProbsResult,
-                     ResponseWrapper, compute_logprobs)
+                     ResponseWrapper, compute_logprobs, is_llm_response)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs, has_event_loop)
 
@@ -888,9 +888,6 @@ class AwaitResponseHelper:
                 # serialized when it has error.
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
-                self.worker._pop_result(response.client_id)
-            elif response.is_final:
-                self.worker._pop_result(response.client_id)
             else:
                 logprobs_result = _get_logprobs(self.worker, response,
                                                 self.worker._is_pytorch_backend)
@@ -995,3 +992,13 @@ def _send_rsp(
             worker.postproc_queues[pid].put(inp)
         else:
             postproc_batches[pid].append(inp)
+
+    # Eliminate the finished GenerationRequest instances timely, which may
+    # take considerable memory.
+    if is_llm_response(response):
+        if response.has_error() or response.result.is_final:
+            worker._pop_result(response.client_id)
+    elif isinstance(response, ErrorResponse):
+        worker._pop_result(response.client_id)
+    else:
+        raise ValueError(f"Unknown response type: {response}")
