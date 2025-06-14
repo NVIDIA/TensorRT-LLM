@@ -31,6 +31,7 @@ def stage_query():
 @pytest.fixture(scope="module")
 def sample_test_cases(stage_query):
     """Fixture that provides sample test cases from actual data."""
+    random.seed(0)  # Ensure deterministic test results
     all_tests = list(stage_query.test_map.keys())
     if not all_tests:
         return []
@@ -45,6 +46,7 @@ def sample_test_cases(stage_query):
 @pytest.fixture(scope="module")
 def sample_stages(stage_query):
     """Fixture that provides sample stages from actual data."""
+    random.seed(0)  # Ensure deterministic test results
     all_stages = list(stage_query.stage_to_yaml.keys())
     if not all_stages:
         return []
@@ -79,7 +81,8 @@ def test_bidirectional_mapping_consistency(stage_query, sample_test_cases,
 
         for test_case in sample_test_cases:
             stages = stage_query.tests_to_stages([test_case])
-            assert stages, f"Test '{test_case}' should map to at least one stage"
+            assert stages, \
+                f"Test '{test_case}' should map to at least one stage"
 
             # Verify all returned stages are valid
             for stage in stages:
