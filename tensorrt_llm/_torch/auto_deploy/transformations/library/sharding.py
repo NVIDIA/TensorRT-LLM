@@ -244,7 +244,7 @@ def column_row_shard(
     shardable_nodes_with_attention = {
         torch.ops.aten.view,
         torch.ops.aten.reshape,
-        torch.ops.rope.flashinfer,
+        torch.ops.auto_deploy.flashinfer_rope,
         operator.getitem,
     }
 
