@@ -2,7 +2,7 @@ from .eagle3 import (Eagle3OneModelDecoder, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3Sampler, Eagle3SpecMetadata)
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
-from .ngram import NGramPoolManager
+from .ngram import NGramSampler, NGramSpecMetadata
 
 
 def get_spec_metadata(spec_config,
@@ -30,6 +30,9 @@ def get_spec_metadata(spec_config,
             num_layers=spec_config.num_layers,
             hidden_size=spec_config.hidden_size,
             max_num_tokens=max_num_tokens)
+    elif spec_config.spec_dec_mode.is_ngram():
+        return NGramSpecMetadata(max_draft_tokens=spec_config.max_draft_tokens,
+                                 max_num_requests=max_num_requests)
     else:
         return None
 
@@ -42,14 +45,11 @@ def get_spec_resource_manager(spec_config, model_config, max_num_requests):
                                           max_num_requests)
         else:
             return None
-    elif spec_config.spec_dec_mode.is_mtp():
+    if spec_config.spec_dec_mode.is_mtp():
         return MTPHiddenStatesManager(spec_config, model_config.torch_dtype,
                                       model_config.hidden_size,
                                       max_num_requests)
-    elif spec_config.spec_dec_mode.is_ngram():
-        return NGramPoolManager(spec_config, max_num_requests)
-    else:
-        return None
+    return None
 
 
 def get_spec_decoder(max_seq_len, spec_config):
@@ -59,6 +59,8 @@ def get_spec_decoder(max_seq_len, spec_config):
         return Eagle3Sampler(max_seq_len)
     elif spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelDecoder(max_seq_len, spec_config)
+    elif spec_config.spec_dec_mode.is_ngram():
+        return NGramSampler(max_seq_len, spec_config)
     else:
         return None
 
