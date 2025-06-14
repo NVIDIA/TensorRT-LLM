@@ -75,6 +75,9 @@ class Logger(metaclass=Singleton):
             self._polygraphy_logger.module_severity = severity_map[
                 min_severity][2]
 
+        # For log_once
+        self._appeared_keys = set()
+
         if invalid_severity:
             self.warning(
                 f"Requested log level {environ_severity} is invalid. Using '{self.DEFAULT_LEVEL}' instead"
@@ -109,22 +112,43 @@ class Logger(metaclass=Singleton):
         parts.extend(map(str, msg))
         self._func_wrapper(severity)(" ".join(parts))
 
+    def log_once(self, severity, *msg, key):
+        if key not in self._appeared_keys:
+            self._appeared_keys.add(key)
+            self.log(severity, *msg)
+
     def critical(self, *msg):
         self.log(self.INTERNAL_ERROR, *msg)
 
+    def critical_once(self, *msg, key):
+        self.log_once(self.INTERNAL_ERROR, *msg, key=key)
+
     fatal = critical
+    fatal_once = critical_once
 
     def error(self, *msg):
         self.log(self.ERROR, *msg)
 
+    def error_once(self, *msg, key):
+        self.log_once(self.ERROR, *msg, key=key)
+
     def warning(self, *msg):
         self.log(self.WARNING, *msg)
+
+    def warning_once(self, *msg, key):
+        self.log_once(self.WARNING, *msg, key=key)
 
     def info(self, *msg):
         self.log(self.INFO, *msg)
 
+    def info_once(self, *msg, key):
+        self.log_once(self.INFO, *msg, key=key)
+
     def debug(self, *msg):
         self.log(self.VERBOSE, *msg)
+
+    def debug_once(self, *msg, key):
+        self.log_once(self.VERBOSE, *msg, key=key)
 
     @property
     def level(self) -> str:

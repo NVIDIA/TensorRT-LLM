@@ -6,8 +6,6 @@ from torch import nn
 from tqdm import tqdm
 from transformers import Qwen3MoeConfig
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
-
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            allgather)
@@ -91,10 +89,6 @@ class Qwen3MoE(nn.Module):
         self.mapping = model_config.mapping
         self.allreduce = AllReduce(mapping=model_config.mapping,
                                    strategy=model_config.allreduce_strategy)
-        self.enable_alltoall = Qwen3MoE.should_enable_alltoall(
-            model_config, self.top_k)
-        if self.enable_alltoall:
-            MnnvlMemory.initialize()
 
         self.gate = Qwen3Gate(
             hidden_size=self.hidden_dim,
@@ -117,25 +111,6 @@ class Qwen3MoE(nn.Module):
             model_config=model_config,
         )
 
-    @staticmethod
-    def should_enable_alltoall(model_config: ModelConfig, top_k: int) -> bool:
-        if not model_config.mapping.enable_attention_dp:
-            return False
-
-        if model_config.mapping.tp_size == 1:
-            return False
-
-        if not MnnvlMemory.supports_mnnvl():
-            return False
-
-        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
-            return False
-
-        if model_config.mapping.moe_ep_size <= top_k:
-            return False
-
-        return True
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -151,7 +126,7 @@ class Qwen3MoE(nn.Module):
         if self.enable_attention_dp and self.mapping.tp_size > 1:
             # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
             # to reduce allreduce BW
-            if disable_fp4_allgather() and not self.enable_alltoall:
+            if disable_fp4_allgather() and not self.experts.enable_alltoall:
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,

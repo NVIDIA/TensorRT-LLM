@@ -27,7 +27,6 @@ class MoE(nn.Module):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
-        enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
     """
 
     def __init__(
@@ -123,3 +122,9 @@ class MoE(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
         )
+
+    @property
+    def enable_alltoall(self):
+        """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
+        """
+        return False
