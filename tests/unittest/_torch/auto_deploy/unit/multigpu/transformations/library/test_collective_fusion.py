@@ -76,7 +76,7 @@ def _run_job(
 @pytest.mark.parametrize(
     "linear_cls, dist_op_expected",
     (
-        (nn.Linear, "linear.fused_linear_all_reduce"),
+        (nn.Linear, "auto_deploy.trtllm_dist_fused_linear_all_reduce"),
         pytest.param(
             FP8Linear,
             "quant.fused_fp8_linear_all_reduce",

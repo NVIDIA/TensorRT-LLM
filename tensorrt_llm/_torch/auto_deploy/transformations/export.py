@@ -212,7 +212,7 @@ _torch_where_patch.where_original = torch.where
 def _torch_linear_patch(
     input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    return torch.ops.linear.simple(input, weight, bias)
+    return torch.ops.auto_deploy.torch_linear_simple(input, weight, bias)
 
 
 # TODO: remove once https://github.com/pytorch/pytorch/issues/142439 is resolved
