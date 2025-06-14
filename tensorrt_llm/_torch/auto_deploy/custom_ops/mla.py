@@ -169,7 +169,7 @@ def fused_flattened_mla_with_cache_fake(
     return torch.empty_like(kv[..., -v_head_dim:])
 
 
-@torch.library.custom_op("attention::prepare_fused_mla_metadata", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_attention_prepare_fused_mla_metadata", mutates_args=())
 def prepare_fused_mla_metadata(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
@@ -229,7 +229,7 @@ class MultiHeadLatentAttention(AttentionDescriptor):
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.attention.prepare_fused_mla_metadata, 4
+        return torch.ops.auto_deploy.triton_attention_prepare_fused_mla_metadata, 4
 
     @classmethod
     def get_cache_initializers(
