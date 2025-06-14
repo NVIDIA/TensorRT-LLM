@@ -18,7 +18,7 @@ LLM_DOCKER_IMAGE = env.dockerImage
 
 AGENT_IMAGE = env.dockerImage
 
-POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
+POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
 
 // Literals for easier access.
 @Field
