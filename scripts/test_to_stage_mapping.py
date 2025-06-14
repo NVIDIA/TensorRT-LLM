@@ -50,12 +50,22 @@ _STAGE_RE = re.compile(
     r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"')
 
 
+def _extract_terms(entry):
+    """Extract terms from either direct 'terms' or 'condition.terms'."""
+    terms = entry.get('terms', {})
+    if not terms:
+        terms = entry.get('condition', {}).get('terms', {})
+    return terms
+
+
 class StageQuery:
 
     def __init__(self, groovy_path: str, test_db_dir: str):
         self.stage_to_yaml, self.yaml_to_stages = self._parse_stage_mapping(
             groovy_path)
         self.test_map, self.yaml_stage_tests = self._parse_tests(test_db_dir)
+        # Build dynamic backend mapping from discovered data
+        self._backend_keywords = self._discover_backend_keywords()
 
     @staticmethod
     def _parse_stage_mapping(path):
@@ -71,40 +81,28 @@ class StageQuery:
                     yaml_to_stages[yml].append(stage)
         return stage_to_yaml, yaml_to_stages
 
-    @staticmethod
-    def _parse_tests(db_dir):
+    def _parse_tests(self, db_dir):
+        """Parse tests from YAML files, supporting both .yml and .yaml."""
         test_map = defaultdict(list)
         yaml_stage_tests = defaultdict(lambda: defaultdict(list))
-        for path in glob(os.path.join(db_dir, '*.yml')):
+
+        yaml_files = (glob(os.path.join(db_dir, '*.yml')) +
+                      glob(os.path.join(db_dir, '*.yaml')))
+
+        for path in yaml_files:
             with open(path, 'r') as f:
                 data = yaml.safe_load(f)
             for key, entries in data.items():
                 if key == 'version' or entries is None:
                     continue
                 for entry in entries:
-                    # Extract stage type
-                    stage = entry.get(
-                        'terms',
-                        entry.get('condition', {}).get('terms',
-                                                       {})).get('stage')
-                    if stage is None:
-                        stage = entry.get('condition', {}).get('terms',
-                                                               {}).get('stage')
+                    terms = _extract_terms(entry)
+
+                    stage = terms.get('stage')
                     if stage is None:
                         continue
 
-                    # Extract backend
-                    backend = entry.get(
-                        'terms',
-                        entry.get('condition', {}).get('terms',
-                                                       {})).get('backend')
-                    if backend is None:
-                        condition_terms = entry.get('condition',
-                                                    {}).get('terms', {})
-                        backend = condition_terms.get('backend')
-                    # Default to empty string if no backend specified
-                    if backend is None:
-                        backend = ''
+                    backend = terms.get('backend', '')  # Default to empty
 
                     tests = entry.get('tests', [])
                     yml = os.path.basename(path)
@@ -112,6 +110,35 @@ class StageQuery:
                         test_map[t].append((yml, stage, backend))
                         yaml_stage_tests[yml][stage].append(t)
         return test_map, yaml_stage_tests
+
+    def _discover_backend_keywords(self):
+        """Discover backend keywords from existing data dynamically."""
+        backend_keywords = {}
+
+        # Collect all backends from test data
+        all_backends = set()
+        for mappings in self.test_map.values():
+            for yml, stage_type, backend in mappings:
+                if backend and backend.strip():
+                    all_backends.add(backend.strip().lower())
+
+        # Map backends to their likely stage name keywords
+        for backend in all_backends:
+            backend_keywords[backend] = backend.upper()
+
+        # Add common variations/aliases
+        aliases = {
+            'tensorrt': ['TENSORRT', 'TRT'],
+            'pytorch': ['PYTORCH', 'TORCH'],
+            'cpp': ['CPP', 'C++'],
+            'triton': ['TRITON']
+        }
+
+        for backend, keywords in aliases.items():
+            if backend in backend_keywords:
+                backend_keywords[backend] = keywords
+
+        return backend_keywords
 
     def search_tests(self, pattern: str):
         parts = pattern.split()
@@ -134,8 +161,13 @@ class StageQuery:
 
                     # Filter by backend if specified
                     if backend and backend != '':
-                        backend_upper = backend.upper()
-                        if backend_upper not in s.upper():
+                        backend_keywords = self._backend_keywords.get(
+                            backend.lower(), [backend.upper()])
+                        if isinstance(backend_keywords, str):
+                            backend_keywords = [backend_keywords]
+
+                        if not any(keyword in s.upper()
+                                   for keyword in backend_keywords):
                             continue
 
                     result.add(s)
@@ -149,17 +181,15 @@ class StageQuery:
                 continue
             stage_type = 'post_merge' if 'Post-Merge' in s else 'pre_merge'
 
-            # Determine expected backend from stage name
+            # Determine expected backend dynamically from stage name
             expected_backend = None
             stage_upper = s.upper()
-            if 'PYTORCH' in stage_upper:
-                expected_backend = 'pytorch'
-            elif 'CPP' in stage_upper:
-                expected_backend = 'cpp'
-            elif 'TENSORRT' in stage_upper:
-                expected_backend = 'tensorrt'
-            elif 'TRITON' in stage_upper:
-                expected_backend = 'triton'
+            for backend, keywords in self._backend_keywords.items():
+                if isinstance(keywords, str):
+                    keywords = [keywords]
+                if any(keyword in stage_upper for keyword in keywords):
+                    expected_backend = backend
+                    break
 
             # Get all tests for yml/stage_type, then filter by backend
             all_tests = self.yaml_stage_tests.get(yml, {}).get(stage_type, [])
