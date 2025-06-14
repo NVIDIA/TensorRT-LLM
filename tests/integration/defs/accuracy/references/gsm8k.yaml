@@ -87,3 +87,5 @@ nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 94.16
+google/gemma-3-1b-it:
+  - accuracy: 23.54

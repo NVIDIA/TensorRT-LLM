@@ -8,6 +8,7 @@ import transformers
 
 from tensorrt_llm import logger
 from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -319,6 +320,11 @@ class ModelConfig(Generic[TConfig]):
         model_config_cpp.mlp_hidden_size = mlp_hidden_size
         model_config_cpp.size_per_head = head_size
 
+        # NOTE: this method is not robust, for Gemma3ForCausalLM only
+        layer_types = self.get_layer_types()
+        if layer_types is not None:
+            model_config_cpp.layer_types = layer_types
+
         return model_config_cpp
 
     def _infer_nemotron_ffn_mult(self):
@@ -335,3 +341,18 @@ class ModelConfig(Generic[TConfig]):
             biggest_ffn_mult, self.pretrained_config.hidden_size)
 
         return mlp_hidden_size
+
+    def get_layer_types(self) -> Optional[List[LayerTypeCpp]]:
+        """
+        This method is a hack to support the effort to switch to KvCacheManagerCpp.
+        Currently, it is only tested for Gemma3ForCausalLM. For other models, it will return None.
+        """
+        if self.pretrained_config.architectures[0] in ["Gemma3ForCausalLM"]:
+            logger.debug(
+                f"Setting layer types for {self.pretrained_config.architectures}"
+            )
+            return [
+                LayerTypeCpp.ATTENTION,
+            ] * self.pretrained_config.num_hidden_layers
+        else:
+            return None
