@@ -24,8 +24,9 @@ from .llm_request import ExecutorResponse
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
-                               PeftCacheManager, ResourceManager)
+from .resource_manager import (KvCacheConfigCpp, KVCacheManager,
+                               MambaHybridCacheManager, PeftCacheManager,
+                               ResourceManager)
 from .sampler import (EarlyStopSampler, TorchSampler, TorchStarAttentionSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -175,6 +176,20 @@ class KvCacheCreator:
             estimating_kv_cache = True
             self._executor_config.kv_cache_config.max_tokens = self._get_token_num_for_estimation(
             )
+            maw = self._executor_config.kv_cache_config.max_attention_window
+            if maw is not None:
+                unique_windows = list(set(maw))
+                if len(unique_windows) > 1:
+                    # NOTE: For sliding window, we need to allocate more tokens(max_num_tokens + window_size) for each window, need to update if this requirement changes
+                    assert len(
+                        unique_windows
+                    ) == 2, "Sliding window with more than 2 window sizes has not been tested"
+                    # sliding window is the one that is not the executor_config.max_seq_len
+                    sliding_window = unique_windows[0] if unique_windows[
+                        0] != self._executor_config.max_seq_len else unique_windows[
+                            1]
+                    self._executor_config.kv_cache_config.max_tokens += (
+                        self._executor_config.max_num_tokens + sliding_window)
         return estimating_kv_cache
 
     def estimate_max_tokens(self, py_executor: PyExecutor) -> None:
@@ -335,8 +350,15 @@ class KvCacheCreator:
                 spec_config=spec_config,
             )
         else:
+            # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
+            is_vswa = executor_config.kv_cache_config.max_attention_window is not None and len(
+                set(executor_config.kv_cache_config.max_attention_window)) > 1
+            binding_model_config = model_engine.model.model_config.get_bindings_model_config(
+            ) if is_vswa else None
+
             kv_cache_manager = KVCacheManager(
-                executor_config.kv_cache_config,
+                # NOTE: from tensorrt_llm.bindings.executor.KvCacheConfig to tensorrt_llm.bindings.KvCacheConfig
+                KvCacheConfigCpp(executor_config.kv_cache_config),
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_hidden_layers,
                 num_kv_heads=num_key_value_heads,
@@ -347,7 +369,8 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
-            )
+                max_num_tokens=executor_config.max_num_tokens,
+                model_config=binding_model_config)
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == KV_CACHE_MANAGER_KEY:
             executor_config.max_seq_len = kv_cache_manager.max_seq_len
