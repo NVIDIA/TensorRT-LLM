@@ -791,6 +791,63 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_device_not_contain(["GB200"])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
+    def test_bfloat16_4gpus_online_eplb(self, mtp_nextn):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        num_slots = 80
+        eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
+                                            layer_updates_per_iter=2)
+        pytorch_config = dict(use_cuda_graph=True,
+                              moe_load_balancer=eplb_config)
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=4,
+                  moe_expert_parallel_size=4,
+                  kv_cache_config=kv_cache_config,
+                  enable_attention_dp=True,
+                  **pytorch_config,
+                  speculative_config=mtp_config)
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_device_not_contain(["GB200"])
+    @parametrize_with_ids("fp8kv", [True, False])
+    def test_nvfp4_4gpus_online_eplb(self, fp8kv):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        num_slots = 80
+        eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
+                                            layer_updates_per_iter=2)
+        pytorch_backend_options = dict(use_cuda_graph=True,
+                                       moe_load_balancer=eplb_config)
+        quant_config = QuantConfig()
+        quant_config.quant_algo = QuantAlgo.NVFP4
+        if fp8kv:
+            quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            pytorch_backend_options["kv_cache_dtype"] = "fp8"
+
+        llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
+                  tensor_parallel_size=4,
+                  moe_expert_parallel_size=4,
+                  kv_cache_config=kv_cache_config,
+                  **pytorch_backend_options,
+                  enable_attention_dp=True,
+                  quant_config=quant_config)
+        with llm:
+            # No need to run MMLU for fp8kv
+            if not fp8kv:
+                task = MMLU(self.MODEL_NAME)
+                task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @skip_pre_blackwell
     @parametrize_with_ids(
         "torch_compile",
