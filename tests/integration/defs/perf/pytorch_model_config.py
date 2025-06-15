@@ -116,7 +116,6 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         }
-        print(f"lora_config: {lora_config}")
         base_config.update(lora_config)
 
     return base_config
