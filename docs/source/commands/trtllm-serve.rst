@@ -4,48 +4,47 @@ trtllm-serve
 About
 -----
 
-The ``trtllm-serve`` command starts an OpenAI compatible server that supports the following endpoints:
+The ``trtllm-serve`` command launches an OpenAI-compatible inference server that provides the following capabilities:
 
-- ``/v1/models``
-- ``/v1/completions``
-- ``/v1/chat/completions``
+API Endpoints
+------------
 
-For information about the inference endpoints, refer to the `OpenAI API Reference <https://platform.openai.com/docs/api-reference>`__.
+OpenAI-Compatible Endpoints:
+- ``/v1/models`` - List available models
+- ``/v1/completions`` - Text completion API
+- ``/v1/chat/completions`` - Chat completion API
 
-The server also supports the following endpoints:
+Additional Endpoints:
+- ``/health`` - Server health check
+- ``/metrics`` - Runtime statistics and performance metrics
+- ``/version`` - Server version information
 
-- ``/health``
-- ``/metrics``
-- ``/version``
+For detailed API specifications, refer to the `OpenAI API Reference <https://platform.openai.com/docs/api-reference>`__.
 
-The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details.
+Quick Start
+----------
 
-Starting a Server
------------------
-
-The following abbreviated command syntax shows the commonly used arguments to start a server:
+Basic server startup command:
 
 .. code-block:: bash
 
    trtllm-serve <model> [--backend pytorch --tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
 
-For the full syntax and argument descriptions, refer to :ref:`syntax`.
+For complete command syntax and all available options, see :ref:`syntax`.
 
-Inference Endpoints
--------------------
-
-After you start the server, you can send inference requests through completions API and Chat API, which are compatible with corresponding OpenAI APIs. We use `TinyLlama-1.1B-Chat-v1.0 <https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0>`_ for examples in the following sections.
+API Usage Examples
+----------------
 
 Chat API
 ~~~~~~~~
 
-You can query Chat API with any http clients, a typical example is OpenAI Python client:
+Using Python client:
 
 .. literalinclude:: ../../../examples/serve/openai_chat_client.py
     :language: python
     :linenos:
 
-Another example uses ``curl``:
+Using curl:
 
 .. literalinclude:: ../../../examples/serve/curl_chat_client.sh
     :language: bash
@@ -54,24 +53,24 @@ Another example uses ``curl``:
 Completions API
 ~~~~~~~~~~~~~~~
 
-You can query Completions API with any http clients, a typical example is OpenAI Python client:
+Using Python client:
 
 .. literalinclude:: ../../../examples/serve/openai_completion_client.py
     :language: python
     :linenos:
 
-Another example uses ``curl``:
+Using curl:
 
 .. literalinclude:: ../../../examples/serve/curl_completion_client.sh
     :language: bash
     :linenos:
 
-Multimodal Serving
-~~~~~~~~~~~~~~~~~
+Multimodal Model Support
+----------------------
 
-For multimodal models (e.g., Qwen2-VL), you'll need to create a configuration file and start the server with additional options:
+For multimodal models (e.g., Qwen2-VL), follow these steps:
 
-First, create a configuration file:
+1. Create a configuration file:
 
 .. code-block:: bash
 
@@ -81,7 +80,7 @@ First, create a configuration file:
        free_gpu_memory_fraction: 0.6
    EOF
 
-Then, start the server with the configuration file:
+2. Start the server with the configuration:
 
 .. code-block:: bash
 
@@ -89,50 +88,52 @@ Then, start the server with the configuration file:
        --extra_llm_api_options ./extra-llm-api-config.yml \
        --backend pytorch
 
-Completions API
-~~~~~~~~~~~~~~~
+Multimodal API Examples
+~~~~~~~~~~~~~~~~~~~~~
 
-You can query Completions API with any http clients, a typical example is OpenAI Python client:
+Using Python client:
 
 .. literalinclude:: ../../../examples/serve/openai_completion_client_for_multimodal.py
     :language: python
     :linenos:
 
-Another example uses ``curl``:
+Using curl:
 
 .. literalinclude:: ../../../examples/serve/curl_chat_client_for_multimodal.sh
     :language: bash
     :linenos:
 
-Benchmark
----------
+Performance Benchmarking
+----------------------
 
-You can use any benchmark clients compatible with OpenAI API to test serving performance of ``trtllm_serve``, we recommend ``genai-perf`` and here is a benchmarking recipe.
+We recommend using ``genai-perf`` for performance testing:
 
-First, install ``genai-perf`` with ``pip``:
-
+1. Install the benchmark tool:
 .. code-block:: bash
 
    pip install genai-perf
 
-Then, :ref:`start a server<Starting a Server>` with ``trtllm-serve`` and ``TinyLlama-1.1B-Chat-v1.0``.
+2. Start the server (see :ref:`Quick Start`)
 
-Finally, test performance with the following command:
-
+3. Run the benchmark:
 .. literalinclude:: ../../../examples/serve/genai_perf_client.sh
     :language: bash
     :linenos:
 
-Refer to `README <https://github.com/triton-inference-server/perf_analyzer/blob/main/genai-perf/README.md>`_ of ``genai-perf`` for more guidance.
+For detailed benchmarking guidance, refer to the `genai-perf README <https://github.com/triton-inference-server/perf_analyzer/blob/main/genai-perf/README.md>`_.
 
-Multi-node Serving with Slurm
------------------------------
+Multi-node Deployment with Slurm
+------------------------------
 
-You can deploy `DeepSeek-V3 <https://huggingface.co/deepseek-ai/DeepSeek-V3>`_ model across two nodes with Slurm and ``trtllm-serve``
+Example deployment of DeepSeek-V3 across two nodes:
 
+1. Create configuration:
 .. code-block:: bash
 
     echo -e "enable_attention_dp: true\npytorch_backend_config:\n  enable_overlap_scheduler: true" > extra-llm-api-config.yml
+
+2. Launch with Slurm:
+.. code-block:: bash
 
     srun -N 2 -w [NODES] \
         --output=benchmark_2node.log \
@@ -143,66 +144,60 @@ You can deploy `DeepSeek-V3 <https://huggingface.co/deepseek-ai/DeepSeek-V3>`_ m
         --container-workdir /workspace \
         bash -c "trtllm-llmapi-launch trtllm-serve deepseek-ai/DeepSeek-V3 --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --tp_size 16 --ep_size 4 --kv_cache_free_gpu_memory_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
 
-See `the source code <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/trtllm-llmapi-launch>`_ of ``trtllm-llmapi-launch`` for more details.
+For more details on multi-node deployment, see the `trtllm-llmapi-launch source code <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/trtllm-llmapi-launch>`_.
 
-Metrics Endpoint
-----------------
+Metrics and Monitoring
+--------------------
 
 .. note::
 
-   This endpoint is beta maturity.
+   The metrics endpoint is currently in beta.
 
-   The statistics for the PyTorch backend are beta and not as comprehensive as those for the TensorRT backend.
+   PyTorch backend metrics are less comprehensive than TensorRT backend metrics.
+   Some metrics (e.g., CPU memory usage) are not available for PyTorch backend.
+   Enabling metrics collection may slightly impact performance.
 
-   Some fields, such as CPU memory usage, are not available for the PyTorch backend.
+To enable metrics collection for PyTorch backend:
 
-   Enabling ``enable_iter_perf_stats`` in the PyTorch backend can impact performance slightly, depending on the serving configuration.
-
-The ``/metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details.
-For the TensorRT backend, these statistics are enabled by default.
-However, for the PyTorch backend, specified with the ``--backend pytorch`` argument, you must explicitly enable iteration statistics logging by setting the `enable_iter_perf_stats` field in a YAML configuration file as shown in the following example:
-
+1. Create a configuration file:
 .. code-block:: yaml
 
    # extra-llm-api-config.yml
    pytorch_backend_config:
     enable_iter_perf_stats: true
 
-Then start the server and specify the ``--extra_llm_api_options`` argument with the path to the YAML file as shown in the following example:
-
+2. Start server with configuration:
 .. code-block:: bash
 
    trtllm-serve <model> \
      --extra_llm_api_options <path-to-extra-llm-api-config.yml> \
      [--backend pytorch --tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
 
-After at least one inference request is sent to the server, you can fetch the runtime-iteration statistics by polling the `/metrics` endpoint:
-
+3. Query metrics:
 .. code-block:: bash
 
    curl -X GET http://<host>:<port>/metrics
 
-*Example Output*
-
+Example metrics output:
 .. code-block:: json
 
    [
        {
            "gpuMemUsage": 56401920000,
-        "inflightBatchingStats": {
-            ...
-        },
-        "iter": 1,
-        "iterLatencyMS": 16.505143404006958,
-        "kvCacheStats": {
-            ...
-        },
-        "newActiveRequestsQueueLatencyMS": 0.0007503032684326172
-    }
-]
+           "inflightBatchingStats": {
+               ...
+           },
+           "iter": 1,
+           "iterLatencyMS": 16.505143404006958,
+           "kvCacheStats": {
+               ...
+           },
+           "newActiveRequestsQueueLatencyMS": 0.0007503032684326172
+       }
+   ]
 
-Syntax
-------
+Command Reference
+---------------
 
 .. click:: tensorrt_llm.commands.serve:main
    :prog: trtllm-serve
