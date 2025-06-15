@@ -127,7 +127,7 @@ class ZeroMqQueue:
 
     def put_noblock(self, obj: Any):
         self.setup_lazily()
-        with nvtx_range_debug("send", color="blue", category="IPC"):
+        with nvtx_range_debug("send (noblock)", color="blue", category="IPC"):
             data = pickle.dumps(obj)  # nosec B301
             if self.use_hmac_encryption:
                 data = self._sign_data(data)

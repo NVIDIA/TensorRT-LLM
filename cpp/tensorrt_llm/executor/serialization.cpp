@@ -946,15 +946,18 @@ Response Serialization::deserializeResponse(std::istream& is)
 {
     auto requestId = su::deserialize<IdType>(is);
     auto errOrResult = su::deserialize<std::variant<std::string, Result>>(is);
+    auto clientId = su::deserialize<std::optional<IdType>>(is);
 
-    return std::holds_alternative<std::string>(errOrResult) ? Response{requestId, std::get<std::string>(errOrResult)}
-                                                            : Response{requestId, std::get<Result>(errOrResult)};
+    return std::holds_alternative<std::string>(errOrResult)
+        ? Response{requestId, std::get<std::string>(errOrResult), clientId}
+        : Response{requestId, std::get<Result>(errOrResult), clientId};
 }
 
 void Serialization::serialize(Response const& response, std::ostream& os)
 {
     su::serialize(response.mImpl->mRequestId, os);
     su::serialize(response.mImpl->mErrOrResult, os);
+    su::serialize(response.mImpl->mClientId, os);
 }
 
 size_t Serialization::serializedSize(Response const& response)
@@ -962,6 +965,7 @@ size_t Serialization::serializedSize(Response const& response)
     size_t totalSize = 0;
     totalSize += su::serializedSize(response.mImpl->mRequestId);
     totalSize += su::serializedSize(response.mImpl->mErrOrResult);
+    totalSize += su::serializedSize(response.mImpl->mClientId);
     return totalSize;
 }
 
