@@ -43,7 +43,7 @@ def _run_job(
 
     def _get_expected_num_params(num_p_og: int) -> int:
         num_update = 0
-        if bias and dist_op_expected == "all_reduce":
+        if bias and dist_op_expected == "torch_dist_all_reduce":
             num_p_og -= num_features
             num_update = num_features * (rank == world_size - 1)
 
@@ -51,7 +51,7 @@ def _run_job(
         return num_params
 
     # now run the test
-    op_expected = getattr(torch.ops.dist, dist_op_expected)
+    op_expected = getattr(torch.ops.auto_deploy, dist_op_expected)
     run_test(
         model,
         x,
@@ -67,8 +67,8 @@ def _run_job(
 @pytest.mark.parametrize(
     "model_cls, dist_op_expected",
     (
-        (MLP, "all_reduce"),
-        (nn.Linear, "all_gather"),
+        (MLP, "torch_dist_all_reduce"),
+        (nn.Linear, "torch_dist_all_gather"),
     ),
 )
 def test_sharding(model_cls: Type[nn.Module], dist_op_expected: str, bias: bool, device_count: int):
