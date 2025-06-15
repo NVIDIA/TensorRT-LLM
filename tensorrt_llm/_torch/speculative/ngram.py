@@ -121,7 +121,7 @@ class NGramPoolManager(BaseResourceManager):
             self.pool.pop(request_id)
             self.start_index.pop(request_id)
 
-    def add_dummy_requests(self, request_ids: List[int]):
+    def prepare_dummy_resources(self, dummy_requests: List[LlmRequest]):
         pass
 
     def shutdown(self):
