@@ -176,10 +176,12 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
     return mapping
 
 
-def create_py_executor(executor_config: ExecutorConfig,
-                       checkpoint_dir: str = None,
-                       engine_dir: str = None,
-                       lora_config: Optional[LoraConfig] = None) -> PyExecutor:
+def create_py_executor(
+        executor_config: ExecutorConfig,
+        checkpoint_dir: str = None,
+        engine_dir: str = None,
+        lora_config: Optional[LoraConfig] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
     _mangle_executor_config(executor_config)
     pytorch_backend_config = executor_config.pytorch_backend_config
 
@@ -334,7 +336,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         py_executor = create_py_executor_instance(
             dist, resources, mapping, pytorch_backend_config, executor_config,
             ctx_chunk_config, model_engine, draft_model_engine, False, sampler,
-            lora_config)
+            lora_config, garbage_collection_gen0_threshold)
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
@@ -365,7 +367,8 @@ def create_py_executor(executor_config: ExecutorConfig,
             py_executor = create_py_executor_instance(
                 dist, resources, mapping, pytorch_backend_config,
                 executor_config, ctx_chunk_config, model_engine,
-                draft_model_engine, False, sampler, lora_config)
+                draft_model_engine, False, sampler, lora_config,
+                garbage_collection_gen0_threshold)
 
     py_executor.start_worker()
     return py_executor
