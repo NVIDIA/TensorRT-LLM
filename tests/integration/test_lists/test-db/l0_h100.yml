@@ -22,6 +22,9 @@ l0_h100:
   - unittest/disaggregated/test_disagg_utils.py
   - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_remoteDictionary.py
+  - unittest/llmapi/test_llm_pytorch.py::test_bielik_11b_v2_2_instruct_multi_lora
+  - accuracy/test_llm_api_pytorch.py::TestBielik11BInstruct::test_auto_dtype
+  - accuracy/test_llm_api_pytorch.py::TestBielik11BInstruct::test_fp8
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=True]
