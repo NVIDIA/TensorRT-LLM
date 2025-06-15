@@ -1860,13 +1860,13 @@ IterationStats Serialization::deserializeIterationStats(std::istream& is)
     auto crossKvCacheStats = su::deserialize<std::optional<KvCacheStats>>(is);
     auto staticBatchingStats = su::deserialize<std::optional<StaticBatchingStats>>(is);
     auto inflightBatchingStats = su::deserialize<std::optional<InflightBatchingStats>>(is);
-    auto specdecStats = su::deserialize<std::optional<SpecDecodingStats>>(is);
+    auto specDecodingStats = su::deserialize<std::optional<SpecDecodingStats>>(is);
 
     return IterationStats{timestamp, iter, iterLatencyMS, newActiveRequestsQueueLatencyMS, numNewActiveRequests,
         numActiveRequests, numQueuedRequests, numCompletedRequests, maxNumActiveRequests, maxBatchSizeStatic,
         maxBatchSizeTunerRecommended, maxBatchSizeRuntime, maxNumTokensStatic, maxNumTokensTunerRecommended,
         maxNumTokensRuntime, gpuMemUsage, cpuMemUsage, pinnedMemUsage, kvCacheStats, crossKvCacheStats,
-        staticBatchingStats, inflightBatchingStats, specdecStats};
+        staticBatchingStats, inflightBatchingStats, specDecodingStats};
 }
 
 IterationStats Serialization::deserializeIterationStats(std::vector<char>& buffer)
@@ -1904,7 +1904,7 @@ size_t Serialization::serializedSize(IterationStats const& iterStats)
     totalSize += su::serializedSize(iterStats.crossKvCacheStats);
     totalSize += su::serializedSize(iterStats.staticBatchingStats);
     totalSize += su::serializedSize(iterStats.inflightBatchingStats);
-    totalSize += su::serializedSize(iterStats.specDecStats);
+    totalSize += su::serializedSize(iterStats.specDecodingStats);
 
     return totalSize;
 }
@@ -1933,7 +1933,7 @@ void Serialization::serialize(IterationStats const& iterStats, std::ostream& os)
     su::serialize(iterStats.crossKvCacheStats, os);
     su::serialize(iterStats.staticBatchingStats, os);
     su::serialize(iterStats.inflightBatchingStats, os);
-    su::serialize(iterStats.specDecStats, os);
+    su::serialize(iterStats.specDecodingStats, os);
 }
 
 std::vector<char> Serialization::serialize(IterationStats const& iterStats)

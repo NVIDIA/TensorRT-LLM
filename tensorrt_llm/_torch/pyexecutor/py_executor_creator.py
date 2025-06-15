@@ -20,7 +20,7 @@ from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..distributed import MPIDist
 from ..speculative import NGramConfig, get_spec_resource_manager
 from ._util import (KvCacheCreator, create_py_executor_instance,
-                    instantiate_sampler, is_mla)
+                    instantiate_drafter, instantiate_sampler, is_mla)
 from .config import PyTorchConfig
 from .config_utils import is_mla
 from .model_engine import DRAFT_KV_CACHE_MANAGER_KEY, PyTorchModelEngine
@@ -29,6 +29,7 @@ from .py_executor import PyExecutor
 
 class _ExecutorCreationStage(enum.Enum):
     SAMPLER = "Sampler"
+    DRAFTER = "Drafter"
     INIT_KV_CACHE = "Initial KV cache (temporary for KV cache size estimation)"
     INIT_EXTRA_RESOURCES = "Additional executor resources (temporary for KV cache size estimation)"
     MODEL_EXTRA = "Model resources created during usage"
@@ -73,6 +74,8 @@ class _ExecutorMemoryMonitor():
         tuning_knobs = {
             _ExecutorCreationStage.SAMPLER:
             "reduce max_seq_len and/or max_attention_window_size",
+            _ExecutorCreationStage.DRAFTER:
+            "reduce max_seq_len and/or max_draft_len",
             _ExecutorCreationStage.KV_CACHE:
             "reduce free_gpu_memory_fraction",
             _ExecutorCreationStage.INIT_KV_CACHE:
@@ -304,6 +307,8 @@ def create_py_executor(executor_config: ExecutorConfig,
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
         sampler = instantiate_sampler(model_engine, executor_config,
                                       pytorch_backend_config, mapping)
+    with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
+        drafter = instantiate_drafter(model_engine)
 
     resources = {}
     estimating_kv_cache = False
@@ -334,7 +339,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         py_executor = create_py_executor_instance(
             dist, resources, mapping, pytorch_backend_config, executor_config,
             ctx_chunk_config, model_engine, draft_model_engine, False, sampler,
-            lora_config)
+            drafter, lora_config)
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
@@ -365,7 +370,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             py_executor = create_py_executor_instance(
                 dist, resources, mapping, pytorch_backend_config,
                 executor_config, ctx_chunk_config, model_engine,
-                draft_model_engine, False, sampler, lora_config)
+                draft_model_engine, False, sampler, drafter, lora_config)
 
     py_executor.start_worker()
     return py_executor
