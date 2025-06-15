@@ -1,7 +1,7 @@
 import hashlib
 import hmac
 import os
-import pickle
+import pickle  # nosec B403
 import time
 import traceback
 from queue import Queue
@@ -10,7 +10,6 @@ from typing import Any, Optional
 import zmq
 import zmq.asyncio
 
-import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
 from .._utils import nvtx_mark, nvtx_range_debug
@@ -42,7 +41,6 @@ class ZeroMqQueue:
             is_server (bool): Whether the current process is the server or the client.
             is_async (bool): Whether to use asyncio for the socket. Defaults to False.
             name (str, optional): The name of the queue. Defaults to None.
-            additional_serializable_classes (Dict, optional): Additional classes to be added to the serializable classes.
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
         '''
 
@@ -115,46 +113,37 @@ class ZeroMqQueue:
         else:
             return False
 
-    def put(self, obj: Any, serialized: bool = False):
+    def put(self, obj: Any):
         self.setup_lazily()
-        with nvtx_range_debug("serialization.dumps",
-                              color="blue",
-                              category="IPC"):
-            if not serialized:
-                data = serialization.dumps(obj,
-                                           protocol=pickle.HIGHEST_PROTOCOL)
-            else:
-                data = obj
-        if self.use_hmac_encryption:
-            # Send pickled data with HMAC appended
-            with nvtx_range_debug("_sign_data", color="blue", category="IPC"):
-                data = self._sign_data(data)
         with nvtx_range_debug("send", color="blue", category="IPC"):
-            self.socket.send(data)
+            if self.use_hmac_encryption:
+                # Send pickled data with HMAC appended
+                data = pickle.dumps(obj)  # nosec B301
+                signed_data = self._sign_data(data)
+                self.socket.send(signed_data)
+            else:
+                # Send data without HMAC
+                self.socket.send_pyobj(obj)
 
     def put_noblock(self, obj: Any):
         self.setup_lazily()
-        with nvtx_range_debug("serialization.dumps",
-                              color="blue",
-                              category="IPC"):
-            data = serialization.dumps(obj)
-        if self.use_hmac_encryption:
-            with nvtx_range_debug("_sign_data", color="blue", category="IPC"):
+        with nvtx_range_debug("send (noblock)", color="blue", category="IPC"):
+            data = pickle.dumps(obj)  # nosec B301
+            if self.use_hmac_encryption:
                 data = self._sign_data(data)
-        with nvtx_range_debug("send(noblock)", color="blue", category="IPC"):
             self.socket.send(data, flags=zmq.NOBLOCK)
 
     async def put_async(self, obj: Any):
         self.setup_lazily()
         try:
-            data = serialization.dumps(obj)
             if self.use_hmac_encryption:
                 # Send pickled data with HMAC appended
+                data = pickle.dumps(obj)  # nosec B301
                 signed_data = self._sign_data(data)
                 await self.socket.send(signed_data)
             else:
                 # Send data without HMAC
-                await self.socket.send(data)
+                await self.socket.send_pyobj(obj)
         except TypeError as e:
             logger.error(f"Cannot pickle {obj}")
             raise e
@@ -180,13 +169,10 @@ class ZeroMqQueue:
             if not self._verify_hmac(data, actual_hmac):
                 raise RuntimeError("HMAC verification failed")
 
-            obj = serialization.loads(
-                data, approved_imports=serialization.BASE_ZMQ_CLASSES)
+            obj = pickle.loads(data)  # nosec B301
         else:
             # Receive data without HMAC
-            data = self.socket.recv()
-            obj = serialization.loads(
-                data, approved_imports=serialization.BASE_ZMQ_CLASSES)
+            obj = self.socket.recv_pyobj()
         return obj
 
     async def get_async(self) -> Any:
@@ -204,13 +190,10 @@ class ZeroMqQueue:
             if not self._verify_hmac(data, actual_hmac):
                 raise RuntimeError("HMAC verification failed")
 
-            obj = serialization.loads(
-                data, approved_imports=serialization.BASE_ZMQ_CLASSES)
+            obj = pickle.loads(data)  # nosec B301
         else:
             # Receive data without HMAC
-            data = await self.socket.recv()
-            obj = serialization.loads(
-                data, approved_imports=serialization.BASE_ZMQ_CLASSES)
+            obj = await self.socket.recv_pyobj()
         return obj
 
     def close(self):

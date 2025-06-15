@@ -155,8 +155,11 @@ def prefetch_files(file_names: List[str]):
     # Find out the files to prefetch for the current rank.
     # Each rank loads files with indices local_rank, local_rank + local_mpi_size, local_rank + 2*local_mpi_size, etc.
     local_file_names = file_names[local_mpi_rank()::local_mpi_size()]
+    if len(local_file_names) == 0:
+        return
 
-    max_processes = min(multiprocessing.cpu_count() * 2, 16)
+    max_processes = min(multiprocessing.cpu_count() * 2, 16,
+                        len(local_file_names))
     with multiprocessing.Pool(processes=max_processes) as pool:
         pool.map(_prefetch_one_file, local_file_names)
 
@@ -1000,6 +1003,7 @@ class PyTorchModelEngine(ModelEngine):
             checkpoint_dir,
             trust_remote_code=True,
             enable_min_latency=self.pytorch_backend_config.enable_min_latency,
+            use_cuda_graph=self.pytorch_backend_config.use_cuda_graph,
             spec_config=self.spec_config,
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=moe_max_num_tokens,
@@ -1077,10 +1081,19 @@ class PyTorchModelEngine(ModelEngine):
         return model
 
     def _init_max_seq_len(self):
+        inferred_max_seq_len = self.model.infer_max_seq_len()
         if self.max_seq_len is None:
-            inferred_max_seq_len = self.model.infer_max_seq_len()
             logger.info(
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
+            )
+            self.max_seq_len = inferred_max_seq_len
+
+        elif inferred_max_seq_len < self.max_seq_len:
+            # NOTE: py_executor_creator makes sure that the executor uses this
+            # smaller value as its max_seq_len too.
+            logger.warning(
+                f"Specified {self.max_seq_len=} is larger than what the model can support "
+                f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
             )
             self.max_seq_len = inferred_max_seq_len
 

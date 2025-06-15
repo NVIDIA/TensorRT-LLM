@@ -1526,6 +1526,10 @@ class PyExecutor:
                 max_num_draft_tokens=self.max_draft_tokens,
             )[0]
             llm_request.is_attention_dp_dummy = True
+            spec_resource_manager = self.resource_manager.get_resource_manager(
+                'spec_resource_manager')
+            if spec_resource_manager is not None:
+                spec_resource_manager.add_dummy_requests([0])
             self.active_requests.append(llm_request)
 
     @nvtx_range("_prepare_disagg_gen_init")
@@ -1769,6 +1773,16 @@ class PyExecutor:
             for request in scheduled_requests.generation_requests:
                 if request.py_draft_pages_allocated == 0:
                     # No space for draft tokens.
+                    continue
+
+                # Stop drafting when we hit the max seqlen. We still need dummy draft
+                # tokens attached to the requests to make sure everything works properly
+                # with CUDA graph. These dummy tokens are already added by
+                # _prepare_draft_requests to make the KV cache/scheduler aware of the fact
+                # that we want to do spec decoding, so no need to do anything else here.
+                # This makes the perf for this case suboptimal, but that's OK - this is
+                # a corner case for weird models like the llama 3.1 8b EAGLE3 implementation.
+                if request.max_beam_num_tokens - 1 >= self.draft_model_engine.max_seq_len:
                     continue
 
                 num_draft_tokens = len(
