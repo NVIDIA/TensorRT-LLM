@@ -126,7 +126,7 @@ class MakeDecodingBatchInputOutput:
 
         # Create decoder batch inputs
         decoding_input = self.create_decoder_batch_inputs(
-            active_slots, decoder_state, decoder_buffers.logits,
+            active_slots, decoder_state, decoder_input_buffers.logits,
             max_num_sequences, decoder_input_buffers.forward_batch_slots,
             decoder_buffers.cache_indirection_input)
         decoding_input.generation_steps = generation_steps

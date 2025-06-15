@@ -1,19 +1,19 @@
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm.bindings.internal.batch_manager import DecoderBuffers
+from tensorrt_llm.bindings.internal.batch_manager import DecoderInputBuffers
 
 
 class HandleGenerationLogits:
 
     def __call__(
         self,
-        logits_index: int,
+        decoder_input_buffers: DecoderInputBuffers,
         generation_requests: list[LlmRequest],
-        decoder_buffers: DecoderBuffers,
         logits: torch.Tensor,
+        logits_index: int,
     ):
-        decoder_buffer_logits = decoder_buffers.logits
+        decoder_buffer_logits = decoder_input_buffers.logits
         for llm_req in generation_requests:
             beam_width = llm_req.get_beam_width_by_iter()
             seq_slot = llm_req.seq_slot
@@ -32,4 +32,4 @@ class HandleGenerationLogits:
             logits_index += beam_width
 
         # Needs to be done in bulk for the copy to work
-        decoder_buffers.logits = decoder_buffer_logits
+        decoder_input_buffers.logits = decoder_buffer_logits
