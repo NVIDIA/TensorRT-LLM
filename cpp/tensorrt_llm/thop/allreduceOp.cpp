@@ -158,7 +158,8 @@ public:
 
     std::vector<torch::Tensor> run(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
         torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
-        torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> workspace)
+        torch::optional<torch::Tensor> const& bias, bool trigger_completion_at_end,
+        torch::optional<torch::Tensor> workspace) noexcept
     {
         size_t size = input.numel();
         size_t seq_len = input.size(0);
@@ -179,7 +180,8 @@ public:
         case AllReduceStrategyType::MIN_LATENCY:
         case AllReduceStrategyType::ONESHOT:
         case AllReduceStrategyType::TWOSHOT:
-            return runFusionAllReduce(input, residual, norm_weight, scale, bias, workspace, runtime_strategy);
+            return runFusionAllReduce(
+                input, residual, norm_weight, scale, bias, trigger_completion_at_end, workspace, runtime_strategy);
         case AllReduceStrategyType::LOWPRECISION:
             return runLowPrecisionAllReduce(input, residual, norm_weight, scale, bias);
         default: TORCH_CHECK(false, "Invalid runtime strategy"); return {};
@@ -371,7 +373,8 @@ private:
     std::vector<torch::Tensor> runFusionAllReduce(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
-        torch::optional<torch::Tensor> workspace, AllReduceStrategyType strategy)
+        bool trigger_completion_at_end, torch::optional<torch::Tensor> workspace,
+        AllReduceStrategyType strategy) noexcept
     {
         // Should handle only Lamport implementation
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -407,6 +410,7 @@ private:
         allreduce_fusion_params.scale_out = nullptr;
         allreduce_fusion_params.residual_out = nullptr;
         allreduce_fusion_params.norm_out = nullptr;
+        allreduce_fusion_params.trigger_completion_at_end = trigger_completion_at_end;
 
         // Determine if using oneshot or twoshot allreduce kernel
         if (strategy == AllReduceStrategyType::MIN_LATENCY)
@@ -963,8 +967,9 @@ private:
 
 std::vector<torch::Tensor> allreduce(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
     torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
-    torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> const& workspace,
-    torch::List<int64_t> const& group_, int64_t const strategy_, int64_t const fusion_op_, double const eps_)
+    torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> workspace,
+    torch::List<int64_t> const& group_, int64_t const strategy_, int64_t const fusion_op_, double const eps_,
+    bool const trigger_completion_at_end_)
 {
 #if ENABLE_MULTI_DEVICE
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
@@ -978,7 +983,7 @@ std::vector<torch::Tensor> allreduce(torch::Tensor const& input, torch::optional
     }
     AllreduceOp op(group, dtype, strategy, fusion_op, eps);
     op.initialize();
-    return op.run(input, residual, norm_weight, scale, bias, workspace);
+    return op.run(input, residual, norm_weight, scale, bias, trigger_completion_at_end_, workspace);
 #else
     return {input};
 #endif // ENABLE_MULTI_DEVICE
@@ -1181,7 +1186,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int[] group,"
         "int strategy,"
         "int op,"
-        "float eps) -> Tensor[]");
+        "float eps,"
+        "bool trigger_completion_at_end) -> Tensor[]");
     m.def(
         "moe_allreduce("
         "Tensor residual,"

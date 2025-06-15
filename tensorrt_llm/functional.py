@@ -3907,7 +3907,8 @@ class AllReduceParams():
                  scale: Optional[Tensor] = None,
                  norm_pre_residual_weight: Optional[Tensor] = None,
                  eps: float = 1e-06,
-                 enable_allreduce: bool = True):
+                 enable_allreduce: bool = True,
+                 trigger_completion_at_end: bool = True):
         self.strategy = strategy
         self.fusion_op = fusion_op
         self.bias = bias
@@ -3918,6 +3919,7 @@ class AllReduceParams():
         self.eps = eps
         # For torch path only, has no effect on TRT path
         self.enable_allreduce = enable_allreduce
+        self.trigger_completion_at_end = trigger_completion_at_end
         assert fusion_op == AllReduceFusionOp.NONE.value or (residual
                                                              is not None)
 

@@ -492,6 +492,8 @@ class AllReduce(nn.Module):
             strategy=self.strategy,
             op=all_reduce_params.fusion_op,
             eps=all_reduce_params.eps,
+            trigger_completion_at_end=all_reduce_params.
+            trigger_completion_at_end,
         )
 
         return output if len(output) > 1 else output[0]

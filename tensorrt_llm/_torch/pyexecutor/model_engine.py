@@ -1003,6 +1003,7 @@ class PyTorchModelEngine(ModelEngine):
             checkpoint_dir,
             trust_remote_code=True,
             enable_min_latency=self.pytorch_backend_config.enable_min_latency,
+            use_cuda_graph=self.pytorch_backend_config.use_cuda_graph,
             spec_config=self.spec_config,
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=moe_max_num_tokens,
@@ -1080,10 +1081,19 @@ class PyTorchModelEngine(ModelEngine):
         return model
 
     def _init_max_seq_len(self):
+        inferred_max_seq_len = self.model.infer_max_seq_len()
         if self.max_seq_len is None:
-            inferred_max_seq_len = self.model.infer_max_seq_len()
             logger.info(
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
+            )
+            self.max_seq_len = inferred_max_seq_len
+
+        elif inferred_max_seq_len < self.max_seq_len:
+            # NOTE: py_executor_creator makes sure that the executor uses this
+            # smaller value as its max_seq_len too.
+            logger.warning(
+                f"Specified {self.max_seq_len=} is larger than what the model can support "
+                f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
             )
             self.max_seq_len = inferred_max_seq_len
 
