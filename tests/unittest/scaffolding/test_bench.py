@@ -52,6 +52,8 @@ def test_scaffolding_benchmark():
         async_scaffolding_benchmark(scaffolding_llm, task_collection_types,
                                     requests, concurrency))
 
+    scaffolding_llm.shutdown()
+
     assert len(results) == requests_num
     assert len(requests_execution_time) == requests_num
     assert results[0].output.output_str == OUTPUT_STR
