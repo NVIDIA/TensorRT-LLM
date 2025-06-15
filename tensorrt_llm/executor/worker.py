@@ -871,8 +871,8 @@ class AwaitResponseHelper:
 
     def handle_for_ipc_batched(self, responses: List[tllm.Response]) -> None:
         ''' Perform the IPC in batch explicitly. '''
-        from tensorrt_llm._torch.pyexecutor.llm_request import \
-            make_llm_responses_serialize_friendly
+        from tensorrt_llm._torch.pyexecutor.llm_request import (
+            LlmResponse, make_llm_responses_serialize_friendly)
         postproc_batches = [
             []
             for _ in range(self.worker.postproc_config.num_postprocess_workers)
@@ -902,12 +902,37 @@ class AwaitResponseHelper:
         if postproc_batches:
             for wid, batch in enumerate(postproc_batches):
                 if batch:
-                    self.worker.postproc_queues[wid].put(
-                        make_postproc_inputs_serialize_friendly(batch))
+                    postproc_inputs = []
+                    other_responses = []
+                    for rsp in batch:
+                        if isinstance(rsp.rsp, LlmResponse):
+                            postproc_inputs.append(rsp)
+                        else:
+                            # Handle ErrorResponse and ResponseWrapper
+                            other_responses.append(rsp)
+                    self.worker.postproc_queues[wid].put({
+                        "postproc_inputs":
+                        make_postproc_inputs_serialize_friendly(
+                            postproc_inputs),
+                        "other_responses":
+                        other_responses
+                    })
 
         if rsp_batch:
-            self.worker.result_queue.put(
-                make_llm_responses_serialize_friendly(rsp_batch))
+            llm_responses = []
+            other_responses = []
+            for rsp in rsp_batch:
+                if isinstance(rsp, LlmResponse):
+                    llm_responses.append(rsp)
+                else:
+                    # Handle ErrorResponse and ResponseWrapper
+                    other_responses.append(rsp)
+            self.worker.result_queue.put({
+                "llm_responses":
+                make_llm_responses_serialize_friendly(llm_responses),
+                "other_responses":
+                other_responses
+            })
 
 
 def _get_params_for_first_rsp(

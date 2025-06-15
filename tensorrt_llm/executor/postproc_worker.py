@@ -188,7 +188,8 @@ class PostprocWorker:
                 self._to_stop.set()
                 yield None
             else:
-                inputs = restore_postproc_inputs(inputs[0])
+                inputs = restore_postproc_inputs(
+                    inputs[0]["postproc_inputs"]) + inputs[0]["other_responses"]
 
                 for inp in inputs:
                     if inp is None:
