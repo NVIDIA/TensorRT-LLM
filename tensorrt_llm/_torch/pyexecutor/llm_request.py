@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 
@@ -245,7 +245,10 @@ class LlmResponse:
 
 
 class ResponseList:
-    """ResponseList wraps a list of `Response` objects and provides fast serialization support"""
+    """ResponseList wraps a list of `Response` objects and provides fast serialization support.
+    It is used to serialize and deserialize a list/dict of LlmResponse objects by calling
+    `serialize` and `deserialize` methods exposed from C++ through Pybind11.
+    """
 
     def __init__(self,
                  responses: list[tensorrt_llm.bindings.executor.Response]):
@@ -266,7 +269,11 @@ class ResponseList:
 
 
 def make_llm_responses_serialize_friendly(
-        responses: Tuple[List[LlmResponse], Dict[int, LlmResponse]]) -> dict:
+        responses: tuple[list[LlmResponse], dict[int, LlmResponse]]) -> dict:
+    """Converts a list or dict of LlmResponse objects into a serialize-friendly format
+    `ResponseList` that can be quickly serialized and deserialized.
+    """
+
     if isinstance(responses, list):
         return {
             "response_list": ResponseList([r._response for r in responses]),
@@ -283,6 +290,9 @@ def make_llm_responses_serialize_friendly(
 
 def restore_llm_responses_from_serialize_friendly_list(
         responses: dict) -> list[LlmResponse]:
+    """
+    Restore a list of `LlmResponse` objects from a serialize-friendly format.
+    """
     return [
         LlmResponse(response, py_result) for response, py_result in zip(
             responses["response_list"].responses, responses["py_result_list"])
@@ -291,6 +301,9 @@ def restore_llm_responses_from_serialize_friendly_list(
 
 def restore_llm_responses_from_serialize_friendly_dict(
         responses: dict) -> dict[int, LlmResponse]:
+    """
+    Restore a dict of LlmResponse objects from a serialize-friendly format.
+    """
     llm_responses = {}
     for request_id, response, py_result in zip(
             responses["req_id_list"], responses["response_list"].responses,
