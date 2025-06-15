@@ -30,7 +30,7 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
     - [trtllm-serve](#trtllm-serve)
     - [Disaggregated Serving](#disaggregated-serving)
     - [Dynamo](#dynamo)
-    - [tensorrtllm_backend for triton inference server (Experimental)](#tensorrtllm_backend-for-triton-inference-server-experimental)
+    - [tensorrtllm\_backend for triton inference server (Experimental)](#tensorrtllm_backend-for-triton-inference-server-experimental)
   - [Advanced Usages](#advanced-usages)
     - [Multi-node](#multi-node)
       - [mpirun](#mpirun)
@@ -40,6 +40,8 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
     - [FlashMLA](#flashmla)
     - [FP8 KV Cache and MLA](#fp8-kv-cache-and-mla)
     - [W4AFP8](#w4afp8)
+      - [Activation calibration](#activation-calibration)
+      - [Weight quantization and assembling](#weight-quantization-and-assembling)
     - [KV Cache Reuse](#kv-cache-reuse)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
   - [Known Issues](#known-issues)
@@ -227,6 +229,8 @@ trtllm-eval --model  <YOUR_MODEL_DIR> \
 ## Serving
 ### trtllm-serve
 
+Take max-throughput scenario on B200 as an example, the settings are extracted from the [blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md#b200-max-throughput). **For users' own models and cases, the specific settings could be different to get best performance.**
+
 To serve the model using `trtllm-serve`:
 
 ```bash
@@ -253,12 +257,12 @@ trtllm-serve \
   --host localhost \
   --port 8000 \
   --backend pytorch \
-  --max_batch_size 161 \
-  --max_num_tokens 1160 \
+  --max_batch_size 384 \
+  --max_num_tokens 1536 \
   --tp_size 8 \
   --ep_size 8 \
   --pp_size 1 \
-  --kv_cache_free_gpu_memory_fraction 0.95 \
+  --kv_cache_free_gpu_memory_fraction 0.85 \
   --extra_llm_api_options ./extra-llm-api-config.yml
 ```
 

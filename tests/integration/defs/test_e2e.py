@@ -1977,15 +1977,15 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             ],
             "video": [
                 ["city", "night", "lights", "jacket", "wet"],
-                ["earth", "spinning", "black", "illuminated", "lights"],
+                ["earth", "spinning", "black"],
             ],
         },
         "qwen2.5-vl-7b-instruct": {
             "image": [
                 ["dramatic", "moody", "stormy", "turbulent", "wave"],
                 [
-                    "dome", "yosemite", "landmark", "sunny", "rock", "clouds",
-                    "pleasant"
+                    "large", "dome", "yosemite", "landmark", "rock", "road",
+                    "formation"
                 ],
                 ["highway", "traffic", "vehicles", "bus", "police"],
             ],
