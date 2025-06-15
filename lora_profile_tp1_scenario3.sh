@@ -118,7 +118,6 @@ if [ ! -f "${EG_DIR}/data/token-norm-dist-with-lora.json" ]; then
         --num-requests ${NUM_REQUESTS} \
         --input-mean ${ISL} --input-stdev 0 \
         --output-mean ${OSL} --output-stdev 0 \
-        --add-special-tokens \
         --dataset-meta-data lora_task_id=0
     echo "Dataset prepared"
 else
