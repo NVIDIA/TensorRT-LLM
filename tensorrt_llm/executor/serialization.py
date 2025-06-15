@@ -9,7 +9,7 @@ import pickle  # nosec B403
 BASE_EXAMPLE_CLASSES = {
     "builtins": [
         "Exception", "ValueError", "NotImplementedError", "AttributeError",
-        "AssertionError"
+        "AssertionError", "RuntimeError"
     ],  # each Exception Error class needs to be added explicitly
     "collections": ["OrderedDict"],
     "torch._utils": ["_rebuild_tensor_v2"],
