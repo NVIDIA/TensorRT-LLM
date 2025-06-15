@@ -1459,6 +1459,27 @@ class LoadFormat(Enum):
     DUMMY = 1
 
 
+class TorchCompileConfig(BaseModel):
+    """
+    Configuration for torch.compile.
+    """
+    torch_compile_fullgraph: bool = Field(
+        default=True,
+        description="Enable full graph compilation in torch.compile.")
+
+    torch_compile_inductor_enabled: bool = Field(
+        default=False, description="Enable inductor backend in torch.compile.")
+
+    torch_compile_piecewise_cuda_graph: bool = Field(
+        default=False,
+        description="Enable piecewise CUDA graph in torch.compile.")
+
+    torch_compile_enable_userbuffers: bool = Field(
+        default=True,
+        description=
+        "When torch compile is enabled, userbuffers is enabled by default.")
+
+
 class TorchLlmArgs(BaseLlmArgs):
 
     # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
@@ -1524,9 +1545,6 @@ class TorchLlmArgs(BaseLlmArgs):
     kv_cache_dtype: str = Field(default="auto",
                                 description="Data type for KV cache.")
 
-    use_kv_cache: bool = Field(default=True,
-                               description="Whether to use KV cache.")
-
     enable_iter_perf_stats: bool = Field(
         default=False, description="Enable iteration performance statistics.")
 
@@ -1539,24 +1557,8 @@ class TorchLlmArgs(BaseLlmArgs):
     print_iter_log: bool = Field(default=False,
                                  description="Print iteration logs.")
 
-    torch_compile_enabled: bool = Field(
-        default=False, description="Enable torch.compile optimization.")
-
-    torch_compile_fullgraph: bool = Field(
-        default=True,
-        description="Enable full graph compilation in torch.compile.")
-
-    torch_compile_inductor_enabled: bool = Field(
-        default=False, description="Enable inductor backend in torch.compile.")
-
-    torch_compile_piecewise_cuda_graph: bool = Field(
-        default=False,
-        description="Enable piecewise CUDA graph in torch.compile.")
-
-    torch_compile_enable_userbuffers: bool = Field(
-        default=True,
-        description=
-        "When torch compile is enabled, userbuffers is enabled by default.")
+    torch_compile_config: Optional[TorchCompileConfig] = Field(
+        default=None, description="Torch compile config.")
 
     autotuner_enabled: bool = Field(
         default=True,
@@ -1649,17 +1651,22 @@ class TorchLlmArgs(BaseLlmArgs):
             mixed_sampler=self.mixed_sampler,
             enable_trtllm_sampler=self.enable_trtllm_sampler,
             kv_cache_dtype=self.kv_cache_dtype,
-            use_kv_cache=self.use_kv_cache,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             enable_iter_req_stats=self.enable_iter_req_stats,
             print_iter_log=self.print_iter_log,
-            torch_compile_enabled=self.torch_compile_enabled,
-            torch_compile_fullgraph=self.torch_compile_fullgraph,
-            torch_compile_inductor_enabled=self.torch_compile_inductor_enabled,
-            torch_compile_piecewise_cuda_graph=self.
-            torch_compile_piecewise_cuda_graph,
-            torch_compile_enable_userbuffers=self.
-            torch_compile_enable_userbuffers,
+            torch_compile_enabled=bool(self.torch_compile_config is not None),
+            torch_compile_fullgraph=self.torch_compile_config.
+            torch_compile_fullgraph
+            if self.torch_compile_config is not None else True,
+            torch_compile_inductor_enabled=self.torch_compile_config.
+            torch_compile_inductor_enabled
+            if self.torch_compile_config is not None else False,
+            torch_compile_piecewise_cuda_graph=self.torch_compile_config.
+            torch_compile_piecewise_cuda_graph
+            if self.torch_compile_config is not None else False,
+            torch_compile_enable_userbuffers=self.torch_compile_config.
+            torch_compile_enable_userbuffers
+            if self.torch_compile_config is not None else True,
             autotuner_enabled=self.autotuner_enabled,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
@@ -1866,6 +1873,7 @@ def update_llm_args_with_extra_dict(
         "batching_type": BatchingType,
         "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
         "cache_transceiver_config": CacheTransceiverConfig,
+        "lora_config": LoraConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:

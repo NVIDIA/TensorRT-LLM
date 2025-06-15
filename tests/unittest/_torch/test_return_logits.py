@@ -14,7 +14,7 @@ from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.llm_utils import BuildConfig, KvCacheConfig
 
 prompts = ["A B C"]
-global_kvcache_config = KvCacheConfig(max_tokens=2048)
+global_kvcache_config = KvCacheConfig(max_tokens=10000)
 
 
 def test_LlmResponse_pickle():
@@ -54,7 +54,6 @@ def test_LlmResponse_pickle():
     assert pickle_result.log_probs == logprobs
 
 
-@pytest.mark.skip(reason="https://nvbugs/5327892")
 @force_ampere  # Save H100 resource
 @pytest.mark.parametrize("return_log_probs", [False, True])
 @pytest.mark.parametrize("gather_generation_logits", [False, True])
@@ -73,14 +72,10 @@ def test_generate_with_return_logits(disable_overlap_scheduler: bool,
     if not enable_trtllm_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
-    build_config = BuildConfig()
-    build_config.gather_context_logits = gather_context_logits
-
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
                            "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
-        build_config=build_config,
         gather_context_logits=gather_context_logits,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
@@ -91,8 +86,6 @@ def test_generate_with_return_logits(disable_overlap_scheduler: bool,
 
     sampling_params = SamplingParams(
         max_tokens=8,
-        top_k=1,
-        top_p=1,
         return_context_logits=gather_context_logits,
         return_generation_logits=gather_generation_logits,
         logprobs=return_log_probs,
@@ -102,7 +95,9 @@ def test_generate_with_return_logits(disable_overlap_scheduler: bool,
         for output in llm.generate(prompts, sampling_params=sampling_params):
             if gather_context_logits:
                 assert output.context_logits is not None
-                assert len(prompts[0].split()) == output.context_logits.shape[0]
+                # NOTE: prompt_token_ids of "A B C" becomes [1, 319, 350, 315]
+                expected_len = len(prompts[0].split()) + 1
+                assert expected_len == output.context_logits.shape[0]
             else:
                 assert output.context_logits is None
 
@@ -123,7 +118,6 @@ def test_generate_with_return_logits(disable_overlap_scheduler: bool,
                 assert len(output.outputs[0].logprobs) == 0
 
 
-@pytest.mark.skip(reason="https://nvbugs/5327892")
 @force_ampere  # Save H100 resource
 @pytest.mark.parametrize("return_log_probs", [False, True])
 @pytest.mark.parametrize("gather_generation_logits", [False, True])
@@ -159,8 +153,6 @@ def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
     )
     sampling_params = SamplingParams(
         max_tokens=8,
-        top_k=1,
-        top_p=1,
         return_context_logits=gather_context_logits,
         return_generation_logits=gather_generation_logits,
         logprobs=return_log_probs)
@@ -172,7 +164,9 @@ def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
                                    streaming=True)):
             if gather_context_logits:
                 assert output.context_logits is not None
-                assert len(prompts[0].split()) == output.context_logits.shape[0]
+                # NOTE: prompt_token_ids of "A B C" becomes [1, 319, 350, 315]
+                expected_len = len(prompts[0].split()) + 1
+                assert expected_len == output.context_logits.shape[0]
             else:
                 assert output.context_logits is None
 

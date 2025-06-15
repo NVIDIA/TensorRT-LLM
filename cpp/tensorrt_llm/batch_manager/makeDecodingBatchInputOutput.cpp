@@ -146,16 +146,16 @@ MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, R
         TLLM_CHECK(fusedRuntimeBuffers);
         // requires mCtxGenFusion == true
         decodingInput->batchSlotsRequestOrder = fusedRuntimeBuffers->seqSlots;
-        decodingInput->explicitDraftTokensInputs = fusedRuntimeBuffers->explicitDraftTokensBuffers->engineOutputs;
-        decodingInput->explicitDraftTokensLastInputs = fusedRuntimeBuffers->explicitDraftTokensBuffers->engineInputs;
+        decodingInput->explicitDraftTokensInputs = fusedRuntimeBuffers->mExplicitDraftTokensBuffers->engineOutputs;
+        decodingInput->explicitDraftTokensLastInputs = fusedRuntimeBuffers->mExplicitDraftTokensBuffers->engineInputs;
     }
     else if (modelConfig.getSpeculativeDecodingMode().isEagle())
     {
         TLLM_CHECK(fusedRuntimeBuffers);
         // requires mCtxGenFusion == true
         decodingInput->batchSlotsRequestOrder = fusedRuntimeBuffers->seqSlots;
-        decodingInput->eagleInputs = fusedRuntimeBuffers->eagleBuffers->engineOutputs;
-        decodingInput->eagleLastInputs = fusedRuntimeBuffers->eagleBuffers->engineInputs;
+        decodingInput->eagleInputs = fusedRuntimeBuffers->mEagleBuffers->engineOutputs;
+        decodingInput->eagleLastInputs = fusedRuntimeBuffers->mEagleBuffers->engineInputs;
     }
 
     auto decodingOutput = std::make_unique<tr::decoder_batch::Output>();

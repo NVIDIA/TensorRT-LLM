@@ -236,6 +236,10 @@ class LlmResponse:
             self._response.result,
             self._py_result)  # LlmResult masquerades bindings.executor.Result
 
+    @property
+    def _is_llm_response(self) -> bool:
+        return True
+
     def __getattr__(self, item):
         return getattr(self._response, item)
 
@@ -278,6 +282,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_rewind_len = 0
         self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
         self.py_last_draft_tokens = None
+        self.py_num_accepted_draft_tokens = 0
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False

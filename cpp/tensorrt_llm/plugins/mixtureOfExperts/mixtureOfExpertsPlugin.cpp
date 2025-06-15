@@ -26,7 +26,6 @@
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::plugins;
-using namespace tensorrt_llm::kernels;
 using tensorrt_llm::common::QuantMode;
 using tensorrt_llm::common::nextWorkspacePtr;
 using tensorrt_llm::common::calculateTotalWorkspaceSize;
@@ -35,6 +34,9 @@ using tensorrt_llm::plugins::MixtureOfExpertsPlugin;
 using tensorrt_llm::plugins::read;
 using tensorrt_llm::plugins::write;
 
+using LoraImpl = tensorrt_llm::kernels::LoraImpl;
+using LoraParams = tensorrt_llm::kernels::LoraParams;
+
 static char const* MIXTURE_OF_EXPERTS_PLUGIN_VERSION{"1"};
 static char const* MIXTURE_OF_EXPERTS_PLUGIN_NAME{"MixtureOfExperts"};
 nvinfer1::PluginFieldCollection MixtureOfExpertsPluginCreator::mFC{};
@@ -42,7 +44,7 @@ std::vector<nvinfer1::PluginField> MixtureOfExpertsPluginCreator::mPluginAttribu
 
 MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(bool remove_input_padding, int number_of_experts, int experts_per_token,
     int expert_hidden_size, int expert_inter_size, int groupwise_quant_algo, int group_size,
-    tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type, nvinfer1::DataType weight_type,
+    ActivationType activation_type, nvinfer1::DataType type, nvinfer1::DataType weight_type,
     nvinfer1::DataType output_type, QuantMode quant_mode, bool use_final_scales, bool use_bias, int tp_size,
     int tp_rank, int ep_size, int ep_rank, bool force_determinism, int side_stream_id,
     MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora, nvinfer1::DataType lora_type,
@@ -218,7 +220,7 @@ void MixtureOfExpertsPlugin::serialize(void* buffer) const noexcept
 }
 
 template <typename Type, bool NeedQuant = false>
-std::unique_ptr<CutlassMoeFCRunnerInterface> switch_output_type(nvinfer1::DataType output_type)
+std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> switch_output_type(nvinfer1::DataType output_type)
 {
     switch (output_type)
     {
@@ -226,25 +228,25 @@ std::unique_ptr<CutlassMoeFCRunnerInterface> switch_output_type(nvinfer1::DataTy
     case nvinfer1::DataType::kFP8:
         // TODO We need an atomic FP8 reduction for the finalize fusions
         TLLM_THROW("Outputting %d directly is not currently supported", static_cast<int>(output_type));
-        // return std::make_unique<CutlassMoeFCRunner<Type, Type>>();
+        // return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type>>();
     case nvinfer1::DataType::kHALF:
         if constexpr (NeedQuant)
         {
-            return std::make_unique<CutlassMoeFCRunner<Type, Type, half, half>>();
+            return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type, half, half>>();
         }
         else
         {
-            return std::make_unique<CutlassMoeFCRunner<Type, Type, half, Type>>();
+            return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type, half, Type>>();
         }
 #ifdef ENABLE_BF16
     case nvinfer1::DataType::kBF16:
         if constexpr (NeedQuant)
         {
-            return std::make_unique<CutlassMoeFCRunner<Type, Type, __nv_bfloat16, __nv_bfloat16>>();
+            return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type, __nv_bfloat16, __nv_bfloat16>>();
         }
         else
         {
-            return std::make_unique<CutlassMoeFCRunner<Type, Type, __nv_bfloat16, Type>>();
+            return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type, __nv_bfloat16, Type>>();
         }
 #endif
     default: TLLM_THROW("Invalid output type %d", static_cast<int>(output_type));
@@ -269,44 +271,44 @@ void MixtureOfExpertsPlugin::init()
 
     if (mType == DataType::kHALF && mWeightType == DataType::kHALF)
     {
-        mMOERunner = std::make_unique<CutlassMoeFCRunner<half, half>>();
+        mMOERunner = std::make_unique<kernels::CutlassMoeFCRunner<half, half>>();
     }
     else if (mType == DataType::kFLOAT && mWeightType == DataType::kFLOAT)
     {
-        mMOERunner = std::make_unique<CutlassMoeFCRunner<float, float>>();
+        mMOERunner = std::make_unique<kernels::CutlassMoeFCRunner<float, float>>();
     }
     else if (mType == DataType::kHALF && mWeightType == DataType::kINT8)
     {
-        mMOERunner = std::make_unique<CutlassMoeFCRunner<half, uint8_t>>();
+        mMOERunner = std::make_unique<kernels::CutlassMoeFCRunner<half, uint8_t>>();
     }
     else if (mType == DataType::kHALF && mWeightType == DataType::kINT4)
     {
-        mMOERunner = std::make_unique<CutlassMoeFCRunner<half, cutlass::uint4b_t>>();
+        mMOERunner = std::make_unique<kernels::CutlassMoeFCRunner<half, cutlass::uint4b_t>>();
     }
 #ifdef ENABLE_FP8
     else if (mType == DataType::kFP8 && mWeightType == DataType::kINT4 && mOutputType == DataType::kHALF)
     {
-        mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half, half>>();
+        mMOERunner = std::make_unique<kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half, half>>();
     }
 #endif
 #ifdef ENABLE_BF16
     else if (mType == DataType::kBF16 && mWeightType == DataType::kBF16)
     {
-        mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16>>();
+        mMOERunner = std::make_unique<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16>>();
     }
     else if (mType == DataType::kBF16 && mWeightType == DataType::kINT8)
     {
-        mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, uint8_t>>();
+        mMOERunner = std::make_unique<kernels::CutlassMoeFCRunner<__nv_bfloat16, uint8_t>>();
     }
     else if (mType == DataType::kBF16 && mWeightType == DataType::kINT4)
     {
-        mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t>>();
+        mMOERunner = std::make_unique<kernels::CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t>>();
     }
 #ifdef ENABLE_FP8
     else if (mType == DataType::kFP8 && mWeightType == DataType::kINT4 && mOutputType == DataType::kBF16)
     {
-        mMOERunner
-            = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_bfloat16>>();
+        mMOERunner = std::make_unique<
+            kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_bfloat16>>();
     }
 #endif
 #endif
@@ -692,14 +694,12 @@ QuantParams tensorrt_llm::plugins::MixtureOfExpertsPlugin::getQuantParams(nvinfe
         TLLM_CHECK(desc_6->dims.nbDims == 1);
         TLLM_CHECK(desc_1->dims.d[0] == 1);
         TLLM_CHECK_WITH_INFO(desc_2->dims.d[0] == experts_per_node && desc_2->dims.d[1] == gated_inter_size
-                && desc_2->dims.d[2]
-                    == mExpertHiddenSize / TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize,
+                && desc_2->dims.d[2] == mExpertHiddenSize / BlockScaleVectorSize,
             "Incorrect shape for FP4 scale");
         TLLM_CHECK_WITH_INFO(desc_3->dims.d[0] == experts_per_node, "Incorrect shape for FP4 scale");
         TLLM_CHECK(desc_4->dims.d[0] == 1);
         TLLM_CHECK_WITH_INFO(desc_5->dims.d[0] == experts_per_node && desc_5->dims.d[1] == mExpertHiddenSize
-                && desc_5->dims.d[2]
-                    == mExpertInterSize / TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize,
+                && desc_5->dims.d[2] == mExpertInterSize / BlockScaleVectorSize,
             "Incorrect shape for FP4 scale");
         TLLM_CHECK_WITH_INFO(desc_6->dims.d[0] == experts_per_node, "Incorrect shape for FP4 scale");
         return QuantParams::FP4(static_cast<float const*>(scale_1),
@@ -1194,7 +1194,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
         auto* obj = new MixtureOfExpertsPlugin(
             // Constructor parameters
             mRemoveInputPadding, mNumExperts, mExpertsPerToken, mExpertHiddenSize, mExpertInterSize,
-            mGroupwiseQuantAlgo, mGroupSize, static_cast<tensorrt_llm::ActivationType>(mActivationType),
+            mGroupwiseQuantAlgo, mGroupSize, static_cast<ActivationType>(mActivationType),
             static_cast<nvinfer1::DataType>(mType), static_cast<nvinfer1::DataType>(mWeightType),
             static_cast<nvinfer1::DataType>(mOutputType), QuantMode(mQuantMode), mUseFinalScales != 0, mUseBias != 0,
             mTPSize, mTPRank, mEPSize, mEPRank, mRequiresDeterminism != 0, mSideStreamId, gemmProfiler, mUseLora != 0,

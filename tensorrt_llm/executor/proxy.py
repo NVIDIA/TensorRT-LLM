@@ -9,7 +9,6 @@ import torch
 import zmq
 import zmq.asyncio
 
-import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_rank, nvtx_range_debug
@@ -298,7 +297,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
             ready_signal=GenerationExecutorProxy.READY_SIGNAL,
-            BASE_ZMQ_CLASSES=serialization.BASE_ZMQ_CLASSES)
+        )
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)
 
@@ -310,14 +309,13 @@ class GenerationExecutorProxy(GenerationExecutor):
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
-                ready_signal = RuntimeError(
-                    "Executor worker died during initialization")
-                break
+                raise RuntimeError("Executor worker died during initialization")
             self._handle_background_error()
 
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
             self.mpi_session.shutdown_abort(reason=ready_signal)
-            raise ready_signal
+            raise RuntimeError(
+                "Executor worker returned error") from ready_signal
 
     def _abort_all_requests(self):
         # The results can be finished during this loop, so self._results may be changed.

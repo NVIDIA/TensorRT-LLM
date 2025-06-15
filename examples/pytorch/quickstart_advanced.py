@@ -123,6 +123,13 @@ def add_llm_args(parser):
     parser.add_argument('--trust_remote_code',
                         default=False,
                         action='store_true')
+    parser.add_argument('--return_context_logits',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--return_generation_logits',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--logprobs', default=False, action='store_true')
     return parser
 
 
@@ -198,14 +205,18 @@ def setup_llm(args):
               moe_cluster_parallel_size=args.moe_cluster_size,
               enable_chunked_prefill=args.enable_chunked_prefill,
               speculative_config=spec_config,
-              trust_remote_code=args.trust_remote_code)
+              trust_remote_code=args.trust_remote_code,
+              gather_context_logits=args.return_context_logits,
+              gather_generation_logits=args.return_generation_logits)
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
-    )
+        return_context_logits=args.return_context_logits,
+        return_generation_logits=args.return_generation_logits,
+        logprobs=args.logprobs)
     return llm, sampling_params
 
 
@@ -220,6 +231,15 @@ def main():
         prompt = output.prompt
         generated_text = output.outputs[0].text
         print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+        if args.return_context_logits:
+            print(f"[{i}] Context logits: {output.context_logits}")
+        if args.return_generation_logits:
+            print(
+                f"[{i}] Generation logits: {output.outputs[0].generation_logits}"
+            )
+        if args.logprobs:
+            print(f"[{i}] Logprobs: {output.outputs[0].logprobs}")
 
 
 if __name__ == '__main__':

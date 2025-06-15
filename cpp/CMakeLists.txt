@@ -43,6 +43,14 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
+       "Using open sourced Cutlass low latency gemm kernel" ON)
+option(USING_OSS_CUTLASS_FP4_GEMM "Using open sourced Cutlass fp4 gemm kernel"
+       ON)
+option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
+       ON)
+option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
+       "Using open sourced Cutlass AR gemm kernel" ON)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
