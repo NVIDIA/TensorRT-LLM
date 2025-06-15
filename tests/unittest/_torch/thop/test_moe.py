@@ -593,8 +593,6 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
     assert num_experts % n_groups == 0
     assert num_experts % 4 == 0
     assert top_k < (top_k_groups * num_experts / n_groups)
-    assert hidden_size % 128 == 0
-    assert intermediate_size % 128 == 0
 
     expert_logits = torch.randn((num_tokens, num_experts),
                                 device='cuda').to(torch.float)
@@ -668,9 +666,9 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024, 4096])
+@pytest.mark.parametrize("num_tokens", [1, 1024, 4096])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024, 768, 384, 192])
 @pytest.mark.parametrize(
     "routing_info",
     [
@@ -743,8 +741,6 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
 
     assert top_k <= num_experts
     assert top_k <= 8
-    assert hidden_size % 128 == 0
-    assert intermediate_size % 128 == 0
     if (top_k_groups is not None) and (n_groups is not None):
         assert top_k_groups <= 4
         assert num_experts > n_groups
@@ -995,8 +991,6 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     assert n_groups == 0 or num_experts % n_groups == 0
     assert num_experts % 4 == 0
     assert n_groups == 0 or top_k < (top_k_groups * num_experts / n_groups)
-    assert hidden_size % 128 == 0
-    assert intermediate_size % 128 == 0
 
     expert_logits = torch.randn((num_tokens, num_experts),
                                 device='cuda').to(torch.float)
