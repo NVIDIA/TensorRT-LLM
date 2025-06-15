@@ -5,8 +5,9 @@ from ordered_set import OrderedSet
 
 from tensorrt_llm.logger import logger
 
+from ..pyexecutor.drafter import Drafter
 from ..pyexecutor.llm_request import *
-from ..pyexecutor.sampler import SampleState, TorchSampler
+from ..pyexecutor.sampler import SampleState
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
@@ -55,9 +56,9 @@ class NGramSpecMetadata(SpecMetadata):
         return super().create_cuda_graph_metadata(max_batch_size)
 
 
-class NGramSampler(TorchSampler):
+class NGramDrafter(Drafter):
     """
-    Sampler for NGram. This class maintains the pattern-matches pairs for NGram drafter.
+    Drafter for NGram. This class maintains the pattern-matches pairs for NGram drafter.
 
     For example, one of the existed pairs could be: ["I","love"] -> [["apple", "because", "it", "is"], ["banana", "and"]].
 
@@ -97,8 +98,6 @@ class NGramSampler(TorchSampler):
         max_seq_len: int,
         spec_config: SpecConfig,
     ):
-        super().__init__(max_seq_len, False)
-
         self.max_num_draft_tokens = spec_config.max_draft_tokens
         self.prompt_lookup_num_tokens = spec_config.prompt_lookup_num_tokens
         self.max_matching_ngram_size = spec_config.max_matching_ngram_size
@@ -108,29 +107,13 @@ class NGramSampler(TorchSampler):
         self.pool = {}
         self.start_index = {}
 
-    def update_requests(self, state: SampleState):
-        super().update_requests(state)  # Reuse `TorchSampler.TorchSampler()`
+    def prepare_draft_tokens(
+        self,
+        scheduled_requests: ScheduledRequests,
+        state: SampleState,
+    ) -> None:
 
-        if self.is_public_pool:  # TODO: need an updating strategy to swap out the out-of-date pairs
-            return
-
-        # Swap out the out-of-date pairs if the request is completed.
-        for request in chain(state.scheduled_requests.context_requests,
-                             state.scheduled_requests.generation_requests):
-            if request.state == LlmRequestState.GENERATION_COMPLETE:
-                request_id = request.request_id
-                if request_id in self.pool:
-                    self.pool.pop(request_id)
-                    self.start_index.pop(request_id)
-        return
-
-    def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> SampleState:
-        return super().sample_async(scheduled_requests, model_outputs)
-
-    def prepare_forward(self, scheduled_requests: ScheduledRequests,
-                        state: SampleState) -> None:
-        if state is None:  # Skip in the first step
+        if state is None:  # Skip in the first step (context phase)
             return
 
         state.sampler_event.synchronize()
@@ -213,6 +196,20 @@ class NGramSampler(TorchSampler):
             (self.prompt_lookup_num_tokens + self.max_matching_ngram_size - 1))
 
         return draft_tokens
+
+    def update_drafter(self, state: SampleState):
+        if self.is_public_pool:  # TODO: need an updating strategy to swap out the out-of-date pairs
+            return
+
+        # Swap out the out-of-date pairs if the request is completed.
+        for request in chain(state.scheduled_requests.context_requests,
+                             state.scheduled_requests.generation_requests):
+            if request.state == LlmRequestState.GENERATION_COMPLETE:
+                request_id = request.request_id
+                if request_id in self.pool:
+                    self.pool.pop(request_id)
+                    self.start_index.pop(request_id)
+        return
 
     def print_pool(self):  # For debug
         if self.is_public_pool:

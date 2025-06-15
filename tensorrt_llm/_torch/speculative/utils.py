@@ -3,7 +3,7 @@ from .eagle3 import (Eagle3OneModelDecoder, Eagle3OneModelSpecMetadata,
                      Eagle3SpecMetadata)
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
-from .ngram import NGramSampler, NGramSpecMetadata
+from .ngram import NGramDrafter, NGramSpecMetadata
 
 
 def get_spec_metadata(spec_config,
@@ -74,14 +74,17 @@ def get_spec_resource_manager(spec_config,
 def get_spec_decoder(max_seq_len, spec_config):
     if spec_config.spec_dec_mode.is_mtp():
         return MTPSampler(max_seq_len, spec_config)
-    elif spec_config.spec_dec_mode.is_eagle3():
+    if spec_config.spec_dec_mode.is_eagle3():
         return Eagle3Sampler(max_seq_len)
-    elif spec_config.spec_dec_mode.is_eagle3_one_model():
+    if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelDecoder(max_seq_len, spec_config)
-    elif spec_config.spec_dec_mode.is_ngram():
-        return NGramSampler(max_seq_len, spec_config)
-    else:
-        return None
+    return None
+
+
+def get_spec_drafter(max_seq_len, spec_config):
+    if spec_config.spec_dec_mode.is_ngram():
+        return NGramDrafter(max_seq_len, spec_config)
+    return None
 
 
 def get_num_spec_layers(spec_config):

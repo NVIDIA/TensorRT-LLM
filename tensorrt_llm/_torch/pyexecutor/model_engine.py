@@ -453,11 +453,9 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             )
             self.max_draft_len = spec_config.max_draft_tokens
-            self.is_ngram = self.spec_config.spec_dec_mode.is_ngram()
         else:
             self.without_logits = False
             self.max_draft_len = 0
-            self.is_ngram = False
 
         # This field is initialized lazily on the first forward pass.
         # This is convenient because:

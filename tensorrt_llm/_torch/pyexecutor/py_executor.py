@@ -29,6 +29,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
 from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
+from .drafter import Drafter
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
                           LlmRequestState, executor_request_to_llm_request)
@@ -164,6 +165,7 @@ class PyExecutor:
                  scheduler,
                  model_engine: ModelEngine,
                  sampler: Sampler,
+                 drafter: Drafter,
                  dist: Distributed,
                  disable_overlap_scheduler: bool = False,
                  max_input_len: int = 2048,
@@ -189,6 +191,7 @@ class PyExecutor:
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.sampler = sampler
+        self.drafter = drafter
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
 
@@ -907,9 +910,9 @@ class PyExecutor:
                     if self.draft_model_engine is not None:
                         self._prepare_draft_tokens(scheduled_batch)
 
-                    if self.is_ngram:
-                        self.sampler.prepare_forward(scheduled_batch,
-                                                     sample_state)
+                    if self.drafter is not None:
+                        self.drafter.prepare_draft_tokens(
+                            scheduled_batch, sample_state)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -926,6 +929,9 @@ class PyExecutor:
 
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state)
+
+                    if self.drafter is not None:
+                        self.drafter.update_drafter(sample_state)
 
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
