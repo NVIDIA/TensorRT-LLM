@@ -388,6 +388,8 @@ class FusedMoE(nn.Module):
                                            == "1") and qm.has_nvfp4()
         self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
             model_config.mapping) if enable_alltoall else None
+        self.moe_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+            model_config.mapping) if enable_alltoall else None
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -1181,7 +1183,7 @@ class FusedMoE(nn.Module):
         '''
 
         alltoall_info, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
-            token_selected_experts, token_final_scales, self.alltoall_workspace, max_num_token, expert_count, top_k,
+            token_selected_experts, token_final_scales, self.moe_prepare_workspace, max_num_token, expert_count, top_k,
             self.ep_rank, self.ep_size)
 
         if not self.use_postquant_alltoall:

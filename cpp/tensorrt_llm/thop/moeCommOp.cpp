@@ -197,6 +197,12 @@ void setMaxUsableSmCount(int64_t maxSmCount)
     tensorrt_llm::kernels::setMaxUsableSmCount(maxSmCount);
 }
 
+int64_t getPrepareWorkspaceSizePerRank(int64_t epSize)
+{
+    int epSize32 = static_cast<int>(epSize);
+    return tensorrt_llm::kernels::moe_prepare::getMoePrepareWorkspaceSize(epSize32);
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 moePrepareOp(torch::Tensor expertsIds, torch::Tensor scales, torch::Tensor allWorkspaces, int64_t maxTokenCountPerRank, int64_t epRank, int64_t epSize, int64_t expertCount, int64_t topK)
 {
@@ -229,14 +235,13 @@ moePrepareOp(torch::Tensor expertsIds, torch::Tensor scales, torch::Tensor allWo
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    //tensorrt_llm::kernels::moeAllToAllPrepare
-    tensorrt_llm::kernels::moe_prepare::rankCount(expertsIds.data_ptr<uint32_t>(), localSendRankCountCumSum.data_ptr<int>(), 
+    tensorrt_llm::kernels::moe_prepare::rankCount(expertsIds.data_ptr<int>(), localSendRankCountCumSum.data_ptr<int>(), 
         localRecvRankCountCumSum.data_ptr<int>(), workspace, 
         tokenCount,topK, expertCount, epRank, epSize, 
         sendReadyCount.data_ptr<int>(), stream);
 
-    tensorrt_llm::kernels::moe_prepare::generateIndiceAndLocalData(expertsIds.data_ptr<uint32_t >(), scales.data_ptr<float>(), 
-        preparedLocalExpertIds.data_ptr<uint32_t>(), preparedLocalScales.data_ptr<float>(), 
+    tensorrt_llm::kernels::moe_prepare::generateIndiceAndLocalData(expertsIds.data_ptr<int>(), scales.data_ptr<float>(), 
+        preparedLocalExpertIds.data_ptr<int>(), preparedLocalScales.data_ptr<float>(), 
         localSendRankCountCumSum.data_ptr<int>(), localRecvRankCountCumSum.data_ptr<int>(), 
         localSendRankIndices.data_ptr<int>(), backwardLocalRecvRankIndices.data_ptr<int>(), 
         localRecvRankIndices.data_ptr<int>(), 
@@ -320,4 +325,13 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("mnnvl_moe_alltoallv_prepare_without_allgather", &torch_ext::moePrepareOp);
+}
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def("get_moe_prepare_workspace_size_per_rank(int ep_size) -> int");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
+{
+    m.impl("get_moe_prepare_workspace_size_per_rank", &torch_ext::getPrepareWorkspaceSizePerRank);
 }

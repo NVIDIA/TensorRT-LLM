@@ -40,6 +40,12 @@ __device__ __forceinline__ uint64_t ld_acquire_sys_global(volatile uint64_t *ptr
     return ret;
 }
 
+__device__ __forceinline__ int ld_acquire_sys_global_int(volatile int *ptr) {
+    int ret;
+    asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
 class StepCommunicatorBase
 {
 public:
@@ -50,6 +56,12 @@ public:
     localCachedHead(0),
     localCachedTail(0)
     {
+    }
+
+    __forceinline__ __device__ void reset()
+    {
+        fifoConnInfo->head = 0;
+        fifoConnInfo->tail = 0;
     }
 
     __forceinline__ __device__ void releaseSendStep()
@@ -112,9 +124,9 @@ protected:
 
 struct IndexInfo
 {
-    int32_t unitIdBase;
-    int32_t cachedUnitId;
-    int32_t cachedFirstValidThread;
+    int unitIdBase;
+    int cachedUnitId;
+    int cachedFirstValidThread;
 
     __device__ __inline__ IndexInfo()
     : unitIdBase(0),
@@ -140,8 +152,9 @@ public:
     __device__ __inline__ PipelineBase(
         uint8_t* bufferBase, 
         STEP_COMMUNICATOR_TYPE* stepCommunicator,
-        typename cub::BlockScan<int, THREADS_PER_PIPELINE>::TempStorage& tempStorage,
-        int* shared_new_step)
+        int* tempStorage,
+        int* shared_new_step,
+        int rank)
     : bufferBase(bufferBase), 
     stepCommunicator(stepCommunicator), 
     tempStorage(tempStorage),
@@ -153,11 +166,18 @@ public:
     allocatedUnit(0),
     unitIndex(pipelineTile.thread_rank() / THREADS_PER_UNIT),
     recivedUnit(0),
-    totalRecivedUnit(0)
+    totalUnit(0),
+    //for debug
+    rank(rank)
     {
         if (!IS_SENDER) {
             acquireNewPacket();
         }
+    }
+
+    __device__ __forceinline__ void reset()
+    {
+        stepCommunicator->reset();
     }
 
     __device__ __inline__ void finishPacket()
@@ -165,11 +185,14 @@ public:
         if (pipelineTile.thread_rank() == 0) {
             if (IS_SENDER) {
                 //*(packetCounterPtr) = allocatedUnit;
-                int32_t* packetCounterI32Ptr = (int32_t*)(packetCounterPtr);
+                //printf("Sender finish packet, allocatedUnit = %d, rankOffset = %d, packetCounterI32Ptr = %p\n", allocatedUnit, rankOffset, packetCounterI32Ptr);
+                int rankOffset = threadIdx.x / (THREADS_PER_UNIT * UNIT_PER_PIPELINE);
+                int* packetCounterI32Ptr = (int*)(packetCounterPtr);
+                //printf("Sender finish packet, allocatedUnit = %d, rank = %d, rankOffset = %d, packetCounterI32Ptr = %p\n", allocatedUnit, rank, rankOffset, packetCounterI32Ptr);
                 *packetCounterI32Ptr = allocatedUnit;
                 assert(allocatedUnit > 0);
-                int rankOffset = threadIdx.x / (THREADS_PER_UNIT * UNIT_PER_PIPELINE);
-                printf("Sender finish packet, allocatedUnit = %d, rankOffset = %d, packetCounterI32Ptr = %p\n", allocatedUnit, rankOffset, packetCounterI32Ptr);
+                //int rankOffset = threadIdx.x / (THREADS_PER_UNIT * UNIT_PER_PIPELINE);
+                //printf("Sender finish packet, allocatedUnit = %d, rankOffset = %d, packetCounterI32Ptr = %p\n", allocatedUnit, rankOffset, packetCounterI32Ptr);
                 stepCommunicator->releaseSendStep();
             } else {
                 stepCommunicator->releaseRecvStep();
@@ -207,15 +230,15 @@ public:
         if (!IS_SENDER) {
             recivedUnit = 0;
             packetCounterPtr = packetPtr + UNIT_BYTES_SIZE * UNIT_COUNT_PER_PACKET;
-            allocatedUnit = *((int32_t*)packetCounterPtr);
+            allocatedUnit = *((int*)packetCounterPtr);
             if (pipelineTile.thread_rank() == 0) {
                 int rankOffset = threadIdx.x / (THREADS_PER_UNIT * UNIT_PER_PIPELINE);
-                printf("Recvicer Acquire new packet, rankOffset = %d, allocatedUnit = %d, packetCounterPtr = %p\n", rankOffset, allocatedUnit, packetCounterPtr);
+                //printf("Recvicer Acquire new packet, rankOffset = %d, allocatedUnit = %d, packetCounterPtr = %p\n", rankOffset, allocatedUnit, packetCounterPtr);
             }
         } else {
             if (pipelineTile.thread_rank() == 0) {
                 int rankOffset = threadIdx.x / (THREADS_PER_UNIT * UNIT_PER_PIPELINE);
-                printf("Sender Acquire new packet, rankOffset = %d, step = %d, allocatedUnit = %d, packetCounterPtr = %p\n", rankOffset, step, allocatedUnit, packetCounterPtr);
+                //printf("Sender Acquire new packet, rankOffset = %d, step = %d, allocatedUnit = %d, packetCounterPtr = %p\n", rankOffset, step, allocatedUnit, packetCounterPtr);
             }
         }
     }
@@ -223,6 +246,7 @@ public:
     __device__ __inline__ uint8_t* conditionalAcquireSendBuffer(bool needBuffer = true)
     {
         bool unitNeedAlloc = unitTile.any(needBuffer);
+        //bool unitNeedAlloc = true;
         int isFirstThreadOnValidUnit = unitTile.thread_rank() == 0 && unitNeedAlloc ? 1 : 0;
         
         int allocUnit = cg::reduce(pipelineTile, isFirstThreadOnValidUnit, cg::plus<int>());
@@ -238,21 +262,41 @@ public:
             acquireNewPacket();
         }
 
-        unitIndex = 0;
-        typedef cub::BlockScan<int, THREADS_PER_PIPELINE> BlockScan;
-        BlockScan(tempStorage).InclusiveSum(isFirstThreadOnValidUnit, unitIndex);
-        unitIndex -= 1;
+        //unitIndex = 0;
+        //typedef cub::BlockScan<int, THREADS_PER_PIPELINE> BlockScan;
+        //BlockScan(tempStorage).InclusiveSum(isFirstThreadOnValidUnit, unitIndex);
 
+        //InclusiveSum the unit index on pipeline
+        int unitId = pipelineTile.thread_rank() / THREADS_PER_UNIT;
+        if (unitTile.thread_rank() == 0) {  
+            tempStorage[unitId] = isFirstThreadOnValidUnit;
+        }
+        pipelineTile.sync();
+
+        if (unitTile.thread_rank() == 0) {
+            unitIndex = 0;
+            for (int i = 0; i < unitId; i++) {
+                unitIndex += tempStorage[i];
+            }
+        }
+        pipelineTile.sync();
+
+        if (unitTile.thread_rank() == 0) {
+            tempStorage[unitId] = unitIndex;
+        }
+        pipelineTile.sync();
+
+        unitIndex = tempStorage[unitId];
         uint8_t* retPtr = nullptr;
-        if (needBuffer) {
+        if (unitNeedAlloc) {
             retPtr = packetPtr + (unitIndex + allocatedUnit) * UNIT_BYTES_SIZE + unitTile.thread_rank() * BYTES_PER_THREAD;
             //uint64_t addr = (uint64_t)retPtr;
             //assert(addr % 8 == 0);
         }
 
-
+        indexInfo.unitIdBase = totalUnit;
         allocatedUnit += allocUnit;
-        indexInfo.unitIdBase += allocUnit;
+        totalUnit += allocUnit;
         if (unitNeedAlloc) {
             indexInfo.cachedUnitId = unitIndex;
             int mask = unitTile.ballot(needBuffer);
@@ -262,11 +306,12 @@ public:
         return retPtr;
     }
 
-    __device__ __forceinline__ const bool recvEnd(int32_t expectedTotalRecivedUnit)
+    __device__ __forceinline__ const bool recvEnd(int expectedTotalRecivedUnit)
     {
-        return totalRecivedUnit >= expectedTotalRecivedUnit;
+        return totalUnit == expectedTotalRecivedUnit;
     }
 
+    bool flag;
     __device__ __inline__ uint8_t* conditionalAcquireRecvBuffer()
     {
         if (recivedUnit >= allocatedUnit)
@@ -276,18 +321,30 @@ public:
             //printf("Acquire new recv packet, threadIdx.x = %d, allocatedUnit = %d\n", threadIdx.x, allocatedUnit);
         }
 
+        if (rank == 0 && threadIdx.x < 64 && totalUnit + unitIndex == 133 && unitTile.thread_rank() == 0) {
+            printf("Recv acquire 133 Token !!!, totalUnit = %d, unitIndex = %d, recivedUnit = %d, allocatedUnit = %d\n", totalUnit, unitIndex, recivedUnit, allocatedUnit);
+        }
+
+        flag = false;
+        if (rank == 0 && threadIdx.x < 64 && totalUnit + unitIndex == 134 && unitTile.thread_rank() == 0) {
+            printf("Recv acquire 134 Token !!!, totalUnit = %d, unitIndex = %d, recivedUnit = %d, allocatedUnit = %d\n", totalUnit, unitIndex, recivedUnit, allocatedUnit);
+            flag = true;
+        }
+
 
         uint8_t* retPtr = nullptr;  
         if (recivedUnit + MAX_UNIT_PER_ITERATION <= allocatedUnit) {
             // fully recived
             retPtr = packetPtr + (recivedUnit + unitIndex) * UNIT_BYTES_SIZE + unitTile.thread_rank() * BYTES_PER_THREAD;
-            totalRecivedUnit += MAX_UNIT_PER_ITERATION;
+            totalUnit += MAX_UNIT_PER_ITERATION;
             recivedUnit += MAX_UNIT_PER_ITERATION;
+
         } else {
             if (recivedUnit + unitIndex < allocatedUnit) {
                 retPtr = packetPtr + (recivedUnit + unitIndex) * UNIT_BYTES_SIZE + unitTile.thread_rank() * BYTES_PER_THREAD;
             } 
-            totalRecivedUnit += (allocatedUnit - recivedUnit);
+
+            totalUnit += (allocatedUnit - recivedUnit);
             recivedUnit = allocatedUnit;
         }
 
@@ -340,24 +397,25 @@ public:
         return indexInfo;
     }
 
-    __device__ __forceinline__ int32_t getTotalRecivedUnit()
+    __device__ __forceinline__ int getTotalRecivedUnit()
     {
-        return totalRecivedUnit;
+        return totalUnit;
     }
     
 protected:
     uint8_t* bufferBase;
     STEP_COMMUNICATOR_TYPE* stepCommunicator;
-    typename cub::BlockScan<int, THREADS_PER_PIPELINE>::TempStorage& tempStorage;
+    int* tempStorage;
     int* shared_new_step;
     uint8_t* packetPtr;
     uint8_t* packetCounterPtr;
-    int32_t allocatedUnit;
-    int32_t recivedUnit;
-    int32_t totalRecivedUnit;
+    int allocatedUnit;
+    int recivedUnit;
+    int totalUnit;
+    int rank;
     // used for indices calculation
     IndexInfo indexInfo;
-    int32_t unitIndex;
+    int unitIndex;
     cg::thread_block_tile<THREADS_PER_PIPELINE> pipelineTile;
     cg::thread_block_tile<THREADS_PER_UNIT> unitTile;
 };
@@ -375,19 +433,20 @@ public:
 
     __forceinline__ __device__ void releaseValue(uint64_t value)
     {
-        fifoConnInfo->tail = value;
-        st_release_sys_global(&(fifoConnInfo->head), uint64_t(1));
+        // Avoid block on 0
+        st_release_sys_global(&(fifoConnInfo->count), value + 1);
     }
 
     __forceinline__ __device__ uint64_t acquireValue()
     {
-        uint64_t head = 0;
+        uint64_t localCount = 0;
         do {
-            head = ld_acquire_sys_global(&(fifoConnInfo->head));
-        } while(head == 0);
+            localCount = ld_acquire_sys_global(&(fifoConnInfo->count));
+        } while(localCount == 0);
 
-        uint64_t value = fifoConnInfo->tail;
-        return value;
+        fifoConnInfo->count = 0; // reset the count
+
+        return localCount - 1;
     }
 
 protected:
@@ -395,7 +454,7 @@ protected:
 };
 
 
-__global__ void rankCountDevice(uint32_t* experts, int* sendCountsCumsum, int* recvCountsCumsum, MoeCommWorkspace workspace, int tokenCount, int topK, int expert_count, int rank_id, int rank_count, int* sendCountReady)
+__global__ void rankCountDevice(int* experts, int* sendCountsCumsum, int* recvCountsCumsum, MoeCommWorkspace workspace, int tokenCount, int topK, int expert_count, int rank_id, int rank_count, int* sendCountReady)
 {
     bool isSender = (blockIdx.x < gridDim.x - 1);
     using BlockScan = cub::BlockScan<int, THREADS_PER_UNIT * UNIT_PER_PIPELINE * PIPELINE_PER_CTA>;
@@ -416,25 +475,19 @@ __global__ void rankCountDevice(uint32_t* experts, int* sendCountsCumsum, int* r
         if (rankTile.thread_rank() == 0) {
             *sharedCountsThisRank = 0;
         }
+        rankTile.sync();
 
         for (int token_id = unitId; token_id < tokenCount; token_id += UNIT_PER_PIPELINE) {
             bool is_valid = false;
             if (laneID < topK)
             {
-                int32_t expert_id = *(experts + token_id * topK + laneID);
-                //int32_t rank_id = expert_id / expert_count_per_rank;
+                int expert_id = *(experts + token_id * topK + laneID);
                 is_valid |= ((expert_id / expertCountPerRank) == target_rankId);
-
-                //if (blockIdx.x == 0 && threadIdx.x == 0) {
-                //    printf("token_id = %d, expert_id = %d, rank_id=%d\n", token_id, expert_id, rank_id);
-                //}
             }
             bool token_is_valid = unitTile.any(is_valid);
+
             if (unitTile.thread_rank() == 0 && token_is_valid) {
                 atomicAdd_block(sharedCountsThisRank, 1);
-                if (blockIdx.x == 0 && threadIdx.x == 0) {
-                    printf("Rank %d, token_id = %d\n", target_rankId, token_id);
-                }
             }
         }
         rankTile.sync();
@@ -443,6 +496,9 @@ __global__ void rankCountDevice(uint32_t* experts, int* sendCountsCumsum, int* r
         if (rankTile.thread_rank() == 0 && target_rankId < rank_count) {
             int countThisRank = *(sharedCountsThisRank);
             counter.releaseValue(uint64_t(countThisRank));
+            if (rank_id == 3) {
+                printf("Rank 3 send to %d, countThisRank = %d\n", target_rankId, countThisRank);
+            }
         }
 
         __syncthreads();
@@ -454,23 +510,39 @@ __global__ void rankCountDevice(uint32_t* experts, int* sendCountsCumsum, int* r
             }
         }
 
+        /*
         if (threadIdx.x == 0) {
             int rank_this_cta = blockIdx.x < gridDim.x - 2 ? PIPELINE_PER_CTA : rank_count - PIPELINE_PER_CTA * (gridDim.x - 2);
             atomicAdd_system(sendCountReady, rank_this_cta);
-
-            //printf("Send count ready = %d, blockIdx.x = %d, rank_this_cta = %d, gridDim.x = %d\n", *sendCountReady, blockIdx.x, rank_this_cta, gridDim.x);
         }
+        */
 
         // block 0 compute send cumsum
         if (blockIdx.x == 0) {
+            volatile int value = -1;
+            /*
             if (threadIdx.x == 0) {
-                do {} while (*sendCountReady < rank_count);
+                int currentCount;
+                do {
+                    currentCount = ld_acquire_sys_global_int((volatile int*)sendCountReady);
+                } while (currentCount < rank_count);
+                // Reset for next use
+                //*sendCountReady = 0;
+                printf("Rank 3 sendCountReady = %d\n", currentCount);
             }
+            
 
             __syncthreads();
-            int value = 0;
+            */
+            
             if (threadIdx.x < rank_count) {
-                value = int(*(sendCountsCumsum + threadIdx.x));
+                volatile int* sendCountPtr = sendCountsCumsum + threadIdx.x;
+                do {
+                    value = *(sendCountPtr);
+                } while (value < 0);
+                if (rank_id == 3 && threadIdx.x < 8) {
+                    printf("Rank 3 get valid value: %d = %d\n", threadIdx.x, value);
+                }
             }
 
             __syncthreads();
@@ -478,14 +550,15 @@ __global__ void rankCountDevice(uint32_t* experts, int* sendCountsCumsum, int* r
             int cumsum;
             BlockScan(tempStorage).InclusiveSum(value, cumsum);
             if (threadIdx.x < rank_count) {
-                *(sendCountsCumsum + threadIdx.x) = uint32_t(cumsum);
-                //printf("Rank %d, send cumsum = %d, value = %d\n", threadIdx.x, cumsum, value);
+                *(sendCountsCumsum + threadIdx.x) = cumsum;
+                if (rank_id == 3 && threadIdx.x < 8) {
+                    printf("Rank 3 send to %d, send cumsum = %d, value = %d\n", threadIdx.x, cumsum, value);
+                }
             }
         }
     }
     else // receiver
     {
-        // assert(gridDim.x >= 1);
         int value = 0;
         CounterCommunicator counter(workspace.getFifoConnInfo(false, rank_id, threadIdx.x, 0, rank_count, 1));
         if (threadIdx.x < rank_count) {
@@ -495,48 +568,27 @@ __global__ void rankCountDevice(uint32_t* experts, int* sendCountsCumsum, int* r
         __syncthreads();
 
         int cumsum;
-        BlockScan(tempStorage).ExclusiveSum(value, cumsum);
+        BlockScan(tempStorage).InclusiveSum(value, cumsum);
         if (threadIdx.x < rank_count) {
             *(recvCountsCumsum + threadIdx.x) = cumsum;
-            printf("Rank %d, recv cumsum = %d\n", threadIdx.x, cumsum);
-            //printf("Revc CTA end: %d, threadIdx.x = %d, \n", blockIdx.x, threadIdx.x);
         }
-
-        //printf("Revc CTA end: %d, threadIdx.x = %d\n", blockIdx.x, threadIdx.x);
     }
 }
 
-__device__ __forceinline__ uint64_t packExpertAndScale(uint32_t expertId, float scale)
-{
-    return (uint64_t(expertId) << 32) | *reinterpret_cast<uint32_t*>(&scale);
-}
-
-__device__ __forceinline__ void unPackExpertAndScale(uint64_t value, uint32_t& expertId, float& scale)
-{
-    expertId = uint32_t(value >> 32);
-    scale = *reinterpret_cast<float*>(&value);
-}
-
-
 template <typename STEP_COMMUNICATOR_TYPE>
-__global__ void generateIndiceAndLocalDataDevice(uint32_t* experts, float* scales, uint32_t* localExperts, float* localScales, int* sendCountsCumsum, int* recvCountsCumsum, 
+__global__ void generateIndiceAndLocalDataDevice(int* experts, float* scales, int* localExperts, float* localScales, int* sendCountsCumsum, int* recvCountsCumsum, 
     int* sendIndice, int* backwardIndice, int* recvIndice, MoeCommWorkspace workspace, int tokenCount, int topK, int expertCount, int rank, int rankCount)
 {
+    //return;
     bool isSender = (blockIdx.y == 0);
     int laneId = threadIdx.x % THREADS_PER_UNIT;
     int unitId = ((threadIdx.x - laneId) / THREADS_PER_UNIT) % UNIT_PER_PIPELINE;
     int rankOffset = threadIdx.x / (THREADS_PER_UNIT * UNIT_PER_PIPELINE);
     int targetRankId = blockIdx.x  * PIPELINE_PER_CTA + rankOffset;
     int expertCountPerRank = expertCount / rankCount;
-    //static constexpr int BYTES_PER_THREAD = UNIT_BYTES_SIZE / THREADS_PER_UNIT;
-    //static constexpr int BUFFER_SIZE_PER_PIPELINE = PACKET_DEPTH * UNIT_BYTES_SIZE * UNIT_COUNT_PER_PACKET + STEP_COMMUNICATOR_TYPE::META_SIZE;
-
-    __shared__ typename cub::BlockScan<int, THREADS_PER_PIPELINE>::TempStorage tempStorage;
+    
+    __shared__ int tempStorage[UNIT_PER_PIPELINE * PIPELINE_PER_CTA];
     __shared__ int sharedNewStep[PIPELINE_PER_CTA];
-#if DEBUG_PIPELINE
-    //Used for debug
-    __shared__ int tokenCounter[PIPELINE_PER_CTA];
-#endif
 
     if (targetRankId >= rankCount) {
         return;
@@ -544,19 +596,14 @@ __global__ void generateIndiceAndLocalDataDevice(uint32_t* experts, float* scale
 
     if (isSender) {
         int cumsum = targetRankId == 0 ? 0 : *(sendCountsCumsum + targetRankId - 1);
-#if DEBUG_PIPELINE
-        uint8_t* bufferBase = (uint8_t*)(workspace.getFifoBasePtrDebug(true, rank, targetRankId, 0, 1));
-        STEP_COMMUNICATOR_TYPE stepCommunicator(workspace.getFifoConnInfoDebug(true, rank, targetRankId, 0, rankCount, 1));
-#else
         uint8_t* bufferBase = (uint8_t*)(workspace.getFifoBasePtr(true, rank, targetRankId, 0, 1));
         STEP_COMMUNICATOR_TYPE stepCommunicator(workspace.getFifoConnInfo(true, rank, targetRankId, 0, rankCount, 1));
-#endif
-        PipelineBase<STEP_COMMUNICATOR_TYPE, true> pipeline(bufferBase, &stepCommunicator, tempStorage, &(sharedNewStep[rankOffset]));
+        PipelineBase<STEP_COMMUNICATOR_TYPE, true> pipeline(bufferBase, &stepCommunicator, tempStorage + rankOffset * UNIT_PER_PIPELINE, &(sharedNewStep[rankOffset]), rank);
 
         int alignTokenCount = (tokenCount + UNIT_PER_PIPELINE - 1) / UNIT_PER_PIPELINE * UNIT_PER_PIPELINE;
 
         for (int tokenId = unitId; tokenId < alignTokenCount; tokenId += UNIT_PER_PIPELINE) {
-            uint8_t* ptr;
+            uint8_t* ptr = nullptr;
             int rankId = -1;
             int expertId;
             if (tokenId < tokenCount && laneId < topK)
@@ -564,26 +611,21 @@ __global__ void generateIndiceAndLocalDataDevice(uint32_t* experts, float* scale
                 int offset = tokenId * topK + laneId;
                 int* source_ptr = (int*)(experts + offset);
                 expertId = *source_ptr;
-                int32_t rank_id = expertId / expertCountPerRank;
-                //rankId = expertId % rankCount;
+                rankId = expertId / expertCountPerRank;
                 ptr = pipeline.conditionalAcquireSendBuffer(rankId == targetRankId);
             } else {
                ptr = pipeline.conditionalAcquireSendBuffer(false); 
             }
 
-            //printf("11111 ptr = %p, threadIdx.x = %d\n", ptr, threadIdx.x);
-            //return;
-
             if (ptr) {
-                //printf("222222 ptr = %p, threadIdx.x = %d\n", ptr, threadIdx.x);
-                float scale = *(scales + tokenId * topK + laneId);
-                uint64_t value;
-                if (rankId == targetRankId) {
-                    value = packExpertAndScale(expertId, scale);
-                } else {
-                    value = packExpertAndScale(expertCount, 0.0f);
+                float scale = *(scales + tokenId * topK + laneId);                   
+                if (rankId != targetRankId) {
+                    scale = 0.0f;
+                    expertId = expertCount;
                 }
-                *((uint64_t*)ptr) = value;
+                // TODO: pack expertId and scale
+                *(int*)ptr = expertId;
+                *(float*)(ptr + sizeof(int)) = scale;
 
                 if (laneId == 0) {
                     int sendTokenId = pipeline.getIndexInfo().unitIdBase + pipeline.getIndexInfo().cachedUnitId;
@@ -597,31 +639,20 @@ __global__ void generateIndiceAndLocalDataDevice(uint32_t* experts, float* scale
     } else { // recv
         int cumsum = targetRankId == 0 ? 0 : *(recvCountsCumsum + targetRankId - 1);
         int recvTokenCount = *(recvCountsCumsum + targetRankId) - cumsum;
-#if DEBUG_PIPELINE
-        uint8_t* bufferBase = (uint8_t*)(workspace.getFifoBasePtrDebug(false, rank, targetRankId, 0, 1));
-        STEP_COMMUNICATOR_TYPE stepCommunicator(workspace.getFifoConnInfoDebug(false, rank, targetRankId, 0, rankCount, 1));
-#else
         uint8_t* bufferBase = (uint8_t*)(workspace.getFifoBasePtr(false, rank, targetRankId, 0, 1));
         STEP_COMMUNICATOR_TYPE stepCommunicator(workspace.getFifoConnInfo(false, rank, targetRankId, 0, rankCount, 1));
-#endif
-        PipelineBase<STEP_COMMUNICATOR_TYPE, false> pipeline(bufferBase, &stepCommunicator, tempStorage, &(sharedNewStep[rankOffset]));
+        PipelineBase<STEP_COMMUNICATOR_TYPE, false> pipeline(bufferBase, &stepCommunicator, tempStorage + rankOffset * UNIT_PER_PIPELINE, &(sharedNewStep[rankOffset]), rank);
 
-        //int alignRecvTokenCount = (recvTokenCount + UNIT_PER_PIPELINE - 1) / UNIT_PER_PIPELINE * UNIT_PER_PIPELINE;
-        //for (int tokenId = unitId; tokenId < alignRecvTokenCount; tokenId += UNIT_PER_PIPELINE) {
         int tokenIdBase = 0;
         while (!pipeline.recvEnd(recvTokenCount)) {
             uint8_t* ptr = pipeline.conditionalAcquireRecvBuffer();
             if (ptr) {
-                //assert(tokenId < recvTokenCount);
-                int64_t value = *((int64_t*)ptr);
-                uint32_t expertId;
+                int expertId;
                 float scale;
-                unPackExpertAndScale(value, expertId, scale);
+                expertId = *(int*)ptr;
+                scale = *(float*)(ptr + sizeof(int));
 
                 int tokenId = tokenIdBase + unitId;
-#if DEBUG_PIPELINE
-                assert(tokenId < recvTokenCount);
-#endif
                 tokenIdBase = pipeline.getTotalRecivedUnit();
 
                 if (laneId < topK) {
@@ -630,22 +661,19 @@ __global__ void generateIndiceAndLocalDataDevice(uint32_t* experts, float* scale
                 }
                 if (laneId == 0) {
                     *(recvIndice + cumsum + tokenId) = cumsum + tokenId;
-#if DEBUG_PIPELINE
-                    atomicAdd_block(&(tokenCounter[rankOffset]), 1);
-#endif
                 }
+            } else {
+                tokenIdBase = pipeline.getTotalRecivedUnit();
             }
         }
-#if DEBUG_PIPELINE
-        if (laneId == 0 && unitId == 0) {
-            printf("Recv end: %d, recvTokenCount = %d, targetRankId = %d, recvCounter = %d\n", blockIdx.x, recvTokenCount, targetRankId, tokenCounter[rankOffset]);
-        }
-#endif
+        // Reset workspace value for next use
+        pipeline.reset();
     }
 }
 
-void rankCount(uint32_t* experts, int* sendCountsCumsum, int* recvCountsCumsum, MoeCommWorkspace workspace, int tokenCount, int topK, int expert_count, int rank_id, int rankCount, int* sendCountReady, cudaStream_t stream)
+void rankCount(int* experts, int* sendCountsCumsum, int* recvCountsCumsum, MoeCommWorkspace workspace, int tokenCount, int topK, int expert_count, int rank_id, int rankCount, int* sendCountReady, cudaStream_t stream)
 {
+    TLLM_CUDA_CHECK(cudaMemsetAsync(sendCountsCumsum, -1, sizeof(int) * rankCount, stream));
     // One for recv, others for send.
     int cta_count = (rankCount + PIPELINE_PER_CTA - 1) / PIPELINE_PER_CTA + 1;
     int block_size = THREADS_PER_CTA;
@@ -654,14 +682,20 @@ void rankCount(uint32_t* experts, int* sendCountsCumsum, int* recvCountsCumsum, 
     rankCountDevice<<<grid, block, 0, stream>>>(experts, sendCountsCumsum, recvCountsCumsum, workspace, tokenCount, topK, expert_count, rank_id, rankCount, sendCountReady);
 }
 
-void generateIndiceAndLocalData(uint32_t* experts, float* scales, uint32_t* localExperts, float* localScales, int* sendCountsCumsum, int* recvCountsCumsum, 
+void generateIndiceAndLocalData(int* experts, float* scales, int* localExperts, float* localScales, int* sendCountsCumsum, int* recvCountsCumsum, 
     int* sendIndice, int* backwardIndice, int* recvIndice, MoeCommWorkspace workspace, int tokenCount, int topK, int expertCount, int rank, int rankCount, cudaStream_t stream)
 {
     int grid_x = (rankCount + PIPELINE_PER_CTA - 1) / PIPELINE_PER_CTA + 1;
     int block_size = THREADS_PER_CTA;
     dim3 block(block_size);
     dim3 grid(grid_x, 2);
+    printf("generateIndiceAndLocalData, grid_x = %d, block_size = %d\n", grid_x, block_size);
     generateIndiceAndLocalDataDevice<StepCommunicatorBase><<<grid, block, 0, stream>>>(experts, scales, localExperts, localScales, sendCountsCumsum, recvCountsCumsum, sendIndice, backwardIndice, recvIndice, workspace, tokenCount, topK, expertCount, rank, rankCount);
+}
+
+size_t getMoePrepareWorkspaceSize(int epSize)
+{
+    return (PACKET_DEPTH * PACKET_SIZE + StepCommunicatorBase::META_SIZE) * epSize;
 }
 
 } // namespace moe_prepare

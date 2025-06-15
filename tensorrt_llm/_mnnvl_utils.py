@@ -288,6 +288,7 @@ class MoEAlltoallInfo:
 class MnnvlMoe:
     moe_workspace: MnnvlMemory = None
     moe_workspace_tensor: torch.Tensor = None
+    moe_prepare_workspace_tensor: torch.Tensor = None
     moe_mapping: Mapping = None
 
     @staticmethod
@@ -305,6 +306,16 @@ class MnnvlMoe:
         return MnnvlMoe.moe_workspace_tensor
 
     @staticmethod
+    def get_moe_prepare_workspace(ep_size: int):
+        if MnnvlMoe.moe_prepare_workspace_tensor is not None:
+            return MnnvlMoe.moe_prepare_workspace_tensor
+        workspace_size_per_rank = torch.ops.trtllm.get_moe_prepare_workspace_size_per_rank(ep_size)
+        MnnvlMoe.moe_prepare_workspace_tensor = MnnvlMemory(mapping, workspace_size_per_rank)
+        MnnvlMoe.moe_prepare_workspace_tensor = MnnvlMoe.moe_prepare_workspace.as_torch_strided_tensor(
+            torch.uint64)
+        return MnnvlMoe.moe_prepare_workspace_tensor
+
+    @staticmethod
     def compute_target_rank_id(token_selected_experts: torch.Tensor,
                                expert_count: int, ep_size: int):
         assert expert_count % ep_size == 0, "expert_count should be divisible by ep_size"
@@ -315,7 +326,7 @@ class MnnvlMoe:
     @staticmethod
     def mnnvl_moe_alltoallv_prepare_without_allgather(expert_ids: torch.Tensor,
                                     scales: torch.Tensor,
-                                    workspace: torch.Tensor
+                                    workspace: torch.Tensor,
                                     max_token_count_per_rank: int,
                                     ep_rank: int,
                                     ep_size: int,

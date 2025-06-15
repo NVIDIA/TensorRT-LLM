@@ -34,7 +34,7 @@ namespace moe_prepare
 #define UNIT_PER_PIPELINE 8 
 #define PIPELINE_PER_CTA 4
 #define UNIT_BYTES_SIZE 64
-#define UNIT_COUNT_PER_PACKET 256
+#define UNIT_COUNT_PER_PACKET 128
 
 static constexpr int THREADS_PER_PIPELINE = THREADS_PER_UNIT * UNIT_PER_PIPELINE;
 static constexpr int THREADS_PER_CTA = THREADS_PER_PIPELINE * PIPELINE_PER_CTA;
@@ -53,6 +53,7 @@ struct ALIGN_256 MoeCommFifoConnInfo
 {
     volatile uint64_t head; // write position
     volatile uint64_t tail; // read position
+    volatile uint64_t count; //for counter
 };
 
 
@@ -84,7 +85,8 @@ struct MoeCommWorkspace
         int fifoInfoIndice = isSender ? peerRank : epRank;
         fifoInfoPtrU64 += strideIndice * rankStrideInU64;
         MoeCommFifoConnInfo* fifoInfoPtr = (MoeCommFifoConnInfo*) fifoInfoPtrU64;
-        return fifoInfoPtr + fifoInfoIndice * channelCount + channel;
+        MoeCommFifoConnInfo* result = fifoInfoPtr + fifoInfoIndice * channelCount + channel;
+        return result;
     }
 
     __inline__ __device__ uint64_t* getFifoBasePtrDebug(
@@ -100,18 +102,17 @@ struct MoeCommWorkspace
         uint64_t* fifoInfoPtrU64 = workspacePtr + FIFO_SIZE_IN_U64 * channelCount * epSize;
         int fifoInfoIndice = peerRank;
         MoeCommFifoConnInfo* fifoInfoPtr = (MoeCommFifoConnInfo*) fifoInfoPtrU64;
-        if (threadIdx.x % THREADS_PER_PIPELINE == 0) {
-            printf("getFifoConnInfoDebug, isSender = %d, peerRank = %d, offset = %d\n", isSender, peerRank, fifoInfoIndice * channelCount + channel);
-        }
         return fifoInfoPtr + fifoInfoIndice * channelCount + channel;
     }
 #endif
 };
 
-void rankCount(uint32_t* experts, int* sendCountsCumsum, int* recvCountsCumsum, MoeCommWorkspace workspace, int tokenCount, int topK, int expert_count, int rank_id, int rankCount, int* sendCountReady, cudaStream_t stream);
+void rankCount(int* experts, int* sendCountsCumsum, int* recvCountsCumsum, MoeCommWorkspace workspace, int tokenCount, int topK, int expert_count, int rank_id, int rankCount, int* sendCountReady, cudaStream_t stream);
 
-void generateIndiceAndLocalData(uint32_t* experts, float* scales, uint32_t* localExperts, float* localScales, int* sendCountsCumsum, int* recvCountsCumsum, 
+void generateIndiceAndLocalData(int* experts, float* scales, int* localExperts, float* localScales, int* sendCountsCumsum, int* recvCountsCumsum, 
     int* sendIndice, int* backwardIndice, int* recvIndice, MoeCommWorkspace workspace, int tokenCount, int topK, int expertCount, int rank, int rankCount, cudaStream_t stream);
+
+size_t getMoePrepareWorkspaceSize(int epSize);
 
 } // namespace tensorrt_llm::kernels::moe_prepare
 
