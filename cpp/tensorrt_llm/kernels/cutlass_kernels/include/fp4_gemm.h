@@ -62,7 +62,13 @@ public:
     virtual std::vector<tkc::CutlassGemmConfig> getConfigs() const = 0;
 };
 
-template <typename T>
+enum class FP4GemmType
+{
+    W4A4_NVFP4_NVFP4,
+    W4A8_MXFP4_MXFP8,
+};
+
+template <typename T, FP4GemmType gemmType = FP4GemmType::W4A4_NVFP4_NVFP4>
 class CutlassFp4GemmRunner : public virtual CutlassFp4GemmRunnerInterface
 {
 public:
