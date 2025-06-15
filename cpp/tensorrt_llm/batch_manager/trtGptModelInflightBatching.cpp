@@ -1426,17 +1426,16 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
         mDecoder->setup(decodingMode, getMaxNumSequences(), mOperatingBeamWidth, getMaxSequenceLen(), decoderType,
             mModelConfig, mWorldConfig);
 
-        mDecoderState = std::make_unique<runtime::decoder::DecoderState>(decoderType, mRuntime->getBufferManager());
+        mDecoderState = std::make_unique<runtime::decoder::DecoderState>(getMaxNumSequences(), mOperatingBeamWidth,
+            getMaxAttentionWindow(), getSinkTokenLen(), getMaxSequenceLen(), decoderType, mModelConfig, mWorldConfig,
+            mRuntime->getBufferManager());
+
         if (!mModelConfig.getSpeculativeDecodingMode().isNone())
         {
-            mDecoderState->allocateSpeculativeDecodingBuffers(
-                mModelConfig.getSpeculativeDecodingMode(), decoderType, mRuntime->getBufferManager());
+            mDecoderState->setupSpeculativeDecoding(mModelConfig.getSpeculativeDecodingMode(),
+                mModelConfig.getMaxDecodingTokens(), decoderType, mModelConfig, mWorldConfig,
+                mRuntime->getBufferManager());
         }
-
-        mDecoderState->setup(getMaxNumSequences(), mOperatingBeamWidth, getMaxAttentionWindow(), getSinkTokenLen(),
-            getMaxSequenceLen(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
-        mDecoderState->setupSpeculativeDecoding(mDecoderState->getSpeculativeDecodingMode(),
-            mModelConfig.getMaxDecodingTokens(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

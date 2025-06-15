@@ -48,20 +48,14 @@ public:
     using DecodingInputPtr = std::unique_ptr<DecodingInput>;
     using DecodingOutputPtr = std::unique_ptr<DecodingOutput>;
 
-    DecoderState(nvinfer1::DataType dtype, BufferManager const& bufferManager);
-
-    //! @brief Allocate buffers for speculative decoding.
-    void allocateSpeculativeDecodingBuffers(
-        SpeculativeDecodingMode speculativeDecodingMode, nvinfer1::DataType dtype, BufferManager const& bufferManager);
-
-    void setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
-        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, ModelConfig const& modelConfig,
-        WorldConfig const& worldConfig, BufferManager const& bufferManager);
+    DecoderState(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType dtype,
+        ModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& bufferManager);
 
     //! @brief Setup buffers for speculative decoding.
     void setupSpeculativeDecoding(SpeculativeDecodingMode const& speculativeDecodingMode,
-        SizeType32 maxTokensPerEngineStep, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
-        BufferManager const& bufferManager);
+        SizeType32 maxTokensPerEngineStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+        WorldConfig const& worldConfig, BufferManager const& bufferManager);
 
     //! @brief Disable lookahead decoding.
     void disableLookahead(RequestVector const& genRequests);
@@ -181,6 +175,17 @@ public:
     [[nodiscard]] DecodingOutput& getJointDecodingOutput() const;
 
 private:
+    void setupBuffers(nvinfer1::DataType dtype, BufferManager const& bufferManager);
+    void reshapeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, ModelConfig const& modelConfig,
+        WorldConfig const& worldConfig, BufferManager const& bufferManager);
+
+    void setupSpeculativeDecodingBuffers(
+        SpeculativeDecodingMode speculativeDecodingMode, nvinfer1::DataType dtype, BufferManager const& bufferManager);
+    void reshapeSpeculativeDecodingBuffers(SpeculativeDecodingMode const& speculativeDecodingMode,
+        SizeType32 maxTokensPerEngineStep, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+        BufferManager const& bufferManager);
+
     SizeType32 mMaxBatchSize{};
     SizeType32 mMaxBeamWidth{};
     SizeType32 mMaxSequenceLength{};

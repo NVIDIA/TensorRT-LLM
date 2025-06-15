@@ -45,7 +45,18 @@ void BeamSearchBuffers::reshape(SizeType32 maxBeamWidth, SizeType32 maxSequenceL
     mCumLogProbsTmp->reshape(ITensor::makeShape({1, maxBeamWidth}));
 }
 
-DecoderState::DecoderState(nvinfer1::DataType dtype, BufferManager const& bufferManager)
+DecoderState::DecoderState(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+    SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+    WorldConfig const& worldConfig, BufferManager const& bufferManager)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    setupBuffers(dtype, bufferManager);
+    reshapeBuffers(maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength, modelConfig,
+        worldConfig, bufferManager);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void DecoderState::setupBuffers(nvinfer1::DataType dtype, BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
@@ -98,7 +109,18 @@ DecoderState::DecoderState(nvinfer1::DataType dtype, BufferManager const& buffer
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void DecoderState::allocateSpeculativeDecodingBuffers(
+void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& speculativeDecodingMode,
+    SizeType32 maxTokensPerEngineStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+    WorldConfig const& worldConfig, BufferManager const& bufferManager)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    setupSpeculativeDecodingBuffers(speculativeDecodingMode, dtype, bufferManager);
+    reshapeSpeculativeDecodingBuffers(
+        speculativeDecodingMode, maxTokensPerEngineStep, modelConfig, worldConfig, bufferManager);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void DecoderState::setupSpeculativeDecodingBuffers(
     SpeculativeDecodingMode const speculativeDecodingMode, nvinfer1::DataType dtype, BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -170,7 +192,7 @@ void DecoderState::allocateSpeculativeDecodingBuffers(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+void DecoderState::reshapeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
     SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig, BufferManager const& bufferManager)
 {
@@ -268,7 +290,7 @@ void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeT
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& speculativeDecodingMode,
+void DecoderState::reshapeSpeculativeDecodingBuffers(SpeculativeDecodingMode const& speculativeDecodingMode,
     SizeType32 maxTokensPerEngineStep, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     BufferManager const& bufferManager)
 {
@@ -282,8 +304,9 @@ void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& specu
 
     TLLM_CHECK_WITH_INFO((mMaxDecodingEngineTokens == 1 && speculativeDecodingMode.isNone())
             || (mMaxDecodingEngineTokens > 1 && !speculativeDecodingMode.isNone()),
-        "Max tokens per engine step must be equal to 1 when no speculative decoding is configured, "
-        "or > 1 for any speculative decoding mode");
+        "Max tokens per engine step is %d, but must be equal to 1 when no speculative decoding is configured, "
+        "or > 1 for any speculative decoding mode.",
+        mMaxDecodingEngineTokens);
 
     auto const maxNewTokensShape = ITensor::makeShape({mMaxDecodingEngineTokens, mMaxBatchSize, mMaxBeamWidth});
     mFinishedSteps->reshape(maxNewTokensShape);
