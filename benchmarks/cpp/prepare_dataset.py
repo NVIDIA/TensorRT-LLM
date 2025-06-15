@@ -97,8 +97,8 @@ def cli(ctx, **kwargs):
                        std_out=kwargs['stdout'],
                        random_seed=kwargs['random_seed'],
                        task_id=kwargs['task_id'],
-                       rand_task_id=kwargs['rand_task_id'])
-    ctx.obj.lora_dir = kwargs['lora_dir']
+                       rand_task_id=kwargs['rand_task_id'],
+                       lora_dir=kwargs['lora_dir'])
 
 
 cli.add_command(dataset)
