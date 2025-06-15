@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from itertools import chain
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -9,7 +8,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
+from ..pyexecutor.sampler import TorchSampler
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 from .mtp import MTPSampler
 
@@ -111,8 +110,7 @@ class Eagle3SpecMetadata(SpecMetadata):
             seq_start += seqlen
 
         hidden_states_gather_ids = []
-        for req in chain(scheduled_requests.context_requests,
-                         scheduled_requests.generation_requests):
+        for req in scheduled_requests.all_requests():
             hidden_states_gather_ids.extend(
                 req_id_to_gather_ids[req.py_request_id])
 
@@ -124,26 +122,6 @@ class Eagle3SpecMetadata(SpecMetadata):
             return torch.cat(
                 [h[hidden_states_gather_ids] for h in self.hidden_states],
                 dim=-1)
-
-
-class Eagle3Sampler(TorchSampler):
-
-    def _batch_sample(self, scheduled_requests, model_outputs) -> SampleState:
-        logits = model_outputs["logits"]
-        new_tokens_device = torch.argmax(logits, dim=-1)
-        if "d2t" in model_outputs:
-            d2t = model_outputs["d2t"]
-            new_tokens_device = d2t[new_tokens_device] + new_tokens_device
-        device = SampleStateTensors(new_tokens=new_tokens_device)
-        host = SampleStateTensors(
-            new_tokens=new_tokens_device.to('cpu', non_blocking=True))
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
-        return SampleState(scheduled_requests=scheduled_requests,
-                           logits=logits,
-                           device=device,
-                           host=host,
-                           sampler_event=sampler_event)
 
 
 @dataclass
@@ -213,31 +191,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 break
 
 
-class Eagle3Decoder(TorchSampler):
+class Eagle3OneModelSampler(MTPSampler):
 
-    def _batch_sample(self, scheduled_requests, model_outputs) -> SampleState:
-        logits = model_outputs["logits"]
-        new_tokens_device = torch.argmax(logits, dim=-1)
-        if "d2t" in model_outputs:
-            d2t = model_outputs["d2t"]
-            new_tokens_device = d2t[new_tokens_device] + new_tokens_device
-        new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
-        new_tensors_device = {"new_tokens_device": new_tokens_device}
-        new_tensors_host = {"new_tokens_host": new_tokens_host}
-        decoder_event = torch.cuda.Event()
-        decoder_event.record()
-        return SampleState(scheduled_requests=scheduled_requests,
-                           logits=logits,
-                           new_tensors_device=new_tensors_device,
-                           new_tensors_host=new_tensors_host,
-                           decoder_event=decoder_event)
-
-
-class Eagle3OneModelDecoder(MTPSampler):
-
-    def __init__(self, max_seq_len: int, config: Eagle3Config):
-        super().__init__(max_seq_len, None)
-        self.draft_len = config.max_draft_tokens
+    def __init__(self, args: TorchSampler.Args):
+        super().__init__(args, nextn=args.max_draft_tokens)
 
 
 class Eagle3OneModelWorker(nn.Module):
