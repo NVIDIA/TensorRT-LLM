@@ -1652,12 +1652,12 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
                                      streaming=False,
                                      backend=None):
     LLM_CLASS = LLM
-    llm_extra_kwargs = {}
-    if backend == "pytorch":
+    llm_args_extra = {}
+    if backend in ["pytorch", "autodeploy"]:
         from tensorrt_llm._torch import LLM as LLM_torch
         LLM_CLASS = LLM_torch
     else:
-        llm_extra_kwargs["fast_build"] = True
+        llm_args_extra["fast_build"] = True
 
     llm = LLM_CLASS(
         llama_model_path,
@@ -1665,7 +1665,7 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
         build_config=BuildConfig(gather_context_logits=True),
         tensor_parallel_size=tp_size,
         gather_generation_logits=True,
-        **llm_extra_kwargs,
+        **llm_args_extra,
     )
 
     prompts = ["A B C D E F G H I J K"]
@@ -2197,13 +2197,16 @@ def run_llm_with_postprocess_parallel_and_result_handler(
     post_proc_params = PostprocParams(
         post_processor=perform_faked_oai_postprocess,
         postproc_args=post_proc_args)
+    kwargs = {}
+    if backend not in ["pytorch", "autodeploy"]:
+        kwargs["fast_build"] = True
     llm = LLM(model=llama_model_path,
               backend=backend,
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
               _num_postprocess_workers=2,
               _postprocess_tokenizer_dir=llama_model_path,
-              fast_build=True)
+              **kwargs)
     golden_result = "DEFGHI"
     for i, output in enumerate(
             llm.generate_async(prompts[0],

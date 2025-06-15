@@ -236,6 +236,10 @@ class LlmResponse:
             self._response.result,
             self._py_result)  # LlmResult masquerades bindings.executor.Result
 
+    @property
+    def _is_llm_response(self) -> bool:
+        return True
+
     def __getattr__(self, item):
         return getattr(self._response, item)
 

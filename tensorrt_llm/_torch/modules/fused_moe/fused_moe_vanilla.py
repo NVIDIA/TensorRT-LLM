@@ -89,8 +89,6 @@ class VanillaMoE(nn.ModuleList):
                                    if model_config.moe_max_num_tokens
                                    is not None else max_num_tokens)
 
-        self.enable_alltoall = False
-
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
@@ -458,7 +456,7 @@ class VanillaMoE(nn.ModuleList):
         use_dp_padding: Optional[bool] = None,
     ):
         outputs = inputs
-        if self.parallel_size > 1 and not self.enable_alltoall:
+        if self.parallel_size > 1:
             if self.use_dp:
                 outputs = reducescatter(
                     inputs,

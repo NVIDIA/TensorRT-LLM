@@ -15,9 +15,14 @@
  * limitations under the License.
  */
 
-#include "fp4_gemm.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/fp4_gemm.h"
+#else
+#include "fp4_gemm.h"
+#endif
+
 #include <cassert>
 #include <memory>
 #include <set>
@@ -27,8 +32,12 @@
 namespace tensorrt_llm::plugins
 {
 
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
+using Fp4GemmRunnerPtr = std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunnerInterface>;
+#else
 using Fp4GemmRunnerPtr
     = std::shared_ptr<tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunnerInterface>;
+#endif
 
 class Fp4GemmPluginProfiler : public GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
                                   Fp4GemmRunnerPtr, GemmIdCore, GemmIdCoreHash>
