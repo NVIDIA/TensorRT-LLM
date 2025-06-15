@@ -103,19 +103,8 @@ void DecoderOutputBuffers::disableLookaheadDecoding(SizeType32 maxNumSequences)
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-DecoderBuffers::DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, BufferManager const& manager,
-    ModelConfig const& modelConfig, WorldConfig const& worldConfig)
-{
-    if (modelConfig.getSpeculativeDecodingMode().needsKVCacheRewind()
-        || modelConfig.getSpeculativeDecodingMode().hasDraftLogits()
-        || modelConfig.getSpeculativeDecodingMode().predictsDraftTokens())
-    {
-        draftBuffers.create(maxNumSequences, maxTokensPerStep, manager, modelConfig);
-    }
-}
-
-void DraftBuffers::create(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, BufferManager const& manager,
-    ModelConfig const& modelConfig)
+void DecoderOutputBuffers::setupSpeculativeDecoding(
+    SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, ModelConfig const& modelConfig)
 {
     auto const speculativeDecodingMode = modelConfig.getSpeculativeDecodingMode();
 
@@ -140,7 +129,7 @@ DecoderStepAsyncSend::DecoderStepAsyncSend(DecoderOutputBuffers const& decoderOu
     bool const useMedusa, mpi::MpiComm const& commSession, int peer)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TLLM_LOG_DEBUG("start send outputs of DecoderBuffers to rank %d", peer);
+    TLLM_LOG_DEBUG("start send outputs of decoder to rank %d", peer);
 
     mRequest1 = commSession.sendAsync(
         *decoderOutputBuffers.newOutputTokensHost, peer, mpi::MpiTag::kDecoderStepNewOutputTokensHost);
@@ -154,14 +143,14 @@ DecoderStepAsyncSend::DecoderStepAsyncSend(DecoderOutputBuffers const& decoderOu
     mRequest5 = returnLogProbs
         ? commSession.sendAsync(*decoderOutputBuffers.logProbsHost, peer, mpi::MpiTag::kDecoderStepLogProbsHost)
         : nullptr;
-    mRequest6 = maxBeamWidth > 1 ? commSession.sendAsync(*decoderState.getCacheIndirectionOutput(), peer,
-                                       mpi::MpiTag::kDecoderStepCacheIndirectionOutput)
+    mRequest6 = maxBeamWidth > 1 ? commSession.sendAsync(
+                    *decoderState.getCacheIndirectionOutput(), peer, mpi::MpiTag::kDecoderStepCacheIndirectionOutput)
                                  : nullptr;
     mRequest7 = useMedusa ? commSession.sendAsync(*decoderState.getAcceptedLengthsCumSum(), peer,
-                                mpi::MpiTag::kDecoderStepAcceptedLengthsCumSumDevice)
+                    mpi::MpiTag::kDecoderStepAcceptedLengthsCumSumDevice)
                           : nullptr;
-    mRequest8 = useMedusa ? commSession.sendAsync(*decoderState.getAcceptedPackedPaths(), peer,
-                                mpi::MpiTag::kDecoderStepAcceptedPackedPathsDevice)
+    mRequest8 = useMedusa ? commSession.sendAsync(
+                    *decoderState.getAcceptedPackedPaths(), peer, mpi::MpiTag::kDecoderStepAcceptedPackedPathsDevice)
                           : nullptr;
     mRequest9 = commSession.sendAsync(
         *decoderOutputBuffers.finishReasonsHost, peer, mpi::MpiTag::kDecoderStepFinishReasonsHost);
@@ -174,7 +163,7 @@ void DecoderStepAsyncSend::recv(DecoderOutputBuffers const& decoderOutputBuffers
     bool const useMedusa, mpi::MpiComm const& commSession, int const peer)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TLLM_LOG_DEBUG("start recv outputs of DecoderBuffers from rank %d", peer);
+    TLLM_LOG_DEBUG("start recv outputs of decoder from rank %d", peer);
 
     commSession.recv(*decoderOutputBuffers.newOutputTokensHost, peer, mpi::MpiTag::kDecoderStepNewOutputTokensHost);
     commSession.recv(*decoderOutputBuffers.finishedSumHost, peer, mpi::MpiTag::kDecoderStepFinishedSumHost);
@@ -198,7 +187,7 @@ void DecoderStepAsyncSend::recv(DecoderOutputBuffers const& decoderOutputBuffers
     }
     commSession.recv(*decoderOutputBuffers.finishReasonsHost, peer, mpi::MpiTag::kDecoderStepFinishReasonsHost);
 
-    TLLM_LOG_DEBUG("end recv outputs of DecoderBuffers from rank %d", peer);
+    TLLM_LOG_DEBUG("end recv outputs of decoder from rank %d", peer);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -221,7 +210,7 @@ DecoderStepAsyncSend::~DecoderStepAsyncSend()
         mRequest8->wait();
     mRequest9->wait();
 
-    TLLM_LOG_DEBUG("end send outputs of DecoderBuffers");
+    TLLM_LOG_DEBUG("end send outputs of decoder");
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -230,7 +219,7 @@ void DecoderStepAsyncSend::bcast(DecoderOutputBuffers const& decoderOutputBuffer
     bool const useMedusa, mpi::MpiComm const& commSession, int const root)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TLLM_LOG_DEBUG("start bcast outputs of DecoderBuffers from rank %d", root);
+    TLLM_LOG_DEBUG("start bcast outputs of decoder from rank %d", root);
 
     auto request1 = commSession.bcastAsync(*decoderOutputBuffers.newOutputTokensHost, root);
     auto request2 = commSession.bcastAsync(*decoderOutputBuffers.finishedSumHost, root);
@@ -258,7 +247,7 @@ void DecoderStepAsyncSend::bcast(DecoderOutputBuffers const& decoderOutputBuffer
         request8->wait();
     request9->wait();
 
-    TLLM_LOG_DEBUG("end bcast outputs of DecoderBuffers from rank %d", root);
+    TLLM_LOG_DEBUG("end bcast outputs of decoder from rank %d", root);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

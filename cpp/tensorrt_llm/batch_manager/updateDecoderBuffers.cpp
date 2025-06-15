@@ -30,9 +30,9 @@ using ITensor = runtime::ITensor;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 runtime::CudaEvent UpdateDecoderBuffers::operator()(runtime::ModelConfig const& modelConfig,
-    DecoderBuffers& decoderBuffers, DecoderOutputBuffers& decoderOutputBuffers,
-    runtime::BufferManager const& copyBufferManager, runtime::decoder::DecoderState const& decoderState,
-    bool returnLogProbs, runtime::CudaEvent const& decoderFinishEvent) const
+    DecoderOutputBuffers& decoderOutputBuffers, runtime::BufferManager const& copyBufferManager,
+    runtime::decoder::DecoderState const& decoderState, bool returnLogProbs,
+    runtime::CudaEvent const& decoderFinishEvent) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(updateDecoderBuffers);
@@ -57,14 +57,14 @@ runtime::CudaEvent UpdateDecoderBuffers::operator()(runtime::ModelConfig const& 
     if (modelConfig.getSpeculativeDecodingMode().predictsDraftTokens())
     {
         // TODO: keep data on device for next iteration
-        copyBufferManager.copy(*decoderState.getNextDraftTokens(), *decoderBuffers.draftBuffers.nextDraftTokensHost);
+        copyBufferManager.copy(*decoderState.getNextDraftTokens(), *decoderOutputBuffers.nextDraftTokensHost);
 
         if (modelConfig.getSpeculativeDecodingMode().variableDraftLength())
         {
             copyBufferManager.copy(
-                *decoderState.getNextDraftTokensLengths(), *decoderBuffers.draftBuffers.nextDraftTokensLengthsHost);
+                *decoderState.getNextDraftTokensLengths(), *decoderOutputBuffers.nextDraftTokensLengthsHost);
             copyBufferManager.copy(
-                *decoderState.getPrevDraftTokensLengths(), *decoderBuffers.draftBuffers.prevDraftTokensLengthsHost);
+                *decoderState.getPrevDraftTokensLengths(), *decoderOutputBuffers.prevDraftTokensLengthsHost);
         }
     }
 

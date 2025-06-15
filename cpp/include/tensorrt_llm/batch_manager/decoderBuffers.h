@@ -80,38 +80,20 @@ public:
     void enableLookaheadDecoding(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep);
     void disableLookaheadDecoding(SizeType32 maxNumSequences);
 
+    void setupSpeculativeDecoding(
+        SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, runtime::ModelConfig const& modelConfig);
+
     TensorPtr sequenceLengthsHost; // [mMaxNumRequests, beamWidth], pinned host tensor
     TensorPtr newOutputTokensHost; // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr cumLogProbsHost;     // [mMaxNumRequests, beamWidth]
     TensorPtr logProbsHost;        // [mMaxNumRequests, beamWidth, maxSeqLen]
     TensorPtr finishedSumHost;     // [mMaxNumRequests], pinned host tensor
     TensorPtr finishReasonsHost;   // [mMaxNumRequests, beamWidth], pinned host tensor
-};
 
-class DraftBuffers
-{
-public:
-    using SizeType32 = runtime::SizeType32;
-    using TensorPtr = runtime::ITensor::SharedPtr;
-
+    // speculative decoding buffers
     TensorPtr nextDraftTokensHost;        // [mMaxNumRequests, maxTokensPerStep-1]
     TensorPtr prevDraftTokensLengthsHost; // [mMaxNumRequests]
     TensorPtr nextDraftTokensLengthsHost; // [mMaxNumRequests]
-
-    void create(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, runtime::BufferManager const& manager,
-        runtime::ModelConfig const& modelConfig);
-};
-
-class DecoderBuffers
-{
-public:
-    using SizeType32 = runtime::SizeType32;
-    using TensorPtr = runtime::ITensor::SharedPtr;
-
-    DraftBuffers draftBuffers;
-
-    DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, runtime::BufferManager const& manager,
-        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 };
 
 class DecoderStepAsyncSend

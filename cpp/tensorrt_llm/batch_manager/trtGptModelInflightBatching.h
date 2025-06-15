@@ -74,7 +74,6 @@ class DecoderStepAsyncSend;
 class DecoderSlotAsyncSend;
 class DecoderInputBuffers;
 class DecoderOutputBuffers;
-class DecoderBuffers;
 class SlotDecoderBuffers;
 class LlmRequest;
 class RuntimeBuffers;
@@ -541,8 +540,6 @@ private:
     std::vector<DecoderInputBuffers> mDecoderInputBuffers;
     // Decoder output buffers for each micro batch.
     std::vector<DecoderOutputBuffers> mDecoderOutputBuffers;
-    // Global buffer to interface with decoder. Slots in this buffer are selected by mSeqSlotManager.
-    std::unique_ptr<DecoderBuffers> mDecoderBuffers;
     // Buffers for each slot in the decoder
     std::vector<std::unique_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
     // PEFT table for each micro batch

@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace tc = tensorrt_llm::common;
 
