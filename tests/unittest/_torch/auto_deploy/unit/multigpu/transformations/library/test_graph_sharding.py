@@ -53,7 +53,7 @@ class GQA_Block(nn.Module):
         k = self.k_proj(x).view(b, s, -1, self.head_dim)
         v = self.v_proj(x).view(b, s, -1, self.head_dim)
 
-        y = torch.ops.attention.bsnd_grouped_sdpa(q, k, v, is_causal=True)
+        y = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa(q, k, v, is_causal=True)
         y = y.contiguous().view(b, s, -1)
 
         return self.o_proj(y)
@@ -108,7 +108,7 @@ def _run_job(
 
     def _get_expected_num_params(num_p_og: int) -> int:
         num_update = 0
-        if bias and dist_op_expected == "all_reduce":
+        if bias and dist_op_expected == "torch_dist_all_reduce":
             num_p_og -= num_features
             num_update = num_features * (rank == world_size - 1)
 
@@ -137,7 +137,7 @@ def _run_job(
         return True
 
     # now run the test
-    op_expected = getattr(torch.ops.dist, dist_op_expected)
+    op_expected = getattr(torch.ops.auto_deploy, dist_op_expected)
 
     transform_func = partial(column_row_shard, rank=rank, world_size=world_size)
 
@@ -164,9 +164,9 @@ def _run_job(
 @pytest.mark.parametrize(
     "model_cls, dist_op_expected",
     (
-        (MLP, "all_reduce"),
-        (nn.Linear, "all_gather"),
-        (GQA_Block, "all_reduce"),
+        (MLP, "torch_dist_all_reduce"),
+        (nn.Linear, "torch_dist_all_gather"),
+        (GQA_Block, "torch_dist_all_reduce"),
     ),
 )
 def test_sharding(model_cls: Type[nn.Module], dist_op_expected: str, bias: bool, device_count: int):
