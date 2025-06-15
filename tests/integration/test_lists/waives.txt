@@ -457,3 +457,5 @@ disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_att
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5340905)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5340905)
 disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5340905)
+examples/test_prompt_lookup.py::test_llm_prompt_lookup_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-prompt_lookup_num_tokens_8-float16-bs1] SKIP (https://nvbugs/4988782)
+examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[enable_gemm_allreduce_plugin-llama-3.1-70b-disable_fp8] SKIP (https://nvbugs/5343850)
