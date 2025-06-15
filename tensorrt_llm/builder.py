@@ -49,6 +49,9 @@ class ConfigEncoder(json.JSONEncoder):
         if isinstance(obj, KVCacheType):
             # For KVCacheType, convert it to string by split of 'KVCacheType.PAGED'.
             return obj.__str__().split('.')[-1]
+        elif hasattr(obj, 'model_dump'):
+            # Handle Pydantic models (including DecodingBaseConfig and subclasses)
+            return obj.model_dump(mode='json')
         else:
             return super().default(obj)
 

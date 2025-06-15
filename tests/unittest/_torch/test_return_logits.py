@@ -72,11 +72,14 @@ def test_generate_with_return_logits(disable_overlap_scheduler: bool,
     if not enable_trtllm_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
+    build_config = BuildConfig()
+    build_config.gather_context_logits = gather_context_logits
+
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
                            "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
-        gather_context_logits=gather_context_logits,
+        build_config=build_config,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
@@ -144,7 +147,6 @@ def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
                            "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
         build_config=build_config,
-        gather_context_logits=gather_context_logits,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits

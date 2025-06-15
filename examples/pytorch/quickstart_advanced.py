@@ -3,7 +3,8 @@ import argparse
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
-                                 MTPDecodingConfig, NGramDecodingConfig)
+                                 MTPDecodingConfig, NGramDecodingConfig,
+                                 TorchCompileConfig)
 
 example_prompts = [
     "Hello, my name is",
@@ -178,36 +179,39 @@ def setup_llm(args):
     else:
         spec_config = None
 
-    llm = LLM(model=args.model_dir,
-              backend='pytorch',
-              disable_overlap_scheduler=args.disable_overlap_scheduler,
-              kv_cache_dtype=args.kv_cache_dtype,
-              kv_cache_config=kv_cache_config,
-              attn_backend=args.attention_backend,
-              use_cuda_graph=args.use_cuda_graph,
-              cuda_graph_padding_enabled=args.cuda_graph_padding_enabled,
-              cuda_graph_batch_sizes=args.cuda_graph_batch_sizes,
-              load_format=args.load_format,
-              print_iter_log=args.print_iter_log,
-              enable_iter_perf_stats=args.print_iter_log,
-              torch_compile_enabled=args.use_torch_compile,
-              torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph,
-              moe_backend=args.moe_backend,
-              enable_trtllm_sampler=args.enable_trtllm_sampler,
-              max_seq_len=args.max_seq_len,
-              max_batch_size=args.max_batch_size,
-              max_num_tokens=args.max_num_tokens,
-              enable_attention_dp=args.enable_attention_dp,
-              tensor_parallel_size=args.tp_size,
-              pipeline_parallel_size=args.pp_size,
-              moe_expert_parallel_size=args.moe_ep_size,
-              moe_tensor_parallel_size=args.moe_tp_size,
-              moe_cluster_parallel_size=args.moe_cluster_size,
-              enable_chunked_prefill=args.enable_chunked_prefill,
-              speculative_config=spec_config,
-              trust_remote_code=args.trust_remote_code,
-              gather_context_logits=args.return_context_logits,
-              gather_generation_logits=args.return_generation_logits)
+    llm = LLM(
+        model=args.model_dir,
+        backend='pytorch',
+        disable_overlap_scheduler=args.disable_overlap_scheduler,
+        kv_cache_dtype=args.kv_cache_dtype,
+        kv_cache_config=kv_cache_config,
+        attn_backend=args.attention_backend,
+        use_cuda_graph=args.use_cuda_graph,
+        cuda_graph_padding_enabled=args.cuda_graph_padding_enabled,
+        cuda_graph_batch_sizes=args.cuda_graph_batch_sizes,
+        load_format=args.load_format,
+        print_iter_log=args.print_iter_log,
+        enable_iter_perf_stats=args.print_iter_log,
+        torch_compile_config=TorchCompileConfig(
+            torch_compile_fullgraph=args.use_torch_compile,
+            torch_compile_inductor_enabled=args.use_torch_compile,
+            torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph)
+        if args.use_torch_compile else None,
+        moe_backend=args.moe_backend,
+        enable_trtllm_sampler=args.enable_trtllm_sampler,
+        max_seq_len=args.max_seq_len,
+        max_batch_size=args.max_batch_size,
+        max_num_tokens=args.max_num_tokens,
+        enable_attention_dp=args.enable_attention_dp,
+        tensor_parallel_size=args.tp_size,
+        pipeline_parallel_size=args.pp_size,
+        moe_expert_parallel_size=args.moe_ep_size,
+        moe_tensor_parallel_size=args.moe_tp_size,
+        moe_cluster_parallel_size=args.moe_cluster_size,
+        enable_chunked_prefill=args.enable_chunked_prefill,
+        speculative_config=spec_config,
+        trust_remote_code=args.trust_remote_code,
+        gather_generation_logits=args.return_generation_logits)
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
