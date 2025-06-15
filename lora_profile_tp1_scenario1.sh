@@ -73,16 +73,16 @@ echo "=== TP=${TP} - Scenario 1: Engine WITHOUT LoRA, Requests WITHOUT LoRA ==="
 
 # TP-specific directories
 BASE_DIR="/lustre/fsw/portfolios/coreai/users/smor/models/lora-benchmark-tp${TP}"
-CONVERTED_CHECKPOINT_NO_LORA="${BASE_DIR}/llama-3.1-8B-ckpt-no-lora"
-ENGINE_WITHOUT_LORA="${BASE_DIR}/llama-3.1-8B-engine-without-lora"
+CONVERTED_CHECKPOINT="${BASE_DIR}/llama-3.1-8B-ckpt"
+ENGINE_NO_LORA="${BASE_DIR}/llama-3.1-8B-engine-no-lora"
 
 mkdir -p ${BASE_DIR}
 
-echo "Converting checkpoint (without LoRA) for TP=${TP}..."
-if [ ! -d "${CONVERTED_CHECKPOINT_NO_LORA}" ]; then
+echo "Converting checkpoint (no LoRA) for TP=${TP}..."
+if [ ! -d "${CONVERTED_CHECKPOINT}" ]; then
     python examples/models/core/llama/convert_checkpoint.py \
         --model_dir ${MODEL_CHECKPOINT} \
-        --output_dir ${CONVERTED_CHECKPOINT_NO_LORA} \
+        --output_dir ${CONVERTED_CHECKPOINT} \
         --dtype ${DTYPE} \
         --tp_size ${TP} \
         --pp_size 1
@@ -91,19 +91,19 @@ else
     echo "Checkpoint already exists, skipping"
 fi
 
-echo "Building standard engine (no LoRA) for TP=${TP}..."
-if [ ! -d "${ENGINE_WITHOUT_LORA}" ]; then
+echo "Building engine (no LoRA) for TP=${TP}..."
+if [ ! -d "${ENGINE_NO_LORA}" ]; then
     trtllm-build \
-        --checkpoint_dir ${CONVERTED_CHECKPOINT_NO_LORA} \
-        --output_dir ${ENGINE_WITHOUT_LORA} \
+        --checkpoint_dir ${CONVERTED_CHECKPOINT} \
+        --output_dir ${ENGINE_NO_LORA} \
         --max_batch_size ${MAX_BATCH} \
         --max_input_len ${ISL} \
         --max_seq_len $((${OSL}+${ISL})) \
         --gemm_plugin ${DTYPE} \
         --use_paged_context_fmha enable
-    echo "Standard engine build completed"
+    echo "Engine build completed"
 else
-    echo "Standard engine already exists, skipping"
+    echo "Engine already exists, skipping"
 fi
 
 echo "Preparing dataset (no LoRA task IDs)..."
@@ -121,17 +121,17 @@ else
 fi
 
 echo "Running nsys profiling for Scenario 1 TP=${TP}..."
-mkdir -p ${EG_DIR}/profiles/scenario1-no-lora-engine-no-lora-requests-tp-${TP}
+mkdir -p ${EG_DIR}/profiles/scenario1-no-lora-engine-tp-${TP}
 
 # Run with nsys profiling
 nsys profile \
     --trace=nvtx,cuda,osrt \
     --cuda-graph-trace=graph \
     --force-overwrite=true \
-    --output=${EG_DIR}/profiles/scenario1-no-lora-engine-no-lora-requests-tp-${TP}/gpt_manager_scenario1_tp1 \
+    --output=${EG_DIR}/profiles/scenario1-no-lora-engine-tp-${TP}/gpt_manager_scenario1_tp1 \
     mpirun -n ${TP} --allow-run-as-root --oversubscribe \
         cpp/build/benchmarks/gptManagerBenchmark \
-        --engine_dir ${ENGINE_WITHOUT_LORA} \
+        --engine_dir ${ENGINE_NO_LORA} \
         --type IFB \
         --dataset "${EG_DIR}/data/token-norm-dist-no-lora.json" \
         --kv_cache_free_gpu_mem_fraction 0.70 \
@@ -140,7 +140,7 @@ nsys profile \
         --streaming
 
 echo "Scenario 1 profiling completed for TP=${TP}"
-echo "Profile saved to: ${EG_DIR}/profiles/scenario1-no-lora-engine-no-lora-requests-tp-${TP}/gpt_manager_scenario1_tp1.nsys-rep"
+echo "Profile saved to: ${EG_DIR}/profiles/scenario1-no-lora-engine-tp-${TP}/gpt_manager_scenario1_tp1.nsys-rep"
 echo ""
 echo "To view the profile, run:"
-echo "nsys-ui ${EG_DIR}/profiles/scenario1-no-lora-engine-no-lora-requests-tp-${TP}/gpt_manager_scenario1_tp1.nsys-rep"
+echo "nsys-ui ${EG_DIR}/profiles/scenario1-no-lora-engine-tp-${TP}/gpt_manager_scenario1_tp1.nsys-rep"

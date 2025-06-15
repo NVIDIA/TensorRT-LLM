@@ -109,48 +109,53 @@ else
     echo "LoRA engine already exists, skipping"
 fi
 
-echo "Preparing dataset (WITH LoRA task IDs)..."
-if [ ! -f "${EG_DIR}/data/token-norm-dist-with-lora.json" ]; then
+echo "Generating random LoRA weights for TP=${TP}..."
+if [ ! -d "${EG_DIR}/loras-tp${TP}" ]; then
+    python benchmarks/cpp/utils/generate_rand_loras.py ${CPP_LORA} ${EG_DIR}/loras-tp${TP} 16
+    echo "LoRA weights generated"
+else
+    echo "LoRA weights already exist, skipping"
+fi
+
+echo "Preparing dataset (with LoRA task IDs) for TP=${TP}..."
+if [ ! -f "${EG_DIR}/data/token-norm-dist-lora-1-tp${TP}.json" ]; then
     python benchmarks/cpp/prepare_dataset.py \
-        --output "${EG_DIR}/data/token-norm-dist-with-lora.json" \
+        --output "${EG_DIR}/data/token-norm-dist-lora-1-tp${TP}.json" \
+        --rand-task-id 0 0 \
         --tokenizer ${TOKENIZER} \
         token-norm-dist \
         --num-requests ${NUM_REQUESTS} \
         --input-mean ${ISL} --input-stdev 0 \
-        --output-mean ${OSL} --output-stdev 0 \
-    echo "Dataset prepared"
+        --output-mean ${OSL} --output-stdev 0
+    echo "LoRA dataset prepared"
 else
-    echo "Dataset already exists, skipping"
+    echo "LoRA dataset already exists, skipping"
 fi
 
 echo "Running nsys profiling for Scenario 3 TP=${TP}..."
-mkdir -p ${EG_DIR}/profiles/scenario3-lora-engine-with-lora-requests-tp-${TP}
+mkdir -p ${EG_DIR}/profiles/scenario3-lora-engine-lora-requests-tp-${TP}
 
 # Run with nsys profiling
 nsys profile \
     --trace=nvtx,cuda \
     --cuda-graph-trace=graph \
     --force-overwrite=true \
-    --output=${EG_DIR}/profiles/scenario3-lora-engine-with-lora-requests-tp-${TP}/gpt_manager_scenario3_tp1 \
+    --output=${EG_DIR}/profiles/scenario3-lora-engine-lora-requests-tp-${TP}/gpt_manager_scenario3_tp1 \
     mpirun -n ${TP} --allow-run-as-root --oversubscribe \
         cpp/build/benchmarks/gptManagerBenchmark \
         --engine_dir ${ENGINE_WITH_LORA} \
         --type IFB \
-        --dataset "${EG_DIR}/data/token-norm-dist-with-lora.json" \
+        --dataset "${EG_DIR}/data/token-norm-dist-lora-1-tp${TP}.json" \
         --lora_host_cache_bytes 8589934592 \
-        --lora_num_device_mod_layers $(( 32 * NUM_LAYERS * NUM_LORA_MODS * MAX_LORA_RANK )) \
-        --lora_cache_optimal_adapter_size 8 \
-        --lora_cache_max_adapter_size 64 \
-        --lora_cache_gpu_memory_fraction 0.05 \
-        --lora_cache_ps_gpu_memory_fraction 0.05 \
-        --lora_dir ${CPP_LORA} \
-        --kv_cache_free_gpu_mem_fraction 0.65 \
+        --lora_num_device_mod_layers $(( 16 * NUM_LAYERS * NUM_LORA_MODS * MAX_LORA_RANK )) \
+        --kv_cache_free_gpu_mem_fraction 0.70 \
         --log_level info \
         --eos_id ${EOS_ID} \
+        --lora_dir ${EG_DIR}/loras-tp${TP} \
         --streaming
 
 echo "Scenario 3 profiling completed for TP=${TP}"
-echo "Profile saved to: ${EG_DIR}/profiles/scenario3-lora-engine-with-lora-requests-tp-${TP}/gpt_manager_scenario3_tp1.nsys-rep"
+echo "Profile saved to: ${EG_DIR}/profiles/scenario3-lora-engine-lora-requests-tp-${TP}/gpt_manager_scenario3_tp1.nsys-rep"
 echo ""
 echo "To view the profile, run:"
-echo "nsys-ui ${EG_DIR}/profiles/scenario3-lora-engine-with-lora-requests-tp-${TP}/gpt_manager_scenario3_tp1.nsys-rep"
+echo "nsys-ui ${EG_DIR}/profiles/scenario3-lora-engine-lora-requests-tp-${TP}/gpt_manager_scenario3_tp1.nsys-rep"
