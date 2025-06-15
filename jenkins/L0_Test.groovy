@@ -460,8 +460,8 @@ eval "\$fullCmd"
             }
         }
     } finally {
-        //uploadResults(pipeline, cluster, jobUID, stageName)
-        //cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID)
+        uploadResults(pipeline, cluster, jobUID, stageName)
+        cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID)
     }
 }
 
