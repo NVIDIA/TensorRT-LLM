@@ -462,7 +462,6 @@ class MTPWorker(nn.Module):
         self.update_mtp_hidden_states(input_ids=input_ids,
                                       hidden_states=hidden_states,
                                       num_accepted_tokens=num_accepted_tokens,
-                                      accepted_tokens=accepted_tokens,
                                       spec_metadata=spec_metadata,
                                       attn_metadata=attn_metadata)
 
