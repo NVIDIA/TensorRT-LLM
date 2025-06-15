@@ -3,6 +3,7 @@ import datetime
 import functools
 import gc
 import heapq
+import itertools
 import os
 import queue
 import threading
@@ -18,12 +19,14 @@ import torch
 
 from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled, nvtx_range,
                                  trace_func)
-from tensorrt_llm.bindings.executor import (DisServingRequestStats,
-                                            FinishReason, InflightBatchingStats,
-                                            IterationStats, KvCacheStats,
-                                            RequestStage, RequestStats,
-                                            RequestType, SpecDecodingStats,
-                                            StaticBatchingStats)
+
+# isort: off
+from tensorrt_llm.bindings.executor import (
+    DisServingRequestStats, FinishReason, InflightBatchingStats, IterationStats,
+    KvCacheStats, RequestStage, RequestStats, RequestType, SpecDecodingStats,
+    StaticBatchingStats, deserialize_responses, serialize_responses)
+# isort: on
+
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.logger import logger
@@ -31,7 +34,8 @@ from tensorrt_llm.logger import logger
 from ..distributed import Distributed
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
-                          LlmRequestState, executor_request_to_llm_request)
+                          LlmRequestState, LlmResponse,
+                          executor_request_to_llm_request)
 from .model_engine import ModelEngine
 from .sampler import Sampler, SampleState, SampleStateTensors, TorchSampler
 from .scheduler import ScheduledRequests
@@ -176,6 +180,8 @@ class PyExecutor:
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
+        # [DO NOT Merge] hacky way to let GC run less often
+        gc.set_threshold(20000)
 
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
@@ -986,6 +992,18 @@ class PyExecutor:
 
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
+
+        # Debugging gen-only
+        if self.dist.rank == 0 and not self.is_warmup:
+            benchmark_req_queue_size = int(
+                os.getenv("TRTLLM_BENCHMARK_REQ_QUEUE_SIZE", "0"))
+            if benchmark_req_queue_size > 0:
+                while self.request_queue.qsize() < benchmark_req_queue_size:
+                    time.sleep(5)
+                    logger.info(
+                        f"sleep 5 seconds, num_request_queue: {self.request_queue.qsize()}"
+                    )
+
         with self._profiler() as profile_step:
             iter_start_time = time.time()
             iter_stats = None
@@ -2000,16 +2018,50 @@ class PyExecutor:
         logger.debug(
             f'before gather, rank = {self.dist.rank}, responses = {responses}')
         if self.enable_attention_dp:
-            if not self.gather_all_responses:
-                responses_list = self.dist.tp_gather(responses)
+            if self.dist.world_size == 1:
+                pass
+            elif not self.gather_all_responses:
+                response_list = ResponseList(
+                    [r._response for r in responses.values()])
+                py_result_list = PyResultsList(
+                    [r._py_result for r in responses.values()])
+                req_id_list = list(responses.keys())
+                packed_responses = PackedResponses(response_list,
+                                                   py_result_list, req_id_list)
+
+                responses_list = self.dist.tp_gather(packed_responses)
+
+                responses = {}
+                if self.dist.rank == 0:
+                    for res in responses_list:
+                        for response, py_result, req_id in itertools.zip_longest(
+                                res._response_list._responses,
+                                res._py_result_list._py_results,
+                                res._req_id_list):
+                            responses[req_id] = LlmResponse(response, py_result)
             else:
-                responses_list = self.dist.allgather(responses)
-            if self.dist.rank == 0 or self.gather_all_responses:
-                gather_responses = {}
-                if responses_list is not None:
-                    for resp in responses_list:
-                        gather_responses.update(resp)
-                    responses = gather_responses
+                response_list = ResponseList(
+                    [r._response for r in responses.values()])
+                py_result_list = PyResultsList(
+                    [r._py_result for r in responses.values()])
+                req_id_list = list(responses.keys())
+                packed_responses = PackedResponses(response_list,
+                                                   py_result_list, req_id_list)
+
+                responses_list = self.dist.allgather(packed_responses)
+
+                responses = {}
+                for res in responses_list:
+                    for response, py_result, req_id in zip(
+                            res._response_list._responses,
+                            res._py_result_list._py_results, res._req_id_list):
+                        responses[req_id] = LlmResponse(response, py_result)
+            # if self.dist.rank == 0 or self.gather_all_responses:
+            #     gather_responses = {}
+            #     if responses_list is not None:
+            #         for resp in responses_list:
+            #             gather_responses.update(resp)
+            #         responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
 
@@ -2044,10 +2096,11 @@ class PyExecutor:
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
         )
         for request in self.active_requests:
-            req_id = request.py_request_id
+            # req_id = request.py_request_id
             # no responses for dummy request, and finish it
             if request.is_attention_dp_dummy:
                 requests_to_terminate.append(request)
+                self.active_requests.remove(request)
                 continue
 
             if request.is_generation_only_request:
@@ -2058,11 +2111,17 @@ class PyExecutor:
                         not self.disable_overlap_scheduler
                         and request.py_decoding_iter <= 1):
                     new_active_requests.append(request)
+                    self.active_requests.remove(request)
                     continue
 
             request.draft_tokens = request.py_draft_tokens
             request.decoding_iter = request.py_decoding_iter
+
+            # responses = create_responses(self.active_requests, False, self.dist.rank)
+            # for i, request in enumerate(self.active_requests):
             response: Response = request.create_response(False, self.dist.rank)
+            # response = responses[i]
+            req_id = request.py_request_id
             request_done = False
             if response:
                 request_done = response.result.is_final
@@ -2152,3 +2211,41 @@ class PyExecutor:
         # getter is required, when not using TorchSampler.
         return not self.disable_overlap_scheduler and not isinstance(
             self.sampler, TorchSampler)
+
+
+class ResponseList:
+
+    def __init__(self, responses):
+        self._responses = responses
+
+    def __reduce__(self):
+        return (ResponseList.deserialize, (self.serialize(), ))
+
+    def serialize(self):
+        return serialize_responses(self._responses)
+
+    @staticmethod
+    def deserialize(s):
+        # convert string back to list
+        responses = deserialize_responses(s)
+        return ResponseList(responses)
+
+
+class PyResultsList:
+
+    def __init__(self, py_results):
+        self._py_results = py_results
+
+
+class PackedResponses:
+
+    def __init__(self, response_list, py_result_list, req_id_list):
+        self._response_list = response_list
+        self._py_result_list = py_result_list
+        self._req_id_list = req_id_list
+
+    def __getstate__(self):
+        return self._response_list, self._py_result_list, self._req_id_list
+
+    def __setstate__(self, state):
+        self._response_list, self._py_result_list, self._req_id_list = state

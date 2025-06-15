@@ -1,5 +1,6 @@
 import atexit
 import concurrent.futures
+import gc
 import threading
 import time
 import weakref
@@ -19,7 +20,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             print_colored, print_colored_debug)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import PostprocWorkerConfig
+from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
@@ -98,6 +99,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.dispatch_stats_thread: Optional[ManagedThread] = None
         self.dispatch_kv_cache_events_thread: Optional[ManagedThread] = None
         self._start_executor_workers(worker_kwargs)
+        # [DO NOT Merge] hacky way to let GC run less often
+        gc.set_threshold(20000)
 
         # MPI registers its joiner using threading._register_atexit if possible.
         # These functions run before atexit.register, so to avoid deadlock,
@@ -150,6 +153,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.request_queue.put(CancellingRequest(request_id))
 
     def dispatch_result_task(self) -> bool:
+        from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse
+
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
         if (res := self.result_queue.get()) is None:
@@ -176,7 +181,19 @@ class GenerationExecutorProxy(GenerationExecutor):
                     res, ErrorResponse):
                 self._results.pop(client_id)
 
-        res = res if isinstance(res, list) else [res]
+        if isinstance(res[0], PostprocWorker.Output):
+            pass
+        else:
+            unpacked_res = []
+            assert len(res[0]._response_list._responses) == len(
+                res[0]._py_result_list._py_results), \
+                "Response list and PyResult list should have the same length"
+            for response, py_result in zip(res[0]._response_list._responses,
+                                           res[0]._py_result_list._py_results):
+                unpacked_res.append(LlmResponse(response, py_result))
+            res = unpacked_res
+
+        # res = res if isinstance(res, list) else [res]
 
         for i in res:
             global_tracer().log_instant("IPC.get")

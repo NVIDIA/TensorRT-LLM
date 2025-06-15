@@ -127,7 +127,7 @@ class ZeroMqQueue:
 
     def put_noblock(self, obj: Any):
         self.setup_lazily()
-        with nvtx_range_debug("send", color="blue", category="IPC"):
+        with nvtx_range_debug("send (noblock)", color="blue", category="IPC"):
             data = pickle.dumps(obj)  # nosec B301
             if self.use_hmac_encryption:
                 data = self._sign_data(data)
@@ -267,13 +267,13 @@ class FusedIpcQueue:
                                           error_queue=self.error_queue)
         self._send_thread.start()
 
-    def put(self, obj: Any):
+    def put(self, obj: Any, serialized: bool = False):
         self.setup_sender()
         if self.fuse_message:
             self.sending_queue.put_nowait(obj)
         else:
             batch = obj if isinstance(obj, list) else [obj]
-            self.queue.put(batch)
+            self.queue.put(batch, serialized=serialized)
 
     def get(self) -> Any:
         return self.queue.get()
