@@ -116,7 +116,6 @@ class NGramDrafter(Drafter):
         if state is None:  # Skip in the first step (context phase)
             return
 
-        state.sampler_event.synchronize()
         for request in sorted(scheduled_requests.generation_requests,
                               key=lambda r: r.py_batch_idx):
             # Add new token to a copy of the generated tokens to find new daft tokens
