@@ -300,11 +300,7 @@ class TorchSampler(Sampler):
                                               num_tokens=num_tokens,
                                               beam=self.BEAM):
                     break
-            if num_accepted > 0:
-                self.handle_logits(req,
-                                   state,
-                                   beam=self.BEAM,
-                                   count=num_accepted)
+            self.handle_logits(req, state, beam=self.BEAM, count=num_accepted)
             req.py_num_accepted_draft_tokens = num_accepted
             req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
 
