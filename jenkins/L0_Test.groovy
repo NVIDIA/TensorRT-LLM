@@ -121,7 +121,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
 }
 
 //TODO: consolidate slurm related code for both multi nodes and single nodes
-def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String nodeName){
+def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jobUID){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def remote = [
             ip           : cluster.ip,
