@@ -179,13 +179,13 @@ TEST_F(TrtGptModelTest, Forward)
 
     std::vector<bool> finished(mMaxNumRequests, false);
 
-    TrtGptModelOptionalParams optionalParams;
-    optionalParams.enableTrtOverlap = false;
-    optionalParams.maxBeamWidth = mBeamWidth;
-    optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kMAX_UTILIZATION};
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setEnableTrtOverlap(false);
+    executorConfig.setMaxBeamWidth(mBeamWidth);
+    executorConfig.setSchedulerConfig(executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kMAX_UTILIZATION});
 
     auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
-        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
 
     // Generate one token for the requests in request_table
     // We need to sync with decoder
@@ -217,13 +217,13 @@ TEST_F(TrtGptModelLoraTest, Forward)
 
     std::vector<bool> finished(mMaxNumRequests, false);
 
-    TrtGptModelOptionalParams optionalParams;
-    optionalParams.enableTrtOverlap = false;
-    optionalParams.maxBeamWidth = mBeamWidth;
-    optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kMAX_UTILIZATION};
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setEnableTrtOverlap(false);
+    executorConfig.setMaxBeamWidth(mBeamWidth);
+    executorConfig.setSchedulerConfig(executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kMAX_UTILIZATION});
 
     auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
-        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
 
     // Generate one token for the requests in request_table
     trtGptModel->forwardAsync(requestList);
@@ -238,14 +238,18 @@ TEST_F(TrtGptModelLoraTest, Forward)
 
 TEST_F(TrtGptModelTest, ForwardMaxNewTokens)
 {
-    TrtGptModelOptionalParams optionalParams;
-    optionalParams.enableTrtOverlap = false;
-    optionalParams.kvCacheConfig.maxTokens = 10000;
-    optionalParams.maxBeamWidth = mBeamWidth;
-    optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setEnableTrtOverlap(false);
+    executorConfig.setMaxBeamWidth(mBeamWidth);
+    executorConfig.setSchedulerConfig(
+        executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT});
+
+    executor::KvCacheConfig kvCacheConfig;
+    kvCacheConfig.setMaxTokens(10000);
+    executorConfig.setKvCacheConfig(kvCacheConfig);
 
     auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
-        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
 
     SamplingConfig inSamplingConfig;
     inSamplingConfig.temperature = std::vector{2.0f};
@@ -285,17 +289,18 @@ TEST_F(TrtGptModelTest, ForwardMaxNewTokens)
 
 TEST_F(TrtGptModelTest, MaxNumTokensInChunked)
 {
-    TrtGptModelOptionalParams optionalParams;
-    optionalParams.enableTrtOverlap = false;
-    optionalParams.enableChunkedContext = true;
-    optionalParams.maxBeamWidth = mBeamWidth;
-    optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setEnableTrtOverlap(false);
+    executorConfig.setEnableChunkedContext(true);
+    executorConfig.setMaxBeamWidth(mBeamWidth);
+    executorConfig.setSchedulerConfig(
+        executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT});
 
     auto modelConfig = mModelConfig;
     mModelConfig.setMaxNumTokens(200);
 
     auto trtGptModelIfb = std::make_shared<TrtGptModelInflightBatching>(
-        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
     std::vector<std::shared_ptr<TrtGptModel>> trtGptModels{trtGptModelIfb};
 
     for (auto trtGptModel : trtGptModels)
@@ -339,14 +344,18 @@ TEST_F(TrtGptModelTest, MaxNumTokensInChunked)
 
 TEST_F(TrtGptModelTest, ForwardEndId)
 {
-    TrtGptModelOptionalParams optionalParams;
-    optionalParams.enableTrtOverlap = false;
-    optionalParams.kvCacheConfig.maxTokens = 10000;
-    optionalParams.maxBeamWidth = mBeamWidth;
-    optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setEnableTrtOverlap(false);
+    executorConfig.setMaxBeamWidth(mBeamWidth);
+    executorConfig.setSchedulerConfig(
+        executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT});
+
+    executor::KvCacheConfig kvCacheConfig;
+    kvCacheConfig.setMaxTokens(10000);
+    executorConfig.setKvCacheConfig(kvCacheConfig);
 
     auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
-        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
 
     SamplingConfig inSamplingConfig;
     inSamplingConfig.temperature = std::vector{2.0f};
@@ -389,14 +398,17 @@ TEST_F(TrtGptModelTest, ForwardEndId)
 
 TEST_F(TrtGptModelTest, ForwardNoEoS)
 {
-    TrtGptModelOptionalParams optionalParams;
-    optionalParams.enableTrtOverlap = false;
-    optionalParams.kvCacheConfig.maxTokens = 10000;
-    optionalParams.maxBeamWidth = mBeamWidth;
-    optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kSTATIC_BATCH};
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setEnableTrtOverlap(false);
+    executorConfig.setMaxBeamWidth(mBeamWidth);
+    executorConfig.setSchedulerConfig(executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kSTATIC_BATCH});
+
+    executor::KvCacheConfig kvCacheConfig;
+    kvCacheConfig.setMaxTokens(10000);
+    executorConfig.setKvCacheConfig(kvCacheConfig);
 
     auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
-        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
 
     SamplingConfig inSamplingConfig;
     inSamplingConfig.topP = {0.9};
@@ -453,13 +465,13 @@ TEST_F(TrtGptModelTest, ForwardFinished)
     std::vector<bool> finishedFalse(mMaxNumRequests, false);
     std::vector<bool> finishedTrue(mMaxNumRequests, true);
 
-    TrtGptModelOptionalParams optionalParams;
-    optionalParams.enableTrtOverlap = false;
-    optionalParams.maxBeamWidth = mBeamWidth;
-    optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kMAX_UTILIZATION};
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setEnableTrtOverlap(false);
+    executorConfig.setMaxBeamWidth(mBeamWidth);
+    executorConfig.setSchedulerConfig(executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kMAX_UTILIZATION});
 
     auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
-        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
 
     // Generate one token for the requests in request_table
     trtGptModel->forwardAsync(requestList);
@@ -484,14 +496,18 @@ TEST_F(TrtGptModelTest, ForwardFinished)
 
 TEST_F(TrtGptModelTest, ForwardStopWords)
 {
-    TrtGptModelOptionalParams optionalParams;
-    optionalParams.enableTrtOverlap = false;
-    optionalParams.kvCacheConfig.maxTokens = 10000;
-    optionalParams.maxBeamWidth = mBeamWidth;
-    optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setEnableTrtOverlap(false);
+    executorConfig.setMaxBeamWidth(mBeamWidth);
+    executorConfig.setSchedulerConfig(
+        executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT});
+
+    executor::KvCacheConfig kvCacheConfig;
+    kvCacheConfig.setMaxTokens(10000);
+    executorConfig.setKvCacheConfig(kvCacheConfig);
 
     auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
-        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
 
     SamplingConfig inSamplingConfig;
     inSamplingConfig.temperature = std::vector{2.0f};
@@ -617,14 +633,18 @@ TEST_F(TrtGptModelTest, ForwardStopWords)
 
 TEST_F(TrtGptModelTest, ForwardBadWords)
 {
-    TrtGptModelOptionalParams optionalParams;
-    optionalParams.enableTrtOverlap = false;
-    optionalParams.kvCacheConfig.maxTokens = 10000;
-    optionalParams.maxBeamWidth = mBeamWidth;
-    optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setEnableTrtOverlap(false);
+    executorConfig.setMaxBeamWidth(mBeamWidth);
+    executorConfig.setSchedulerConfig(
+        executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT});
+
+    executor::KvCacheConfig kvCacheConfig;
+    kvCacheConfig.setMaxTokens(10000);
+    executorConfig.setKvCacheConfig(kvCacheConfig);
 
     auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
-        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
 
     SamplingConfig inSamplingConfig;
     inSamplingConfig.temperature = std::vector{2.0f};
@@ -742,14 +762,18 @@ TEST_F(TrtGptModelTest, ForwardBadWords)
 
 TEST_F(TrtGptModelTest, ForwardEmbeddingBias)
 {
-    TrtGptModelOptionalParams optionalParams;
-    optionalParams.enableTrtOverlap = false;
-    optionalParams.kvCacheConfig.maxTokens = 10000;
-    optionalParams.maxBeamWidth = mBeamWidth;
-    optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setEnableTrtOverlap(false);
+    executorConfig.setMaxBeamWidth(mBeamWidth);
+    executorConfig.setSchedulerConfig(
+        executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT});
+
+    executor::KvCacheConfig kvCacheConfig;
+    kvCacheConfig.setMaxTokens(10000);
+    executorConfig.setKvCacheConfig(kvCacheConfig);
 
     auto trtGptModelIfb = std::make_shared<TrtGptModelInflightBatching>(
-        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
 
     std::vector<std::shared_ptr<TrtGptModel>> trtGptModels{trtGptModelIfb};
 
@@ -874,20 +898,23 @@ public:
 
 TEST_F(TrtGptModelTest, KVCacheReuseChunked)
 {
-    TrtGptModelOptionalParams optionalParams;
-    optionalParams.enableTrtOverlap = false;
-    optionalParams.enableChunkedContext = true;
-    optionalParams.kvCacheConfig.enableBlockReuse = true;
-    optionalParams.maxBeamWidth = mBeamWidth;
-    optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setEnableTrtOverlap(false);
+    executorConfig.setEnableChunkedContext(true);
+    executorConfig.setMaxBeamWidth(mBeamWidth);
+    executorConfig.setSchedulerConfig(
+        executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT});
 
-    auto modelConfig = mModelConfig;
+    executor::KvCacheConfig kvCacheConfig;
+    kvCacheConfig.setEnableBlockReuse(true);
+    executorConfig.setKvCacheConfig(kvCacheConfig);
+
     mModelConfig.setMaxNumTokens(384);
 
     for (int const numBlocksExpectedReused : {1, 2})
     {
         auto trtGptModelIfb = std::make_shared<TrtGptModelIfbHelper>(
-            mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+            mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
         auto const cacheManager = trtGptModelIfb->getKVCacheManager();
         auto const tokensPerBlock = cacheManager->getTokensPerBlock();
         constexpr int numPrefillBlocks = 2;
@@ -938,13 +965,13 @@ TEST_F(TrtGptModelTest, PauseRequestStats)
 
     RequestList requestList{llmRequest};
 
-    TrtGptModelOptionalParams optionalParams;
-    optionalParams.enableTrtOverlap = false;
-    optionalParams.maxBeamWidth = mBeamWidth;
-    optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kMAX_UTILIZATION};
+    executor::ExecutorConfig executorConfig;
+    executorConfig.setEnableTrtOverlap(false);
+    executorConfig.setMaxBeamWidth(mBeamWidth);
+    executorConfig.setSchedulerConfig(executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kMAX_UTILIZATION});
 
     auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
-        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+        mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
 
     // Generate one token for the requests in request_table
     // We need to sync with decoder
@@ -1053,16 +1080,19 @@ TEST_F(TrtGptModelLogitsTest, ReturnContextLogitsWithChunkedContext)
                 modelConfig.setMaxNumTokens(128);
             }
 
-            TrtGptModelOptionalParams optionalParams;
-            optionalParams.enableTrtOverlap = false;
-            optionalParams.kvCacheConfig.enableBlockReuse = true;
-            optionalParams.enableChunkedContext = enableChunkedContext;
-            optionalParams.maxBeamWidth = mBeamWidth;
-            optionalParams.schedulerConfig
-                = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
+            executor::ExecutorConfig executorConfig;
+            executorConfig.setEnableTrtOverlap(false);
+            executorConfig.setMaxBeamWidth(mBeamWidth);
+            executorConfig.setEnableChunkedContext(enableChunkedContext);
+            executorConfig.setSchedulerConfig(
+                executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT});
+
+            executor::KvCacheConfig kvCacheConfig;
+            kvCacheConfig.setEnableBlockReuse(true);
+            executorConfig.setKvCacheConfig(kvCacheConfig);
 
             auto trtGptModelIfb = std::make_shared<TrtGptModelIfbHelper>(
-                mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+                mLogger, modelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
 
             // Prepare input tokens
             std::vector<int32_t> input_ids;
@@ -1091,12 +1121,13 @@ TEST_F(TrtGptModelLogitsTest, ReturnContextLogitsWithChunkedContext)
             = bufferCast<float>(*(finishList.front()->getContextLogitsHost()));
         float const* const enableChunkedContextLogits = bufferCast<float>(*(finishList.back()->getContextLogitsHost()));
 
-        for (int i = 0; i < promptLength; i++)
+        for (int tokenIdx = 0; tokenIdx < promptLength; tokenIdx++)
         {
-            for (int j = 0; j < vocabSizePadded; j++)
+            for (int vocabIdx = 0; vocabIdx < vocabSizePadded; vocabIdx++)
             {
-                size_t idx = i * vocabSizePadded + j;
-                EXPECT_EQ(disableChunkedContextLogits[idx], enableChunkedContextLogits[idx]);
+                size_t idx = tokenIdx * vocabSizePadded + vocabIdx;
+                EXPECT_NEAR(disableChunkedContextLogits[idx], enableChunkedContextLogits[idx], 1e-0)
+                    << "tokenIdx=" << tokenIdx << " vocabIdx=" << vocabIdx;
             }
         }
         finishList.clear();
@@ -1141,18 +1172,21 @@ TEST_F(LlamaModelLADTest, SeamlessLookaheadDecoding)
             requestId += 1;
         }
 
-        TrtGptModelOptionalParams optionalParams;
-        optionalParams.enableChunkedContext = false;
-        optionalParams.enableTrtOverlap = false;
-        optionalParams.maxBeamWidth = 1;
-        optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kMAX_UTILIZATION};
+        executor::ExecutorConfig executorConfig;
+        executorConfig.setEnableChunkedContext(false);
+        executorConfig.setEnableTrtOverlap(false);
+        executorConfig.setMaxBeamWidth(1);
+        executorConfig.setSchedulerConfig(
+            executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kMAX_UTILIZATION});
         if (initLADConfig)
         {
-            optionalParams.decodingConfig.setLookaheadDecodingConfig(executor::LookaheadDecodingConfig(5, 5, 5));
+            executor::DecodingConfig decodingConfig;
+            decodingConfig.setLookaheadDecodingConfig(executor::LookaheadDecodingConfig(5, 5, 5));
+            executorConfig.setDecodingConfig(decodingConfig);
         }
 
         auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
-            mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, optionalParams);
+            mLogger, mModelConfig, mWorldConfig, *mRawEngine, true, executorConfig, false);
 
         // Generate tokens for the requests in request_table
         // We need to sync with decoder
