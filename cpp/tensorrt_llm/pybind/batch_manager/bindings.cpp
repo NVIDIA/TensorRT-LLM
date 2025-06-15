@@ -410,14 +410,9 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tb::DraftBuffers>(m, "DraftBuffers")
         .def(py::init())
-        .def_readwrite("next_draft_tokens_device", &tb::DraftBuffers::nextDraftTokensDevice)
         .def_readwrite("next_draft_tokens_host", &tb::DraftBuffers::nextDraftTokensHost)
-        .def_readwrite("prev_draft_tokens_lengths_device", &tb::DraftBuffers::prevDraftTokensLengthsDevice)
         .def_readwrite("prev_draft_tokens_lengths_host", &tb::DraftBuffers::prevDraftTokensLengthsHost)
-        .def_readwrite("next_draft_tokens_lengths_device", &tb::DraftBuffers::nextDraftTokensLengthsDevice)
         .def_readwrite("next_draft_tokens_lengths_host", &tb::DraftBuffers::nextDraftTokensLengthsHost)
-        .def_readwrite("accepted_lengths_cum_sum_device", &tb::DraftBuffers::acceptedLengthsCumSumDevice)
-        .def_readwrite("accepted_packed_paths_device", &tb::DraftBuffers::acceptedPackedPathsDevice)
         .def("create", &tb::DraftBuffers::create, py::arg("max_num_sequences"), py::arg("max_tokens_per_step"),
             py::arg("runtime"), py::arg("model_config"));
 

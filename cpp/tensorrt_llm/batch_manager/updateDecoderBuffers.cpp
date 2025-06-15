@@ -57,25 +57,15 @@ runtime::CudaEvent UpdateDecoderBuffers::operator()(runtime::ModelConfig const& 
     if (modelConfig.getSpeculativeDecodingMode().predictsDraftTokens())
     {
         // TODO: keep data on device for next iteration
-        decoderBuffers.draftBuffers.nextDraftTokensDevice = decoderState.getNextDraftTokens();
-        copyBufferManager.copy(
-            *decoderBuffers.draftBuffers.nextDraftTokensDevice, *decoderBuffers.draftBuffers.nextDraftTokensHost);
+        copyBufferManager.copy(*decoderState.getNextDraftTokens(), *decoderBuffers.draftBuffers.nextDraftTokensHost);
 
         if (modelConfig.getSpeculativeDecodingMode().variableDraftLength())
         {
-            decoderBuffers.draftBuffers.nextDraftTokensLengthsDevice = decoderState.getNextDraftTokensLengths();
-            decoderBuffers.draftBuffers.prevDraftTokensLengthsDevice = decoderState.getPrevDraftTokensLengths();
-            copyBufferManager.copy(*decoderBuffers.draftBuffers.nextDraftTokensLengthsDevice,
-                *decoderBuffers.draftBuffers.nextDraftTokensLengthsHost);
-            copyBufferManager.copy(*decoderBuffers.draftBuffers.prevDraftTokensLengthsDevice,
-                *decoderBuffers.draftBuffers.prevDraftTokensLengthsHost);
+            copyBufferManager.copy(
+                *decoderState.getNextDraftTokensLengths(), *decoderBuffers.draftBuffers.nextDraftTokensLengthsHost);
+            copyBufferManager.copy(
+                *decoderState.getPrevDraftTokensLengths(), *decoderBuffers.draftBuffers.prevDraftTokensLengthsHost);
         }
-    }
-
-    if (modelConfig.getSpeculativeDecodingMode().needsKVCacheRewind())
-    {
-        decoderBuffers.draftBuffers.acceptedLengthsCumSumDevice = decoderState.getAcceptedLengthsCumSum();
-        decoderBuffers.draftBuffers.acceptedPackedPathsDevice = decoderState.getAcceptedPackedPaths();
     }
 
     runtime::CudaEvent copyEvent{};
