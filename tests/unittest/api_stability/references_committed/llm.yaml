@@ -105,6 +105,9 @@ methods:
       kv_cache_config:
         annotation: tensorrt_llm.llmapi.llm_args.KvCacheConfig
         default: null
+      garbage_collection_gen0_threshold:
+        annotation: int
+        default: 20000
     return_annotation: None
   generate:
     parameters:
