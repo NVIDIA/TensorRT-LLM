@@ -36,6 +36,8 @@ public:
     explicit DecoderInputBuffers(SizeType32 maxNumSequences, SizeType32 maxBatchSize, SizeType32 maxDecoderSteps,
         runtime::BufferManager const& manager);
 
+    void setupMedusaLogits(SizeType32 maxNumSequences, runtime::ModelConfig const& modelConfig);
+
     //! Buffers for decoder setup
 
     //! Input IDs of new requests, [maxBatchSize]
@@ -55,6 +57,10 @@ public:
     //! Logits for all batch slots, [maxNumSequences]
     //! The vector is sparse, only slots in forwardBatchSlots are used.
     std::vector<TensorPtr> logits;
+
+    //! Logits for speculative decoding (Medusa)
+    //! [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
+    std::vector<std::vector<runtime::ITensor::SharedPtr>> predictedDraftLogits;
 };
 
 class DecoderOutputBuffers
@@ -91,8 +97,6 @@ public:
     TensorPtr nextDraftTokensLengthsHost;   // [mMaxNumRequests]
     TensorPtr acceptedLengthsCumSumDevice;  // [mMaxNumRequests+1]
     TensorPtr acceptedPackedPathsDevice;    // [mMaxNumRequests * maxAcceptedTokens]
-    std::vector<std::vector<runtime::ITensor::SharedPtr>>
-        predictedDraftLogits;               // [mMaxNumRequests][mMaxNumHeads][maxDraftTokens + 1, vocabSize]
 
     void create(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, runtime::BufferManager const& manager,
         runtime::ModelConfig const& modelConfig);

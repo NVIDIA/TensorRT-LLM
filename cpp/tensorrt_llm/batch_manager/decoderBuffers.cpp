@@ -52,6 +52,19 @@ DecoderInputBuffers::DecoderInputBuffers(
     logits.resize(maxNumSequences);
 }
 
+void DecoderInputBuffers::setupMedusaLogits(SizeType32 maxNumSequences, ModelConfig const& modelConfig)
+{
+    if (modelConfig.getSpeculativeDecodingMode().isMedusa())
+    {
+        auto const maxDraftPathLen = modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen();
+        predictedDraftLogits.resize(maxNumSequences);
+        for (auto& medusaLogitsHead : predictedDraftLogits)
+        {
+            medusaLogitsHead.resize(maxDraftPathLen);
+        }
+    }
+}
+
 DecoderOutputBuffers::DecoderOutputBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxSeqLen,
     SizeType32 maxTokensPerStep, BufferManager const& manager)
 {
@@ -117,16 +130,6 @@ void DraftBuffers::create(SizeType32 maxNumSequences, SizeType32 maxTokensPerSte
                 = BufferManager::pinned(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
             prevDraftTokensLengthsHost
                 = BufferManager::pinned(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
-        }
-    }
-
-    if (speculativeDecodingMode.isMedusa())
-    {
-        auto const maxDraftPathLen = modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen();
-        predictedDraftLogits.resize(maxNumSequences);
-        for (auto& medusaLogitsHead : predictedDraftLogits)
-        {
-            medusaLogitsHead.resize(maxDraftPathLen);
         }
     }
 

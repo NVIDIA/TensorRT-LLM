@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 
+namespace tr = tensorrt_llm::runtime;
 namespace tru = tensorrt_llm::runtime::utils;
 
 namespace tensorrt_llm::batch_manager
@@ -76,7 +77,7 @@ void setupMedusaLogits(std::vector<TensorPtr>& medusaLogitsHeads, TensorPtr cons
 void HandleGenerationLogits::operator()(DecoderInputBuffers& inputBuffers, RequestVector const& generationRequests,
     tr::ITensor::SharedPtr const& logits, tr::SizeType32 logitsIndex, tr::ModelConfig const& modelConfig,
     tr::BufferManager const& manager, OptionalRef<RuntimeBuffers> genRuntimeBuffers,
-    OptionalRef<DraftBuffers> draftBuffers) const
+    OptionalRef<MedusaBuffers> medusaBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(HandleGenerationLogits);
@@ -137,11 +138,9 @@ void HandleGenerationLogits::operator()(DecoderInputBuffers& inputBuffers, Reque
         }
         if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
         {
-            TLLM_CHECK(draftBuffers);
-            auto& medusaLogitsHeads = draftBuffers->predictedDraftLogits.at(seqSlot);
-            TLLM_CHECK(genRuntimeBuffers);
-            TLLM_CHECK(genRuntimeBuffers->mMedusaBuffers);
-            setupMedusaLogits(medusaLogitsHeads, genRuntimeBuffers->mMedusaBuffers->medusaLogitsDevice,
+            auto& medusaLogitsHeads = inputBuffers.predictedDraftLogits.at(seqSlot);
+            TLLM_CHECK(medusaBuffers);
+            setupMedusaLogits(medusaLogitsHeads, medusaBuffers->medusaLogitsDevice,
                 modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen(), logitsIndex, draftLength);
         }
         logitsIndex += numLogits;

@@ -135,7 +135,7 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator
 
     if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
     {
-        decodingInput->predictedDraftLogits = decoderBuffers.draftBuffers.predictedDraftLogits;
+        decodingInput->predictedDraftLogits = inputBuffers.predictedDraftLogits;
     }
 
     if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())

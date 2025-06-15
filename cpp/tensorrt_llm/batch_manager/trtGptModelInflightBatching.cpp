@@ -1479,6 +1479,7 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
     {
         mDecoderInputBuffers.emplace_back(
             getMaxNumSequences(), getMaxBatchSize(), mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
+        mDecoderInputBuffers.back().setupMedusaLogits(getMaxNumSequences(), mModelConfig);
         mDecoderOutputBuffers.emplace_back(getMaxNumSequences(), mOperatingBeamWidth, getMaxSequenceLen(),
             mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
     }
@@ -2017,13 +2018,14 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     auto& contextRuntimeBuffers = mBuffers.at(contextBufferId);
     auto const logitsIndex = (*mHandleContextLogits)(decoderInputBuffers, scheduledRequests.contextRequests,
         contextRuntimeBuffers->logits, contextRuntimeBuffers->numContextLogits, mModelConfig,
-        mRuntime->getBufferManager(), mDecoderBuffers->draftBuffers, contextRuntimeBuffers->mMedusaBuffers);
+        mRuntime->getBufferManager(), contextRuntimeBuffers->mMedusaBuffers);
 
     auto const genLogitsIndex = mCtxGenFusion ? logitsIndex : 0;
     auto const genBufferId = mCtxGenFusion ? getFusedBufferId() : getGenerationBufferId();
     auto& genRuntimeBuffers = mBuffers.at(genBufferId);
     (*mHandleGenerationLogits)(decoderInputBuffers, scheduledRequests.generationRequests, genRuntimeBuffers->logits,
-        genLogitsIndex, mModelConfig, mRuntime->getBufferManager(), *genRuntimeBuffers, mDecoderBuffers->draftBuffers);
+        genLogitsIndex, mModelConfig, mRuntime->getBufferManager(), *genRuntimeBuffers,
+        genRuntimeBuffers->mMedusaBuffers);
 
     if (mOperatingBeamWidth > 1)
     {

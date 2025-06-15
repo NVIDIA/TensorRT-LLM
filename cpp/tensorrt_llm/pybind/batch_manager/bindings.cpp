@@ -418,7 +418,6 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("next_draft_tokens_lengths_host", &tb::DraftBuffers::nextDraftTokensLengthsHost)
         .def_readwrite("accepted_lengths_cum_sum_device", &tb::DraftBuffers::acceptedLengthsCumSumDevice)
         .def_readwrite("accepted_packed_paths_device", &tb::DraftBuffers::acceptedPackedPathsDevice)
-        .def_readwrite("predicted_draft_logits", &tb::DraftBuffers::predictedDraftLogits)
         .def("create", &tb::DraftBuffers::create, py::arg("max_num_sequences"), py::arg("max_tokens_per_step"),
             py::arg("runtime"), py::arg("model_config"));
 
