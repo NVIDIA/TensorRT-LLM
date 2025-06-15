@@ -9,7 +9,6 @@ from .test_llm import (get_model_path, global_kvcache_config, llama_model_path,
                        llm_get_stats_test_harness, prompts,
                        run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
-                       tinyllama_guided_decoding_test_harness,
                        tinyllama_logits_processor_test_harness)
 from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_gpu_memory_less_than_80gb, skip_gpu_memory_less_than_138gb
 from utils.llm_data import llm_models_root
@@ -25,12 +24,6 @@ from peft import get_peft_model
 from transformers import AutoModelForCausalLM
 
 # isort: on
-
-
-@force_ampere
-def test_tinyllama_guided_decoding():
-    pytest.skip(reason="https://nvbugs/5240350")
-    tinyllama_guided_decoding_test_harness(backend="pytorch")
 
 
 @force_ampere

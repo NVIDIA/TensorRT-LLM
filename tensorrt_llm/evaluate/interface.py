@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import random
 from abc import ABC, abstractmethod
-from typing import Any, Iterable, List, Optional
+from typing import Any, Iterable, List, Optional, Union
 
 import numpy as np
 import torch
@@ -48,8 +49,12 @@ class Evaluator(ABC):
                       *auxiliaries) -> float:
         raise NotImplementedError()
 
-    def do_apply_chat_template(self, llm: Any, prompt: str) -> str:
-        messages = [{"role": "user", "content": prompt}]
+    def do_apply_chat_template(self, llm: Any,
+                               prompt: Union[str, List[dict]]) -> str:
+        if isinstance(prompt, str):
+            messages = [{"role": "user", "content": prompt}]
+        else:
+            messages = prompt
         if self.system_prompt is not None:
             messages = [{
                 "role": "system",
@@ -59,15 +64,29 @@ class Evaluator(ABC):
                                                  tokenize=False,
                                                  add_generation_prompt=True)
 
+    def _get_sampline_params(self, sampling_params: Optional[SamplingParams],
+                             sampling_args: Optional[dict]) -> SamplingParams:
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+        else:
+            sampling_params = copy.deepcopy(sampling_params)
+
+        if sampling_args is not None:
+            for key, value in sampling_args.items():
+                setattr(sampling_params, key, value)
+        return sampling_params
+
     def evaluate(self,
                  llm: Any,
                  sampling_params: Optional[SamplingParams] = None) -> float:
         profiler.start("trtllm exec")
         outputs, references, auxiliaries = [], [], []
-        for prompt, reference, *aux in tqdm(self.generate_samples(),
-                                            desc="Submitting requests"):
+        for prompt, sampling_args, reference, *aux in tqdm(
+                self.generate_samples(), desc="Submitting requests"):
             if self.apply_chat_template:
                 prompt = self.do_apply_chat_template(llm, prompt)
+            sampling_params = self._get_sampline_params(sampling_params,
+                                                        sampling_args)
             output = llm.generate_async(prompt, sampling_params)
             outputs.append(output)
             references.append(reference)
