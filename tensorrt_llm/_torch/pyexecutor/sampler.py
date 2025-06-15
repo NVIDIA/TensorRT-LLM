@@ -307,8 +307,9 @@ class TorchSampler(Sampler):
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 new_token = new_tokens_list[token_idx]
                 num_tokens = request.add_new_token(new_token, beam_idx)
-                self._handle_stop_criteria(request, new_token, num_tokens,
-                                           beam_idx)
+                if self._handle_stop_criteria(request, new_token, num_tokens,
+                                              beam_idx):
+                    continue
 
                 # Accept draft tokens (if we have any) if and only if they match the new
                 # token exactly.
