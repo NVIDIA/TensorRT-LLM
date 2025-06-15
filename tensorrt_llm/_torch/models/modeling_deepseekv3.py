@@ -1119,15 +1119,13 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
-            if ckpt_nextn == 1:
+            if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
                 mtp_layer = DeepseekV3MTP(model_config, self.num_hidden_layers,
                                           self.model.aux_stream_dict)
                 self.model.layers.append(mtp_layer)
                 self.epilogue.append(mtp_layer)
                 self.mtp_worker = MTPEagleWorker(model_config.spec_config)
             else:
-                # TODO: fix the accuracy issue and remove this assert.
-                assert False, "Cannot support num_nextn_predict_layers>1 in checkpoint now. Will fix it soon"
                 mtp_layers = nn.ModuleList([
                     DeepseekV3MTP(model_config,
                                   layer_idx + self.num_hidden_layers,

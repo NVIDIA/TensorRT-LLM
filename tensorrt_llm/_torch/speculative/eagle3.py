@@ -33,7 +33,6 @@ class Eagle3Config(SpecConfig):
         else:
             self.spec_dec_mode = SpeculativeDecodingMode.from_string(
                 self.spec_dec_name)
-            self.num_extra_kv_tokens = 0
         logger.info(f"EAGLE3 Config: {self}")
 
     def update_from_model_config(self, model_config):
