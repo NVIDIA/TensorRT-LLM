@@ -1338,9 +1338,9 @@ class PyTorchModelEngine(ModelEngine):
         previous_batch_len = len(previous_batch_indices)
 
         def previous_seq_slots_device():
-            sorted_previous_batch_indices = sorted(previous_batch_indices)
-            previous_batch_indices_host = torch.tensor(
-                sorted_previous_batch_indices, dtype=torch.int, pin_memory=True)
+            previous_batch_indices_host = torch.tensor(previous_batch_indices,
+                                                       dtype=torch.int,
+                                                       pin_memory=True)
             previous_slots = self.previous_batch_indices_cuda[:
                                                               previous_batch_len]
             previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
