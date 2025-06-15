@@ -78,7 +78,7 @@ Welcome to TensorRT-LLM's Documentation!
    :hidden:
 
    commands/trtllm-build
-   commands/trtllm-serve
+   commands/trtllm-serve/index
 
 
 .. toctree::
