@@ -104,8 +104,6 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.dispatch_stats_thread: Optional[ManagedThread] = None
         self.dispatch_kv_cache_events_thread: Optional[ManagedThread] = None
         self._start_executor_workers(worker_kwargs)
-        # [DO NOT Merge] hacky way to let GC run less often
-        gc.set_threshold(20000)
 
         # MPI registers its joiner using threading._register_atexit if possible.
         # These functions run before atexit.register, so to avoid deadlock,
