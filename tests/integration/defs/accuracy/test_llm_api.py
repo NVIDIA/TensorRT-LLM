@@ -14,7 +14,7 @@
 # limitations under the License.
 import pytest
 
-from tensorrt_llm.llmapi import LLM, EagleDecodingConfig
+from tensorrt_llm.llmapi import LLM, EagleDecodingConfig, KvCacheConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -71,6 +71,79 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                   pipeline_parallel_size=2)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.2-1B"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B"
+    EXAMPLE_FOLDER = "models/core/llama"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_post_blackwell
+    def test_smooth_quant(self):
+        quant_config = QuantConfig(
+            QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_post_blackwell
+    def test_smooth_quant_ootb(self):
+        quant_config = QuantConfig(QuantAlgo.W8A8_SQ_PER_CHANNEL)
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_post_blackwell
+    def test_int4_awq(self):
+        quant_config = QuantConfig(QuantAlgo.W4A16_AWQ)
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_post_blackwell
+    def test_int4_awq_int8_kv_cache(self):
+        quant_config = QuantConfig(QuantAlgo.W4A16_AWQ)
+        kv_cache_config = KvCacheConfig(quant_algo=QuantAlgo.INT8)
+        with LLM(self.MODEL_PATH,
+                 quant_config=quant_config,
+                 kv_cache_config=kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    def test_fp8(self):
+        quant_config = QuantConfig(QuantAlgo.FP8)
+        kv_cache_config = KvCacheConfig(quant_algo=QuantAlgo.FP8)
+        with LLM(self.MODEL_PATH,
+                 quant_config=quant_config,
+                 kv_cache_config=kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @pytest.mark.skip_less_device(2)
+    def test_fp8_pp2(self):
+        quant_config = QuantConfig(QuantAlgo.FP8)
+        kv_cache_config = KvCacheConfig(quant_algo=QuantAlgo.FP8)
+        with LLM(self.MODEL_PATH,
+                 pipeline_parallel_size=2,
+                 quant_config=quant_config,
+                 kv_cache_config=kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @skip_post_blackwell
+    def test_fp8_rowwise(self):
+        quant_config = QuantConfig(QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
 
