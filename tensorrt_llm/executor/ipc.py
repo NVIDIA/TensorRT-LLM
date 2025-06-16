@@ -267,7 +267,7 @@ class FusedIpcQueue:
                                           error_queue=self.error_queue)
         self._send_thread.start()
 
-    def put(self, obj: Any, serialized: bool = False):
+    def put(self, obj: Any):
         self.setup_sender()
         if self.fuse_message:
             self.sending_queue.put_nowait(obj)
