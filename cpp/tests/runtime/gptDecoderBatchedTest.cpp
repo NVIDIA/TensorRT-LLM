@@ -75,7 +75,7 @@ std::shared_ptr<tb::LlmRequest> createLlmRequest(SizeType32 batchSlot, SizeType3
         request->setDraftTokens(draftTokens);
     }
 
-    return std::move(request);
+    return request;
 }
 
 std::vector<std::shared_ptr<tb::LlmRequest>> createLlmRequests(std::vector<SizeType32> const& inputLengths,
