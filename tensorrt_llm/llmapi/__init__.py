@@ -9,7 +9,7 @@ from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
                        ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
                        MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
-                       TorchLlmArgs, TrtLlmArgs)
+                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mpi_session import MpiCommSession
@@ -42,6 +42,7 @@ __all__ = [
     'DynamicBatchConfig',
     'CacheTransceiverConfig',
     'NGramDecodingConfig',
+    'TorchCompileConfig',
     'LlmArgs',
     'TorchLlmArgs',
     'TrtLlmArgs',

@@ -26,6 +26,7 @@ namespace jit
 
 bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin);
 bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin);
+bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin);
 bool supportConfigTllmGen(
     XQAParams const& xqaParams, int SM, bool forConfigurePlugin, TllmGenFmhaRunner const* tllmRunner);
 

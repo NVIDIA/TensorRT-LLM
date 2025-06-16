@@ -19,7 +19,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import llm_models_root, skip_post_blackwell, skip_pre_ada
-from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
+from .accuracy_core import (GSM8K, MMLU, CnnDailymail, JsonModeEval,
+                            LlmapiAccuracyTestHarness)
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
@@ -54,6 +55,22 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  tensor_parallel_size=2,
                  context_parallel_size=2) as llm:
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_guided_decoding(self):
+        llm = LLM(self.MODEL_PATH, guided_decoding_backend="xgrammar")
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    def test_guided_decoding_4gpus(self):
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend="xgrammar",
+                  tensor_parallel_size=2,
+                  pipeline_parallel_size=2)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -113,6 +130,7 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-v0.1"
 
+    @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.skip_less_device(2)
     def test_tp2(self):
         with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
