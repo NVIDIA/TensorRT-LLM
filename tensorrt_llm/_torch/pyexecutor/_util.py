@@ -262,7 +262,7 @@ class KvCacheCreator:
             self, model_engine: PyTorchModelEngine) -> KVCacheManager:
         executor_config = self._executor_config
         mapping = self._mapping
-        assert executor_config.pytorch_backend_config.use_kv_cache, "Only construct KV cache when it is needed."
+        assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
 
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
@@ -398,7 +398,7 @@ def create_py_executor_instance(
                 "Guided decoding is not supported with overlap scheduler.")
 
     logger.info(
-        f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"
+        f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}, max_batch_size={executor_config.max_batch_size}"
     )
 
     for key, value in pytorch_backend_config.extra_resource_managers.items():

@@ -332,9 +332,6 @@ void initBindings(pybind11::module_& m)
         .def("setup_speculative_decoding", &tr::decoder::DecoderState::setupSpeculativeDecoding,
             py::arg("speculative_decoding_mode"), py::arg("max_tokens_per_engine_step"), py::arg("model_config"),
             py::arg("world_config"), py::arg("buffer_manager"))
-        .def("setup_explicit_draft_tokens", &tr::decoder::DecoderState::setupExplicitDraftTokens,
-            py::arg("explicit_draft_tokens_buffers"))
-        .def("setup_lookahead", &tr::decoder::DecoderState::setupLookahead, py::arg("lookahead_decoding_buffers"))
         .def_property_readonly("joint_decoding_input", &tr::decoder::DecoderState::getJointDecodingInput)
         .def_property_readonly("joint_decoding_output", &tr::decoder::DecoderState::getJointDecodingOutput)
         .def_property_readonly(

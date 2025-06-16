@@ -27,13 +27,14 @@
 
 namespace tensorrt_llm::plugins
 {
+namespace tk = ::tensorrt_llm::kernels;
 
 class AllreducePlugin : public BasePlugin
 {
 public:
-    AllreducePlugin(std::set<int> group, nvinfer1::DataType type, kernels::AllReduceStrategyType strategy,
-        kernels::AllReduceStrategyConfig config, kernels::AllReduceFusionOp op, int32_t counter, float eps,
-        int8_t affine, int8_t bias, int8_t scale);
+    AllreducePlugin(std::set<int> group, nvinfer1::DataType type, tk::AllReduceStrategyType strategy,
+        tk::AllReduceStrategyConfig config, tk::AllReduceFusionOp op, int32_t counter, float eps, int8_t affine,
+        int8_t bias, int8_t scale);
 
     AllreducePlugin(void const* data, size_t length);
 
@@ -70,8 +71,7 @@ private:
     bool isCustomAllReduceSupported(int ranks_per_node) const noexcept;
     void initGroupTopology() noexcept;
     void setGroupTopology() noexcept;
-    kernels::AllReduceStrategyType selectImplementation(
-        size_t messageSize, int worldSize, nvinfer1::DataType type) noexcept;
+    tk::AllReduceStrategyType selectImplementation(size_t messageSize, int worldSize, nvinfer1::DataType type) noexcept;
     void check() noexcept;
 
 private:
@@ -80,9 +80,9 @@ private:
     bool mIsNVLINKSupported;
     bool mIsP2PSupported;
     nvinfer1::DataType mType;
-    kernels::AllReduceStrategyType mStrategy;
-    kernels::AllReduceStrategyConfig mConfig;
-    kernels::AllReduceFusionOp mOp;
+    tk::AllReduceStrategyType mStrategy;
+    tk::AllReduceStrategyConfig mConfig;
+    tk::AllReduceFusionOp mOp;
     float mEps;
     std::shared_ptr<ncclComm_t> mNcclComm;
     int8_t mAffine;

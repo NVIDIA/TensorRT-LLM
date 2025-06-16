@@ -16,6 +16,7 @@
 
 import datetime
 import os
+import platform
 import re
 import shutil
 import subprocess as sp
@@ -283,7 +284,6 @@ def gemma_example_root(llm_root, llm_venv):
     # and caused pipeline to fail. We manually install gemma dependency as a WAR.
     llm_venv.run_cmd(["-m", "pip", "install", "safetensors~=0.4.1", "nltk"])
     # Install Jax because it breaks dependency
-    import platform
     google_extension = [
         "-f",
         "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
@@ -1722,8 +1722,6 @@ def qcache_dir(llm_venv, llm_root):
 
     quantization_root = os.path.join(llm_root, "examples", "quantization")
 
-    import platform
-
     # Fix the issue that the requirements.txt is not available on aarch64.
     if "aarch64" not in platform.machine() and get_sm_version() >= 89:
         llm_venv.run_cmd([
@@ -1874,7 +1872,11 @@ skip_no_hopper = pytest.mark.skipif(
     reason="This test is only  supported in Hopper architecture")
 
 skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
-                                   reason="This test is for Blackwell SM120")
+                                   reason="This test is for SM120")
+
+skip_arm = pytest.mark.skipif(
+    "aarch64" in platform.machine(),
+    reason="This test is not supported on ARM architecture")
 
 
 def skip_fp8_pre_ada(use_fp8):

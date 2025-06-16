@@ -52,7 +52,6 @@ def create_moe(
     aux_stream: Optional[torch.cuda.Stream] = None,
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     apply_router_weight_on_input: bool = False,
-    enable_alltoall: bool = False,
     layer_idx: Optional[int] = None,
 ) -> MoE:
     moe_cls = get_moe_cls(model_config, override_quant_config)
@@ -63,7 +62,6 @@ def create_moe(
 
     if moe_cls == TRTLLMGenFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
-        assert not enable_alltoall, "enable_alltoall is not supported in TRTLLMGenFusedMoE."
 
         return moe_cls(
             routing_method=routing_method,
@@ -88,12 +86,10 @@ def create_moe(
             aux_stream=aux_stream,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            enable_alltoall=enable_alltoall,
             layer_idx=layer_idx,
         )
     elif moe_cls == VanillaMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in VanillaMoE."
-        assert not enable_alltoall, "enable_alltoall is not supported in VanillaMoE."
 
         return moe_cls(
             routing_method=routing_method,

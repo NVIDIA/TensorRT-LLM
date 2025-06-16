@@ -248,7 +248,8 @@ void initBindings(pybind11::module_& m)
                 {
                     self.setDraftTokens(std::make_shared<GenLlmReq::VecTokens>(draftTokens.value()));
                 }
-            });
+            })
+        .def_property("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest);
 
     py::classh<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", pybind11::dynamic_attr())
         .def(py::init(
