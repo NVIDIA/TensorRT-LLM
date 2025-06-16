@@ -271,11 +271,19 @@ class ModelConfig(Generic[TConfig]):
         model_config._frozen = True
         return model_config
 
-    def get_bindings_model_config(self) -> "ModelConfigCpp":
+    def get_bindings_model_config(self,
+                                  tokens_per_block: Optional[int] = None
+                                  ) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
         Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
         that an engine has been created.
+
+        Args:
+            tokens_per_block: The number of tokens per block. Please note that in PyTorch flow tokens_per_block is not available in the model config, instead it is defined in the executor config.
+
+        Returns:
+            The bindings model config.
         """
         # TODO smor- this isn't robust, and currently tested for LlamaConfig only
         # TODO smor- currently assuming no rnn layers, no MOE
@@ -294,6 +302,12 @@ class ModelConfig(Generic[TConfig]):
             hidden_size=hidden_size,
             data_type=torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
+        if tokens_per_block is None:
+            logger.warning(
+                f"tokens_per_block is not set, using default value {model_config_cpp.tokens_per_block}"
+            )
+        else:
+            model_config_cpp.tokens_per_block = tokens_per_block
 
         mlp_hidden_size = None
         if self.pretrained_config.intermediate_size is not None:

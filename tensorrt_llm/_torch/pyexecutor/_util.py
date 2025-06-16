@@ -180,20 +180,6 @@ class KvCacheCreator:
             estimating_kv_cache = True
             self._executor_config.kv_cache_config.max_tokens = self._get_token_num_for_estimation(
             )
-            maw = self._executor_config.kv_cache_config.max_attention_window
-            if maw is not None:
-                unique_windows = list(set(maw))
-                if len(unique_windows) > 1:
-                    # NOTE: For sliding window, we need to allocate more tokens(max_num_tokens + window_size) for each window, need to update if this requirement changes
-                    assert len(
-                        unique_windows
-                    ) == 2, "Sliding window with more than 2 window sizes has not been tested"
-                    # sliding window is the one that is not the executor_config.max_seq_len
-                    sliding_window = unique_windows[0] if unique_windows[
-                        0] != self._executor_config.max_seq_len else unique_windows[
-                            1]
-                    self._executor_config.kv_cache_config.max_tokens += (
-                        self._executor_config.max_num_tokens + sliding_window)
         return estimating_kv_cache
 
     def estimate_max_tokens(self, py_executor: PyExecutor) -> None:
@@ -358,6 +344,7 @@ class KvCacheCreator:
             is_vswa = executor_config.kv_cache_config.max_attention_window is not None and len(
                 set(executor_config.kv_cache_config.max_attention_window)) > 1
             binding_model_config = model_engine.model.model_config.get_bindings_model_config(
+                tokens_per_block=executor_config.tokens_per_block
             ) if is_vswa else None
 
             kv_cache_manager = KVCacheManager(
