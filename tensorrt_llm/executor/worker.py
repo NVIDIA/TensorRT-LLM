@@ -889,9 +889,9 @@ class AwaitResponseHelper:
                 # serialized when it has error.
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
-                self.worker._pop_result(response.client_id)
-            elif response.is_final:
-                self.worker._pop_result(response.client_id)
+            #     self.worker._pop_result(response.client_id)
+            # elif response.is_final:
+            #     self.worker._pop_result(response.client_id)
             else:
                 logprobs_result = _get_logprobs(self.worker, response,
                                                 self.worker._is_pytorch_backend)
@@ -906,37 +906,39 @@ class AwaitResponseHelper:
         if postproc_batches:
             for wid, batch in enumerate(postproc_batches):
                 if batch:
-                    postproc_inputs = []
-                    other_responses = []
-                    for rsp in batch:
-                        if isinstance(rsp.rsp, LlmResponse):
-                            postproc_inputs.append(rsp)
-                        else:
-                            # Handle ErrorResponse and ResponseWrapper
-                            other_responses.append(rsp)
-                    self.worker.postproc_queues[wid].put({
-                        "postproc_inputs":
-                        make_postproc_inputs_serialize_friendly(
-                            postproc_inputs),
-                        "other_responses":
-                        other_responses
-                    })
+                    # postproc_inputs = []
+                    # other_responses = []
+                    # for rsp in batch:
+                    #     if isinstance(rsp.rsp, LlmResponse):
+                    #         postproc_inputs.append(rsp)
+                    #     else:
+                    #         # Handle ErrorResponse and ResponseWrapper
+                    #         other_responses.append(rsp)
+                    # self.worker.postproc_queues[wid].put({
+                    #     "postproc_inputs":
+                    #     make_postproc_inputs_serialize_friendly(
+                    #         postproc_inputs),
+                    #     "other_responses":
+                    #     other_responses
+                    # })
+                    self.worker.postproc_queues[wid].put(batch)
 
         if rsp_batch:
-            llm_responses = []
-            other_responses = []
-            for rsp in rsp_batch:
-                if isinstance(rsp, LlmResponse):
-                    llm_responses.append(rsp)
-                else:
-                    # Handle ErrorResponse and ResponseWrapper
-                    other_responses.append(rsp)
-            self.worker.result_queue.put({
-                "llm_responses":
-                make_llm_responses_serialize_friendly(llm_responses),
-                "other_responses":
-                other_responses
-            })
+            # llm_responses = []
+            # other_responses = []
+            # for rsp in rsp_batch:
+            #     if isinstance(rsp, LlmResponse):
+            #         llm_responses.append(rsp)
+            #     else:
+            #         # Handle ErrorResponse and ResponseWrapper
+            #         other_responses.append(rsp)
+            # self.worker.result_queue.put({
+            #     "llm_responses":
+            #     make_llm_responses_serialize_friendly(llm_responses),
+            #     "other_responses":
+            #     other_responses
+            # })
+            self.worker.result_queue.put(rsp_batch)
 
 
 def _get_params_for_first_rsp(
@@ -1023,12 +1025,12 @@ def _send_rsp(
         else:
             postproc_batches[pid].append(inp)
 
-    # # Eliminate the finished GenerationRequest instances timely, which may
-    # # take considerable memory.
-    # if is_llm_response(response):
-    #     if response.has_error() or response.result.is_final:
-    #         worker._pop_result(response.client_id)
-    # elif isinstance(response, ErrorResponse):
-    #     worker._pop_result(response.client_id)
-    # else:
-    #     raise ValueError(f"Unknown response type: {response}")
+    # Eliminate the finished GenerationRequest instances timely, which may
+    # take considerable memory.
+    if is_llm_response(response):
+        if response.has_error() or response.result.is_final:
+            worker._pop_result(response.client_id)
+    elif isinstance(response, ErrorResponse):
+        worker._pop_result(response.client_id)
+    else:
+        raise ValueError(f"Unknown response type: {response}")

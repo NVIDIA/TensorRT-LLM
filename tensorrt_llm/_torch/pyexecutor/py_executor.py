@@ -2020,23 +2020,31 @@ class PyExecutor:
             f'before gather, rank = {self.dist.rank}, responses = {responses}')
         if self.enable_attention_dp and self.dist.world_size != 1:
             if not self.gather_all_responses:
-                packed_responses = make_llm_responses_serialize_friendly(
-                    responses)
-                packed_responses = self.dist.tp_gather(packed_responses)
-                responses = {}
-                if self.dist.rank == 0:
-                    for res in packed_responses:
-                        responses.update(
-                            restore_llm_responses_from_serialize_friendly_dict(
-                                res))
+                # packed_responses = make_llm_responses_serialize_friendly(
+                #     responses)
+                # packed_responses = self.dist.tp_gather(packed_responses)
+                # responses = {}
+                # if self.dist.rank == 0:
+                #     for res in packed_responses:
+                #         responses.update(
+                #             restore_llm_responses_from_serialize_friendly_dict(
+                #                 res))
+                responses_list = self.dist.tp_gather(responses)
             else:
-                packed_responses = make_llm_responses_serialize_friendly(
-                    responses)
-                packed_responses = self.dist.allgather(packed_responses)
-                responses = {}
-                for res in packed_responses:
-                    responses.update(
-                        restore_llm_responses_from_serialize_friendly_dict(res))
+                # packed_responses = make_llm_responses_serialize_friendly(
+                #     responses)
+                # packed_responses = self.dist.allgather(packed_responses)
+                # responses = {}
+                # for res in packed_responses:
+                #     responses.update(
+                #         restore_llm_responses_from_serialize_friendly_dict(res))
+                responses_list = self.dist.allgather(responses)
+            if self.dist.rank == 0 or self.gather_all_responses:
+                gather_responses = {}
+                if responses_list is not None:
+                    for resp in responses_list:
+                        gather_responses.update(resp)
+                    responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
 

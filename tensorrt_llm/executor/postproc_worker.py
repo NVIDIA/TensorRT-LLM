@@ -185,19 +185,29 @@ class PostprocWorker:
                              | PostprocWorker.
                              Input] = await self._pull_pipe.get_async()
 
-            if inputs[0] is None:
-                self._to_stop.set()
-                yield None
-            else:
-                inputs = restore_postproc_inputs(
-                    inputs[0]["postproc_inputs"]) + inputs[0]["other_responses"]
+            # if inputs[0] is None:
+            #     self._to_stop.set()
+            #     yield None
+            # else:
+            #     inputs = restore_postproc_inputs(
+            #         inputs[0]["postproc_inputs"]) + inputs[0]["other_responses"]
 
-                for inp in inputs:
-                    if inp is None:
-                        self._to_stop.set()
-                        yield None
-                        break
-                    await handle_single_input(inp, batch)
+            #     for inp in inputs:
+            #         if inp is None:
+            #             self._to_stop.set()
+            #             yield None
+            #             break
+            #         await handle_single_input(inp, batch)
+
+            if not isinstance(inputs, list):
+                inputs = [inputs]
+
+            for inp in inputs:
+                if inp is None:
+                    self._to_stop.set()
+                    yield None
+                    break
+                await handle_single_input(inp, batch)
 
             yield batch
 

@@ -182,9 +182,11 @@ class GenerationExecutorProxy(GenerationExecutor):
                     res, ErrorResponse):
                 self._results.pop(client_id)
 
-        if not isinstance(res[0], PostprocWorker.Output):
-            res = restore_llm_responses_from_serialize_friendly_list(
-                res[0]["llm_responses"]) + res[0]["other_responses"]
+        # if not isinstance(res[0], PostprocWorker.Output):
+        #     res = restore_llm_responses_from_serialize_friendly_list(
+        #         res[0]["llm_responses"]) + res[0]["other_responses"]
+
+        res = res if isinstance(res, list) else [res]
 
         for i in res:
             global_tracer().log_instant("IPC.get")
