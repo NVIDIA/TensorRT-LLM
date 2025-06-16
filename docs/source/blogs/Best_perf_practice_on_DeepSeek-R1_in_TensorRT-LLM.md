@@ -21,7 +21,7 @@ In this blog, we share the configurations and procedures about how to reproduce 
     - [B200 max-throughput with FP8 KV](#b200-max-throughput-for-r1-0528-with-fp8-kv-cache)
       - [Benchmark](#benchmark)
       - [Expected Result Format](#expected-result-format)
-    - [B200 max-throughput FP16 KV](#b200-max-throughput-for-r1-with-fp16-kv-cache)
+    - [B200 max-throughput with FP16 KV](#b200-max-throughput-for-r1-with-fp16-kv-cache)
       - [Benchmark](#benchmark)
       - [Expected Result Format](#expected-result-format)
     - [H200 min-latency](#h200-min-latency)
