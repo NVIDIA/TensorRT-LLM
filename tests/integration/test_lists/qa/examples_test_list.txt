@@ -384,8 +384,8 @@ accuracy/test_llm_api.py::TestLlama3_2_1B::test_int4_awq
 accuracy/test_llm_api.py::TestLlama3_2_1B::test_int4_awq_int8_kv_cache
 accuracy/test_llm_api.py::TestLlama3_2_1B::test_fp8_pp2
 accuracy/test_llm_api.py::TestLlama3_2_1B::test_fp8_rowwise
-accuracy/test_llm_api.py::TestLlama3_2_3B::test_auto_dtype
-accuracy/test_llm_api.py::TestLlama3_2_3B::test_fp8_prequantized
+accuracy/test_llm_api_pytorch.py::TestLlama3_2_3B::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestLlama3_2_3B::test_fp8_prequantized
 accuracy/test_cli_flow.py::TestMistral7B::test_beam_search
 accuracy/test_cli_flow.py::TestMistral7B::test_fp8_tp4pp2
 accuracy/test_cli_flow.py::TestMistral7B::test_smooth_quant_tp4pp1
