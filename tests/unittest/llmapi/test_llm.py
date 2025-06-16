@@ -23,15 +23,13 @@ import datasets
 import pytest
 import torch
 import transformers
-from pydantic import BaseModel
 from utils.util import skip_single_gpu
 
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (GenerationExecutorWorker, LoRARequest,
                                    PromptAdapterRequest, RequestError)
 from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
-                                 GuidedDecodingParams, KvCacheConfig,
-                                 KvCacheRetentionConfig,
+                                 KvCacheConfig, KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
 from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
@@ -1066,62 +1064,6 @@ def test_tinyllama_logits_processor_batched():
     tinyllama_logits_processor_batched_test_harness()
 
 
-def tinyllama_guided_decoding_test_harness(**llm_kwargs):
-    prompts = [
-        "What is 1+1? Answer formatted in a dict in json format: ",
-        "What is the year after 2024? Answer: ",
-    ]
-
-    class Answer(BaseModel):
-        answer: int
-
-    json_schema = json.dumps(Answer.model_json_schema())
-    regex = r"\d+"
-    ebnf_grammar = "root ::= [0-9]+"
-
-    sampling_params = [
-        SamplingParams(max_tokens=10),
-        SamplingParams(max_tokens=10,
-                       guided_decoding=GuidedDecodingParams(json_object=True)),
-        SamplingParams(max_tokens=10,
-                       guided_decoding=GuidedDecodingParams(json=json_schema)),
-        SamplingParams(max_tokens=10,
-                       guided_decoding=GuidedDecodingParams(regex=regex)),
-        SamplingParams(
-            max_tokens=10,
-            guided_decoding=GuidedDecodingParams(grammar=ebnf_grammar)),
-    ]
-
-    num_prompts, num_sampling_params = len(prompts), len(sampling_params)
-    prompts = [p for p in prompts for _ in range(num_sampling_params)]
-    sampling_params = [sp for _ in range(num_prompts) for sp in sampling_params]
-    references = [
-        '\n\n```\n{\n    "1":',
-        '{"1": "1", "2": "',
-        '{"answer": 1}',
-        '1',
-        '1',
-        '2025\n\nQuestion 3:',
-        '[2025]',
-        '{"answer": 202',
-        '2025',
-        '2025',
-    ]
-    llm_test_harness(llama_model_path,
-                     prompts,
-                     references,
-                     sampling_params=sampling_params,
-                     guided_decoding_backend='xgrammar',
-                     similar_threshold=0.7,
-                     **llm_kwargs)
-
-
-@force_ampere
-@pytest.mark.part0
-def test_tinyllama_guided_decoding():
-    tinyllama_guided_decoding_test_harness()
-
-
 @pytest.mark.part0
 def test_llm_api_medusa():
     prompts = [
@@ -1906,10 +1848,12 @@ def llm_get_stats_test_harness(tp_size: int = 1,
     else:
         LLM_CLASS = LLM
 
+    if not pytorch_backend:
+        llm_args_extra["fast_build"] = True
+
     llm = LLM_CLASS(model=llama_model_path,
                     kv_cache_config=global_kvcache_config,
                     tensor_parallel_size=tp_size,
-                    fast_build=True,
                     **llm_args_extra)
 
     max_tokens = 5
@@ -2031,11 +1975,11 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
         LLM_CLASS = LLM_torch
     else:
         LLM_CLASS = LLM
+        llm_args_extra["fast_build"] = True
 
     llm = LLM_CLASS(model=llama_model_path,
                     kv_cache_config=global_kvcache_config,
                     tensor_parallel_size=tp_size,
-                    fast_build=True,
                     **llm_args_extra)
 
     max_tokens = 6
@@ -2169,8 +2113,8 @@ def test_llm_dynamic_batch_config():
 def run_llm_with_postprocess_parallel(tp_size: int = 1):
     sampling_params = SamplingParams(max_tokens=6)
 
-    postproc_settings = dict(_num_postprocess_workers=2,
-                             _postprocess_tokenizer_dir=llama_model_path)
+    postproc_settings = dict(num_postprocess_workers=2,
+                             postprocess_tokenizer_dir=llama_model_path)
 
     llm_test_harness(llama_model_path,
                      prompts, ["D E F G H I J K"],
@@ -2204,8 +2148,8 @@ def run_llm_with_postprocess_parallel_and_result_handler(
               backend=backend,
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
-              _num_postprocess_workers=2,
-              _postprocess_tokenizer_dir=llama_model_path,
+              num_postprocess_workers=2,
+              postprocess_tokenizer_dir=llama_model_path,
               **kwargs)
     golden_result = "DEFGHI"
     for i, output in enumerate(

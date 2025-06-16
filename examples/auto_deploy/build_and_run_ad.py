@@ -12,6 +12,7 @@ from tensorrt_llm._torch.auto_deploy.shim import DemoLLM
 from tensorrt_llm._torch.auto_deploy.utils.benchmark import benchmark, store_benchmark_results
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 from tensorrt_llm.llmapi.llm import LLM, RequestOutput
+from tensorrt_llm.llmapi.llm_args import TorchCompileConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 # Global torch config, set the torch compile cache to fix up to llama 405B
@@ -56,7 +57,9 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
         max_batch_size=config.max_batch_size,
         # AutoDeploy-specific parameters
         use_cuda_graph=config.compile_backend in ["torch-opt", "torch-cudagraph"],
-        torch_compile_enabled=config.compile_backend in ["torch-opt", "torch-compile"],
+        torch_compile_config=TorchCompileConfig()
+        if config.compile_backend in ["torch-opt", "torch-compile"]
+        else None,
         model_factory=config.model_factory,
         model_kwargs=config.model_kwargs,
         attn_backend=config.attn_backend,
