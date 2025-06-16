@@ -1050,13 +1050,14 @@ class MLA(nn.Module):
             # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim} zero padded
             # fetch `loop_idx` chunk from kv cache
             temp_cu_chunked_seq_len = cu_chunked_seq_len[loop_idx]
+            total_ctx_chunked_tokens = host_cu_chunked_seq_len[
+                loop_idx, attn_metadata.num_contexts]
             chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
                 metadata=attn_metadata,
                 chunked_idx=loop_idx,
+                num_ctx_cached_tokens=total_ctx_chunked_tokens,
                 cu_chunked_seq_len=temp_cu_chunked_seq_len,
                 out_dtype=q.dtype)
-            # assert chunked_latent_cache.shape[
-            #     1] == attn_metadata.runtime_features.chunk_unit_size
 
             chunked_compressed_kv = chunked_compressed_kv.contiguous()
             # up proj to uncompressed kv
@@ -1109,7 +1110,7 @@ class MLA(nn.Module):
 
         # deal with the uncached kv
         kv = self.kv_b_proj(compressed_kv)
-        k_pe = latent_cache.view([
+        _, k_pe = latent_cache.view([
             -1, self.kv_lora_rank + self.qk_rope_head_dim
         ]).split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
         k_pe = k_pe.contiguous()
@@ -1175,7 +1176,7 @@ class MLA(nn.Module):
             if trtllm_attention.is_chunked_prefill_for_mla_context(
                     attn_metadata):
                 return self.forward_context_with_chunked_prefill(
-                    q, latent_cache, attn_metadata)
+                    q, compressed_kv, latent_cache, attn_metadata)
             elif trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
                 return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)

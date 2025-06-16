@@ -76,8 +76,8 @@ struct setChunkedKVKernelTraits
 // merged_attn [q_total_len, H=128, D=128] (T)
 // merged_softmax_sum [q_total_len, H, 2] (float, max/sum)
 template <typename T>
-__global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softmax_stats, T* const pre_attn,
-    float2* const pre_softmax_stats, T* const curr_attn, float2* const curr_softmax_stats, int64_t const* cu_q_seq_len,
+__global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softmax_stats, T const* pre_attn,
+    float2 const* pre_softmax_stats, T const* curr_attn, float2 const* curr_softmax_stats, int64_t const* cu_q_seq_len,
     int64_t const* merge_op, int const num_heads, int const head_size)
 {
     using KT = MergeSoftmaxTraits<T>;
@@ -120,9 +120,9 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softma
             = (global_q_offset + local_token_idx) * num_heads * head_size + head_idx * head_size;
 
         pre_attn_reader.reader
-            = *reinterpret_cast<decltype(pre_attn_reader.reader)*>(pre_attn + global_attn_offset + head_dim_idx);
-        curr_attn_reader.reader
-            = *reinterpret_cast<decltype(curr_attn_reader.reader)*>(curr_attn + global_attn_offset + head_dim_idx);
+            = *reinterpret_cast<decltype(pre_attn_reader.reader) const*>(pre_attn + global_attn_offset + head_dim_idx);
+        curr_attn_reader.reader = *reinterpret_cast<decltype(curr_attn_reader.reader) const*>(
+            curr_attn + global_attn_offset + head_dim_idx);
 
         // only copy curr attn and curr softmax sum
         if (merge_op_val == 2)
@@ -219,8 +219,8 @@ __global__ void loadChunkedKVCacheForMLAKernel(T* output_kv_ptr, T* output_k_pe_
 // rope_h}
 // cu_seq_lens {batch + 1}, fake cu_seq_len, for chunked prefill is {0, chunk_size, chunk_size * 2 ....}
 template <typename T>
-__global__ void setChunkedKVCacheForMLAKernel(T* output_kv, T* const kv, T* const k_pe, int const max_seq_len,
-    int const num_heads, int uncompressed_head_size, int rope_size, int64_t* const cu_seq_lens,
+__global__ void setChunkedKVCacheForMLAKernel(T* output_kv, T const* kv, T const* k_pe, int const max_seq_len,
+    int const num_heads, int uncompressed_head_size, int rope_size, int64_t const* cu_seq_lens,
     int kv_cache_tokens_per_block)
 {
     using KT = setChunkedKVKernelTraits<T>;
@@ -251,9 +251,9 @@ __global__ void setChunkedKVCacheForMLAKernel(T* output_kv, T* const kv, T* cons
                 = int64_t(global_token_offset + local_token_idx) * 2 * num_heads * uncompressed_head_size
                 + head_idx * uncompressed_head_size;
             int64_t ld_kv_local_offset = head_dim_vec_idx;
-            auto k_data = (reinterpret_cast<typename KT::VecT*>(kv + ld_kv_global_offset))[ld_kv_local_offset];
-            auto v_data
-                = (reinterpret_cast<typename KT::VecT*>(kv + kv_offset + ld_kv_global_offset))[ld_kv_local_offset];
+            auto k_data = (reinterpret_cast<typename KT::VecT const*>(kv + ld_kv_global_offset))[ld_kv_local_offset];
+            auto v_data = (reinterpret_cast<typename KT::VecT const*>(
+                kv + kv_offset + ld_kv_global_offset))[ld_kv_local_offset];
 
             int64_t st_k_global_offset = int64_t(batch_idx) * 2 * offset_for_kv_in_mem_pool
                 + local_token_idx / kv_cache_tokens_per_block * kv_cache_block_size
@@ -270,7 +270,8 @@ __global__ void setChunkedKVCacheForMLAKernel(T* output_kv, T* const kv, T* cons
             // rope h = 1
             int64_t ld_rope_global_offset = int64_t(global_token_offset + local_token_idx) * rope_size;
             int64_t ld_rope_local_offset = head_dim_vec_idx - KT::kKVThreadPerHead;
-            auto rope_data = (reinterpret_cast<typename KT::VecT*>(k_pe + ld_rope_global_offset))[ld_rope_local_offset];
+            auto rope_data
+                = (reinterpret_cast<typename KT::VecT const*>(k_pe + ld_rope_global_offset))[ld_rope_local_offset];
             int64_t st_rope_global_offset = int64_t(batch_idx) * 2 * offset_for_kv_in_mem_pool
                 + local_token_idx / kv_cache_tokens_per_block * kv_cache_block_size
                 + head_idx * kv_cache_tokens_per_block * (uncompressed_head_size + rope_size)
@@ -295,8 +296,8 @@ namespace kernels
 // merge_op[b]
 // == 2, we only copy curr_attn and curr_softmax_sum to merged_attn and merged_softmax_sum
 template <typename T>
-void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T* const pre_attn,
-    float* const pre_softmax_stats, T* const curr_attn, float* const curr_softmax_stats, int const batch_size,
+void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T const* pre_attn,
+    float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, int const batch_size,
     int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads, int const head_size,
     cudaStream_t stream)
 {
@@ -307,8 +308,8 @@ void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T* 
     dim3 block(KT::kNumThreads);
 
     mergeAttnWithSoftmaxKernel<T><<<grid, block, 0, stream>>>(merged_attn,
-        reinterpret_cast<float2*>(merged_softmax_stats), pre_attn, reinterpret_cast<float2*>(pre_softmax_stats),
-        curr_attn, reinterpret_cast<float2*>(curr_softmax_stats), cu_q_seq_len, merge_op, num_heads, head_size);
+        reinterpret_cast<float2*>(merged_softmax_stats), pre_attn, reinterpret_cast<float2 const*>(pre_softmax_stats),
+        curr_attn, reinterpret_cast<float2 const*>(curr_softmax_stats), cu_q_seq_len, merge_op, num_heads, head_size);
 }
 
 // load single chunk kv from kv_cache for each request
@@ -332,8 +333,8 @@ void invokeMLALoadChunkedKV(T* output_kv_ptr, T* output_k_pe_ptr, KVBlockArray c
 // kv {total_token, 2, H, uncompressed_h=128} 0 for k and 1 for v, k_pe {total_token, h=1, rope_h}
 // input kv and k_pe can be cached tokens or uncached tokens
 template <typename T>
-void invokeMLASetChunkedKV(T* output_kv, T* const kv, T* const k_pe, int const batch_size, int const max_seq_len,
-    int const num_heads, int uncompressed_head_size, int rope_size, int64_t* const cu_seq_lens,
+void invokeMLASetChunkedKV(T* output_kv, T const* kv, T const* k_pe, int const batch_size, int const max_seq_len,
+    int const num_heads, int uncompressed_head_size, int rope_size, int64_t const* cu_seq_lens,
     int const kv_cache_tokens_per_block, cudaStream_t stream)
 {
     using KT = setChunkedKVKernelTraits<T>;
@@ -348,16 +349,16 @@ void invokeMLASetChunkedKV(T* output_kv, T* const kv, T* const k_pe, int const b
 }
 
 #define INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(T)                                                                      \
-    template void invokeMergeAttnWithSoftmax<T>(T * merged_attn, float* merged_softmax_stats, T* const pre_attn,       \
-        float* const pre_softmax_stats, T* const curr_attn, float* const curr_softmax_stats, int const batch_size,     \
+    template void invokeMergeAttnWithSoftmax<T>(T * merged_attn, float* merged_softmax_stats, T const* pre_attn,       \
+        float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, int const batch_size,     \
         int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads,                  \
         int const head_size, cudaStream_t stream);                                                                     \
     template void invokeMLALoadChunkedKV<T>(T * output_kv_ptr, T * output_k_pe_ptr, KVBlockArray const& kv_cache,      \
         int const num_contexts, int64_t const* cu_ctx_chunked_len, int lora_size, int rope_size, int chunked_size,     \
         int chunked_idx, cudaStream_t stream);                                                                         \
-    template void invokeMLASetChunkedKV<T>(T * output_kv, T* const kv, T* const k_pe, int const batch_size,            \
+    template void invokeMLASetChunkedKV<T>(T * output_kv, T const* kv, T const* k_pe, int const batch_size,            \
         int const max_seq_len, int const num_heads, int uncompressed_head_size, int rope_size,                         \
-        int64_t* const cu_seq_lens, int const kv_cache_tokens_per_block, cudaStream_t stream);
+        int64_t const* cu_seq_lens, int const kv_cache_tokens_per_block, cudaStream_t stream);
 
 INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(half);
 INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(float);

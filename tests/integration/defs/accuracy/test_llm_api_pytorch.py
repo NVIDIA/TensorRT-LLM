@@ -1116,6 +1116,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         llm = LLM(model_path,
                   kv_cache_config=kv_cache_config,
                   enable_chunked_prefill=True,
+                  max_num_tokens=512,
                   **pytorch_config,
                   quant_config=quant_config,
                   enable_attention_dp=attention_dp,

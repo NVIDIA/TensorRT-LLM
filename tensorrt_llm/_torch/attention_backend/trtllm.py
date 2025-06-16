@@ -1038,6 +1038,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self,
         metadata: TrtllmAttentionMetadata,
         chunked_idx: int,
+        num_ctx_cached_tokens: int,
         cu_chunked_seq_len: torch.Tensor,
         out_dtype: torch.dtype,
     ) -> torch.Tensor:
@@ -1056,6 +1057,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         output_kv, output_k_pe = torch.ops.trtllm.load_chunked_kv_cache_for_mla(
             out_dtype,
             metadata.num_contexts,
+            num_ctx_cached_tokens,
             cu_chunked_seq_len,
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
@@ -1105,6 +1107,50 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.mla_params.qk_nope_head_dim,
             self.mla_params.qk_rope_head_dim,
             tokens_per_block,
+        )
+
+        max_block_num = (max_seq_len + tokens_per_block - 1) // tokens_per_block
+        assert paged_kv_offsets.shape == (num_contexts, 2, max_block_num)
+        return paged_kv_offsets
+
+    def set_chunked_kv_cache_for_mla(
+        self,
+        paged_kv: torch.Tensor,
+        kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        cu_chunked_seq_len: torch.Tensor,
+        cached: bool,
+        metadata: TrtllmAttentionMetadata,
+    ) -> torch.Tensor:
+        assert self.is_mla_enable and self.mla_params is not None
+        assert self.mla_params.qk_nope_head_dim == self.mla_params.v_head_dim
+        assert metadata.kv_cache_manager is not None
+        assert paged_kv.shape[0] == metadata.num_contexts
+        assert paged_kv.is_contiguous()
+
+        kv = kv.contiguous()
+        k_pe = k_pe.contiguous()
+
+        num_contexts = metadata.num_contexts
+        tokens_per_block = metadata.kv_cache_manager.tokens_per_block
+        if cached:
+            # this indptr is the fake.
+            cu_seq_len = cu_chunked_seq_len
+            max_seq_len = metadata.runtime_features.normal_chunk_size
+        else:
+            cu_seq_len = metadata.ctx_uncached_token_indptr
+            max_seq_len = metadata.max_ctx_seq_len
+        paged_kv_offsets = torch.ops.trtllm.set_chunked_kv_cache_for_mla(
+            paged_kv,
+            kv,
+            k_pe,
+            num_contexts,
+            cu_seq_len,
+            self.num_heads,
+            self.mla_params.qk_nope_head_dim,
+            self.mla_params.qk_rope_head_dim,
+            metadata.kv_cache_manager.tokens_per_block,
+            max_seq_len,
         )
 
         max_block_num = (max_seq_len + tokens_per_block - 1) // tokens_per_block
