@@ -283,6 +283,7 @@ def get_model(ckpt_path: str,
         model = AutoModel.from_pretrained(
             ckpt_path,
             device_map=device,
+            trust_remote_code=True,
         )
         model = model.language_model
     else:
