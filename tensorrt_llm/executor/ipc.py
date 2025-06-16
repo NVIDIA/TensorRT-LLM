@@ -273,7 +273,7 @@ class FusedIpcQueue:
             self.sending_queue.put_nowait(obj)
         else:
             batch = obj if isinstance(obj, list) else [obj]
-            self.queue.put(batch, serialized=serialized)
+            self.queue.put(batch)
 
     def get(self) -> Any:
         return self.queue.get()
