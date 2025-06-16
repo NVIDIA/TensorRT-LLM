@@ -8,11 +8,15 @@ context_servers:
   pipeline_parallel_size: 1
   kv_cache_config:
     free_gpu_memory_fraction: 0.2
+  cache_transceiver_config:
+    enable_cache_transceiver: True
   urls:
       - "localhost:8001"
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
+  cache_transceiver_config:
+    enable_cache_transceiver: True
   urls:
       - "localhost:8002"

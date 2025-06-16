@@ -14,6 +14,8 @@ context_servers:
     enable_block_reuse: True
     enable_partial_reuse: True
     event_buffer_max_size: 1024
+  cache_transceiver_config:
+    enable_cache_transceiver: True
   urls:
       - "localhost:8001"
 generation_servers:
@@ -27,5 +29,7 @@ generation_servers:
     enable_partial_reuse: True
     event_buffer_max_size: 1024
     free_gpu_memory_fraction: 0.05
+  cache_transceiver_config:
+    enable_cache_transceiver: True
   urls:
       - "localhost:8002"

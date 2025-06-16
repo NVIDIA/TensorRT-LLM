@@ -80,21 +80,15 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus)
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete);
 
-    py::enum_<tb::CacheTransceiver::CommType>(m, "CommType")
-        .value("UNKNOWN", tb::CacheTransceiver::CommType::UNKNOWN)
-        .value("MPI", tb::CacheTransceiver::CommType::MPI)
-        .value("UCX", tb::CacheTransceiver::CommType::UCX)
-        .value("NIXL", tb::CacheTransceiver::CommType::NIXL);
-
     py::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)
         .value("MLA", executor::kv_cache::CacheState::AttentionType::kMLA);
 
     py::classh<tb::CacheTransceiver, tb::BaseCacheTransceiver>(m, "CacheTransceiver")
-        .def(py::init<tb::kv_cache_manager::BaseKVCacheManager*, tb::CacheTransceiver::CommType,
-                 std::vector<SizeType32>, SizeType32, SizeType32, runtime::WorldConfig, nvinfer1::DataType,
-                 executor::kv_cache::CacheState::AttentionType, std::optional<executor::CacheTransceiverConfig>>(),
-            py::arg("cache_manager"), py::arg("comm_type"), py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"),
+        .def(py::init<tb::kv_cache_manager::BaseKVCacheManager*, std::vector<SizeType32>, SizeType32, SizeType32,
+                 runtime::WorldConfig, nvinfer1::DataType, executor::kv_cache::CacheState::AttentionType,
+                 std::optional<executor::CacheTransceiverConfig>>(),
+            py::arg("cache_manager"), py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"),
             py::arg("tokens_per_block"), py::arg("world_config"), py::arg("dtype"), py::arg("attention_type"),
             py::arg("cache_transceiver_config") = std::nullopt);
 
