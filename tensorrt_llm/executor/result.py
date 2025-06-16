@@ -295,7 +295,7 @@ class GenerationResultBase:
 
             response_result = response.result
             if hasattr(response_result, "_result"):
-                response_result = tllm.deserialize_result(
+                response_result._result = tllm.deserialize_result(
                     response_result._result)
 
             self._done = response_result.is_final
