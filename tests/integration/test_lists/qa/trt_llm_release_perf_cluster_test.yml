@@ -59,5 +59,13 @@ trt_llm_release_perf_cluster_test:
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:512-input_output_len:128,128-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8] #min latency test
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8] #min latency test
-  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-tp:8-gpus:8] #max throughput test
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-tp:8-gpus:8] TIMEOUT (120) #max throughput test
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-tp:8-gpus:8] #max throughput test
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct-bench-pytorch-bfloat16-input_output_len:128,128-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct-bench-pytorch-bfloat16-input_output_len:500,2000-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct-bench-pytorch-bfloat16-input_output_len:2000,500-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct-bench-pytorch-streaming-bfloat16-input_output_len:2000,500-ep:8-tp:8-gpus:8] TIMEOUT (40)
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-bfloat16-input_output_len:128,128-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-bfloat16-input_output_len:500,2000-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-bfloat16-input_output_len:2000,500-ep:8-tp:8-gpus:8] TIMEOUT (40)
+  - perf/test_perf.py::test_perf[llama_v4_maverick_17b_128e_instruct_fp8-bench-pytorch-streaming-bfloat16-input_output_len:2000,500-ep:8-tp:8-gpus:8]
