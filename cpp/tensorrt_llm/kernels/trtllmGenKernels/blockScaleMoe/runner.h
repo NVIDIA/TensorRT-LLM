@@ -131,7 +131,7 @@ public:
     [[nodiscard]] bool isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens) const;
 
-    [[nodiscard]] std::vector<int32_t> getPassingConfigIndices() const;
+    [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
     void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale, void* expertWeights,
         float* outputScalesScalar, float* outputScalesGateScalar, void* output, void* outputScale, int32_t topK,
@@ -164,7 +164,7 @@ public:
     [[nodiscard]] bool isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens) const;
 
-    [[nodiscard]] std::vector<int32_t> getPassingConfigIndices() const;
+    [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
     void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight, void* weightScale,
         float* outputScalesScalar, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,

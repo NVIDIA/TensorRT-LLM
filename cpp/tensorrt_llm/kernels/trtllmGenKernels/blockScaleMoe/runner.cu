@@ -272,7 +272,7 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
     return isValid;
 }
 
-std::vector<int32_t> Runner::getPassingConfigIndices() const
+std::vector<int64_t> Runner::getPassingConfigIndices() const
 {
     return mRunner.getPassingConfigIndices();
 }
@@ -347,7 +347,7 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
     return isValid;
 }
 
-std::vector<int32_t> Runner::getPassingConfigIndices() const
+std::vector<int64_t> Runner::getPassingConfigIndices() const
 {
     return mRunner.getPassingConfigIndices();
 }
