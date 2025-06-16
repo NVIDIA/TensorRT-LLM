@@ -5,14 +5,25 @@ Depending on your deployment environment, this can be done in different ways.
 
 ## Launching context and generation servers using multiple independent `trtllm-serve` commands
 
+We use the `cache_transceiver_config` configuration to set up disaggregated serving, which includes the following parameters:
+
+```
+cache_transceiver_config:
+  enable_cache_transceiver: <bool>
+  comm_type: <str>
+  max_num_tokens: <int>
+```
+Setting `enable_cache_transceiver` to `True` is required for disaggregated serving.
+`comm_type` specifies the communication backend for transferring the kvCache, valid options include `UCX`, `NIXL`, and `MPI`, the default option is `UCX`.
+`max_num_tokens` defines the buffer size for kvCache transfers. For optimal performance, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests.
+
 You can use multiple `trtllm-serve` commands to launch the context and generation servers that will be used
 for disaggregated serving. For example, you could launch two context servers and one generation servers as follows:
 
 ```
-echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  max_num_tokens: 2048" > context_extra-llm-api-config.yml
-echo -e "cache_transceiver_config:\n  max_num_tokens: 2048" > gen_extra-llm-api-config.yml
+echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  enable_cache_transceiver: True\n  comm_type: UCX\n  max_num_tokens: 2048" > context_extra-llm-api-config.yml
+echo -e "cache_transceiver_config:\n  enable_cache_transceiver: True\n  comm_type: UCX\n  max_num_tokens: 2048" > gen_extra-llm-api-config.yml
 
-export TRTLLM_USE_UCX_KVCACHE=1
 #Context servers
 CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_0 &
 CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_1 &
@@ -49,7 +60,6 @@ Clients can then send requests to the disaggregated server at `localhost:8000`, 
 
 One can also launch all context and generation servers using MPI. This can be done by issuing the following command:
 ```
-export TRTLLM_USE_MPI_KVCACHE=1
 mpirun -n <total_num_ranks> trtllm-serve disaggregated_mpi_worker -c disagg_config.yaml
 ```
 where `<total_num_ranks>` is the sum of `TP*PP` for all context and generation servers. For the example above, `total_num_ranks` is 3
@@ -69,6 +79,8 @@ context_servers:
   num_instances: 2
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
+  cache_transceiver_config:
+    enable_cache_transceiver: True
   kv_cache_config:
     free_gpu_memory_fraction: 0.9
   urls:
@@ -78,6 +90,8 @@ generation_servers:
   num_instances: 1
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
+  cache_transceiver_config:
+    enable_cache_transceiver: True
   urls:
       - "localhost:8003"
 ```
@@ -102,3 +116,6 @@ Or using the provided client parsing the prompts from a file and sending request
 ```
 python3 ./clients/disagg_client.py -c disagg_config.yaml -p ./clients/prompts.json -e chat
 ```
+## Know Issues
+
+The MPI communication backend for kvCache transfer has been deprecated and may not be supported in the future. When using the MPI backend, the environment variable `TRTLLM_USE_MPI_KVCACHE=1` should be set to avoid conflicts between mpi4py and kvCache transfer.
