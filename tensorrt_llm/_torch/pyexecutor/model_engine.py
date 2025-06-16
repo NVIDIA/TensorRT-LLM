@@ -19,6 +19,7 @@ import psutil
 import safetensors
 import torch
 import torch._dynamo.config
+import tqdm
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
@@ -180,10 +181,32 @@ def load_weights(checkpoint_dir: str):
                 f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
             )
             prefetch_files(weight_files)
-        for file in weight_files:
-            logger.info(f"Loading {file}")
-            part_weights = safetensors.torch.load_file(file)
-            weights.update(part_weights)
+
+        def load_safetensors_file(file):
+            return safetensors.torch.load_file(file)
+
+        pbar = tqdm.tqdm(total=len(weight_files),
+                         desc="Loading safetensors weights in parallel")
+        # Use ThreadPoolExecutor to load weights concurrently
+        from concurrent import futures
+        with futures.ThreadPoolExecutor() as executor:
+            # Submit all file loading tasks
+            future_to_file = {
+                executor.submit(load_safetensors_file, file): file
+                for file in weight_files
+            }
+
+            # Process completed tasks as they finish
+            for future in futures.as_completed(future_to_file):
+                file = future_to_file[future]
+                try:
+                    part_weights = future.result()
+                    weights.update(part_weights)
+                    pbar.update(1)
+                except Exception as e:
+                    logger.error(f"Error loading {file}: {str(e)}")
+                    raise
+
         return weights
 
     weight_files = glob.glob(f"{checkpoint_dir}/*.bin")
@@ -191,8 +214,8 @@ def load_weights(checkpoint_dir: str):
         weight_files = glob.glob(f"{checkpoint_dir}/*.pth")
 
     if weight_files:
-        for file in weight_files:
-            # try mmap first, if failed, turn off mmap
+
+        def load_bin_file(file):
             try:
                 part_weights = torch.load(file,
                                           weights_only=True,
@@ -206,7 +229,28 @@ def load_weights(checkpoint_dir: str):
                                           weights_only=True,
                                           map_location='cpu',
                                           mmap=False)
-            weights.update(part_weights)
+            finally:
+                return part_weights
+
+        pbar = tqdm.tqdm(total=len(weight_files),
+                         desc="Loading bin weights in parallel")
+        with futures.ThreadPoolExecutor() as executor:
+            future_to_file = {
+                executor.submit(load_bin_file, file): file
+                for file in weight_files
+            }
+
+            # Process completed tasks as they finish
+            for future in futures.as_completed(future_to_file):
+                file = future_to_file[future]
+                try:
+                    part_weights = future.result()
+                    weights.update(part_weights)
+                    pbar.update(1)
+                except Exception as e:
+                    logger.error(f"Error loading {file}: {str(e)}")
+                    raise
+
         return weights
 
     raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
@@ -1013,6 +1057,7 @@ class PyTorchModelEngine(ModelEngine):
                         return t
                     if t not in memo:
                         memo[t] = torch.empty_like(t, device='cuda')
+                        # logger.info(f"init_meta_tensor: {memo[t].device}")
                     return memo[t]
 
                 model._apply(init_meta_tensor)

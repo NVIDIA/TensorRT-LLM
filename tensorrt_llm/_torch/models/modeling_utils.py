@@ -1,5 +1,6 @@
 import contextlib
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Dict, Generic, List, Optional, Tuple, Type, TypeVar, Union
@@ -655,30 +656,29 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         'gate_up_proj': ['gate_proj', 'up_proj']
     }
 
-    for name, module in tqdm(list(model.named_modules()),
-                             desc="Loading weights"):
+    def load_single_module(name, module):
         if len(module._parameters) > 0:
             # skip load weights if module is in skip_modules
             if any(skip_module in name for skip_module in skip_modules):
-                continue
+                return
 
             # skip load weights if tie word embeddings is enabled and layer is lm_head
             if model.config.tie_word_embeddings and name.startswith("lm_head"):
-                continue
+                return
 
             # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values
             if hasattr(model, "model") and hasattr(
                     model.model, 'has_custom_embed_tokens'
             ) and model.model.has_custom_embed_tokens and name == "model.embed_tokens":
-                continue
+                return
             if hasattr(model, 'has_custom_lm_head'
                        ) and model.has_custom_lm_head and name == "lm_head":
-                continue
+                return
 
             names = name.split('.')
             # WAR: better solution is that llama has its own load_weights function.
             if names[-1] == 'next_layer_layernorm':
-                continue
+                return
             if names[-1] in params_map:
                 module_weights = []
                 for new_name in params_map[names[-1]]:
@@ -704,3 +704,24 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                     for n, p in module._parameters.items():
                         if p is not None:
                             p.data.copy_(module_weights[n][:])
+
+    if os.environ.get("TRT_LLM_LOAD_WEIGHTS_IN_PARALLEL", False):
+        from concurrent import futures
+
+        # TODO use a better way to get the number of max workers
+        with futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [
+                executor.submit(load_single_module, name, module)
+                for name, module in tqdm(list(model.named_modules()),
+                                         desc="Loading weights")
+            ]
+            pbar = tqdm(list(model.named_modules()), desc="Loading weights")
+
+            for future in futures:
+                future.result()
+                pbar.update(1)
+
+    else:
+        for name, module in tqdm(list(model.named_modules()),
+                                 desc="Loading weights"):
+            load_single_module(name, module)
