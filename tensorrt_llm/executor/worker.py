@@ -32,11 +32,13 @@ from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
-                              PostprocWorkerConfig, postproc_worker_main)
+                              PostprocWorkerConfig,
+                              make_postproc_inputs_serialize_friendly,
+                              postproc_worker_main)
 from .request import (CancellingRequest, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import (GenerationResult, IterationResult, LogProbsResult,
-                     ResponseWrapper, compute_logprobs)
+                     ResponseWrapper, compute_logprobs, is_llm_response)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs, has_event_loop)
 
@@ -870,19 +872,13 @@ class AwaitResponseHelper:
 
     def handle_for_ipc_batched(self, responses: List[tllm.Response]) -> None:
         ''' Perform the IPC in batch explicitly. '''
-        postproc_batches = None
-        rsp_batch = None
-        if self.enable_postprocprocess_parallel:
-            postproc_batches = [[] for _ in range(
-                self.worker.postproc_config.num_postprocess_workers)]
-        else:
-            rsp_batch = []
-
-        # postproc_batches = [
-        #     []
-        #     for _ in range(self.worker.postproc_config.num_postprocess_workers)
-        # ] if self.enable_postprocprocess_parallel else None
-        # rsp_batch = [] if not self.enable_postprocprocess_parallel else None
+        from tensorrt_llm._torch.pyexecutor.llm_request import (
+            LlmResponse, make_llm_responses_serialize_friendly)
+        postproc_batches = [
+            []
+            for _ in range(self.worker.postproc_config.num_postprocess_workers)
+        ] if self.enable_postprocprocess_parallel else None
+        rsp_batch = [] if not self.enable_postprocprocess_parallel else None
 
         for response in responses:
 
@@ -910,97 +906,37 @@ class AwaitResponseHelper:
         if postproc_batches:
             for wid, batch in enumerate(postproc_batches):
                 if batch:
-                    response_list = []
-                    py_result_list = []
-                    sampling_params_list = []
-                    postproc_params_list = []
-                    streaming_list = []
-                    for r in batch:
-                        response_list.append(r.rsp._response)
-                        py_result_list.append(r.rsp._py_result)
-                        sampling_params_list.append(r.sampling_params)
-                        postproc_params_list.append(r.postproc_params)
-                        streaming_list.append(r.streaming)
-                    response_list = ResponseList(response_list)
-                    py_params_list = PostprocInputsPyParams(
-                        py_result_list, sampling_params_list,
-                        postproc_params_list, streaming_list)
-                    packed_postproc_inputs = PackedPostprocInputs(
-                        response_list, py_params_list)
-                    self.worker.postproc_queues[wid].put(packed_postproc_inputs)
+                    postproc_inputs = []
+                    other_responses = []
+                    for rsp in batch:
+                        if isinstance(rsp.rsp, LlmResponse):
+                            postproc_inputs.append(rsp)
+                        else:
+                            # Handle ErrorResponse and ResponseWrapper
+                            other_responses.append(rsp)
+                    self.worker.postproc_queues[wid].put({
+                        "postproc_inputs":
+                        make_postproc_inputs_serialize_friendly(
+                            postproc_inputs),
+                        "other_responses":
+                        other_responses
+                    })
 
         if rsp_batch:
-            response_list = ResponseList([r._response for r in rsp_batch])
-            py_result_list = PyResultsList([r._py_result for r in rsp_batch])
-            packed_responses = PackedResponses(response_list, py_result_list)
-            self.worker.result_queue.put(packed_responses)
-            # self.worker.result_queue.put(rsp_batch)
-
-
-class ResponseList:
-
-    def __init__(self, responses):
-        self._responses = responses
-
-    def __reduce__(self):
-        return (ResponseList.deserialize, (self.serialize(), ))
-
-    def serialize(self):
-        return tllm.serialize_responses(self._responses)
-
-    @staticmethod
-    def deserialize(s):
-        # convert string back to list
-        responses = tllm.deserialize_responses(s)
-        return ResponseList(responses)
-
-
-class PyResultsList:
-
-    def __init__(self, py_results):
-        self._py_results = py_results
-
-
-class PackedResponses:
-
-    def __init__(self, response_list, py_result_list):
-        self._response_list = response_list
-        self._py_result_list = py_result_list
-
-    def __getstate__(self):
-        return self._response_list, self._py_result_list
-
-    def __setstate__(self, state):
-        self._response_list, self._py_result_list = state
-
-
-class PostprocInputsPyParams:
-
-    def __init__(self, py_result_list, sampling_params_list,
-                 postproc_params_list, streaming_list):
-        self.py_result_list = py_result_list
-        self._sampling_params_list = sampling_params_list
-        self._postproc_params_list = postproc_params_list
-        self._streaming_list = streaming_list
-
-    def __getstate__(self):
-        return self.py_result_list, self._sampling_params_list, self._postproc_params_list, self._streaming_list
-
-    def __setstate__(self, state):
-        self.py_result_list, self._sampling_params_list, self._postproc_params_list, self._streaming_list = state
-
-
-class PackedPostprocInputs:
-
-    def __init__(self, response_list, py_params_list):
-        self._response_list = response_list
-        self._py_params_list = py_params_list
-
-    def __getstate__(self):
-        return self._response_list, self._py_params_list
-
-    def __setstate__(self, state):
-        self._response_list, self._py_params_list = state
+            llm_responses = []
+            other_responses = []
+            for rsp in rsp_batch:
+                if isinstance(rsp, LlmResponse):
+                    llm_responses.append(rsp)
+                else:
+                    # Handle ErrorResponse and ResponseWrapper
+                    other_responses.append(rsp)
+            self.worker.result_queue.put({
+                "llm_responses":
+                make_llm_responses_serialize_friendly(llm_responses),
+                "other_responses":
+                other_responses
+            })
 
 
 def _get_params_for_first_rsp(

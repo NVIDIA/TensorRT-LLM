@@ -153,11 +153,12 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.request_queue.put(CancellingRequest(request_id))
 
     def dispatch_result_task(self) -> bool:
-        from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse
+        from tensorrt_llm._torch.pyexecutor.llm_request import \
+            restore_llm_responses_from_serialize_friendly_list
 
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
-        if (res := self.result_queue.get()) is None:
+        if (res := self.result_queue.get()) is None or res[0] is None:
             return False  # shutdown the thread
 
         async_queues = []
@@ -181,19 +182,9 @@ class GenerationExecutorProxy(GenerationExecutor):
                     res, ErrorResponse):
                 self._results.pop(client_id)
 
-        if isinstance(res[0], PostprocWorker.Output):
-            pass
-        else:
-            unpacked_res = []
-            assert len(res[0]._response_list._responses) == len(
-                res[0]._py_result_list._py_results), \
-                "Response list and PyResult list should have the same length"
-            for response, py_result in zip(res[0]._response_list._responses,
-                                           res[0]._py_result_list._py_results):
-                unpacked_res.append(LlmResponse(response, py_result))
-            res = unpacked_res
-
-        # res = res if isinstance(res, list) else [res]
+        if not isinstance(res[0], PostprocWorker.Output):
+            res = restore_llm_responses_from_serialize_friendly_list(
+                res[0]["llm_responses"]) + res[0]["other_responses"]
 
         for i in res:
             global_tracer().log_instant("IPC.get")

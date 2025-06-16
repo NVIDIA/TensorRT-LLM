@@ -252,6 +252,74 @@ class LlmResponse:
         return getattr(self._response, item)
 
 
+class ResponseList:
+    """ResponseList wraps a list of `Response` objects and provides fast serialization support.
+    It is used to serialize and deserialize a list/dict of LlmResponse objects by calling
+    `serialize` and `deserialize` methods exposed from C++ through Pybind11.
+    """
+
+    def __init__(self,
+                 responses: list[tensorrt_llm.bindings.executor.Response]):
+        self.responses = responses
+
+    def __reduce__(self):
+        return (ResponseList.deserialize, (self.serialize(), ))
+
+    def serialize(self):
+        return tensorrt_llm.bindings.executor.serialize_responses(
+            self.responses)
+
+    @staticmethod
+    def deserialize(responses):
+        responses = tensorrt_llm.bindings.executor.deserialize_responses(
+            responses)
+        return ResponseList(responses)
+
+
+def make_llm_responses_serialize_friendly(
+        responses: tuple[list[LlmResponse], dict[int, LlmResponse]]) -> dict:
+    """Converts a list or dict of LlmResponse objects into a serialize-friendly format
+    `ResponseList` that can be quickly serialized and deserialized.
+    """
+
+    if isinstance(responses, list):
+        return {
+            "response_list": ResponseList([r._response for r in responses]),
+            "py_result_list": [r._py_result for r in responses],
+        }
+    elif isinstance(responses, dict):
+        return {
+            "req_id_list": list(responses.keys()),
+            "response_list":
+            ResponseList([r._response for r in responses.values()]),
+            "py_result_list": [r._py_result for r in responses.values()],
+        }
+
+
+def restore_llm_responses_from_serialize_friendly_list(
+        responses: dict) -> list[LlmResponse]:
+    """
+    Restore a list of `LlmResponse` objects from a serialize-friendly format.
+    """
+    return [
+        LlmResponse(response, py_result) for response, py_result in zip(
+            responses["response_list"].responses, responses["py_result_list"])
+    ]
+
+
+def restore_llm_responses_from_serialize_friendly_dict(
+        responses: dict) -> dict[int, LlmResponse]:
+    """
+    Restore a dict of LlmResponse objects from a serialize-friendly format.
+    """
+    llm_responses = {}
+    for request_id, response, py_result in zip(
+            responses["req_id_list"], responses["response_list"].responses,
+            responses["py_result_list"]):
+        llm_responses[request_id] = LlmResponse(response, py_result)
+    return llm_responses
+
+
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     """LlmRequest wraps `bindings.internal.batch_manager.LlmRequest`
     but detour some features to Python implementation"""
