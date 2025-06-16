@@ -16,6 +16,7 @@
 
 import datetime
 import os
+import platform
 import re
 import shutil
 import subprocess as sp
@@ -36,6 +37,7 @@ import yaml
 from _pytest.mark import ParameterSet
 
 from tensorrt_llm.bindings import ipc_nvls_supported
+from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
 from .perf.gpu_clock_lock import GPUClockLock
 from .perf.session_data_writer import SessionDataWriter
@@ -283,7 +285,6 @@ def gemma_example_root(llm_root, llm_venv):
     # and caused pipeline to fail. We manually install gemma dependency as a WAR.
     llm_venv.run_cmd(["-m", "pip", "install", "safetensors~=0.4.1", "nltk"])
     # Install Jax because it breaks dependency
-    import platform
     google_extension = [
         "-f",
         "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
@@ -1722,8 +1723,6 @@ def qcache_dir(llm_venv, llm_root):
 
     quantization_root = os.path.join(llm_root, "examples", "quantization")
 
-    import platform
-
     # Fix the issue that the requirements.txt is not available on aarch64.
     if "aarch64" not in platform.machine() and get_sm_version() >= 89:
         llm_venv.run_cmd([
@@ -1814,6 +1813,19 @@ def skip_by_device_count(request):
 
 
 @pytest.fixture(autouse=True)
+def skip_by_mpi_world_size(request):
+    "fixture for skip less device count"
+    if request.node.get_closest_marker('skip_less_mpi_world_size'):
+        mpi_world_size = get_mpi_world_size()
+        expected_count = request.node.get_closest_marker(
+            'skip_less_mpi_world_size').args[0]
+        if expected_count > int(mpi_world_size):
+            pytest.skip(
+                f'MPI world size {mpi_world_size} is less than {expected_count}'
+            )
+
+
+@pytest.fixture(autouse=True)
 def skip_by_device_memory(request):
     "fixture for skip less device memory"
     if request.node.get_closest_marker('skip_less_device_memory'):
@@ -1874,7 +1886,11 @@ skip_no_hopper = pytest.mark.skipif(
     reason="This test is only  supported in Hopper architecture")
 
 skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
-                                   reason="This test is for Blackwell SM120")
+                                   reason="This test is for SM120")
+
+skip_arm = pytest.mark.skipif(
+    "aarch64" in platform.machine(),
+    reason="This test is not supported on ARM architecture")
 
 
 def skip_fp8_pre_ada(use_fp8):

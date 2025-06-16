@@ -71,143 +71,6 @@ RuntimeBuffers::RuntimeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
 
 RuntimeBuffers::~RuntimeBuffers() = default;
 
-void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
-    bool gatherGenerationLogits)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    NVTX3_SCOPED_RANGE(runtimeBuffersReshape);
-
-    if (worldConfig.isLastPipelineParallelRank())
-    {
-        auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
-
-        if (modelConfig.computeContextLogits() && (numContextRequests > 0))
-        {
-            // Only when need to return context logits, and there are new requests will execute context phase,
-            // logits buffer need to be re-allocated with size of [numContextTokens + numGenSequences, vocabSizePadded]
-            auto const& engine = runtime.getEngine();
-            auto const& manager = runtime.getBufferManager();
-            auto const logitsType = engine.getTensorDataType(kLogitsTensorName);
-            logits = manager.gpu(ITensor::makeShape({numContextTokens + numGenSequences, vocabSizePadded}), logitsType);
-        }
-        else if (gatherGenerationLogits && modelConfig.getSpeculativeDecodingMode().isNone())
-        {
-            // If need to return generation logits, re-point the logit buffer to avoid overwrite,
-            // so we could write back GenerationLogitsCache::kCACHE_LENGTH steps' logits together
-            // logits shape: [1, maxBatchSize * maxBeamWidth, vocabSizePadded]
-            // which is large enough to cover both numContextRequests and numGenSequences
-            logits = ITensor::slice(generationLogitsCache.logits, generationLogitsCache.offset, 1);
-            generationLogitsCache.offset = (generationLogitsCache.offset + 1) % GenerationLogitsCache::kCACHE_LENGTH;
-            logits->squeeze(0);
-        }
-        else
-        {
-            logits->reshape(ITensor::makeShape({numLogits, vocabSizePadded}));
-        }
-    }
-
-    auto const numSequences = getNumSequences();
-    auto const numSequencesShape = ITensor::makeShape({numSequences});
-    requestTypes->reshape(numSequencesShape);
-    contextLengthsHost->reshape(numSequencesShape);
-    contextLengthsDevice->reshape(numSequencesShape);
-    sequenceLengthsHost->reshape(numSequencesShape);
-    sequenceLengthsDevice->reshape(numSequencesShape);
-
-    auto const numLogitsShape = ITensor::makeShape({numLogits});
-    lastTokenIdsHost->reshape(numLogitsShape);
-    lastTokenIdsDevice->reshape(numLogitsShape);
-    logitsIdsHost->reshape(numLogitsShape);
-
-    if (transformerBuffers)
-    {
-        transformerBuffers->reshape(numSequences, numContextTokens + numGenTokens);
-    }
-
-    if (rnnStateBuffers)
-    {
-        rnnStateBuffers->reshape(numSequences);
-    }
-
-    if (modelConfig.useCrossAttention())
-    {
-        encoderBuffers->reshape();
-    }
-
-    if (modelConfig.useLoraPlugin())
-    {
-        loraBuffers->reshape(numSequences);
-    }
-
-    if (medusaBuffers)
-    {
-        medusaBuffers->reshape(
-            numContextRequests, numGenRequests, modelConfig.getSpeculativeDecodingModulePtr()->getMaxDecodingTokens());
-    }
-
-    if (lookaheadBuffers && modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
-    {
-        lookaheadBuffers->reshape(
-            numContextRequests, numGenRequests, modelConfig.getSpeculativeDecodingModulePtr()->getMaxDecodingTokens());
-    }
-
-    if (explicitDraftTokensBuffers)
-    {
-        explicitDraftTokensBuffers->reshape(numContextRequests, numGenRequests, modelConfig);
-    }
-
-    if (eagleBuffers)
-    {
-        eagleBuffers->reshape(numContextRequests, numGenRequests, modelConfig);
-    }
-
-    auto const numRequests = getNumRequests();
-    auto const numRequestsShape = ITensor::makeShape({numRequests});
-    seqSlots->reshape(numRequestsShape);
-    seqSlotsDevice->reshape(numRequestsShape);
-    sortedSeqSlots->reshape(numRequestsShape);
-    seqSlotRemappingHost->reshape(numRequestsShape);
-    seqSlotRemappingDevice->reshape(numRequestsShape);
-
-    auto const numTokens = getNumTokens();
-    inputsIds->reshape(ITensor::makeShape({numTokens}));
-
-    if (modelConfig.useMrope())
-    {
-        auto const mropeRotaryCosSinSize = modelConfig.getMaxPositionEmbeddings() * modelConfig.getRotaryEmbeddingDim();
-        mropeRotaryCosSin->reshape(ITensor::makeShape({numSequences, mropeRotaryCosSinSize}));
-        mropePositionDeltas->reshape(ITensor::makeShape({numSequences, 1}));
-    }
-
-    if (worldConfig.isPipelineParallel())
-    {
-        auto const hiddenSize = (!modelConfig.getPpReduceScatter() || worldConfig.isFirstPipelineParallelRank())
-            ? modelConfig.getHiddenSize() * worldConfig.getTensorParallelism()
-            : modelConfig.getHiddenSize();
-
-        auto const hiddenStatesShape = ITensor::makeShape({numTokens, hiddenSize});
-        hiddenStates->reshape(hiddenStatesShape);
-    }
-
-    if (modelConfig.useLanguageAdapter())
-    {
-        languageAdapterRoutings->reshape(ITensor::makeShape({numTokens, 1}));
-    }
-
-    for (auto const& outputTensor : mAdditionalOutputTensors)
-    {
-        auto const& [name, tensor] = outputTensor;
-        auto const& engine = runtime.getEngine();
-        auto shape = engine.getTensorShape(name.c_str());
-        TLLM_CHECK_WITH_INFO(
-            shape.d[0] == -1, "First dimension of additional output tensor '%s' must be dynamic", name.c_str());
-        shape.d[0] = numTokens;
-        tensor->reshape(shape);
-    }
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
 void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLen,
     TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
@@ -318,21 +181,23 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
 
     if (modelConfig.getSpeculativeDecodingMode().isMedusa())
     {
-        medusaBuffers = std::make_unique<MedusaBuffers>(
+        mMedusaBuffers = std::make_unique<MedusaBuffers>(
             maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig, decodingConfig, runtime);
     }
     else if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
     {
-        lookaheadBuffers.emplace(
+        mLookaheadBuffers = std::make_unique<runtime::LookaheadRuntimeBuffers>(
             maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig, decodingConfig, runtime);
     }
     else if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
     {
-        explicitDraftTokensBuffers.emplace(maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig);
+        mExplicitDraftTokensBuffers = std::make_unique<runtime::ExplicitDraftTokensBuffers>(
+            maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig);
     }
     else if (modelConfig.getSpeculativeDecodingMode().isEagle())
     {
-        eagleBuffers.emplace(maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig, decodingConfig);
+        mEagleBuffers = std::make_unique<runtime::EagleBuffers>(
+            maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig, decodingConfig);
     }
 
     if (modelConfig.useLanguageAdapter())
@@ -424,6 +289,143 @@ void RuntimeBuffers::setBufferSizes(RequestVector const& contextRequests, Reques
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    bool gatherGenerationLogits)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(runtimeBuffersReshape);
+
+    if (worldConfig.isLastPipelineParallelRank())
+    {
+        auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
+
+        if (modelConfig.computeContextLogits() && (numContextRequests > 0))
+        {
+            // Only when need to return context logits, and there are new requests will execute context phase,
+            // logits buffer need to be re-allocated with size of [numContextTokens + numGenSequences, vocabSizePadded]
+            auto const& engine = runtime.getEngine();
+            auto const& manager = runtime.getBufferManager();
+            auto const logitsType = engine.getTensorDataType(kLogitsTensorName);
+            logits = manager.gpu(ITensor::makeShape({numContextTokens + numGenSequences, vocabSizePadded}), logitsType);
+        }
+        else if (gatherGenerationLogits && modelConfig.getSpeculativeDecodingMode().isNone())
+        {
+            // If need to return generation logits, re-point the logit buffer to avoid overwrite,
+            // so we could write back GenerationLogitsCache::kCACHE_LENGTH steps' logits together
+            // logits shape: [1, maxBatchSize * maxBeamWidth, vocabSizePadded]
+            // which is large enough to cover both numContextRequests and numGenSequences
+            logits = ITensor::slice(generationLogitsCache.logits, generationLogitsCache.offset, 1);
+            generationLogitsCache.offset = (generationLogitsCache.offset + 1) % GenerationLogitsCache::kCACHE_LENGTH;
+            logits->squeeze(0);
+        }
+        else
+        {
+            logits->reshape(ITensor::makeShape({numLogits, vocabSizePadded}));
+        }
+    }
+
+    auto const numSequences = getNumSequences();
+    auto const numSequencesShape = ITensor::makeShape({numSequences});
+    requestTypes->reshape(numSequencesShape);
+    contextLengthsHost->reshape(numSequencesShape);
+    contextLengthsDevice->reshape(numSequencesShape);
+    sequenceLengthsHost->reshape(numSequencesShape);
+    sequenceLengthsDevice->reshape(numSequencesShape);
+
+    auto const numLogitsShape = ITensor::makeShape({numLogits});
+    lastTokenIdsHost->reshape(numLogitsShape);
+    lastTokenIdsDevice->reshape(numLogitsShape);
+    logitsIdsHost->reshape(numLogitsShape);
+
+    if (transformerBuffers)
+    {
+        transformerBuffers->reshape(numSequences, numContextTokens + numGenTokens);
+    }
+
+    if (rnnStateBuffers)
+    {
+        rnnStateBuffers->reshape(numSequences);
+    }
+
+    if (modelConfig.useCrossAttention())
+    {
+        encoderBuffers->reshape();
+    }
+
+    if (modelConfig.useLoraPlugin())
+    {
+        loraBuffers->reshape(numSequences);
+    }
+
+    if (mMedusaBuffers)
+    {
+        mMedusaBuffers->reshape(
+            numContextRequests, numGenRequests, modelConfig.getSpeculativeDecodingModulePtr()->getMaxDecodingTokens());
+    }
+
+    if (mLookaheadBuffers && modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
+    {
+        mLookaheadBuffers->reshape(
+            numContextRequests, numGenRequests, modelConfig.getSpeculativeDecodingModulePtr()->getMaxDecodingTokens());
+    }
+
+    if (mExplicitDraftTokensBuffers)
+    {
+        mExplicitDraftTokensBuffers->reshape(numContextRequests, numGenRequests, modelConfig);
+    }
+
+    if (mEagleBuffers)
+    {
+        mEagleBuffers->reshape(numContextRequests, numGenRequests, modelConfig);
+    }
+
+    auto const numRequests = getNumRequests();
+    auto const numRequestsShape = ITensor::makeShape({numRequests});
+    seqSlots->reshape(numRequestsShape);
+    seqSlotsDevice->reshape(numRequestsShape);
+    sortedSeqSlots->reshape(numRequestsShape);
+    seqSlotRemappingHost->reshape(numRequestsShape);
+    seqSlotRemappingDevice->reshape(numRequestsShape);
+
+    auto const numTokens = getNumTokens();
+    inputsIds->reshape(ITensor::makeShape({numTokens}));
+
+    if (modelConfig.useMrope())
+    {
+        auto const mropeRotaryCosSinSize = modelConfig.getMaxPositionEmbeddings() * modelConfig.getRotaryEmbeddingDim();
+        mropeRotaryCosSin->reshape(ITensor::makeShape({numSequences, mropeRotaryCosSinSize}));
+        mropePositionDeltas->reshape(ITensor::makeShape({numSequences, 1}));
+    }
+
+    if (worldConfig.isPipelineParallel())
+    {
+        auto const hiddenSize = (!modelConfig.getPpReduceScatter() || worldConfig.isFirstPipelineParallelRank())
+            ? modelConfig.getHiddenSize() * worldConfig.getTensorParallelism()
+            : modelConfig.getHiddenSize();
+
+        auto const hiddenStatesShape = ITensor::makeShape({numTokens, hiddenSize});
+        hiddenStates->reshape(hiddenStatesShape);
+    }
+
+    if (modelConfig.useLanguageAdapter())
+    {
+        languageAdapterRoutings->reshape(ITensor::makeShape({numTokens, 1}));
+    }
+
+    for (auto const& outputTensor : mAdditionalOutputTensors)
+    {
+        auto const& [name, tensor] = outputTensor;
+        auto const& engine = runtime.getEngine();
+        auto shape = engine.getTensorShape(name.c_str());
+        TLLM_CHECK_WITH_INFO(
+            shape.d[0] == -1, "First dimension of additional output tensor '%s' must be dynamic", name.c_str());
+        shape.d[0] = numTokens;
+        tensor->reshape(shape);
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void RuntimeBuffers::prepareBuffersForCudaGraph(SizeType32 maxSequenceLength)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -450,7 +452,7 @@ void RuntimeBuffers::prepareBuffersForCudaGraph(SizeType32 maxSequenceLength)
 
 void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, RequestVector const& genRequests,
     SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers,
-    kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
+    runtime::decoder::DecoderState const& decoderState, kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
     kv_cache_manager::BaseKVCacheManager* crossKvCacheManagerPtr,
     rnn_state_manager::RnnStateManager* rnnStateManagerPtr, PeftTable const& peftTable,
     runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
@@ -761,8 +763,8 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
         {
             // copy from lookahead decoding buffer
-            lookaheadBuffers->setFromInputs(numContextRequests, numGenRequests, *requestTypes, *seqSlots,
-                decoderBuffers.lookaheadBuffers.value(), runtime, modelConfig, worldConfig);
+            mLookaheadBuffers->setFromInputs(numContextRequests, numGenRequests, *requestTypes, *seqSlots,
+                decoderState.getLookaheadBuffers(), runtime, modelConfig, worldConfig);
         }
     }
 
@@ -839,7 +841,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         if (transformerBuffers)
         {
             TensorPtr decoderPositionIds = modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding()
-                ? lookaheadBuffers->positionIdsDevice
+                ? mLookaheadBuffers->positionIdsDevice
                 : nullptr;
             transformerBuffers->copyPositionIds(runtime, positionIdsHost, isChatGlm || isGlm, decoderPositionIds);
         }
@@ -879,40 +881,43 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
     {
         if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
         {
-            prepareExplicitDraftTokenBuffers(decoderBuffers, runtime, modelConfig, worldConfig);
+            prepareExplicitDraftTokenBuffers(
+                decoderState.getExplicitDraftTokensBuffers(), runtime, modelConfig, worldConfig);
         }
         if (modelConfig.getSpeculativeDecodingMode().isEagle())
         {
-            prepareEagleBuffers(contextRequests, genRequests, decoderBuffers, runtime, modelConfig, worldConfig);
+            prepareEagleBuffers(
+                contextRequests, genRequests, decoderState.getEagleBuffers(), runtime, modelConfig, worldConfig);
         }
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void RuntimeBuffers::prepareExplicitDraftTokenBuffers(DecoderBuffers& decoderBuffers, TllmRuntime const& runtime,
+void RuntimeBuffers::prepareExplicitDraftTokenBuffers(
+    runtime::ExplicitDraftTokensBuffers::Inputs const& explicitDraftTokensBuffers, TllmRuntime const& runtime,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    TLLM_CHECK(explicitDraftTokensBuffers);
+    TLLM_CHECK(mExplicitDraftTokensBuffers);
 
-    explicitDraftTokensBuffers->setFromInputs(numContextRequests, numGenRequests, *requestTypes, *seqSlots,
-        decoderBuffers.explicitDraftTokensBuffers, *transformerBuffers->positionIds, modelConfig, worldConfig,
+    mExplicitDraftTokensBuffers->setFromInputs(numContextRequests, numGenRequests, *requestTypes, *seqSlots,
+        explicitDraftTokensBuffers, *transformerBuffers->positionIds, modelConfig, worldConfig,
         runtime.getBufferManager(), runtime.getStream());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void RuntimeBuffers::prepareEagleBuffers(RequestVector const& contextRequests, RequestVector const& genRequests,
-    DecoderBuffers& decoderBuffers, TllmRuntime const& runtime, ModelConfig const& modelConfig,
+    runtime::EagleBuffers::Inputs const& eagleBuffers, TllmRuntime const& runtime, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    TLLM_CHECK(eagleBuffers);
+    TLLM_CHECK(mEagleBuffers);
 
-    eagleBuffers->setFromInputs(contextRequests, genRequests, *requestTypes, *seqSlots, decoderBuffers.eagleBuffers,
+    mEagleBuffers->setFromInputs(contextRequests, genRequests, *requestTypes, *seqSlots, eagleBuffers,
         runtime.getBufferManager(), modelConfig, worldConfig);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -920,10 +925,10 @@ void RuntimeBuffers::prepareEagleBuffers(RequestVector const& contextRequests, R
 
 std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorMap&> RuntimeBuffers::prepareStep(
     RequestVector const& contextRequests, RequestVector const& genRequests, SizeType32 maxBeamWidth,
-    SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers, kv_cache_manager::BaseKVCacheManager* kvCacheManager,
-    kv_cache_manager::BaseKVCacheManager* crossKvCacheManager, rnn_state_manager::RnnStateManager* rnnStateManager,
-    PeftTable const& peftTable, TllmRuntime const& runtime, ModelConfig const& modelConfig,
-    WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
+    SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers, runtime::decoder::DecoderState const& decoderState,
+    kv_cache_manager::BaseKVCacheManager* kvCacheManager, kv_cache_manager::BaseKVCacheManager* crossKvCacheManager,
+    rnn_state_manager::RnnStateManager* rnnStateManager, PeftTable const& peftTable, TllmRuntime const& runtime,
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
     OptionalRef<runtime::ITensor const> newOutputTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -932,8 +937,8 @@ std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorM
     setBufferSizes(contextRequests, genRequests);
     reshape(runtime, modelConfig, worldConfig, gatherGenerationLogits);
 
-    setFromInputs(contextRequests, genRequests, maxBeamWidth, maxAttentionWindow, decoderBuffers, kvCacheManager,
-        crossKvCacheManager, rnnStateManager, peftTable, runtime, modelConfig, worldConfig, trtOverlap,
+    setFromInputs(contextRequests, genRequests, maxBeamWidth, maxAttentionWindow, decoderBuffers, decoderState,
+        kvCacheManager, crossKvCacheManager, rnnStateManager, peftTable, runtime, modelConfig, worldConfig, trtOverlap,
         newOutputTokens);
 
     fillIOMaps(modelConfig, worldConfig);
@@ -1018,21 +1023,21 @@ void RuntimeBuffers::fillIOMaps(ModelConfig const& modelConfig, WorldConfig cons
         inputMap.insert_or_assign("language_adapter_routings", languageAdapterRoutings);
     }
 
-    if (medusaBuffers)
+    if (mMedusaBuffers)
     {
-        medusaBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
+        mMedusaBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
     }
-    if (lookaheadBuffers)
+    if (mLookaheadBuffers)
     {
-        lookaheadBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
+        mLookaheadBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
     }
-    if (explicitDraftTokensBuffers)
+    if (mExplicitDraftTokensBuffers)
     {
-        explicitDraftTokensBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
+        mExplicitDraftTokensBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
     }
-    if (eagleBuffers)
+    if (mEagleBuffers)
     {
-        eagleBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
+        mEagleBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
     }
 
     for (auto const& outputTensor : mAdditionalOutputTensors)

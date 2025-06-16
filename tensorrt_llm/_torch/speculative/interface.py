@@ -1,14 +1,13 @@
 import copy
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Dict, List, Optional, Type
+from typing import List, Optional, Type
 
 import torch
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
 from ..model_config import TConfig
-from ..pyexecutor.scheduler import ScheduledRequests
 
 
 class SpeculativeDecodingMode(IntEnum):
@@ -17,6 +16,7 @@ class SpeculativeDecodingMode(IntEnum):
     EAGLE3 = auto()
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
+    DRAFT_TARGET = auto()
     NONE = auto()
 
     def is_mtp(self):
@@ -28,6 +28,9 @@ class SpeculativeDecodingMode(IntEnum):
     def is_eagle3(self):
         return self == SpeculativeDecodingMode.EAGLE3
 
+    def use_one_engine(self):
+        return self.is_mtp() or self.is_eagle3_one_model()
+
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
 
@@ -36,6 +39,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
+
+    def is_draft_target(self):
+        return self == SpeculativeDecodingMode.DRAFT_TARGET
 
     def without_logits(self):
         return self.is_mtp() or self.is_eagle3_one_model()
@@ -47,6 +53,14 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp() or self.is_eagle3_one_model()
 
     def has_draft_model(self):
+        return self.is_eagle3() or self.is_draft_target()
+
+    def needs_kv_cache_recompute(self):
+        """
+        Whether the draft model needs to recompute the kv cache.
+        If true, the 1st draft model forward will recompute the kv cache for
+        the accepted draft tokens.
+        """
         return self.is_eagle3()
 
     def need_load_draft_weights(self):
@@ -67,8 +81,8 @@ class SpeculativeDecodingMode(IntEnum):
         """
 
         # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
-        return (self.is_eagle3()
-                and not (issubclass(attention_backend, TrtllmAttention)
+        return ((self.is_eagle3() or self.is_draft_target())
+                and not (isinstance(attention_backend, TrtllmAttention)
                          and get_sm_version() == 100)) or self.is_ngram()
 
     @staticmethod
@@ -146,6 +160,7 @@ class SpecMetadata:
     # same kv lengths for different layers. Add extra kv token in kv cache manager
     # to haddle this issue.
     num_extra_kv_tokens: Optional[int] = 0  # Number of layers in target model
+    # The number of layers
     num_layers: int = 0
 
     def prepare(self):
@@ -173,21 +188,3 @@ class SpecMetadata:
         Some spec decode algorithms require hidden states from the target
         model. Use this method to record them. By default, does nothing.
         """
-
-    def get_hidden_states(
-            self,
-            scheduled_requests: ScheduledRequests,
-            num_rejected_tokens: Optional[Dict] = None) -> List[torch.Tensor]:
-        """
-        Return any captured hidden states. Should do any necessary
-        pre-processing.
-
-        num_rejected_tokens is a dictionary mapping request IDs to the
-        number of tokens rejected for that request. If a request ID isn't
-        in the dictionary, it means that the request is not needed for drafting.
-
-        If the dictionary is not given, this function assumes that the hidden
-        states are being prepared for running the draft model autoregressively,
-        and only the last hidden state vector for each sequence is returned.
-        """
-        return []

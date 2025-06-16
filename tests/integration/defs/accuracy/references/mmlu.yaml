@@ -153,9 +153,13 @@ Qwen3/Qwen3-235B-A22B:
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 79.43
   - quant_algo: FP8
+    kv_cache_quant_algo: FP8
     accuracy: 79.26
 nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
   - accuracy: 57.97
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 57.12
 nvidia/Nemotron-H-8B-Base-8K:
   - accuracy: 69.590
 microsoft/Phi-4-mini-instruct:

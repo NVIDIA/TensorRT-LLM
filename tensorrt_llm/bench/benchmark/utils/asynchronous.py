@@ -12,6 +12,7 @@ from zmq.asyncio import Context
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
+from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 
@@ -42,7 +43,8 @@ class LlmManager:
         self.modality = modality
 
     async def process_request(self, request: InferenceRequest,
-                              sampling_params: SamplingParams):
+                              sampling_params: SamplingParams,
+                              post_proc_params: PostprocParams):
         # Set up sampling params with inference request
         self.request_seen.set()
         sampling_params.max_tokens = request.output_tokens
@@ -51,10 +53,13 @@ class LlmManager:
             request_start_timestamp = time.perf_counter_ns()
             time_on_first_token = None
             # Schedule the request in the LLM API (asynchronously)
+            logger.debug(f"request.lora_request: {request.lora_request}")
             output: RequestOutput = self.llm.generate_async(
                 request.input_ids if self.modality is None else request.prompt,
                 sampling_params=sampling_params,
-                streaming=self.streaming)
+                _postproc_params=post_proc_params,
+                streaming=self.streaming,
+                lora_request=request.lora_request)
             if self.streaming:
                 async for stream_output in output:
                     if time_on_first_token is None:
@@ -86,10 +91,12 @@ class LlmManager:
     async def worker(self) -> None:
         while not self._stop.is_set():
             try:
-                request, sampling_params = await self._inbox.get()
+                request, sampling_params, post_proc_params = await self._inbox.get(
+                )
                 task = asyncio.create_task(
                     self.process_request(request,
-                                         sampling_params=sampling_params))
+                                         sampling_params=sampling_params,
+                                         post_proc_params=post_proc_params))
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
             except asyncio.CancelledError:
@@ -164,8 +171,9 @@ class LlmManager:
                 self.iteration_worker(iteration_addr))
 
     async def enqueue(self, request: InferenceRequest,
-                      sampling_params: SamplingParams) -> None:
-        await self._inbox.put((request, sampling_params))
+                      sampling_params: SamplingParams,
+                      post_proc_params: PostprocParams) -> None:
+        await self._inbox.put((request, sampling_params, post_proc_params))
 
 
 @asynccontextmanager
@@ -182,11 +190,12 @@ async def semaphore_guard(semaphore: Optional[asyncio.Semaphore] = None):
 async def enqueue_messages(backend: LlmManager,
                            requests: List[InferenceRequest],
                            sampling_params: SamplingParams,
+                           post_proc_params: PostprocParams,
                            submit_finished: asyncio.Event) -> None:
     num_requests = 0
     submit_start = time.perf_counter_ns()
     for request in requests:
-        await backend.enqueue(request, sampling_params)
+        await backend.enqueue(request, sampling_params, post_proc_params)
         num_requests += 1
     submit_time = (time.perf_counter_ns() - submit_start) * 1.0e-9
     logger.info(
@@ -199,6 +208,7 @@ async def enqueue_messages(backend: LlmManager,
 async def async_benchmark(
     llm: LLM,
     sampling_params: SamplingParams,
+    post_proc_params: PostprocParams,
     requests: List[InferenceRequest],
     streaming: bool,
     concurrency: int = -1,
@@ -220,7 +230,7 @@ async def async_benchmark(
 
         enqueue_task = asyncio.create_task(
             enqueue_messages(backend, requests, sampling_params,
-                             submit_finished))
+                             post_proc_params, submit_finished))
 
         logger.info("Starting benchmark...")
         while not submit_finished.is_set() or backend.busy or not outbox.empty(

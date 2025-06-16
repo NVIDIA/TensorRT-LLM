@@ -24,7 +24,7 @@ l0_a100:
       - '*a100*'
       linux_distribution_name: ubuntu*
     terms:
-      stage: pre_merge
+      stage: post_merge
       backend: tensorrt
   tests:
   - unittest/trt/attention/test_sage_attention.py unittest/llmapi/test_llm_download.py unittest/llmapi/test_llm_kv_cache_events.py unittest/llmapi/test_mpi_session.py unittest/trt/model/redrafter unittest/trt/model/test_phi.py unittest/trt/model/test_unet.py unittest/trt/python_plugin unittest/tools unittest/utils unittest/others
@@ -46,6 +46,7 @@ l0_a100:
   - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_smooth_quant_ootb_manage_weights
   - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_int8_gptq
   - accuracy/test_cli_flow.py::TestQwen2_7BInstruct::test_int4_awq_prequantized
+  - accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_guided_decoding
 - condition:
     ranges:
       system_gpu_count:

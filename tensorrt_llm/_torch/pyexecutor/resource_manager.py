@@ -206,8 +206,10 @@ class KVCacheManager(BaseResourceManager):
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
             'tokens_per_block': tokens_per_block,
-            'blocks_in_primary_pool': self.blocks_in_primary_pool,
-            'blocks_in_secondary_pool': self.blocks_in_secondary_pool,
+            'blocks_per_window': {
+                self.max_attention_window:
+                (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
+            },
             'max_num_sequences': max_batch_size,
             'max_beam_width': 1,  # TODO: more than 1 beam?
             'max_attention_window_vec': [self.max_attention_window],
@@ -342,6 +344,7 @@ class KVCacheManager(BaseResourceManager):
                                  sampling_params._get_sampling_config()),
                              is_streaming=False,
                              encoder_input_tokens=encoder_input_tokens)
+            req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
                 self.impl.add_sequence(req_id, token_num, beam_width, req)
@@ -595,7 +598,9 @@ class MambaCacheManager(BaseResourceManager):
                 block = self.mamba_cache_free_blocks.pop()
                 self.mamba_cache_index[r] = block
                 state_indices.append(block)
-        self.state_indices = torch.as_tensor(state_indices, dtype=torch.int32)
+        self.state_indices = torch.as_tensor(state_indices,
+                                             dtype=torch.int32,
+                                             device=self.ssm_states.device)
 
     def free_mamba_cache_blocks(self, request_id: int):
         if request_id in self.mamba_cache_index:

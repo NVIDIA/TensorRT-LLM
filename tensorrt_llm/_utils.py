@@ -781,6 +781,26 @@ class QuantModeWrapper:
         return self.objs[index]
 
 
+PYTHON_DEFAULT_GC_THRESHOLDS = gc.get_threshold()
+
+
+@contextmanager
+def customized_gc_thresholds(gen0_threshold: Optional[int] = None):
+    try:
+        if gen0_threshold:
+            gc.set_threshold(gen0_threshold)
+            logger.debug(
+                f'Set Python GC threshold to customized value: {gen0_threshold}'
+            )
+        yield
+    finally:
+        if gen0_threshold:
+            gc.set_threshold(*PYTHON_DEFAULT_GC_THRESHOLDS)
+            logger.debug(
+                f'Reset Python GC thresholds to default value: {PYTHON_DEFAULT_GC_THRESHOLDS}'
+            )
+
+
 @contextmanager
 def _null_context_manager():
     yield
