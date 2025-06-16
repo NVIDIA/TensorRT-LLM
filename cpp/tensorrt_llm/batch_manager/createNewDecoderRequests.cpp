@@ -122,7 +122,8 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
 
 } // namespace
 
-std::tuple<TensorPtr, std::vector<runtime::decoder_batch::Request>, std::vector<runtime::SamplingConfig>>
+std::tuple<TensorPtr, std::vector<runtime::SamplingConfig>, std::vector<runtime::ITensor::SharedConstPtr>,
+    std::vector<executor::LookaheadDecodingConfig>>
 CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
     executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
     runtime::BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
@@ -139,9 +140,9 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
     copySequenceLengths(finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth,
         bufferManager, runtimeStream);
 
-    auto decoderRequests = createDecoderRequests(finishedContextRequests, inputBuffers.inputsIds, decodingConfig,
-        decoderState, bufferManager, logitsType, modelConfig, worldConfig, runtimeStream, decoderStream,
-        maxSequenceLength, medusaBuffers);
+    auto [lookaheadPrompt, lookaheadAlgoConfigs] = createDecoderRequests(finishedContextRequests,
+        inputBuffers.inputsIds, decodingConfig, decoderState, bufferManager, logitsType, modelConfig, worldConfig,
+        runtimeStream, decoderStream, maxSequenceLength, medusaBuffers);
 
     auto const batchSize = finishedContextRequests.size();
 
@@ -155,7 +156,8 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
     TensorPtr batchSlotsView = runtime::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return {std::move(batchSlotsView), std::move(decoderRequests), std::move(samplingConfigs)};
+    return {std::move(batchSlotsView), std::move(samplingConfigs), std::move(lookaheadPrompt),
+        std::move(lookaheadAlgoConfigs)};
 }
 
 void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder_batch::Request const& request,
@@ -555,8 +557,8 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-[[nodiscard]] std::vector<runtime::decoder_batch::Request> CreateNewDecoderRequests::createDecoderRequests(
-    RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
+std::tuple<std::vector<runtime::ITensor::SharedConstPtr>, std::vector<executor::LookaheadDecodingConfig>>
+CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
     executor::DecodingConfig const& decodingConfig, runtime::decoder::DecoderState& decoderState,
     BufferManager const& bufferManager, nvinfer1::DataType logitsType, runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig, runtime::CudaStream const& runtimeStream,
@@ -573,6 +575,16 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
 
     std::vector<decoder_batch::Request> decoderRequests;
     decoderRequests.reserve(finishedContextRequests.size());
+
+    std::vector<runtime::ITensor::SharedConstPtr> lookaheadPrompt;
+    std::vector<executor::LookaheadDecodingConfig> lookaheadAlgoConfigs;
+    if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
+    {
+        TLLM_CHECK_WITH_INFO(
+            decodingConfig.getLookaheadDecodingConfig().has_value(), "Lookahead decoding config must be provided");
+        lookaheadPrompt.reserve(finishedContextRequests.size());
+        lookaheadAlgoConfigs.reserve(finishedContextRequests.size());
+    }
 
     SizeType32 inputOffset{0};
     for (auto const& llmReq : finishedContextRequests)
@@ -620,14 +632,11 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
         }
         else if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
         {
-            decoderRequest.lookaheadRuntimeConfig = llmReq->getLookaheadConfig()
-                ? llmReq->getLookaheadConfig()
-                : decodingConfig.getLookaheadDecodingConfig();
-        }
-        else if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
-        {
-            // Only Explicit draft tokens model needs dtype to WAR the lack of bf16 decoder.
-            decoderRequest.dtype = modelConfig.getDataType();
+            lookaheadPrompt.emplace_back(ITensor::slice(decoderRequest.ids, 0, decoderRequest.inputLen));
+
+            auto const& lookaheadRuntimeConfig
+                = llmReq->getLookaheadConfig().value_or(decodingConfig.getLookaheadDecodingConfig().value());
+            lookaheadAlgoConfigs.emplace_back(lookaheadRuntimeConfig);
         }
         else if (modelConfig.getSpeculativeDecodingMode().isEagle())
         {
@@ -659,7 +668,7 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
         inputOffset += promptLen;
     }
 
-    return decoderRequests;
+    return {std::move(lookaheadPrompt), std::move(lookaheadAlgoConfigs)};
 }
 
 std::shared_ptr<runtime::ITensor> CreateNewDecoderRequests::retrieveDraftLogits(ModelConfig const& modelConfig,

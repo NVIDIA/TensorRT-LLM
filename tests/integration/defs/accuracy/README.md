@@ -16,16 +16,18 @@ This test suite is organized as following:
 
 The following tasks are currently supported:
 
-| Dataset           | Task                | Metric     | LLM API | CLI flow |
-|:-----------------:|:-------------------:|:----------:|:-------:|:--------:|
-| CNN Dailymail     | summarization       | rouge      | Y | Y |
-| MMLU              | QA; multiple choice | accuracy   | Y | Y |
-| GSM8K             | QA; regex matching  | accuracy   | Y | N |
-| GPQA              | QA; multiple choice | accuracy   | Y | N |
-| Humaneval         | code completion     | rouge*     | N | Y |
-| ZeroScrolls       | summarization       | rouge      | N | Y |
-| Passkey retrieval | retrieval           | accuracy   | N | Y |
-| SlimPajama-6B     | perplexity          | perplexity | N | Y |
+| Dataset                | Task                  | Metric     | Default ISL | Default OSL | LLM API | CLI flow |
+|:----------------------:|:---------------------:|:----------:|------------:|------------:|:--------:|:--------:|
+| CNN Dailymail          | summarization         | rouge      |         924 |         100 | Y | Y |
+| MMLU                   | QA; multiple choice   | accuracy   |       4,094 |           2 | Y | Y |
+| GSM8K                  | QA; regex matching    | accuracy   |       4,096 |         256 | Y | N |
+| GPQA                   | QA; multiple choice   | accuracy   |      32,768 |       4,096 | Y | N |
+| JSON mode eval         | structured generation | accuracy   |       1,024 |         512 | Y | N |
+| Humaneval              | code completion       | rouge*     |         924 |         100 | N | Y |
+| ZeroScrolls            | summarization         | rouge      |      24,576 |       8,192 | N | Y |
+| Passkey retrieval 64k  | retrieval             | accuracy   |      65,536 |          50 | N | Y |
+| Passkey retrieval 128k | retrieval             | accuracy   |     131,072 |          50 | N | Y |
+| SlimPajama-6B          | perplexity            | perplexity |      16,384 |           1 | N | Y |
 
 \* Rouge is an informal evaluation metric for code completion.
 
