@@ -1,9 +1,8 @@
-from typing import List
+from typing import List, Tuple
 
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm.bindings.internal.batch_manager import DecoderInputBuffers
 from tensorrt_llm.logger import logger
 
 
@@ -11,27 +10,27 @@ class HandleContextLogits:
 
     def __call__(
         self,
-        decoder_input_buffers: DecoderInputBuffers,
         context_requests: List[LlmRequest],
         logits: torch.Tensor,
         num_context_logits_vec: List[int],
-    ) -> int:
+        max_num_sequences: int,
+    ) -> Tuple[List[torch.Tensor], int]:
         """Handle context logits for a batch of requests.
 
         Args:
-            decoder_input_buffers: Decoder input buffers for storing intermediate results
             context_requests: List of context requests to process
             logits: Input logits tensor
             num_context_logits_vec: Number of context logits for each request
+            max_num_sequences: Maximum number of sequences to process
 
         Returns:
+            List[torch.Tensor]: List of logits tensors for each request
             int: Index into logits tensor after processing all requests
         """
         logits_index = 0
 
         # Copy logits into decoderBuffers.logits
-        decoder_buffer_logits = [torch.empty(0)] * len(
-            decoder_input_buffers.logits)
+        decoder_buffer_logits = [torch.empty(0)] * max_num_sequences
         for batch_index, llm_req in enumerate(context_requests):
             num_context_logits = num_context_logits_vec[batch_index]
             draft_length = llm_req.num_draft_tokens if llm_req.is_last_context_chunk else 0
@@ -76,7 +75,4 @@ class HandleContextLogits:
             # else:
             #     decoder_buffer_logits[seq_slot] = logits_view[:logits_view.shape[0], :1, :logits_view.shape[1]]
 
-        # Needs to be done in bulk for the copy to work
-        decoder_input_buffers.logits = decoder_buffer_logits
-
-        return logits_index
+        return decoder_buffer_logits, logits_index

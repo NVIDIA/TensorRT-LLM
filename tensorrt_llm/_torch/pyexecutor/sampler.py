@@ -616,15 +616,15 @@ class TRTLLMSampler(Sampler):
             num_context_logits[
                 batch_index] = request.context_chunk_size if request.py_return_context_logits else 1
 
-        logits_index = self.algs.handle_context_logits(
-            self.store["decoder_input_buffers"],
+        decoder_buffer_logits, logits_index = self.algs.handle_context_logits(
             scheduled_requests.context_requests, model_outputs["logits"],
-            num_context_logits)
+            num_context_logits, self.max_num_sequences)
 
-        self.algs.handle_generation_logits(
-            self.store["decoder_input_buffers"],
-            scheduled_requests.generation_requests, model_outputs["logits"],
-            logits_index)
+        decoder_buffer_logits = self.algs.handle_generation_logits(
+            decoder_buffer_logits, scheduled_requests.generation_requests,
+            model_outputs["logits"], logits_index)
+
+        self.store["decoder_input_buffers"].logits = decoder_buffer_logits
 
         decoding_input, self.decoding_output = self.algs.make_decoding_batch_input_output(
             scheduled_requests.context_requests,
