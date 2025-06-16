@@ -398,7 +398,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     }
 
     mCapacityScheduler = std::make_unique<CapacityScheduler>(getMaxNumSequences(),
-        optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), mKvCacheManager != nullptr, mNumMicroBatches > 1);
+        optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), mKvCacheManager != nullptr,
+        mWorldConfig.isPipelineParallel());
 
     mMicroBatchScheduler = std::make_unique<MicroBatchScheduler>(ctxChunkConfig, maxContextLength);
 
@@ -1423,8 +1424,8 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
         }
 
         mDecoder = std::make_unique<runtime::GptDecoderBatched>(mRuntime->getStreamPtr());
-        mDecoder->setup(decodingMode, getMaxNumSequences(), mOperatingBeamWidth, getMaxSequenceLen(), decoderType,
-            mModelConfig, mWorldConfig);
+        mDecoder->setup(
+            decodingMode, getMaxNumSequences(), mOperatingBeamWidth, decoderType, mModelConfig, mWorldConfig);
 
         mDecoderState = std::make_unique<runtime::decoder::DecoderState>(decoderType, mRuntime->getBufferManager());
         if (!mModelConfig.getSpeculativeDecodingMode().isNone())
@@ -1785,18 +1786,18 @@ void TrtGptModelInflightBatching::setupDecoderStep(
     {
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
 
-        auto [batchSlots, decoderRequests, samplingConfigs]
+        auto [batchSlots, samplingConfigs, lookaheadPrompt, lookaheadAlgoConfigs]
             = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig, mDecodingConfig, contextRequests,
                 mRuntime->getBufferManager(), logitsType, inputBuffers, *mDecoderState, mRuntime->getStream(),
                 *mDecoder->getDecoderStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.mMedusaBuffers);
 
-        if (!decoderRequests.empty())
+        auto const localBatchSize = batchSlots->getSize();
+        if (localBatchSize > 0)
         {
-            // Setup underlying decoder.
-            auto const localBatchSize = batchSlots->getSize();
             auto samplingConfig = SamplingConfig(samplingConfigs);
             mDecoder->getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
-                {mDecoderState->getJointDecodingOutput()}, {decoderRequests});
+                {mDecoderState->getJointDecodingOutput()}, mModelConfig.getDataType(), lookaheadPrompt,
+                lookaheadAlgoConfigs);
 
             auto const& stream = mDecoder->getDecoderStream();
             CudaEvent event{};
