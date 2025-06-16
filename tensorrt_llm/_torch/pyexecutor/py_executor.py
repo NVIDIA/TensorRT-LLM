@@ -33,10 +33,15 @@ from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
 from .kv_cache_transceiver import KvCacheTransceiver
+<<<<<<< HEAD
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
                           LlmRequestState, executor_request_to_llm_request,
                           make_llm_responses_serialize_friendly,
                           restore_llm_responses_from_serialize_friendly_dict)
+=======
+from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
+                          LlmResponse, executor_request_to_llm_request)
+>>>>>>> clean_prepare_2
 from .model_engine import ModelEngine
 from .sampler import Sampler, SampleState, SampleStateTensors, TorchSampler
 from .scheduler import ScheduledRequests
@@ -330,14 +335,14 @@ class PyExecutor:
         self,
         id: Optional[Union[List[int], int]] = None,
         timeout: Optional[datetime.timedelta] = None,
-    ) -> Union[List[List[ExecutorResponse]], List[ExecutorResponse]]:
+    ) -> Union[List[List[LlmResponse]], List[LlmResponse]]:
         """
         Await for ready responses
         Args:
             id (Optional[Union[List[int], int]]): Request id
             timeout (Optional[datetime.timedelta]): The maximum time to wait for new responses
         Returns:
-            Union[List[tensorrt_llm.bindings.executor.Response], List[List[tensorrt_llm.bindings.executor.Response]]]: Responses
+            Union[List[LlmResponse], List[List[LlmResponse]]]: Responses
         """
         timeout = timeout.total_seconds() if timeout is not None else None
         if id is None:
@@ -1769,7 +1774,6 @@ class PyExecutor:
         """
         try:
             draft_batch = ScheduledRequests()
-            req_id_to_num_rejected_tokens = {}
 
             for request in scheduled_requests.generation_requests:
                 if request.py_draft_pages_allocated == 0:
@@ -1791,12 +1795,9 @@ class PyExecutor:
                 ) if request.py_last_draft_tokens is not None else 0
                 request.py_draft_tokens = []
 
-                num_accepted_tokens = getattr(request,
-                                              "py_num_accepted_draft_tokens", 0)
+                num_accepted_tokens = request.py_num_accepted_draft_tokens
                 num_rejected_tokens = num_draft_tokens - num_accepted_tokens
                 assert num_rejected_tokens >= 0
-                req_id_to_num_rejected_tokens[
-                    request.py_request_id] = num_rejected_tokens
 
                 spec_config = self.model_engine.spec_config
                 beam_idx = 0
@@ -1816,7 +1817,7 @@ class PyExecutor:
                         is_streaming=False)
 
                     draft_batch.context_requests.append(new_request)
-                elif getattr(request, "py_num_accepted_draft_tokens", 0) == 0:
+                elif num_accepted_tokens == 0:
                     new_request = LlmRequest(
                         request_id=request.py_request_id,
                         max_new_tokens=request.py_max_new_tokens,
@@ -1843,7 +1844,7 @@ class PyExecutor:
 
                 new_request.py_stop_words_list = request.py_stop_words_list
 
-            return draft_batch, req_id_to_num_rejected_tokens
+            return draft_batch
 
         except Exception as e:
             traceback.print_exc()
@@ -1854,8 +1855,7 @@ class PyExecutor:
     @nvtx_range("_prepare_draft_tokens")
     def _prepare_draft_tokens(self, scheduled_requests: ScheduledRequests):
         try:
-            draft_batch, num_rejected_tokens = self._prepare_draft_batch(
-                scheduled_requests)
+            draft_batch = self._prepare_draft_batch(scheduled_requests)
 
             if draft_batch.batch_size == 0:
                 return
@@ -1866,37 +1866,24 @@ class PyExecutor:
                                  scheduled_requests.generation_requests)
             }
 
-            spec_metadata = self.model_engine.last_spec_metadata
-
-            hidden_states = spec_metadata.get_hidden_states(
-                draft_batch, num_rejected_tokens)
-
-            if spec_metadata.spec_dec_mode.is_eagle3():
-                # Hack for eagle3. We might need to run a matmul to reduce
-                # the dimensionality of the hidden states on the first pass
-                # through the draft model. Shape dependent control flow will
-                # not work with CUDA graphs. So we just do it here.
-                hidden_states = self.draft_model_engine.model.apply_eagle3_fc(
-                    hidden_states)
-
-            extra_model_inputs = {'hidden_states': hidden_states}
-
-            outputs = self.draft_model_engine.forward(
-                draft_batch,
-                self.resource_manager,
-                extra_model_inputs=extra_model_inputs)
-
-            if spec_metadata.spec_dec_mode.is_eagle3() and hasattr(
-                    self.draft_model_engine.model.model, 'd2t'):
+            # Disable cuda graph for the 1st draft model forward
+            if self.model_engine.spec_config.spec_dec_mode.needs_kv_cache_recompute(
+            ):
+                with self.draft_model_engine.no_cuda_graph():
+                    outputs = self.draft_model_engine.forward(
+                        draft_batch, self.resource_manager)
+            else:
+                outputs = self.draft_model_engine.forward(
+                    draft_batch, self.resource_manager)
+            if hasattr(self.draft_model_engine.model.model, 'd2t'):
                 outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
             sample_state = self._sample_async(draft_batch, outputs)
+            previous_batch = sample_state
 
             self._update_request_states(draft_batch)
 
-            self._update_requests(sample_state)
-
-            def _process_decoded_tokens():
+            def _process_decoded_tokens(draft_batch):
                 new_requests = []
                 for req in chain(draft_batch.context_requests,
                                  draft_batch.generation_requests):
@@ -1915,43 +1902,36 @@ class PyExecutor:
             # this? Just needs proper kernel support.
             def _pad_to_max_draft_tokens():
                 for req in scheduled_requests.generation_requests:
-                    max_draft_tokens = spec_metadata.max_draft_tokens
+                    max_draft_tokens = self.max_draft_tokens
                     num_draft_tokens = len(req.py_draft_tokens)
                     req.py_draft_tokens.extend(
                         0 for _ in range(max_draft_tokens - num_draft_tokens))
 
-            new_requests = _process_decoded_tokens()
-            if not new_requests:
-                _pad_to_max_draft_tokens()
-                return
-
-            draft_batch.generation_requests = new_requests
+            draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
             draft_batch.context_requests = []
 
-            for _ in range(spec_metadata.max_draft_tokens - 1):
-                draft_spec_metadata = self.draft_model_engine.last_spec_metadata
-                hidden_states = draft_spec_metadata.get_hidden_states(
-                    draft_batch)
-                extra_model_inputs = {'hidden_states': hidden_states}
+            for i in range(self.max_draft_tokens - 1):
+                if len(draft_batch.generation_requests) == 0:
+                    break
 
                 outputs = self.draft_model_engine.forward(
                     draft_batch,
                     self.resource_manager,
-                    extra_model_inputs=extra_model_inputs)
+                    new_tensors_device=previous_batch.device)
 
-                if spec_metadata.spec_dec_mode.is_eagle3() and hasattr(
-                        self.draft_model_engine.model.model, 'd2t'):
+                if hasattr(self.draft_model_engine.model.model, 'd2t'):
                     outputs[
                         'd2t'] = self.draft_model_engine.model.model.d2t.data
                 sample_state = self._sample_async(draft_batch, outputs)
                 self._update_request_states(draft_batch)
-                self._update_requests(sample_state)
-
-                new_requests = _process_decoded_tokens()
-                if not new_requests:
-                    break
+                self._update_requests(previous_batch)
+                new_requests = _process_decoded_tokens(
+                    previous_batch.scheduled_requests)
                 draft_batch.generation_requests = new_requests
-
+                previous_batch = sample_state
+            self._update_requests(previous_batch)
+            new_requests = _process_decoded_tokens(
+                previous_batch.scheduled_requests)
             _pad_to_max_draft_tokens()
 
         except Exception as e:
@@ -1967,8 +1947,10 @@ class PyExecutor:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
             self._terminate_request(request)
-            error_responses[req_id] = ExecutorResponse(
-                req_id, error_msg, client_id=request.py_client_id)
+            error_responses[req_id] = LlmResponse(
+                request_id=req_id,
+                error_msg=error_msg,
+                client_id=request.py_client_id)
         self.active_requests.clear()
         self._enqueue_responses(error_responses)
 
@@ -2012,7 +1994,7 @@ class PyExecutor:
         self._enqueue_responses(cancelled_responses)
 
     @nvtx_range("_enqueue_responses")
-    def _enqueue_responses(self, responses: Dict[int, ExecutorResponse]):
+    def _enqueue_responses(self, responses: Dict[int, LlmResponse]):
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
             return
 
@@ -2085,7 +2067,7 @@ class PyExecutor:
                 self.active_requests.remove(request)
                 continue
 
-            if request.is_generation_only_request:
+            if request.is_generation_only_request():
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
@@ -2128,7 +2110,7 @@ class PyExecutor:
 
     def _await_any_response(self,
                             timeout: Optional[float] = None
-                            ) -> List[ExecutorResponse]:
+                            ) -> List[LlmResponse]:
 
         def any_responses_ready():
             return len(self.responses) > 0 or self.is_shutdown
@@ -2145,7 +2127,7 @@ class PyExecutor:
     def _await_single_response(
             self,
             id: int,
-            timeout: Optional[float] = None) -> List[ExecutorResponse]:
+            timeout: Optional[float] = None) -> List[LlmResponse]:
         with self.response_cv:
 
             def key_has_response():

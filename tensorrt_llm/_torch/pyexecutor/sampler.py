@@ -553,7 +553,6 @@ class TRTLLMSampler(Sampler):
             mode=self.decoding_mode,
             max_batch_size=self.executor_config.max_batch_size,
             max_beam_width=self.executor_config.max_beam_width,
-            max_sequence_length=self.executor_config.max_seq_len,
             dtype=self.logits_datatype,
             model_config=self.model_config,
             world_config=self.world_config)
@@ -579,19 +578,21 @@ class TRTLLMSampler(Sampler):
         )
 
     def setup_sampler_step(self, requests):
-        batch_slots, decoder_requests, sampling_configs = self.algs.create_new_decoder_requests(
+        batch_slots, sampling_configs, lookahead_prompt, lookahead_algo_configs = self.algs.create_new_decoder_requests(
             self.model_config, self.world_config, self.decoding_config,
             requests, self.store["buffer_manager"], self.logits_datatype,
             self.store["decoder_input_buffers"], self.algs.decoder_state,
             self.store["cuda_stream"], self.algs.decoder.decoder_stream,
             self.executor_config.max_seq_len, self.beam_width(requests))
 
-        if len(decoder_requests):
-            local_batch_size = len(batch_slots)
+        local_batch_size = len(batch_slots)
+        if local_batch_size > 0:
             sampling_config = make_sampling_config(sampling_configs)
             self.algs.decoder.underlying_decoder().setup(
                 sampling_config, local_batch_size, batch_slots,
-                self.algs.decoder_state.joint_decoding_output, decoder_requests)
+                self.algs.decoder_state.joint_decoding_output,
+                self.model_config.data_type, lookahead_prompt,
+                lookahead_algo_configs)
 
     @staticmethod
     def beam_width(scheduled_requests: Iterable[LlmRequest]) -> int:
