@@ -1111,7 +1111,8 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         int(divUp(params.batch_size, MIN_SEQUENCES_PER_WARP)));                                                        \
     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX                                        \
         || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE                                         \
-        || params.position_embedding_type == PositionEmbeddingType::kROPE_M)                                           \
+        || params.position_embedding_type == PositionEmbeddingType::kROPE_M                                            \
+        || params.position_embedding_type == PositionEmbeddingType::kYARN)                                             \
     {                                                                                                                  \
         applyBiasRopeUpdateKVCache<T, TCache, Dh_MAX, ADD_BIAS, STORE_QKV, KVCacheBuffer,                              \
             RotaryPositionEmbeddingType::GPT_NEOX, DYNAMIC_ROTARY_SCALING, FP8_OUTPUT, GEN_PHASE>                      \
@@ -1275,7 +1276,8 @@ void kernelV1Dispatch(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStrea
     config.attrs = attrs;                                                                                              \
     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX                                        \
         || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE                                         \
-        || params.position_embedding_type == PositionEmbeddingType::kROPE_M)                                           \
+        || params.position_embedding_type == PositionEmbeddingType::kROPE_M                                            \
+        || params.position_embedding_type == PositionEmbeddingType::kYARN)                                             \
     {                                                                                                                  \
         cudaLaunchKernelEx(&config,                                                                                    \
             applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, GEN_PHASE,        \

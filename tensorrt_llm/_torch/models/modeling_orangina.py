@@ -71,7 +71,8 @@ class AttentionBlock(Attention):
                 max_positions=pretrained_config.max_position_embeddings,
                 original_max_positions=pretrained_config.initial_context_length,
                 beta_fast=pretrained_config.rope_ntk_beta,
-                beta_slow=pretrained_config.rope_ntk_alpha),
+                beta_slow=pretrained_config.rope_ntk_alpha,
+                duplicate_data=False),
             is_neox=False,
         )
 
