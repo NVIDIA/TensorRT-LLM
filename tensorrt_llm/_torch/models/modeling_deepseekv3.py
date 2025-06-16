@@ -134,19 +134,23 @@ class DeepseekV3MTPHead(nn.Module):
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
 
-    def forward(self, hidden_states: torch.Tensor, lm_head: Linear,
-                attn_metadata: AttentionMetadata) -> torch.Tensor:
-        if attn_metadata is not None:
-            last_tokens = torch.cumsum(
-                attn_metadata.seq_lens_cuda,
-                dim=0,
-                dtype=torch.long,
-            ) - 1
-            last_token_hidden_states = hidden_states[last_tokens]
-        else:
-            last_token_hidden_states = hidden_states[-1].unsqueeze(0)
+    def forward(self,
+                hidden_states: torch.Tensor,
+                lm_head: Linear,
+                attn_metadata: AttentionMetadata,
+                return_context_logits: bool = False) -> torch.Tensor:
+        if not return_context_logits:
+            if attn_metadata is not None:
+                last_tokens = torch.cumsum(
+                    attn_metadata.seq_lens_cuda,
+                    dim=0,
+                    dtype=torch.long,
+                ) - 1
+                hidden_states = hidden_states[last_tokens]
+            else:
+                hidden_states = hidden_states[-1].unsqueeze(0)
 
-        logits = lm_head(last_token_hidden_states)
+        logits = lm_head(hidden_states)
         return logits
 
 
@@ -1039,9 +1043,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         else:
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
-        logits = self.shared_head(hidden_states, lm_head, attn_metadata).float()
-
-        return hidden_states, logits
+        return hidden_states
 
 
 class DeepseekV3Model(DecoderModel):
