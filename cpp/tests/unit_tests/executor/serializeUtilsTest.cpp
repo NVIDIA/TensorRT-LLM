@@ -160,6 +160,7 @@ void compareResponse(texec::Response res, texec::Response res2)
     {
         compareResult(res.getResult(), res2.getResult());
     }
+    EXPECT_EQ(res.getClientId(), res2.getClientId());
 }
 
 template <typename T>
