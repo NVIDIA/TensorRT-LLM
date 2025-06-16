@@ -231,8 +231,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
         draft_len = 4
-        spec_config = EagleDecodingConfig(
-            max_draft_len=draft_len, pytorch_eagle_weights_path=eagle_model_dir)
+        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
+                                          pytorch_weights_path=eagle_model_dir)
 
         llm = LLM(model=target_model_dir,
                   **pytorch_config,
