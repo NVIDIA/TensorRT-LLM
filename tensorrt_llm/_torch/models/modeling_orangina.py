@@ -386,13 +386,13 @@ class OranginaForCausalLM(DecoderModelForCausalLM[Transformer,
                                                         num_q_head:head_dim *
                                                         (num_q_head +
                                                          num_kv_head), :]
-                    v_weight = module_weights['weight'][:head_dim *
-                                                        num_kv_head, :]
+                    v_weight = module_weights['weight'][-head_dim *
+                                                        num_kv_head:, :]
                     q_bias = module_weights['bias'][:head_dim * num_q_head]
                     k_bias = module_weights['bias'][head_dim *
                                                     num_q_head:head_dim *
                                                     (num_q_head + num_kv_head)]
-                    v_bias = module_weights['bias'][:head_dim * num_kv_head]
+                    v_bias = module_weights['bias'][-head_dim * num_kv_head:]
                     qkv_weights = [{
                         'weight': q_weight,
                         'bias': q_bias
