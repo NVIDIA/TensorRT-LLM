@@ -187,8 +187,10 @@ Average request latency (ms):                     7456.1219
 ### B200 max-throughput for R1-0528 with FP8 KV cache
 
 Due to our evaluation found that FP8 KV cache does not introduce obvious accuracy drop compared to BF16 KV cache. See [Precision strategy](./tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md), the latest [DeepSeek-R1-0528-FP4](https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4) checkpoint had enabled FP8 KV cache by-default.
+
 We are seeing meaningful speedup using FP8 KV cache, thus refreshing the numbers here. The results are reproduced with TensorRT-LLM commit b6261862419c33d6ce2313aff1e7116067d6037d.
-!! Note that the exact command to reproduce numbers can change as the API/options are refactored, the numbers here is a reference at given exact commit.
+
+!! Note that the exact command to reproduce numbers can change as the API/options are refactored, the option and numbers here is a reference at given exact commit.
 
 #### Benchmark
 ```bash
@@ -239,9 +241,11 @@ Per GPU Output Throughput (tps/gpu):              5393.2755
 ```
 
 ### B200 max-throughput for R1 with FP16 KV cache
-Our benchmark results are based on **Batch = 3072, ISL = 1K, OSL = 2K, num_requests = 49152 from synthetic dataset**
+Our benchmark results are based on **Batch = 3072, ISL = 1K, OSL = 2K, num_requests = 49152 from synthetic dataset**.
+
 The results are reproduced with TensorRT-LLM commit b6261862419c33d6ce2313aff1e7116067d6037d.
-!! Note that the exact command to reproduce numbers can change as the API/options are refactored, the numbers here is a reference at given exact commit.
+
+!! Note that the exact command to reproduce numbers can change as the API/options are refactored, the option and numbers here is a reference at given exact commit.
 
 #### Benchmark
 To do the benchmark, run the following command:
