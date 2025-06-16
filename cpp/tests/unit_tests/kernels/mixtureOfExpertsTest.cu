@@ -1965,7 +1965,6 @@ constexpr static auto typeToDtypeID()
 
 TYPED_TEST(MixtureOfExpertsTest, RunProfiler)
 {
-    constexpr bool is_half = std::is_same<typename TypeParam::DataType, half>::value;
     auto test_func = [this](GemmProfilerBackend::GemmToProfile gemm_to_profile)
     {
         int64_t num_experts = 4;
