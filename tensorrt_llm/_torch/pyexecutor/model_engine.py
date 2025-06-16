@@ -783,8 +783,9 @@ class PyTorchModelEngine(ModelEngine):
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
         enable_paged_context_mla = is_mla(
-            self.model.model_config.pretrained_config
-        ) and self.attn_runtime_features.cache_reuse
+            self.model.model_config.pretrained_config) and (
+                self.attn_runtime_features.cache_reuse
+                or self.attn_runtime_features.chunked_prefill)
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,

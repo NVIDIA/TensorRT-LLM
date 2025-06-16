@@ -1067,16 +1067,18 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, False, False, True),
                            (False, True, True, True), (True, True, True, True)])
     @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids("kv_cache_reuse", [True, False])
     @parametrize_with_ids(
         "quant_dtype",
         [
-            pytest.param("none", marks=skip_pre_hopper),
+            pytest.param("none", marks=skip_pre_blackwell),
             # pytest.param("fp8", marks=skip_pre_hopper),
             # pytest.param("nvfp4", marks=skip_pre_blackwell)
         ])
     # currently, chunked prefill is not supported for fp8 and nvfp4
-    def test_chunked_prefill(self, quant_dtype, mtp_nextn, fp8kv, attention_dp,
-                             cuda_graph, overlap_scheduler):
+    def test_chunked_prefill(self, quant_dtype, mtp_nextn, kv_cache_reuse,
+                             fp8kv, attention_dp, cuda_graph,
+                             overlap_scheduler):
         if quant_dtype == "nvfp4" and mtp_nextn > 0:
             pytest.skip("MTP is not supported for NVFP4")
         if fp8kv:
@@ -1089,7 +1091,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only"
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                        enable_block_reuse=True)
+                                        enable_block_reuse=kv_cache_reuse)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
