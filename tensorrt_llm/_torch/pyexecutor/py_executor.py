@@ -33,15 +33,12 @@ from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
 from .kv_cache_transceiver import KvCacheTransceiver
-<<<<<<< HEAD
-from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
-                          LlmRequestState, executor_request_to_llm_request,
-                          make_llm_responses_serialize_friendly,
-                          restore_llm_responses_from_serialize_friendly_dict)
-=======
+# from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
+#                           LlmRequestState, executor_request_to_llm_request,
+#                           make_llm_responses_serialize_friendly,
+#                           restore_llm_responses_from_serialize_friendly_dict)
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, executor_request_to_llm_request)
->>>>>>> clean_prepare_2
 from .model_engine import ModelEngine
 from .sampler import Sampler, SampleState, SampleStateTensors, TorchSampler
 from .scheduler import ScheduledRequests
