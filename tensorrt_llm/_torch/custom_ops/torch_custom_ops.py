@@ -5,6 +5,7 @@ import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
+from .. import autotuner
 from ..attention_backend.interface import AttentionInputType
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
@@ -22,12 +23,6 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
 class MoERunner(TunableRunner):
     # avoid overhead of creating a new runner in forward pass
     runner_dict = dict()
-    # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
-    tuning_config = TuningConfig(dynamic_tensor_specs=(
-        DynamicTensorSpec(0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-                          lambda x: min(last_positive_power_of_2(x), 8192)),
-        DynamicTensorSpec(3, 0, (0, ), lambda x: x),
-    ))
 
     def __init__(
         self,
@@ -122,16 +117,31 @@ class MoERunner(TunableRunner):
     @classmethod
     @lru_cache(maxsize=None)
     def refine_tuning_config(cls, tune_max_num_tokens: int):
-        cls.tuning_config = TuningConfig(dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                0, 0, get_last_power_of_2_num_tokens_buckets(
-                    tune_max_num_tokens), lambda x: min(
-                        last_positive_power_of_2(x), tune_max_num_tokens)),
-            DynamicTensorSpec(3, 0, (0, ), lambda x: x),
-        ))
+        # TODO: Remove this and put it automatically in the autotuner
+        # User can decide if tune_max_num_tokens is needed or not
+        tuning_config = TuningConfig(
+            name=("trtllm::fused_moe::gemm1", "trtllm::fused_moe::gemm2"),
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    0, 0,
+                    get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
+                    lambda x: min(last_positive_power_of_2(x),
+                                  tune_max_num_tokens)),
+                DynamicTensorSpec(3, 0, (0, ), lambda x: x),
+            ),
+        )
+        AutoTuner.get().register_tuning_config(tuning_config)
 
 
 @torch.library.custom_op("trtllm::fused_moe", mutates_args=())
+@autotuner.tuning_config(
+    name=("trtllm::fused_moe::gemm1", "trtllm::fused_moe::gemm2"),
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(0, 0, get_last_power_of_2_num_tokens_buckets(8192),
+                          lambda x: min(last_positive_power_of_2(x), 8192)),
+        DynamicTensorSpec(3, 0, (0, ), lambda x: x),
+    ),
+)
 def fused_moe(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -180,7 +190,6 @@ def fused_moe(
     _, gemm_tactic_1 = tuner.choose_one(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
-        MoERunner.tuning_config,
         [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
         gemm_idx=1,
     )
@@ -188,7 +197,6 @@ def fused_moe(
     _, gemm_tactic_2 = tuner.choose_one(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
-        MoERunner.tuning_config,
         [input, fc1_expert_weights, fc2_expert_weights, min_latency_tensor],
         gemm_idx=2,
     )
@@ -257,11 +265,6 @@ def _(
 
 class FP4GemmRunner(TunableRunner):
     runner_dict = dict()
-    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
-        0, 0, get_last_power_of_2_num_tokens_buckets,
-        last_positive_power_of_2), ),
-                                 constraint_specs=(ConstraintSpec(
-                                     2, 0, fp4_scale_infer_shape), ))
 
     def __init__(
         self,
@@ -304,6 +307,13 @@ class FP4GemmRunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::nvfp4_gemm", mutates_args=())
+@autotuner.tuning_config(
+    name="trtllm::nvfp4_gemm::gemm",
+    dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_last_power_of_2_num_tokens_buckets,
+        last_positive_power_of_2), ),
+    constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
+)
 def nvfp4_gemm(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
@@ -323,13 +333,13 @@ def nvfp4_gemm(
     _, best_tactic = tuner.choose_one(
         "trtllm::fp4_gemm::gemm",
         [nvfp4_gemm_runner],
-        FP4GemmRunner.tuning_config,
         [act_fp4, weight, act_sf, weight_scale, alpha],
     )
 
     return nvfp4_gemm_runner(
         inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
-        tactic=best_tactic)
+        tactic=best_tactic,
+    )
 
 
 @nvfp4_gemm.register_fake
@@ -348,42 +358,36 @@ def _(
 
 class FP8BatchedGemmRunner(TunableRunner):
     runner_dict = dict()
-    tuning_config = None
 
     def __init__(self, output_dtype: torch.dtype, use_deep_seek_fp8: bool,
-                 low_latency_kernel: bool, tile_size: int,
-                 epilogue_tile_m: int):
+                 low_latency_kernel: bool):
 
         self.output_dtype = output_dtype
         self.use_deep_seek_fp8 = use_deep_seek_fp8
         self.low_latency_kernel = low_latency_kernel
-        self.tile_size = tile_size
-        self.epilogue_tile_m = epilogue_tile_m
-        FP8BatchedGemmRunner.tuning_config = FP8BatchedGemmRunner.get_tuning_config(
-            use_deep_seek_fp8, tile_size)
-
-        instance_key = (output_dtype, use_deep_seek_fp8, low_latency_kernel,
-                        tile_size, epilogue_tile_m)
-
-        if instance_key not in FP8BatchedGemmRunner.runner_dict:
-            FP8BatchedGemmRunner.runner_dict[
-                instance_key] = torch.classes.trtllm.FP8BatchedGemmRunner(
-                    output_dtype, use_deep_seek_fp8, low_latency_kernel,
-                    tile_size, epilogue_tile_m)
-
-        self.kernel_runner = FP8BatchedGemmRunner.runner_dict[instance_key]
 
     def forward(
         self,
         inputs: List[torch.Tensor],
         tactic: int = -1,
+        tile_size: int = 8,
+        epilogue_tile_m: int = 64,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run the batched GEMM operation with the given inputs and tactic.
         """
 
-        mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c = inputs
+        if tactic == -1:
+            # use the right default value for epilogue_tile_m
+            # This is not tunable due to
+            epilogue_tile_m = 64 if self.use_deep_seek_fp8 else 128
 
-        out_tensors = self.kernel_runner.run_batched_gemm(
+        mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c = inputs
+        kernel_runner = self.get_runner(self.output_dtype,
+                                        self.use_deep_seek_fp8,
+                                        self.low_latency_kernel, tile_size,
+                                        epilogue_tile_m)
+
+        out_tensors = kernel_runner.run_batched_gemm(
             mat1,
             mat2,
             dq_sfs_a,
@@ -398,7 +402,19 @@ class FP8BatchedGemmRunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
+        tile_size: int,
+        epilogue_tile_m: int,
     ) -> List[int]:
+
+        valid_epilogue_tile_m = (epilogue_tile_m == 64
+                                 and self.use_deep_seek_fp8) or (
+                                     epilogue_tile_m == 128
+                                     and not self.use_deep_seek_fp8)
+        m = inputs[0].shape[1]
+        valid_tile_size = (m % tile_size == 0)
+        valid = valid_epilogue_tile_m and valid_tile_size
+        if not valid:
+            return []
 
         mat1, mat2, _, _, _ = inputs
 
@@ -407,82 +423,55 @@ class FP8BatchedGemmRunner(TunableRunner):
         n = mat2.shape[1]
         k = mat1.shape[2]
 
-        tactics = self.kernel_runner.get_valid_configs(b, m, n, k)
+        kernel_runner = self.get_runner(self.output_dtype,
+                                        self.use_deep_seek_fp8,
+                                        self.low_latency_kernel, tile_size,
+                                        epilogue_tile_m)
+
+        tactics = kernel_runner.get_valid_configs(b, m, n, k)
 
         return tactics
 
-    @classmethod
-    def get_dynamic_tensor_specs(cls) -> Tuple[DynamicTensorSpec, ...]:
-        """Get the dynamic tensor specs for use with the AutoTuner."""
+    def get_runner(self, output_dtype: torch.dtype, use_deep_seek_fp8: bool,
+                   low_latency_kernel: bool, tile_size: int,
+                   epilogue_tile_m: int):
+        instance_key = (output_dtype, use_deep_seek_fp8, low_latency_kernel,
+                        tile_size, epilogue_tile_m)
 
-        # These indices correspond to the 0th input tensor and it's first dimension
-        # i.e. we are tuning M where the first input tensor is of shape [B, M, K]
+        if instance_key not in FP8BatchedGemmRunner.runner_dict:
+            FP8BatchedGemmRunner.runner_dict[
+                instance_key] = torch.classes.trtllm.FP8BatchedGemmRunner(
+                    output_dtype, use_deep_seek_fp8, low_latency_kernel,
+                    tile_size, epilogue_tile_m)
 
-        MAT1_IDX = 0
-        TUNED_DIM = 1
-
-        # Starting at 8 as M % tile size == 0 is required
-        m_values = (8, 16, 32, 64, 128, 256, 512, 1024, 2048)
-        round_rule = last_positive_power_of_2
-
-        specs = (DynamicTensorSpec(MAT1_IDX, TUNED_DIM, m_values, round_rule), )
-
-        return specs
+        return FP8BatchedGemmRunner.runner_dict[instance_key]
 
     @classmethod
-    def get_constraint_specs(cls, use_deep_seek_fp8: bool,
-                             tile_size: int) -> Tuple[ConstraintSpec, ...]:
-        """Get the constraint specs for the dynamic tensors for use with the AutoTuner.
-        """
+    def constrain_dq_sfs_a_dim1(cls, shapes: Tuple[torch.Size]) -> int:
+        b = shapes[0][0]
+        m = shapes[0][1]
 
-        # When using deepseek fp8, the dq_sfs_a and dq_sfs_b tensors are expected to
-        # have specific dimensions. As we are only tuning M, we need only constrain
-        # dimension 1 of dq_sfs_a
-        if not use_deep_seek_fp8:
-            constraint_dq_sfs_a = ()
-        else:
-
-            def _constrain_dq_sfs_a_dim1(shapes: Tuple[torch.Size]) -> int:
-                b = shapes[0][0]
-                m = shapes[0][1]
-
-                m_padded = (m + tile_size - 1) // tile_size
-                result = m_padded * tile_size * b
-
-                return result
-
-            SFS_A_IDX = 2
-            CONSTRAINED_DIM = 1
-
-            constraint_dq_sfs_a = (ConstraintSpec(SFS_A_IDX, CONSTRAINED_DIM,
-                                                  _constrain_dq_sfs_a_dim1), )
-
-        return constraint_dq_sfs_a
-
-    @classmethod
-    @lru_cache(maxsize=None)
-    def get_tuning_config(cls, use_deep_seek_fp8: bool,
-                          tile_size: int) -> TuningConfig:
-        """Get the tuning configuration for the AutoTuner."""
-
-        dynamic_tensor_specs = cls.get_dynamic_tensor_specs()
-        constraint_specs = cls.get_constraint_specs(use_deep_seek_fp8,
-                                                    tile_size)
-
-        tuning_config = TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs,
-                                     constraint_specs=constraint_specs)
-
-        return tuning_config
+        return m * b
 
 
 @torch.library.custom_op("trtllm::fp8_batched_gemm_trtllmgen", mutates_args=())
+@autotuner.tuning_config(
+    name="trtllm::fp8_batched_gemm_trtllmgen::batched_gemm",
+    dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 1, (8, 16, 32, 64, 128, 256, 512, 1024, 2048),
+        last_positive_power_of_2), ),
+    constraint_specs=(ConstraintSpec(
+        2, 1, FP8BatchedGemmRunner.constrain_dq_sfs_a_dim1), ),
+    configs={
+        'tile_size': [8],
+        'epilogue_tile_m': [64, 128]
+    },
+)
 def fp8_batched_gemm_trtllmgen(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
-    tile_size: int,
     use_deep_seek_fp8: Optional[bool] = False,
     low_latency: Optional[bool] = False,
-    epilogue_tile_m: Optional[int] = 0,
     dq_sfs_a: Optional[torch.Tensor] = None,
     dq_sfs_b: Optional[torch.Tensor] = None,
     scale_c: Optional[torch.Tensor] = None,
@@ -491,24 +480,22 @@ def fp8_batched_gemm_trtllmgen(
 
     kernel_runner = FP8BatchedGemmRunner(output_dtype=out_dtype,
                                          use_deep_seek_fp8=use_deep_seek_fp8,
-                                         low_latency_kernel=low_latency,
-                                         tile_size=tile_size,
-                                         epilogue_tile_m=epilogue_tile_m)
+                                         low_latency_kernel=low_latency)
 
     tuner = AutoTuner.get()
 
     inputs = [mat1, mat2, dq_sfs_a, dq_sfs_b, scale_c]
 
-    _, best_tactic = tuner.choose_one(
+    _, best_tactic, best_config = tuner.choose_one(
         "trtllm::fp8_batched_gemm_trtllmgen::batched_gemm",
         [kernel_runner],
-        FP8BatchedGemmRunner.tuning_config,
         inputs,
     )
 
     return kernel_runner(
         inputs=inputs,
         tactic=best_tactic,
+        **best_config,
     )
 
 
@@ -518,10 +505,8 @@ def fp8_batched_gemm_trtllmgen(
 def _(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
-    tile_size: int,
     use_deep_seek_fp8: Optional[bool] = False,
     low_latency: Optional[bool] = False,
-    epilogue_tile_m: Optional[int] = 0,
     dq_sfs_a: Optional[torch.Tensor] = None,
     dq_sfs_b: Optional[torch.Tensor] = None,
     scale_c: Optional[torch.Tensor] = None,

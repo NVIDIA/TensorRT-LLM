@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import functools
 import inspect
 import itertools
 from abc import ABC, abstractmethod
@@ -43,7 +44,7 @@ class ConstraintSpec:
     infer_shape: Callable
 
 
-@dataclass(kw_only=True, unsafe_hash=True)
+@dataclass(kw_only=True)
 class TuningConfig:
     """Configuration for autotuning.
 
@@ -82,8 +83,37 @@ class TuningConfig:
                 ...     )
                 ... )
     """
+    name: Union[str, Tuple[str, ...]] = ""
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
+    configs: Dict[str, Any] = field(default_factory=dict)
+
+
+def tuning_config(
+        name: Union[str, Tuple[str, ...]] = "",
+        dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = (),
+        constraint_specs: Tuple[ConstraintSpec, ...] = (),
+        configs: Dict[str, Any] = field(default_factory=dict),
+):
+
+    def decorator(func):
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        tuner = AutoTuner.get()
+        tuning_config = TuningConfig(
+            name=name,
+            dynamic_tensor_specs=dynamic_tensor_specs,
+            constraint_specs=constraint_specs,
+            configs=configs,
+        )
+        tuner.register_tuning_config(tuning_config)
+
+        return wrapper
+
+    return decorator
 
 
 @dataclass(unsafe_hash=True)
@@ -139,7 +169,7 @@ class TunableRunner(ABC):
 
     @abstractmethod
     def get_valid_tactics(self, inputs: List[torch.Tensor],
-                          profile: OptimizationProfile) -> List[int]:
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         """One tactic corresponding to one cuda kernel normally, but how to interpret the meaning
         of tactic is pure internal details of the runner.
 
@@ -167,7 +197,8 @@ class TunableRunner(ABC):
             inputs: List[torch.Tensor],
             *,  # all others are keyword args only
             tactic: int = -1,
-            do_preparation: bool = False) -> Any:
+            do_preparation: bool = False,
+            **kwargs) -> Any:
         """Forward pass for tunable runners.
 
         Args:
@@ -277,6 +308,7 @@ class AutoTuner:
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = {}
+        self.tuning_configs = {}
         self.is_tuning_mode = False
 
         # Add statistics tracking
@@ -296,7 +328,7 @@ class AutoTuner:
         runners: List[TunableRunner],
         input_shapes: Tuple[torch.Size],
         tuning_config: TuningConfig,
-    ) -> Tuple[bool, int, int, OptimizationProfile]:
+    ) -> Tuple[bool, int, int, Dict[str, Any], OptimizationProfile]:
         """Search for cached profiling results matching the current configuration.
 
         Args:
@@ -314,10 +346,13 @@ class AutoTuner:
                     tuning_config)) in self.profiling_cache:
                 return True, *self.profiling_cache[cache_key]
 
-        return False, 0, -1, None
+        if tuning_config.configs:
+            return False, 0, -1, {}, None
+        else:
+            return False, 0, -1, None, None
 
     def choose_one(self, custom_op: str, runners: List[TunableRunner],
-                   tuning_config: TuningConfig, inputs: List[torch.Tensor],
+                   inputs: List[torch.Tensor],
                    **kwargs) -> Tuple[TunableRunner, int]:
         """Choose the best runner and tactic combination through performance profiling.
 
@@ -343,9 +378,10 @@ class AutoTuner:
 
         input_shapes = tuple(self._get_input_sizes(inputs))
 
+        tuning_config = self.get_tuning_config(custom_op)
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
-            is_cache_hit, runner_id, tactic, stored_profile = self.search_cache(
+            is_cache_hit, runner_id, tactic, stored_config, stored_profile = self.search_cache(
                 custom_op, runners, input_shapes, tuning_config)
             runner = runners[runner_id]
             # TODO: check the stored runner and tactic can implement this shape here
@@ -360,81 +396,111 @@ class AutoTuner:
                 logger.debug(
                     f"[AutoTunner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config)}"
                 )
-            return runner, tactic
+
+            if tuning_config.configs:
+                return runner, tactic, stored_config
+            else:
+                return runner, tactic
 
         assert len(runners) > 0, "At least one runner is required"
         assert all([isinstance(r, TunableRunner) for r in runners]), \
             "All Given runners must be subclass of TunableRunner"
 
         profiles = self._optimization_profiles(tuning_config, inputs)
+        configs = self._generate_all_configs(tuning_config)
+
         # Record the total configs to try
         self.stats.tuned_op_total_configs[custom_op] = len(profiles)
 
         for p in profiles:
+            # This can depend on the configs, which is only looped over in profile_runners
             tensors = self._prepare_input_tensors(p, inputs)
-            is_cache_hit, runner_id, tactic, _ = self.search_cache(
-                custom_op, runners, p.get_opt_shapes(), tuning_config)
+            is_cache_hit, *_ = self.search_cache(custom_op, runners,
+                                                 p.get_opt_shapes(),
+                                                 tuning_config)
             if not is_cache_hit:
-                min_time = float('inf')
                 # Initialize runner and tactic as None in case of no valid tactic or runners are found
-                runner_id, tactic = None, None
-                for r_id, r in enumerate(runners):
-                    # TODO: use FakeTensor here.
-                    valid_tactics = r.get_valid_tactics(tensors, p)
-                    runner_arg_names = {
-                        p.name
-                        for p in inspect.signature(
-                            r.forward).parameters.values()
-                    }
-                    if "do_preparation" in runner_arg_names and len(
-                            valid_tactics) > 0:
-                        r(tensors, tactic=-1, do_preparation=True, **kwargs)
-                    for tac in valid_tactics:
-                        try:
-                            time_measured = self._profile_single_kernel(
-                                r, tensors, tac, **kwargs)
-                        except Exception as e:
-                            shapes = self._get_input_sizes(tensors)
-
-                            logger.error(
-                                f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
-                            )
-
-                            # Record the failed profiling combinations
-                            if custom_op not in self.stats.failed_profiling_count:
-                                self.stats.failed_profiling_count[
-                                    custom_op] = set()
-                            self.stats.failed_profiling_count[custom_op].add(
-                                AutoTuner._get_cache_key(
-                                    custom_op, r, p.get_opt_shapes(),
-                                    tuning_config))
-
-                            # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
-                            # or some runtime error occurs during profiling.
-                            time_measured = float('inf')
-                        if time_measured < min_time:
-                            min_time = time_measured
-                            runner_id, tactic = r_id, tac
-                if runner_id is not None:
+                best_runner_id, best_tactic, best_config = self._profile_runners(
+                    custom_op, runners, tensors, p, tuning_config, configs,
+                    **kwargs)
+                if best_runner_id is not None:
                     # At least one valid (runner, tactic) pair is found
                     cache_key = AutoTuner._get_cache_key(
-                        custom_op, runners[runner_id], p.get_opt_shapes(),
+                        custom_op, runners[best_runner_id], p.get_opt_shapes(),
                         tuning_config)
                     # inspect call stack
-                    self.profiling_cache[cache_key] = (runner_id, tactic, p)
+                    self.profiling_cache[cache_key] = (best_runner_id,
+                                                       best_tactic, best_config,
+                                                       p)
                     self.stats.tuned_op_successful_configs[
                         custom_op] = self.stats.tuned_op_successful_configs.get(
                             custom_op, 0) + 1
                     logger.debug(
-                        f"[Autotuner]: profiling chosen runner: {runners[runner_id]} {tactic} for {cache_key}"
+                        f"[Autotuner]: profiling chosen runner: {runners[best_runner_id]} {best_tactic}{f' {best_config}' if best_config else ''} for {cache_key}"
                     )
 
         # Get the best runner and tactic from cache
         # If no valid tactic is found, the fallback runner and tactic will be used
-        _, runner_id, tactic, _ = self.search_cache(custom_op, runners,
-                                                    input_shapes, tuning_config)
+        _, runner_id, tactic, config, _ = self.search_cache(
+            custom_op, runners, input_shapes, tuning_config)
 
-        return runners[runner_id], tactic
+        if tuning_config.configs:
+            return runners[runner_id], tactic, config
+        else:
+            return runners[runner_id], tactic
+
+    def _profile_runners(self, custom_op: str, runners: List[TunableRunner],
+                         input_tensors: List[torch.Tensor],
+                         profile: OptimizationProfile,
+                         tuning_config: TuningConfig,
+                         configs: List[Dict[str, Any]], **kwargs) -> float:
+        min_time = float('inf')
+        best_runner_id, best_tactic, best_config = None, None, None
+        for runner_id, runner in enumerate(runners):
+            # TODO: use FakeTensor here.
+            runner_arg_names = {
+                p.name
+                for p in inspect.signature(runner.forward).parameters.values()
+            }
+            for config in configs:
+                valid_tactics = runner.get_valid_tactics(
+                    input_tensors, profile, **config)
+                if "do_preparation" in runner_arg_names and len(
+                        valid_tactics) > 0:
+                    runner(input_tensors,
+                           tactic=-1,
+                           do_preparation=True,
+                           **config,
+                           **kwargs)
+
+                for tac in valid_tactics:
+                    try:
+                        time_measured = self._profile_single_kernel(
+                            runner, input_tensors, tac, config, **kwargs)
+                    except Exception as e:
+                        # Handle None tensors for optional inputs
+                        shapes = self._get_input_sizes(input_tensors)
+
+                        logger.error(
+                            f"[Autotuner]: Failed when profiling {runner} {tac}, shapes={shapes}. Error occurred: {e}"
+                        )
+
+                        # Record the failed profiling combinations
+                        if custom_op not in self.stats.failed_profiling_count:
+                            self.stats.failed_profiling_count[custom_op] = set()
+                        self.stats.failed_profiling_count[custom_op].add(
+                            AutoTuner._get_cache_key(custom_op, runner,
+                                                     profile.get_opt_shapes(),
+                                                     tuning_config))
+
+                        # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
+                        # or some runtime error occurs during profiling.
+                        time_measured = float('inf')
+                    if time_measured < min_time:
+                        min_time = time_measured
+                        best_runner_id, best_tactic, best_config = runner_id, tac, config
+
+        return best_runner_id, best_tactic, best_config
 
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
 
@@ -448,7 +514,7 @@ class AutoTuner:
 
     def _profile_single_kernel(self, runner: TunableRunner,
                                inputs: List[torch.Tensor], tactic: int,
-                               **kwargs) -> float:
+                               config: Dict[str, Any], **kwargs) -> float:
         """Profile a single kernel implementation for performance measurement.
 
         Args:
@@ -467,7 +533,7 @@ class AutoTuner:
         stream = torch.cuda.current_stream()
         # warm up, no timing
         for _ in range(self.warmup):
-            runner(inputs, tactic=tactic, **kwargs)
+            runner(inputs, tactic=tactic, **config, **kwargs)
         stream.synchronize()
 
         # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
@@ -479,7 +545,7 @@ class AutoTuner:
 
         start.record(stream=stream)
         for _ in range(self.repeat):
-            runner(inputs, tactic=tactic, **kwargs)
+            runner(inputs, tactic=tactic, **config, **kwargs)
         end.record(stream=stream)
         stream.synchronize()
 
@@ -554,6 +620,8 @@ class AutoTuner:
             for spec in tuning_config.constraint_specs:
                 min_value = opt_value = max_value = spec.infer_shape(
                     p.get_opt_shapes())
+                if p.shapes[spec.input_idx] == [StaticDim(0)]:
+                    continue
                 p.shapes[spec.input_idx][spec.dim_idx] = DynamicDim(
                     min_value, opt_value, max_value)
             generated_profiles.append(p)
@@ -562,8 +630,10 @@ class AutoTuner:
 
     @classmethod
     @lru_cache(maxsize=None)
-    def _find_nearest_profile(cls, shapes: Tuple[torch.Size],
-                              tuning_config: TuningConfig) -> Tuple:
+    def _find_nearest_profile(
+            cls, shapes: Tuple[torch.Size],
+            dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...],
+            constraint_specs: Tuple[ConstraintSpec, ...]) -> Tuple:
         """Find the nearest optimization profile for given inputs
         User can define their own nearest profile generation method to reduce the host overhead.
 
@@ -578,13 +648,15 @@ class AutoTuner:
         """
         base_profile = list(list(shape) for shape in shapes)
 
-        for spec in tuning_config.dynamic_tensor_specs:
+        for spec in dynamic_tensor_specs:
             base_profile[spec.input_idx][
                 spec.dim_idx] = spec.map_to_tuning_buckets(
                     base_profile[spec.input_idx][spec.dim_idx])
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
-        for spec in tuning_config.constraint_specs:
+        for spec in constraint_specs:
+            if base_profile[spec.input_idx] == [0]:
+                continue
             base_profile[spec.input_idx][spec.dim_idx] = -1
 
         return tuple(tuple(shape) for shape in base_profile)
@@ -598,7 +670,9 @@ class AutoTuner:
         tuning_config: TuningConfig,
     ) -> Tuple:
         return (custom_op, runner.__class__.__name__, hash(runner),
-                cls._find_nearest_profile(input_shapes, tuning_config))
+                cls._find_nearest_profile(input_shapes,
+                                          tuning_config.dynamic_tensor_specs,
+                                          tuning_config.constraint_specs))
 
     def _create_tensor_like(self, origin_tensor: torch.Tensor,
                             dims: List[Dim]) -> torch.Tensor:
@@ -642,6 +716,14 @@ class AutoTuner:
             tensors.append(tensor)
         return tensors
 
+    def _generate_all_configs(
+            self, tuning_config: TuningConfig) -> List[Dict[str, Any]]:
+        # If there is no config, return a list with an empty dict
+        if not tuning_config.configs:
+            return [{}]
+        prod = itertools.product(*tuning_config.configs.values())
+        return list(dict(zip(tuning_config.configs.keys(), p)) for p in prod)
+
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
@@ -649,3 +731,12 @@ class AutoTuner:
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""
         self.stats = AutoTunerStatistics()
+
+    def register_tuning_config(self, tuning_config: TuningConfig):
+        name = tuning_config.name
+        names = [name] if isinstance(name, str) else name
+        for name in names:
+            self.tuning_configs[name] = tuning_config
+
+    def get_tuning_config(self, name: str) -> TuningConfig:
+        return self.tuning_configs.get(name, TuningConfig())
