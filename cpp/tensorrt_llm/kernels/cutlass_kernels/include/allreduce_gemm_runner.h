@@ -25,11 +25,11 @@
 #include "cutlass_extensions/gemm_configs.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
+namespace tensorrt_llm::kernels::opened_cutlass_kernels
+{
 using namespace cute;
 using namespace tensorrt_llm::cutlass_extensions;
 
-namespace tensorrt_llm::kernels::opened_cutlass_kernels
-{
 enum GemmAllReduceImpl
 {
     kNVLS_2SHOT

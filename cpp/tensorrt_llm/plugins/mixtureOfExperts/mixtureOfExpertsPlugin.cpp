@@ -694,12 +694,14 @@ QuantParams tensorrt_llm::plugins::MixtureOfExpertsPlugin::getQuantParams(nvinfe
         TLLM_CHECK(desc_6->dims.nbDims == 1);
         TLLM_CHECK(desc_1->dims.d[0] == 1);
         TLLM_CHECK_WITH_INFO(desc_2->dims.d[0] == experts_per_node && desc_2->dims.d[1] == gated_inter_size
-                && desc_2->dims.d[2] == mExpertHiddenSize / BlockScaleVectorSize,
+                && desc_2->dims.d[2]
+                    == mExpertHiddenSize / TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize,
             "Incorrect shape for FP4 scale");
         TLLM_CHECK_WITH_INFO(desc_3->dims.d[0] == experts_per_node, "Incorrect shape for FP4 scale");
         TLLM_CHECK(desc_4->dims.d[0] == 1);
         TLLM_CHECK_WITH_INFO(desc_5->dims.d[0] == experts_per_node && desc_5->dims.d[1] == mExpertHiddenSize
-                && desc_5->dims.d[2] == mExpertInterSize / BlockScaleVectorSize,
+                && desc_5->dims.d[2]
+                    == mExpertInterSize / TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize,
             "Incorrect shape for FP4 scale");
         TLLM_CHECK_WITH_INFO(desc_6->dims.d[0] == experts_per_node, "Incorrect shape for FP4 scale");
         return QuantParams::FP4(static_cast<float const*>(scale_1),
@@ -954,6 +956,7 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
     MoeMinLatencyParams min_latency_params{};
     mMOERunner->setTactic(gemm1, gemm2);
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
     mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr,
         static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
         hasFinalScales() ? static_cast<float const*>(inputs[getTokenFinalScalesIndex()]) : nullptr,
@@ -964,6 +967,18 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig,
         /*enable_alltoall=*/false, hasLora(), lora_params, /*use_deepseek_fp8_block_scale=*/false,
         /*min_latency_mode=*/false, min_latency_params, stream);
+#else
+    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr,
+        static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
+        hasFinalScales() ? static_cast<float const*>(inputs[getTokenFinalScalesIndex()]) : nullptr,
+        inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr, mActivationType,
+        inputs[getExpertWeights2Index()], hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens,
+        mExpertHiddenSize, mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
+        // Outputs
+        outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig, hasLora(),
+        lora_params, /*use_deepseek_fp8_block_scale=*/false,
+        /*min_latency_mode=*/false, min_latency_params, stream);
+#endif
 
     if (useSideStream())
     {
@@ -1279,8 +1294,15 @@ void MixtureOfExpertsGemmProfiler::checkInit()
     }
     init_backend = true;
     auto& plugin = *mRunner;
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
     backend.init(*plugin.mMOERunner, backend.mGemmToProfile, plugin.mType, plugin.mWeightType, plugin.mOutputType,
         plugin.mNumExperts, plugin.mExpertsPerToken, plugin.mExpertHiddenSize, plugin.mExpertInterSize,
         plugin.mGroupSize, plugin.mActivationType, plugin.hasBias(), plugin.hasLora(), /*min_latency_mode=*/false,
         /*need_weights=*/true, plugin.getParallelismConfig(), /*enable_alltoall=*/false);
+#else
+    backend.init(*plugin.mMOERunner, backend.mGemmToProfile, plugin.mType, plugin.mWeightType, plugin.mOutputType,
+        plugin.mNumExperts, plugin.mExpertsPerToken, plugin.mExpertHiddenSize, plugin.mExpertInterSize,
+        plugin.mGroupSize, plugin.mActivationType, plugin.hasBias(), plugin.hasLora(), /*min_latency_mode=*/false,
+        /*need_weights=*/true, plugin.getParallelismConfig());
+#endif
 }

@@ -130,7 +130,7 @@ include = [
     "tensorrt_llm/top_model_mixin.py",
 ]
 exclude = [
-    "3rdparty/**",
+    "**3rdparty/**",
 ]
 
 

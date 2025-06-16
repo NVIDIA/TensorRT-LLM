@@ -33,14 +33,13 @@
 #pragma GCC diagnostic pop
 #endif          // __GNUC__
 
-using namespace cute;
-
 namespace tensorrt_llm
 {
 namespace kernels
 {
 namespace cutlass_kernels
 {
+using namespace cute;
 
 template <typename ElementType, typename OutElementType, typename AccumElementType, typename CtaShape,
     typename WarpShape, int Stages>

@@ -27,7 +27,8 @@
 
 namespace tensorrt_llm::kernels::cutlass_kernels
 {
-std::array<size_t, 17> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(int num_experts)
+std::array<size_t, 17> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
+    int num_experts, FpXBlockScalingType scaling_type)
 {
     size_t problem_shape_size = sizeof(ProblemShape::UnderlyingProblemShape) * num_experts;
     size_t stride_a_size = sizeof(StrideA) * num_experts;
@@ -40,8 +41,12 @@ std::array<size_t, 17> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(int 
 
     size_t sf_a_size = sizeof(ElementSF*) * num_experts;
     size_t sf_b_size = sizeof(ElementSF*) * num_experts;
-    size_t stride_sf_a_size = sizeof(LayoutScalingFactorsA) * num_experts;
-    size_t stride_sf_b_size = sizeof(LayoutScalingFactorsB) * num_experts;
+    size_t stride_sf_a_size = scaling_type == FpXBlockScalingType::MXFPX
+        ? sizeof(MXFPXBlockScaledConfig::LayoutSF) * num_experts
+        : sizeof(NVFP4BlockScaledConfig::LayoutSF) * num_experts;
+    size_t stride_sf_b_size = scaling_type == FpXBlockScalingType::MXFPX
+        ? sizeof(MXFPXBlockScaledConfig::LayoutSF) * num_experts
+        : sizeof(NVFP4BlockScaledConfig::LayoutSF) * num_experts;
 
     size_t int4_groupwise_problem_shape_size
         = sizeof(INT4GroupwiseParams::ProblemShapeInt::UnderlyingProblemShape) * num_experts;
@@ -53,16 +58,16 @@ std::array<size_t, 17> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(int 
         stride_sf_b_size, int4_groupwise_problem_shape_size, int4_groupwise_sf_a_size, int4_groupwise_stride_sf_a_size};
 }
 
-size_t TmaWarpSpecializedGroupedGemmInput::workspaceSize(int num_experts)
+size_t TmaWarpSpecializedGroupedGemmInput::workspaceSize(int num_experts, FpXBlockScalingType scaling_type)
 {
-    auto buffers = workspaceBuffers(num_experts);
+    auto buffers = workspaceBuffers(num_experts, scaling_type);
     return tensorrt_llm::common::calculateTotalWorkspaceSize(buffers.data(), buffers.size());
 }
 
-void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(
-    int8_t* start_ptr, int num_experts, void* gemm_workspace, size_t gemm_workspace_size)
+void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(int8_t* start_ptr, int num_experts, void* gemm_workspace,
+    size_t gemm_workspace_size, FpXBlockScalingType scaling_type)
 {
-    auto buffers = workspaceBuffers(num_experts);
+    auto buffers = workspaceBuffers(num_experts, scaling_type);
     std::array<int8_t*, 17> pointers{};
     TLLM_CHECK_WITH_INFO(pointers.size() == buffers.size(), "Mismatching workspace size and number of buffers");
     for (int i = 0; i < buffers.size(); i++)
@@ -86,11 +91,11 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(
 
     alpha_scale_ptr_array = reinterpret_cast<float const**>(pointers[9]);
 
-    fp4_block_scaling_factors_A = reinterpret_cast<ElementSF const**>(pointers[10]);
-    fp4_block_scaling_factors_B = reinterpret_cast<ElementSF const**>(pointers[11]);
+    fpX_block_scaling_factors_A = reinterpret_cast<ElementSF const**>(pointers[10]);
+    fpX_block_scaling_factors_B = reinterpret_cast<ElementSF const**>(pointers[11]);
 
-    fp4_block_scaling_factors_stride_A = reinterpret_cast<LayoutScalingFactorsA*>(pointers[12]);
-    fp4_block_scaling_factors_stride_B = reinterpret_cast<LayoutScalingFactorsB*>(pointers[13]);
+    fpX_block_scaling_factors_stride_A = pointers[12];
+    fpX_block_scaling_factors_stride_B = pointers[13];
 
     int4_groupwise_params.shape.problem_shapes
         = reinterpret_cast<INT4GroupwiseParams::ProblemShapeInt::UnderlyingProblemShape*>(pointers[14]);
@@ -152,10 +157,11 @@ std::string TmaWarpSpecializedGroupedGemmInput::toString() const
         ss << '\n';
         ss << "Alpha scale ptr: " << (PrintType) alpha_scale_ptr_array << "\n";
 
-        ss << "Fp4 Block Scaling Factors A: " << (PrintType) fp4_block_scaling_factors_A
-           << ", with Stride: " << (PrintType) fp4_block_scaling_factors_stride_A << "\n";
-        ss << "Fp4 Block Scaling Factors B: " << (PrintType) fp4_block_scaling_factors_B
-           << ", with Stride: " << (PrintType) fp4_block_scaling_factors_stride_B << "\n";
+        ss << "FpX Block Scaling Type: " << (int) fpX_block_scaling_type << "\n";
+        ss << "Fp4 Block Scaling Factors A: " << (PrintType) fpX_block_scaling_factors_A
+           << ", with Stride: " << (PrintType) fpX_block_scaling_factors_stride_A << "\n";
+        ss << "Fp4 Block Scaling Factors B: " << (PrintType) fpX_block_scaling_factors_B
+           << ", with Stride: " << (PrintType) fpX_block_scaling_factors_stride_B << "\n";
         ss << "Gemm Workspace: " << (PrintType) gemm_workspace << ", with Size: " << gemm_workspace_size << "\n";
     }
 

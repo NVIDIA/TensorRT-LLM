@@ -20,7 +20,14 @@
 
 #include <nlohmann/json.hpp>
 
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#else
 #include "moe_kernels.h"
+#endif
+
+#include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
+
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
@@ -41,6 +48,12 @@ using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::cutlass_extensions;
+
+using namespace CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
+using CUTLASS_MOE_GEMM_NAMESPACE::TmaWarpSpecializedGroupedGemmInput;
+using CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::CutlassMoeFCRunner;
+using CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
+using CUTLASS_MOE_GEMM_NAMESPACE::isGatedActivation;
 
 static BufferManager::CudaStreamPtr streamPtr;
 static std::unique_ptr<BufferManager> bufferManager;
@@ -485,7 +498,7 @@ public:
     bool mIsGated = false;
     int mGatedMultiplier = 1;
 
-    tensorrt_llm::ActivationType mActType = tensorrt_llm::ActivationType::Relu;
+    ActivationType mActType = ActivationType::Relu;
 
     QuantParams mQuantParams{};
     bool mUseLora = false;
@@ -650,9 +663,15 @@ public:
             "Tactic Profiling GEMM " + std::to_string(static_cast<int>(gemm_to_profile)));
 
         GemmProfilerBackend profiler;
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+        profiler.init(mMoERunner, gemm_to_profile, typeToDtypeID<DataType>(), typeToDtypeID<WeightType>(),
+            typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize, mGroupSize, mActType, mUseBias,
+            mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, parallelism_config, /*enable_alltoall=*/false);
+#else
         profiler.init(mMoERunner, gemm_to_profile, typeToDtypeID<DataType>(), typeToDtypeID<WeightType>(),
             typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize, mGroupSize, mActType, mUseBias,
             mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, parallelism_config);
+#endif
         auto workspace_size = profiler.getWorkspaceSize(mTotalTokens);
         auto workspace = bufferManager->gpu(workspace_size);
 
@@ -760,11 +779,19 @@ public:
     {
         auto stream = streamPtr->get();
         MoeMinLatencyParams min_latency_params;
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
         mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExperts, mUseFinalScale ? mScaleProbs : nullptr,
             mExpertWeight1, mExpertBias1, mActType, mExpertWeight2, mExpertBias2, mQuantParams, mTotalTokens,
             mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
-            parallelism_config, mUseLora, mLoraParams,
+            parallelism_config, /*enable_alltoall=*/false, mUseLora, mLoraParams,
             /*use_deepseek_fp8_block_scale=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
+#else
+        mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExperts, mUseFinalScale ? mScaleProbs : nullptr,
+            mExpertWeight1, mExpertBias1, mActType, mExpertWeight2, mExpertBias2, mQuantParams, mTotalTokens,
+            mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
+            parallelism_config, mUseLora, mLoraParams, /*use_deepseek_fp8_block_scale=*/false,
+            /*min_latency_mode=*/false, min_latency_params, stream);
+#endif
     }
 
     void runBenchmark(benchmark::State& state);

@@ -281,11 +281,11 @@ struct WarpSpecializedLayerNorm
                 return true;
             };
 
-            if (load_a_tile(Bool<true>{}))
+            if (load_a_tile(ConstBool<true>{}))
             {
                 if constexpr (Traits::PERSISTENT_MODE)
                 {
-                    while (load_a_tile(Bool<false>{}))
+                    while (load_a_tile(ConstBool<false>{}))
                         ;
                 }
             }
@@ -717,7 +717,7 @@ struct WarpSpecializedLayerNorm
                         {
                             if (thread_id == 0)
                             {
-                                wait_for_store(Int<0>{});
+                                wait_for_store(ConstInt<0>{});
                             }
                             namedBarrierSync(buffer_id + 1, 128);
                         }
