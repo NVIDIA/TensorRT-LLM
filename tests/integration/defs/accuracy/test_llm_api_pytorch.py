@@ -363,6 +363,29 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.2-3B"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-3B"
+    EXAMPLE_FOLDER = "models/core/llama"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_fp8_prequantized(self):
+        model_path = f"{llm_models_root()}/ llama-3.2-models/Llama-3.2-3B-Instruct-FP8"
+        with LLM(model_path) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
 
