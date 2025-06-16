@@ -224,19 +224,13 @@ CacheTransBufferManager::CacheTransBufferManager(
         "mUseFabricMemory:%d",
         maxNumTokens.has_value() ? maxNumTokens.value() : 0, mRecvBufferCount, mSendBufferCount, mTransferBufferSize,
         mPreAllocBufferSize, mOnlyUseDynamicBuffer, mUseFabricMemory);
-    bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseUCXKvCache() || common::getEnvUseNixlKvCache();
 
-    TLLM_CHECK_WITH_INFO(to_allocate, "CacheTransBufferManager: to_allocate is false");
     allocateBuffer();
 }
 
 size_t CacheTransBufferManager::preAllocBufferSize(std::optional<size_t> maxNumTokens)
 {
-    bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseUCXKvCache() || common::getEnvUseNixlKvCache();
-    if (!to_allocate)
-    {
-        return 0;
-    }
+
     size_t TransferBufferSize = common::getEnvMemSizeForKVCacheTransferBuffer();
     if (maxNumTokens.has_value())
     {

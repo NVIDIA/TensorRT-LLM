@@ -407,19 +407,47 @@ void initConfigBindings(pybind11::module_& m)
             "stop_token_ids", &tle::GuidedDecodingConfig::getStopTokenIds, &tle::GuidedDecodingConfig::setStopTokenIds)
         .def(py::pickle(guidedDecodingConfigGetstate, guidedDecodingConfigSetstate));
 
-    auto cacheTransceiverConfigGetstate
-        = [](tle::CacheTransceiverConfig const& self) { return py::make_tuple(self.getMaxNumTokens()); };
+    auto cacheTransceiverConfigGetstate = [](tle::CacheTransceiverConfig const& self)
+    { return py::make_tuple(self.getEnableCacheTransceiver(), self.getCommType(), self.getMaxNumTokens()); };
     auto cacheTransceiverConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 1)
+        if (state.size() != 3)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
-        return tle::CacheTransceiverConfig(state[0].cast<std::optional<size_t>>());
+        return tle::CacheTransceiverConfig(state[0].cast<bool>(),
+            state[1].cast<std::optional<tle::CacheTransceiverConfig::CommType>>(),
+            state[2].cast<std::optional<size_t>>());
     };
 
+    py::enum_<tle::CacheTransceiverConfig::CommType>(m, "CacheTransceiverCommType")
+        .value("UNKNOWN", tle::CacheTransceiverConfig::CommType::UNKNOWN)
+        .value("MPI", tle::CacheTransceiverConfig::CommType::MPI)
+        .value("UCX", tle::CacheTransceiverConfig::CommType::UCX)
+        .value("NIXL", tle::CacheTransceiverConfig::CommType::NIXL)
+        .def(py::init(
+            [](std::string const& str)
+            {
+                if (str == "UNKNOWN" || str == "unknown")
+                    return tle::CacheTransceiverConfig::CommType::UNKNOWN;
+                if (str == "MPI" || str == "mpi")
+                    return tle::CacheTransceiverConfig::CommType::MPI;
+                if (str == "UCX" || str == "ucx")
+                    return tle::CacheTransceiverConfig::CommType::UCX;
+                if (str == "NIXL" || str == "nixl")
+                    return tle::CacheTransceiverConfig::CommType::NIXL;
+                throw std::runtime_error("Invalid comm type: " + str);
+            }));
+
+    py::implicitly_convertible<std::string, tle::CacheTransceiverConfig::CommType>();
+
     py::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
-        .def(py::init<std::optional<size_t>>(), py::arg("max_num_tokens") = py::none())
+        .def(py::init<bool, std::optional<tle::CacheTransceiverConfig::CommType>, std::optional<size_t>>(),
+            py::arg("enable_cache_transceiver") = false, py::arg("comm_type") = std::nullopt,
+            py::arg("max_num_tokens") = std::nullopt)
+        .def_property("enable_cache_transceiver", &tle::CacheTransceiverConfig::getEnableCacheTransceiver,
+            &tle::CacheTransceiverConfig::setEnableCacheTransceiver)
+        .def_property("comm_type", &tle::CacheTransceiverConfig::getCommType, &tle::CacheTransceiverConfig::setCommType)
         .def_property("max_num_tokens", &tle::CacheTransceiverConfig::getMaxNumTokens,
             &tle::CacheTransceiverConfig::setMaxNumTokens)
         .def(py::pickle(cacheTransceiverConfigGetstate, cacheTransceiverConfigSetstate));

@@ -11,6 +11,7 @@ from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._utils import set_mpi_comm
+from tensorrt_llm.bindings.executor import CacheTransceiverConfig
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MpiCommSession
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -121,16 +122,19 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
+    cache_transceiver_configs = [
+        CacheTransceiverConfig(enable_cache_transceiver=True) for _ in range(2)
+    ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
     worker_args = list(
-        zip(kv_cache_configs, worker_pytorch_configs, model_names, ranks))
+        zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
+            model_names, ranks))
 
     port_name = MPI.Open_port()
     MPI.Publish_name('my_port', port_name)
 
-    with MPIPoolExecutor(max_workers=2, env={"TRTLLM_USE_MPI_KVCACHE":
-                                             "1"}) as executor:
+    with MPIPoolExecutor(max_workers=2, env={"UCX_TLS": "^ib"}) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
@@ -247,18 +251,21 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
         KvCacheConfig(max_tokens=128, enable_block_reuse=False)
         for _ in range(2)
     ]
+    cache_transceiver_configs = [
+        CacheTransceiverConfig(enable_cache_transceiver=True) for _ in range(2)
+    ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
     worker_args = list(
-        zip(kv_cache_configs, worker_pytorch_configs, model_names, ranks))
+        zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
+            model_names, ranks))
 
     port_name = MPI.Open_port()
     MPI.Publish_name('my_port', port_name)
 
     prompt = "European Union is a political and economic union of 27 countries. The European Union is headquartered in Brussels, Belgium. The first president of the European Union was Jean-Claude Juncker. The current president is Ursula von der Leyen. The European Union is a major economic and political entity."
 
-    with MPIPoolExecutor(max_workers=2, env={"TRTLLM_USE_MPI_KVCACHE":
-                                             "1"}) as executor:
+    with MPIPoolExecutor(max_workers=2, env={"UCX_TLS": "^ib"}) as executor:
         futures = []
         try:
             for worker_arg in worker_args:

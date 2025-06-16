@@ -662,6 +662,7 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
     KvCacheConfig kvCacheConfig{true, std::nullopt, std::nullopt, std::nullopt, freeGpuMemoryFraction};
     executorConfig.setKvCacheConfig(kvCacheConfig);
     executorConfig.setRequestStatsMaxIterations(1000);
+    executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(true, std::nullopt, std::nullopt));
     auto manager = tr::BufferManager(std::make_shared<tr::CudaStream>());
     auto const& givenInput = tr::utils::loadNpy(manager, inputPath.string(), tr::MemoryType::kCPU);
     auto [givenInputLengths, nbGivenInputs, maxInputLength] = getGivenInputLengths(*givenInput, modelIds.padId);
@@ -894,6 +895,7 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
             spawnProcess ? std::nullopt : std::optional<std::vector<SizeType32>>(participantIdsEachInstance.at(in)),
             orchestratorConfig};
         executorConfig.setParallelConfig(parallelConfig);
+        executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(true, std::nullopt, std::nullopt));
         if (in < contextNum)
         {
             ctxExecutorConfigs.push_back(executorConfig);
@@ -994,6 +996,7 @@ TEST_P(ConditionalDisaggParamsTest, DisaggTokenComparison)
     KvCacheConfig kvCacheConfig{true, std::nullopt, std::nullopt, std::nullopt, freeGpuMemoryFraction};
     executorConfig.setKvCacheConfig(kvCacheConfig);
     executorConfig.setRequestStatsMaxIterations(1000);
+    executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(true, std::nullopt, std::nullopt));
     auto manager = tr::BufferManager(std::make_shared<tr::CudaStream>());
     auto const& givenInput = tr::utils::loadNpy(manager, inputPath.string(), tr::MemoryType::kCPU);
     auto [givenInputLengths, nbGivenInputs, maxInputLength] = getGivenInputLengths(*givenInput, modelIds.padId);

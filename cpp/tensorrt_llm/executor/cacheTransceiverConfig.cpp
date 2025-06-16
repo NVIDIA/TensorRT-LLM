@@ -21,14 +21,37 @@
 namespace tensorrt_llm::executor
 {
 
-CacheTransceiverConfig::CacheTransceiverConfig(std::optional<size_t> maxNumTokens)
-    : mMaxNumTokens(maxNumTokens)
+CacheTransceiverConfig::CacheTransceiverConfig(
+    bool enableCacheTransceiver, std::optional<CommType> commType, std::optional<size_t> maxNumTokens)
+    : mEnableCacheTransceiver(enableCacheTransceiver)
+    , mCommType(commType)
+    , mMaxNumTokens(maxNumTokens)
 {
 }
 
 bool CacheTransceiverConfig::operator==(CacheTransceiverConfig const& other) const
 {
     return mMaxNumTokens == other.mMaxNumTokens;
+}
+
+bool CacheTransceiverConfig::getEnableCacheTransceiver() const
+{
+    return mEnableCacheTransceiver;
+}
+
+void CacheTransceiverConfig::setCommType(std::optional<CommType> commType)
+{
+    mCommType = commType;
+}
+
+std::optional<CacheTransceiverConfig::CommType> CacheTransceiverConfig::getCommType() const
+{
+    return mCommType;
+}
+
+void CacheTransceiverConfig::setEnableCacheTransceiver(bool enableCacheTransceiver)
+{
+    mEnableCacheTransceiver = enableCacheTransceiver;
 }
 
 std::optional<size_t> CacheTransceiverConfig::getMaxNumTokens() const

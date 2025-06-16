@@ -1430,14 +1430,29 @@ private:
 class CacheTransceiverConfig
 {
 public:
-    explicit CacheTransceiverConfig(std::optional<size_t> maxNumTokens = std::nullopt);
+    enum class CommType : std::uint8_t
+    {
+        UNKNOWN = 0,
+        MPI = 1,
+        UCX = 2,
+        NIXL = 3
+    };
+    explicit CacheTransceiverConfig(bool enableCacheTransceiver = false,
+        std::optional<CommType> commType = std::nullopt, std::optional<size_t> maxNumTokens = std::nullopt);
 
     bool operator==(CacheTransceiverConfig const& other) const;
 
     [[nodiscard]] std::optional<size_t> getMaxNumTokens() const;
     void setMaxNumTokens(size_t maxNumTokens);
 
+    void setEnableCacheTransceiver(bool enableCacheTransceiver);
+    void setCommType(std::optional<CommType> commType);
+    [[nodiscard]] bool getEnableCacheTransceiver() const;
+    [[nodiscard]] std::optional<CommType> getCommType() const;
+
 private:
+    bool mEnableCacheTransceiver;
+    std::optional<CommType> mCommType;
     /// @brief The maximum number of tokens that the CacheTransceiver's pre-allocated buffer can hold. If the number of
     /// kvCache tokens to be transferred for a single request is greater than this value, the performance of the cache
     /// transfer may be degraded.
