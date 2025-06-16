@@ -1,3 +1,4 @@
+import enum
 import math
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -34,6 +35,14 @@ RequestList = list[LlmRequest]
 PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
 PeftCacheConfig = tensorrt_llm.bindings.executor.PeftCacheConfig
 WorldConfig = tensorrt_llm.bindings.WorldConfig
+
+
+class ResourceManagerType(enum.Enum):
+    KV_CACHE_MANAGER = "KV_CACHE_MANAGER"
+    DRAFT_KV_CACHE_MANAGER = "DRAFT_KV_CACHE_MANAGER"
+    PEFT_CACHE_MANAGER = "PEFT_CACHE_MANAGER"
+    SEQ_SLOT_MANAGER = "SEQ_SLOT_MANAGER"
+    SPEC_RESOURCE_MANAGER = "SPEC_RESOURCE_MANAGER"
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
