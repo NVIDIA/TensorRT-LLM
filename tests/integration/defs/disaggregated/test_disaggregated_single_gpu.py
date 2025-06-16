@@ -11,8 +11,8 @@ from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._utils import set_mpi_comm
-from tensorrt_llm.bindings.executor import CacheTransceiverConfig
-from tensorrt_llm.llmapi import KvCacheConfig, MpiCommSession
+from tensorrt_llm.llmapi import (CacheTransceiverConfig, KvCacheConfig,
+                                 MpiCommSession)
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -38,7 +38,8 @@ def model_path(model_name):
         raise ValueError(f"Unknown model: {model_name}")
 
 
-async def run_worker(kv_cache_config, pytorch_config, model_name, rank):
+async def run_worker(kv_cache_config, cache_transceiver_config, pytorch_config,
+                     model_name, rank):
     assert isinstance(pytorch_config, dict)
     print(f"Running worker {rank}")
     port_name = MPI.Lookup_name('my_port')
@@ -54,7 +55,8 @@ async def run_worker(kv_cache_config, pytorch_config, model_name, rank):
                   enable_chunked_prefill=False,
                   **pytorch_config,
                   _mpi_session=mpi_session,
-                  kv_cache_config=kv_cache_config)
+                  kv_cache_config=kv_cache_config,
+                  cache_transceiver_config=cache_transceiver_config)
         print(f"LLM created")
     except Exception as e:
         print(f"Error creating LLM: {e}")
@@ -98,9 +100,11 @@ def send_requests_to_worker(requests, worker_rank, intercomm):
     return responses
 
 
-def worker_entry_point(kv_cache_config, pytorch_config, model_name, rank):
+def worker_entry_point(kv_cache_config, cache_transceiver_config,
+                       pytorch_config, model_name, rank):
     return asyncio.run(
-        run_worker(kv_cache_config, pytorch_config, model_name, rank))
+        run_worker(kv_cache_config, cache_transceiver_config, pytorch_config,
+                   model_name, rank))
 
 
 def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
