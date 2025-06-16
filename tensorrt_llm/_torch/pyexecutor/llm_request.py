@@ -1,4 +1,5 @@
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import List, Optional, Union
 
 import torch
 
@@ -206,7 +207,7 @@ class LlmResult:
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs'))
 
     def __init__(self,
-                 result: bytes,
+                 result: Union[bytes, tensorrt_llm.bindings.executor.Result],
                  py_result: PyResult,
                  is_final: bool = False):
         self._result = result
@@ -221,26 +222,20 @@ class LlmResult:
         result = object.__getattribute__(self, '_result')
         return getattr(result, item)
 
+    def deserialize(self):
+        self._result = tensorrt_llm.bindings.executor.deserialize_result(
+            self._result)
 
+
+@dataclass
 class LlmResponse:
-    """LlmResponse wraps `bindings.executor.Response` but detour some features to Python implementation"""
-
-    def __init__(self,
-                 request_id: int,
-                 error_msg: str = None,
-                 result: LlmResult = None,
-                 client_id: int = None):
-        self.request_id = request_id
-        self.error_msg = error_msg
-        self.result = result
-        self.client_id = client_id
+    request_id: int
+    error_msg: Optional[str] = None
+    result: Optional[LlmResult] = None
+    client_id: Optional[int] = None
 
     def has_error(self):
         return self.error_msg is not None
-
-    @property
-    def _is_llm_response(self) -> bool:
-        return True
 
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):

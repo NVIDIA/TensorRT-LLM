@@ -1,5 +1,4 @@
 import os
-import pickle
 
 import pytest
 import torch
@@ -8,50 +7,10 @@ from utils.util import force_ampere
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, PyResult
-from tensorrt_llm.bindings.executor import Response, Result
-from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.llm_utils import BuildConfig, KvCacheConfig
 
 prompts = ["A B C"]
 global_kvcache_config = KvCacheConfig(max_tokens=10000)
-
-
-def test_LlmResponse_pickle():
-    result = Result()
-    result.decoding_iter = 1
-    result.sequence_index = 1
-    binding_response = Response(request_id=1, result=result, client_id=1)
-    py_result = PyResult(prompt_len=1,
-                         max_new_tokens=1,
-                         use_device_memory=True,
-                         streaming=False,
-                         return_log_probs=True,
-                         return_context_logits=True,
-                         return_generation_logits=True)
-    context_logits = torch.randn([1, 1, 128], device='cuda')
-    generation_logits = torch.randn([1, 1, 128], device='cuda')
-    logprobs = [[{1: Logprob(0.8, 1)}]]
-    py_result.append_context_logits(context_logits)
-    py_result.append_generation_logits(generation_logits)
-    py_result.append_log_probs(logprobs)
-
-    response = LlmResponse(binding_response, py_result)
-
-    data = pickle.dumps(response)
-    pickle_response: LlmResponse = pickle.loads(data)
-
-    assert pickle_response._response.request_id == 1
-    assert pickle_response._response.client_id == 1
-
-    pickle_result = pickle_response.result
-
-    assert pickle_result.decoding_iter == 1
-    assert pickle_result.sequence_index == 1
-    assert torch.all(torch.eq(pickle_result.context_logits, context_logits))
-    assert torch.all(
-        torch.eq(pickle_result.generation_logits, generation_logits))
-    assert pickle_result.log_probs == logprobs
 
 
 @force_ampere  # Save H100 resource
