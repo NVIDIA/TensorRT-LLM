@@ -2,10 +2,9 @@ import argparse
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm.llmapi import (DraftTargetDecodingConfig,
-                                 EagleDecodingConfig, KvCacheConfig,
-                                 MTPDecodingConfig, NGramDecodingConfig,
-                                 TorchCompileConfig)
+from tensorrt_llm.llmapi import (DraftTargetDecodingConfig, EagleDecodingConfig,
+                                 KvCacheConfig, MTPDecodingConfig,
+                                 NGramDecodingConfig, TorchCompileConfig)
 
 example_prompts = [
     "Hello, my name is",
