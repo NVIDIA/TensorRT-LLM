@@ -629,14 +629,16 @@ def main(args: argparse.Namespace):
                                     dataset_path=args.dataset_path).
             sample(tokenizer=tokenizer, num_requests=args.num_prompts),
             "random":
-            lambda: RandomDataset(dataset_path=args.dataset_path).sample(
-                tokenizer=tokenizer,
-                num_requests=args.num_prompts,
-                prefix_len=args.random_prefix_len,
-                input_len=args.random_input_len,
-                output_len=args.random_output_len,
-                range_ratio=args.random_range_ratio,
-            )
+            lambda: RandomDataset(sample_from_sharegpt=not args.random_ids,
+                                  return_text=not args.tokenize_on_client,
+                                  dataset_path=args.dataset_path).sample(
+                                      tokenizer=tokenizer,
+                                      num_requests=args.num_prompts,
+                                      prefix_len=args.random_prefix_len,
+                                      input_len=args.random_input_len,
+                                      output_len=args.random_output_len,
+                                      range_ratio=args.random_range_ratio,
+                                  )
         }
 
         try:
@@ -692,7 +694,7 @@ def main(args: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
             extra_body=sampling_params,
-            streaming=args.streaming,
+            streaming=not args.no_streaming,
         ))
 
     # Save config and results to json
@@ -858,9 +860,11 @@ if __name__ == "__main__":
         "bursty requests. A higher burstiness value (burstiness > 1) "
         "results in a more uniform arrival of requests.",
     )
-    parser.add_argument("--streaming",
-                        action="store_true",
-                        help="Enable streaming")
+    parser.add_argument(
+        "--no-streaming",
+        action="store_true",
+        help="Disable streaming mode",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--trust-remote-code",
@@ -1012,6 +1016,17 @@ if __name__ == "__main__":
               "a random "
               "context length sampled from [input_len * (1 - range_ratio), "
               "input_len * (1 + range_ratio)]."),
+    )
+    random_group.add_argument(
+        "--random-ids",
+        action="store_true",
+        help="Generate random ids instead of sample from ShareGPT dataset.",
+    )
+    random_group.add_argument(
+        "--tokenize-on-client",
+        action="store_true",
+        help=
+        "Tokenize on client instead of server. This option only takes effect with random dataset to let the server run exactly the same isl specified by cli.",
     )
 
     hf_group = parser.add_argument_group("hf dataset options")
