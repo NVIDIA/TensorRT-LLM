@@ -9,7 +9,7 @@ from transformers import LlamaConfig
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.debug.debug_hook import (DebuggerContext, Filter,
-                                                  debugger_addon,
+                                                  debug_mode,
                                                   get_current_debug_ctx)
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -194,7 +194,7 @@ class TestDebugger(unittest.TestCase):
 
         self.assertEqual(len(past_seen_tokens), logits.shape[0])
 
-        with torch.inference_mode() and debugger_addon(llama):
+        with torch.inference_mode() and debug_mode(llama):
             register_module_name_dump_hook()
             attn_metadata.prepare()
             logits = llama.forward(input_ids=input_ids,

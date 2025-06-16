@@ -1,5 +1,8 @@
 import enum
+import inspect
+import os
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -34,40 +37,38 @@ class DebuggerContext:
         self.forward_hook_handles = {}  # module to handlers
         self.forward_pre_hook_handles = {}
         self.log_folder = dest_folder
-        self.is_forward_pre = True
+        self.is_pre_forward = True
         self.dump_style: DumpStyle = DumpStyle.BINARY
-        self.log_folder_inited: bool = False
+        self.is_log_folder_inited: bool = False
 
     def set_log_folder(self, log_folder):
         self.log_folder = log_folder
-        self.log_folder_inited = False
+        self.is_log_folder_inited = False
 
     def _init_log_folder(self):
-        if self.log_folder_inited:
+        if self.is_log_folder_inited:
             return
 
         if self.log_folder is None:
-            import os
             pwd = os.getcwd()
             self.log_folder = os.path.join(pwd, "data_dump")
 
         rank = tensorrt_llm.mpi_rank()
 
-        from pathlib import Path
         p = Path(self.log_folder) / f"rank{rank}"
         self.log_folder = p.absolute()
         p.mkdir(parents=True, exist_ok=True)
-        self.log_folder_inited = True
+        self.is_log_folder_inited = True
 
     def get_log_folder(self):
         self._init_log_folder()
         return self.log_folder
 
     def check_in_pre_forward(self):
-        return self.is_forward_pre
+        return self.is_pre_forward
 
     def mark_in_pre_forward(self, is_pre_forward):
-        self.is_forward_pre = is_pre_forward
+        self.is_pre_forward = is_pre_forward
 
     def clear_state(self):
         self.pre_forward_actions.clear()
@@ -356,18 +357,18 @@ def disable_debug():
 # If filter is provided, it will be used to filter out satisfied module to register hook.
 # If filter is not provided, all modules will be registered with hooks.
 # Example:
-#       from tensorrt_llm._torch.debug.debug_hook import debugger_addon
+#       from tensorrt_llm._torch.debug.debug_hook import debug_mode
 #       model_config = ModelConfig(pretrained_config=llama_config,
 #                                   attn_backend=backend)
 #       llama = LlamaForCausalLM(model_config).to(dtype).to(device)
 #       llama.load_weights(hf_llama.state_dict())
-#        with torch.inference_mode() and debugger_addon(llama, r"tensor_dump"):
+#        with torch.inference_mode() and debug_mode(llama, r"tensor_dump"):
 #            attn_metadata.prepare()
 #            logits = llama.forward(input_ids=input_ids,
 #                                   position_ids=position_ids,
 #                                   attn_metadata=attn_metadata)
 @contextmanager
-def debugger_addon(model, dest_folder: Optional[str] = None, filter=None):
+def debug_mode(model, dest_folder: Optional[str] = None, filter=None):
     try:
         enable_debug(model, dest_folder, filter)
         yield model
@@ -382,7 +383,6 @@ tensor_counter = 0
 def get_forward_arg_names(module: nn.Module):
     if hasattr(module, "forward"):
         forward_func = module.forward
-        import inspect
         args = inspect.getfullargspec(forward_func).args
         return args
 
@@ -432,7 +432,6 @@ def dump_tensor(module: nn.Module, data_tensor, debug_ctx: DebuggerContext):
 
         tensor_counter += 1
         module_path = "-".join([module_path, tensor_name])
-        from pathlib import Path
         p = Path(debug_ctx.get_log_folder()) / module_path
         return p.absolute()
 
@@ -457,5 +456,5 @@ def dump_tensor(module: nn.Module, data_tensor, debug_ctx: DebuggerContext):
 def register_tensor_dump_hook():
     debug_ctx = get_current_debug_ctx()
     assert debug_ctx is not None, ""
-    debug_ctx.register_pre_forward_action(DumpTensorFilter(), dump_tensor)
+    # debug_ctx.register_pre_forward_action(DumpTensorFilter(), dump_tensor)
     debug_ctx.register_after_forward_action(DumpTensorFilter(), dump_tensor)
