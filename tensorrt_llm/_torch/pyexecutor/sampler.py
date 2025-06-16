@@ -610,7 +610,7 @@ class TRTLLMSampler(Sampler):
 
         decoder_buffer_logits, logits_index = self.algs.handle_context_logits(
             scheduled_requests.context_requests, num_context_logits,
-            model_outputs["logits"], self.executor_config.max_batch_size)
+            model_outputs["logits"], self.max_num_sequences)
 
         self.algs.handle_generation_logits(
             logits_index, scheduled_requests.generation_requests,
