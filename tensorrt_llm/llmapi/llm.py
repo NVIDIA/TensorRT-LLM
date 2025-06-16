@@ -708,7 +708,9 @@ class LLM:
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
             is_llm_executor=True,
-            lora_config=self.args.lora_config)
+            lora_config=self.args.lora_config,
+            garbage_collection_gen0_threshold=self.args.
+            garbage_collection_gen0_threshold)
 
     @property
     def _on_trt_backend(self) -> bool:

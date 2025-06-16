@@ -57,7 +57,6 @@ public:
     std::optional<TensorPtr> draftLogits; // [generatedTokensPerEngineStep - 1, vocabSize] on gpu
     TensorPtr medusaPaths;                // [maxDecodingTokens, maxPathLen], on gpu
     TensorPtr medusaTreeIds;              // [maxDecodingTokens], on gpu
-    nvinfer1::DataType dtype;             // Request data type, only used by explicit draft tokens.
     std::optional<executor::LookaheadDecodingConfig> lookaheadRuntimeConfig;
     std::optional<executor::EagleConfig> eagleConfig;
 };
