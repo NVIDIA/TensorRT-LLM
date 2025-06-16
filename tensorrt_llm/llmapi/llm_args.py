@@ -207,6 +207,7 @@ class DecodingBaseConfig(BaseModel):
             "Eagle": EagleDecodingConfig,
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
+            "DraftTarget": DraftTargetDecodingConfig,
         }
 
         config_class = config_classes.get(decoding_type)
@@ -238,7 +239,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     dynamic_tree_max_topK: Optional[int] = None
     num_eagle_layers: Optional[int] = None
     max_non_leaves_per_layer: Optional[int] = None
-    pytorch_eagle_weights_path: Optional[str] = None
+    pytorch_weights_path: Optional[str] = None
     eagle3_one_model: Optional[bool] = True
 
     @classmethod
@@ -280,6 +281,16 @@ class NGramDecodingConfig(DecodingBaseConfig):
         return cls(**data)
 
     decoding_type: ClassVar[str] = "NGram"
+
+
+class DraftTargetDecodingConfig(DecodingBaseConfig):
+    pytorch_weights_path: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "DraftTarget"
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -896,10 +907,11 @@ class BaseLlmArgs(BaseModel):
         default=None, description="Cache transceiver config.")
 
     # Speculative decoding parameters
-    speculative_config: Optional[Union[
-        LookaheadDecodingConfig, MedusaDecodingConfig, EagleDecodingConfig,
-        MTPDecodingConfig, NGramDecodingConfig]] = Field(
-            default=None, description="Speculative decoding config.")
+    speculative_config: Optional[
+        Union[LookaheadDecodingConfig, MedusaDecodingConfig,
+              EagleDecodingConfig, MTPDecodingConfig, NGramDecodingConfig,
+              DraftTargetDecodingConfig]] = Field(
+                  default=None, description="Speculative decoding config.")
 
     batching_type: Optional[BatchingType] = Field(default=None,
                                                   description="Batching type.")
@@ -1302,7 +1314,7 @@ class BaseLlmArgs(BaseModel):
                     self.speculative_config = Eagle3Config(
                         max_draft_tokens=self.speculative_config.max_draft_len,
                         draft_model_path=self.speculative_config.
-                        pytorch_eagle_weights_path,
+                        pytorch_weights_path,
                         eagle3_one_model=self.speculative_config.
                         eagle3_one_model)
             elif isinstance(self.speculative_config, NGramDecodingConfig):
@@ -1320,6 +1332,16 @@ class BaseLlmArgs(BaseModel):
                     is_use_oldest=self.speculative_config.is_use_oldest,
                     is_public_pool=self.speculative_config.is_public_pool,
                 )
+            elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL
+                assert self.backend == 'pytorch'
+                assert self.speculative_config.max_draft_len > 0
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
+                from tensorrt_llm._torch.speculative import DraftTargetConfig
+                self.speculative_config = DraftTargetConfig(
+                    max_draft_tokens=self.speculative_config.max_draft_len,
+                    draft_model_path=self.speculative_config.
+                    pytorch_weights_path)
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 from tensorrt_llm._torch.speculative import MTPConfig
                 self.speculative_config = MTPConfig(

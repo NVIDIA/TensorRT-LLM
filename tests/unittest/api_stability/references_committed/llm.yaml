@@ -74,7 +74,8 @@ methods:
       # Speculative decoding
       speculative_config:
         annotation: Union[tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_utils.MedusaDecodingConfig,
-          tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, tensorrt_llm.llmapi.llm_args.NGramDecodingConfig, NoneType]
+          tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, tensorrt_llm.llmapi.llm_args.NGramDecodingConfig,
+          tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig, NoneType]
         default: null
       # generation constraints
       max_batch_size:
