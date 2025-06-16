@@ -26,8 +26,8 @@ from ..conftest import (llm_models_root, parametrize_with_ids,
                         skip_device_contain_gb200, skip_no_hopper,
                         skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper)
-from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond, JsonModeEval,
-                            LlmapiAccuracyTestHarness)
+from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
+                            JsonModeEval, LlmapiAccuracyTestHarness)
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
@@ -268,26 +268,26 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    # def test_guided_decoding(self):
-    #     llm = LLM(self.MODEL_PATH,
-    #               guided_decoding_backend="xgrammar",
-    #               disable_overlap_scheduler=True,
-    #               use_cuda_graph=True)
-    #     with llm:
-    #         task = JsonModeEval(self.MODEL_NAME)
-    #         task.evaluate(llm)
+    def test_guided_decoding(self):
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend="xgrammar",
+                  disable_overlap_scheduler=True,
+                  use_cuda_graph=True)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
 
-    # @pytest.mark.skip_less_device(4)
-    # def test_guided_decoding_4gpus(self):
-    #     llm = LLM(self.MODEL_PATH,
-    #               guided_decoding_backend="xgrammar",
-    #               disable_overlap_scheduler=True,
-    #               use_cuda_graph=True,
-    #               tensor_parallel_size=2,
-    #               pipeline_parallel_size=2)
-    #     with llm:
-    #         task = JsonModeEval(self.MODEL_NAME)
-    #         task.evaluate(llm)
+    @pytest.mark.skip_less_device(4)
+    def test_guided_decoding_4gpus(self):
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend="xgrammar",
+                  disable_overlap_scheduler=True,
+                  use_cuda_graph=True,
+                  tensor_parallel_size=2,
+                  pipeline_parallel_size=2)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
@@ -1220,7 +1220,8 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-
+    @skip_pre_ada
+    @pytest.mark.skip_less_device(8)
     def test_fp8_tp8(self):
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)
         with LLM(f"{llm_models_root()}/Nemotron-H-8B-Reasoning-128K-FP8",
