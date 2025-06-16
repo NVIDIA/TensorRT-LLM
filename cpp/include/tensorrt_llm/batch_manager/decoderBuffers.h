@@ -100,9 +100,6 @@ public:
     };
 
     DraftBuffers draftBuffers;
-    runtime::ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers;
-    runtime::EagleBuffers::Inputs eagleBuffers;
-    std::optional<runtime::LookaheadDecodingBuffers> lookaheadBuffers;
 
     DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
         SizeType32 maxTokensPerStep, runtime::BufferManager const& manager, runtime::ModelConfig const& modelConfig,

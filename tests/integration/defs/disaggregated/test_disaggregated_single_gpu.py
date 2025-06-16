@@ -50,7 +50,6 @@ async def run_worker(kv_cache_config, pytorch_config, model_name, rank):
 
     try:
         llm = LLM(tensor_parallel_size=1,
-                  auto_parallel=False,
                   model=model_name,
                   enable_chunked_prefill=False,
                   **pytorch_config,

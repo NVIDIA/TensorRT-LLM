@@ -68,6 +68,8 @@ MODEL_PATH_DICT = {
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
     "mixtral_8x7b_v0.1_instruct_fp8": "Mixtral-8x7B-Instruct-v0.1-fp8",
+    "mixtral_8x7b_v0.1_instruct_fp4":
+    "modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp4",
     "mixtral_8x22b_v0.1": "Mixtral-8x22B-v0.1",
     "mistral_7b_v0.1": "mistral-7b-v0.1",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
@@ -133,6 +135,7 @@ HF_MODEL_PATH = {
 LORA_MODEL_PATH = {
     "llama_v2_13b": "llama-models-v2/chinese-llama-2-lora-13b",
     "mixtral_8x7b_0.1": "chinese-mixtral-lora",
+    "llama_v3.1_8b_instruct_fp8": "lora/llama-3-chinese-8b-instruct-v2-lora/",
 }
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
@@ -336,6 +339,7 @@ class PerfTestConfig:
         num_reqs: int = 512,
         concurrency: int = -1,
         quantization: str = "",
+        kv_cache_dtype: str = "auto",
         ep_size: int = None,
         tp_size: int = 1,
         pp_size: int = 1,
@@ -379,6 +383,8 @@ class PerfTestConfig:
         self.concurrency = concurrency
         # Quantization type.
         self.quantization = quantization
+        # KV Cache dtype
+        self.kv_cache_dtype = kv_cache_dtype
         # Multiple Profiles
         self.multiple_profiles = False
         # EP Size
@@ -475,6 +481,10 @@ class PerfTestConfig:
         # Add quantization type.
         if self.quantization != "":
             entries.append(f"quant:{self.quantization}")
+
+        # Add kv cache dtype.
+        if self.kv_cache_dtype != "auto":
+            entries.append(f"kv_cache_dtype:{self.kv_cache_dtype}")
 
         # Add number of requests.
         if self.num_reqs != 512:
@@ -579,6 +589,11 @@ class PerfTestConfig:
                 "quant:") else labels.pop(0).replace("quant:", "")
 
         if len(labels) > 0:
+            self.kv_cache_dtype = "auto" if not labels[0].startswith(
+                "kv_cache_dtype:") else labels.pop(0).replace(
+                    "kv_cache_dtype:", "")
+
+        if len(labels) > 0:
             self.num_reqs = 512 if not labels[0].startswith("reqs:") else int(
                 labels.pop(0).replace("reqs:", ""))
 
@@ -636,6 +651,8 @@ class PerfTestConfig:
         # Validate dtype.
         VALID_DTYPES = ["float32", "float16", "bfloat16", "float8", "float4"]
         assert self.data_type in VALID_DTYPES, f"Invalid data_type {self.data_type}!"
+        VALID_KV_CACHE_DTYPES = ["auto", "fp8"]
+        assert self.kv_cache_dtype in VALID_KV_CACHE_DTYPES, f"Invalid kv_cache_dtype {self.kv_cache_dtype}!"
 
         # Validate quantization mode.
         if self.model_name in MODEL_PATH_DICT.keys():
@@ -791,6 +808,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         self._config.load_from_str(self._test_param_labels)
         # This will store the currently running metric.
         self._current_metric = None
+        self.lora_dirs = []
 
     def get_test_name(self) -> str:
         return str(self._config)
@@ -1019,28 +1037,63 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             istdev = 16
             ostdev = 24
             nloras = self._config.num_loras
-            # lora_data = os.path.join(engine_dir,
-            #                          f"token-norm-dist-lora-{nloras}.json")
             dataset_path = os.path.join(engine_dir, "synthetic_data.json")
-            data_cmd += [
-                "python3", prepare_data_script, f"--stdout",
-                f"--rand-task-id 0 {nloras-1}", f"--tokenizer={tokenizer_dir}",
-                f"token-norm-dist", f"--num-requests={self._config.num_reqs}",
-                f"--input-mean={input_len}", f"--output-mean={output_len}",
-                f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-                f" > {dataset_path}"
-            ]
-            if self._config.runtime == "cppmanager":
-                data_cmd += [";"]
+
+            if self._config.model_name in LORA_MODEL_PATH.keys(
+            ) and self._config.backend == "pytorch" and self._config.runtime == "bench":
+                actual_lora_paths = LORA_MODEL_PATH[self._config.model_name]
+                if not isinstance(actual_lora_paths, list):
+                    actual_lora_paths = [actual_lora_paths]
+                for i, actual_lora_path in enumerate(actual_lora_paths):
+                    if not actual_lora_path.startswith("/"):
+                        actual_lora_paths[i] = os.path.join(
+                            llm_models_root(), actual_lora_path)
+                lora_dir = os.path.join(engine_dir, "loras")
+                data_cmd += [f"mkdir -p {lora_dir}", ";"]
+                if len(actual_lora_paths) != nloras:
+                    raise ValueError(
+                        f"Number of LoRA paths ({len(actual_lora_paths)}) does not match requested number of LoRAs ({nloras})"
+                    )
+                for i, lora_path in enumerate(actual_lora_paths):
+                    self.lora_dirs.append(f"{lora_dir}/{i}")
+                    data_cmd += [f"ln -sf {lora_path} {lora_dir}/{i}", ";"]
+                data_cmd += [
+                    "python3", prepare_data_script, f"--stdout",
+                    f"--rand-task-id 0 {nloras-1}",
+                    f"--tokenizer={tokenizer_dir}", f"--lora-dir={lora_dir}",
+                    f"token-norm-dist",
+                    f"--num-requests={self._config.num_reqs}",
+                    f"--input-mean={input_len}", f"--output-mean={output_len}",
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
+                    f" > {dataset_path}"
+                ]
+            elif self._config.backend == "cppmanager":
+                data_cmd += [
+                    "python3", prepare_data_script, f"--stdout",
+                    f"--rand-task-id 0 {nloras-1}",
+                    f"--tokenizer={tokenizer_dir}", f"token-norm-dist",
+                    f"--num-requests={self._config.num_reqs}",
+                    f"--input-mean={input_len}", f"--output-mean={output_len}",
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
+                    f" > {dataset_path}"
+                ]
+                # generate LoRA weights for C++ runtime
+                # the lora_dir is $engine_dir/loras. This is populated by the convert_lora_cmd executed before this.
+                # The generate_rand_loras.py will create random lora weights to $engine_dir/lora_cpp.
                 generate_rand_lora_script = os.path.join(
                     self._llm_root, "benchmarks", "cpp", "utils",
                     "generate_rand_loras.py")
                 checkpoint_dir = os.path.join(engine_dir, "lora_cpp")
-                lora_dir = os.path.join(engine_dir, f"loras")
                 data_cmd += [
                     "python3", generate_rand_lora_script, checkpoint_dir,
-                    lora_dir, "16"
+                    lora_dir,
+                    str(nloras)
                 ]
+
+            else:
+                pytest.skip(
+                    f"LoRA config not supported for {self._config.model_name} with the current backend and runtime."
+                )
         else:
             istdev = 0
             ostdev = 0
@@ -1176,8 +1229,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         #use default yaml config
         if self._config.backend == "pytorch":
             import yaml
-            config = get_model_yaml_config(self._config.to_string())
-            print_info(f"pytorch model config: {config}")
+            config = get_model_yaml_config(self._config.to_string(),
+                                           self.lora_dirs)
             with open('extra-llm-api-config.yml', 'w') as f:
                 yaml.dump(config, f, default_flow_style=False)
             benchmark_cmd += [

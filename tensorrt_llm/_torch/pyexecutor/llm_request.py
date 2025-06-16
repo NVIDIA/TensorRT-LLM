@@ -238,6 +238,10 @@ class LlmResponse:
     def has_error(self):
         return self.error_msg is not None
 
+    @property
+    def _is_llm_response(self) -> bool:
+        return True
+
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     """LlmRequest wraps `bindings.internal.batch_manager.LlmRequest`
@@ -277,6 +281,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_rewind_len = 0
         self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
         self.py_last_draft_tokens = None
+        self.py_num_accepted_draft_tokens = 0
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
@@ -301,17 +306,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
-
-    def get_tokens(self, beam: int) -> int:
-        return self.py_tokens[beam]
-
-    def get_last_tokens(self, beam: int) -> int:
-        return self.py_tokens[beam][-1]
-
-    def add_new_token(self, token: int, beam: int) -> int:
-        self.py_tokens[beam].append(token)
-        # sync to C++ side
-        return super().add_new_token(token, beam)
 
     def create_response(
             self,
