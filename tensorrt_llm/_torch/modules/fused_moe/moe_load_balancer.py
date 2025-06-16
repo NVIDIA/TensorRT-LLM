@@ -1,4 +1,3 @@
-import platform
 import threading
 from contextlib import nullcontext
 from multiprocessing import resource_tracker, shared_memory
