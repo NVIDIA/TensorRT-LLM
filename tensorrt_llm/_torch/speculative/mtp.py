@@ -1054,8 +1054,9 @@ class MTPWorker(nn.Module):
             position_ids_gen = position_ids[num_ctx_tokens:].reshape(
                 num_gens, mtp_num_modules + 1)[:, -mtp_num_modules:]
             position_ids_gen = position_ids_gen - (
-                1 + mtp_num_modules - num_accepted_tokens.unsqueeze(0))
-            position_ids_list.append(position_ids_gen)
+                1 + mtp_num_modules -
+                num_accepted_tokens[num_contexts:].unsqueeze(1))
+            position_ids_list.append(position_ids_gen.flatten())
         return_position_ids = torch.concat(position_ids_list, dim=-1)
 
         return {
