@@ -468,7 +468,7 @@ accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized[tp8ep
 accuracy/test_cli_flow.py::TestNemotronUltra::test_auto_dtype[tp8-cuda_graph=True] TIMEOUT (240)
 accuracy/test_cli_flow.py::TestNemotronUltra::test_fp8_prequantized[tp8-cuda_graph=True]
 accuracy/test_llm_api_pytorch.py::TestNemotronH::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestNemotronH::test_fp8_tp8
+accuracy/test_llm_api_pytorch.py::TestNemotronH::test_reasoning_fp8_prequantized
 accuracy/test_llm_api_pytorch.py::TestQwen2_7BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[latency]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[latency_trtllmgen]
