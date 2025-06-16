@@ -377,9 +377,9 @@ class TorchSampler(Sampler):
             if "d2t" in model_outputs:  # Eagle3
                 new_tokens[current_slice] += model_outputs["d2t"][
                     new_tokens[current_slice]]
-            if gen_logits:
+            if gen_logits is not None:
                 gen_logits[current_slice] = logits
-            if log_probs:
+            if log_probs is not None:
                 assert beam == 0, "The following call relies on beam_width to be 1 - hence the unsqueeze"
                 token_probs = torch.gather(
                     softmax, dim=1, index=next_tokens.unsqueeze(1)).squeeze(-1)
