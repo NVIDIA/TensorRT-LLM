@@ -46,6 +46,7 @@ UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
 UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
 
 POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
+POD_TIMEOUT_SECONDS_TMP = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
 
 // Literals for easier access.
 @Field
@@ -412,7 +413,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS}]
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_TMP}]
                     volumeMounts:
                     - name: sw-tensorrt-pvc
                       mountPath: "/mnt/sw-tensorrt-pvc"
@@ -1564,16 +1565,16 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A30-TensorRT-[Post-Merge]-5": ["a30", "l0_a30", 5, 6],
         "A30-TensorRT-[Post-Merge]-6": ["a30", "l0_a30", 6, 6],
         "A30-CPP-[Post-Merge]-1": ["a30", "l0_a30", 1, 1],
-        "A30-Triton-Python-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
-        "A30-Triton-Python-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
+        "A30-Triton-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
+        "A30-Triton-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
         "A100X-TensorRT-[Post-Merge]-1": ["a100x", "l0_a100", 1, 6],
         "A100X-TensorRT-[Post-Merge]-2": ["a100x", "l0_a100", 2, 6],
         "A100X-TensorRT-[Post-Merge]-3": ["a100x", "l0_a100", 3, 6],
         "A100X-TensorRT-[Post-Merge]-4": ["a100x", "l0_a100", 4, 6],
         "A100X-TensorRT-[Post-Merge]-5": ["a100x", "l0_a100", 5, 6],
         "A100X-TensorRT-[Post-Merge]-6": ["a100x", "l0_a100", 6, 6],
-        "A100X-Triton-Python-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
-        "A100X-Triton-Python-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
+        "A100X-Triton-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
+        "A100X-Triton-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
         "L40S-TensorRT-[Post-Merge]-1": ["l40s", "l0_l40s", 1, 5],
         "L40S-TensorRT-[Post-Merge]-2": ["l40s", "l0_l40s", 2, 5],
         "L40S-TensorRT-[Post-Merge]-3": ["l40s", "l0_l40s", 3, 5],
@@ -1586,7 +1587,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "H100_PCIe-TensorRT-[Post-Merge]-3": ["h100-cr", "l0_h100", 3, 5],
         "H100_PCIe-TensorRT-[Post-Merge]-4": ["h100-cr", "l0_h100", 4, 5],
         "H100_PCIe-TensorRT-[Post-Merge]-5": ["h100-cr", "l0_h100", 5, 5],
-        "B200_PCIe-Triton-Python-[Post-Merge]-1": ["b100-ts2", "l0_b200", 1, 1],
+        "B200_PCIe-Triton-[Post-Merge]-1": ["b100-ts2", "l0_b200", 1, 1],
         "H100_PCIe-TensorRT-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-8_GPUs-PyTorch-[Post-Merge]-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
@@ -1630,9 +1631,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     // Try to match what are being tested on x86 H100_PCIe.
     // The total machine time is scaled proportionally according to the number of each GPU.
     SBSATestConfigs = [
-        "GH200-1": ["gh200", "l0_gh200", 1, 2],
-        "GH200-2": ["gh200", "l0_gh200", 2, 2],
-        "GH200-[Post-Merge]": ["gh200", "l0_gh200", 1, 1],
+        "GH200-TensorRT-[Post-Merge]-1": ["gh200", "l0_gh200", 1, 2],
+        "GH200-TensorRT-[Post-Merge]-2": ["gh200", "l0_gh200", 2, 2],
     ]
     fullSet += SBSATestConfigs.keySet()
 
