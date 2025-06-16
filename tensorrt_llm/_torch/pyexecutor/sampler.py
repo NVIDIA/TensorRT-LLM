@@ -281,29 +281,27 @@ class TorchSampler(Sampler):
             assert beam == 0, "The following call relies on beam_width to be 1 - hence the list with a single element"
             request.py_result.append_log_probs([token_log_probs])
 
+    def process_draft_tokens(self, request: LlmRequest,
+                             new_tokens: torch.Tensor, new_token: int) -> int:
+        num_accepted = 0
+        for draft_token in request.py_draft_tokens:
+            if draft_token != new_token:
+                # Reject.
+                break
+            num_accepted += 1
+            new_token = add_token(request,
+                                  new_tokens,
+                                  beam=self.BEAM,
+                                  step=num_accepted)
+            if self._handle_stop_criteria(request, new_token, beam=self.BEAM):
+                break
+        return num_accepted
+
     def update_requests(self, state: SampleState) -> None:
         assert isinstance(state, SampleState)
         if state.sampler_event:
             state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens
-
-        def process_draft_tokens(req: LlmRequest, new_token: int) -> int:
-            num_accepted = 0
-            for draft_token in req.py_draft_tokens:
-                if draft_token != new_token:
-                    # Reject.
-                    break
-                num_accepted += 1
-                new_token = add_token(req,
-                                      new_tokens,
-                                      beam=self.BEAM,
-                                      step=num_accepted)
-                if self._handle_stop_criteria(req, new_token, beam=self.BEAM):
-                    break
-            req.py_num_accepted_draft_tokens = num_accepted
-            req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
-
-            return num_accepted
 
         for req in state.scheduled_requests.all_requests():
             if req.context_remaining_length != 0:
@@ -314,7 +312,11 @@ class TorchSampler(Sampler):
                 self._handle_stop_criteria(req, new_token, beam=self.BEAM)
                 processed = 1
                 if len(req.py_draft_tokens) > 0:
-                    processed += process_draft_tokens(req, new_token)
+                    num_accepted = self.process_draft_tokens(
+                        req, new_tokens, new_token)
+                    req.py_num_accepted_draft_tokens = num_accepted
+                    req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
+                    processed += num_accepted
                 self.handle_logits(req, state, beam=self.BEAM, count=processed)
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
