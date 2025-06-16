@@ -21,24 +21,36 @@
 namespace tensorrt_llm::executor
 {
 
-CacheTransceiverConfig::CacheTransceiverConfig(std::optional<size_t> maxNumTokens)
-    : mMaxNumTokens(maxNumTokens)
+CacheTransceiverConfig::CacheTransceiverConfig(
+    std::optional<BackendType> backendType, std::optional<size_t> maxNumTokens)
+    : mBackendType(backendType)
+    , mMaxTokensInBuffer(maxNumTokens)
 {
 }
 
 bool CacheTransceiverConfig::operator==(CacheTransceiverConfig const& other) const
 {
-    return mMaxNumTokens == other.mMaxNumTokens;
+    return mMaxTokensInBuffer == other.mMaxTokensInBuffer;
 }
 
-std::optional<size_t> CacheTransceiverConfig::getMaxNumTokens() const
+void CacheTransceiverConfig::setBackendType(std::optional<BackendType> backendType)
 {
-    return mMaxNumTokens;
+    mBackendType = backendType;
 }
 
-void CacheTransceiverConfig::setMaxNumTokens(size_t maxNumTokens)
+void CacheTransceiverConfig::setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer)
 {
-    mMaxNumTokens = maxNumTokens;
+    mMaxTokensInBuffer = maxTokensInBuffer;
+}
+
+std::optional<CacheTransceiverConfig::BackendType> CacheTransceiverConfig::getBackendType() const
+{
+    return mBackendType;
+}
+
+std::optional<size_t> CacheTransceiverConfig::getMaxTokensInBuffer() const
+{
+    return mMaxTokensInBuffer;
 }
 
 } // namespace tensorrt_llm::executor

@@ -195,6 +195,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": disable_overlap_scheduler
         }
+        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
@@ -312,6 +314,8 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
@@ -347,6 +351,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": not overlap_scheduler}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
                 "decoding_type": "MTP",

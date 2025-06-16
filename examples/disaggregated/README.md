@@ -4,14 +4,25 @@ To run TRT-LLM in disaggregated mode, you must first launch context (prefill) an
 
 ## Launching context and generation servers using multiple independent `trtllm-serve` commands
 
+We use the `cache_transceiver_config` configuration to set up disaggregated serving, which includes the following parameters:
+
+```
+cache_transceiver_config:
+  backend: <str>
+  max_tokens_in_buffer: <int>
+```
+
+`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`,`UCX`, `NIXL`, and `MPI`, the default backend is UCX.
+
+`max_tokens_in_buffer` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
+
 You can use multiple `trtllm-serve` commands to launch the context and generation servers that will be used
 for disaggregated serving. For example, you could launch two context servers and one generation servers as follows:
 
 ```
-echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  max_num_tokens: 2048" > context_extra-llm-api-config.yml
-echo -e "cache_transceiver_config:\n  max_num_tokens: 2048" > gen_extra-llm-api-config.yml
+echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_extra-llm-api-config.yml
+echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_extra-llm-api-config.yml
 
-export TRTLLM_USE_UCX_KVCACHE=1
 #Context servers
 CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_0 &
 CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_1 &
@@ -128,6 +139,8 @@ context_servers:
   pipeline_parallel_size: 1
   kv_cache_config:
     free_gpu_memory_fraction: 0.9
+  cache_transceiver_config:
+    backend: UCX
   urls:
       - "localhost:8001"
       - "localhost:8002"
@@ -135,6 +148,8 @@ generation_servers:
   num_instances: 1
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
+  cache_transceiver_config:
+    backend: UCX
   urls:
       - "localhost:8003"
 ```
@@ -143,3 +158,7 @@ Once the context and generation servers are launched, you can again launch the d
 ```
 trtllm-serve disaggregated -c disagg_config.yaml
 ```
+
+## Know Issues
+
+The MPI communication backend for kvCache transfer has been deprecated and may not be supported in the future. When using the MPI backend, the environment variable `TRTLLM_USE_MPI_KVCACHE=1` should be set to avoid conflicts between mpi4py and kvCache transfer.
