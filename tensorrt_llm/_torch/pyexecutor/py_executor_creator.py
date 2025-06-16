@@ -176,10 +176,12 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
     return mapping
 
 
-def create_py_executor(executor_config: ExecutorConfig,
-                       checkpoint_dir: str = None,
-                       engine_dir: str = None,
-                       lora_config: Optional[LoraConfig] = None) -> PyExecutor:
+def create_py_executor(
+        executor_config: ExecutorConfig,
+        checkpoint_dir: str = None,
+        engine_dir: str = None,
+        lora_config: Optional[LoraConfig] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
     _mangle_executor_config(executor_config)
     pytorch_backend_config = executor_config.pytorch_backend_config
 
@@ -238,6 +240,7 @@ def create_py_executor(executor_config: ExecutorConfig,
                 attn_runtime_features=attn_runtime_features,
                 dist=dist,
                 spec_config=draft_spec_config,
+                is_draft_model=True,
             )
             draft_model_engine.kv_cache_manager_key = DRAFT_KV_CACHE_MANAGER_KEY
             draft_model_engine.load_weights_from_target_model(
@@ -323,7 +326,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     # resource managers for speculative decoding
     if spec_config is not None:
         spec_resource_manager = get_spec_resource_manager(
-            spec_config, model_engine.model.config, model_engine.batch_size * 2)
+            spec_config, model_engine, draft_model_engine)
         if spec_resource_manager is not None:
             resources["spec_resource_manager"] = spec_resource_manager
 
@@ -333,7 +336,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         py_executor = create_py_executor_instance(
             dist, resources, mapping, pytorch_backend_config, executor_config,
             ctx_chunk_config, model_engine, draft_model_engine, False, sampler,
-            lora_config)
+            lora_config, garbage_collection_gen0_threshold)
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
@@ -364,7 +367,8 @@ def create_py_executor(executor_config: ExecutorConfig,
             py_executor = create_py_executor_instance(
                 dist, resources, mapping, pytorch_backend_config,
                 executor_config, ctx_chunk_config, model_engine,
-                draft_model_engine, False, sampler, lora_config)
+                draft_model_engine, False, sampler, lora_config,
+                garbage_collection_gen0_threshold)
 
     py_executor.start_worker()
     return py_executor

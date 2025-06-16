@@ -76,7 +76,7 @@ class Qwen3MoE(nn.Module):
         self,
         model_config: ModelConfig[Qwen3MoeConfig],
         aux_stream: torch.cuda.Stream,
-        layer_idx: int,
+        layer_idx: Optional[int] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -109,6 +109,7 @@ class Qwen3MoE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
+            layer_idx=layer_idx,
         )
 
     def forward(

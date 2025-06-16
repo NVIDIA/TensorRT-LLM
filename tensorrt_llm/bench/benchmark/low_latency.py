@@ -218,6 +218,7 @@ def latency_command(
             n=beam_width,
             use_beam_search=beam_width > 1,
         )
+        post_proc_params = None  # No detokenization
         llm = LLM(**kwargs)
 
         # Perform warmup if requested.
@@ -226,8 +227,8 @@ def latency_command(
             warmup_dataset = generate_warmup_dataset(requests, warmup)
             logger.info("Running warmup.")
             asyncio.run(
-                async_benchmark(llm, sampling_params, warmup_dataset, False,
-                                concurrency))
+                async_benchmark(llm, sampling_params, post_proc_params,
+                                warmup_dataset, False, concurrency))
             # WAR: IterationResult is a singleton tied to the executor.
             # Since the benchmark calls asyncio.run() multiple times (e.g., during warmup),
             # we must reset it to ensure it attaches to the correct event loop.
@@ -236,8 +237,9 @@ def latency_command(
 
         with iteration_writer.capture():
             statistics = asyncio.run(
-                async_benchmark(llm, sampling_params, requests, True,
-                                concurrency, iteration_writer.full_address))
+                async_benchmark(llm, sampling_params, post_proc_params,
+                                requests, True, concurrency,
+                                iteration_writer.full_address))
 
         logger.info(f"Benchmark done. Reporting results...")
         report_utility = ReportUtility(statistics, metadata, runtime_config,
