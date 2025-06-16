@@ -117,20 +117,17 @@ class GenerationExecutorWorker(GenerationExecutor):
                 return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
                                      executor_config)
             args = {
-                "executor_config":
-                executor_config,
-                "checkpoint_dir":
-                executor_config.hf_model_dir,
-                "engine_dir":
-                executor_config.trt_engine_dir,
-                "garbage_collection_gen0_threshold":
-                garbage_collection_gen0_threshold,
+                "executor_config": executor_config,
+                "checkpoint_dir": executor_config.hf_model_dir,
+                "engine_dir": executor_config.trt_engine_dir,
             }
             if executor_config.backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
                 create_executor = create_py_executor
                 args["lora_config"] = lora_config
+                args[
+                    "garbage_collection_gen0_threshold"] = garbage_collection_gen0_threshold
             elif executor_config.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
