@@ -398,7 +398,7 @@ def create_py_executor_instance(
                 "Guided decoding is not supported with overlap scheduler.")
 
     logger.info(
-        f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"
+        f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}, max_batch_size={executor_config.max_batch_size}"
     )
 
     for key, value in pytorch_backend_config.extra_resource_managers.items():
@@ -483,8 +483,7 @@ def create_py_executor_instance(
         max_num_sequences,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,
-        two_step_lookahead=mapping.has_pp()
-        or not pytorch_backend_config.disable_overlap_scheduler)
+        two_step_lookahead=mapping.has_pp())
     mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
                                            executor_config.max_num_tokens,
                                            ctx_chunk_config)
