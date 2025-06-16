@@ -761,7 +761,7 @@ __global__ void setPagedKVCacheForMLAKernel(T* output, T const* k_ptr, T const* 
 // q {total_uncached_tokens, h, d_nope + d_rope}
 // latent_cache {total_uncached_tokens, d_k + d_rope}
 template <typename T, typename TCache, int BLOCK_SIZE, int K_DIM, int ROPE_DIM>
-__global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, T* q_ptr, T const* latent_cache_ptr,
+__global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, T* q_ptr, T* latent_cache_ptr,
     int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
     float2 const* cos_sin_cache, size_t head_num, int nope_size, float const* kv_scale_orig_quant_ptr)
 {
@@ -851,6 +851,10 @@ __global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, T*
                     if constexpr (std::is_same_v<TCache, T>)
                     {
                         reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
+                        // copy to latent_cache (for chunked prefill, it will not load kv cache for uncached k_pe)
+                        auto const src_k_global_offset
+                            = static_cast<size_t>(global_token_idx) * (K_DIM + ROPE_DIM) + K_DIM;
+                        *reinterpret_cast<VecT*>(&latent_cache_ptr[src_k_global_offset + head_dim_idx]) = data;
                     }
                     else if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
                     {
@@ -980,10 +984,10 @@ void invokeMLASetPagedKV(T* output, T const* k_ptr, T const* v_ptr, T const* k_p
 }
 
 template <typename T, typename TCache>
-void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T const* latent_cache_ptr,
-    int const num_requests, int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens,
-    int const max_input_uncached_seq_len, float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size,
-    int lora_size, float const* kv_scale_orig_quant_ptr, cudaStream_t stream)
+void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* latent_cache_ptr, int const num_requests,
+    int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
+    float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size, int lora_size,
+    float const* kv_scale_orig_quant_ptr, cudaStream_t stream)
 {
     dim3 grid(int(tensorrt_llm::common::divUp(max_input_uncached_seq_len, 32)), num_requests, head_num + 1 + 8);
     TLLM_CHECK_WITH_INFO(lora_size == 512, "lora_size should be equal to %d", 512);
@@ -1012,7 +1016,7 @@ INSTANTIATE_MLA_ROPE(__nv_bfloat16, KVLinearBuffer);
         int const num_contexts, int64_t const* cu_ctx_cached_kv_lens, int const max_input_seq_len,                     \
         int const lora_size, int const rope_size, float const* kv_scale_quant_orig_ptr, cudaStream_t stream);          \
     template void invokeMLARopeAppendPagedKVAssignQ<T, TCache>(KVBlockArray & kv_cache, T * q_ptr,                     \
-        T const* latent_cache_ptr, int const num_requests, int64_t const* cu_ctx_cached_kv_lens,                       \
+        T * latent_cache_ptr, int const num_requests, int64_t const* cu_ctx_cached_kv_lens,                            \
         int64_t const* cu_seq_lens, int const max_input_uncached_seq_len, float2 const* cos_sin_cache,                 \
         size_t head_num, int nope_size, int rope_size, int lora_size, float const* kv_scale_orig_quant_ptr,            \
         cudaStream_t stream);

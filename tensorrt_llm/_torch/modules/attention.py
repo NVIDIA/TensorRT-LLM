@@ -973,40 +973,14 @@ class MLA(nn.Module):
         self,
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
+        latent_cache: torch.
+        Tensor,  # compressed_kv + k_pe [context_tokens, 1, lora_size + rope_size]
         attn_metadata: TrtllmAttentionMetadata,
-        position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         trtllm_attention = cast(TrtllmAttention, self.mha)
-
-        # split current q into q_nope and q_pe
-        q_nope, q_pe = q.view([
-            -1, self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim
-        ]).split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-        # apply rope to current q_pe and k_pe
-        assert position_ids is not None
-        assert position_ids.dim() == 1 or (position_ids.dim() == 2
-                                           and position_ids.shape[0] == 1)
-        assert self.rotary_emb is not None
-        assert self.rotary_emb.head_dim == self.qk_rope_head_dim
-        assert q_pe.shape[0] == k_pe.shape[0]
-        q_pe = q_pe.contiguous().view(-1,
-                                      self.num_heads * self.qk_rope_head_dim)
-        q_pe, k_pe = self.rotary_emb(
-            position_ids[..., :attn_metadata.num_ctx_tokens], [q_pe, k_pe])
-        k_pe = k_pe.contiguous()
-
-        # build q for attention op
-        q_view = q.view(-1, self.num_heads,
-                        self.qk_nope_head_dim + self.qk_rope_head_dim)
-        q_view[:, :,
-               self.qk_nope_head_dim:] = q_pe.view(-1, self.num_heads,
-                                                   self.qk_rope_head_dim)
-        q = q_view.view(
-            -1,
-            self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim))
-        assert q.is_contiguous()
+        # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
+        trtllm_attention.mla_rope_append_paged_kv_assign_q(
+            q, latent_cache, attn_metadata)
 
         # determine the number of loop
         # currently we assume that the chunk size is the same as the max_num_tokens
@@ -1135,15 +1109,10 @@ class MLA(nn.Module):
 
         # deal with the uncached kv
         kv = self.kv_b_proj(compressed_kv)
-
-        # append paged kv cache for mla
-        # we may finish it inside the attention op by passing latent_cache
-        trtllm_attention.append_paged_kv_cache_for_mla(
-            compressed_kv,
-            k_pe,
-            attn_metadata,
-        )
-
+        k_pe = latent_cache.view([
+            -1, self.kv_lora_rank + self.qk_rope_head_dim
+        ]).split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
+        k_pe = k_pe.contiguous()
         # final round of attention
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
@@ -1206,7 +1175,7 @@ class MLA(nn.Module):
             if trtllm_attention.is_chunked_prefill_for_mla_context(
                     attn_metadata):
                 return self.forward_context_with_chunked_prefill(
-                    q, compressed_kv, k_pe, attn_metadata, position_ids)
+                    q, latent_cache, attn_metadata)
             elif trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
                 return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)

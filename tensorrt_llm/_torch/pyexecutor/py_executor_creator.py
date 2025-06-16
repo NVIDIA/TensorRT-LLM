@@ -292,8 +292,6 @@ def create_py_executor(
             )
             executor_config.kv_cache_config.enable_block_reuse = False
 
-        executor_config.enable_chunked_context = False
-
     if executor_config.enable_chunked_context:
         chunk_unit_size = executor_config.tokens_per_block
         chunking_policy = (

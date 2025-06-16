@@ -80,11 +80,10 @@ void setPagedKVCacheForMLAHelper(torch::Tensor& output, torch::Tensor const& k, 
 }
 
 template <typename T, typename TCache>
-void invokeMLARopeAppendPagedKVAssignQHelper(KVBlockArray& kv_cache, torch::Tensor& q,
-    torch::Tensor const& latent_cache, int const num_requests, torch::Tensor const& cu_ctx_cached_kv_lens,
-    torch::Tensor const& cu_seq_lens, int const max_input_uncached_seq_len, torch::Tensor const& cos_sin_cache,
-    int const head_num, int const nope_size, int const rope_size, int const lora_size,
-    float const* kv_scale_orig_quant_ptr)
+void invokeMLARopeAppendPagedKVAssignQHelper(KVBlockArray& kv_cache, torch::Tensor& q, torch::Tensor& latent_cache,
+    int const num_requests, torch::Tensor const& cu_ctx_cached_kv_lens, torch::Tensor const& cu_seq_lens,
+    int const max_input_uncached_seq_len, torch::Tensor const& cos_sin_cache, int const head_num, int const nope_size,
+    int const rope_size, int const lora_size, float const* kv_scale_orig_quant_ptr)
 {
     auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
     auto* q_ptr = static_cast<T*>(q.data_ptr());
@@ -392,7 +391,7 @@ torch::Tensor setPagedKVCacheForMLA(torch::Tensor& output, torch::Tensor const& 
     return faked_kv_cache_block_offsets;
 }
 
-void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor const& latent_cache, int64_t const num_contexts,
+void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, int64_t const num_contexts,
     torch::Tensor const& cu_ctx_cached_kv_lens, torch::Tensor const& cu_seq_lens,
     int64_t const max_input_uncached_seq_len, torch::Tensor const& cos_sin_cache, int64_t const head_num,
     int64_t const nope_size, int64_t const rope_size, int64_t const lora_size,
