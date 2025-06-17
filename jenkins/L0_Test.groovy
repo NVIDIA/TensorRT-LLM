@@ -1311,7 +1311,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
         }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install --retries 1 -r requirements-dev.txt")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -i https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple triton==3.4.0")
+        // The actual Triton version is still 3.4.0, but here we used 3.4.1 when building the wheel to avoid conflicts with previous builds.
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -i https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple triton==3.4.1")
         if (!skipInstallWheel) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
         }
