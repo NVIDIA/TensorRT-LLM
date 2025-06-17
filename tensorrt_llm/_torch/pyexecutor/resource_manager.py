@@ -38,6 +38,9 @@ PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheMana
 PeftCacheConfig = tensorrt_llm.bindings.executor.PeftCacheConfig
 WorldConfig = tensorrt_llm.bindings.WorldConfig
 TempAttentionWindowInputs = tensorrt_llm.bindings.internal.batch_manager.TempAttentionWindowInputs
+BlocksPerWindow = Dict[int, Tuple[
+    int,
+    int]]  # window_size -> (blocks_in_primary_pool, blocks_in_secondary_pool)
 
 
 class ResourceManagerType(enum.Enum):
@@ -177,6 +180,7 @@ class KVCacheManager(BaseResourceManager):
         # draft/target layers. Add extra tokens to handle this issue.
         self.num_extra_kv_tokens = 0 if spec_config is None else spec_config.num_extra_kv_tokens
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
+        self.max_num_tokens = max_num_tokens
 
         # Determine max_attention_window_vec
         if kv_cache_config.max_attention_window is None:
@@ -254,13 +258,8 @@ class KVCacheManager(BaseResourceManager):
                 f"Adjusted attention window size to {self.max_seq_len} in blocks_per_window"
             )
 
-        # Set up temp_attention_window_inputs only for VSWA or when needed
-        temp_attention_window_inputs = None
-        if is_vswa:  # Only create when necessary
-            temp_attention_window_inputs = TempAttentionWindowInputs()
-            temp_attention_window_inputs.paged_context_fmha = True
-            temp_attention_window_inputs.max_input_len = self.max_seq_len - 1
-            temp_attention_window_inputs.max_num_tokens = max_num_tokens
+        # Set up temp_attention_window_inputs
+        temp_attention_window_inputs = self._set_temp_attention_window_inputs()
 
         # Note that this stream is unused for now. Will be used for copying to host
         # when that feature is enabled.
@@ -284,7 +283,6 @@ class KVCacheManager(BaseResourceManager):
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
         }
-
         if self.event_buffer_max_size > 0:
             kwargs['event_manager'] = KVCacheEventManagerCpp(
                 max_kv_event_entries=self.event_buffer_max_size)
@@ -590,15 +588,22 @@ class KVCacheManager(BaseResourceManager):
             # This case should ideally be prevented by earlier config validation.
             # If num_local_layers is 0, an empty map is fine.
             if self.num_local_layers > 0:
-                raise ValueError(
+                raise Exception(
                     "max_attention_window_vec cannot be empty if there are local layers."
                 )
             return {
             }  # Return an empty dict if no local layers or if somehow vec is empty and no layers.
 
         # Treat max_attention_window_vec as a repeating pattern.
-        # This also correctly handles the case where len(self.max_attention_window_vec) == 1.
-        pattern_len = len(self.max_attention_window_vec)
+        pattern_len = len(
+            self.max_attention_window_vec
+        )  # `sliding_window_pattern`, in HF config terms, e.g. https://huggingface.co/google/gemma-3-1b-it/blob/main/config.json#L32
+        # early return if max_attention_window_vec is a single value(SWA)
+        if pattern_len == 1:
+            return {
+                self.max_attention_window_vec[0]:
+                list(range(self.num_local_layers))
+            }
         for local_layer_idx in range(self.num_local_layers):
             window_size = self.max_attention_window_vec[local_layer_idx %
                                                         pattern_len]
@@ -651,18 +656,18 @@ class KVCacheManager(BaseResourceManager):
             allotted_primary_mem_bytes=primary_pool_memory_bytes,
             allotted_secondary_mem_bytes=secondary_pool_memory_bytes,
             extra_cost_memory=extra_cost_memory,
-            kvFactor=self.kv_factor,
+            kv_factor=self.kv_factor,
         )
         return blocks_per_window
 
     def _validate_and_adjust_attention_windows(
         self,
         max_attention_window_vec: List[int],
-        blocks_per_window: Dict[int, Tuple[int, int]],
+        blocks_per_window: BlocksPerWindow,
         tokens_per_block: int,
         sink_token_length: int,
         max_seq_len: int,
-    ) -> Tuple[Dict[int, Tuple[int, int]], int, List[int]]:
+    ) -> Tuple[BlocksPerWindow, int, List[int]]:
         """
         Validate and adjust attention windows against their upper bounds if needed.
         If there is no adjustment, the returned max_attention_window_vec will be the same as the input.
@@ -720,6 +725,22 @@ class KVCacheManager(BaseResourceManager):
             return adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_window_vec
         else:
             return blocks_per_window, max_seq_len, max_attention_window_vec
+
+    def _set_temp_attention_window_inputs(
+            self) -> Optional[TempAttentionWindowInputs]:
+        """
+        Set up temp_attention_window_inputs for sliding window.
+        """
+        is_sliding_window = min(
+            self.max_attention_window_vec) < self.max_seq_len
+        if is_sliding_window:
+            temp_attention_window_inputs = TempAttentionWindowInputs()
+            temp_attention_window_inputs.paged_context_fmha = True
+            temp_attention_window_inputs.max_input_len = self.max_seq_len - 1
+            temp_attention_window_inputs.max_num_tokens = self.max_num_tokens
+            return temp_attention_window_inputs
+        else:
+            return None
 
 
 class MambaCacheManager(BaseResourceManager):
