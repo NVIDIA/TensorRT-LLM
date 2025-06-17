@@ -2,7 +2,6 @@ from enum import IntEnum
 
 import torch
 
-
 # The declarations must be aligned with thUtils.h
 SF_DTYPE = torch.uint8
 FLOAT4_E2M1X2 = torch.uint8
