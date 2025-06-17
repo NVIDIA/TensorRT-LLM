@@ -27,7 +27,7 @@ from ..conftest import (llm_models_root, parametrize_with_ids,
                         skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            LlmapiAccuracyTestHarness)
+                            JsonModeEval, LlmapiAccuracyTestHarness)
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
@@ -61,15 +61,16 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_chunked_prefill(self, attn_backend):
-        pytorch_config = dict(attn_backend=attn_backend, )
+        pytorch_config = dict(
+            attn_backend=attn_backend,
+            # https://nvbugspro.nvidia.com/bug/5345391
+            disable_overlap_scheduler=True)
         llm = LLM(self.MODEL_PATH,
                   enable_chunked_prefill=True,
-                  max_num_tokens=64,
+                  max_num_tokens=512,
                   **pytorch_config)
         with llm:
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(32000)
@@ -231,8 +232,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
         draft_len = 4
-        spec_config = EagleDecodingConfig(
-            max_draft_len=draft_len, pytorch_eagle_weights_path=eagle_model_dir)
+        spec_config = EagleDecodingConfig(max_draft_len=draft_len,
+                                          pytorch_weights_path=eagle_model_dir)
 
         llm = LLM(model=target_model_dir,
                   **pytorch_config,
@@ -265,6 +266,27 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         with llm:
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_guided_decoding(self):
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend="xgrammar",
+                  disable_overlap_scheduler=True,
+                  use_cuda_graph=True)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    def test_guided_decoding_4gpus(self):
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend="xgrammar",
+                  disable_overlap_scheduler=True,
+                  use_cuda_graph=True,
+                  tensor_parallel_size=2,
+                  pipeline_parallel_size=2)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -344,7 +366,7 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     def test_auto_dtype_tp8(self):
         model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
         with LLM(model_path, tensor_parallel_size=8) as llm:
@@ -391,7 +413,7 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Maverick-17B-128E-Instruct"
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("cuda_graph", [False, True])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
                                                          (8, 1, 8)],
@@ -413,7 +435,7 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
 
     @skip_pre_hopper
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("cuda_graph", [False, True])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
                                                          (8, 1, 8)],
@@ -972,7 +994,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-R1"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1"
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
@@ -1027,7 +1049,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",

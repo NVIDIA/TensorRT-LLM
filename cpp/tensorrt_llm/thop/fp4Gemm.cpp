@@ -38,9 +38,11 @@
 
 namespace tkc = tensorrt_llm::cutlass_extensions;
 #if defined(USING_OSS_CUTLASS_FP4_GEMM)
+using tensorrt_llm::kernels::cutlass_kernels::FP4GemmType;
 using tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunner;
 using tensorrt_llm::kernels::cutlass_kernels::CutlassFp4GemmRunnerInterface;
 #else
+using tensorrt_llm::kernels::internal_cutlass_kernels::FP4GemmType;
 using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunner;
 using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunnerInterface;
 #endif
@@ -51,13 +53,28 @@ namespace torch_ext
 namespace
 {
 
-tkc::CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k)
+tkc::CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k, FP4GemmType fp4GemmType)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
-    if (sm >= 120)
+    if (fp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
     {
-        return tkc::CutlassGemmConfig(tkc::CutlassTileConfigSM120::CtaShape128x128x256B,
-            tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO, tkc::ClusterShape::ClusterShape_1x1x1);
+        if (sm >= 120)
+        {
+            return tkc::CutlassGemmConfig(tkc::CutlassTileConfigSM120::CtaShape128x128x256B,
+                tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
+                tkc::ClusterShape::ClusterShape_1x1x1);
+        }
+        else
+        {
+            return tkc::CutlassGemmConfig(tkc::CutlassTileConfigSM100::CtaShape128x256x128B,
+                tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
+                tkc::ClusterShape::ClusterShape_1x1x1);
+        }
+    }
+    else if (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
+    {
+        return tkc::CutlassGemmConfig(tkc::CutlassTileConfigSM100::CtaShape128x256x256B,
+            tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO, tkc::ClusterShape::ClusterShape_4x4x1);
     }
     else
     {
@@ -69,50 +86,71 @@ tkc::CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k)
 template <typename T>
 void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
     at::Tensor const& mat2Scale, at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k, int64_t batch_count,
-    tkc::CutlassGemmConfig const& gemmConfig)
+    tkc::CutlassGemmConfig const& gemmConfig, FP4GemmType fp4GemmType)
 {
-    CutlassFp4GemmRunner<T> gemmRunner;
-    int64_t const wsBytes = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
+    if (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
+    {
+        CutlassFp4GemmRunner<T, FP4GemmType::W4A8_MXFP4_MXFP8> gemmRunner;
+        int64_t const wsBytes = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
 
-    at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, mat1.device(), std::nullopt);
+        at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, mat1.device(), std::nullopt);
 
-    gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
-        mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
-        reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()));
+        gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
+            mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
+            reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()));
+    }
+    else if (fp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
+    {
+        CutlassFp4GemmRunner<T, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
+        int64_t const wsBytes = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
+
+        at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, mat1.device(), std::nullopt);
+
+        gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
+            mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
+            reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()));
+    }
 }
 
-// mat1: [B, M, K / 2], FLOAT4_E2M1X2
+// mat1: [B, M, K / 2], FLOAT4_E2M1X2 or [B, M, K], FLOAT8_E4M3FN
 // mat2: [B, N, K / 2], FLOAT4_E2M1X2
 // out: [B, M, N], fp16/bf16/fp32
 // mat1Scale: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 // mat2Scale: ceil(N / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 // globalScale: [1], 1 / (((448 * 6) / mat1.abs().max()) * ((448 * 6) / mat2.abs().max()))
 // B = 1 for GEMM op as a special case
-// Only NVFP4 is currently supported
+// Only W4A4_NVFP4 and W4A8_MXFP4_FP8 are currently supported
 at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
-    at::Tensor const& mat2Scale, at::Tensor const& globalScale, bool sfUseUE8M0,
+    at::Tensor const& mat2Scale, at::Tensor const& globalScale, FP4GemmType fp4GemmType,
     std::optional<c10::ScalarType> out_dtype, bool to_userbuffers = false,
     tkc::CutlassGemmConfig const* maybe_config = nullptr)
 {
-    CHECK_INPUT(mat1, FLOAT4_E2M1X2);
-    CHECK_INPUT(mat2, FLOAT4_E2M1X2);
+    if (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
+    {
+        CHECK_INPUT(mat1, torch::kFloat8_e4m3fn);
+        CHECK_INPUT(mat2, FLOAT4_E2M1X2);
+    }
+    else if (fp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
+    {
+        CHECK_INPUT(mat1, FLOAT4_E2M1X2);
+        CHECK_INPUT(mat2, FLOAT4_E2M1X2);
+    }
+    int mat2_k_scale = fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8 ? 2 : 1;
 
     CHECK_INPUT(mat1Scale, SF_DTYPE);
     CHECK_INPUT(mat2Scale, SF_DTYPE);
 
     CHECK_INPUT(globalScale, at::ScalarType::Float);
 
-    TORCH_CHECK(!sfUseUE8M0, "use UE8M0 for FP4 Block Scale Factors is not supported yet");
-
     int64_t m, n, k, b;
     if (mat1.dim() == 2)
     {
         TORCH_CHECK(mat2.dim() == 2, "mat2 must be a matrix");
-        TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[1], "mat1 and mat2 shapes cannot be multiplied (", mat1.sizes()[0],
-            "x", mat1.sizes()[1], " and ", mat2.sizes()[0], "x", mat2.sizes()[1], ")");
+        TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[1] * mat2_k_scale, "mat1 and mat2 shapes cannot be multiplied (",
+            mat1.sizes()[0], "x", mat1.sizes()[1], " and ", mat2.sizes()[0], "x", mat2.sizes()[1], ")");
         m = mat1.sizes()[0];
         n = mat2.sizes()[0];
-        k = mat1.sizes()[1] * 2;
+        k = mat2.sizes()[1] * 2;
         b = 1;
     }
     else if (mat1.dim() == 3)
@@ -120,11 +158,11 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
         TORCH_CHECK(mat2.dim() == 3, "mat2 must be a batch of matrices");
         TORCH_CHECK(mat1.sizes()[0] == mat2.sizes()[0], "mat1 and mat2 must have the same batch size (",
             mat1.sizes()[0], " and ", mat2.sizes()[0], ")");
-        TORCH_CHECK(mat1.sizes()[2] == mat2.sizes()[2], "mat1 and mat2 shapes cannot be multiplied (", mat1.sizes()[1],
-            "x", mat1.sizes()[2], " and ", mat2.sizes()[1], "x", mat2.sizes()[2], ")");
+        TORCH_CHECK(mat1.sizes()[2] == mat2.sizes()[2] * mat2_k_scale, "mat1 and mat2 shapes cannot be multiplied (",
+            mat1.sizes()[1], "x", mat1.sizes()[2], " and ", mat2.sizes()[1], "x", mat2.sizes()[2], ")");
         m = mat1.sizes()[1];
         n = mat2.sizes()[1];
-        k = mat1.sizes()[2] * 2;
+        k = mat2.sizes()[2] * 2;
         b = mat1.sizes()[0];
     }
     else
@@ -132,7 +170,7 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
         C10_THROW_ERROR(NotImplementedError, "mat1 must be a matrix or a batch of matrices");
     }
 
-    auto config = maybe_config ? *maybe_config : getDefaultGemmConfig(m, n, k);
+    auto config = maybe_config ? *maybe_config : getDefaultGemmConfig(m, n, k, fp4GemmType);
 
     constexpr int alignment = 32;
     TORCH_CHECK(k % alignment == 0, "Expected k to be divisible by ", alignment, ", but got mat1 shape: (",
@@ -157,17 +195,16 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
     {
         out = at::detail::empty_cuda(out_shape, out_dtype.value(), mat1.device(), std::nullopt);
     }
-
     switch (out_dtype.value())
     {
     case at::ScalarType::Half:
-        runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config);
+        runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config, fp4GemmType);
         break;
     case at::ScalarType::BFloat16:
-        runGemm<__nv_bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config);
+        runGemm<__nv_bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config, fp4GemmType);
         break;
     case at::ScalarType::Float:
-        runGemm<float>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config);
+        runGemm<float>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config, fp4GemmType);
         break;
     default: C10_THROW_ERROR(NotImplementedError, "out_dtype must be one of fp16/bf16/fp32.");
     }
@@ -177,33 +214,56 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
 } // namespace
 
 at::Tensor fp4_bmm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
-    at::Tensor const& mat2Scale, at::Tensor const& globalScale, bool sfUseUE8M0,
+    at::Tensor const& mat2Scale, at::Tensor const& globalScale, int64_t fp4GemmType,
     std::optional<c10::ScalarType> out_dtype)
 {
     // The functional version of this op does not do any profiling; use the profiler class below instead for
     // better performance.
     // Note that we can still add a heuristic here.
-    return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, sfUseUE8M0, out_dtype);
+    return fp4_bmm_impl(
+        mat1, mat2, mat1Scale, mat2Scale, globalScale, static_cast<FP4GemmType>(fp4GemmType), out_dtype);
 }
 
 class FP4GemmRunner : public torch::CustomClassHolder
 {
 public:
-    explicit FP4GemmRunner(at::ScalarType outputDtype)
+    explicit FP4GemmRunner(at::ScalarType outputDtype, int64_t fp4GemmType)
         : mOutputDtype(outputDtype)
+        , mfp4GemmType(static_cast<FP4GemmType>(fp4GemmType))
     {
         if (outputDtype == at::ScalarType::Half)
         {
-            mGemmRunner = std::make_unique<CutlassFp4GemmRunner<half>>();
+            if (mfp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
+            {
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<half, FP4GemmType::W4A8_MXFP4_MXFP8>>();
+            }
+            else if (mfp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
+            {
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<half, FP4GemmType::W4A4_NVFP4_NVFP4>>();
+            }
         }
         else if (outputDtype == at::ScalarType::Float)
         {
-            mGemmRunner = std::make_unique<CutlassFp4GemmRunner<float>>();
+            if (mfp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
+            {
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<float, FP4GemmType::W4A8_MXFP4_MXFP8>>();
+            }
+            else if (mfp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
+            {
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<float, FP4GemmType::W4A4_NVFP4_NVFP4>>();
+            }
         }
 #ifdef ENABLE_BF16
         else if (outputDtype == at::ScalarType::BFloat16)
         {
-            mGemmRunner = std::make_unique<CutlassFp4GemmRunner<__nv_bfloat16>>();
+            if (mfp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
+            {
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<__nv_bfloat16, FP4GemmType::W4A8_MXFP4_MXFP8>>();
+            }
+            else if (mfp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
+            {
+                mGemmRunner = std::make_unique<CutlassFp4GemmRunner<__nv_bfloat16, FP4GemmType::W4A4_NVFP4_NVFP4>>();
+            }
         }
 #endif
         else
@@ -214,8 +274,7 @@ public:
     }
 
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
-        at::Tensor const& mat2Scale, at::Tensor const& globalScale, bool sfUseUE8M0, bool to_userbuffers,
-        int64_t configIdx) const
+        at::Tensor const& mat2Scale, at::Tensor const& globalScale, bool to_userbuffers, int64_t configIdx) const
     {
         tkc::CutlassGemmConfig const* config = nullptr;
         if (configIdx != -1)
@@ -224,7 +283,7 @@ public:
             config = &mConfigs.at(configIdx);
         }
         return fp4_bmm_impl(
-            mat1, mat2, mat1Scale, mat2Scale, globalScale, sfUseUE8M0, mOutputDtype, to_userbuffers, config);
+            mat1, mat2, mat1Scale, mat2Scale, globalScale, mfp4GemmType, mOutputDtype, to_userbuffers, config);
     }
 
     at::ScalarType getOutputDtype() const
@@ -241,21 +300,22 @@ private:
     std::shared_ptr<CutlassFp4GemmRunnerInterface> mGemmRunner{nullptr};
     std::vector<tkc::CutlassGemmConfig> mConfigs;
     at::ScalarType mOutputDtype;
+    FP4GemmType mfp4GemmType;
 };
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.class_<torch_ext::FP4GemmRunner>("FP4GemmRunner")
-        .def(torch::init<at::ScalarType>())
+        .def(torch::init<at::ScalarType, int64_t>())
         .def("run_gemm", &torch_ext::FP4GemmRunner::runGemm)
         .def("get_num_configs", &torch_ext::FP4GemmRunner::getNumConfigs);
 
     m.def(
-        "fp4_bmm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor globalScale, bool sfUseUE8M0, "
+        "fp4_bmm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor globalScale, int fp4GemmType, "
         "ScalarType? out_dtype=None) -> Tensor");
     m.def(
-        "fp4_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor globalScale, bool sfUseUE8M0, "
+        "fp4_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor globalScale, int fp4GemmType, "
         "ScalarType? out_dtype=None) -> Tensor");
 }
 

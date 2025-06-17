@@ -310,7 +310,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 torch.ops.trtllm.nvfp4_gemm.default, KeywordArg('act_fp4'),
                 KeywordArg('weight'), KeywordArg('act_sf'),
                 KeywordArg('weight_scale'), KeywordArg('alpha'),
-                KeywordArg('sf_use_ue8m0'), KeywordArg('output_dtype'))
+                KeywordArg('output_dtype'))
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
                                    trtllm_nvfp4_gemm_default)
             nvfp4_gemm_prologue_pattern = MultiOutputPattern([ub_copy])
@@ -321,7 +321,6 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 act_sf: torch.Tensor,
                 weight_scale: torch.Tensor,
                 alpha: torch.Tensor,
-                sf_use_ue8m0: bool,
                 output_dtype: torch.dtype,
             ):
                 return
@@ -332,12 +331,11 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
                 act_sf: torch.Tensor,
                 weight_scale: torch.Tensor,
                 alpha: torch.Tensor,
-                sf_use_ue8m0: bool,
                 output_dtype: torch.dtype,
             ):
                 nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
-                    act_fp4, weight, act_sf, weight_scale, alpha, sf_use_ue8m0,
-                    output_dtype, True)
+                    act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
+                    True)
                 return nvfp4_gemm_output
 
             # No extra check needed as the output dtype of nvfp4_gemm has been verified when
