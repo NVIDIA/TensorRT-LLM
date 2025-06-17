@@ -14,6 +14,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaAttention
 # LoRA Imports
 from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
+from tensorrt_llm._torch.pyexecutor.llm_request import create_dummy_requests
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -388,8 +389,11 @@ class TestLoraAttentionPytorchFlowVsTRT(unittest.TestCase):
 
         request_ids = [0]
 
-        kv_cache_manager.add_dummy_requests(request_ids=request_ids,
-                                            token_nums=[self.seq_len])
+        requests = create_dummy_requests(
+            request_ids=request_ids,
+            token_nums=[self.seq_len],
+            is_cross_kv=kv_cache_manager.is_cross_kv)
+        kv_cache_manager.prepare_dummy_resources(requests)
         sequence_lengths = [self.seq_len]
         past_seen_tokens = [0]
         metadata_cls = get_attention_backend(model_config.attn_backend).Metadata

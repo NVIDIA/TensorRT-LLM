@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention_backend import (AttentionBackend,
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.llm_request import create_dummy_requests
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -202,7 +203,10 @@ def produce_outputs(
     seq_lens_append = seq_lens_kv if seq_lens_kv is not None else seq_lens
     token_nums = (torch.tensor(num_cached_tokens_per_seq) +
                   seq_lens_append).tolist()
-    kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+    requests = create_dummy_requests(request_ids=request_ids,
+                                     token_nums=token_nums,
+                                     is_cross_kv=kv_cache_manager.is_cross_kv)
+    kv_cache_manager.prepare_dummy_resources(requests)
 
     metadata = Attention.Metadata(
         num_contexts=num_contexts if num_contexts is not None else s.batch_size,
