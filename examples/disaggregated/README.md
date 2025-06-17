@@ -13,9 +13,12 @@ cache_transceiver_config:
   comm_type: <str>
   max_num_tokens: <int>
 ```
+
 Setting `enable_cache_transceiver` to `True` is required for disaggregated serving.
+
 `comm_type` specifies the communication backend for transferring the kvCache, valid options include `UCX`, `NIXL`, and `MPI`, the default option is `UCX`.
-`max_num_tokens` defines the buffer size for kvCache transfers. For optimal performance, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests.
+
+`max_num_tokens` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
 
 You can use multiple `trtllm-serve` commands to launch the context and generation servers that will be used
 for disaggregated serving. For example, you could launch two context servers and one generation servers as follows:
