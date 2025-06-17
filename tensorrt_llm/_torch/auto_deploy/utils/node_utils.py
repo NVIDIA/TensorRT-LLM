@@ -222,7 +222,7 @@ def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
     """
     lin_ops = {
         torch.ops.aten.linear,
-        torch.ops.linear.simple,
+        torch.ops.auto_deploy.torch_linear_simple,
     }
 
     if include_quantization:
@@ -233,8 +233,8 @@ def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
 def is_dist_op(node: Node) -> bool:
     """Check if the node is a distributed op."""
     dist_ops = {
-        torch.ops.dist.all_gather,
-        torch.ops.dist.all_reduce,
+        torch.ops.auto_deploy.torch_dist_all_gather,
+        torch.ops.auto_deploy.torch_dist_all_reduce,
     }
     return is_op(node, dist_ops)
 

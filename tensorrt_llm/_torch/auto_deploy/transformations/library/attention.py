@@ -18,7 +18,7 @@ def match_repeat_kv(gm: GraphModule) -> GraphModule:
     The pattern is:
     unsqueeze -> expand -> reshape -> [optional] contiguous
 
-    This is replaced with torch.ops.attention.repeat_kv.
+    This is replaced with torch.ops.auto_deploy.torch_attention_repeat_kv.
     """
     graph = gm.graph
 
@@ -49,7 +49,7 @@ def match_eager_attention(gm: GraphModule) -> GraphModule:
     The pattern is:
     transpose -> matmul -> mul -> (optional) add -> softmax -> to -> dropout -> matmul
 
-    This is replaced with torch.ops.attention.scaled_dot_product_attention.
+    This is replaced with torch.ops.auto_deploy.torch_attention_sdpa.
     """
     graph = gm.graph
 
@@ -82,7 +82,7 @@ def match_grouped_attention(gm: GraphModule) -> GraphModule:
     repeat_kv(v, n_rep) ->
     sdpa(q, repeated_k, repeated_v)
 
-    This is replaced with torch.ops.attention.grouped_sdpa.
+    This is replaced with torch.ops.auto_deploy.torch_attention_grouped_sdpa.
     """
     graph = gm.graph
 
@@ -92,7 +92,7 @@ def match_grouped_attention(gm: GraphModule) -> GraphModule:
     # Iterate through nodes in the graph
     for node in list(graph.nodes):
         # Look for SDPA nodes that could be part of our pattern
-        if is_op(node, torch.ops.attention.scaled_dot_product_attention):
+        if is_op(node, torch.ops.auto_deploy.torch_attention_sdpa):
             match_info = _match_grouped_attention_pattern(node)
             if match_info:
                 ad_logger.debug(f"Found grouped attention pattern at {node}")
@@ -126,8 +126,8 @@ def match_causal_attn_mask(gm: GraphModule) -> GraphModule:
     for node in list(graph.nodes):
         # Look for SDPA nodes or grouped SDPA nodes
         if not (
-            is_op(node, torch.ops.attention.scaled_dot_product_attention)
-            or is_op(node, torch.ops.attention.grouped_sdpa)
+            is_op(node, torch.ops.auto_deploy.torch_attention_sdpa)
+            or is_op(node, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
         ):
             continue
 
@@ -437,7 +437,7 @@ def _match_grouped_attention_pattern(sdpa_node: Node) -> Optional[Dict[str, Node
     Returns a dictionary with information about the match or None if no match.
     """
     # Check that sdpa_node is an SDPA operation
-    if not is_op(sdpa_node, torch.ops.attention.scaled_dot_product_attention):
+    if not is_op(sdpa_node, torch.ops.auto_deploy.torch_attention_sdpa):
         return None
 
     # SDPA should have query, key, value as its first three arguments
@@ -447,8 +447,8 @@ def _match_grouped_attention_pattern(sdpa_node: Node) -> Optional[Dict[str, Node
     query, key_repeated, value_repeated = sdpa_node.args[0:3]
 
     # Key and value should come from repeat_kv operations
-    if not is_op(key_repeated, torch.ops.attention.repeat_kv) or not is_op(
-        value_repeated, torch.ops.attention.repeat_kv
+    if not is_op(key_repeated, torch.ops.auto_deploy.torch_attention_repeat_kv) or not is_op(
+        value_repeated, torch.ops.auto_deploy.torch_attention_repeat_kv
     ):
         return None
 
@@ -487,7 +487,7 @@ def _replace_with_repeat_kv(graph, match_info: Dict[str, Node]) -> None:
 
     with graph.inserting_before(node_to_replace):
         repeat_kv_node = graph.call_function(
-            torch.ops.attention.repeat_kv, args=(input_tensor, n_rep)
+            torch.ops.auto_deploy.torch_attention_repeat_kv, args=(input_tensor, n_rep)
         )
 
     # Preserve metadata from the original node
@@ -502,7 +502,7 @@ def _replace_with_sdpa(graph, match_info: Dict[str, Node]) -> None:
     Replace the matched eager attention pattern with scaled_dot_product_attention.
     """
     # retrieve the default op for scaled_dot_product_attention
-    sdpa_op = torch.ops.attention.scaled_dot_product_attention.default
+    sdpa_op = torch.ops.auto_deploy.torch_attention_sdpa.default
 
     # construct the args for the ops based on the match_info and the op's schema
     args = []
@@ -530,7 +530,7 @@ def _replace_with_sdpa(graph, match_info: Dict[str, Node]) -> None:
 
 def _replace_with_grouped_sdpa(graph, match_info: Dict[str, Node]) -> None:
     """
-    Replace the matched grouped attention pattern with torch.ops.attention.grouped_sdpa.
+    Replace the matched grouped attention pattern with torch.ops.auto_deploy.torch_attention_grouped_sdpa.
     """
     sdpa_node = match_info["sdpa_node"]
     query = match_info["query"]
@@ -543,7 +543,7 @@ def _replace_with_grouped_sdpa(graph, match_info: Dict[str, Node]) -> None:
 
     with graph.inserting_before(sdpa_node):
         grouped_sdpa_node = graph.call_function(
-            torch.ops.attention.grouped_sdpa.default, args=args, kwargs=kwargs
+            torch.ops.auto_deploy.torch_attention_grouped_sdpa.default, args=args, kwargs=kwargs
         )
 
     # Preserve metadata from the original node
@@ -763,8 +763,8 @@ def match_attention_layout(gm: GraphModule, attention_op: Type[AttentionDescript
 
     # List of SDPA operations to look for
     sdpa_ops = {
-        torch.ops.attention.scaled_dot_product_attention,
-        torch.ops.attention.grouped_sdpa,
+        torch.ops.auto_deploy.torch_attention_sdpa,
+        torch.ops.auto_deploy.torch_attention_grouped_sdpa,
     }
 
     graph = gm.graph

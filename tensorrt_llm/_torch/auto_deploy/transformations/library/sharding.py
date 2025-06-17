@@ -188,8 +188,8 @@ def _insert_sharded_matmul(
 
     # figure out the right dist op
     dist_lookup = {
-        0: (torch.ops.dist.all_gather, -1),
-        1: (torch.ops.dist.all_reduce,),
+        0: (torch.ops.auto_deploy.torch_dist_all_gather, -1),
+        1: (torch.ops.auto_deploy.torch_dist_all_reduce,),
     }
     fn_dist, *dist_args = dist_lookup[dim]
 
@@ -258,9 +258,9 @@ def column_row_shard(
 
     # acceptable attention nodes between sharded GEMMs
     shardable_attention_nodes = {
-        torch.ops.attention.scaled_dot_product_attention,
-        torch.ops.attention.grouped_sdpa,
-        torch.ops.attention.bsnd_grouped_sdpa,
+        torch.ops.auto_deploy.torch_attention_sdpa,
+        torch.ops.auto_deploy.torch_attention_grouped_sdpa,
+        torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa,
     }
 
     # This is a heuristic. Basically, we assume those are okay to shard if we also encounter an
@@ -270,7 +270,7 @@ def column_row_shard(
     shardable_nodes_with_attention = {
         torch.ops.aten.view,
         torch.ops.aten.reshape,
-        torch.ops.rope.flashinfer,
+        torch.ops.auto_deploy.flashinfer_rope,
         operator.getitem,
     }
 
@@ -466,7 +466,7 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
         base_size = bmm_batch_size // world_size
         remainder = bmm_batch_size % world_size
 
-        # NOTE: our torch.ops.dist.all_gather doesn't support uneven splits at the moment.
+        # NOTE: our torch.ops.auto_deploy.torch_dist_all_gather doesn't support uneven splits at the moment.
         if remainder:
             ad_logger.warning(
                 f"BMM batch size {bmm_batch_size} is not divisible by world size {world_size}. "
@@ -493,7 +493,7 @@ def dp_bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
         # Add all_gather node after BMM to collect results
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
-                torch.ops.dist.all_gather,
+                torch.ops.auto_deploy.torch_dist_all_gather,
                 args=(node, 0),  # Gather along batch dimension (0)
             )
             node.replace_all_uses_with(gather_node)
