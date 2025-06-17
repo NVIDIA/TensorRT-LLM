@@ -192,7 +192,8 @@ class RandomDataset(BenchmarkDataset):
     def load_data(self, download_path: str, download_timeout: int):
         if self.dataset_path is None:
             logger.warning(
-                "dataset is not provided, downloading sharegpt dataset")
+                "Dataset is not provided, downloading sharegpt dataset")
+            assert download_path is not None, "Please provide a download path to sample from the ShareGPT dataset for more consistent ISL by specifying it with the `--download-path` option. Alternatively, you can use the `--random-ids` option to skip the sampling, which may introduce some unexpected ISL variation even the range ratio is set to 0."
             self.dataset_path = download_and_cache_file(
                 RandomDataset.SHAREGPT_URL, download_path,
                 RandomDataset.SHAREGPT_URL.split("/")[-1], download_timeout)

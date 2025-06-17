@@ -631,7 +631,10 @@ def main(args: argparse.Namespace):
             "random":
             lambda: RandomDataset(sample_from_sharegpt=not args.random_ids,
                                   return_text=not args.tokenize_on_client,
-                                  dataset_path=args.dataset_path).sample(
+                                  dataset_path=args.dataset_path,
+                                  download_path=args.download_path,
+                                  download_timeout=args.download_timeout
+                                  ).sample(
                                       tokenizer=tokenizer,
                                       num_requests=args.num_prompts,
                                       prefix_len=args.random_prefix_len,
@@ -1026,7 +1029,7 @@ if __name__ == "__main__":
         "--tokenize-on-client",
         action="store_true",
         help=
-        "Tokenize on client instead of server. This option only takes effect with random dataset to let the server run exactly the same isl specified by cli.",
+        "Tokenize on client instead of server. This option only takes effect with random dataset to let the server run exactly the same ISL specified by cli.",
     )
 
     hf_group = parser.add_argument_group("hf dataset options")
