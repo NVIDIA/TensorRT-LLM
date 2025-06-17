@@ -94,7 +94,8 @@ def test_swizzle_sf(rows, cols):
 
     # Create scaling factor data using fp4_sf_dtype
     sf_data = torch.arange(rows * sf_cols,
-                           dtype=fp4_utils.float4_sf_dtype).view(rows, sf_cols)
+                           dtype=fp4_utils.float4_sf_dtype,
+                           device="cuda").view(rows, sf_cols)
 
     # Apply reference implementation
     ref_result = swizzle_sf_ref(sf_data, rows, cols, scaling_vector_size)
@@ -118,8 +119,8 @@ def test_unswizzle_sf(rows, cols):
 
     # Create scaling factor data by first swizzling with reference implementation
     original_sf_data = torch.arange(rows * sf_cols,
-                                    dtype=fp4_utils.float4_sf_dtype).view(
-                                        rows, sf_cols)
+                                    dtype=fp4_utils.float4_sf_dtype,
+                                    device="cuda").view(rows, sf_cols)
     swizzled_sf_data = swizzle_sf_ref(original_sf_data, rows, cols,
                                       scaling_vector_size)
 
@@ -152,7 +153,8 @@ def test_swizzle_round_trip(rows, cols):
     # Create scaling factor data
     original_sf_data = torch.randint(0,
                                      256, (rows, sf_cols),
-                                     dtype=fp4_utils.float4_sf_dtype)
+                                     dtype=fp4_utils.float4_sf_dtype,
+                                     device="cuda")
 
     # Apply swizzle then unswizzle using the utils functions
     swizzled_sf = swizzle_sf(original_sf_data, rows, cols, scaling_vector_size)
@@ -177,8 +179,8 @@ def test_reswizzle_sf(rows, cols, num_partitions):
     for i in range(num_partitions):
         sf_data = torch.arange(i * 100,
                                i * 100 + rows * sf_cols,
-                               dtype=fp4_utils.float4_sf_dtype).view(
-                                   rows, sf_cols)
+                               dtype=fp4_utils.float4_sf_dtype,
+                               device="cuda").view(rows, sf_cols)
         swizzled_sf = swizzle_sf_ref(sf_data, rows, cols, scaling_vector_size)
         partition_sf_data.append(swizzled_sf)
 
