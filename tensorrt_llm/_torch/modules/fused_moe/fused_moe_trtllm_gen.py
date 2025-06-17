@@ -5,7 +5,7 @@ import torch
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor
 from .interface import MoE, MoEWeightLoadingMode
-from .quantization import (FP8BlockScalesFusedMoEMethod,
+from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
@@ -23,7 +23,6 @@ class TRTLLMGenFusedMoE(MoE):
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
-        enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
 
     MoE torch custom op:
         Only support min-latency mode now (SM100 Blackwell only).
@@ -90,12 +89,12 @@ class TRTLLMGenFusedMoE(MoE):
             self.create_weights()
 
     def _check_configs(self):
-        assert self.has_fp8_block_scales or self.has_nvfp4, "TRTLLMGenFusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
+        assert self.has_deepseek_fp8_block_scales or self.has_nvfp4, "TRTLLMGenFusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
 
     def _get_quant_method(self):
         if self.quant_config is not None:
             if self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return FP8BlockScalesFusedMoEMethod()
+                return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4TRTLLMGenFusedMoEMethod()
             else:
@@ -128,6 +127,7 @@ class TRTLLMGenFusedMoE(MoE):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        do_finalize: bool = True,
         *args,
         **kwargs,
     ) -> torch.Tensor:
@@ -150,7 +150,8 @@ class TRTLLMGenFusedMoE(MoE):
 
         # TODO: since routing kernel is integrated into moe_runner for fp8,
         #       here we just route the I/Os for moe_runner
-        if self.has_fp8_block_scales:
+        if self.has_deepseek_fp8_block_scales:
+            assert do_finalize, "fp8_block_scale_moe_runner does not support do_finalize=False"
             x_val, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
 
             # FIXME: tile_tokens_dim is hardcoded for now
@@ -191,7 +192,7 @@ class TRTLLMGenFusedMoE(MoE):
             # FIXME: tile_tokens_dim is hardcoded for now
             tile_tokens_dim = 8
 
-            final_hidden_states = torch.ops.trtllm.fp4_block_scale_moe_runner(
+            outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
                 hidden_states_fp4,
@@ -214,7 +215,14 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 tile_tokens_dim,
                 self.routing_method.routing_method_type,
+                do_finalize=do_finalize,
             )
+
+            if not do_finalize:
+                assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
+                return outputs
+            else:
+                final_hidden_states = outputs[0]
         else:
             raise NotImplementedError(
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling and nvfp4 dtypes."

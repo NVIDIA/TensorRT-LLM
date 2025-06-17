@@ -24,13 +24,12 @@ from .library import (
     insert_cached_attention,
     match_attention_layout,
     match_causal_attn_mask,
-    match_complex_rope,
     match_eager_attention,
-    match_explicit_rope,
     match_grouped_attention,
     match_moe_pattern,
     match_repeat_kv,
     match_rope_layout,
+    match_rope_pattern,
     optimize_rope,
     quantize,
     resize_kv_cache,
@@ -50,11 +49,11 @@ class InferenceOptimizer:
 
         self.ad_config = ad_config
         # Map Pytorch config to AutoDeploy compile backends.
-        if ad_config.use_cuda_graph and ad_config.torch_compile_enabled:
+        if ad_config.use_cuda_graph and ad_config.torch_compile_config:
             compile_backend = "torch-opt"
         elif ad_config.use_cuda_graph:
             compile_backend = "torch-cudagraph"
-        elif ad_config.torch_compile_enabled:
+        elif ad_config.torch_compile_config:
             compile_backend = "torch-compile"
         else:
             compile_backend = "torch-simple"
@@ -116,8 +115,8 @@ class InferenceOptimizer:
         egm = match_attention_layout(egm, AttentionRegistry.get(self.ad_config.attn_backend))
 
         # Match rope
-        egm = match_explicit_rope(egm)
-        egm = match_complex_rope(egm)
+        egm, _ = match_rope_pattern(egm)
+
         # Match RoPE layout expected by our backend
         egm = match_rope_layout(
             egm, AttentionRegistry.get(self.ad_config.attn_backend).get_attention_layout()
@@ -153,7 +152,7 @@ class InferenceOptimizer:
         ############################################################################################
 
         # load weights
-        self.factory.load_or_random_init(egm, device=cm.device)
+        self.factory.load_or_random_init(egm, device=self.ad_config.checkpoint_device or cm.device)
 
         # move remaining parts to device
         move_to_device(egm, cm.device)

@@ -305,16 +305,12 @@ protected:
         return mCudaGraphMode;
     }
 
-    void setMaxAttentionWindow(SizeType32 newMaxAttentionWindow)
+    void setMaxAttentionWindowVec(std::vector<SizeType32> const& maxAttentionWindowVec)
     {
-        auto const oldMax = mMaxAttentionWindow;
-        mMaxAttentionWindow = newMaxAttentionWindow;
-        std::for_each(std::begin(mMaxAttentionWindowVec), std::end(mMaxAttentionWindowVec),
-            [oldMax, newMaxAttentionWindow](SizeType32 w)
-            {
-                TLLM_CHECK_DEBUG_WITH_INFO(w <= oldMax, "A window can't be larger than oldMax");
-                return std::min(w, newMaxAttentionWindow); // clamp vec to newMaxAttentionWindow
-            });
+        TLLM_CHECK_WITH_INFO(maxAttentionWindowVec.size() == mMaxAttentionWindowVec.size(),
+            "The size of maxAttentionWindowVec must match the size of mMaxAttentionWindowVec");
+        mMaxAttentionWindowVec = maxAttentionWindowVec;
+        mMaxAttentionWindow = *std::max_element(std::begin(mMaxAttentionWindowVec), std::end(mMaxAttentionWindowVec));
     }
 
     void setMaxSequenceLen(SizeType32 maxSequenceLen)

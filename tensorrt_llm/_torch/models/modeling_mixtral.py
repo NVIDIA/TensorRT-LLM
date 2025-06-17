@@ -25,6 +25,7 @@ class MixtralMoE(nn.Module):
         self,
         model_config: ModelConfig[PretrainedConfig],
         aux_stream: torch.cuda.Stream,
+        layer_idx: Optional[int] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -51,7 +52,8 @@ class MixtralMoE(nn.Module):
             aux_stream=aux_stream,
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
-            model_config=model_config)
+            model_config=model_config,
+            layer_idx=layer_idx)
 
     def forward(
         self,
@@ -108,7 +110,9 @@ class MixtralDecoderLayer(DecoderLayer):
 
         self.self_attn = MixtralAttention(model_config, layer_idx=layer_idx)
 
-        self.block_sparse_moe = MixtralMoE(model_config, aux_stream)
+        self.block_sparse_moe = MixtralMoE(model_config,
+                                           aux_stream,
+                                           layer_idx=layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,

@@ -257,47 +257,32 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     {
         auto cacheTransceiverConfig
             = optionalParams.cacheTransceiverConfig.value_or(executor::CacheTransceiverConfig());
-        auto const cacheSizePerToken
-            = kv_cache_manager::BaseKVCacheManager::calculateCacheSizePerToken(modelConfig, worldConfig, false);
-        //  TODO: cacheType
-        auto cacheTransPreAllocaSize = kv_cache_manager::CacheTransBufferManager::preAllocBufferSize(
-            cacheTransceiverConfig.getMaxNumTokens(), cacheSizePerToken);
-        auto const [blocksInPrimaryPool, blocksInSecondaryPool]
-            = BaseKVCacheManager::calculateMaxNumBlocks(optionalParams.kvCacheConfig, mModelConfig.getKvDataType(),
-                mModelConfig, mWorldConfig, mRuntime->getBufferManager(), 2, cacheTransPreAllocaSize);
-        TLLM_LOG_INFO("before Create KVCacheManager cacheTransPreAllocaSize:%ld", cacheTransPreAllocaSize);
+        auto cacheTransPreAllocaSize
+            = kv_cache_manager::CacheTransBufferManager::preAllocBufferSize(cacheTransceiverConfig.getMaxNumTokens());
+
+        auto const [freePrimaryMemBytes, freeSecondaryMemBytes]
+            = BaseKVCacheManager::calculateFreeMemBytes(mRuntime->getBufferManager(), optionalParams.kvCacheConfig);
+
         if (mModelConfig.useCrossAttention())
         {
             TLLM_CHECK_WITH_INFO(optionalParams.kvCacheConfig.crossKvCacheFraction.has_value(),
                 "Must set crossKvCacheFraction for encoder-decoder model");
             auto const crossKvCacheFraction = optionalParams.kvCacheConfig.crossKvCacheFraction.value();
-            auto selfCacheSizePerToken
-                = kv_cache_manager::KVCacheManager::calculateCacheSizePerToken(mModelConfig, mWorldConfig, false);
-            auto crossCacheSizePerToken
-                = kv_cache_manager::KVCacheManager::calculateCacheSizePerToken(mModelConfig, mWorldConfig, true);
-            mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig,
-                blocksInPrimaryPool * (1.0f - crossKvCacheFraction),
-                blocksInSecondaryPool * (1.0f - crossKvCacheFraction), KvCacheType::kSELF);
-            auto const numCrossBlocks
-                = (float) blocksInPrimaryPool * crossKvCacheFraction * selfCacheSizePerToken / crossCacheSizePerToken;
-            auto const numCrossSecondaryBlocks
-                = (float) blocksInSecondaryPool * crossKvCacheFraction * selfCacheSizePerToken / crossCacheSizePerToken;
-            mCrossKvCacheManager = createKvCacheManager(
-                optionalParams.kvCacheConfig, numCrossBlocks, numCrossSecondaryBlocks, KvCacheType::kCROSS);
+            mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kSELF,
+                freePrimaryMemBytes * (1.0f - crossKvCacheFraction),
+                freeSecondaryMemBytes * (1.0f - crossKvCacheFraction), cacheTransPreAllocaSize);
+            mCrossKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kCROSS,
+                freePrimaryMemBytes * crossKvCacheFraction, freeSecondaryMemBytes * crossKvCacheFraction,
+                cacheTransPreAllocaSize);
             TLLM_LOG_INFO("This is an Encoder-Decoder model, set %0.1f cross KV cache fraction based on the config.",
                 crossKvCacheFraction);
-            TLLM_LOG_INFO("Number of blocks in self KV cache primary pool: %d, in cross KV cache primary pool: %d",
-                (SizeType32) (blocksInPrimaryPool * (1.0f - crossKvCacheFraction)), (SizeType32) (numCrossBlocks));
-            TLLM_LOG_INFO("Number of blocks in self KV cache secondary pool: %d, in cross KV cache secondary pool: %d",
-                (SizeType32) (blocksInSecondaryPool * (1.0f - crossKvCacheFraction)),
-                (SizeType32) (numCrossSecondaryBlocks));
         }
         else
         {
             TLLM_CHECK_WITH_INFO(!optionalParams.kvCacheConfig.crossKvCacheFraction.has_value(),
                 "Do not set crossKvCacheFraction for decoder-only model");
-            mKvCacheManager = createKvCacheManager(
-                optionalParams.kvCacheConfig, blocksInPrimaryPool, blocksInSecondaryPool, KvCacheType::kSELF);
+            mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kSELF,
+                freePrimaryMemBytes, freeSecondaryMemBytes, cacheTransPreAllocaSize);
         }
 
         mCacheTransceiver
@@ -413,7 +398,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     }
 
     mCapacityScheduler = std::make_unique<CapacityScheduler>(getMaxNumSequences(),
-        optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), mKvCacheManager != nullptr, mNumMicroBatches > 1);
+        optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), mKvCacheManager != nullptr,
+        mWorldConfig.isPipelineParallel());
 
     mMicroBatchScheduler = std::make_unique<MicroBatchScheduler>(ctxChunkConfig, maxContextLength);
 
@@ -528,7 +514,10 @@ void TrtGptModelInflightBatching::reshapeKvTensors(OffsetTableDimensions const& 
     }
 }
 
-void TrtGptModelInflightBatching::adjustMaxAttentionWindow(SizeType32 numPrimaryBlocks, SizeType32 numTokensPerBlock)
+using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+
+std::pair<BlocksPerWindow, std::vector<SizeType32>>
+TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(BlocksPerWindow const& blocksPerWindow)
 {
     // At this point, we can only validate that the cheapest sequence in terms of kv-cache resources still fits. More
     // validation is needed on a per-request basis, once the prompt / output lengths and the actual beam width are
@@ -538,37 +527,60 @@ void TrtGptModelInflightBatching::adjustMaxAttentionWindow(SizeType32 numPrimary
         = getMaxSequenceLen() - promptLength; // This makes it the best case scenario, as context tokens are 'cheaper'
                                               // in terms of kv-cache resources on average.
     auto const sinkTokenLength = getSinkTokenLen();
-    auto const maxAttentionWindow = getMaxAttentionWindow();
     auto const maxBeamWidth = getMaxBeamWidth();
-    auto const bestCaseBlockRequirements = kv_cache_manager::KVCacheManager::calculateMaxBlockRequirements(
-        promptLength, outputLength, sinkTokenLength, maxAttentionWindow, maxBeamWidth, numTokensPerBlock);
-    if (bestCaseBlockRequirements > numPrimaryBlocks)
+    auto const tokensPerBlock = mModelConfig.getTokensPerBlock();
+    auto const& oldMaxAttentionWindowVec = getMaxAttentionWindowVec();
+    std::vector<SizeType32> newMaxAttentionWindowVec;
+    BlocksPerWindow newBlocksPerWindow;
+
+    newMaxAttentionWindowVec.reserve(oldMaxAttentionWindowVec.size());
+    for (auto const windowSize : oldMaxAttentionWindowVec)
     {
-        auto const newMaxAttentionWindow = KVCacheManager::calculateMaxAttentionWindow(
-            promptLength, outputLength, sinkTokenLength, numPrimaryBlocks, maxBeamWidth, numTokensPerBlock);
-        TLLM_LOG_WARNING(
-            "maxAttentionWindow and maxSequenceLen are too large for at least one sequence to fit in kvCache. "
-            "they are reduced to %d",
-            newMaxAttentionWindow);
-        setMaxAttentionWindow(newMaxAttentionWindow);
-        setMaxSequenceLen(newMaxAttentionWindow);
+        auto const bestCaseBlockRequirements = kv_cache_manager::KVCacheManager::calculateMaxBlockRequirements(
+            promptLength, outputLength, sinkTokenLength, windowSize, maxBeamWidth, tokensPerBlock);
+        auto const [numPrimaryBlocks, numSecondaryBlocks] = blocksPerWindow.at(windowSize);
+        if (bestCaseBlockRequirements > numPrimaryBlocks)
+        {
+            auto const newMaxAttentionWindow = KVCacheManager::calculateMaxAttentionWindow(
+                promptLength, outputLength, sinkTokenLength, numPrimaryBlocks, maxBeamWidth, tokensPerBlock);
+            newMaxAttentionWindowVec.push_back(newMaxAttentionWindow);
+            newBlocksPerWindow[newMaxAttentionWindow] = std::make_tuple(numPrimaryBlocks, numSecondaryBlocks);
+        }
+        else
+        {
+            newMaxAttentionWindowVec.push_back(windowSize);
+            newBlocksPerWindow[windowSize] = std::make_tuple(numPrimaryBlocks, numSecondaryBlocks);
+        }
+    }
+    if (newMaxAttentionWindowVec == getMaxAttentionWindowVec())
+    {
+        return {blocksPerWindow, newMaxAttentionWindowVec};
+    }
+    TLLM_LOG_WARNING("maxAttentionWindowVec too large to fit at least one sequence in kvCache. Old: %s, New: %s",
+        common::vec2str(getMaxAttentionWindowVec()).c_str(), common::vec2str(newMaxAttentionWindowVec).c_str());
+    setMaxAttentionWindowVec(newMaxAttentionWindowVec);
+    if (getMaxSequenceLen() < getMaxAttentionWindow())
+    {
+        TLLM_LOG_WARNING("maxSequenceLen is reduced to maxAttentionWindow: %d", getMaxAttentionWindow());
+        setMaxSequenceLen(getMaxAttentionWindow());
         if (getMaxInputLen() > getMaxSequenceLen() - 1)
         {
             setMaxInputLen(getMaxSequenceLen() - 1);
             TLLM_LOG_WARNING("maxInputLen is reduced to %d", getMaxInputLen());
         }
-
-        // createBuffers depends on:
-        // maxAttentionWindow; maxAttentionWindowVec; maxSequenceLen;
-        // TODO(nhaber): This is problematic, as createBuffers edits the state of trtGptModelInflightBatching, but what
-        // if there are different window values for cross+self etc. in encoder+decoder scenario...
-        createBuffers(mDecodingConfig, mAdditionalModelOutputs);
     }
+    // createBuffers depends on:
+    // maxAttentionWindow; maxAttentionWindowVec; maxSequenceLen;
+    // TODO: This is problematic, as createBuffers edits the state of trtGptModelInflightBatching, but
+    // what if there are different window values for cross+self etc. in encoder+decoder scenario...
+    createBuffers(mDecodingConfig, mAdditionalModelOutputs);
+    createDecoder(mDecodingConfig.getDecodingMode());
+    return {newBlocksPerWindow, newMaxAttentionWindowVec};
 }
 
 std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::createKvCacheManager(
-    KvCacheConfig const& kvCacheConfig, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
-    KvCacheType kvCacheType)
+    KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType, uint64_t freePrimaryMemBytes,
+    uint64_t freeSecondaryMemBytes, size_t extraCostMemory)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     bool isCrossAttention = kvCacheType == KvCacheType::kCROSS;
@@ -595,21 +607,24 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = mModelConfig.getNumKvHeadsPerLayerLocalRange(
         mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank(), isCrossAttention);
     auto numKvHeadsPerLayer = std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd);
-    auto const sizePerHead = mModelConfig.getSizePerHead();
-
-    // now we check if maxAttentionWindow is too large for at least one sequence to fit in kvCache
-    // this can happen if maxSeqLen is deduced from the model and is too large
-    // and user also either didn't provide maxAttentionWindow, which leads it to be equal to maxSeqLen
-    if (kvCacheType == KvCacheType::kSELF)
-    {
-        adjustMaxAttentionWindow(blocksInPrimaryPool, tokensPerBlock);
-    }
 
     auto maxAttentionWindowVec = getMaxAttentionWindowVec();
-
     if (kvCacheType != KvCacheType::kSELF) // TODO(nhaber): more foolproof way of initing cross-kvcache-manager
     {
         maxAttentionWindowVec = std::vector<SizeType32>{mModelConfig.getMaxEncoderLen()};
+    }
+
+    auto const numLayers = static_cast<SizeType32>(numKvHeadsPerLayer.size());
+    auto const windowSizeToLayers = KVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, numLayers);
+    auto blocksPerWindow = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, isCrossAttention, kvDtype, mModelConfig,
+        mWorldConfig, windowSizeToLayers, freePrimaryMemBytes, freeSecondaryMemBytes, extraCostMemory, 2);
+
+    // now we check if any of the window sizes is too large for at least one sequence to fit in kvCache
+    // this can happen if e.g. maxSeqLen is deduced from the model and is too large
+    // and user also didn't provide maxAttentionWindow, which leads it to be equal to maxSeqLen
+    if (kvCacheType == KvCacheType::kSELF)
+    {
+        std::tie(blocksPerWindow, maxAttentionWindowVec) = clampWindowSizesToFitAtLeastOneSequence(blocksPerWindow);
     }
 
     kv_cache_manager::TempAttentionWindowInputs tempAttentionWindowInputs;
@@ -624,10 +639,11 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
             "Thus, KV cache reuse is disabled for cross KV cache.");
     }
     auto const enableBlockReuse = kvCacheType == KvCacheType::kSELF ? kvCacheConfig.enableBlockReuse : false;
+    auto const sizePerHead = mModelConfig.getSizePerHead();
 
     auto kvCacheManager = std::make_unique<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
-        blocksInPrimaryPool, blocksInSecondaryPool, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec,
-        tempAttentionWindowInputs, kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse,
+        blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
+        kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse,
         kvCacheConfig.onboardBlocks, kvCacheType, kvCacheConfig.secondaryOffloadMinPriority,
         kvCacheConfig.eventBufferMaxSize > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.eventBufferMaxSize)
@@ -1408,8 +1424,8 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
         }
 
         mDecoder = std::make_unique<runtime::GptDecoderBatched>(mRuntime->getStreamPtr());
-        mDecoder->setup(decodingMode, getMaxNumSequences(), mOperatingBeamWidth, getMaxSequenceLen(), decoderType,
-            mModelConfig, mWorldConfig);
+        mDecoder->setup(
+            decodingMode, getMaxNumSequences(), mOperatingBeamWidth, decoderType, mModelConfig, mWorldConfig);
 
         mDecoderState = std::make_unique<runtime::decoder::DecoderState>(decoderType, mRuntime->getBufferManager());
         if (!mModelConfig.getSpeculativeDecodingMode().isNone())
@@ -1422,19 +1438,6 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
             getMaxSequenceLen(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
         mDecoderState->setupSpeculativeDecoding(mDecoderState->getSpeculativeDecodingMode(),
             mModelConfig.getMaxDecodingTokens(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
-
-        if (decodingMode.isExplicitDraftTokens())
-        {
-            mDecoderState->setupExplicitDraftTokens(mDecoderBuffers->explicitDraftTokensBuffers);
-        }
-        else if (decodingMode.isLookahead())
-        {
-            mDecoderState->setupLookahead(mDecoderBuffers->lookaheadBuffers.value());
-        }
-        else if (decodingMode.isEagle())
-        {
-            mDecoderState->setupEagle(mDecoderBuffers->eagleBuffers);
-        }
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -1592,7 +1595,7 @@ void TrtGptModelInflightBatching::prepareDistGenBufferAndDecoder(RequestVector c
         auto const bufferId = getFusedBufferId();
         auto& runtimeBuffers = *mBuffers[bufferId];
         runtimeBuffers.prepareStep(cacheTransCompleteRequests, {}, getMaxBeamWidth(), getMaxAttentionWindow(),
-            *mDecoderBuffers, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
+            *mDecoderBuffers, *mDecoderState, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
             mPeftTables[mMicroBatchId], *mRuntime, mModelConfig, mWorldConfig, getGatherGenerationLogits(),
             isTrtOverlap());
         auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
@@ -1657,7 +1660,7 @@ TrtGptModelInflightBatching::prepareBuffers(
         : std::nullopt;
 
     auto [optProfileId, inputMap, outputMap] = runtimeBuffers.prepareStep(contextRequests, generationRequests,
-        mOperatingBeamWidth, getMaxAttentionWindow(), *mDecoderBuffers, mKvCacheManager.get(),
+        mOperatingBeamWidth, getMaxAttentionWindow(), *mDecoderBuffers, *mDecoderState, mKvCacheManager.get(),
         mCrossKvCacheManager.get(), mRnnStateManager.get(), mPeftTables[bufferId], *mRuntime, mModelConfig,
         mWorldConfig, getGatherGenerationLogits(), isTrtOverlap(), allNewTokens);
 
@@ -1783,18 +1786,18 @@ void TrtGptModelInflightBatching::setupDecoderStep(
     {
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
 
-        auto [batchSlots, decoderRequests, samplingConfigs]
+        auto [batchSlots, samplingConfigs, lookaheadPrompt, lookaheadAlgoConfigs]
             = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig, mDecodingConfig, contextRequests,
                 mRuntime->getBufferManager(), logitsType, inputBuffers, *mDecoderState, mRuntime->getStream(),
-                *mDecoder->getDecoderStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.medusaBuffers);
+                *mDecoder->getDecoderStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.mMedusaBuffers);
 
-        if (!decoderRequests.empty())
+        auto const localBatchSize = batchSlots->getSize();
+        if (localBatchSize > 0)
         {
-            // Setup underlying decoder.
-            auto const localBatchSize = batchSlots->getSize();
             auto samplingConfig = SamplingConfig(samplingConfigs);
             mDecoder->getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
-                {mDecoderState->getJointDecodingOutput()}, {decoderRequests});
+                {mDecoderState->getJointDecodingOutput()}, mModelConfig.getDataType(), lookaheadPrompt,
+                lookaheadAlgoConfigs);
 
             auto const& stream = mDecoder->getDecoderStream();
             CudaEvent event{};
@@ -1996,7 +1999,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     auto& contextRuntimeBuffers = mBuffers.at(contextBufferId);
     auto const logitsIndex = (*mHandleContextLogits)(scheduledRequests.contextRequests,
         contextRuntimeBuffers->numContextLogits, contextRuntimeBuffers->logits, *mDecoderBuffers, mModelConfig,
-        mRuntime->getBufferManager(), mRuntime->getStream(), contextRuntimeBuffers->medusaBuffers);
+        mRuntime->getBufferManager(), mRuntime->getStream(), contextRuntimeBuffers->mMedusaBuffers);
 
     auto const genLogitsIndex = mCtxGenFusion ? logitsIndex : 0;
     auto const genBufferId = mCtxGenFusion ? getFusedBufferId() : getGenerationBufferId();
@@ -2539,7 +2542,7 @@ void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& sch
         mModelConfig.enableSeamlessLookaheadDecoding(mSeamlessLADMaxDraftLen);
         mDecodingConfig.enableSeamlessLookaheadDecoding();
         setupSpeculativeDecodingModule(mDecodingConfig);
-        mBuffers.at(bufferId)->lookaheadBuffers->enableLookaheadDecoding(
+        mBuffers.at(bufferId)->mLookaheadBuffers->enableLookaheadDecoding(
             getMaxBatchSize(), mModelConfig.getMaxDecodingTokens());
         mDecoderOutputBuffers.at(getFusedBufferId())
             .enableLookaheadDecoding(getMaxNumSequences(), mModelConfig.getMaxDecodingTokens());
@@ -2551,7 +2554,7 @@ void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& sch
         // Lookahead -> None
         mModelConfig.disableSeamlessLookaheadDecoding();
         mDecodingConfig.setDecodingMode(executor::DecodingMode::Auto());
-        mBuffers.at(bufferId)->lookaheadBuffers->disableLookaheadDecoding();
+        mBuffers.at(bufferId)->mLookaheadBuffers->disableLookaheadDecoding();
         mDecoderOutputBuffers.at(getFusedBufferId()).disableLookaheadDecoding(getMaxNumSequences());
         mDecoder->disableLookahead(
             scheduledRequests.generationRequests, mDecoderInputBuffers.at(getFusedBufferId()).setupBatchSlots);

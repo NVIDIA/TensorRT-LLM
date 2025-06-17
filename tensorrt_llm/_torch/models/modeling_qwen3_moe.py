@@ -6,8 +6,6 @@ from torch import nn
 from tqdm import tqdm
 from transformers import Qwen3MoeConfig
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
-
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            allgather)
@@ -15,16 +13,18 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE, MoE,
-                                 Qwen3MoeRoutingMethod,
-                                 RenormalizeMoeRoutingMethod, RoutingMethodType,
-                                 create_moe)
+                                 RenormalizeMoeRoutingMethod,
+                                 RenormalizeNaiveMoeRoutingMethod,
+                                 RoutingMethodType, create_moe)
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..speculative import SpecMetadata
 from ..utils import disable_fp4_allgather
 from .modeling_qwen3 import Qwen3Attention
-from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, duplicate_kv_weight,
-                             filter_weights, register_auto_model)
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import (DecoderModel, EagerFusionConfig,
+                             duplicate_kv_weight, filter_weights,
+                             register_auto_model)
 
 
 class Qwen3Gate(nn.Module):
@@ -63,8 +63,8 @@ class Qwen3Gate(nn.Module):
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
-        if self.routing_method_type == RoutingMethodType.Qwen3:
-            return Qwen3MoeRoutingMethod(top_k=self.top_k)
+        if self.routing_method_type == RoutingMethodType.RenormalizeNaive:
+            return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k)
         elif self.routing_method_type == RoutingMethodType.Renormalize:
             return RenormalizeMoeRoutingMethod(top_k=self.top_k)
         else:
@@ -78,7 +78,7 @@ class Qwen3MoE(nn.Module):
         self,
         model_config: ModelConfig[Qwen3MoeConfig],
         aux_stream: torch.cuda.Stream,
-        layer_idx: int,
+        layer_idx: Optional[int] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -89,11 +89,8 @@ class Qwen3MoE(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.mapping = model_config.mapping
-        self.allreduce = AllReduce(self.mapping)
-        self.enable_alltoall = Qwen3MoE.should_enable_alltoall(
-            model_config, self.top_k)
-        if self.enable_alltoall:
-            MnnvlMemory.initialize()
+        self.allreduce = AllReduce(mapping=model_config.mapping,
+                                   strategy=model_config.allreduce_strategy)
 
         self.gate = Qwen3Gate(
             hidden_size=self.hidden_dim,
@@ -114,26 +111,8 @@ class Qwen3MoE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
+            layer_idx=layer_idx,
         )
-
-    @staticmethod
-    def should_enable_alltoall(model_config: ModelConfig, top_k: int) -> bool:
-        if not model_config.mapping.enable_attention_dp:
-            return False
-
-        if model_config.mapping.tp_size == 1:
-            return False
-
-        if not MnnvlMemory.supports_mnnvl():
-            return False
-
-        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
-            return False
-
-        if model_config.mapping.moe_ep_size <= top_k:
-            return False
-
-        return True
 
     def forward(
         self,
@@ -150,7 +129,7 @@ class Qwen3MoE(nn.Module):
         if self.enable_attention_dp and self.mapping.tp_size > 1:
             # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
             # to reduce allreduce BW
-            if disable_fp4_allgather() and not self.enable_alltoall:
+            if disable_fp4_allgather() and not self.experts.enable_alltoall:
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,
@@ -202,7 +181,8 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
 
-        self.allreduce = AllReduce(self.mapping)
+        self.allreduce = AllReduce(mapping=model_config.mapping,
+                                   strategy=model_config.allreduce_strategy)
         self.next_layer_layernorm: RMSNorm = None
 
         self.fusion_config = EagerFusionConfig()
@@ -225,6 +205,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -262,6 +243,9 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)))
 
+        if spec_metadata:
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx,
+                                                      hidden_states, residual)
         if self.fusion_config.POST_MOE_FUSION:
             hidden_states, residual = self.allreduce(
                 hidden_states,
@@ -322,6 +306,7 @@ class Qwen3MoEModel(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -339,13 +324,14 @@ class Qwen3MoEModel(DecoderModel):
             hidden_states, residual = decoder_layer(position_ids=position_ids,
                                                     hidden_states=hidden_states,
                                                     attn_metadata=attn_metadata,
-                                                    residual=residual)
+                                                    residual=residual,
+                                                    spec_metadata=spec_metadata)
         return hidden_states
 
 
 @register_auto_model("Qwen3MoeForCausalLM")
-class Qwen3MoeForCausalLM(DecoderModelForCausalLM[Qwen3MoEModel,
-                                                  Qwen3MoeConfig]):
+class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
+                                                      Qwen3MoeConfig]):
 
     def __init__(
         self,
@@ -353,9 +339,7 @@ class Qwen3MoeForCausalLM(DecoderModelForCausalLM[Qwen3MoEModel,
     ):
         super().__init__(
             Qwen3MoEModel(model_config),
-            config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
-            vocab_size=model_config.pretrained_config.vocab_size,
+            model_config,
         )
 
     def load_weights(self, weights: Dict):
@@ -375,7 +359,7 @@ class Qwen3MoeForCausalLM(DecoderModelForCausalLM[Qwen3MoEModel,
             if len(module._parameters) > 0:
                 # skip load weights if tie word embeddings is enabled and layer is lm_head
                 if self.config.tie_word_embeddings and name.startswith(
-                        "lm_head"):
+                        "lm_head") or name.startswith("draft_model"):
                     continue
 
                 names = name.split(".")

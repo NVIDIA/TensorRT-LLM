@@ -20,9 +20,14 @@
 #include <nccl.h>
 #include <vector>
 
+#if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
+#else
 #include "allreduce_gemm_runner.h"
+#endif
 #include "common.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <NvInferRuntime.h>
@@ -53,8 +58,13 @@ using namespace nvinfer1;
 using namespace tensorrt_llm::mpi;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::common;
-using namespace tensorrt_llm::kernels::cutlass_kernels;
-
+using namespace tensorrt_llm::runtime::ub;
+using namespace tensorrt_llm::kernels::ub;
+#if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+namespace cutlass_kernels = ::tensorrt_llm::kernels::opened_cutlass_kernels;
+#else
+namespace cutlass_kernels = ::tensorrt_llm::kernels::cutlass_kernels;
+#endif
 ///////////////////////////
 // CLI Args
 ///////////////////////////
@@ -62,6 +72,7 @@ struct Options
 {
     bool help = false;
     bool verify = true;
+    bool use_UB = false;
     int seed = 0;
 
     // problem shape
@@ -95,6 +106,11 @@ struct Options
         if (cmd.check_cmd_line_flag("skip_check"))
         {
             verify = false;
+        }
+
+        if (cmd.check_cmd_line_flag("userbuffers"))
+        {
+            use_UB = true;
         }
 
         cmd.get_cmd_line_argument("m", M);
@@ -136,7 +152,8 @@ struct Options
                "  --alpha=<float>             GEMM alpha parameter\n"
                "  --beta=<float>              GEMM beta parameter\n"
                "  --iterations=<int>          Number of profiling iterations to perform.\n"
-               "  --skip_check                Skips verification (verification is slow for large shapes)"
+               "  --skip_check                Skips verification (verification is slow for large shapes)\n"
+               "  --userbuffers               Uses UserBuffers for AR reference benchmarking.\n"
                "\n"
                "Examples:\n"
                "\n"
@@ -175,6 +192,17 @@ struct Options
         double gb_total = bytes / kBytesPerGiB;
         return gb_total / runtime_s;
     }
+
+    double overlap_efficiency(double gemm_runtime, double AR_runtime, double gemm_AR_runtime)
+    {
+        double effective_gemm_time_fused = gemm_AR_runtime - AR_runtime;
+        double effective_comm_time_fused = gemm_AR_runtime - gemm_runtime;
+
+        double overlap_gemm_efficiency = 1 - effective_gemm_time_fused / gemm_runtime;
+        double overlap_comm_efficiency = 1 - effective_comm_time_fused / AR_runtime;
+
+        return max(overlap_gemm_efficiency, overlap_comm_efficiency);
+    }
 };
 
 struct Result
@@ -185,7 +213,7 @@ struct Result
     double eff_bw;
     double eff_AR_bw;
     bool passed;
-    GemmAllReduceImplInterface::LaunchConfig best_config;
+    cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig best_config;
 
     Result(double avg_runtime_us = 0, double avg_runtime_AR_us = 0, double tflops = 0, double eff_bw = 0,
         double eff_AR_bw = 0)
@@ -200,7 +228,7 @@ struct Result
 };
 
 ///////////////////////////
-// NCCL types
+// CUTLASS type converter
 ///////////////////////////
 template <typename CutlassType>
 struct ToType
@@ -210,6 +238,7 @@ struct ToType
 template <>
 struct ToType<cutlass::bfloat16_t>
 {
+    nvinfer1::DataType trt_value = nvinfer1::DataType::kBF16;
     ncclDataType_t nccl_value = ncclBfloat16;
     char const* str_value = "bf16";
 };
@@ -217,6 +246,7 @@ struct ToType<cutlass::bfloat16_t>
 template <>
 struct ToType<cutlass::half_t>
 {
+    nvinfer1::DataType trt_value = nvinfer1::DataType::kHALF;
     ncclDataType_t nccl_value = ncclFloat16;
     char const* str_value = "fp16";
 };
@@ -224,6 +254,7 @@ struct ToType<cutlass::half_t>
 template <>
 struct ToType<cutlass::float_e4m3_t>
 {
+    nvinfer1::DataType trt_value = nvinfer1::DataType::kFP8;
     ncclDataType_t nccl_value = ncclFloat8e4m3;
     char const* str_value = "fp8_e4m3";
 };
@@ -325,24 +356,30 @@ protected:
 
     static void SetUpTestSuite()
     {
-        // Blackwell skip FP4 GEMMs
-        if (getSMVersion() >= 100 && !IsFP4)
-        {
-            GTEST_SKIP() << "Skipping non-FP4 GEMM";
-        }
         // Hopper skip FP4 GEMMs
-        else if (getSMVersion() < 100 && IsFP4)
+        if (getSMVersion() < 100 && IsFP4)
         {
             GTEST_SKIP() << "Skipping FP4 GEMM";
+        }
+        // Allocate UB
+        ub_initialize(COMM_SESSION.getSize());
+        if (!ub_is_initialized())
+        {
+            options.use_UB = false;
+        }
+        if (options.use_UB)
+        {
+            void* p0 = ub_allocate(options.M * options.N * sizeof(ElementD)).addr;
+            ASSERT_NE(p0, nullptr);
         }
     }
 
     void SetUp() override
     {
-        using GemmTraits = GemmTypes<ElementA, ElementB, ElementC, ElementD, ElementSFA, ElementSFB, LayoutA, LayoutB,
-            LayoutC, LayoutD>;
+        using GemmTraits = cutlass_kernels::GemmTypes<ElementA, ElementB, ElementC, ElementD, ElementSFA, ElementSFB,
+            LayoutA, LayoutB, LayoutC, LayoutD>;
 
-        _gemm = std::make_shared<GemmAllReduceImplRunner<GemmTraits>>();
+        _gemm = std::make_shared<cutlass_kernels::GemmAllReduceImplRunner<GemmTraits>>();
 
         auto const M = options.M;
         auto const N = options.N;
@@ -355,11 +392,13 @@ protected:
         {
             _D_nvls.reset(M * N, options.tp_group);
             // Create workspace for max problem size
-            GemmAllReduceImplInterface::LaunchConfig launch_config = _gemm->getSupportedLaunchConfigs()[0];
-            GemmAllReduceImplInterface::ProblemArgs max_problem;
+            cutlass_kernels::GemmAllReduceImplInterface::ProblemArgs max_problem;
+            cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig launch_config
+                = _gemm->getSupportedLaunchConfigs()[0];
             max_problem.argProblemShape(M, N, K_tp, 1)
                 .argRanks(options.rank, options.tp_group)
                 .argLaunchConfig(launch_config);
+            // max_problem.argProblemShape(M, N, K_tp, 1).argRanks(options.rank, options.tp_group);
             _workspace = _gemm->getPersistentWorkspace(max_problem);
             _workspace->allocate();
         }
@@ -413,7 +452,7 @@ protected:
      */
     void bench(cudaStream_t stream)
     {
-        GemmAllReduceImplInterface::ProblemArgs args = get_arguments();
+        cutlass_kernels::GemmAllReduceImplInterface::ProblemArgs args = get_arguments();
         int const warmup = 20;
 
         auto sweep_configs = [&]()
@@ -421,7 +460,7 @@ protected:
             Result result;
             tensorrt_llm::testing::GpuTimer timer;
             float best_elapsed_us = std::numeric_limits<float>::max();
-            GemmAllReduceImplInterface::LaunchConfig best_launch_config;
+            cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig best_launch_config;
 
             auto launch_configs = _gemm->getSupportedLaunchConfigs();
             for (auto launch_config : launch_configs)
@@ -468,6 +507,9 @@ protected:
         // Benchmark each config.
         auto result = sweep_configs();
 
+        // Let clocks spin up again for fair benchmark.
+        sleep(3);
+
         // set to single device
         args.argRanks(0, {0});
         // Benchmark GEMM with no fusion.
@@ -489,10 +531,21 @@ protected:
                     timer.start(stream);
                 }
 
-                ncclComm_t comm = NcclCommunicator::instance().comm;
-                auto dtype = ToType<ElementD>{}.nccl_value;
-                TLLM_NCCL_CHECK(ncclAllReduce(
-                    _D_ref.device_data(), _D_ref.device_data(), _D_ref.size(), dtype, ncclSum, comm, stream));
+                if (options.use_UB)
+                {
+                    auto comm = ub_comm();
+                    auto dtype = ToType<ElementD>{}.trt_value;
+                    auto ub_buf = ub_get(0);
+                    EXPECT_TRUE(not ub_buf.invalid());
+                    allreduce2_userbuff_inplace_launcher(ub_buf.handle, 0, _D_ref.size(), dtype, comm, stream);
+                }
+                else
+                {
+                    ncclComm_t comm = NcclCommunicator::instance().comm;
+                    auto dtype = ToType<ElementD>{}.nccl_value;
+                    TLLM_NCCL_CHECK(ncclAllReduce(
+                        _D_ref.device_data(), _D_ref.device_data(), _D_ref.size(), dtype, ncclSum, comm, stream));
+                }
             }
             timer.stop();
             float elapsed_us = timer.elapsed_millis() * 1000.f;
@@ -524,8 +577,11 @@ protected:
             float speedup
                 = (result_no_fusion.avg_runtime_us + result_no_fusion.avg_runtime_AR_us) / result.avg_runtime_us;
             std::cout << "\n  Speedup: " << speedup << std::endl;
+            double overlap_efficiency = options.overlap_efficiency(
+                result_no_fusion.avg_runtime_us, result_no_fusion.avg_runtime_AR_us, result.avg_runtime_us);
+            std::cout << "  Overlap efficiency: " << overlap_efficiency << std::endl;
             std::cout << std::endl;
-        };
+        }
     }
 
     /**
@@ -533,7 +589,7 @@ protected:
      */
     void run(cudaStream_t stream = NULL)
     {
-        GemmAllReduceImplInterface::ProblemArgs args = get_arguments();
+        cutlass_kernels::GemmAllReduceImplInterface::ProblemArgs args = get_arguments();
 
         Result result;
         result.passed = true;
@@ -557,9 +613,9 @@ protected:
     }
 
 private:
-    GemmAllReduceImplInterface::ProblemArgs get_arguments()
+    cutlass_kernels::GemmAllReduceImplInterface::ProblemArgs get_arguments()
     {
-        GemmAllReduceImplInterface::ProblemArgs args;
+        cutlass_kernels::GemmAllReduceImplInterface::ProblemArgs args;
         args.argProblemShape(options.M, options.N, options.K_tp, 1)
             .argA(_A.device_data())
             .argB(_B.device_data())
@@ -812,8 +868,8 @@ private:
     typename std::conditional<IsInputScalingNeeded,
         cutlass::HostTensor<ElementSFB, cutlass::layout::PackedVectorLayout>, void*>::type _SFB;
     DeviceAllocationNvls<ElementD> _D_nvls;
-    std::shared_ptr<PersistentWorkspaceInterface> _workspace;
-    std::shared_ptr<GemmAllReduceImplInterface> _gemm;
+    std::shared_ptr<cutlass_kernels::PersistentWorkspaceInterface> _workspace;
+    std::shared_ptr<cutlass_kernels::GemmAllReduceImplInterface> _gemm;
 };
 
 using MyTypes = testing::Types<
@@ -823,8 +879,7 @@ using MyTypes = testing::Types<
     // fp8xfp8=fp16
     TestConfig<cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::half_t, cutlass::half_t>,
     // fp16xfp16=fp16
-    >;
-// TestConfig<cutlass::half_t, cutlass::half_t, cutlass::half_t, cutlass::half_t>>;
+    TestConfig<cutlass::half_t, cutlass::half_t, cutlass::half_t, cutlass::half_t>>;
 
 TYPED_TEST_SUITE(GemmAllReduceFixture, MyTypes);
 

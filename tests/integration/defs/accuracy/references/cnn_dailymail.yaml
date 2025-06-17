@@ -148,6 +148,11 @@ meta-llama/Llama-3.2-1B:
     accuracy: 27.259
   - extra_acc_spec: max_attention_window_size=960;beam_width=4
     accuracy: 0
+meta-llama/Llama-3.2-3B:
+  - accuracy: 25.495
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 33.629
 meta-llama/Llama-3.3-70B-Instruct:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
