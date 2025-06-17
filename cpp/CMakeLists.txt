@@ -212,6 +212,7 @@ endif()
 include_directories(
   SYSTEM
   ${CUDAToolkit_INCLUDE_DIRS}
+  ${CUDAToolkit_INCLUDE_DIRS}/cccl
   ${CUDNN_ROOT_DIR}/include
   $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
   ${3RDPARTY_DIR}/cutlass/include
