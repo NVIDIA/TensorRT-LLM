@@ -364,8 +364,11 @@ class KVCacheManager(BaseResourceManager):
     def prepare_dummy_resources(self, dummy_requests: List[LlmRequest]):
         beam_width = 1  # TODO: more than 1 beam?
         for req in dummy_requests:
-            self.impl.add_sequence(req.py_request_id, req.py_prompt_len + 1,
-                                   beam_width, req)
+            token_num = req.py_prompt_len
+            if req.state == LlmRequestState.GENERATION_IN_PROGRESS:
+                token_num += 1
+            self.impl.add_sequence(req.py_request_id, token_num, beam_width,
+                                   req)
             for _ in range(self.num_extra_kv_tokens):
                 self.impl.add_token(req.py_request_id)
             for _ in range(len(req.py_draft_tokens)):
