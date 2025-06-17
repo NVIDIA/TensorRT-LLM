@@ -51,7 +51,7 @@ l0_a10:
       - '*a10*'
       linux_distribution_name: ubuntu*
     terms:
-      stage: post_merge
+      stage: pre_merge
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
