@@ -2,7 +2,7 @@ import enum
 import math
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -21,9 +21,6 @@ if ENABLE_MULTI_DEVICE:
     from mpi4py import MPI
 
     from tensorrt_llm._utils import mpi_comm
-
-if TYPE_CHECKING:
-    from ..speculative.interface import SpecConfig
 
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
 KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
@@ -75,7 +72,7 @@ class BaseResourceManager(ABC):
 def get_pp_layers(
     num_layers: int,
     mapping: Mapping,
-    spec_config: Optional["SpecConfig"] = None,
+    spec_config: Optional["DecodingBaseConfig"] = None,
     layer_mask: Optional[List[bool]] = None,
 ) -> Tuple[List[int], int]:
     from ..speculative.utils import get_num_spec_layers
@@ -119,7 +116,7 @@ class KVCacheManager(BaseResourceManager):
         max_batch_size: int,
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
-        spec_config: Optional["SpecConfig"] = None,
+        spec_config: Optional["DecodingBaseConfig"] = None,
         layer_mask: Optional[List[bool]] = None,
     ) -> None:
         self.mapping = mapping
@@ -168,7 +165,10 @@ class KVCacheManager(BaseResourceManager):
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         # Some speculative decoding methods need to use different kv lengths for the
         # draft/target layers. Add extra tokens to haddle this issue.
-        self.num_extra_kv_tokens = 0 if spec_config is None else spec_config.num_extra_kv_tokens
+        # Import here to avoid circular imports
+        from ..speculative.utils import get_num_extra_kv_tokens
+        self.num_extra_kv_tokens = 0 if spec_config is None else get_num_extra_kv_tokens(
+            spec_config)
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
 
         if kv_cache_config.max_attention_window is None:
@@ -670,7 +670,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         max_batch_size: int,
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
-        spec_config: Optional["SpecConfig"] = None,
+        spec_config: Optional["DecodingBaseConfig"] = None,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
