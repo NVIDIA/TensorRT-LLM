@@ -22,6 +22,7 @@
 #include <ATen/ATen.h>
 #include <pybind11/functional.h>
 #include <pybind11/operators.h>
+#include <pybind11/pytypes.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
 #include <torch/extension.h>
@@ -96,5 +97,5 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
         .def(py::init<tb::kv_cache_manager::BaseKVCacheManager*, std::optional<size_t>>(), py::arg("cache_manager"),
             py::arg("max_num_tokens") = std::nullopt)
         .def_static("pre_alloc_buffer_size", &tb::kv_cache_manager::CacheTransBufferManager::preAllocBufferSize,
-            py::arg("max_num_tokens") = std::nullopt);
+            py::arg("cache_size_bytes_per_token"), py::arg("cache_transceiver_config") = py::none());
 }

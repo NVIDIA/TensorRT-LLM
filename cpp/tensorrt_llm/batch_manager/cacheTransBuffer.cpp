@@ -228,13 +228,23 @@ CacheTransBufferManager::CacheTransBufferManager(
     allocateBuffer();
 }
 
-size_t CacheTransBufferManager::preAllocBufferSize(std::optional<size_t> maxNumTokens)
+size_t CacheTransBufferManager::preAllocBufferSize(
+    size_t cacheSizeBytesPerToken, std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig)
 {
+    if (!cacheTransceiverConfig.has_value())
+    {
+        return 0;
+    }
+    if (!cacheTransceiverConfig->getEnableCacheTransceiver())
+    {
+        return 0;
+    }
+    auto maxNumTokens = cacheTransceiverConfig->getMaxNumTokens();
 
     size_t TransferBufferSize = common::getEnvMemSizeForKVCacheTransferBuffer();
     if (maxNumTokens.has_value())
     {
-        TransferBufferSize = maxNumTokens.value();
+        TransferBufferSize = maxNumTokens.value() * cacheSizeBytesPerToken;
     }
     bool useFabricMemory = FabricMemory::supportFbaricMemory()
         && (!(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer()));
