@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@emma/add_open_driver', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -643,7 +643,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def hasMultipleGPUs = (gpuCount > 1)
         def memorySize = "${TESTER_MEMORY}"
         def storageSize = "300Gi"
-        def driverVersion = type.contains("rtx-pro-6000") ? Constants.DEFAULT_OPEN_NVIDIA_DRIVER_VERSION : Constants.DEFAULT_NVIDIA_DRIVER_VERSION
+        def driverVersion = type.contains("rtx-pro-6000") ? Constants.DEFAULT_NVIDIA_OPEN_DRIVER_VERSION : Constants.DEFAULT_NVIDIA_DRIVER_VERSION
         def cpuCount = "${TESTER_CORES}"
 
         // Multi-GPU only supports DGX-H100 and DGX-H200 due to the hardware stability.
