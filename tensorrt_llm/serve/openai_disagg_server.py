@@ -47,8 +47,8 @@ class OpenAIDisaggServer:
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
         self.metadata_server = create_metadata_server(metadata_server_cfg)
-        self.ctx_router = create_router(ctx_router_config, ctx_servers, self.metadata_server)
-        self.gen_router = create_router(gen_router_config, gen_servers, self.metadata_server)
+        self.ctx_router = create_router(ctx_router_config, ctx_servers, metadata_server_cfg, self.metadata_server)
+        self.gen_router = create_router(gen_router_config, gen_servers, metadata_server_cfg, self.metadata_server)
         self.conditional_disagg_config = conditional_disagg_config
 
 

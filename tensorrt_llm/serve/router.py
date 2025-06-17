@@ -8,7 +8,8 @@ from transformers import AutoTokenizer
 
 from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
                                                           BlockKeyHasher)
-from tensorrt_llm.llmapi.disagg_utils import RouterConfig, ServerRole
+from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
+                                              RouterConfig, ServerRole)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
@@ -147,6 +148,7 @@ class Router(ABC):
     def __init__(self,
                  server_role: ServerRole,
                  servers: List[str] = None,
+                 metadata_server_cfg: MetadataServerConfig = None,
                  metadata_server: JsonDictionary = None):
         self._servers = servers or []
         self._metadata_server = metadata_server
@@ -154,7 +156,7 @@ class Router(ABC):
         self._lock = asyncio.Lock()
         self._monitor_task = None
         self._session = None
-        self._health_check_timeout = 5.0  # Default timeout in seconds
+        self._health_check_timeout = metadata_server_cfg.health_check_timeout if metadata_server_cfg else 5.0  # Default timeout in seconds
 
     def _on_servers_updated(self, old_servers, new_servers):
         """Called when the server list changes. Override in subclasses to handle index resets.
@@ -233,20 +235,16 @@ class Router(ABC):
                     # Update server list
                     async with self._lock:
                         if final_servers != self._servers:
-                            num_old_servers = len(self._servers)
                             old_servers = self._servers.copy()
                             self._servers = final_servers
-                            num_new_servers = len(self._servers)
 
                             # Call handler for server list changes
                             self._on_servers_updated(old_servers, self._servers)
 
-                            logger.info(
-                                f"Updated {self._server_role} server list: {num_old_servers} -> {num_new_servers} servers"
-                            )
-                            if logger.level == "debug" and self._servers:
-                                for server in self._servers:
-                                    logger.debug(f"  - {server}")
+                            # Log removed servers
+                            for server in old_servers:
+                                if server not in final_servers:
+                                    logger.info(f"Server {server} is removed")
                         else:
                             logger.debug(
                                 f"No change in {self._server_role} server list: {len(self._servers)} servers"
@@ -312,25 +310,12 @@ class Router(ABC):
                             server_metadata, dict) and 'url' in server_metadata:
                         server_key_map[key] = server_metadata['url']
 
-                        # Check if metadata includes health check timeout
-                        if 'health_check_timeout' in server_metadata:
-                            try:
-                                self._health_check_timeout = float(
-                                    server_metadata['health_check_timeout'])
-                                logger.debug(
-                                    f"Using health check timeout: {self._health_check_timeout}s"
-                                )
-                            except (ValueError, TypeError):
-                                logger.warning(
-                                    f"Invalid health_check_timeout value: {server_metadata['health_check_timeout']}"
-                                )
-
             if server_key_map:
                 logger.info(
                     f"Using {len(server_key_map)} servers from metadata service"
                 )
             else:
-                logger.warning("No servers found in metadata service")
+                raise ValueError("No servers found in metadata service")
 
         except Exception as e:
             logger.error(f"Error fetching servers from metadata service: {e}")
@@ -629,6 +614,7 @@ class KvCacheAwareRouter(Router):
 
 def create_router(router_config: Optional[RouterConfig],
                   servers: List[str],
+                  metadata_server_cfg: MetadataServerConfig = None,
                   metadata_server: JsonDictionary = None) -> Router:
     """
     Factory function to create different types of router instances.
