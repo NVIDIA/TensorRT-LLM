@@ -2738,6 +2738,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     sync_check_cuda_error(stream);
 }
 
+
+
+
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
 void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::runMoe(
     void const* input_activations_void, void const* input_sf_void, int const* token_selected_experts,

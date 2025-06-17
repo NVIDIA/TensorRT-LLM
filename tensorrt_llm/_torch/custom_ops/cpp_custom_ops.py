@@ -384,3 +384,6 @@ def _register_fake():
         pad_slot_id: int,
     ) -> None:
         pass
+
+def fp8_quantize_1x128(input: torch.Tensor):
+    return torch.ops.trtllm.fp8_quantize_1x128(input)

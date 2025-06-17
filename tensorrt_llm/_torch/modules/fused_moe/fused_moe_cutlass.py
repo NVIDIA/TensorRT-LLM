@@ -22,6 +22,105 @@ from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            UnquantizedFusedMoEMethod, WInt4AFP8FusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
+from ..gated_mlp import swiglu
+# from tensorrt_llm._torch.custom_ops.cute_dsl_ops import cute_dsl_fp8_group_blockwise_gemm_ref
+
+import math
+
+def cute_dsl_fp8_group_blockwise_gemm_ref(a: torch.Tensor, b: torch.Tensor, a_sf: torch.Tensor, b_sf: torch.Tensor, group_m_list: torch.Tensor, use_offset_array: bool = False) -> torch.Tensor:
+    m, k = a.shape[0], a.shape[1]
+    l, n, k = b.shape[0], b.shape[1], b.shape[2]
+    num_group, w_n, w_k = b_sf.shape[0], b_sf.shape[1], b_sf.shape[2]
+    # print(f"limin: m = {m}, k = {k}, l = {l}, n = {n}, num_group = {num_group}, w_n = {w_n}, w_k = {w_k}")
+    # c = torch.empty(*(m, n), dtype=torch.bfloat16, device="cuda")
+
+    # TODO: view(int8) will cause error.
+    a_tmp = a.as_strided((m, k, 1), (k, 1, m * k))
+    b_tmp = b.permute(1, 2, 0)
+    # c_tmp = c.as_strided((m, n, 1), (n, 1, m * n))
+    # print(f"limin: a_tmp.shape = {a_tmp.shape}, a_tmp.stride = {a_tmp.stride()}")
+    # print(f"limin: b_tmp.shape = {b_tmp.shape}, b_tmp.stride = {b_tmp.stride()}")
+    # print(f"limin: c_tmp.shape = {c_tmp.shape}, c_tmp.stride = {c_tmp.stride()}")
+
+    m_padded = (m + 3) // 4 * 4
+    input_scale_tmp = a_sf[0:m_padded * w_k]
+    # print(f"limin: 0, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+    input_scale_tmp = input_scale_tmp.reshape(-1, m_padded)
+    # print(f"limin: 1, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+    input_scale_tmp = input_scale_tmp[:w_k, :m].contiguous().permute(1, 0)
+    # print(f"limin: 2, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+    input_scale_tmp = input_scale_tmp.as_strided((m, w_k, 1), (1, m, m * w_k))
+    # print(f"limin: input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+
+    # TOOD: contiguous
+    weight_scale_tmp = b_sf.permute(1, 2, 0)
+    # print(f"limin: weight_scale_tmp.shape = {weight_scale_tmp.shape}, weight_scale_tmp.stride = {weight_scale_tmp.stride()}")
+
+    # print("limin: input = ", a_tmp)
+    # print("limin: weight = ", b_tmp)
+    # print("limin: input_scale = ", input_scale_tmp)
+    # print("limin: weight_scale = ", weight_scale_tmp)
+
+    # print("limin: input negative_numbers = ",  torch.sum(a_tmp < 0).item())
+    # print("limin: weight negative_numbers = ",  torch.sum(b_tmp < 0).item())
+    # print("limin: input_scale negative_numbers = ",  torch.sum(input_scale_tmp < 0).item())
+    # print("limin: weight_scale negative_numbers = ",  torch.sum(weight_scale_tmp < 0).item())
+    # update
+    def pad_and_multiply(scale, tensor):
+        cm, ck, _ = scale.shape
+        m, k, _ = tensor.shape
+        IsGroupWise = False
+        IsBlockWise = False
+        if ck == math.ceil(k / 128):
+            IsGroupWise = True
+        if cm == math.ceil(m / 128):
+            IsBlockWise = True
+        if not IsBlockWise and not IsGroupWise:
+            raise ValueError("Only support granularity = 128")
+
+        k_idx = torch.arange(k, device=scale.device)
+        if IsGroupWise:
+            k_idx = k_idx // 128
+        m_idx = torch.arange(m, device=scale.device)
+        if IsBlockWise:
+            m_idx = m_idx // 128
+        expanded_scale = scale[m_idx[:, None], k_idx, :]
+
+        result = expanded_scale * tensor
+
+        return result
+
+    updated_a = pad_and_multiply(input_scale_tmp, a_tmp.to(torch.float32))
+    updated_b = pad_and_multiply(weight_scale_tmp, b_tmp.to(torch.float32))
+
+    # print(f"limin: updated_a = {updated_a}")
+    # print(f"limin: updated_b = {updated_b}")
+
+    ref = torch.zeros((m, n), device="cuda", dtype=torch.float32)
+    if not use_offset_array:
+        start = 0
+        for i, group_m in enumerate(group_m_list):
+            end = start + group_m
+            ref[start:end, :] = torch.einsum(
+                "mk,nk->mn", updated_a[start:end, :, 0], updated_b[:, :, i]
+            )
+            start = end
+    else:
+        # print(f"limin: group_m_list = {group_m_list}")
+        # [0, 2, 5, 6]
+        len_group_m_list = group_m_list.shape[0]
+        for i in range(len_group_m_list - 1):
+            start = group_m_list[i]
+            end = group_m_list[i+1]
+            # assert start <= end, f"Invalid group boundaries: start={start} > end={end}"
+            ref[start:end, :] = torch.einsum(
+                "mk,nk->mn", updated_a[start:end, :, 0], updated_b[:, :, i]
+            )
+
+    ref = ref.to(torch.bfloat16)
+    # print(f"limin: ref.shape = {ref.shape}, ref.stride = {ref.stride()}, ref = {ref}")
+    return ref
+
 
 # The type of alltoall method
 class AlltoallMethodType(IntEnum):
@@ -97,6 +196,7 @@ class CutlassFusedMoE(MoE):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        use_optimized_permute_and_finalize_scale: bool = False,
     ):
 
         super().__init__(
@@ -225,6 +325,8 @@ class CutlassFusedMoE(MoE):
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
+
+        self.use_optimized_permute_and_finalize_scale = use_optimized_permute_and_finalize_scale
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -576,40 +678,157 @@ class CutlassFusedMoE(MoE):
                         (1, token_final_scales.shape[1]),
                         dtype=token_final_scales.dtype,
                         device=token_final_scales.device)
+        
+        if self.use_optimized_permute_and_finalize_scale:
+            # print(f"limin: token_selected_slots = {token_selected_slots}")
+            # print(f"limin: token_final_scales = {token_final_scales}")
+            # print(f"x is contiguous: {x.is_contiguous()}")
+            # print(f"token_selected_slots is contiguous: {token_selected_slots.is_contiguous()}")
+            # print(f"token_final_scales is contiguous: {token_final_scales.is_contiguous()}")
+            # print(f"CUDA memory allocated: {torch.cuda.memory_allocated()}")
+            # print(f"CUDA memory cached: {torch.cuda.memory_reserved()}")
+            # torch.cuda.synchronize()
+            (
+                unpermuted_token_selected_experts_tensor, 
+                unpermuted_source_token_ids_tensor, 
+                permuted_source_token_ids_tensor, 
+                permuted_token_selected_experts_tensor, 
+                permuted_data_tensor, 
+                expert_first_token_offset_tensor, 
+                permuted_token_final_scales_tensor, 
+                src_to_dest_map_tensor
+            ) = torch.ops.trtllm.moe_permute_op(
+                x, 
+                token_selected_slots, 
+                token_final_scales, 
+                None, #w3_w1_weight.view(weight_dtype), 
+                None, #w2_weight.view(weight_dtype),
+                None, #quant_scales, 
+                input_sf=x_sf, 
+                num_experts_on_rank=self.expert_size_per_partition,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                ep_size=ep_size, 
+                ep_rank=ep_rank, 
+                cluster_size=cluster_size, 
+                cluster_rank=cluster_rank, 
+                min_latency_mode=cutlass_min_latency_mode, 
+                use_fp8_block_scaling=use_deepseek_fp8_block_scale
+            )
+            # print(f"limin: unpermuted_token_selected_experts_tensor = {unpermuted_token_selected_experts_tensor.shape}")
+            # print(f"limin: x.shape = {x.shape}")
+            # print(f"limin: token_final_scales.shape = {token_final_scales.shape}")
+            # print(f"limin: permuted_source_token_ids_tensor = {permuted_source_token_ids_tensor.shape}")
+            # print(f"limin: expert_first_token_offset_tensor = {expert_first_token_offset_tensor.shape}")
+            # (
+            #     permuted_data_tensor, 
+            #     permuted_token_final_scales_tensor, 
+            #     src_to_dest_map_tensor
+            # ) = torch.ops.trtllm.moe_expand_op(
+            #     x, 
+            #     token_final_scales, 
+            #     permuted_source_token_ids_tensor, 
+            #     x.shape[0],
+            #     expert_first_token_offset_tensor,
+            #     x.shape[1],
+            #     self.routing_method.top_k,
+            #     self.expert_size_per_partition,
+            #     self.tp_size,
+            #     self.tp_rank,
+            #     ep_size,
+            #     ep_rank,
+            #     use_fp8_block_scaling
+            # )
+            # # torch.cuda.synchronize()
+            # print(f"limin: unpermuted_token_selected_experts_tensor = {unpermuted_token_selected_experts_tensor.shape}")
+            # # print(f"limin: unpermuted_token_selected_experts_tensor = {unpermuted_token_selected_experts_tensor}")
+            # print(f"limin: unpermuted_source_token_ids_tensor = {unpermuted_source_token_ids_tensor.shape}")
+            # print(f"limin: permuted_source_token_ids_tensor = {permuted_source_token_ids_tensor.shape}")
+            # print(f"limin: permuted_token_selected_experts_tensor = {permuted_token_selected_experts_tensor.shape}")
+            # print(f"limin: permuted_token_final_scales_tensor = {permuted_token_final_scales_tensor.shape}")
+            # print(f"limin: src_to_dest_map_tensor = {src_to_dest_map_tensor.shape}")
+            # print(f"limin: permuted_data_tensor = {permuted_data_tensor.shape}")
+            # print(f"limin: expert_first_token_offset_tensor = {expert_first_token_offset_tensor.shape}")
 
-        final_hidden_states = torch.ops.trtllm.fused_moe(
-            x,
-            token_selected_slots,
-            token_final_scales,
-            w3_w1_weight.view(weight_dtype),
-            w2_weight.view(weight_dtype),
-            output_dtype,
-            quant_scales=quant_scales,
-            input_sf=x_sf,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            cluster_size=cluster_size,
-            cluster_rank=cluster_rank,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4a8_group_scaling=use_w4a8_group_scaling,
-            min_latency_mode=cutlass_min_latency_mode,
-            tune_max_num_tokens=self.tune_max_num_tokens,
-        )
-
-        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-        ) and is_last_call:
-            self.layer_load_balancer.set_cpu_stage()
-
-        if cutlass_min_latency_mode:
-            assert not self.reduce_results
-            assert not self.enable_alltoall
+            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(permuted_data_tensor)
+            # print(f"limin: act_input_fp8 = {act_input_fp8.shape}, {act_input_fp8}")
+            # print(f"limin: act_input_sf = {act_input_sf.shape}, {act_input_sf}")
+            # print(f"limin: w3_w1_weight = {w3_w1_weight.shape}, {w3_w1_weight}")
+            # print(f"limin: quant_scales[0] = {quant_scales[0].shape}, {quant_scales[0]}")
+            h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
+                a=act_input_fp8,
+                b=w3_w1_weight.view(weight_dtype),
+                a_sf=act_input_sf,
+                b_sf=quant_scales[0],
+                group_m_list=expert_first_token_offset_tensor,
+                use_offset_array=True,
+            )
+            # print(f"limin: group_gemm_1, output shape = {h1.shape}, {h1}")
+            h2 = swiglu(h1)
+            # print(f"limin: swiglu, output shape = {h2.shape}, {h2}")
+            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(h2)
+            # print(f"limin: w2_weight = {w2_weight.shape}, {w2_weight}")
+            # print(f"limin: quant_scales[1] = {quant_scales[1].shape}, {quant_scales[1]}")
+            h3 = cute_dsl_fp8_group_blockwise_gemm_ref(
+                a=act_input_fp8,
+                b=w2_weight.view(weight_dtype),
+                a_sf=act_input_sf,
+                b_sf=quant_scales[1],
+                group_m_list=expert_first_token_offset_tensor,
+                use_offset_array=True,
+            )
+            # print(f"limin: group_gemm_2, output shape = {h3.shape}, {h3}")
+            final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
+                h3,
+                None,
+                token_final_scales,
+                src_to_dest_map_tensor,
+                unpermuted_token_selected_experts_tensor,
+                expert_first_token_offset_tensor,
+                x.shape[0], # num_rows
+                x.shape[1], # hidden_size
+                self.routing_method.top_k,
+                self.expert_size_per_partition, # num_experts_per_node
+                self.tp_size,
+                self.tp_rank,
+                ep_size,
+                ep_rank,
+            )
+            # print(f"limin: finalize_scale_op, output shape = {final_hidden_states.shape}, {final_hidden_states}")
         else:
-            # Custom op requires all inputs are in the same type.
-            # Only in cutlass_min_latency_mode, the output is a list of tensors.
-            # Otherwise, the output should be unpacked as a single tensor.
-            final_hidden_states = final_hidden_states[0]
+            final_hidden_states = torch.ops.trtllm.fused_moe(
+                x,
+                token_selected_slots,
+                token_final_scales,
+                w3_w1_weight.view(weight_dtype),
+                w2_weight.view(weight_dtype),
+                output_dtype,
+                quant_scales=quant_scales,
+                input_sf=x_sf,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                cluster_size=cluster_size,
+                cluster_rank=cluster_rank,
+                use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+                use_w4a8_group_scaling=use_w4a8_group_scaling,
+                min_latency_mode=cutlass_min_latency_mode,
+                tune_max_num_tokens=self.tune_max_num_tokens,
+            )
+
+            if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
+            ) and is_last_call:
+                self.layer_load_balancer.set_cpu_stage()
+
+            if cutlass_min_latency_mode:
+                assert not self.reduce_results
+                assert not self.enable_alltoall
+            else:
+                # Custom op requires all inputs are in the same type.
+                # Only in cutlass_min_latency_mode, the output is a list of tensors.
+                # Otherwise, the output should be unpacked as a single tensor.
+                final_hidden_states = final_hidden_states[0]
 
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
