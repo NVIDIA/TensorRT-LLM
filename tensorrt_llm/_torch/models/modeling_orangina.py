@@ -112,18 +112,21 @@ class AttentionBlock(Attention):
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
+        x = hidden_states
         hidden_states = self.norm(hidden_states)
 
         attention_window_size = self.sliding_window
-        return super().forward(position_ids=position_ids,
-                               hidden_states=hidden_states,
-                               attn_metadata=attn_metadata,
-                               attention_mask=attention_mask,
-                               all_reduce_params=all_reduce_params,
-                               lora_params=lora_params,
-                               attention_window_size=attention_window_size,
-                               attention_sinks=self.sinks.data,
-                               **kwargs)
+        attn_output = super().forward(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            attention_mask=attention_mask,
+            all_reduce_params=all_reduce_params,
+            lora_params=lora_params,
+            attention_window_size=attention_window_size,
+            attention_sinks=self.sinks.data,
+            **kwargs)
+        return attn_output + x
 
     def load_weights(self, weights: Dict):
         sinks = weights[0]['sinks'][self.num_heads *
@@ -187,8 +190,6 @@ class MLPBlock(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         t = self.norm(x)
         g = self.gate(t)
-
-        # TODO: add bias and customized swiglu to MoE kernels
         t = self.experts(x=t, router_logits=g)
         return x + t
 
