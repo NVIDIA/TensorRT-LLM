@@ -67,6 +67,7 @@ void invokeTopkBeamSearch(T const* logProbs, T const* bias, void* workspace, Bea
         case 2:
         case 4: CASE_K(4)
         case 8: CASE_K(8)
+        case 12: CASE_K(8)
         }
     }
 }
