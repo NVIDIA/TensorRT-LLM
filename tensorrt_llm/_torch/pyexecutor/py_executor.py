@@ -2044,10 +2044,8 @@ class PyExecutor:
             request.draft_tokens = request.py_draft_tokens
             request.decoding_iter = request.py_decoding_iter
 
-            create_responses = self.model_engine.iter_counter % self.stream_interval == 0 or request.is_finished
             request_done = False
-
-            if create_responses:
+            if self.model_engine.iter_counter % self.stream_interval == 0 or request.is_finished:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = response.result.is_final
@@ -2061,7 +2059,7 @@ class PyExecutor:
             else:
                 new_active_requests.append(request)
         self.active_requests = new_active_requests
-        if create_responses:
+        if len(new_responses) > 0:
             self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
