@@ -1301,6 +1301,7 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     }
 
     static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
     int64_t const blocks = smCount * 8;
     int64_t const threads = EXPAND_THREADS_PER_BLOCK;
     auto func = expandInputRowsKernel<InputActivationsType, ExpandedActivationsType>;
@@ -1529,6 +1530,7 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
     {
         // If all-to-all comm is enabled, finalizeMoeRouting doesn't need to fill the invalid output tokens with zeros.
         static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+        // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
         int64_t const blocks = smCount * 8;
         int64_t const threads = FINALIZE_THREADS_PER_BLOCK;
         config.gridDim = blocks;
@@ -1729,6 +1731,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, cudaStream_t stream)
 {
     static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
     int64_t const blocks = smCount * 8;
     int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
 

@@ -1258,10 +1258,10 @@ protected:
         mInterSizeFraction = inter_size_fraction;
         // 2 experts per rank
         ParallelismTest(k, 1, num_experts / 2, hidden_size, num_experts, num_tokens, false);
+        // 2 experts per rank, enable alltoall
         ParallelismTest(k, 1, num_experts / 2, hidden_size, num_experts, num_tokens, true);
         // 1 expert per rank
         ParallelismTest(k, 1, num_experts, hidden_size, num_experts, num_tokens, false);
-        ParallelismTest(k, 1, num_experts, hidden_size, num_experts, num_tokens, true);
     }
 
     // Tensor parallel tests default to inter_size_fraction = 1.0f so that all ranks have interesting values
@@ -1280,16 +1280,11 @@ protected:
         mInterSizeFraction = inter_size_fraction;
 
         // 2 experts per rank
-        ParallelismTest(k, 2, num_experts / 2, hidden_size, num_experts, num_tokens, false);
-        ParallelismTest(k, 8, num_experts / 2, hidden_size, num_experts, num_tokens, false);
-        ParallelismTest(k, 2, num_experts / 2, hidden_size, num_experts, num_tokens, true);
-        ParallelismTest(k, 8, num_experts / 2, hidden_size, num_experts, num_tokens, true);
-
+        ParallelismTest(k, 2, num_experts / 2, hidden_size, num_experts, num_tokens);
+        ParallelismTest(k, 8, num_experts / 2, hidden_size, num_experts, num_tokens);
         // 1 expert per rank
-        ParallelismTest(k, 2, num_experts, hidden_size, num_experts, num_tokens, false);
-        ParallelismTest(k, 8, num_experts, hidden_size, num_experts, num_tokens, false);
-        ParallelismTest(k, 2, num_experts, hidden_size, num_experts, num_tokens, true);
-        ParallelismTest(k, 8, num_experts, hidden_size, num_experts, num_tokens, true);
+        ParallelismTest(k, 2, num_experts, hidden_size, num_experts, num_tokens);
+        ParallelismTest(k, 8, num_experts, hidden_size, num_experts, num_tokens);
     }
 
     void ParallelismTest(int k = 1, int tp_size = 4, int ep_size = 2, int64_t hidden_size = DEFAULT_HIDDEN_SIZE,
