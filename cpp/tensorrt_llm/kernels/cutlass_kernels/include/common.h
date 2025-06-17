@@ -28,7 +28,8 @@ enum class ActivationType
     Swiglu,
     Geglu,
     Identity,
-    InvalidType
+    InvalidType,
+    Test
 };
 
 } // namespace tensorrt_llm::kernels::cutlass_kernels
