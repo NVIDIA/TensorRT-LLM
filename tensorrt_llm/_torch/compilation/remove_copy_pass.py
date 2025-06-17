@@ -55,6 +55,10 @@ def remove_copy_for_mutates_args(graph: Graph):
                 },
                 is_v2=node.target == auto_functionalized_v2,
             )
+        if inplace_func == torch.ops.trtllm.attention_inplace.default:
+            remove_functionalize_inner(node, {1: "output", 2: "output_sf"})
+        if inplace_func == torch.ops.trtllm.mla_custom_op_inplace.default:
+            remove_functionalize_inner(node, {1: "output"})
 
     for node in nodes_to_remove:
         graph.erase_node(node)
