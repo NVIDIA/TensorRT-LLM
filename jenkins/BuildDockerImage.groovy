@@ -193,7 +193,7 @@ def buildImage(config, imageKeyToTag)
     def postTag = config.postTag
     def dependent = config.dependent
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
-    def dockerImageStage = config.dockerImageStage
+    def dockerfileStage = config.dockerfileStage
 
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
 
