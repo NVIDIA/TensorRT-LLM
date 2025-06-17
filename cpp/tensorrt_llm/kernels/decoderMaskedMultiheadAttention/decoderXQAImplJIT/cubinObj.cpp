@@ -74,8 +74,8 @@ CubinObj::CubinObj(CubinObj&& other)
     {
         this->mInitialized = true;
         this->mDriver = std::move(other.mDriver);
-        this->mModule = other.mModule;
-        this->mFunction = other.mFunction;
+        this->mLibrary = other.mLibrary;
+        this->mKernel = other.mKernel;
         this->mSharedMemBytes = other.mSharedMemBytes;
         this->mKernelType = other.mKernelType;
 
@@ -99,8 +99,8 @@ CubinObj& CubinObj::operator=(CubinObj&& other)
     {
         this->mInitialized = true;
         this->mDriver = std::move(other.mDriver);
-        this->mModule = other.mModule;
-        this->mFunction = other.mFunction;
+        this->mLibrary = other.mLibrary;
+        this->mKernel = other.mKernel;
         this->mSharedMemBytes = other.mSharedMemBytes;
         this->mKernelType = other.mKernelType;
 
@@ -140,7 +140,7 @@ void CubinObj::launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kern
     CUlaunchConfig const cfg{
         gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, mSharedMemBytes, hStream, &pdlAttr, 1};
 
-    TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&cfg, mFunction, kernelParams, /*extra=*/nullptr));
+    TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&cfg, kernel(), kernelParams, /*extra=*/nullptr));
 }
 
 void CubinObj::initialize()
@@ -148,24 +148,27 @@ void CubinObj::initialize()
     if (!mInitialized)
     {
         mDriver = tensorrt_llm::common::CUDADriverWrapper::getInstance();
-        mModule = nullptr;
-        TLLM_CU_CHECK(mDriver->cuModuleLoadData(&mModule, mContent.c_str()));
-        TLLM_CHECK(mModule != nullptr);
-        mFunction = nullptr;
-        TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&mFunction, mModule, kFuncName));
-        TLLM_CHECK(mFunction != nullptr);
+        mLibrary = nullptr;
+        TLLM_CU_CHECK(
+            mDriver->cuLibraryLoadData(&mLibrary, mContent.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+        TLLM_CHECK(mLibrary != nullptr);
+        mKernel = nullptr;
+        TLLM_CU_CHECK(mDriver->cuLibraryGetKernel(&mKernel, mLibrary, kFuncName));
+        TLLM_CHECK(mKernel != nullptr);
 
         // Populate mSharedMemBytes and mKernelType.
-        mSharedMemBytes = getGlobalVar<uint32_t>(mDriver, mModule, kSmemName, true).value();
-        mKernelType = getGlobalVar<XQAKernelType>(mDriver, mModule, kKernelTypeName, true).value();
+        mSharedMemBytes = getGlobalVar<uint32_t>(mDriver, mLibrary, kSmemName, true).value();
+        mKernelType = getGlobalVar<XQAKernelType>(mDriver, mLibrary, kKernelTypeName, true).value();
 
         TLLM_CHECK(mSharedMemBytes > 0);
 
         /* Set 46KB threshold here because we have to take static/driver shared memory into consideration. */
         if (mSharedMemBytes >= 46 * 1024)
         {
-            TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(
-                mFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, mSharedMemBytes));
+            CUdevice device;
+            mDriver->cuCtxGetDevice(&device);
+            TLLM_CU_CHECK(mDriver->cuKernelSetAttribute(
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, mSharedMemBytes, mKernel, device));
         }
 
         mInitialized = true;
@@ -176,7 +179,7 @@ CubinObj::~CubinObj()
 {
     if (mInitialized)
     {
-        TLLM_CU_CHECK(mDriver->cuModuleUnload(mModule));
+        TLLM_CU_CHECK(mDriver->cuLibraryUnload(mLibrary));
         mInitialized = false;
     }
 }

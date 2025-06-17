@@ -64,6 +64,12 @@ MODEL_PATH_DICT = {
     "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8",
     "llama_v3.1_nemotron_ultra_253b_fp8":
     "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
+    "llama_v4_scout_17b_16e_instruct":
+    "llama4-models/Llama-4-Scout-17B-16E-Instruct",
+    "llama_v4_maverick_17b_128e_instruct":
+    "llama4-models/Llama-4-Maverick-17B-128E-Instruct",
+    "llama_v4_maverick_17b_128e_instruct_fp8":
+    "llama4-models/Llama-4-Maverick-17B-128E-Instruct-FP8",
     # "llama_30b": "llama-models/llama-30b-hf",
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
@@ -135,6 +141,7 @@ HF_MODEL_PATH = {
 LORA_MODEL_PATH = {
     "llama_v2_13b": "llama-models-v2/chinese-llama-2-lora-13b",
     "mixtral_8x7b_0.1": "chinese-mixtral-lora",
+    "llama_v3.1_8b_instruct_fp8": "lora/llama-3-chinese-8b-instruct-v2-lora/",
 }
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
@@ -807,6 +814,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         self._config.load_from_str(self._test_param_labels)
         # This will store the currently running metric.
         self._current_metric = None
+        self.lora_dirs = []
 
     def get_test_name(self) -> str:
         return str(self._config)
@@ -1035,28 +1043,63 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             istdev = 16
             ostdev = 24
             nloras = self._config.num_loras
-            # lora_data = os.path.join(engine_dir,
-            #                          f"token-norm-dist-lora-{nloras}.json")
             dataset_path = os.path.join(engine_dir, "synthetic_data.json")
-            data_cmd += [
-                "python3", prepare_data_script, f"--stdout",
-                f"--rand-task-id 0 {nloras-1}", f"--tokenizer={tokenizer_dir}",
-                f"token-norm-dist", f"--num-requests={self._config.num_reqs}",
-                f"--input-mean={input_len}", f"--output-mean={output_len}",
-                f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-                f" > {dataset_path}"
-            ]
-            if self._config.runtime == "cppmanager":
-                data_cmd += [";"]
+
+            if self._config.model_name in LORA_MODEL_PATH.keys(
+            ) and self._config.backend == "pytorch" and self._config.runtime == "bench":
+                actual_lora_paths = LORA_MODEL_PATH[self._config.model_name]
+                if not isinstance(actual_lora_paths, list):
+                    actual_lora_paths = [actual_lora_paths]
+                for i, actual_lora_path in enumerate(actual_lora_paths):
+                    if not actual_lora_path.startswith("/"):
+                        actual_lora_paths[i] = os.path.join(
+                            llm_models_root(), actual_lora_path)
+                lora_dir = os.path.join(engine_dir, "loras")
+                data_cmd += [f"mkdir -p {lora_dir}", ";"]
+                if len(actual_lora_paths) != nloras:
+                    raise ValueError(
+                        f"Number of LoRA paths ({len(actual_lora_paths)}) does not match requested number of LoRAs ({nloras})"
+                    )
+                for i, lora_path in enumerate(actual_lora_paths):
+                    self.lora_dirs.append(f"{lora_dir}/{i}")
+                    data_cmd += [f"ln -sf {lora_path} {lora_dir}/{i}", ";"]
+                data_cmd += [
+                    "python3", prepare_data_script, f"--stdout",
+                    f"--rand-task-id 0 {nloras-1}",
+                    f"--tokenizer={tokenizer_dir}", f"--lora-dir={lora_dir}",
+                    f"token-norm-dist",
+                    f"--num-requests={self._config.num_reqs}",
+                    f"--input-mean={input_len}", f"--output-mean={output_len}",
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
+                    f" > {dataset_path}"
+                ]
+            elif self._config.backend == "cppmanager":
+                data_cmd += [
+                    "python3", prepare_data_script, f"--stdout",
+                    f"--rand-task-id 0 {nloras-1}",
+                    f"--tokenizer={tokenizer_dir}", f"token-norm-dist",
+                    f"--num-requests={self._config.num_reqs}",
+                    f"--input-mean={input_len}", f"--output-mean={output_len}",
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
+                    f" > {dataset_path}"
+                ]
+                # generate LoRA weights for C++ runtime
+                # the lora_dir is $engine_dir/loras. This is populated by the convert_lora_cmd executed before this.
+                # The generate_rand_loras.py will create random lora weights to $engine_dir/lora_cpp.
                 generate_rand_lora_script = os.path.join(
                     self._llm_root, "benchmarks", "cpp", "utils",
                     "generate_rand_loras.py")
                 checkpoint_dir = os.path.join(engine_dir, "lora_cpp")
-                lora_dir = os.path.join(engine_dir, f"loras")
                 data_cmd += [
                     "python3", generate_rand_lora_script, checkpoint_dir,
-                    lora_dir, "16"
+                    lora_dir,
+                    str(nloras)
                 ]
+
+            else:
+                pytest.skip(
+                    f"LoRA config not supported for {self._config.model_name} with the current backend and runtime."
+                )
         else:
             istdev = 0
             ostdev = 0

@@ -63,15 +63,6 @@ public:
         SizeType32 maxTokensPerEngineStep, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
         BufferManager const& bufferManager);
 
-    //! @brief Setup buffers for ExplicitDraftTokens decoding.
-    void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) const;
-
-    //! @brief Setup buffers for Lookahead decoding.
-    void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) const;
-
-    //! @brief Setup buffers for Eagle decoding.
-    void setupEagle(EagleBuffers::Inputs eagleBuffers) const;
-
     //! @brief Disable lookahead decoding.
     void disableLookahead(RequestVector const& genRequests);
 
@@ -168,7 +159,17 @@ public:
     //! @param numTokens The number of tokens for the specified request.
     void setNumDecodingEngineTokens(SizeType32 batchIdx, SizeType32 numTokens);
 
+    //! @brief Get the speculative decoding mode.
     [[nodiscard]] SpeculativeDecodingMode getSpeculativeDecodingMode() const;
+
+    //! @brief Get the explicit draft tokens buffers.
+    [[nodiscard]] ExplicitDraftTokensBuffers::Inputs const& getExplicitDraftTokensBuffers() const;
+
+    //! @brief Get the eagle buffers.
+    [[nodiscard]] EagleBuffers::Inputs const& getEagleBuffers() const;
+
+    //! @brief Get the lookahead buffers.
+    [[nodiscard]] LookaheadDecodingBuffers const& getLookaheadBuffers() const;
 
     //! @brief Workspace for beam search in streaming mode.
     [[nodiscard]] BeamSearchBuffers const& getBeamSearchBuffers() const;

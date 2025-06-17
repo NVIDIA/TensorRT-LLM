@@ -11,7 +11,7 @@ import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
-from .._utils import mpi_rank, nvtx_range_debug
+from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
@@ -44,6 +44,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         worker_cls: type = GenerationExecutorWorker,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None,
     ) -> None:
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
@@ -86,10 +87,14 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.model_world_size = model_world_size
 
+        self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
+
         worker_kwargs = dict(**worker_kwargs,
                              worker_queues=self._setup_queues(),
                              postproc_worker_config=postproc_worker_config,
-                             is_llm_executor=False)
+                             is_llm_executor=False,
+                             garbage_collection_gen0_threshold=self.
+                             garbage_collection_gen0_threshold)
 
         if "log_level" not in worker_kwargs:
             worker_kwargs["log_level"] = logger.level
@@ -152,8 +157,9 @@ class GenerationExecutorProxy(GenerationExecutor):
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
-        if (res := self.result_queue.get()) is None:
-            return False  # shutdown the thread
+        with customized_gc_thresholds(self.garbage_collection_gen0_threshold):
+            if (res := self.result_queue.get()) is None:
+                return False  # shutdown the thread
 
         async_queues = []
         event_loop = None
@@ -309,14 +315,13 @@ class GenerationExecutorProxy(GenerationExecutor):
                 break
             if any(fut.done() for fut in self.mpi_futures):
                 logger.error("Executor worker died during initialization.")
-                ready_signal = RuntimeError(
-                    "Executor worker died during initialization")
-                break
+                raise RuntimeError("Executor worker died during initialization")
             self._handle_background_error()
 
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
             self.mpi_session.shutdown_abort(reason=ready_signal)
-            raise ready_signal
+            raise RuntimeError(
+                "Executor worker returned error") from ready_signal
 
     def _abort_all_requests(self):
         # The results can be finished during this loop, so self._results may be changed.

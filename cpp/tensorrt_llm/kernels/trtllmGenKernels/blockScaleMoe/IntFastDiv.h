@@ -16,9 +16,6 @@
 
 #pragma once
 
-// code in this file based on https://github.com/milakov/int_fastdiv
-// note: above repo is not added as a submodule because we slightly update APIs
-
 #include <cute/config.hpp>
 
 #include <stdexcept>

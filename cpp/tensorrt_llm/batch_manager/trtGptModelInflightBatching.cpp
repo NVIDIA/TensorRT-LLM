@@ -398,7 +398,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     }
 
     mCapacityScheduler = std::make_unique<CapacityScheduler>(getMaxNumSequences(),
-        optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), mKvCacheManager != nullptr, mNumMicroBatches > 1);
+        optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), mKvCacheManager != nullptr,
+        mWorldConfig.isPipelineParallel());
 
     mMicroBatchScheduler = std::make_unique<MicroBatchScheduler>(ctxChunkConfig, maxContextLength);
 
@@ -573,6 +574,7 @@ TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(BlocksPerWi
     // TODO: This is problematic, as createBuffers edits the state of trtGptModelInflightBatching, but
     // what if there are different window values for cross+self etc. in encoder+decoder scenario...
     createBuffers(mDecodingConfig, mAdditionalModelOutputs);
+    createDecoder(mDecodingConfig.getDecodingMode());
     return {newBlocksPerWindow, newMaxAttentionWindowVec};
 }
 
@@ -1422,8 +1424,8 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
         }
 
         mDecoder = std::make_unique<runtime::GptDecoderBatched>(mRuntime->getStreamPtr());
-        mDecoder->setup(decodingMode, getMaxNumSequences(), mOperatingBeamWidth, getMaxSequenceLen(), decoderType,
-            mModelConfig, mWorldConfig);
+        mDecoder->setup(
+            decodingMode, getMaxNumSequences(), mOperatingBeamWidth, decoderType, mModelConfig, mWorldConfig);
 
         mDecoderState = std::make_unique<runtime::decoder::DecoderState>(decoderType, mRuntime->getBufferManager());
         if (!mModelConfig.getSpeculativeDecodingMode().isNone())
@@ -1436,19 +1438,6 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
             getMaxSequenceLen(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
         mDecoderState->setupSpeculativeDecoding(mDecoderState->getSpeculativeDecodingMode(),
             mModelConfig.getMaxDecodingTokens(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
-
-        if (decodingMode.isExplicitDraftTokens())
-        {
-            mDecoderState->setupExplicitDraftTokens(mDecoderBuffers->explicitDraftTokensBuffers);
-        }
-        else if (decodingMode.isLookahead())
-        {
-            mDecoderState->setupLookahead(mDecoderBuffers->lookaheadBuffers.value());
-        }
-        else if (decodingMode.isEagle())
-        {
-            mDecoderState->setupEagle(mDecoderBuffers->eagleBuffers);
-        }
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -1606,7 +1595,7 @@ void TrtGptModelInflightBatching::prepareDistGenBufferAndDecoder(RequestVector c
         auto const bufferId = getFusedBufferId();
         auto& runtimeBuffers = *mBuffers[bufferId];
         runtimeBuffers.prepareStep(cacheTransCompleteRequests, {}, getMaxBeamWidth(), getMaxAttentionWindow(),
-            *mDecoderBuffers, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
+            *mDecoderBuffers, *mDecoderState, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
             mPeftTables[mMicroBatchId], *mRuntime, mModelConfig, mWorldConfig, getGatherGenerationLogits(),
             isTrtOverlap());
         auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
@@ -1671,7 +1660,7 @@ TrtGptModelInflightBatching::prepareBuffers(
         : std::nullopt;
 
     auto [optProfileId, inputMap, outputMap] = runtimeBuffers.prepareStep(contextRequests, generationRequests,
-        mOperatingBeamWidth, getMaxAttentionWindow(), *mDecoderBuffers, mKvCacheManager.get(),
+        mOperatingBeamWidth, getMaxAttentionWindow(), *mDecoderBuffers, *mDecoderState, mKvCacheManager.get(),
         mCrossKvCacheManager.get(), mRnnStateManager.get(), mPeftTables[bufferId], *mRuntime, mModelConfig,
         mWorldConfig, getGatherGenerationLogits(), isTrtOverlap(), allNewTokens);
 
@@ -1797,18 +1786,18 @@ void TrtGptModelInflightBatching::setupDecoderStep(
     {
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
 
-        auto [batchSlots, decoderRequests, samplingConfigs]
+        auto [batchSlots, samplingConfigs, lookaheadPrompt, lookaheadAlgoConfigs]
             = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig, mDecodingConfig, contextRequests,
                 mRuntime->getBufferManager(), logitsType, inputBuffers, *mDecoderState, mRuntime->getStream(),
-                *mDecoder->getDecoderStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.medusaBuffers);
+                *mDecoder->getDecoderStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.mMedusaBuffers);
 
-        if (!decoderRequests.empty())
+        auto const localBatchSize = batchSlots->getSize();
+        if (localBatchSize > 0)
         {
-            // Setup underlying decoder.
-            auto const localBatchSize = batchSlots->getSize();
             auto samplingConfig = SamplingConfig(samplingConfigs);
             mDecoder->getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
-                {mDecoderState->getJointDecodingOutput()}, {decoderRequests});
+                {mDecoderState->getJointDecodingOutput()}, mModelConfig.getDataType(), lookaheadPrompt,
+                lookaheadAlgoConfigs);
 
             auto const& stream = mDecoder->getDecoderStream();
             CudaEvent event{};
@@ -2010,7 +1999,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     auto& contextRuntimeBuffers = mBuffers.at(contextBufferId);
     auto const logitsIndex = (*mHandleContextLogits)(scheduledRequests.contextRequests,
         contextRuntimeBuffers->numContextLogits, contextRuntimeBuffers->logits, *mDecoderBuffers, mModelConfig,
-        mRuntime->getBufferManager(), mRuntime->getStream(), contextRuntimeBuffers->medusaBuffers);
+        mRuntime->getBufferManager(), mRuntime->getStream(), contextRuntimeBuffers->mMedusaBuffers);
 
     auto const genLogitsIndex = mCtxGenFusion ? logitsIndex : 0;
     auto const genBufferId = mCtxGenFusion ? getFusedBufferId() : getGenerationBufferId();
@@ -2553,7 +2542,7 @@ void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& sch
         mModelConfig.enableSeamlessLookaheadDecoding(mSeamlessLADMaxDraftLen);
         mDecodingConfig.enableSeamlessLookaheadDecoding();
         setupSpeculativeDecodingModule(mDecodingConfig);
-        mBuffers.at(bufferId)->lookaheadBuffers->enableLookaheadDecoding(
+        mBuffers.at(bufferId)->mLookaheadBuffers->enableLookaheadDecoding(
             getMaxBatchSize(), mModelConfig.getMaxDecodingTokens());
         mDecoderOutputBuffers.at(getFusedBufferId())
             .enableLookaheadDecoding(getMaxNumSequences(), mModelConfig.getMaxDecodingTokens());
@@ -2565,7 +2554,7 @@ void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& sch
         // Lookahead -> None
         mModelConfig.disableSeamlessLookaheadDecoding();
         mDecodingConfig.setDecodingMode(executor::DecodingMode::Auto());
-        mBuffers.at(bufferId)->lookaheadBuffers->disableLookaheadDecoding();
+        mBuffers.at(bufferId)->mLookaheadBuffers->disableLookaheadDecoding();
         mDecoderOutputBuffers.at(getFusedBufferId()).disableLookaheadDecoding(getMaxNumSequences());
         mDecoder->disableLookahead(
             scheduledRequests.generationRequests, mDecoderInputBuffers.at(getFusedBufferId()).setupBatchSlots);

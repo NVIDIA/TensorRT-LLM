@@ -52,6 +52,11 @@ meta-llama/Llama-3.2-1B:
     accuracy: 33.87
   - extra_acc_spec: max_attention_window_size=960
     accuracy: 32.82
+meta-llama/Llama-3.2-3B:
+  - accuracy: 57.92
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 60.60
 meta-llama/Llama-3.3-70B-Instruct:
   - accuracy: 81.31
   - quant_algo: NVFP4
@@ -162,6 +167,9 @@ nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
     accuracy: 57.12
 nvidia/Nemotron-H-8B-Base-8K:
   - accuracy: 69.590
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 69.180
 microsoft/Phi-4-mini-instruct:
   - accuracy: 68.98
 nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
@@ -169,3 +177,5 @@ nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 83.36
+kanana-1.5-2.1b-instruct-2505:
+  - accuracy: 56.89

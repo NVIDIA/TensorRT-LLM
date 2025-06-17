@@ -30,23 +30,21 @@ class Singleton(type):
 
     def __call__(cls, *args, **kwargs):
         if cls not in cls._instances:
-            cls._instances[cls] = super(Singleton,
-                                        cls).__call__(*args, **kwargs)
+            cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
         return cls._instances[cls]
 
 
 class Logger(metaclass=Singleton):
+    ENV_VARIABLE = "TLLM_LOG_LEVEL"
+    PREFIX = "TRT-LLM"
+    DEFAULT_LEVEL = "error"
 
-    ENV_VARIABLE = 'TLLM_LOG_LEVEL'
-    PREFIX = 'TRT-LLM'
-    DEFAULT_LEVEL = 'error'
-
-    INTERNAL_ERROR = '[F]'
-    ERROR = '[E]'
-    WARNING = '[W]'
-    INFO = '[I]'
-    VERBOSE = '[V]'
-    DEBUG = '[D]'
+    INTERNAL_ERROR = "[F]"
+    ERROR = "[E]"
+    WARNING = "[W]"
+    INFO = "[I]"
+    VERBOSE = "[V]"
+    DEBUG = "[D]"
 
     def __init__(self):
         environ_severity = os.environ.get(self.ENV_VARIABLE)
@@ -54,8 +52,7 @@ class Logger(metaclass=Singleton):
 
         self.rank: Optional[int] = None
 
-        min_severity = environ_severity.lower(
-        ) if self._set_from_env else self.DEFAULT_LEVEL
+        min_severity = environ_severity.lower() if self._set_from_env else self.DEFAULT_LEVEL
         invalid_severity = min_severity not in severity_map
         if invalid_severity:
             min_severity = self.DEFAULT_LEVEL
@@ -66,14 +63,16 @@ class Logger(metaclass=Singleton):
         self._logger.propagate = False
         handler = logging.StreamHandler(stream=sys.stdout)
         handler.setFormatter(
-            logging.Formatter(fmt='[%(asctime)s] %(message)s',
-                              datefmt='%m/%d/%Y-%H:%M:%S'))
+            logging.Formatter(fmt="[%(asctime)s] %(message)s", datefmt="%m/%d/%Y-%H:%M:%S")
+        )
         self._logger.addHandler(handler)
         self._logger.setLevel(severity_map[min_severity][1])
         self._polygraphy_logger = G_LOGGER
         if self._polygraphy_logger is not None:
-            self._polygraphy_logger.module_severity = severity_map[
-                min_severity][2]
+            self._polygraphy_logger.module_severity = severity_map[min_severity][2]
+
+        # For log_once
+        self._appeared_keys = set()
 
         if invalid_severity:
             self.warning(
@@ -95,36 +94,57 @@ class Logger(metaclass=Singleton):
         elif severity == self.VERBOSE or severity == self.DEBUG:
             return self._logger.debug
         else:
-            raise AttributeError(f'No such severity: {severity}')
+            raise AttributeError(f"No such severity: {severity}")
 
     @property
     def trt_logger(self) -> trt.ILogger:
         return self._trt_logger
 
     def log(self, severity, *msg):
-        parts = [f'[{self.PREFIX}]']
+        parts = [f"[{self.PREFIX}]"]
         if self.rank is not None:
-            parts.append(f'[RANK {self.rank}]')
+            parts.append(f"[RANK {self.rank}]")
         parts.append(severity)
         parts.extend(map(str, msg))
         self._func_wrapper(severity)(" ".join(parts))
 
+    def log_once(self, severity, *msg, key):
+        if key not in self._appeared_keys:
+            self._appeared_keys.add(key)
+            self.log(severity, *msg)
+
     def critical(self, *msg):
         self.log(self.INTERNAL_ERROR, *msg)
 
+    def critical_once(self, *msg, key):
+        self.log_once(self.INTERNAL_ERROR, *msg, key=key)
+
     fatal = critical
+    fatal_once = critical_once
 
     def error(self, *msg):
         self.log(self.ERROR, *msg)
 
+    def error_once(self, *msg, key):
+        self.log_once(self.ERROR, *msg, key=key)
+
     def warning(self, *msg):
         self.log(self.WARNING, *msg)
+
+    def warning_once(self, *msg, key):
+        self.log_once(self.WARNING, *msg, key=key)
 
     def info(self, *msg):
         self.log(self.INFO, *msg)
 
+    def info_once(self, *msg, key):
+        self.log_once(self.INFO, *msg, key=key)
+
     def debug(self, *msg):
         self.log(self.VERBOSE, *msg)
+
+    def debug_once(self, *msg, key):
+        self.log_once(self.VERBOSE, *msg, key=key)
 
     @property
     def level(self) -> str:
@@ -140,29 +160,28 @@ class Logger(metaclass=Singleton):
         self._trt_logger.min_severity = severity_map[min_severity][0]
         self._logger.setLevel(severity_map[min_severity][1])
         if self._polygraphy_logger is not None:
-            self._polygraphy_logger.module_severity = severity_map[
-                min_severity][2]
+            self._polygraphy_logger.module_severity = severity_map[min_severity][2]
 
 
 severity_map = {
-    'internal_error': [trt.Logger.INTERNAL_ERROR, logging.CRITICAL],
-    'error': [trt.Logger.ERROR, logging.ERROR],
-    'warning': [trt.Logger.WARNING, logging.WARNING],
-    'info': [trt.Logger.INFO, logging.INFO],
-    'verbose': [trt.Logger.VERBOSE, logging.DEBUG],
-    'debug': [trt.Logger.VERBOSE, logging.DEBUG],
-    'trace': [trt.Logger.VERBOSE, logging.DEBUG],
+    "internal_error": [trt.Logger.INTERNAL_ERROR, logging.CRITICAL],
+    "error": [trt.Logger.ERROR, logging.ERROR],
+    "warning": [trt.Logger.WARNING, logging.WARNING],
+    "info": [trt.Logger.INFO, logging.INFO],
+    "verbose": [trt.Logger.VERBOSE, logging.DEBUG],
+    "debug": [trt.Logger.VERBOSE, logging.DEBUG],
+    "trace": [trt.Logger.VERBOSE, logging.DEBUG],
 }
 
 if G_LOGGER is not None:
     g_logger_severity_map = {
-        'internal_error': G_LOGGER.CRITICAL,
-        'error': G_LOGGER.ERROR,
-        'warning': G_LOGGER.WARNING,
-        'info': G_LOGGER.INFO,
-        'verbose': G_LOGGER.SUPER_VERBOSE,
-        'debug': G_LOGGER.SUPER_VERBOSE,
-        'trace': G_LOGGER.SUPER_VERBOSE,
+        "internal_error": G_LOGGER.CRITICAL,
+        "error": G_LOGGER.ERROR,
+        "warning": G_LOGGER.WARNING,
+        "info": G_LOGGER.INFO,
+        "verbose": G_LOGGER.SUPER_VERBOSE,
+        "debug": G_LOGGER.SUPER_VERBOSE,
+        "trace": G_LOGGER.SUPER_VERBOSE,
     }
     for key, value in g_logger_severity_map.items():
         severity_map[key].append(value)
