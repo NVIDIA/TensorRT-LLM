@@ -1364,13 +1364,11 @@ class PyTorchModelEngine(ModelEngine):
                                         new_tokens, non_blocking=True)
                 # previous draft tokens
                 previous_batch_draft_tokens = previous_batch_len * self.max_draft_len
-                self.draft_tokens_cuda[
-                    num_draft_tokens:num_draft_tokens +
-                    previous_batch_draft_tokens].copy_(next_draft_tokens_device[
-                        self.
-                        previous_batch_indices_cuda[:previous_batch_len], :].
-                                                       flatten(),
-                                                       non_blocking=True)
+                self.draft_tokens_cuda[num_draft_tokens:num_draft_tokens +
+                                       previous_batch_draft_tokens].copy_(
+                                           next_draft_tokens_device[
+                                               previous_slots, :].flatten(),
+                                           non_blocking=True)
                 # prepare data for the preprocess inputs
                 kv_len_offsets_device = new_tokens_lens_device - self.max_draft_len - 1
                 previous_pos_indices_host = torch.tensor(previous_pos_indices,
@@ -1384,9 +1382,7 @@ class PyTorchModelEngine(ModelEngine):
                             0:previous_batch_tokens]],
                         non_blocking=True)
                 self.previous_kv_lens_offsets_cuda[0:previous_batch_len].copy_(
-                    kv_len_offsets_device[
-                        self.previous_batch_indices_cuda[:previous_batch_len]],
-                    non_blocking=True)
+                    kv_len_offsets_device[previous_slots], non_blocking=True)
                 # for the requests that do not have previous batch, set the previous_pos_id_offsets and
                 # previous_kv_lens_offsets to zeros to skip the value changes in _preprocess_inputs
                 self.previous_pos_id_offsets_cuda[
