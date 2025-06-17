@@ -697,7 +697,7 @@ def main(args: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
             extra_body=sampling_params,
-            streaming=not args.no_streaming,
+            streaming=not args.non_streaming,
         ))
 
     # Save config and results to json
@@ -864,7 +864,7 @@ if __name__ == "__main__":
         "results in a more uniform arrival of requests.",
     )
     parser.add_argument(
-        "--no-streaming",
+        "--non-streaming",
         action="store_true",
         help="Disable streaming mode",
     )
