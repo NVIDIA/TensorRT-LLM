@@ -1723,6 +1723,13 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, enable min-latency mode. Currently only used for Llama4.",
     )
 
+    # TODO: make this a per-request parameter
+    stream_interval: int = Field(
+        default=1,
+        description=
+        "The iteration interval to create responses under the streaming mode.",
+    )
+
     # TODO: remove backend later
     @field_validator('backend', mode='before')
     def init_backend(cls, v):
@@ -1812,7 +1819,8 @@ class TorchLlmArgs(BaseLlmArgs):
             autotuner_enabled=self.autotuner_enabled,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
-            enable_min_latency=self.enable_min_latency)
+            enable_min_latency=self.enable_min_latency,
+            stream_interval=self.stream_interval)
 
     @field_validator('cuda_graph_max_batch_size')
     @classmethod

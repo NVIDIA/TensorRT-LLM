@@ -91,6 +91,9 @@ methods:
       postprocess_tokenizer_dir:
         annotation: Optional[str]
         default: null
+      stream_interval:
+        annotation: int
+        default: 1
       # reasoning
       reasoning_parser:
         annotation: Optional[str]
