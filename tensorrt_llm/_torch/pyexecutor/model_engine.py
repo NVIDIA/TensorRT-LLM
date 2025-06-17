@@ -597,8 +597,8 @@ class PyTorchModelEngine(ModelEngine):
                 is_gen = num_tokens_per_request == 1
 
                 requests = kv_cache_manager.add_dummy_requests(
-                    list(range(batch_size)),
-                    [num_tokens_per_request] * batch_size,
+                    list(range(batch_size)), [num_tokens_per_request] *
+                    batch_size if not is_gen else None,
                     is_gen=is_gen,
                     max_num_draft_tokens=self.max_draft_len)
 
@@ -765,7 +765,7 @@ class PyTorchModelEngine(ModelEngine):
                                  resource_manager=resource_manager)
                     torch.cuda.synchronize()
 
-                if self._torch_compile_piecewise_cuda_graph:
+                if self._torch_compile_piecewise_cuda_graph and self._torch_compile_enabled:
                     with self.no_cuda_graph():
                         with release_batch(
                                 get_torch_compile_warmup_request(1,

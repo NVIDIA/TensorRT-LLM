@@ -618,6 +618,11 @@ def compute_logprobs(
             # reshape from [1, T, V] to [T, V]
             logits = logits.squeeze(0)
 
+        if tokens is not None and logits.size(0) > len(tokens):
+            # WAR for nvbug 5324291 where TRT backend might return more logits
+            # than output tokens.
+            logits = logits[:len(tokens)]
+
         logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
         topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)
 
