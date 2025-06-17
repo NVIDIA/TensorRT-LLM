@@ -80,7 +80,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_bfloat16(self, attn_backend, torch_compile):
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True) if torch_compile else None
+            enable_fullgraph=True) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
             cuda_graph_padding_enabled=torch_compile,
@@ -109,7 +109,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 "Issue: Unfusing flashinfer_fused_add_rmsnorm causes outputs to be "
                 "discarded at graph breaks.")
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True) if torch_compile else None
+            enable_fullgraph=True) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
             cuda_graph_padding_enabled=torch_compile,
@@ -136,7 +136,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     def test_fp8(self, fp8kv, attn_backend, torch_compile):
         quant_config = QuantConfig(QuantAlgo.FP8)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True) if torch_compile else None
+            enable_fullgraph=True) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
             cuda_graph_padding_enabled=torch_compile,
@@ -177,7 +177,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 "discarded at graph breaks.")
         quant_config = QuantConfig(QuantAlgo.FP8)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True) if torch_compile else None
+            enable_fullgraph=True) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
             cuda_graph_padding_enabled=torch_compile,
@@ -505,9 +505,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252559")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True,
-            torch_compile_piecewise_cuda_graph=cuda_graph
-        ) if torch_compile else None
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=cuda_graph) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -552,9 +551,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("PP with torch.compile is not supported yet.")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True,
-            torch_compile_piecewise_cuda_graph=cuda_graph
-        ) if torch_compile else None
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=cuda_graph) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -597,9 +595,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252559")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True,
-            torch_compile_piecewise_cuda_graph=cuda_graph
-        ) if torch_compile else None
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=cuda_graph) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -719,9 +716,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("PP with torch.compile is not supported yet.")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True,
-            torch_compile_piecewise_cuda_graph=cuda_graph
-        ) if torch_compile else None
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=cuda_graph) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -808,9 +804,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252559")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True,
-            torch_compile_piecewise_cuda_graph=cuda_graph
-        ) if torch_compile else None
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=cuda_graph) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -866,9 +861,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5336321")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True,
-            torch_compile_piecewise_cuda_graph=cuda_graph
-        ) if torch_compile else None
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=cuda_graph) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
