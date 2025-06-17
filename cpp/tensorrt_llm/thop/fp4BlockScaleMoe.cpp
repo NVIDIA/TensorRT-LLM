@@ -143,8 +143,9 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::Tensor const& r
     at::Tensor gemm1_output = at::detail::empty_cuda({max_num_padded_tokens, intermediate_size / 2},
         at::ScalarType::Float8_e4m3fn, hidden_states.device(), std::nullopt);
 
-    at::Tensor gemm1_output_scale = at::detail::empty_cuda({max_num_padded_tokens, intermediate_size / 16},
-        at::ScalarType::Float8_e4m3fn, hidden_states.device(), std::nullopt);
+    int64_t sf_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(max_num_padded_tokens, intermediate_size / 16);
+    at::Tensor gemm1_output_scale
+        = at::detail::empty_cuda({sf_size}, at::ScalarType::Float8_e4m3fn, hidden_states.device(), std::nullopt);
 
     at::Tensor gemm2_output = at::detail::empty_cuda(
         {max_num_padded_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);

@@ -877,6 +877,40 @@ inline bool checkAndUpdateGemmOptions(
     TLLM_CHECK_ERROR(options.mM > 0 && options.mN > 0 && options.mK > 0, "M, N and K must be larger than 0");
     TLLM_CHECK_ERROR(options.mNumSlicesForSplitK > 0, "Split K must be larger than 0.");
 
+    int32_t padMultiplierA = 1;
+    int32_t padMultiplierB = 1;
+    if (options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4)
+    {
+        if (options.mDtypeA == tg::Dtype::MxE2m1)
+        {
+            padMultiplierA = 2;
+        }
+        if (options.mDtypeB == tg::Dtype::MxE2m1)
+        {
+            padMultiplierB = 2;
+        }
+    }
+    TLLM_CHECK_ERROR((padMultiplierA * tg::dtypeGetNumBits(options.mDtypeA) * options.mK / 8) % 16 == 0,
+        "K dimension of A must be aligned to 16 bytes.");
+    TLLM_CHECK_ERROR((padMultiplierB * tg::dtypeGetNumBits(options.mDtypeB) * options.mK / 8) % 16 == 0,
+        "K dimension of B must be aligned to 16 bytes.");
+
+    if (tg::dtypeIsBlockFmt(options.mDtypeA))
+    {
+        auto const numEltsPerSfA = tg::dtypeNumEltsPerSf(options.mDtypeA);
+        auto const numEltsPerSfAInK = options.mK / numEltsPerSfA;
+        TLLM_CHECK_ERROR(numEltsPerSfAInK % 4 == 0, "K dimension of scaling factors for A (", numEltsPerSfAInK,
+            ") must be a multiple of 4");
+    }
+
+    if (tg::dtypeIsBlockFmt(options.mDtypeB))
+    {
+        auto const numEltsPerSfB = tg::dtypeNumEltsPerSf(options.mDtypeB);
+        auto const numEltsPerSfBInK = options.mK / numEltsPerSfB;
+        TLLM_CHECK_ERROR(numEltsPerSfBInK % 4 == 0, "K dimension of scaling factors for B (", numEltsPerSfBInK,
+            ") must be a multiple of 4");
+    }
+
     if (options.mUseShuffledMatrixA)
     {
         auto const shuffleBlockSize = getShuffleBlockSize(options.mEpilogueTileM);

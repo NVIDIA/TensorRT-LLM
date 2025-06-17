@@ -110,6 +110,10 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_NONE;
         }
+        else if ((fastestDimTileSizeBytes % 16) == 0 && (dtype == tg::Dtype::UE8m0 || dtype == tg::Dtype::E4m3))
+        {
+            swizzleType = CU_TENSOR_MAP_SWIZZLE_NONE;
+        }
         else
         {
             std::cerr << "buildNdTmaDescriptor: unexpected fastestDimTileSizeBytes " << fastestDimTileSizeBytes

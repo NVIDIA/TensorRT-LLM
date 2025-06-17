@@ -17,7 +17,6 @@
 #pragma once
 
 #include <numeric>
-#include <optional>
 
 #include "BatchedGemmOptions.h"
 #include "KernelParams.h"
@@ -245,10 +244,8 @@ struct BatchedGemmData
         float const* mPtrScaleGate{nullptr};
 
         // The alpha and beta for SwiGlu.
-        // gatedActivation <- (x0 + beta) * activation(x1, alpha)
-        // Shape is [B].
-        // Alpha is 1.f if nullptr.
-        // Beta is 0.f if nullptr.
+        // gatedActivation <- (x0 + beta) * sigmoid(alpha * x1)
+        // Shape is [B]
         float const* mPtrSwiGluAlpha{nullptr};
         float const* mPtrSwiGluBeta{nullptr};
 
@@ -395,15 +392,12 @@ struct BatchedGemmData
 class BatchedGemmInterface
 {
 public:
-    using ModuleCache = std::unordered_map<std::string, std::tuple<CUmodule, CUfunction>>;
-
     BatchedGemmInterface() {}
 
     // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
     // Provided config must be validated with isValidConfig before the call.
     int32_t run(BatchedGemmConfig const& config, void* workspace, BatchedGemmData const& options, void* cudaStream,
-        int32_t multiProcessorCount, bool usePdl = true,
-        std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt);
+        int32_t multiProcessorCount, bool usePdl = true);
 
     // Initializes the buffers before the world sync. Must be called before run.
     int32_t runInitBeforeWorldSync(
@@ -585,9 +579,9 @@ std::vector<size_t> BatchedGemmInterface::getWorkspaceSizesInBytes(
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
 int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspace,
-    BatchedGemmData const& batchedGemmData, void* cudaStream, int32_t /* multiProcessorCount */, bool usePdl,
-    std::optional<std::reference_wrapper<ModuleCache>> moduleCache)
+    BatchedGemmData const& batchedGemmData, void* cudaStream, int32_t /* multiProcessorCount */, bool usePdl)
 {
     // Might be used.
     (void) usePdl;
@@ -660,42 +654,8 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
 #ifdef TLLM_GEN_EXPORT_INTERFACE
     CUmodule cuModule;
     CUfunction cuFunction;
-    if (moduleCache.has_value())
-    {
-        ModuleCache& moduleCacheRef = moduleCache.value().get();
-
-        // Modules are associated with a specific context so include the ctxId in the key
-        CUcontext ctx;
-        unsigned long long ctxId;
-        cuCtxGetCurrent(&ctx);
-        cuCtxGetId(ctx, &ctxId);
-
-        // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a string in decimal
-        // representation.
-        std::string const ctxName
-            = std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
-        std::string const funcName = std::string(config.mFunctionName);
-        // As the ctxName is a fixed number of bytes, the two strings can just be appended without risk of a collision
-        auto const moduleKey = ctxName + funcName;
-        auto module = moduleCacheRef.find(moduleKey);
-
-        // Check if module exists in cache. Otherwise, load it
-        if (module != moduleCacheRef.end())
-        {
-            cuFunction = std::get<1>(module->second);
-        }
-        else
-        {
-            cuModuleLoadData(&cuModule, config.mData);
-            cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
-            moduleCacheRef.insert(std::make_pair(moduleKey, std::make_tuple(cuModule, cuFunction)));
-        }
-    }
-    else
-    {
-        cuModuleLoadData(&cuModule, config.mData);
-        cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
-    }
+    cuModuleLoadData(&cuModule, config.mData);
+    cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
 
     // Prepare the grid/block.
     dim3 block3{static_cast<uint32_t>(config.mNumThreadsPerCTA), static_cast<uint32_t>(1), static_cast<uint32_t>(1)};
@@ -715,11 +675,6 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     if (result != CUDA_SUCCESS)
     {
         return -1;
-    }
-    // If a module cache has not been given, unload the module to avoid overflow
-    if (!moduleCache.has_value())
-    {
-        cuModuleUnload(cuModule);
     }
 #else
     config.mCudaRunner->run((void*) &kernelParams, (void*) cudaStream, grid);
