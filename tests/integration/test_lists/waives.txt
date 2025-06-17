@@ -237,6 +237,8 @@ full:B200/examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_
 
 full:RTXPro6000/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False] SKIP (https://nvbugs/5063469)
 full:RTXPro6000/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True] SKIP (https://nvbugs/5063469)
+full:RTXPro6000/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[tp2pp2-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False] SKIP (unknown reason exit)
+full:RTXPro6000/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_4gpus[pp4-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
 
 examples/test_qwen.py::test_llm_qwen_moe_multi_gpu_summary[qwen2_57b_a14b-tp4pp1-context_fmha] SKIP (https://nvbugs/5063469)
 examples/test_qwen.py::test_llm_qwen_moe_multi_gpu_summary[qwen2_57b_a14b-tp2pp2-context_fmha_fp32_acc] SKIP (https://nvbugs/5063469)
