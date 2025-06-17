@@ -32,8 +32,11 @@ CacheTransceiverConfig(bool enableCacheTransceiver,
         std::optional<CommType> commType, std::optional<size_t> maxNumTokens);
 ```
 The configuration parameters serve the following purposes:
-The `enableCacheTransceiver` parameter must be set to `True` to enable kvCache transfer functionality
-The `commType` parameter determines the communication backend for kvCache transfer. Valid options include `CommType::UCX`, `CommType::NIXL`, and `CommType::MPI`, with `UCX` serving as the default backend
+
+The `enableCacheTransceiver` parameter must be set to `True` to enable kvCache transfer functionality.
+
+The `commType` parameter determines the communication backend for kvCache transfer. Valid options include `CommType::UCX`, `CommType::NIXL`, and `CommType::MPI`, with `UCX` serving as the default backend.
+
 The `maxNumTokens` parameter specifies the buffer size for kvCache transfers. For optimal performance, this value should be set to match or exceed the maximum Input Sequence Length (ISL) of all requests.
 
 
@@ -85,12 +88,13 @@ Please refer to `benchmarks/cpp/disaggServerBenchmark.cpp` and `benchmarks/cpp/R
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
 
+The `enableCacheTransceiver` parameter in `CacheTransceiverConfig` must be set to `true` for disaggregated service. If the `commType` parameter is not explicitly specified, TRT-LLM automatically determines the appropriate communication backend based on available environment variables.
+
 * `TRTLLM_USE_MPI_KVCACHE`: Whether to use MPI to transfer KV cache. Currently, the default value is `0`.
 
 * `TRTLLM_USE_UCX_KVCACHE`: Whether to use UCX to transfer KV cache. Currently, the default value is `0`.
 
 * `TRTLLM_USE_NIXL_KVCACHE`: whether to use NIXL to transfer KV cache. Currently, the default value is `0`.
-For disaggregated service functionality, the `enableCacheTransceiver` parameter in `CacheTransceiverConfig` must be set to `true`. If the `commType` parameter is not explicitly specified, TRT-LLM automatically determines the appropriate communication backend based on available environment variables.
 
 * `TRTLLM_PARALLEL_CACHE_SEND`: If set to `1`, contextExecutor will attempt to send KV cache for multiple requests in parallel. The default value is `0`.
 
