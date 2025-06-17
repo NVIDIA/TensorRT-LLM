@@ -300,66 +300,36 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_post_blackwell
-    def test_smooth_quant(self):
-        quant_config = QuantConfig(
-            QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
-        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+    def test_fp8_prequantized(self):
+        model_path = f"{llm_models_root()}/ llama-3.2-models/Llama-3.2-1B-FP8"
+        with LLM(model_path) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_post_blackwell
-    def test_smooth_quant_ootb(self):
-        quant_config = QuantConfig(QuantAlgo.W8A8_SQ_PER_CHANNEL)
-        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+
+class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.2-3B"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-3B"
+    EXAMPLE_FOLDER = "models/core/llama"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-
-    @skip_post_blackwell
-    def test_int4_awq(self):
-        quant_config = QuantConfig(QuantAlgo.W4A16_AWQ)
-        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_post_blackwell
-    def test_int4_awq_int8_kv_cache(self):
-        quant_config = QuantConfig(QuantAlgo.W4A16_AWQ)
-        kv_cache_config = KvCacheConfig(quant_algo=QuantAlgo.INT8)
-        with LLM(self.MODEL_PATH,
-                 quant_config=quant_config,
-                 kv_cache_config=kv_cache_config) as llm:
+    @skip_pre_hopper
+    def test_fp8_prequantized(self):
+        model_path = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-3B-Instruct-FP8"
+        with LLM(model_path) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-
-    @skip_pre_ada
-    def test_fp8(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
-        kv_cache_config = KvCacheConfig(quant_algo=QuantAlgo.FP8)
-        with LLM(self.MODEL_PATH,
-                 quant_config=quant_config,
-                 kv_cache_config=kv_cache_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_ada
-    @pytest.mark.skip_less_device(2)
-    def test_fp8_pp2(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
-        kv_cache_config = KvCacheConfig(quant_algo=QuantAlgo.FP8)
-        with LLM(self.MODEL_PATH,
-                 pipeline_parallel_size=2,
-                 quant_config=quant_config,
-                 kv_cache_config=kv_cache_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_ada
-    @skip_post_blackwell
-    def test_fp8_rowwise(self):
-        quant_config = QuantConfig(QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
-        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -1250,6 +1220,19 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_ada
+    def test_reasoning_fp8_prequantized(self):
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+        with LLM(f"{llm_models_root()}/Nemotron-H-8B-Reasoning-128K-FP8",
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=256) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
@@ -1476,3 +1459,21 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
             task = GPQADiamond(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
+
+
+class TestKanana_Instruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "kanana-1.5-2.1b-instruct-2505"
+    MODEL_PATH = f"{llm_models_root()}/kanana-1.5-2.1b-instruct-2505"
+
+    @pytest.mark.skip_not_contain(["H20", "H100"])
+    def test_auto_dtype(self):
+        "RCCA: https://nvbugspro.nvidia.com/bug/5310520"
+        pytorch_config = dict(duse_cuda_graph=True,
+                              cuda_graph_padding_enabled=True,
+                              cuda_graph_max_batch_size=384)
+        with LLM(self.MODEL_PATH, **pytorch_config,
+                 enable_attention_dp=True) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
