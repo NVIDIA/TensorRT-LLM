@@ -1591,9 +1591,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-8_GPUs-PyTorch-[Post-Merge]-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
-        "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
-        "DGX_H100-4_GPUs-TensorRT-[Post-Merge]-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
-        "DGX_H100-4_GPUs-TensorRT-[Post-Merge]-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
+        "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
+        "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 3, 4],
+        "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-3": ["dgx-h100-x4", "l0_dgx_h100", 3, 3, 4],
     ]
 
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
