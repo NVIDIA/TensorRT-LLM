@@ -194,8 +194,6 @@ void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeT
     dInput.maxLength = mMaxSequenceLength;
     dInput.maxAttentionWindow = maxAttentionWindow;
     dInput.sinkTokenLength = sinkTokenLength;
-    dInput.stopWordsLists.resize(mMaxBatchSize);
-    dInput.badWordsLists.resize(mMaxBatchSize);
 
     auto const maxBatchSizeShape = ITensor::makeShape({mMaxBatchSize});
     auto const maxBatchSizeXmaxBeamWidthShape = ITensor::makeShape({mMaxBatchSize, mMaxBeamWidth});

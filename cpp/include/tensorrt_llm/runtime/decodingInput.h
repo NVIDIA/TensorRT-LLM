@@ -83,15 +83,13 @@ public:
     TensorConstPtr finishReasons;
     //! The maximum sequence length for each sequence in the batch, [batchSize] on gpu
     TensorConstPtr sequenceLimitLength;
-    TensorConstPtr embeddingBias;          // [batchSize, vocabSizePadded] on gpu
-    TensorConstPtr lengths;                // [batchSize, beamWidth] on gpu
-    std::vector<TensorPtr> badWordsLists;  // [batchSize][2, badWordsLength] on gpu
-    TensorConstPtr badWordsPtrs;           // [batchSize][2, badWordsLength] on pinned
-    TensorConstPtr badWordsLens;           // [batchSize] on gpu
-    std::vector<TensorPtr> stopWordsLists; // [batchSize][2, stopWordsLength] on gpu
-    TensorConstPtr stopWordsPtrs;          // [batchSize][2, stopWordsLength] on pinned
-    TensorConstPtr stopWordsLens;          // [batchSize] on pinned
-    TensorConstPtr noRepeatNgramSize;      // [batchSize] on gpu
+    TensorConstPtr embeddingBias;     // [batchSize, vocabSizePadded] on gpu
+    TensorConstPtr lengths;           // [batchSize, beamWidth] on gpu
+    TensorConstPtr badWordsPtrs;      // [batchSize][2, badWordsLength] on pinned
+    TensorConstPtr badWordsLens;      // [batchSize] on gpu
+    TensorConstPtr stopWordsPtrs;     // [batchSize][2, stopWordsLength] on pinned
+    TensorConstPtr stopWordsLens;     // [batchSize] on pinned
+    TensorConstPtr noRepeatNgramSize; // [batchSize] on gpu
 
     //! Parameters for beam search
     //! KV cache index for beam search, [batchSize, beamWidth, maxSeqLen] on gpu
