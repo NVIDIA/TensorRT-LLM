@@ -27,6 +27,138 @@ namespace kernels
 {
 
 using namespace batchedGemm::batchedGemm;
+using namespace batchedGemm::gemm;
+using namespace batchedGemm::trtllm::gen;
+
+std::vector<int64_t> prioritizePredefinedConfigs(int m, int n, int k, std::vector<int64_t> const& sortedIndices,
+    batchedGemm::batchedGemm::BatchedGemmConfig const* configs)
+{
+
+    // Function to bubble up the pre-determined config.
+    auto bubbleUpConfig = [&configs](std::vector<int64_t> const& sortedIndices, auto&& pred) -> std::vector<int64_t>
+    {
+        std::vector<int64_t> prioritizedIndices_;
+        // Copy matching configs to new vector
+        std::copy_if(sortedIndices.begin(), sortedIndices.end(), std::back_inserter(prioritizedIndices_),
+            [&configs, &pred](int idx)
+            {
+                BatchedGemmConfig const& config = configs[idx];
+                return (pred(config));
+            });
+        // Copy the rest of the configs to new vector, if not already copied
+        std::copy_if(sortedIndices.begin(), sortedIndices.end(), std::back_inserter(prioritizedIndices_),
+            [&prioritizedIndices_](int idx) {
+                return std::find(prioritizedIndices_.begin(), prioritizedIndices_.end(), idx)
+                    == prioritizedIndices_.end();
+            });
+        return prioritizedIndices_;
+    };
+
+    // Init empty vector
+    std::vector<int64_t> prioritizedIndices;
+
+    //
+    // Qwen3
+    //
+
+    // Qwen3_235B_TP1_EP8_MoE_FC1 m=3072 k=4096
+    if (n /* out_dim */ == 3072 && k /* in_dim */ == 4096)
+    {
+        auto pred = [](BatchedGemmConfig const& config)
+        {
+            BatchedGemmOptions const& options = config.mOptions;
+            return options.mNumStages == 4 && options.mNumStagesMma == 1 && options.mTileK == 512
+                && options.mTileScheduler == TileScheduler::Static;
+        };
+        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
+    }
+    // Qwen3_235B_TP1_EP8_MoE_FC2 m=4096 k=1536
+    else if (n /* out_dim */ == 4096 && k /* in_dim */ == 1536)
+    {
+        auto pred = [](BatchedGemmConfig const& config)
+        {
+            BatchedGemmOptions const& options = config.mOptions;
+            return options.mNumStages == 4 && options.mNumStagesMma == 1 && options.mTileK == 512
+                && options.mTileScheduler == TileScheduler::Static;
+        };
+        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
+    }
+    // Qwen3_235B_TP2_EP4_MoE_FC1 m=1536 k=4096
+    else if (n /* out_dim */ == 1536 && k /* in_dim */ == 4096)
+    {
+        auto pred = [](BatchedGemmConfig const& config)
+        {
+            BatchedGemmOptions const& options = config.mOptions;
+            return options.mNumStages == 4 && options.mNumStagesMma == 1 && options.mTileK == 512
+                && options.mTileScheduler == TileScheduler::Static;
+        };
+        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
+    }
+    // Qwen3_235B_TP2_EP4_MoE_FC2 m=4096 k=768
+    else if (n /* out_dim */ == 4096 && k /* in_dim */ == 768)
+    {
+        auto pred = [](BatchedGemmConfig const& config)
+        {
+            BatchedGemmOptions const& options = config.mOptions;
+            return options.mNumStages == 4 && options.mNumStagesMma == 2 && options.mTileK == 512
+                && options.mTileScheduler == TileScheduler::Persistent;
+        };
+        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
+    }
+    // Qwen3_235B_TP4_EP2_MoE_FC1 m=768 k=4096
+    else if (n /* out_dim */ == 768 && k /* in_dim */ == 4096)
+    {
+        auto pred = [](BatchedGemmConfig const& config)
+        {
+            BatchedGemmOptions const& options = config.mOptions;
+            return options.mNumStages == 4 && options.mNumStagesMma == 1 && options.mTileK == 512
+                && options.mTileScheduler == TileScheduler::Static;
+        };
+        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
+    }
+    // Qwen3_235B_TP4_EP2_MoE_FC2 m=4096 k=384
+    else if (n /* out_dim */ == 4096 && k /* in_dim */ == 384)
+    {
+        auto pred = [](BatchedGemmConfig const& config)
+        {
+            BatchedGemmOptions const& options = config.mOptions;
+            return options.mNumStages == 4 && options.mNumStagesMma == 2 && options.mTileK == 512
+                && options.mTileScheduler == TileScheduler::Persistent;
+        };
+        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
+    }
+    // Qwen3_235B_TP8_EP1_MoE_FC1 m=384 k=4096
+    else if (n /* out_dim */ == 384 && k /* in_dim */ == 4096)
+    {
+        auto pred = [](BatchedGemmConfig const& config)
+        {
+            BatchedGemmOptions const& options = config.mOptions;
+            return options.mNumStages == 4 && options.mNumStagesMma == 1 && options.mTileK == 512
+                && options.mTileScheduler == TileScheduler::Static;
+        };
+        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
+    }
+    // Qwen3_235B_TP8_EP1_MoE_FC2 m=4096 k=192
+    else if (n /* out_dim */ == 4096 && k /* in_dim */ == 192)
+    {
+        auto pred = [](BatchedGemmConfig const& config)
+        {
+            BatchedGemmOptions const& options = config.mOptions;
+            return options.mNumStages == 4 && options.mNumStagesMma == 2 && options.mTileK == 256
+                && options.mTileScheduler == TileScheduler::Persistent;
+        };
+        prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
+    }
+    //
+    // Fall back
+    //
+    else
+    {
+        prioritizedIndices = sortedIndices;
+    }
+
+    return prioritizedIndices;
+}
 
 TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunnerOptions const& options_)
     : mOptions(options_)
@@ -44,7 +176,8 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         // When we include low-latency kernels we can set transposeMmaOutput via constructor
         if (options.mDtypeA == mOptions.eltType && options.mDtypeC == mOptions.outputType
             && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
-            && options.mTransposeMmaOutput == mOptions.transposeMmaOutput && options.mRouteAct == mOptions.routeAct
+            && options.mTransposeMmaOutput == mOptions.transposeMmaOutput
+            && (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct
             && options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch
             && tileSize == mOptions.tileSize)
         {
@@ -227,9 +360,9 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
     gemmData.mProblemDimensions.mWorldSize = 1;
     gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
     // Sort configs by options
-    std::vector<int32_t> sortedIndices = mPassingConfigIndices;
+    std::vector<int64_t> sortedIndices = mPassingConfigIndices;
     std::sort(sortedIndices.begin(), sortedIndices.end(),
-        [&configs](int32_t idx0, int32_t idx1)
+        [&configs](int64_t idx0, int64_t idx1)
         {
             auto const& optionsA = configs[idx0].mOptions;
             auto const& optionsB = configs[idx1].mOptions;
@@ -247,7 +380,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
             }
 
             // Then by tile scheduler (persistent scheduler is better for FC2 in MoE)
-            if (!optionsA.mRouteAct)
+            if (doesRouteImplUseNoRoute(optionsA.mRouteImpl))
             {
                 return optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
             }
@@ -255,8 +388,9 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
             return optionsA.mTileM > optionsB.mTileM;
         });
 
+    std::vector<int64_t> prioritizedIndices = prioritizePredefinedConfigs(m, n, k, sortedIndices, configs);
     std::vector<int64_t> validConfigIndices;
-    for (auto const& configIndex : sortedIndices)
+    for (auto const& configIndex : prioritizedIndices)
     {
         auto const& config = configs[configIndex];
         auto isValidConfig = bmm.isValidConfig(config, gemmData);

@@ -30,7 +30,8 @@ from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
-from .llm_args import (CalibConfig, EagleDecodingConfig, KvCacheConfig, LlmArgs,
+from .llm_args import (CalibConfig, DraftTargetDecodingConfig,
+                       EagleDecodingConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
                        MTPDecodingConfig, NGramDecodingConfig, _ModelFormatKind,
                        _ModelWrapper, _ParallelConfig, get_model_format,
@@ -871,6 +872,7 @@ __all__ = [
     'MedusaDecodingConfig',
     'MTPDecodingConfig',
     'NGramDecodingConfig',
+    'DraftTargetDecodingConfig',
     'ContextChunkingPolicy',
     'CapacitySchedulerPolicy',
     'BuildConfig',

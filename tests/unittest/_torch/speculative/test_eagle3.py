@@ -39,18 +39,20 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
     draft_len = 4
     spec_config = EagleDecodingConfig(
         max_draft_len=draft_len,
-        pytorch_eagle_weights_path=eagle_model_dir,
+        pytorch_weights_path=eagle_model_dir,
         # Llama 3 does not support one model eagle.
         eagle3_one_model=False)
 
     llm_spec = LLM(
         model=target_model_dir,
         **pytorch_config,
+        # This max_seq_len is larger than the one specified
+        # in the llama 3 8B eagle's config. We want to make sure
+        # that the draft model won't go above its max in warmup
+        # in this test.
+        max_seq_len=8192,
         kv_cache_config=kv_cache_config,
-        speculative_config=spec_config,
-        # TODO: https://nvbugspro.nvidia.com/bug/5319281
-        max_num_tokens=2048,
-        max_seq_len=2048)
+        speculative_config=spec_config)
 
     sampling_params = SamplingParams(
         max_tokens=32,
@@ -88,9 +90,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
 
     llm_ref = LLM(model=target_model_dir,
                   **pytorch_config,
-                  kv_cache_config=kv_cache_config,
-                  max_num_tokens=2048,
-                  max_seq_len=2048)
+                  kv_cache_config=kv_cache_config)
 
     results_ref = llm_ref.generate(prompts, sampling_params)
     generated_text_ref = [result.outputs[0].text for result in results_ref]

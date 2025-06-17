@@ -1,12 +1,11 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,6 +22,8 @@
 
 static char const* GEMM_ALLREDUCE_PLUGIN_VERSION = "1";
 static char const* GEMM_ALLREDUCE_PLUGIN_NAME = "GemmAllReduce";
+template <nvinfer1::DataType T>
+using CutlassType = ::tensorrt_llm::kernels::cutlass_kernels::CutlassType<T>;
 
 namespace tensorrt_llm::plugins
 {
@@ -32,17 +33,16 @@ static std::pair<K, V> makeEntry()
     return {std::make_tuple(ElementA, ElementB, ElementD),
         [&]()
         {
-            using GemmTraits = tensorrt_llm::kernels::cutlass_kernels::GemmTypes<typename CutlassType<ElementA>::type,
-                typename CutlassType<ElementB>::type,
-                typename CutlassType<ElementD>::type,                                         // C, unused
-                typename CutlassType<ElementD>::type,
-                std::conditional_t<ElementA == DataType::kFP4, cutlass::float_ue4m3_t, void>, // SFA
-                std::conditional_t<ElementB == DataType::kFP4, cutlass::float_ue4m3_t, void>, // SFB
-                cutlass::layout::RowMajor, cutlass::layout::ColumnMajor,
-                cutlass::layout::RowMajor,                                                    // C, unused
-                cutlass::layout::RowMajor>;
-
-            return new GemmAllReduceImplRunner<GemmTraits>();
+            using GemmTraits
+                = cutlass_kernels::GemmTypes<typename CutlassType<ElementA>::type, typename CutlassType<ElementB>::type,
+                    typename CutlassType<ElementD>::type,                                         // C, unused
+                    typename CutlassType<ElementD>::type,
+                    std::conditional_t<ElementA == DataType::kFP4, cutlass::float_ue4m3_t, void>, // SFA
+                    std::conditional_t<ElementB == DataType::kFP4, cutlass::float_ue4m3_t, void>, // SFB
+                    cutlass::layout::RowMajor, cutlass::layout::ColumnMajor,
+                    cutlass::layout::RowMajor,                                                    // C, unused
+                    cutlass::layout::RowMajor>;
+            return new cutlass_kernels::GemmAllReduceImplRunner<GemmTraits>();
         }};
 }
 
@@ -101,15 +101,16 @@ GemmAllReducePlugin::GemmAllReducePlugin(GemmAllReducePluginOptions const& optio
     auto key = std::make_tuple(mOptions.typeA, mOptions.typeB, mOptions.typeD);
 
     TLLM_CHECK_WITH_INFO(mTypedInstantiators.count(key) > 0, "No cutlass gemm for impl.");
-    mGemm = std::shared_ptr<GemmAllReduceImplInterface>(mTypedInstantiators[key]());
+    mGemm = std::shared_ptr<cutlass_kernels::GemmAllReduceImplInterface>(mTypedInstantiators[key]());
 }
 
 void GemmAllReducePlugin::allocatePersistentWorkspace()
 {
     TLLM_CHECK(mOptions.maxProblemShape.isInitialized());
 
-    GemmAllReduceImplInterface::LaunchConfig smallest_tile_config = mGemm->getSupportedLaunchConfigs()[0];
-    GemmAllReduceImplInterface::ProblemArgs args;
+    cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig smallest_tile_config
+        = mGemm->getSupportedLaunchConfigs()[0];
+    cutlass_kernels::GemmAllReduceImplInterface::ProblemArgs args;
     args.argProblemShape(mOptions.maxProblemShape.maxM, mOptions.maxProblemShape.n, mOptions.maxProblemShape.k, 1)
         .argRanks(mRank, mOptions.group)
         .argLaunchConfig(smallest_tile_config);
@@ -352,13 +353,6 @@ int GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensor
 
     auto bestLaunchConfig = mProfiler->getBestConfig(M, mGemmId).value();
 
-    // For 2x GPUs, switch AR is less efficient that unicast AR.
-    // Since the gemmPluginProfiler does not run across ranks, it may
-    // not select SM based reduction, therefore force override this.
-    // TODO: remove this override when profiling across multiple GPUs
-    // is supported.
-    bestLaunchConfig.reduce_location = mOptions.groupSize <= 2 ? ReduceLocationType::kSM : ReduceLocationType::kSWITCH;
-
     void const* activation = inputs[mArgInvMap[TensorArg::IN_ACTIVATION]];
     void const* weight = inputs[mArgInvMap[TensorArg::IN_WEIGHT]];
     void* D_out_uc = outputs[mArgInvMap[TensorArg::OUT_D_UC] - mNbInputs];
@@ -371,7 +365,7 @@ int GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensor
     TLLM_CHECK_WITH_INFO(D_out_mc != nullptr, "GemmAllReducePlugin out_mc is NULL");
     TLLM_CHECK_WITH_INFO(D_out_ipc != nullptr, "GemmAllReducePlugin out_ipc is NULL");
 
-    GemmAllReduceImplInterface::ProblemArgs args;
+    cutlass_kernels::GemmAllReduceImplInterface::ProblemArgs args;
     args.argProblemShape(M, N, K, 1)
         .argA(activation)
         .argB(weight)

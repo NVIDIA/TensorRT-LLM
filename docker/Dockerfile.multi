@@ -72,6 +72,10 @@ RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
 RUN pip3 uninstall -y opencv && rm -rf /usr/local/lib/python3*/dist-packages/cv2/
 RUN pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
 
+# Install DeepEP
+COPY docker/common/install_deep_ep.sh install_deep_ep.sh
+RUN bash ./install_deep_ep.sh && rm install_deep_ep.sh
+
 # WARs against security issues inherited from pytorch:25.04
 # * https://github.com/advisories/GHSA-vqfr-h8mv-ghfj
 # * https://github.com/advisories/GHSA-7cx3-6m66-7c5m

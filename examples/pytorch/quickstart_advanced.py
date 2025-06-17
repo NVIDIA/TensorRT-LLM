@@ -2,8 +2,9 @@ import argparse
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
-from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
-                                 MTPDecodingConfig, NGramDecodingConfig)
+from tensorrt_llm.llmapi import (DraftTargetDecodingConfig, EagleDecodingConfig,
+                                 KvCacheConfig, MTPDecodingConfig,
+                                 NGramDecodingConfig, TorchCompileConfig)
 
 example_prompts = [
     "Hello, my name is",
@@ -108,7 +109,10 @@ def add_llm_args(parser):
     # Speculative decoding
     parser.add_argument('--spec_decode_algo', type=str, default=None)
     parser.add_argument('--spec_decode_nextn', type=int, default=1)
-    parser.add_argument('--eagle_model_dir', type=str, default=None)
+    parser.add_argument('--draft_model_dir',
+                        '--eagle_model_dir',
+                        type=str,
+                        default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
     parser.add_argument('--use_one_model', default=False, action='store_true')
 
@@ -123,6 +127,13 @@ def add_llm_args(parser):
     parser.add_argument('--trust_remote_code',
                         default=False,
                         action='store_true')
+    parser.add_argument('--return_context_logits',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--return_generation_logits',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--logprobs', default=False, action='store_true')
     return parser
 
 
@@ -158,8 +169,12 @@ def setup_llm(args):
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_nextn,
-            pytorch_eagle_weights_path=args.eagle_model_dir,
+            pytorch_weights_path=args.draft_model_dir,
             eagle3_one_model=args.use_one_model)
+    elif spec_decode_algo == "DRAFT_TARGET":
+        spec_config = DraftTargetDecodingConfig(
+            max_draft_len=args.spec_decode_nextn,
+            pytorch_weights_path=args.draft_model_dir)
     elif spec_decode_algo == "NGRAM":
         spec_config = NGramDecodingConfig(
             prompt_lookup_num_tokens=args.spec_decode_nextn,
@@ -171,41 +186,48 @@ def setup_llm(args):
     else:
         spec_config = None
 
-    llm = LLM(model=args.model_dir,
-              backend='pytorch',
-              disable_overlap_scheduler=args.disable_overlap_scheduler,
-              kv_cache_dtype=args.kv_cache_dtype,
-              kv_cache_config=kv_cache_config,
-              attn_backend=args.attention_backend,
-              use_cuda_graph=args.use_cuda_graph,
-              cuda_graph_padding_enabled=args.cuda_graph_padding_enabled,
-              cuda_graph_batch_sizes=args.cuda_graph_batch_sizes,
-              load_format=args.load_format,
-              print_iter_log=args.print_iter_log,
-              enable_iter_perf_stats=args.print_iter_log,
-              torch_compile_enabled=args.use_torch_compile,
-              torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph,
-              moe_backend=args.moe_backend,
-              enable_trtllm_sampler=args.enable_trtllm_sampler,
-              max_seq_len=args.max_seq_len,
-              max_batch_size=args.max_batch_size,
-              max_num_tokens=args.max_num_tokens,
-              enable_attention_dp=args.enable_attention_dp,
-              tensor_parallel_size=args.tp_size,
-              pipeline_parallel_size=args.pp_size,
-              moe_expert_parallel_size=args.moe_ep_size,
-              moe_tensor_parallel_size=args.moe_tp_size,
-              moe_cluster_parallel_size=args.moe_cluster_size,
-              enable_chunked_prefill=args.enable_chunked_prefill,
-              speculative_config=spec_config,
-              trust_remote_code=args.trust_remote_code)
+    llm = LLM(
+        model=args.model_dir,
+        backend='pytorch',
+        disable_overlap_scheduler=args.disable_overlap_scheduler,
+        kv_cache_dtype=args.kv_cache_dtype,
+        kv_cache_config=kv_cache_config,
+        attn_backend=args.attention_backend,
+        use_cuda_graph=args.use_cuda_graph,
+        cuda_graph_padding_enabled=args.cuda_graph_padding_enabled,
+        cuda_graph_batch_sizes=args.cuda_graph_batch_sizes,
+        load_format=args.load_format,
+        print_iter_log=args.print_iter_log,
+        enable_iter_perf_stats=args.print_iter_log,
+        torch_compile_config=TorchCompileConfig(
+            torch_compile_fullgraph=args.use_torch_compile,
+            torch_compile_inductor_enabled=args.use_torch_compile,
+            torch_compile_piecewise_cuda_graph=args.use_piecewise_cuda_graph)
+        if args.use_torch_compile else None,
+        moe_backend=args.moe_backend,
+        enable_trtllm_sampler=args.enable_trtllm_sampler,
+        max_seq_len=args.max_seq_len,
+        max_batch_size=args.max_batch_size,
+        max_num_tokens=args.max_num_tokens,
+        enable_attention_dp=args.enable_attention_dp,
+        tensor_parallel_size=args.tp_size,
+        pipeline_parallel_size=args.pp_size,
+        moe_expert_parallel_size=args.moe_ep_size,
+        moe_tensor_parallel_size=args.moe_tp_size,
+        moe_cluster_parallel_size=args.moe_cluster_size,
+        enable_chunked_prefill=args.enable_chunked_prefill,
+        speculative_config=spec_config,
+        trust_remote_code=args.trust_remote_code,
+        gather_generation_logits=args.return_generation_logits)
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
-    )
+        return_context_logits=args.return_context_logits,
+        return_generation_logits=args.return_generation_logits,
+        logprobs=args.logprobs)
     return llm, sampling_params
 
 
@@ -220,6 +242,15 @@ def main():
         prompt = output.prompt
         generated_text = output.outputs[0].text
         print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+        if args.return_context_logits:
+            print(f"[{i}] Context logits: {output.context_logits}")
+        if args.return_generation_logits:
+            print(
+                f"[{i}] Generation logits: {output.outputs[0].generation_logits}"
+            )
+        if args.logprobs:
+            print(f"[{i}] Logprobs: {output.outputs[0].logprobs}")
 
 
 if __name__ == '__main__':

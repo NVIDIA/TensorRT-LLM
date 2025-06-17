@@ -21,6 +21,7 @@ def _register_fake():
         strategy,
         op,
         eps,
+        trigger_completion_at_end,
     ):
         from tensorrt_llm.functional import AllReduceFusionOp
         if op == int(AllReduceFusionOp.NONE):
@@ -98,6 +99,22 @@ def _register_fake():
         return ret
 
     @torch.library.register_fake("trtllm::cublas_mm")
+    def _(mat_a, mat_b, bias, out_dtype):
+        shape = list(mat_a.shape)
+        shape[-1] = mat_b.shape[-1]
+        ret = mat_a.new_empty(
+            shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
+        return ret
+
+    @torch.library.register_fake("trtllm::dsv3_router_gemm_op")
+    def _(mat_a, mat_b, bias, out_dtype):
+        shape = list(mat_a.shape)
+        shape[-1] = mat_b.shape[-1]
+        ret = mat_a.new_empty(
+            shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
+        return ret
+
+    @torch.library.register_fake("trtllm::dsv3_fused_a_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
         shape = list(mat_a.shape)
         shape[-1] = mat_b.shape[-1]
