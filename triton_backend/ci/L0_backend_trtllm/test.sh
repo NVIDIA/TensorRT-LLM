@@ -228,49 +228,13 @@ for NUM_GPU in "${NUM_GPUS_TO_TEST[@]}"; do
 
     run_server "${SERVER_ARGS}"
     wait_for_server_ready ${SERVER_TIMEOUT} ${SERVER_PID[@]}
-    if [ "$WAIT_RET" != "0" ]; then
-        # Cleanup
-        kill $SERVER_PID > /dev/null 2>&1 || true
-        echo -e "\n***\n*** Failed to start $SERVER\n***"
+
+    # Expect invalid GPT model type error to be gracefully handled
+    if [ `grep -c "Static batching type is deprecated" $SERVER_LOG` == "0" ]; then
+        echo -e "\n***\n*** GPT model type error not handled gracefully: line ${LINENO}\n***"
         cat $SERVER_LOG
         exit 1
     fi
-
-    set -e
-    python3 ${TOOLS_DIR}/inflight_batcher_llm/benchmark_core_model.py \
-        --max-input-len=500 \
-        dataset --dataset=${DATASET} \
-        --tokenizer-dir=${TOKENIZER_DIR}
-
-    if [ $? -ne 0 ]; then
-        cat $SERVER_LOG
-        echo -e "\n***\n*** Error executing v1 benchmark_core_model test with ${NUM_GPU}GPU(s): line ${LINENO}\n***"
-        kill_server
-        wait_for_server_terminated ${SERVER_TIMEOUT} ${SERVER_PID[@]}
-        RET=1
-    fi
-    set +e
-
-    set -e
-    python3 ${TOOLS_DIR}/inflight_batcher_llm/end_to_end_test.py \
-        --max-input-len=500 \
-        --dataset=${DATASET}
-
-    if [ $? -ne 0 ]; then
-        cat $SERVER_LOG
-        echo -e "\n***\n*** Error executing v1 end-to-end test with ${NUM_GPU}GPU(s): line ${LINENO}\n***"
-        kill_server
-        wait_for_server_terminated ${SERVER_TIMEOUT} ${SERVER_PID[@]}
-        RET=1
-    fi
-    set +e
-
-    # Make sure the metrics is retrieved after the server has updated the metrics internally
-    sleep ${SLEEP_DURATION}
-    curl localhost:8002/metrics -o ${NUM_GPU}gpu_v1_no_stream_metrics.out
-
-    kill_server
-    wait_for_server_terminated ${SERVER_TIMEOUT} ${SERVER_PID[@]}
 
     # inflight batching ON
     # streaming OFF
