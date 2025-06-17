@@ -505,7 +505,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252559")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True) if torch_compile else None
+            torch_compile_fullgraph=True,
+            torch_compile_piecewise_cuda_graph=cuda_graph
+        ) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -550,7 +552,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("PP with torch.compile is not supported yet.")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True) if torch_compile else None
+            torch_compile_fullgraph=True,
+            torch_compile_piecewise_cuda_graph=cuda_graph
+        ) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -573,7 +577,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_device_not_contain(["H100", "H200"])
+    @skip_no_hopper
     @parametrize_with_ids(
         "torch_compile",
         [False, pytest.param(True, marks=skip_device_contain_gb200)])
@@ -593,7 +597,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252559")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True) if torch_compile else None
+            torch_compile_fullgraph=True,
+            torch_compile_piecewise_cuda_graph=cuda_graph
+        ) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -654,7 +660,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_device_not_contain(["H100", "H200"])
+    @skip_no_hopper
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids("attention_dp", [False, True])
     def test_fp8_block_scales_cuda_graph_padding_4gpus(self, mtp_nextn,
@@ -686,7 +692,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_device_not_contain(["H100", "H200"])
+    @skip_no_hopper
     @parametrize_with_ids(
         "torch_compile",
         [False, pytest.param(True, marks=skip_device_contain_gb200)])
@@ -713,7 +719,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("PP with torch.compile is not supported yet.")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True) if torch_compile else None
+            torch_compile_fullgraph=True,
+            torch_compile_piecewise_cuda_graph=cuda_graph
+        ) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
@@ -800,13 +808,14 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252559")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True) if torch_compile else None
+            torch_compile_fullgraph=True,
+            torch_compile_piecewise_cuda_graph=cuda_graph
+        ) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
             torch_compile_config=torch_compile_config,
         )
-
         quant_config = QuantConfig()
         quant_config.quant_algo = QuantAlgo.NVFP4
         if fp8kv:
@@ -855,7 +864,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("PP with torch.compile is not supported yet.")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
-            torch_compile_fullgraph=True) if torch_compile else None
+            torch_compile_fullgraph=True,
+            torch_compile_piecewise_cuda_graph=cuda_graph
+        ) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             use_cuda_graph=cuda_graph,
