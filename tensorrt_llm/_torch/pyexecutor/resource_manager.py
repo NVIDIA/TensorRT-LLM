@@ -721,6 +721,7 @@ class BaseDraftTokenManager(BaseResourceManager):
         may be arbitrarily long.
 
         You can produce the draft tokens in any manner that you want.
+        conflict
         """
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
