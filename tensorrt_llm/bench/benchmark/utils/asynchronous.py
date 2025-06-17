@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from contextlib import asynccontextmanager
 from itertools import chain
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple, Union
+from threading import Event
 
-from zmq import PUSH
+from zmq import PUSH, Socket
 from zmq.asyncio import Context
 
 from tensorrt_llm import LLM, SamplingParams
@@ -15,6 +17,9 @@ from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
+
+
+RequestTuple = Tuple[InferenceRequest, SamplingParams, PostprocParams]
 
 
 class LlmManager:
@@ -27,26 +32,29 @@ class LlmManager:
                  concurrency: int = -1,
                  modality: Optional[str] = None) -> None:
         self.llm = llm
-        self._inbox: asyncio.Queue[Tuple[InferenceRequest,
-                                         SamplingParams]] = asyncio.Queue()
+        self.streaming = streaming
+        self.modality = modality
+
+        # Task and thread tracking
+        self._tasks: Set[asyncio.Task] = set()
+        self._backend_task = None
+        self._iteration_thread = None
+
+        # Queues for communication between the main thread and the backend thread
+        self._inbox: asyncio.Queue[RequestTuple] = asyncio.Queue()
         self._outbox = outbox
+
 
         self._stop = asyncio.Event()
         self._running = asyncio.Event()
-        self._tasks: Set[asyncio.Task] = set()
-        self._backend_task = None
-        self._iteration_log_task = None
         self._concurrency_semaphore = asyncio.Semaphore(
             concurrency) if concurrency > 0 else None
-        self.streaming = streaming
-        self.request_seen = asyncio.Event()
-        self.modality = modality
+        self.request_seen = Event()
 
     async def process_request(self, request: InferenceRequest,
                               sampling_params: SamplingParams,
                               post_proc_params: PostprocParams):
         # Set up sampling params with inference request
-        self.request_seen.set()
         sampling_params.max_tokens = request.output_tokens
 
         async with semaphore_guard(self._concurrency_semaphore):
@@ -60,6 +68,8 @@ class LlmManager:
                 _postproc_params=post_proc_params,
                 streaming=self.streaming,
                 lora_request=request.lora_request)
+
+            self.request_seen.set()
             if self.streaming:
                 async for stream_output in output:
                     if time_on_first_token is None:
@@ -102,50 +112,51 @@ class LlmManager:
             except asyncio.CancelledError:
                 logger.info("Worker task cancelled.")
 
-    # This asynchronous function acts as a worker that logs iteration statistics.
-    # It connects to a given address using a PUSH socket and sends JSON-encoded
-    # statistics data until a stop signal is received.
-    async def iteration_worker(self, iteration_addr: str) -> None:
+    def statistics_worker_thread(self, iteration_addr: str) -> None:
         logger.info("Iteration log worker starting up...")
-        context = None
-        socket = None
 
-        try:
-            # Create a ZMQ context and socket for sending data
-            context = Context.instance(io_threads=1)
-            socket = context.socket(PUSH)
-            socket.connect(iteration_addr)
-
-            # Wait until a request is seen before proceeding
-            await self.request_seen.wait()
-            logger.debug(
-                f"Iteration log worker connected to '{iteration_addr}'.")
-
+        # This asynchronous function acts as a worker that logs iteration statistics.
+        # It connects to a given address using a PUSH socket and sends JSON-encoded
+        # statistics data until a stop signal is received.
+        async def iteration_worker(context: Context, socket: Socket) -> None:
             # Continuously send statistics data while the stop signal is not set
-            while not self._stop.is_set():
+            try:
+                while not self._stop.is_set():
+                    async for stats in self.llm.get_stats_async(2):
+                        await socket.send_json(stats)
+            except asyncio.CancelledError:
+                # Handle task cancellation
+                logger.debug("Iteration log task cancelled.")
+            except Exception as e:
+                # Raise any other exceptions encountered
+                raise e
+            finally:
+                # Wrap up by sending any remaining statistics data
+                logger.debug("Iteration log worker wrapping up...")
                 async for stats in self.llm.get_stats_async(2):
                     await socket.send_json(stats)
+                # Ensure the socket sends a termination message and is properly closed
+                logger.debug("Iteration log worker sending None...")
+                socket.send_json({"end": True})
 
-            # Wrap up by sending any remaining statistics data
-            logger.debug("Iteration log worker wrapping up...")
-            async for stats in self.llm.get_stats_async(2):
-                await socket.send_json(stats)
-        except asyncio.CancelledError:
-            # Handle task cancellation
-            logger.debug("Iteration log worker cancelled.")
-        except Exception as e:
-            # Raise any other exceptions encountered
-            raise e
+        # Create a ZMQ context and socket for sending data
+        logger.debug("Iteration log thread creating context and socket...")
+        context = Context.instance(io_threads=1)
+        socket = context.socket(PUSH)
+        socket.connect(iteration_addr)
+        logger.debug("Iteration log thread waiting for request...")
+        self.request_seen.wait()
+        logger.debug("Request seen, creating iteration log task...")
+
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            # Run the async worker in the thread's event loop
+            loop.run_until_complete(iteration_worker(context, socket))
         finally:
-            # Ensure the socket sends a termination message and is properly closed
-            logger.debug("Iteration log worker sending None...")
-            socket.send_json({"end": True})
-            if socket is not None:
-                logger.debug("Closing socket...")
-                socket.close()
-            if context is not None:
-                logger.debug("Terminating context...")
-                context.term()
+            # Clean up the event loop
+            loop.close()
 
         logger.info("Iteration log worker exiting.")
 
@@ -156,19 +167,24 @@ class LlmManager:
         for task in self._tasks:
             task.cancel()
         logger.info("All tasks cancelled.")
-        if self._iteration_log_task:
-            asyncio.gather(self._iteration_log_task)
+        if self._iteration_thread:
+            logger.info("Waiting for iteration log thread to complete.")
+            self._iteration_thread.join()
         logger.info("LLM Backend stopped.")
 
     @property
     def busy(self) -> bool:
         return bool(self._tasks)
 
-    def run(self, iteration_addr: str = None) -> None:
+    def run(self, iteration_addr: Union[str, None] = None) -> None:
         self._backend_task = asyncio.create_task(self.worker())
         if iteration_addr is not None:
-            self._iteration_task = asyncio.create_task(
-                self.iteration_worker(iteration_addr))
+            self._iteration_log_task = \
+                threading.Thread(
+                    target=self.statistics_worker_thread,
+                    args=(iteration_addr,)
+                )
+            self._iteration_log_task.start()
 
     async def enqueue(self, request: InferenceRequest,
                       sampling_params: SamplingParams,
