@@ -294,6 +294,9 @@ class GenerationResultBase:
                     handler(response.error_msg)
 
             response_result = response.result
+            if hasattr(response_result, "_result"):
+                response_result.deserialize()
+
             self._done = response_result.is_final
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
@@ -617,6 +620,11 @@ def compute_logprobs(
         if logits.dim() == 3:
             # reshape from [1, T, V] to [T, V]
             logits = logits.squeeze(0)
+
+        if tokens is not None and logits.size(0) > len(tokens):
+            # WAR for nvbug 5324291 where TRT backend might return more logits
+            # than output tokens.
+            logits = logits[:len(tokens)]
 
         logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
         topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)
