@@ -15,11 +15,14 @@ class DynasorGenerationController(Controller):
 
     # Certainty_threshold and chunk_size controls the compute saving level
     # Decreasing the certainty_threshold and chunk_size will save tokens but may risk at compromising accuracy.
-    def __init__(self,
-                 generation_dir,
-                 max_tokens=8192,
-                 certainty_threshold=3,
-                 chunk_size=64):
+    def __init__(
+        self,
+        generation_dir,
+        max_tokens=8192,
+        certainty_threshold=3,
+        chunk_size=64,
+        streaming=False,
+    ):
         """
         Initializes the controller with parameters controlling token limits and certainty thresholds.
 
@@ -46,6 +49,7 @@ class DynasorGenerationController(Controller):
             trust_remote_code=False,
             use_fast=True,
         )
+        self.streaming = streaming
 
     def process(self, tasks: List[GenerationTask], **kwargs):
         """
@@ -70,12 +74,14 @@ class DynasorGenerationController(Controller):
         proposer_task.temperature = 0.6
         proposer_task.top_p = 0.95
         proposer_task.worker_tag = self.WorkerTag.GENERATION
+        proposer_task.streaming = self.streaming
 
         probe_task = GenerationTask()
         probe_task.max_tokens = 20
         probe_task.temperature = 0.6
         probe_task.top_p = 0.95
         probe_task.worker_tag = self.WorkerTag.GENERATION
+        probe_task.streaming = self.streaming
 
         probe_answers = []
         probe_responses = []
@@ -96,9 +102,13 @@ class DynasorGenerationController(Controller):
             probe_task.input_str = current_prompt + self.probe_suffix
 
             # For the probe task, append the suffix to force a chain-of-thought leading to an answer.
+            print("[DynasorGenerationController] probe_task")
             yield [probe_task]
 
             # Retrieve the output from the probe task.
+            # if probe_task.streaming:
+            #     print("[DynasorGenerationController] wait result for probe_task")
+            #     probe_task.result.result()
             probe_text = probe_task.output_str
 
             # Extract the potential answer from the probe response.
@@ -120,6 +130,7 @@ class DynasorGenerationController(Controller):
                         probe_answers[-self.certainty_threshold:])
                     == self.certainty_threshold
                     and sum(probe_certain_count) == self.certainty_threshold):
+                tasks[0].result = probe_task.result
                 # If the current prompt indicates the chain-of-thought phase has ended, use one type of suffix.
                 if "</think>" in current_prompt:
                     tasks[0].output_str = (current_prompt + self.answer_suffix +
@@ -133,13 +144,18 @@ class DynasorGenerationController(Controller):
                     return
 
             # if not confident, do another round of generation
+            print("[DynasorGenerationController] proposer_task")
             yield [proposer_task]
 
             # Append the newly generated text from the proposer to the current prompt for the next iteration.
+            # if proposer_task.streaming:
+            #     print("[DynasorGenerationController] wait result for proposer_task")
+            #     proposer_task.result.result()
             current_prompt += proposer_task.output_str
 
         # If the maximum token limit is reached without satisfying the certainty condition,
         # output the accumulated prompt as the final output.
+        tasks[0].result = proposer_task.result
         tasks[0].output_str = current_prompt
         return
 

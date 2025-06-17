@@ -28,7 +28,7 @@ def test_sync(prompts, proposer_worker):
     )
     results = llm.generate(prompts)
     for result in results:
-        print(result.output.output_str)
+        print(result.output.outputs[0].text)
     print(f'main shutting down...')
     llm.shutdown()
     print(f'worker shutting down...')
@@ -40,16 +40,24 @@ def test_async(prompt, proposer_worker):
 
     async def test_async_func(prompt, proposer_worker):
         prototype_controller = NativeGenerationController(
-            sampling_params={"temperature": 0.9})
+            sampling_params={"temperature": 0.9}, streaming=True)
         llm = ScaffoldingLlm(
             prototype_controller,
             {NativeGenerationController.WorkerTag.GENERATION: proposer_worker},
         )
+        i = 0
 
-        future = llm.generate_async(prompt)
+        async for result in llm.generate_async(prompt):
+            i += 1
+            print(">>>", i, result)
+            async for output in result.output:
+                print(len(output.outputs[0].text))
+            # print(result.output,
+            #       end='\n' if result.finished else '\r',
+            #       flush=True)
 
-        result = await future.aresult()
-        print(result.output.output_str)
+        # result = await future.aresult()
+        # print(result.output.output_str)
 
         print(f'main shutting down...')
         llm.shutdown()
