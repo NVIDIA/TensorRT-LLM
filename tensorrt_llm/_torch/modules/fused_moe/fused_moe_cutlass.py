@@ -27,6 +27,48 @@ from ..gated_mlp import swiglu
 
 import math
 
+
+USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE = os.environ.get("USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE", "0") == "1"
+PRINT_TENSOR = os.environ.get("PRINT_TENSOR", "0") == "1"
+print(f"limin: fused_moe_cutlass.py: USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE = {USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE}, PRINT_TENSOR = {PRINT_TENSOR}")
+
+if USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE:
+    output_dir = "_opt"
+else:
+    output_dir = ""
+
+def save_tensor_to_file(tensor, dir_name, filename, dtype="float"):
+    # 确保tensor在CPU上并转换为numpy数组
+    if tensor.is_cuda:
+        tensor_cpu = tensor.cpu()
+    else:
+        tensor_cpu = tensor
+    if dtype == "float":
+        numpy_array = tensor_cpu.detach().float().numpy()
+    elif dtype == "int":
+        numpy_array = tensor_cpu.detach().numpy()
+    else:
+        raise ValueError(f"Invalid dtype: {dtype}")
+
+    # 创建目录(如果不存在)
+    import os
+    os.makedirs(dir_name, exist_ok=True)
+    
+    # 保存为npy格式
+    import numpy as np
+    np.save(f"{dir_name}/{filename}.npy", numpy_array)
+    
+    # 同时保存一些基本信息到文本文件
+    with open(f"{dir_name}/{filename}.txt", "w") as f:
+        f.write(f"Tensor shape: {tensor.shape}\n")
+        f.write(f"Tensor dtype: {tensor.dtype}\n")
+        f.write(f"Tensor device: {tensor.device}\n")
+        f.write(f"Tensor mean: {tensor.float().mean().item()}\n")
+        f.write(f"Tensor std: {tensor.float().std().item()}\n")
+        f.write(f"Tensor min: {tensor.float().min().item()}\n") 
+        f.write(f"Tensor max: {tensor.float().max().item()}\n")
+
+
 def cute_dsl_fp8_group_blockwise_gemm_ref(a: torch.Tensor, b: torch.Tensor, a_sf: torch.Tensor, b_sf: torch.Tensor, group_m_list: torch.Tensor, use_offset_array: bool = False) -> torch.Tensor:
     m, k = a.shape[0], a.shape[1]
     l, n, k = b.shape[0], b.shape[1], b.shape[2]
@@ -550,6 +592,7 @@ class CutlassFusedMoE(MoE):
             all_rank_num_tokens: Optional[List[int]] = None,
             use_dp_padding: Optional[bool] = None,
             repeating_info: Tuple = (True, True),
+            output_id: Optional[int] = None,
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -779,6 +822,15 @@ class CutlassFusedMoE(MoE):
                         dtype=token_final_scales.dtype,
                         device=token_final_scales.device)
         
+        if output_id == 4 and PRINT_TENSOR:
+            save_tensor_to_file(x, "forward_chunk_moe_input" + output_dir, "forward_chunk_moe_input" + str(output_id) + "_" + str(self.layer_idx))
+            save_tensor_to_file(token_selected_slots, "forward_chunk_moe_selected_slots" + output_dir, "forward_chunk_moe_selected_slots" + str(output_id) + "_" + str(self.layer_idx), dtype="int")
+            save_tensor_to_file(token_final_scales, "forward_chunk_moe_final_scales" + output_dir, "forward_chunk_moe_final_scales" + str(output_id) + "_" + str(self.layer_idx))
+            save_tensor_to_file(w3_w1_weight, "forward_chunk_moe_w3_w1_weight" + output_dir, "forward_chunk_moe_w3_w1_weight" + str(output_id) + "_" + str(self.layer_idx))
+            save_tensor_to_file(w2_weight, "forward_chunk_moe_w2_weight" + output_dir, "forward_chunk_moe_w2_weight" + str(output_id) + "_" + str(self.layer_idx))
+            save_tensor_to_file(quant_scales[0], "forward_chunk_moe_quant_scales_0" + output_dir, "forward_chunk_moe_quant_scales_0" + str(output_id) + "_" + str(self.layer_idx))
+            save_tensor_to_file(quant_scales[1], "forward_chunk_moe_quant_scales_1" + output_dir, "forward_chunk_moe_quant_scales_1" + str(output_id) + "_" + str(self.layer_idx))
+
         if self.use_optimized_permute_and_finalize_scale:
             # print(f"limin: token_selected_slots = {token_selected_slots}")
             # print(f"limin: token_final_scales = {token_final_scales}")
@@ -929,6 +981,9 @@ class CutlassFusedMoE(MoE):
                 # Only in cutlass_min_latency_mode, the output is a list of tensors.
                 # Otherwise, the output should be unpacked as a single tensor.
                 final_hidden_states = final_hidden_states[0]
+        
+        if output_id == 4 and PRINT_TENSOR:
+            save_tensor_to_file(final_hidden_states, "forward_chunk_output" + output_dir, "forward_chunk_output" + str(output_id) + "_" + str(self.layer_idx))
 
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
@@ -965,6 +1020,7 @@ class CutlassFusedMoE(MoE):
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
+        output_id: Optional[int] = None,
     ) -> torch.Tensor:
         if self.use_dp:
             assert all_rank_num_tokens is not None
@@ -996,7 +1052,8 @@ class CutlassFusedMoE(MoE):
                 cutlass_min_latency_mode,
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
-                use_dp_padding=use_dp_padding)
+                use_dp_padding=use_dp_padding,
+                output_id=output_id)
             outputs = self.reducescatter_or_allreduce(
                 outputs,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
@@ -1050,7 +1107,8 @@ class CutlassFusedMoE(MoE):
                                 all_rank_num_tokens=all_rank_num_tokens_list[
                                     idx_chunk] if self.use_dp else None,
                                 use_dp_padding=use_dp_padding,
-                                repeating_info=(is_first_call, is_last_call))
+                                repeating_info=(is_first_call, is_last_call),
+                                output_id=output_id)
                         if idx_chunk > 0:
                             outputs_list[-1] = self.reducescatter_or_allreduce(
                                 outputs_list[-1],
@@ -1064,7 +1122,8 @@ class CutlassFusedMoE(MoE):
                             all_rank_num_tokens=all_rank_num_tokens_list[
                                 idx_chunk] if self.use_dp else None,
                             use_dp_padding=use_dp_padding,
-                            repeating_info=(is_first_call, is_last_call))
+                            repeating_info=(is_first_call, is_last_call),
+                            output_id=output_id)
                         with torch.cuda.stream(self.aux_stream):
                             outputs_list[-1] = self.reducescatter_or_allreduce(
                                 outputs_list[-1],
@@ -1077,7 +1136,8 @@ class CutlassFusedMoE(MoE):
                         router_logits,
                         all_rank_num_tokens=all_rank_num_tokens_list[idx_chunk]
                         if self.use_dp else None,
-                        repeating_info=(is_first_call, is_last_call))
+                        repeating_info=(is_first_call, is_last_call),
+                        output_id=output_id)
 
                 outputs_list.append(outputs)
             if not self.enable_alltoall:

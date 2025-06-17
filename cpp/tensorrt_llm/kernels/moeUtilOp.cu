@@ -918,13 +918,13 @@ void generateTokenPermutation(int const* unpermuted_token_selected_experts, int 
     // limin-todo:
     size_t const sorter_ws_size_bytes
         = cutlass_kernels::pad_to_multiple_of_16(sorter.getWorkspaceSize(expanded_num_rows, num_experts_per_node));
-    std::cout << "sorter_ws_size_bytes = " << sorter_ws_size_bytes << std::endl;
+    // std::cout << "sorter_ws_size_bytes = " << sorter_ws_size_bytes << std::endl;
     sorter.run((void*) sorter_ws, sorter_ws_size_bytes, unpermuted_token_selected_experts,
         permuted_token_selected_experts, unpermuted_source_token_ids, permuted_source_token_ids, expanded_num_rows,
         stream);
 
     sync_check_cuda_error(stream);
-    std::cout << "after call sorter.run" << std::endl;
+    // std::cout << "after call sorter.run" << std::endl;
 
     // Upper bound on number of expanded rows
     computeExpertFirstTokenOffset(

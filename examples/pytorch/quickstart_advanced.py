@@ -8,9 +8,9 @@ from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
 
 example_prompts = [
     "Hello, my name is",
-    "The president of the United States is",
-    "The capital of France is",
-    "The future of AI is",
+    # "The president of the United States is",
+    # "The capital of France is",
+    # "The future of AI is",
 ]
 
 
@@ -125,12 +125,12 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--return_context_logits',
-                        default=False,
+                        default=True,
                         action='store_true')
     parser.add_argument('--return_generation_logits',
-                        default=False,
+                        default=True,
                         action='store_true')
-    parser.add_argument('--logprobs', default=False, action='store_true')
+    parser.add_argument('--logprobs', default=True, action='store_true')
     return parser
 
 
