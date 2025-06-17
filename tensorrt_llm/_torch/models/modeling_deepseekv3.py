@@ -980,10 +980,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         input_ids: torch.IntTensor,
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
-        lm_head: Linear,
         embed_tokens: Embedding,
         attn_metadata: AttentionMetadata,
-        spec_metadata: MTPSpecMetadata,
+        all_rank_num_tokens: Optional[List[int]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -1024,7 +1023,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         # MoE
         hidden_states = self.mlp(
             hidden_states,
-            all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
+            all_rank_num_tokens=all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),

@@ -140,6 +140,13 @@ class MTPSpecMetadata(SpecMetadata):
     slot_ids: Optional[torch.Tensor] = None
     # The index of the batche inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
+    # The number of sequences for speculative model/layer of different rank
+    _all_rank_num_seqs: Optional[List[int]] = None
+    # This is used for attention dp in the MTP Eagle worker. The numbers of input
+    # tokens varies between the 1st draft forward and subsequent ones. To support
+    # CUDA graph, we use this tensor to store the number of input tokens for the
+    # subsequence draft forward.
+    subseq_all_rank_num_tokens: Optional[List[int]] = None
 
     def __post_init__(self) -> None:
         if self.mtp_hidden_states_manager is not None:
@@ -166,6 +173,16 @@ class MTPSpecMetadata(SpecMetadata):
             device='cuda',
         )
 
+    @property
+    def all_rank_num_seqs(self):
+        return self._all_rank_num_seqs
+
+    @all_rank_num_seqs.setter
+    def all_rank_num_seqs(self, value: List[int]):
+        self._all_rank_num_seqs = value
+        if self.spec_dec_mode.is_mtp_eagle():
+            self.subseq_all_rank_num_tokens = value
+
     def prepare(self):
         assert self.request_ids is not None
         num_seqs = len(self.request_ids)
@@ -176,10 +193,11 @@ class MTPSpecMetadata(SpecMetadata):
                                      pin_memory=True)
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
-        # MTP module need different number of input tokens in generation phase
-        if self.spec_dec_mode.is_mtp_eagle():
-            self.num_tokens -= (self.num_generations) * self.mtp_num_modules
-        else:
+        # MTP vanilla worker uses total max_draft_tokens input tokens in generation phase,
+        # while MTP Eagle worker uses (max_draft_tokens + 1) input tokens in the 1st draft
+        # forward and only one input token in the following draft forward.
+        # This num_tokens is used to set the all_rank_num_tokens for attention dp.
+        if not self.spec_dec_mode.is_mtp_eagle():
             self.num_tokens -= self.num_generations
 
         if self.mtp_hidden_states_manager is not None:  # MTP vanilla or use relaxed acceptance
@@ -375,9 +393,7 @@ class MTPWorker(nn.Module):
                 num_accepted_tokens=num_accepted_tokens,
                 spec_metadata=spec_metadata,
                 attn_metadata=attn_metadata)
-            hidden_states = mtp_layer(lm_head=lm_head,
-                                      embed_tokens=embed_tokens,
-                                      **draft_inputs)
+            hidden_states = mtp_layer(embed_tokens=embed_tokens, **draft_inputs)
             logits = mtp_layer.shared_head(hidden_states, lm_head,
                                            attn_metadata).float()
             previous_layer_draft_tokens = self.draft_sampler(logits)
@@ -1023,7 +1039,6 @@ class MTPWorker(nn.Module):
             "position_ids": position_ids,
             "hidden_states": return_hidden_states,
             "attn_metadata": attn_metadata,
-            "spec_metadata": spec_metadata,
         }
 
     def draft_sampler(
@@ -1096,10 +1111,11 @@ class MTPEagleWorker(MTPWorker):
         # Predict draft tokens
         next_draft_tokens = []
         for i in range(self.mtp_num_modules):
-            hidden_states = mtp_layers[0](lm_head=lm_head,
-                                          embed_tokens=embed_tokens,
-                                          **inputs)
             if i == 0:
+                hidden_states = mtp_layers[0](
+                    embed_tokens=embed_tokens,
+                    all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
+                    **inputs)
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
                                  (self.mtp_num_modules + 1)).long()
                 gather_ids_gen = (start_ids_gen +
@@ -1108,6 +1124,10 @@ class MTPEagleWorker(MTPWorker):
                 gather_ids = torch.concat(
                     [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
             else:
+                hidden_states = mtp_layers[0](embed_tokens=embed_tokens,
+                                              all_rank_num_tokens=spec_metadata.
+                                              subseq_all_rank_num_tokens,
+                                              **inputs)
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
             logits = mtp_layers[0].shared_head(hidden_states[gather_ids],
@@ -1115,11 +1135,6 @@ class MTPEagleWorker(MTPWorker):
             new_draft_token = self.draft_sampler(logits)
             next_draft_tokens.append(new_draft_token)
             # update inputs
-            last_tokens = torch.cumsum(
-                attn_metadata.seq_lens_cuda,
-                dim=0,
-                dtype=torch.long,
-            ) - 1
             hidden_states = hidden_states[gather_ids]
             position_ids = inputs["position_ids"][gather_ids] + 1
             # update attn_metadata
@@ -1151,15 +1166,11 @@ class MTPEagleWorker(MTPWorker):
                         reorder_block_ids_per_seq, non_blocking=True)
             elif hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
-            # support attention dp
-            if spec_metadata.all_rank_num_tokens is not None:
-                spec_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
             inputs = {
                 "input_ids": new_draft_token,
                 "position_ids": position_ids,
                 "hidden_states": hidden_states,
                 "attn_metadata": attn_metadata,
-                "spec_metadata": spec_metadata,
             }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
@@ -1216,5 +1227,4 @@ class MTPEagleWorker(MTPWorker):
             "position_ids": position_ids,
             "hidden_states": hidden_states,
             "attn_metadata": attn_metadata,
-            "spec_metadata": spec_metadata,
         }
