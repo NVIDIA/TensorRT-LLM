@@ -20,6 +20,7 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, local_mpi_rank,
@@ -1155,6 +1156,16 @@ class PyTorchModelEngine(ModelEngine):
         draft_lens = []
         mrope_config = defaultdict(list)
 
+        mtp_batch_idx = 0  # Temporary: MTP (and Eagle3OneModel) remain the only samplers to index new_tokens serially
+
+        def py_batch_idx(request: LlmRequest) -> int:
+            if not self.without_logits:
+                return request.seq_slot
+            nonlocal mtp_batch_idx
+            batch_idx = mtp_batch_idx
+            mtp_batch_idx += 1
+            return batch_idx
+
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             all_prompt_tokens = request.get_tokens(0)
@@ -1184,7 +1195,7 @@ class PyTorchModelEngine(ModelEngine):
                 ) if mrope_rotary_cos_sin.device == 'cpu' else mrope_rotary_cos_sin
                 mrope_config['mrope_rotary_cos_sin'].append(
                     mrope_rotary_cos_sin.to('cuda', non_blocking=True))
-            request.py_batch_idx = request.seq_slot
+            request.py_batch_idx = py_batch_idx(request)
 
         num_ctx_requests = len(scheduled_requests.context_requests)
         num_ctx_tokens = len(input_ids)
@@ -1266,11 +1277,11 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request_ids.append(request.py_request_id)
                 # update batch index
-                request.py_batch_idx = request.seq_slot
+                request.py_batch_idx = py_batch_idx(request)
             else:
                 # update batch index
                 previous_batch_idx = request.py_batch_idx
-                request.py_batch_idx = request.seq_slot
+                request.py_batch_idx = py_batch_idx(request)
                 # inputs
                 # overlap scheduler can only support the speculative decoding
                 # methods with a fixed number of draft tokens
@@ -1321,7 +1332,7 @@ class PyTorchModelEngine(ModelEngine):
             prompt_lengths.append(request.py_prompt_len)
             draft_lens.append(0)
 
-            request.py_batch_idx = request.seq_slot
+            request.py_batch_idx = py_batch_idx(request)
 
         previous_batch_len = len(previous_batch_indices)
 
