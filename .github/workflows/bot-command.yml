@@ -46,17 +46,20 @@ jobs:
             "Run `/bot [-h|--help]` to print this help message.\n\n" +
             "See details below for each supported subcommand.\n\n" +
             "<details>\n\n" +
-            "`run  [--disable-fail-fast --skip-test --stage-list \"A10-1, xxx\" --gpu-type \"A30, H100_PCIe\" --add-multi-gpu-test --only-multi-gpu-test --disable-multi-gpu-test --post-merge --extra-stage \"H100_PCIe-[Post-Merge]-1, xxx\"]`\n\n" +
+            "`run  [--disable-fail-fast --skip-test --stage-list \"A10-1, xxx\" --gpu-type \"A30, H100_PCIe\" --test-backend \"pytorch, cpp\" --add-multi-gpu-test --only-multi-gpu-test --disable-multi-gpu-test --post-merge --extra-stage --debug --detailed-log \"H100_PCIe-[Post-Merge]-1, xxx\"]`\n\n" +
             "Launch build/test pipelines. All previously running jobs will be killed.\n\n" +
             "`--disable-fail-fast ` *(OPTIONAL)* : Disable fail fast on build/tests/infra failures.\n\n" +
             "`--skip-test ` *(OPTIONAL)* : Skip all test stages, but still run build stages, package stages and sanity check stages. Note: Does **NOT** update GitHub check status.\n\n" +
             "`--stage-list \"A10-1, xxx\"` *(OPTIONAL)* : Only run the specified test stages. Examples: \"A10-1, xxx\". Note: Does **NOT** update GitHub check status.\n\n" +
             "`--gpu-type \"A30, H100_PCIe\"` *(OPTIONAL)* : Only run the test stages on the specified GPU types. Examples: \"A30, H100_PCIe\". Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--test-backend \"pytorch, cpp\"` *(OPTIONAL)* : Skip test stages which don't match the specified backends. Only support [pytorch, cpp, tensorrt, triton]. Examples: \"pytorch, cpp\" (does not run test stages with tensorrt backend). Note: Does **NOT** update GitHub pipeline status.\n\n" +
             "`--only-multi-gpu-test ` *(OPTIONAL)* : Only run the multi-GPU tests. Note: Does **NOT** update GitHub check status.\n\n" +
             "`--disable-multi-gpu-test ` *(OPTIONAL)* : Disable the multi-GPU tests. Note: Does **NOT** update GitHub check status.\n\n" +
             "`--add-multi-gpu-test ` *(OPTIONAL)* : Force run the multi-GPU tests. Will also run L0 pre-merge pipeline.\n\n" +
             "`--post-merge ` *(OPTIONAL)* : Run the L0 post-merge pipeline instead of the ordinary L0 pre-merge pipeline.\n\n" +
             "`--extra-stage \"H100_PCIe-[Post-Merge]-1, xxx\"` *(OPTIONAL)* : Run the ordinary L0 pre-merge pipeline and specified test stages. Examples: --extra-stage \"H100_PCIe-[Post-Merge]-1, xxx\".\n\n" +
+            "`--debug ` *(OPTIONAL)* : Enable access to the Blossom container for debugging purpose. Specify exactly one stage in the `stage-list` parameter to access the appropriate container environment. Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--detailed-log ` *(OPTIONAL)* : Enable flushing out all logs to the Jenkins console. This will significantly increase the log volume and may slow down the job.\n\n" +
             "### kill\n\n" +
             "`kill  `\n\n" +
             "Kill all running builds associated with pull request.\n\n" +
