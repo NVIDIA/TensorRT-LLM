@@ -1053,6 +1053,7 @@ class MTPEagleWorker(MTPWorker):
     def __init__(self, spec_config: MTPConfig):
         super().__init__(spec_config)
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
+        self.is_thop = False
 
     def forward(
         self,
@@ -1123,9 +1124,8 @@ class MTPEagleWorker(MTPWorker):
             position_ids = inputs["position_ids"][gather_ids] + 1
             # update attn_metadata
             if i == 0:
-                attn_metadata._seq_lens[:attn_metadata.num_contexts].fill_(1)
-                attn_metadata._seq_lens_cuda[:attn_metadata.num_contexts].fill_(
-                    1)
+                attn_metadata._seq_lens[:batch_size].fill_(1)
+                attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
                 attn_metadata.on_update()
                 # cannot run generation if their is no kv cache
                 has_kv_cache = inputs[
