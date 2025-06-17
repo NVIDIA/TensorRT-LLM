@@ -451,6 +451,8 @@ def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
 def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 @Field
+def ONLY_TRITON_FILE_CHANGED = "only_triton_file_changed"
+@Field
 def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 @Field
 def DEBUG_MODE = "debug"
@@ -472,6 +474,7 @@ def testFilter = [
     (EXTRA_STAGE_LIST): null,
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_PYTORCH_FILE_CHANGED): false,
+    (ONLY_TRITON_FILE_CHANGED): false,
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): false,
@@ -2223,6 +2226,16 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         echo "Only docs files are changed, run doc build stage only."
         parallelJobsFiltered = docBuildJobs
         println parallelJobsFiltered.keySet()
+    }
+
+    if (testFilter[(ONLY_TRITON_FILE_CHANGED)]) {
+        if (testFilter[(TEST_BACKEND)] != null) {
+            echo "Force disable ONLY_TRITON_FILE_CHANGED mode. Backend mode set by flag: ${testFilter[(TEST_BACKEND)]}."
+        } else {
+            echo "ONLY_TRITON_FILE_CHANGED mode is true."
+            parallelJobsFiltered = parallelJobsFiltered.findAll { it.key.contains("-Triton-") }
+            println parallelJobsFiltered.keySet()
+        }
     }
 
     // Check --stage-list, only run the stages in stage-list.
