@@ -296,6 +296,7 @@ class MoEAlltoallInfo:
 class MnnvlMoe:
     moe_workspace: MnnvlMemory = None
     moe_workspace_tensor: torch.Tensor = None
+    moe_prepare_workspace_tensor: torch.Tensor = None
     moe_mapping: Mapping = None
 
     @staticmethod
@@ -313,6 +314,19 @@ class MnnvlMoe:
         return MnnvlMoe.moe_workspace_tensor
 
     @staticmethod
+    def get_moe_prepare_workspace(mapping: Mapping):
+        if MnnvlMoe.moe_prepare_workspace_tensor is not None:
+            return MnnvlMoe.moe_prepare_workspace_tensor
+        workspace_size_per_rank = torch.ops.trtllm.get_moe_prepare_workspace_size_per_rank(
+            mapping.tp_size
+        )
+        MnnvlMoe.moe_prepare_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
+        MnnvlMoe.moe_prepare_workspace_tensor = (
+            MnnvlMoe.moe_prepare_workspace.as_torch_strided_tensor(torch.uint64)
+        )
+        return MnnvlMoe.moe_prepare_workspace_tensor
+
+    @staticmethod
     def compute_target_rank_id(
         token_selected_experts: torch.Tensor, expert_count: int, ep_size: int
     ):
@@ -320,6 +334,52 @@ class MnnvlMoe:
         expert_per_rank = expert_count // ep_size
         token_target_rank_ids = token_selected_experts // expert_per_rank
         return token_target_rank_ids
+
+    @staticmethod
+    def mnnvl_moe_alltoallv_prepare_without_allgather(
+        expert_ids: torch.Tensor,
+        scales: torch.Tensor,
+        workspace: torch.Tensor,
+        max_token_count_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        expert_count: int,
+        top_k: int,
+    ):
+        (
+            prepared_local_experts,
+            prepared_local_scales,
+            local_send_rank_count_cumsum,
+            local_send_rank_indices,
+            local_recv_rank_count_cumsum,
+            local_recv_rank_indices,
+            backward_local_recv_rank_indices,
+        ) = torch.ops.trtllm.mnnvl_moe_alltoallv_prepare_without_allgather(
+            expert_ids,
+            scales,
+            workspace,
+            max_token_count_per_rank,
+            ep_rank,
+            ep_size,
+            expert_count,
+            top_k,
+        )
+
+        local_token_allocation_count = max_token_count_per_rank * ep_size
+        # Looks like we don't need this.
+        local_gather_indices = None
+
+        alltoall_info = MoEAlltoallInfo(
+            local_gather_indices,
+            local_send_rank_count_cumsum,
+            local_send_rank_indices,
+            local_recv_rank_count_cumsum,
+            local_recv_rank_indices,
+            backward_local_recv_rank_indices,
+            local_token_allocation_count,
+        )
+
+        return alltoall_info, prepared_local_experts, prepared_local_scales
 
     @staticmethod
     def mnnvl_moe_alltoallv_prepare(
