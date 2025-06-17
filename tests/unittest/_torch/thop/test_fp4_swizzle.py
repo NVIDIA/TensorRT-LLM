@@ -4,6 +4,7 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.utils import reswizzle_sf, swizzle_sf, unswizzle_sf
+from tensorrt_llm.math_utils import ceil_div
 
 
 # Reference PyTorch implementations (original)
@@ -13,8 +14,8 @@ def swizzle_sf_ref(sf: torch.Tensor,
                    scaling_vector_size: int = 16):
     """Reference PyTorch implementation of swizzle_sf"""
     factor = scaling_vector_size * 4
-    num_m_tiles = (row + 128 - 1) // 128
-    num_k_tiles = (col + factor - 1) // factor
+    num_m_tiles = ceil_div(row, 128)
+    num_k_tiles = ceil_div(col, factor)
     # SF layout [num_m_tiles, num_k_tiles, 32 (m_tile column major), 4 (m_tile column major), 4(k_tile)]
     sf_full = torch.zeros(num_m_tiles * 32 * 4,
                           num_k_tiles * 4,
@@ -35,8 +36,8 @@ def unswizzle_sf_ref(sf: torch.Tensor,
                      scaling_vector_size: int = 16):
     """Reference PyTorch implementation of unswizzle_sf"""
     factor = scaling_vector_size * 4
-    num_m_tiles = (row + 128 - 1) // 128
-    num_k_tiles = (col + factor - 1) // factor
+    num_m_tiles = ceil_div(row, 128)
+    num_k_tiles = ceil_div(col, factor)
     # SF layout [num_m_tiles, num_k_tiles, 32 (m_tile column major), 4 (m_tile column major), 4(k_tile)]
     sf_reshaped = sf.view(num_m_tiles, num_k_tiles, 32, 4, 4)
     sf_unswizzle = sf_reshaped.transpose(1, 3)
@@ -51,8 +52,8 @@ def reswizzle_sf_ref(sf: torch.Tensor,
                      scaling_vector_size: int = 16):
     """Reference PyTorch implementation of reswizzle_sf"""
     factor = scaling_vector_size * 4
-    num_m_tiles = (row + 128 - 1) // 128
-    num_k_tiles = (col + factor - 1) // factor
+    num_m_tiles = ceil_div(row, 128)
+    num_k_tiles = ceil_div(col, factor)
     partition_size = num_m_tiles * num_k_tiles * 32 * 4 * 4
     num_partitions = sf.numel() // partition_size
     sf_reshaped = sf.view(num_partitions, num_m_tiles, num_k_tiles, 32, 4, 4)
@@ -60,7 +61,7 @@ def reswizzle_sf_ref(sf: torch.Tensor,
     sf_unswizzle = sf_unswizzle.reshape(num_partitions, num_m_tiles * 32 * 4,
                                         num_k_tiles * 4)
     total_rows = num_partitions * row
-    num_m_tiles_out = (total_rows + 128 - 1) // 128
+    num_m_tiles_out = ceil_div(total_rows, 128)
     sf_out = torch.zeros(
         num_m_tiles_out,
         4,
@@ -89,21 +90,20 @@ def reswizzle_sf_ref(sf: torch.Tensor,
 def test_swizzle_sf(rows, cols):
     """Test C++ swizzle_sf against PyTorch reference implementation"""
     scaling_vector_size = 16
-    sf_cols = cols // scaling_vector_size
+    sf_cols = ceil_div(cols, scaling_vector_size)
 
-    # Create scaling factor data using uint8 dtype
+    # Create scaling factor data using fp4_sf_dtype
     sf_data = torch.arange(rows * sf_cols,
                            dtype=fp4_utils.float4_sf_dtype).view(rows, sf_cols)
 
-    # Apply reference implementation (convert to float32 for ref)
-    ref_result = swizzle_sf_ref(sf_data.float(), rows, cols,
-                                scaling_vector_size)
+    # Apply reference implementation
+    ref_result = swizzle_sf_ref(sf_data, rows, cols, scaling_vector_size)
 
     # Apply C++ implementation
     result = swizzle_sf(sf_data, rows, cols, scaling_vector_size)
 
     # Verify results are equivalent
-    torch.testing.assert_close(result.float(), ref_result.float())
+    torch.testing.assert_close(result, ref_result)
 
 
 @skip_pre_blackwell
@@ -114,27 +114,23 @@ def test_swizzle_sf(rows, cols):
 def test_unswizzle_sf(rows, cols):
     """Test C++ unswizzle_sf against PyTorch reference implementation"""
     scaling_vector_size = 16
-    sf_cols = cols // scaling_vector_size
+    sf_cols = ceil_div(cols, scaling_vector_size)
 
     # Create scaling factor data by first swizzling with reference implementation
     original_sf_data = torch.arange(rows * sf_cols,
-                                    dtype=torch.uint8).view(rows, sf_cols)
-    swizzled_sf_data = swizzle_sf_ref(original_sf_data.float(), rows, cols,
+                                    dtype=fp4_utils.float4_sf_dtype).view(
+                                        rows, sf_cols)
+    swizzled_sf_data = swizzle_sf_ref(original_sf_data, rows, cols,
                                       scaling_vector_size)
 
     # Apply reference unswizzle
     ref_result = unswizzle_sf_ref(swizzled_sf_data, rows, cols,
                                   scaling_vector_size)
 
-    # Apply C++ unswizzle (convert to uint8 for C++ op)
-    swizzled_uint8 = (swizzled_sf_data % 256).to(torch.uint8)
-    cpp_result = unswizzle_sf(swizzled_uint8, rows, cols, scaling_vector_size)
+    result = unswizzle_sf(swizzled_sf_data, rows, cols, scaling_vector_size)
 
     # Verify C++ result matches reference result
-    torch.testing.assert_close(ref_result,
-                               cpp_result.float(),
-                               atol=1.0,
-                               rtol=0.1)
+    torch.testing.assert_close(result, ref_result)
 
 
 @skip_pre_blackwell
@@ -151,7 +147,7 @@ def test_unswizzle_sf(rows, cols):
 def test_swizzle_round_trip(rows, cols):
     """Test that swizzle/unswizzle operations are inverse of each other"""
     scaling_vector_size = 16
-    sf_cols = cols // scaling_vector_size
+    sf_cols = ceil_div(cols, scaling_vector_size)
 
     # Create scaling factor data
     original_sf_data = torch.randint(0,
@@ -163,7 +159,7 @@ def test_swizzle_round_trip(rows, cols):
     unswizzled_sf = unswizzle_sf(swizzled_sf, rows, cols, scaling_vector_size)
 
     # Verify round-trip preserves original scaling factor data
-    torch.testing.assert_close(original_sf_data.float(), unswizzled_sf.float())
+    torch.testing.assert_close(original_sf_data, unswizzled_sf)
 
 
 @skip_pre_blackwell
@@ -174,16 +170,16 @@ def test_swizzle_round_trip(rows, cols):
 def test_reswizzle_sf(rows, cols, num_partitions):
     """Test C++ reswizzle_sf against PyTorch reference implementation"""
     scaling_vector_size = 16
-    sf_cols = cols // scaling_vector_size
+    sf_cols = ceil_div(cols, scaling_vector_size)
 
     # Create scaling factor data: multiple partitions of swizzled data
     partition_sf_data = []
     for i in range(num_partitions):
         sf_data = torch.arange(i * 100,
                                i * 100 + rows * sf_cols,
-                               dtype=torch.uint8).view(rows, sf_cols)
-        swizzled_sf = swizzle_sf_ref(sf_data.float(), rows, cols,
-                                     scaling_vector_size)
+                               dtype=fp4_utils.float4_sf_dtype).view(
+                                   rows, sf_cols)
+        swizzled_sf = swizzle_sf_ref(sf_data, rows, cols, scaling_vector_size)
         partition_sf_data.append(swizzled_sf)
 
     # Concatenate partitions
@@ -198,4 +194,4 @@ def test_reswizzle_sf(rows, cols, num_partitions):
                           scaling_vector_size)
 
     # Verify results are equivalent
-    torch.testing.assert_close(result.float(), ref_result.float())
+    torch.testing.assert_close(result, ref_result)

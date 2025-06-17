@@ -8,6 +8,7 @@ from typing import Dict, List
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
 
 is_torch_compiling_flag = False
@@ -106,8 +107,8 @@ def disable_fp4_allgather():
 
 
 def compute_swizzled_sf_shape(row: int, col: int):
-    padded_row = (row + 128 - 1) // 128 * 128
-    padded_col = (col + 4 - 1) // 4 * 4
+    padded_row = pad_up(row, 128)
+    padded_col = pad_up(col, 4)
     return padded_row, padded_col
 
 
@@ -117,7 +118,7 @@ def swizzle_sf(sf: torch.Tensor,
                scaling_vector_size: int = 16):
     """Swizzle FP4 scaling factors using C++ torch op implementation"""
     if row is not None and col is not None:
-        sf_cols = (col + scaling_vector_size - 1) // scaling_vector_size
+        sf_cols = ceil_div(col, scaling_vector_size)
         sf = sf.view(-1, row, sf_cols)
     return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(sf)
 
@@ -140,8 +141,8 @@ def reswizzle_sf(sf: torch.Tensor,
                  scaling_vector_size: int = 16):
     """Reswizzle scaling factors for multiple partitions using C++ ops"""
     factor = scaling_vector_size * 4
-    num_m_tiles = (row + 128 - 1) // 128
-    num_k_tiles = (col + factor - 1) // factor
+    num_m_tiles = ceil_div(row, 128)
+    num_k_tiles = ceil_div(col, factor)
     partition_size = num_m_tiles * num_k_tiles * 32 * 4 * 4
     num_partitions = sf.numel() // partition_size
 
@@ -153,16 +154,10 @@ def reswizzle_sf(sf: torch.Tensor,
 
     # Concatenate partitions and re-swizzle for the new dimensions
     total_rows = num_partitions * row
-    sf_cols = col // scaling_vector_size
+    sf_cols = ceil_div(col, scaling_vector_size)
     sf_concatenated = sf_unswizzle[:, :row].reshape(total_rows, sf_cols)
 
-    # Convert to uint8 for C++ op if needed
-    if sf_concatenated.dtype != torch.uint8:
-        sf_uint8 = sf_concatenated.to(torch.uint8)
-    else:
-        sf_uint8 = sf_concatenated
-
-    return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(sf_uint8)
+    return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(sf_concatenated)
 
 
 def next_positive_power_of_2(x: int) -> int:
