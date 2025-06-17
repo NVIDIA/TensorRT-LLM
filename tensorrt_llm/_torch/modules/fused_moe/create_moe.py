@@ -53,6 +53,7 @@ def create_moe(
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     apply_router_weight_on_input: bool = False,
     layer_idx: Optional[int] = None,
+    use_optimized_permute_and_finalize_scale: bool = False,
 ) -> MoE:
     moe_cls = get_moe_cls(model_config, override_quant_config)
 
@@ -87,6 +88,7 @@ def create_moe(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            use_optimized_permute_and_finalize_scale=use_optimized_permute_and_finalize_scale,
         )
     elif moe_cls == VanillaMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in VanillaMoE."

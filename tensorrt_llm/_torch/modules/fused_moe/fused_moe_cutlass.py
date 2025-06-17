@@ -122,6 +122,106 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(a: torch.Tensor, b: torch.Tensor, a_sf
     return ref
 
 
+def cute_dsl_fp8_group_blockwise_gemm_ref_new(a: torch.Tensor, b: torch.Tensor, a_sf: torch.Tensor, b_sf: torch.Tensor, group_m_list: torch.Tensor, use_offset_array: bool = False) -> torch.Tensor:
+    m, k = a.shape[0], a.shape[1]
+    l, n, k = b.shape[0], b.shape[1], b.shape[2]
+    num_group, w_n, w_k = b_sf.shape[0], b_sf.shape[1], b_sf.shape[2]
+    print(f"limin: m = {m}, k = {k}, l = {l}, n = {n}, num_group = {num_group}, w_n = {w_n}, w_k = {w_k}")
+    print(f"limin: a.shape = {a.shape}")
+    print(f"limin: a_sf.shape = {a_sf.shape}")
+    print(f"limin: b.shape = {b.shape}")
+    print(f"limin: b_sf.shape = {b_sf.shape}")
+    print(f"limin: group_m_list.shape = {group_m_list.shape}")
+    print(f"limin: use_offset_array = {use_offset_array}")
+    # c = torch.empty(*(m, n), dtype=torch.bfloat16, device="cuda")
+
+    # TODO: view(int8) will cause error.
+    # a_tmp = a.as_strided((m, k, 1), (k, 1, m * k))
+    # b_tmp = b.permute(1, 2, 0)
+    # c_tmp = c.as_strided((m, n, 1), (n, 1, m * n))
+    # print(f"limin: a_tmp.shape = {a_tmp.shape}, a_tmp.stride = {a_tmp.stride()}")
+    # print(f"limin: b_tmp.shape = {b_tmp.shape}, b_tmp.stride = {b_tmp.stride()}")
+    # print(f"limin: c_tmp.shape = {c_tmp.shape}, c_tmp.stride = {c_tmp.stride()}")
+
+    m_padded = (m + 3) // 4 * 4
+    input_scale_tmp = a_sf[0:m_padded * w_k]
+    # print(f"limin: 0, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+    input_scale_tmp = input_scale_tmp.reshape(-1, m_padded)
+    # print(f"limin: 1, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+    input_scale_tmp = input_scale_tmp[:w_k, :m].contiguous().permute(1, 0)
+    print(f"limin: 2, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+    # input_scale_tmp = input_scale_tmp.as_strided((m, w_k, 1), (1, m, m * w_k))
+    # print(f"limin: input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+
+    # TOOD: contiguous
+    # weight_scale_tmp = b_sf.permute(1, 2, 0)
+    # print(f"limin: weight_scale_tmp.shape = {weight_scale_tmp.shape}, weight_scale_tmp.stride = {weight_scale_tmp.stride()}")
+
+    # print("limin: input = ", a_tmp)
+    # print("limin: weight = ", b_tmp)
+    # print("limin: input_scale = ", input_scale_tmp)
+    # print("limin: weight_scale = ", weight_scale_tmp)
+
+    # print("limin: input negative_numbers = ",  torch.sum(a_tmp < 0).item())
+    # print("limin: weight negative_numbers = ",  torch.sum(b_tmp < 0).item())
+    # print("limin: input_scale negative_numbers = ",  torch.sum(input_scale_tmp < 0).item())
+    # print("limin: weight_scale negative_numbers = ",  torch.sum(weight_scale_tmp < 0).item())
+    # update
+    def pad_and_multiply(scale, tensor):
+        if scale.ndim == 2:
+            cm, ck = scale.shape
+            m, k = tensor.shape
+        else:
+            _, cm, ck = scale.shape
+            _, m, k = tensor.shape
+
+        IsGroupWise = False
+        IsBlockWise = False
+        if ck == math.ceil(k / 128):
+            IsGroupWise = True
+        if cm == math.ceil(m / 128):
+            IsBlockWise = True
+        if not IsBlockWise and not IsGroupWise:
+            raise ValueError("Only support granularity = 128")
+
+        k_idx = torch.arange(k, device=scale.device)
+        if IsGroupWise:
+            k_idx = k_idx // 128
+        m_idx = torch.arange(m, device=scale.device)
+        if IsBlockWise:
+            m_idx = m_idx // 128
+        print(f"   limin: m_idx.shape = {m_idx.shape}, m_idx = {m_idx}")
+        print(f"   limin: k_idx.shape = {k_idx.shape}, k_idx = {k_idx}")
+        expanded_scale = scale[m_idx[:, None], k_idx]
+        print(f"   limin: tensor.shape = {tensor.shape}, tensor = {tensor}")
+        print(f"   limin: expanded_scale.shape = {expanded_scale.shape}, expanded_scale = {expanded_scale}")
+
+        result = expanded_scale * tensor
+
+        return result
+
+    updated_a = pad_and_multiply(input_scale_tmp, a.to(torch.float32))
+    updated_b = pad_and_multiply(b_sf, b.to(torch.float32))
+
+    # print(f"limin: updated_a = {updated_a}")
+    # print(f"limin: updated_b = {updated_b}")
+
+    ref = torch.zeros((m, n), device="cuda", dtype=torch.float32)
+    # # print(f"limin: group_m_list = {group_m_list}")
+    # # [0, 2, 5, 6]
+    # len_group_m_list = group_m_list.shape[0]
+    # for i in range(len_group_m_list - 1):
+    #     start = group_m_list[i]
+    #     end = group_m_list[i+1]
+    #     # assert start <= end, f"Invalid group boundaries: start={start} > end={end}"
+    #     ref[start:end, :] = torch.einsum(
+    #         "mk,nk->mn", updated_a[start:end, :], updated_b[i, :, :]
+    #     )
+
+    ref = ref.to(torch.bfloat16)
+    # print(f"limin: ref.shape = {ref.shape}, ref.stride = {ref.stride()}, ref = {ref}")
+    return ref
+
 # The type of alltoall method
 class AlltoallMethodType(IntEnum):
     # Not available

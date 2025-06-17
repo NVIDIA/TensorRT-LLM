@@ -434,7 +434,8 @@ class Deepseekv3MoE(nn.Module):
             model_config=model_config,
             override_quant_config=override_quant_config,
             aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
-            layer_idx=layer_idx)
+            layer_idx=layer_idx,
+            use_optimized_permute_and_finalize_scale=True)
 
         self.mapping = model_config.mapping
 
