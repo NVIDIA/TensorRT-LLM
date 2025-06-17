@@ -1557,7 +1557,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         // in the test-db. This behavior may change in the future.
         "A10-TensorRT-[Post-Merge]-1": ["a10", "l0_a10", 1, 2],
         "A10-TensorRT-[Post-Merge]-2": ["a10", "l0_a10", 2, 2],
-        "A10-TensorRT-[Post-Merge]-8": ["a10", "l0_a10", 8, 8],
         "A30-TensorRT-[Post-Merge]-1": ["a30", "l0_a30", 1, 6],
         "A30-TensorRT-[Post-Merge]-2": ["a30", "l0_a30", 2, 6],
         "A30-TensorRT-[Post-Merge]-3": ["a30", "l0_a30", 3, 6],
