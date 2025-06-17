@@ -45,9 +45,8 @@ def test_linear_unquantized(linear_cls):
     linear.load_weights([weights])
     linear.cuda()
 
-    with torch.inference_mode():
-        actual_c = linear.forward(x)
-        reference_c = torch.matmul(x, w) + b
+    actual_c = linear.forward(x)
+    reference_c = torch.matmul(x, w) + b
 
     check_accuracy(actual_c, reference_c, atol=0.01, rtol=0.01, percent=0.99)
 
@@ -81,11 +80,10 @@ def test_linear_fp8qdq(linear_cls):
     linear.load_weights([weights])
     linear.cuda()
 
-    with torch.inference_mode():
-        actual_c = linear.forward(qx)
-        x_qdq = qx.to(torch.float32) * sx
-        w_qdq = qw.to(torch.float32) * sw
-        reference_c = torch.matmul(x_qdq, w_qdq) + b
+    actual_c = linear.forward(qx)
+    x_qdq = qx.to(torch.float32) * sx
+    w_qdq = qw.to(torch.float32) * sw
+    reference_c = torch.matmul(x_qdq, w_qdq) + b
 
     check_accuracy(actual_c,
                    reference_c.to(dtype),
@@ -144,8 +142,7 @@ def test_linear_mxfp4(activation_dtype):
     ref_linear.load_weights([ref_weights])
     ref_linear.cuda()
 
-    with torch.inference_mode():
-        ref_output = ref_linear.forward(x)
+    ref_output = ref_linear.forward(x)
     torch.cuda.synchronize()
 
     # Now test with MXFP4 quantized weights
@@ -177,8 +174,7 @@ def test_linear_mxfp4(activation_dtype):
     linear.load_weights([weights])
     linear.cuda()
 
-    with torch.inference_mode():
-        output = linear.forward(x)
+    output = linear.forward(x)
     torch.cuda.synchronize()
 
     # Compare outputs with more relaxed tolerance for MXFP4

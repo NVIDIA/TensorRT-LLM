@@ -11,13 +11,13 @@ from tensorrt_llm.mapping import Mapping
 from ...models.modeling_utils import QuantConfig
 # Reuse the common Triton import setup
 from .fused_moe.fused_moe_triton import (IS_TRITON_KERNELS_AVAILABLE,
-                                         check_and_swizzle)
+                                         get_swizzle_type,
+                                         swizzle_weight_and_scale)
 
 if IS_TRITON_KERNELS_AVAILABLE:
     from triton_kernels.matmul_ogs import (FlexCtx, PrecisionConfig, matmul_ogs,
                                            MicroscalingCtx)
     from triton_kernels.numerics import InFlexData
-    from triton_kernels.numerics_details.mxfp import SwizzlingType
 
 from .linear import (Linear, LinearMethodBase, TensorParallelMode,
                      WeightsLoadingConfig, copy_weight, load_weight_shard,
@@ -216,6 +216,8 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
         assert activation_dtype in [torch.float8_e4m3fn, torch.bfloat16], \
             f"TritonMXFP4LinearMethod only supports float8_e4m3fn or bfloat16 activation, got {activation_dtype}"
         self.activation_dtype = activation_dtype
+        self.swizzle_value, self.swizzle_scale = get_swizzle_type(
+            activation_dtype)
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -268,10 +270,9 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
 
         mx_ctx = MicroscalingCtx(
             weight_scale=module.weight_scale,
-            swizzle_value=None,
-            swizzle_scale=SwizzlingType.
-            BLACKWELL,  #TODO: Integrate other types recently added to Triton TOT
-            actual_weight_scale_shape=module.weight_scale.shape)
+            swizzle_value=self.swizzle_value,
+            swizzle_scale=self.swizzle_scale,
+            actual_weight_scale_shape=self.scale_actual_shape)
         if self.activation_dtype == torch.float8_e4m3fn:
             flex_ctx = FlexCtx(lhs_data=InFlexData(scale=input_scale), )
         else:
@@ -317,17 +318,19 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
             processed_weights)  # (out_features, in_features//2)
         fused_weight = fused_weight.T.unsqueeze(
             0)  # (1, in_features//2, out_features)
-        copy_weight(module.weight, fused_weight)
 
         # handle scales
         fused_scale = torch.cat(
             weight_scales)  # (out_features, in_features//32)
         fused_scale = fused_scale.T.unsqueeze(
             0)  # (1, in_features//32, out_features)
-        fused_scale = check_and_swizzle(fused_weight, fused_scale)
+        fused_weight, fused_scale, scale_actual_shape = swizzle_weight_and_scale(
+            fused_weight, fused_scale, self.swizzle_value, self.swizzle_scale)
         assert module.weight_scale.dtype == fused_scale.dtype
-        assert module.weight_scale.shape == fused_scale.shape
-        module.weight_scale.data = fused_scale  # We don't use copy_weight here because we need to maintain the stride
+        # We don't use copy_weight here because we need to maintain the stride
+        module.weight.data = fused_weight
+        module.weight_scale.data = fused_scale
+        self.scale_actual_shape = scale_actual_shape
 
         # handle biases
         if module.bias is not None:
