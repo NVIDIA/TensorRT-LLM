@@ -741,6 +741,8 @@ def getOnlyTritonFileChanged(pipeline, testFilter, globalVars) {
     def tritonOnlyList = [
         "tests/integration/defs/triton_server/",
         "triton_backend/",
+        "jenkins/L0_MergeRequest.groovy",
+        "jenkins/L0_Test.groovy",
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
