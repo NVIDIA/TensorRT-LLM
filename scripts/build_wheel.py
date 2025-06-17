@@ -792,7 +792,7 @@ def add_arguments(parser: ArgumentParser):
         "Use the current Python interpreter without creating a virtual environment."
     )
     parser.add_argument(
-        "--nvrtc-dynamic-linking",
+        "--nvrtc_dynamic_linking",
         action="store_true",
         help="Link against the dynamic NVRTC libraries and not the static ones."
     )
