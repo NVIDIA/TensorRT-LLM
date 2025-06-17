@@ -92,8 +92,8 @@ def globalVars = [
 // TODO: Move common variables to an unified location
 BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
-BUILD_MEMORY_REQUEST = "96Gi"
-BUILD_MEMORY_LIMIT = "128Gi"
+BUILD_MEMORY_REQUEST = "48Gi"
+BUILD_MEMORY_LIMIT = "64Gi"
 BUILD_JOBS = "8"
 
 TESTER_CORES = "12"
@@ -380,6 +380,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
 {
     // Step 1: cloning tekit source code
     sh "pwd && ls -alh"
+    sh "export CCACHE_SLOPPINESS=file_macro,include_file_mtime,time_macros"
     sh "env | sort"
     sh "ccache -sv"
     sh "rm -rf **/*.xml *.tar.gz"
@@ -419,7 +420,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks"
+        sh "cd ${LLM_ROOT} && export CCACHE_SLOPPINESS=file_macro,include_file_mtime,time_macros && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks"
     }
     if (is_linux_x86_64) {
         sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
@@ -491,7 +492,7 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     sh "bash -c 'git config --global --add safe.directory \"*\"'"
     // Because different architectures involve different macros, a comprehensive test is conducted here.
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}\"")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"cd ${LLM_ROOT} && export CCACHE_SLOPPINESS=file_macro,include_file_mtime,time_macros && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}\"")
     }
 }
 
