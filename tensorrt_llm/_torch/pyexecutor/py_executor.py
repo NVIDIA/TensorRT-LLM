@@ -16,8 +16,8 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled, nvtx_range,
-                                 trace_func)
+from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
+                                 is_trace_enabled, nvtx_range, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -171,6 +171,7 @@ class PyExecutor:
                  max_draft_tokens: int = 0,
                  kv_cache_transceiver: KvCacheTransceiver = None,
                  draft_model_engine: Optional[ModelEngine] = None,
+                 garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
@@ -268,6 +269,8 @@ class PyExecutor:
                 "Drafting is not supported for selected executor loop. "
                 "Please disable disagg/pipeline parallelism/overlap scheduler.")
 
+        self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
+
         self.worker_started = False
         self.worker_lock = threading.Lock()
         if start_worker:
@@ -275,7 +278,9 @@ class PyExecutor:
 
     def _event_loop_wrapper(self):
         try:
-            self.event_loop()
+            with customized_gc_thresholds(
+                    self.garbage_collection_gen0_threshold):
+                self.event_loop()
         except Exception as e:
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())

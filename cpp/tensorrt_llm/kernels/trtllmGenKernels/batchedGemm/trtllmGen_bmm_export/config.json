@@ -180,6 +180,7 @@
             "dtypeC": ["bf16", "fp16", "e2m1"],
             "listN": "8,8",
             "numExperts": 2,
+            "numStagesMma": 1,
             "tileScheduler": "static"
         },
         {
@@ -191,6 +192,7 @@
             "dtypeC": ["bf16", "fp16", "e4m3"],
             "listN": "8,8",
             "numExperts": 2,
+            "numStagesMma": 1,
             "tileScheduler": "static"
         },
         {
@@ -202,6 +204,7 @@
             "dtypeC": ["bf16", "fp16", "e4m3"],
             "listN": "8,8",
             "numExperts": 2,
+            "numStagesMma": 2,
             "tileScheduler": "static"
         },
         {
@@ -209,15 +212,17 @@
             "_template": "BatchedGemmFp4LowLatency",
             "routeAct": true,
             "fusedAct": true,
+            "sfLayoutB": "linear",
             "useRoutingScalesOnInput": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "e2m1",
             "numTokens": 2,
             "numExperts": 2,
+            "numStagesMma": 1,
             "tileScheduler": "static"
         },
         {
-            "_comment": "DS_FP4_FC2",
+            "_comment": "DS_FP4_FC2_persistSched",
             "_template": "BatchedGemmFp4LowLatency",
             "routeAct": false,
             "fusedAct": false,
@@ -227,10 +232,23 @@
             "numTokens": 2,
             "numExperts": 2,
             "numStagesMma": 2,
-            "tileScheduler": ["persistent", "static"]
+            "tileScheduler": "persistent"
         },
         {
-            "_comment": "DS_FP4_TP8_EP1_FC2",
+            "_comment": "DS_FP4_FC2_staticSched",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "useRoutingScalesOnInput": false,
+            "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "bf16",
+            "numTokens": 2,
+            "numExperts": 2,
+            "numStagesMma": 1,
+            "tileScheduler": "static"
+        },
+        {
+            "_comment": "DS_FP4_TP8_EP1_FC2_persistSched",
             "_template": "BatchedGemmFp4LowLatency",
             "routeAct": false,
             "fusedAct": false,
@@ -242,7 +260,22 @@
             "numStagesMma": 2,
             "tileK": 256,
             "numStages": 6,
-            "tileScheduler": ["persistent", "static"]
+            "tileScheduler": "persistent"
+        },
+        {
+            "_comment": "DS_FP4_TP8_EP1_FC2_staticSched",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "useRoutingScalesOnInput": false,
+            "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "bf16",
+            "numTokens": 2,
+            "numExperts": 2,
+            "numStagesMma": 1,
+            "tileK": 256,
+            "numStages": 6,
+            "tileScheduler": "static"
         },
         {
             "_comment": "DS_FP8_FC1",
@@ -259,7 +292,7 @@
             "tileScheduler": "static"
         },
         {
-            "_comment": "DS_FP8_FC2",
+            "_comment": "DS_FP8_FC2_persistent",
             "_template": "BatchedGemmDeepSeekFp8LowLatency",
             "routeAct": false,
             "fusedAct": false,
@@ -270,7 +303,21 @@
             "numExperts": 2,
             "numStages": 8,
             "numStagesMma": 4,
-            "tileScheduler": ["persistent", "static"]
+            "tileScheduler": "persistent"
+        },
+        {
+            "_comment": "DS_FP8_FC2_static",
+            "_template": "BatchedGemmDeepSeekFp8LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "useRoutingScalesOnInput": false,
+            "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "bf16",
+            "numTokens": 2,
+            "numExperts": 2,
+            "numStages": 8,
+            "numStagesMma": 2,
+            "tileScheduler": "static"
         },
         {
             "_comment": "DS_FP8_FC1_16_THROUGHPUT",
@@ -407,7 +454,7 @@
             "tileScheduler": "static"
         },
         {
-            "_comment": "Llama4_FP8_FC2",
+            "_comment": "Llama4_FP8_FC2_persistent",
             "_template": "BatchedGemmPerTensorScalingFp8LowLatency",
             "routeAct": false,
             "fusedAct": false,
@@ -418,22 +465,38 @@
             "numExperts": 2,
             "numStages": 3,
             "numStagesMma": 2,
-            "tileScheduler": ["persistent", "static"]
+            "tileScheduler": "persistent"
+        },
+        {
+            "_comment": "Llama4_FP8_FC2_static",
+            "_template": "BatchedGemmPerTensorScalingFp8LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "useRoutingScalesOnInput": false,
+            "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "bf16",
+            "numTokens": 2,
+            "numExperts": 2,
+            "numStages": 3,
+            "numStagesMma": 1,
+            "tileScheduler": "static"
         },
         {
             "_comment": "MxE2m1_FC1",
             "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
             "routeAct": true,
             "fusedAct": true,
+            "sfLayoutB": "linear",
             "useRoutingScalesOnInput": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "mxe4m3",
             "numTokens": 2,
             "numExperts": 2,
+            "numStagesMma": 1,
             "tileScheduler": "static"
         },
         {
-            "_comment": "MxE2m1_FC2",
+            "_comment": "MxE2m1_FC2_persistent",
             "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
             "routeAct": false,
             "fusedAct": false,
@@ -443,10 +506,23 @@
             "numTokens": 2,
             "numExperts": 2,
             "numStagesMma": 2,
-            "tileScheduler": ["persistent", "static"]
+            "tileScheduler": "persistent"
         },
         {
-            "_comment": "MxE2m1_TP8_EP1_FC2",
+            "_comment": "MxE2m1_FC2_static",
+            "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "useRoutingScalesOnInput": false,
+            "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "bf16",
+            "numTokens": 2,
+            "numExperts": 2,
+            "numStagesMma": 1,
+            "tileScheduler": "static"
+        },
+        {
+            "_comment": "MxE2m1_TP8_EP1_FC2_persistent",
             "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
             "routeAct": false,
             "fusedAct": false,
@@ -458,7 +534,122 @@
             "numStagesMma": 2,
             "tileK": 256,
             "numStages": 4,
-            "tileScheduler": ["persistent", "static"]
+            "tileScheduler": "persistent"
+        },
+        {
+            "_comment": "MxE2m1_TP8_EP1_FC2_static",
+            "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "useRoutingScalesOnInput": false,
+            "useUnrollLoop2xForMma": [true, false],
+            "dtypeC": "bf16",
+            "numTokens": 2,
+            "numExperts": 2,
+            "numStagesMma": 1,
+            "tileK": 256,
+            "numStages": 4,
+            "tileScheduler": "static"
+        },
+        {
+            "_comment": "Qwen3_TP1_EP8_FC1",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": true,
+            "fusedAct": true,
+            "sfLayoutB": "linear",
+            "dtypeC": "e2m1",
+            "numStages": 4,
+            "numStagesMma": 1,
+            "tileK": 512,
+            "tileScheduler": "static",
+            "useUnrollLoop2xForMma": [true]
+        },
+        {
+            "_comment": "Qwen3_TP1_EP8_FC2",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "dtypeC": "bf16",
+            "numStages": 4,
+            "numStagesMma": 1,
+            "tileK": 512,
+            "tileScheduler": "static",
+            "useUnrollLoop2xForMma": [false]
+        },
+        {
+            "_comment": "Qwen3_TP2_EP4_FC1",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": true,
+            "fusedAct": true,
+            "sfLayoutB": "linear",
+            "dtypeC": "e2m1",
+            "numStages": 4,
+            "numStagesMma": 1,
+            "tileK": 512,
+            "tileScheduler": "static",
+            "useUnrollLoop2xForMma": [true]
+        },
+        {
+            "_comment": "Qwen3_TP2_EP4_FC2",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "dtypeC": "bf16",
+            "numStages": 4,
+            "numStagesMma": 2,
+            "tileK": 512,
+            "tileScheduler": "persistent",
+            "useUnrollLoop2xForMma": [false]
+        },
+        {
+            "_comment": "Qwen3_TP4_EP2_FC1",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": true,
+            "fusedAct": true,
+            "sfLayoutB": "linear",
+            "dtypeC": "e2m1",
+            "numStages": 4,
+            "numStagesMma": 1,
+            "tileK": 512,
+            "tileScheduler": "static",
+            "useUnrollLoop2xForMma": [true]
+        },
+        {
+            "_comment": "Qwen3_TP4_EP2_FC2",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "dtypeC": "bf16",
+            "numStages": 4,
+            "numStagesMma": 2,
+            "tileK": 512,
+            "tileScheduler": "persistent",
+            "useUnrollLoop2xForMma": [false]
+        },
+        {
+            "_comment": "Qwen3_TP8_EP1_FC1",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": true,
+            "fusedAct": true,
+            "sfLayoutB": "linear",
+            "dtypeC": "e2m1",
+            "numStages": 4,
+            "numStagesMma": 1,
+            "tileK": 512,
+            "tileScheduler": "static",
+            "useUnrollLoop2xForMma": [true]
+        },
+        {
+            "_comment": "Qwen3_TP8_EP1_FC2",
+            "_template": "BatchedGemmFp4LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "dtypeC": "bf16",
+            "numStages": 4,
+            "numStagesMma": 2,
+            "tileK": 256,
+            "tileScheduler": "persistent",
+            "useUnrollLoop2xForMma": [false]
         }
     ]
 }

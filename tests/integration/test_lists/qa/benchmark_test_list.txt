@@ -1,0 +1,11 @@
+test_e2e.py::test_ptp_quickstart_advanced_8gpus[Nemotron-Ultra-253B-nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1]
+accuracy/test_llm_api_pytorch.py::TestLlama3_3NemotronSuper49Bv1::test_auto_dtype_tp2
+accuracy/test_cli_flow.py::TestLlama3_3NemotronSuper49Bv1::test_auto_dtype_tp2
+accuracy/test_cli_flow.py::TestLlama3_3NemotronSuper49Bv1::test_fp8_prequantized_tp2
+accuracy/test_llm_api_pytorch.py::TestLlama3_1NemotronNano8Bv1::test_auto_dtype
+accuracy/test_cli_flow.py::TestLlama3_1NemotronNano8Bv1::test_auto_dtype
+accuracy/test_cli_flow.py::TestLlama3_1NemotronNano8Bv1::test_fp8_prequantized
+accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_auto_dtype[tp8ep4-cuda_graph=True]
+accuracy/test_cli_flow.py::TestNemotronUltra::test_auto_dtype[tp8-cuda_graph=True] TIMEOUT (240)
+accuracy/test_cli_flow.py::TestNemotronUltra::test_fp8_prequantized[tp8-cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestNemotronH::test_auto_dtype
