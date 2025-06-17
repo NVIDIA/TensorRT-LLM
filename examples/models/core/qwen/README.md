@@ -669,7 +669,7 @@ pip install -e .
 popd
 ```
 
-By default, the checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-30B-A3B_nvfp4_hf/`.
+By default, the checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/`.
 
 ### Benchmark
 
@@ -678,7 +678,7 @@ To run the benchmark, we suggest using the `trtllm-bench` tool. Please refer to 
 ```bash
 #!/bin/bash
 
-folder_model=TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-30B-A3B_nvfp4_hf/
+folder_model=TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
 path_config=extra-llm-api-config.yml
 num_gpus=8
 ep_size=8
@@ -686,7 +686,7 @@ max_input_len=1024
 max_batch_size=512
 # We want to limit the number of prefill requests to 1 with in-flight batching.
 max_num_tokens=$(( max_input_len + max_batch_size - 1 ))
-kv_cache_free_gpu_mem_fraction=0.6
+kv_cache_free_gpu_mem_fraction=0.9
 concurrency=128
 
 path_data=./aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt
