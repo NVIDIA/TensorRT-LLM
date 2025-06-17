@@ -291,7 +291,7 @@ th::Tensor NVFP4BlockScaleInterleave(th::Tensor const& blockScale)
     auto cols = blockScaleShape.size() == 3 ? blockScaleShape[2] : blockScaleShape[1];
 
     auto expert_out_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(rows, cols);
-    th::Tensor interleavedBlockScale = th::zeros(
+    th::Tensor interleavedBlockScale = th::empty(
         {expert_out_size * num_experts}, th::dtype(SF_DTYPE).device(blockScale.device()).requires_grad(false));
 
     if (is_cuda)
@@ -335,7 +335,7 @@ th::Tensor NVFP4BlockScaleInterleaveReverse(th::Tensor blockScale)
     auto cols = blockScaleShape.size() == 3 ? blockScaleShape[2] : blockScaleShape[1];
     auto expert_out_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(rows, cols);
 
-    th::Tensor reversedBlockScale = th::zeros(blockScaleShape, th::dtype(SF_DTYPE).requires_grad(false));
+    th::Tensor reversedBlockScale = th::empty(blockScaleShape, th::dtype(SF_DTYPE).requires_grad(false));
     std::map<int, std::array<int, 3>> identity;
     for (int eIdx = 0; eIdx < num_experts; eIdx++)
     {
