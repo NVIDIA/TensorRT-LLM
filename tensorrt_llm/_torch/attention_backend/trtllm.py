@@ -716,6 +716,50 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_request_types_runtime = self.host_request_types[:self.
                                                                   num_seqs]
 
+    def pre_process_for_chunked_prefill(
+        self,
+        chunked_seq_len: torch.Tensor,
+        cu_chunked_seq_len: torch.Tensor,
+        merge_op_tensor: torch.Tensor,
+        chunked_loop_num: int,
+    ) -> None:
+        """
+        Pre-process the MLA layer for chunked prefill.
+        This method is called before the forward pass to prepare the MLA layer for chunked prefill.
+        """
+        num_contexts = self.num_contexts
+        chunk_size = self.runtime_features.normal_chunk_size
+        cached_kv_lens = torch.tensor(
+            self.kv_cache_params.num_cached_tokens_per_seq,
+            dtype=torch.int,
+            device='cpu',
+        )
+        for loop_idx in range(chunked_loop_num):
+            cu_chunked_seq_len[loop_idx, 0] = 0
+            used_chunk_seq_len = loop_idx * chunk_size
+            chunked_seq_len[loop_idx, :num_contexts] = torch.clamp(
+                cached_kv_lens[:num_contexts] - used_chunk_seq_len,
+                min=0,
+                max=chunk_size)
+            torch.cumsum(chunked_seq_len[loop_idx, :num_contexts],
+                         dim=0,
+                         dtype=torch.int64,
+                         out=cu_chunked_seq_len[loop_idx, 1:num_contexts + 1])
+            for s in range(num_contexts):
+                if loop_idx == 0 and chunked_seq_len[loop_idx, s] > 0:
+                    merge_op_tensor[loop_idx, s] = 2  # copy only
+                elif chunked_seq_len[loop_idx, s] > 0:
+                    merge_op_tensor[loop_idx, s] = 1  # merge
+                else:
+                    merge_op_tensor[loop_idx, s] = 0  # skip
+
+        # set merge op for last attn
+        for s in range(num_contexts):
+            if cached_kv_lens[s] == 0:
+                merge_op_tensor[chunked_loop_num, s] = 2  # copy only
+            else:
+                merge_op_tensor[chunked_loop_num, s] = 1  # merge
+
     def prepare_paged_context_mla(self, cached_token_lens: torch.Tensor,
                                   kv_lens: torch.Tensor) -> None:
         if self.num_contexts > 0:
@@ -728,16 +772,72 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.max_ctx_kv_len = kv_lens[:self.num_contexts].max().item()
             self.max_ctx_seq_len = self.seq_lens[:self.num_contexts].max().item(
             )
-            # total_q_tokens
-            self.num_ctx_seq_len = self.seq_lens[:self.num_contexts].sum().item(
-            )
+            # determine the number of loop
+            # currently we assume that the chunk size is the same as the max_num_tokens
+            if self.runtime_features.chunked_prefill:
+                chunk_size = self.runtime_features.normal_chunk_size
+                self.chunked_loop_num = (self.max_ctx_cached_token_len +
+                                         chunk_size - 1) // chunk_size
+                # [toal_token_q, num_heads, 2] -> [toal_token_q, num_heads] float2
+                self.softmax_stats_tensor = torch.empty(
+                    (self.num_ctx_tokens, self.num_heads, 2),
+                    dtype=torch.float,
+                    device='cuda',
+                )
+                self.temp_softmax_stats_tensor = torch.empty(
+                    (self.num_ctx_tokens, self.num_heads, 2),
+                    dtype=torch.float,
+                    device='cuda',
+                )
+
+                self.chunked_seq_len = torch.empty(
+                    (self.chunked_loop_num, self.num_seqs),
+                    dtype=torch.int,
+                    device='cuda',
+                )
+                self.host_chunked_seq_len = torch.empty_like(
+                    self.chunked_seq_len,
+                    device='cpu',
+                    pin_memory=True,
+                )
+                self.cu_chunked_seq_len = torch.zeros(
+                    (self.chunked_loop_num, self.num_contexts + 1),
+                    dtype=torch.int64,
+                    device='cuda',
+                )
+                self.host_cu_chunked_seq_len = torch.zeros_like(
+                    self.cu_chunked_seq_len,
+                    device='cpu',
+                    pin_memory=True,
+                )
+                # For last chunk we use the uncached kv
+                self.merge_op_tensor = torch.empty(
+                    (self.chunked_loop_num + 1, self.num_contexts),
+                    dtype=torch.int64,
+                    device='cuda',
+                )
+                self.host_merge_op_tensor = torch.empty_like(
+                    self.merge_op_tensor,
+                    device='cpu',
+                    pin_memory=True,
+                )
+
+                self.pre_process_for_chunked_prefill(
+                    chunked_seq_len=self.host_chunked_seq_len,
+                    cu_chunked_seq_len=self.host_cu_chunked_seq_len,
+                    merge_op_tensor=self.host_merge_op_tensor,
+                    chunked_loop_num=self.chunked_loop_num)
+                self.chunked_seq_len.copy_(self.host_chunked_seq_len,
+                                           non_blocking=True)
+                self.cu_chunked_seq_len.copy_(self.host_cu_chunked_seq_len,
+                                              non_blocking=True)
+                self.merge_op_tensor.copy_(self.host_merge_op_tensor,
+                                           non_blocking=True)
         else:
             self.num_ctx_cached_tokens = 0
             self.max_ctx_cached_token_len = 0
             self.max_ctx_kv_len = 0
             self.max_ctx_seq_len = 0
-            # total_q_tokens
-            self.num_ctx_seq_len = 0
         torch.cumsum(cached_token_lens[:self.num_contexts],
                      dim=0,
                      dtype=torch.int64,

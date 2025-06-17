@@ -937,7 +937,6 @@ class MLA(nn.Module):
         attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         chunk_size = attn_metadata.runtime_features.normal_chunk_size
-        # cached_kv_lens = attn_metadata.kv_lens_runtime
         cached_kv_lens = torch.tensor(
             attn_metadata.kv_cache_params.num_cached_tokens_per_seq,
             dtype=torch.int,
@@ -985,72 +984,19 @@ class MLA(nn.Module):
         # determine the number of loop
         # currently we assume that the chunk size is the same as the max_num_tokens
         chunk_size = attn_metadata.runtime_features.normal_chunk_size
-        chunked_loop_num = (attn_metadata.max_ctx_cached_token_len +
-                            chunk_size - 1) // chunk_size
-        # [toal_token_q, num_heads, 2] -> [toal_token_q, num_heads] float2
-        softmax_stats_tensor = torch.empty(
-            (attn_metadata.num_ctx_seq_len, self.num_heads, 2),
-            dtype=torch.float,
-            device=q.device,
-        )
-        temp_softmax_stats_tensor = torch.empty(
-            (attn_metadata.num_ctx_seq_len, self.num_heads, 2),
-            dtype=torch.float,
-            device=q.device,
-        )
+        chunked_loop_num = attn_metadata.chunked_loop_num
         attn_output = q.new_empty((q.size(0), self.num_heads * self.v_head_dim),
                                   dtype=q.dtype)
-        chunked_seq_len = torch.empty(
-            (chunked_loop_num, attn_metadata.num_seqs),
-            dtype=torch.int,
-            device='cuda',
-        )
-        host_chunked_seq_len = torch.empty_like(
-            chunked_seq_len,
-            device='cpu',
-            pin_memory=True,
-        )
-        cu_chunked_seq_len = torch.zeros(
-            (chunked_loop_num, attn_metadata.num_contexts + 1),
-            dtype=torch.int64,
-            device='cuda',
-        )
-        host_cu_chunked_seq_len = torch.zeros_like(
-            cu_chunked_seq_len,
-            device='cpu',
-            pin_memory=True,
-        )
-        # For last chunk we use the uncached kv
-        merge_op_tensor = torch.empty(
-            (chunked_loop_num + 1, attn_metadata.num_contexts),
-            dtype=torch.int64,
-            device='cuda',
-        )
-        host_merge_op_tensor = torch.empty_like(
-            merge_op_tensor,
-            device='cpu',
-            pin_memory=True,
-        )
 
-        self.pre_process_for_chunked_prefill(
-            chunked_seq_len=host_chunked_seq_len,
-            cu_chunked_seq_len=host_cu_chunked_seq_len,
-            merge_op_tensor=host_merge_op_tensor,
-            chunked_loop_num=chunked_loop_num,
-            attn_metadata=attn_metadata)
-        chunked_seq_len.copy_(host_chunked_seq_len, non_blocking=False)
-        cu_chunked_seq_len.copy_(host_cu_chunked_seq_len, non_blocking=False)
-        merge_op_tensor.copy_(host_merge_op_tensor, non_blocking=False)
-
-        # # use fake cached_cu_seq_len for chunked loop
+        # use fake cached_cu_seq_len for chunked loop
         origin_kv_lens_cuda_runtime = attn_metadata.kv_lens_cuda_runtime
         origin_kv_lens_runtime = attn_metadata.kv_lens_runtime
 
         for loop_idx in range(chunked_loop_num):
             # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim} zero padded
             # fetch `loop_idx` chunk from kv cache
-            temp_cu_chunked_seq_len = cu_chunked_seq_len[loop_idx]
-            total_ctx_chunked_tokens = host_cu_chunked_seq_len[
+            temp_cu_chunked_seq_len = attn_metadata.cu_chunked_seq_len[loop_idx]
+            total_ctx_chunked_tokens = attn_metadata.host_cu_chunked_seq_len[
                 loop_idx, attn_metadata.num_contexts]
             chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
                 metadata=attn_metadata,
@@ -1059,7 +1005,6 @@ class MLA(nn.Module):
                 cu_chunked_seq_len=temp_cu_chunked_seq_len,
                 out_dtype=q.dtype)
 
-            chunked_compressed_kv = chunked_compressed_kv.contiguous()
             # up proj to uncompressed kv
             # [tokens, 2, h, kv_dim], without rope_dim
             chunked_kv = self.kv_b_proj(chunked_compressed_kv)
@@ -1085,8 +1030,10 @@ class MLA(nn.Module):
                 metadata=attn_metadata)
 
             # copy chunked_seq_len to replace kv_lens_runtime
-            attn_metadata.kv_lens_runtime = host_chunked_seq_len[loop_idx]
-            attn_metadata.kv_lens_cuda_runtime = chunked_seq_len[loop_idx]
+            attn_metadata.kv_lens_runtime = attn_metadata.host_chunked_seq_len[
+                loop_idx]
+            attn_metadata.kv_lens_cuda_runtime = attn_metadata.chunked_seq_len[
+                loop_idx]
             out_scale = None
             # do not apply mask for attention within loop
             temp_attn_output = self.mha.forward(
@@ -1100,13 +1047,15 @@ class MLA(nn.Module):
                 attention_mask=PredefinedAttentionMask.FULL,
                 mla_context_paged_kv=full_kv,
                 mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
-                softmax_stats_tensor=temp_softmax_stats_tensor,
+                softmax_stats_tensor=attn_metadata.temp_softmax_stats_tensor,
             )
             # merge attn result
-            temp_merge_op = merge_op_tensor[loop_idx]
+            temp_merge_op = attn_metadata.merge_op_tensor[loop_idx]
             trtllm_attention.merge_attention_for_mla(
-                attn_output, temp_attn_output, softmax_stats_tensor,
-                temp_softmax_stats_tensor, temp_merge_op, attn_metadata)
+                attn_output, temp_attn_output,
+                attn_metadata.softmax_stats_tensor,
+                attn_metadata.temp_softmax_stats_tensor, temp_merge_op,
+                attn_metadata)
 
         # deal with the uncached kv
         kv = self.kv_b_proj(compressed_kv)
@@ -1148,13 +1097,13 @@ class MLA(nn.Module):
             out_scale=out_scale,
             mla_context_paged_kv=full_kv,
             mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
-            softmax_stats_tensor=temp_softmax_stats_tensor,
+            softmax_stats_tensor=attn_metadata.temp_softmax_stats_tensor,
         )
-        temp_merge_op = merge_op_tensor[chunked_loop_num]
-        trtllm_attention.merge_attention_for_mla(attn_output, temp_attn_output,
-                                                 softmax_stats_tensor,
-                                                 temp_softmax_stats_tensor,
-                                                 temp_merge_op, attn_metadata)
+        temp_merge_op = attn_metadata.merge_op_tensor[chunked_loop_num]
+        trtllm_attention.merge_attention_for_mla(
+            attn_output, temp_attn_output, attn_metadata.softmax_stats_tensor,
+            attn_metadata.temp_softmax_stats_tensor, temp_merge_op,
+            attn_metadata)
         # copy back kv_lens_runtime and kv_lens_cuda_runtime
         attn_metadata.kv_lens_runtime = origin_kv_lens_runtime
         attn_metadata.kv_lens_cuda_runtime = origin_kv_lens_cuda_runtime
