@@ -246,7 +246,7 @@ class GenerationExecutorWorker(GenerationExecutor):
     def _create_error_response(self, response: tllm.Response) -> ErrorResponse:
         bck_error = self._error_queue.get_nowait()
         assert isinstance(bck_error, Exception)
-        return ErrorResponse(None, bck_error, None)
+        return ErrorResponse(response.client_id, bck_error, response.request_id)
 
     def _iteration_result_task(self, it_result_queue: IterationResultQueue,
                                engine_get_result_api: Callable,

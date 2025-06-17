@@ -1680,15 +1680,26 @@ class DummyExecutorWorker(GenerationExecutorWorker):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    @classmethod
+    def create(cls, *args, **kwargs):
+        print("DummyExecutorWorker.create", args, kwargs)
+        worker_kwargs = {
+            "engine": kwargs.get("engine"),
+            "executor_config": kwargs.get("executor_config"),
+            "batched_logits_processor": kwargs.get("batched_logits_processor"),
+        }
+
+        return cls(**worker_kwargs,
+                   is_llm_executor=kwargs.get("is_llm_executor"))
+
     def _engine_response_callback(self, response: tllm.Response):
         # Making the first response failed, and the subsequent responses successful
         if DummyExecutorWorker.should_raise_system_error:
             DummyExecutorWorker.should_raise_system_error = False
-            print(f"Raise system error for {response.client_id}")
             return tllm.Response(
-                request_id=None,  # dummy value
-                client_id=None,
-                error_msg="Test system error")
+                request_id=response.request_id,  # dummy value
+                client_id=response.client_id,
+                error_msg=Exception("Test system error"))
         else:
             return response
 
@@ -1699,7 +1710,7 @@ def test_llm_system_error_handler():
               build_config=build_config,
               executor_cls=DummyExecutorWorker,
               kv_cache_config=global_kvcache_config,
-              fast_build=True)
+              backend='pytorch')
 
     DummyExecutorWorker.should_raise_system_error = True
     output = llm.generate(prompts)
