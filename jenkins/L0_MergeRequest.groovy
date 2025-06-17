@@ -140,6 +140,12 @@ def globalVars = [
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
 ]
 
+@Field
+def RUN_MULTI_GPU_TEST = "run_multi_gpu_test"
+def subJobReturnVars = [
+    (RUN_MULTI_GPU_TEST): false,
+]
+
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
 boolean enableUpdateGitlabStatus =
     !testFilter[ENABLE_SKIP_TEST] &&
@@ -818,7 +824,7 @@ def getCommonParameters()
     ]
 }
 
-def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
+def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "", getHandle = false)
 {
     if (jenkinsUrl == "" && env.localJobCredentials) {
         jenkinsUrl = env.JENKINS_URL
@@ -843,11 +849,22 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
         )
         echo "Triggered job: ${handle.absoluteUrl}"
         status = handle.result
+        if (getHandle) {
+            return handle
+        }
     }
     return status
 }
 
-def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
+def updateSubJobReturnVars(handle, subJobReturnVars) {
+    def artifacts = handle.getArtifacts()
+    def resultFile = artifacts.find { it.fileName == 'subJobReturnVars.json' }
+    def url = "${handle.absoluteUrl}artifact/${resultFile.relativePath}"
+    def myResult = sh(script: "curl -s '${url}'", returnStdout: true).trim()
+    trtllm_utils.updateMapWithJson(this, subJobReturnVars, myResult, "subJobReturnVars")
+}
+
+def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars, subJobReturnVars)
 {
     stages = [
         "Release Check": {
@@ -886,10 +903,87 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
 
                 }
-                def testStageName = "[Test-x86_64] Run"
+                def testStageName = "[Test-x86_64-Single-GPU] Run"
                 if (env.localJobCredentials) {
-                    testStageName = "[Test-x86_64] Remote Run"
+                    testStageName = "[Test-x86_64-Single-GPU] Remote Run"
                 }
+                testJobName = "L0_Test-x86_64-Single-GPU"
+                def willRunMultiGpuTest = false
+                stage(testStageName) {
+                    if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                        echo "x86_64 test job is skipped due to Jenkins configuration"
+                        return
+                    }
+                    try {
+                        parameters = getCommonParameters()
+
+                        String testFilterJson = writeJSON returnText: true, json: testFilter
+                        String globalVarsJson = writeJSON returnText: true, json: globalVars
+                        parameters += [
+                            'enableFailFast': enableFailFast,
+                            'testFilter': testFilterJson,
+                            'dockerImage': LLM_DOCKER_IMAGE,
+                            'wheelDockerImagePy310': LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
+                            'wheelDockerImagePy312': LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+                            'globalVars': globalVarsJson,
+                        ]
+
+                        if (env.alternativeTRT) {
+                            parameters += [
+                                'alternativeTRT': env.alternativeTRT,
+                            ]
+                        }
+
+                        if (env.testPhase2StageName) {
+                            parameters += [
+                                'testPhase2StageName': env.testPhase2StageName,
+                            ]
+                        }
+
+                        echo "trigger x86_64 test job, params: ${parameters}"
+
+                        def status = ""
+                        handle = triggerJob(
+                            testJobName,
+                            parameters,
+                            "",
+                            "",
+                            true,
+                        )
+                        status = handle.result
+                        subJobReturnVars = updateSubJobReturnVars(handle, subJobReturnVars)
+                        willRunMultiGpuTest = subJobReturnVars[RUN_MULTI_GPU_TEST]
+                        echo "willRunMultiGpuTest: ${willRunMultiGpuTest}"
+
+                        if (status != "SUCCESS") {
+                            error "Downstream job did not succeed"
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (X86_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "x86_64 test failed but ignored due to Jenkins configuration"
+                            }
+                        } else if (JOB_NAME ==~ /.*PostMerge.*/) {
+                            catchError(
+                                buildResult: 'FAILURE',
+                                stageResult: 'FAILURE') {
+                                error "x86_64 single-GPU test failed"
+                            }
+                        } else {
+                            throw e
+                        }
+                    }
+                }
+                if (!willRunMultiGpuTest && JOB_NAME ==~ /.*PostMerge.*/) {
+                    echo "Not postMerge job and will not run multi-GPU tests"
+                    return
+                }
+                testStageName = "[Test-x86_64-Multi-GPU] Run"
+                testJobName = "L0_Test-x86_64-Multi-GPU"
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "x86_64 test job is skipped due to Jenkins configuration"
@@ -924,7 +1018,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         echo "trigger x86_64 test job, params: ${parameters}"
 
                         def status = triggerJob(
-                            "L0_Test-x86_64",
+                            testJobName,
                             parameters,
                         )
 
@@ -1164,7 +1258,7 @@ pipeline {
                         // globalVars[CACHED_CHANGED_FILE_LIST] is only used in setupPipelineEnvironment
                         // Reset it to null to workaround the "Argument list too long" error
                         globalVars[CACHED_CHANGED_FILE_LIST] = null
-                        launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
+                        launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars, subJobReturnVars)
                     }
                 }
             }
