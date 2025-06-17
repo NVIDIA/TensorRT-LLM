@@ -146,7 +146,7 @@ set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 if(NVRTC_DYNAMIC_LINKING)
   set(NVRTC_LIB CUDA::nvrtc)
   set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins)
-else
+else()
   set(NVRTC_LIB CUDA::nvrtc_static)
   set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
 
