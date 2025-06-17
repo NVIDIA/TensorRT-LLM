@@ -127,6 +127,8 @@ ExternalProject_Add(
                 ${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch
   COMMAND sed "s/TRANSPORT_VERSION_MAJOR 3/TRANSPORT_VERSION_MAJOR 103/" -i
           src/CMakeLists.txt
+  COMMAND sed "s/_STANDARD 11/_STANDARD 17/" -i src/device/CMakeLists.txt
+  COMMAND sed "s/_STANDARD 11/_STANDARD 17/" -i src/CMakeLists.txt
   COMMAND patch -p1 --forward --batch -i
           ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch
   CMAKE_CACHE_ARGS

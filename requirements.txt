@@ -21,7 +21,7 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-tensorrt~=10.11.0
+tensorrt
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-06.html#rel-25-06 uses 2.8.0a0.
 torch>=2.7.1,<=2.8.0a0
 torchvision

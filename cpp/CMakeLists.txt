@@ -472,7 +472,6 @@ print(os.path.dirname(torch.__file__),end='');"
       endif()
     endif()
   endif()
-
 else()
   if(NOT WIN32)
     if(NOT USE_CXX11_ABI)

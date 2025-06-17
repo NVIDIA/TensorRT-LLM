@@ -49,31 +49,31 @@ install_ubuntu_requirements() {
     rm cuda-keyring_1.1-1_all.deb
 
     apt-get update
-    if [[ $(apt list --installed | grep libcudnn9) ]]; then
-      apt-get remove --purge -y libcudnn9*
-    fi
-    if [[ $(apt list --installed | grep libnccl) ]]; then
-      apt-get remove --purge -y --allow-change-held-packages libnccl*
-    fi
-    if [[ $(apt list --installed | grep libcublas) ]]; then
-      apt-get remove --purge -y --allow-change-held-packages libcublas*
-    fi
-    if [[ $(apt list --installed | grep cuda-nvrtc-dev) ]]; then
-      apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev*
-    fi
+  #   if [[ $(apt list --installed | grep libcudnn9) ]]; then
+  #     apt-get remove --purge -y libcudnn9*
+  #   fi
+  #   if [[ $(apt list --installed | grep libnccl) ]]; then
+  #     apt-get remove --purge -y --allow-change-held-packages libnccl*
+  #   fi
+  #   if [[ $(apt list --installed | grep libcublas) ]]; then
+  #     apt-get remove --purge -y --allow-change-held-packages libcublas*
+  #   fi
+  #   if [[ $(apt list --installed | grep cuda-nvrtc-dev) ]]; then
+  #     apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev*
+  #   fi
 
-    CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
-    NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+  #   CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+  #   NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
 
-    apt-get install -y --no-install-recommends \
-        libcudnn9-cuda-12=${CUDNN_VER} \
-        libcudnn9-dev-cuda-12=${CUDNN_VER} \
-	libcudnn9-headers-cuda-12=${CUDNN_VER} \
-        libnccl2=${NCCL_VER} \
-        libnccl-dev=${NCCL_VER} \
-        libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
-        libcublas-dev-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
-        cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER}
+  #   apt-get install -y --no-install-recommends \
+  #       libcudnn9-cuda-12=${CUDNN_VER} \
+  #       libcudnn9-dev-cuda-12=${CUDNN_VER} \
+	# libcudnn9-headers-cuda-12=${CUDNN_VER} \
+  #       libnccl2=${NCCL_VER} \
+  #       libnccl-dev=${NCCL_VER} \
+  #       libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
+  #       libcublas-dev-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
+  #       cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER}
 
     apt-get clean
     rm -rf /var/lib/apt/lists/*
@@ -130,12 +130,17 @@ install_tensorrt() {
         if [ -z "$ARCH" ];then ARCH=$(uname -m);fi
         if [ "$ARCH" = "arm64" ];then ARCH="aarch64";fi
         if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
-        RELEASE_URL_TRT="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/${TRT_VER_SHORT}/tars/TensorRT-${TRT_VER}.Linux.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz"
+
+        if [ "$ARCH" = "x86_64" ]; then
+        RELEASE_URL_TRT="http://cuda-repo/release-candidates/Libraries/TensorRT/v10.14/10.14.0.19-6374d0f7/13.0-r580/Linux-x64-manylinux_2_28/tar/TensorRT-10.14.0.19.Linux.x86_64-gnu.cuda-13.0.tar.gz"
+        else
+        RELEASE_URL_TRT="http://cuda-repo/release-candidates/Libraries/TensorRT/v10.14/10.14.0.19-6374d0f7/13.0-r580/Linux-aarch64-manylinux_2_35/tar/TensorRT-10.14.0.19.Ubuntu-22.04.aarch64-gnu.cuda-13.0.tar.gz"
+        fi
     fi
 
     wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
     tar -xf /tmp/TensorRT.tar -C /usr/local/
-    mv /usr/local/TensorRT-${TRT_VER} /usr/local/tensorrt
+    mv /usr/local/TensorRT-* /usr/local/tensorrt
     pip3 install --no-cache-dir /usr/local/tensorrt/python/tensorrt-*-cp${PARSED_PY_VERSION}-*.whl
     rm -rf /tmp/TensorRT.tar
     echo 'export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:$LD_LIBRARY_PATH' >> "${ENV}"
