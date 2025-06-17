@@ -53,6 +53,27 @@ option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
 option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
        "Using open sourced Cutlass AR gemm kernel" ON)
 
+# Disable CUTLASS FP4 GEMM for sm120 architectures
+if(CMAKE_CUDA_ARCHITECTURES)
+  string(REGEX MATCH "120" SM120_FOUND "${CMAKE_CUDA_ARCHITECTURES}")
+  if(SM120_FOUND)
+    set(USING_OSS_CUTLASS_FP4_GEMM
+        OFF
+        CACHE BOOL "Using open sourced Cutlass fp4 gemm kernel" FORCE)
+    set(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
+        OFF
+        CACHE BOOL "Using open sourced Cutlass low latency gemm kernel" FORCE)
+    set(USING_OSS_CUTLASS_MOE_GEMM
+        OFF
+        CACHE BOOL "Using open sourced Cutlass moe gemm kernel" FORCE)
+    set(USING_OSS_CUTLASS_ALLREDUCE_GEMM
+        OFF
+        CACHE BOOL "Using open sourced Cutlass AR gemm kernel" FORCE)
+    message(
+      STATUS "Disabling USING_OSS_CUTLASS_FP4_GEMM for sm_120 architecture")
+  endif()
+endif()
+
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
   message(STATUS "NVTX is disabled")
