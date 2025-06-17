@@ -41,6 +41,7 @@ class MoERunner(TunableRunner):
         ep_rank: int,
         cluster_size: int,
         cluster_rank: int,
+        enable_alltoall: bool,
         use_deepseek_fp8_block_scale: bool,
         use_w4a8_group_scaling: bool,
     ):
@@ -54,6 +55,7 @@ class MoERunner(TunableRunner):
         self.ep_rank = ep_rank
         self.cluster_size = cluster_size
         self.cluster_rank = cluster_rank
+        self.enable_alltoall = enable_alltoall
         self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
         self.use_w4a8_group_scaling = use_w4a8_group_scaling
 
@@ -110,6 +112,7 @@ class MoERunner(TunableRunner):
             self.ep_rank,
             self.cluster_size,
             self.cluster_rank,
+            self.enable_alltoall,
             min_latency_mode,
             gemm_idx,
             tactic,
@@ -144,6 +147,7 @@ def fused_moe(
     ep_rank: int = 0,
     cluster_size: int = 1,
     cluster_rank: int = 0,
+    enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
     use_w4a8_group_scaling: bool = False,
     min_latency_mode: bool = False,
@@ -168,6 +172,7 @@ def fused_moe(
         ep_rank=ep_rank,
         cluster_size=cluster_size,
         cluster_rank=cluster_rank,
+        enable_alltoall=enable_alltoall,
         use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
         use_w4a8_group_scaling=use_w4a8_group_scaling,
     )
@@ -203,6 +208,7 @@ def fused_moe(
         ep_rank,
         cluster_size,
         cluster_rank,
+        enable_alltoall,
         min_latency_mode,
         [gemm_tactic_1, gemm_tactic_2],
     )

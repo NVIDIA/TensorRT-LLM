@@ -30,8 +30,8 @@ from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
 from .kv_cache_transceiver import KvCacheTransceiver
-from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
-                          LlmRequestState, executor_request_to_llm_request)
+from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
+                          LlmResponse, executor_request_to_llm_request)
 from .model_engine import ModelEngine
 from .sampler import Sampler, SampleState, SampleStateTensors, TorchSampler
 from .scheduler import ScheduledRequests
@@ -328,14 +328,14 @@ class PyExecutor:
         self,
         id: Optional[Union[List[int], int]] = None,
         timeout: Optional[datetime.timedelta] = None,
-    ) -> Union[List[List[ExecutorResponse]], List[ExecutorResponse]]:
+    ) -> Union[List[List[LlmResponse]], List[LlmResponse]]:
         """
         Await for ready responses
         Args:
             id (Optional[Union[List[int], int]]): Request id
             timeout (Optional[datetime.timedelta]): The maximum time to wait for new responses
         Returns:
-            Union[List[tensorrt_llm.bindings.executor.Response], List[List[tensorrt_llm.bindings.executor.Response]]]: Responses
+            Union[List[LlmResponse], List[List[LlmResponse]]]: Responses
         """
         timeout = timeout.total_seconds() if timeout is not None else None
         if id is None:
@@ -1928,8 +1928,10 @@ class PyExecutor:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
             self._terminate_request(request)
-            error_responses[req_id] = ExecutorResponse(
-                req_id, error_msg, client_id=request.py_client_id)
+            error_responses[req_id] = LlmResponse(
+                request_id=req_id,
+                error_msg=error_msg,
+                client_id=request.py_client_id)
         self.active_requests.clear()
         self._enqueue_responses(error_responses)
 
@@ -1973,7 +1975,7 @@ class PyExecutor:
         self._enqueue_responses(cancelled_responses)
 
     @nvtx_range("_enqueue_responses")
-    def _enqueue_responses(self, responses: Dict[int, ExecutorResponse]):
+    def _enqueue_responses(self, responses: Dict[int, LlmResponse]):
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
             return
 
@@ -2030,7 +2032,7 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
-            if request.is_generation_only_request:
+            if request.is_generation_only_request():
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
@@ -2042,7 +2044,7 @@ class PyExecutor:
 
             request.draft_tokens = request.py_draft_tokens
             request.decoding_iter = request.py_decoding_iter
-            response: Response = request.create_response(False, self.dist.rank)
+            response = request.create_response(False, self.dist.rank)
             request_done = False
             if response:
                 request_done = response.result.is_final
@@ -2069,7 +2071,7 @@ class PyExecutor:
 
     def _await_any_response(self,
                             timeout: Optional[float] = None
-                            ) -> List[ExecutorResponse]:
+                            ) -> List[LlmResponse]:
 
         def any_responses_ready():
             return len(self.responses) > 0 or self.is_shutdown
@@ -2086,7 +2088,7 @@ class PyExecutor:
     def _await_single_response(
             self,
             id: int,
-            timeout: Optional[float] = None) -> List[ExecutorResponse]:
+            timeout: Optional[float] = None) -> List[LlmResponse]:
         with self.response_cv:
 
             def key_has_response():

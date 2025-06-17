@@ -961,8 +961,9 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         inputs[getExpertWeights2Index()], hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens,
         mExpertHiddenSize, mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
         // Outputs
-        outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig, hasLora(),
-        lora_params, /*use_deepseek_fp8_block_scale=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
+        outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig,
+        /*enable_alltoall=*/false, hasLora(), lora_params, /*use_deepseek_fp8_block_scale=*/false,
+        /*min_latency_mode=*/false, min_latency_params, stream);
 
     if (useSideStream())
     {
@@ -1281,5 +1282,5 @@ void MixtureOfExpertsGemmProfiler::checkInit()
     backend.init(*plugin.mMOERunner, backend.mGemmToProfile, plugin.mType, plugin.mWeightType, plugin.mOutputType,
         plugin.mNumExperts, plugin.mExpertsPerToken, plugin.mExpertHiddenSize, plugin.mExpertInterSize,
         plugin.mGroupSize, plugin.mActivationType, plugin.hasBias(), plugin.hasLora(), /*min_latency_mode=*/false,
-        /*need_weights=*/true, plugin.getParallelismConfig());
+        /*need_weights=*/true, plugin.getParallelismConfig(), /*enable_alltoall=*/false);
 }
