@@ -470,6 +470,12 @@ def globalVars = [
     (ACTION_INFO): null,
 ]
 
+@Field
+def RUN_MULTI_GPU_TEST = "run_multi_gpu_test"
+def subJobReturnVars = [
+    (RUN_MULTI_GPU_TEST): false,
+]
+
 String getShortenedJobName(String path)
 {
     static final nameMapping = [
@@ -2280,6 +2286,10 @@ pipeline {
             steps
             {
                 script {
+                    if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
+                        echo "This check is not needed for multi-GPU tests."
+                        return
+                    }
                     launchTestListCheck(this)
                 }
             }
@@ -2293,10 +2303,34 @@ pipeline {
                     dgxJobs = [:]
 
                     def testPhase2StageName = env.testPhase2StageName
-                    if (testPhase2StageName) {
+                    if (testPhase2StageName || env.JOB_NAME ==~ /.*Multi-GPU.*/ || env.JOB_NAME ==~ /.*Single-GPU.*/) {
                         def dgxSigns = ["DGX_H100", "DGX_H200", "GB200", "DGX_B200"]
                         singleGpuJobs = parallelJobs.findAll{!dgxSigns.any{sign -> it.key.contains(sign)}}
                         dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
+                    }
+
+                    if (env.JOB_NAME ==~ /.*Single-GPU.*/) {
+                        echo "Only run single-GPU tests."
+                        singleGpuJobs.failFast = params.enableFailFast
+                        parallel singleGpuJobs
+                        stage("Upload Artifacts") {
+                            if (dgxJobs.size() > 0) {
+                                subJobReturnVars[RUN_MULTI_GPU_TEST] = true
+                                echo "Set subJobReturnVars[RUN_MULTI_GPU_TEST] to true."
+                            }
+                            String subJobReturnVarsJson = writeJSON returnText: true, json: subJobReturnVars
+                            writeFile file: "subJobReturnVars.json", text: subJobReturnVarsJson
+                            retry(3) {
+                                uploadArtifacts artifacts: "subJobReturnVars.json", fingerprint: true
+                            }
+                        }
+                        return
+                    }
+                    if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
+                        echo "Only run multi-GPU tests."
+                        dgxJobs.failFast = params.enableFailFast
+                        parallel dgxJobs
+                        return
                     }
 
                     if (singleGpuJobs.size() > 0) {
