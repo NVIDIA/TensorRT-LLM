@@ -630,9 +630,11 @@ void CreateNewDecoderRequests::retrieveDraftLogits(ModelConfig const& modelConfi
 
     if (isLeaderInOrchMode)
     {
+        // TODO: This should be moved out of llm request.
         te::SpeculativeDecodingFastLogitsInfo fastLogitsInfo;
         std::memcpy(&fastLogitsInfo, llmReq.getDraftLogits().value()->data(), sizeof(fastLogitsInfo));
         auto logits = utils::targetModelReceiveLogits(fastLogitsInfo, modelConfig).value();
+        // TODO: This const_cast should be removed, ContextRequests should be non-const reference.
         const_cast<LlmRequest&>(llmReq).setDraftLogits(std::move(logits));
 
         // Broadcast to other ranks if needed
@@ -656,6 +658,7 @@ void CreateNewDecoderRequests::retrieveDraftLogits(ModelConfig const& modelConfi
     auto logits = tensorrt_llm::runtime::BufferManager::pinnedPool(
         ITensor::makeShape({dims[0], dims[1]}), modelConfig.getLogitsDtype());
     commSession.bcast(logits->data(), logits->getSizeInBytes(), mpi::MpiType::kUINT8, 0);
+    // TODO: Same with this const_cast, ContextRequests should be non-const reference.
     const_cast<LlmRequest&>(llmReq).setDraftLogits(std::move(logits));
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
