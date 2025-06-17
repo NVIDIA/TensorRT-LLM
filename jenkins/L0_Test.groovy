@@ -266,20 +266,14 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     }
 }
 
-def getNodeArgsFromStageName(String stageName) {
-    def taskConfig = parseMultiNodeTaskConfigFromStageName(stageName)
-    if (taskConfig) {
-        int gpu_count = taskConfig.system_gpu_count.toInteger()
-        int node_count = taskConfig.node_count.toInteger()
-        int gpu_per_node = ((gpu_count / node_count) as BigDecimal).setScale(0, BigDecimal.ROUND_CEILING).intValue()
-        return [
-            "--nodes=${node_count}",
-            "--ntasks=${gpu_count}",
-            "--ntasks-per-node=${gpu_per_node}",
-            "--gpus-per-node=${gpu_per_node}",
-        ].join(" ")
-    }
-    return null
+def getNodeArgs(int nodeCount, int gpuCount) {
+    int gpusPerNode = ((gpuCount / nodeCount) as BigDecimal).setScale(0, BigDecimal.ROUND_CEILING).intValue()
+    return [
+        "--nodes=${nodeCount}",
+        "--ntasks=${gpuCount}",
+        "--ntasks-per-node=${gpusPerNode}",
+        "--gpus-per-node=${gpusPerNode}",
+    ].join(" ")
 }
 
 def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=2, skipInstallWheel=false, cpver="cp312")
@@ -343,7 +337,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 // Generate Multi Node Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
                 def mounts = "/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro,/home/svc_tensorrt/bloom/scripts:/home/svc_tensorrt/bloom/scripts"
-                String taskArgs = getNodeArgsFromStageName(stageName)
+                String taskArgs = getNodeArgs(nodeCount, gpuCount)
 
                 if (taskArgs == null) {
                     error "Invalid multinode task stage name is set"
@@ -1855,7 +1849,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm_MultiNodes(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1)
+            runLLMTestlistOnSlurm_MultiNodes(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2)
         }]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs

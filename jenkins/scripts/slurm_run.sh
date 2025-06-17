@@ -42,7 +42,7 @@ cd $llmSrcNode/tests/integration/defs
 testCmdLines=(
     "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
     "pytest"
-    "-vvv"
+    "-v"
     "--timeout=$pytestTestTimeout"
     "--test-list=$testListPathNode"
     "--rootdir $llmSrcNode/tests/integration/defs"
