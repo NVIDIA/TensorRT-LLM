@@ -990,12 +990,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
                 stage(testStageName) {
-                    /*
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "SBSA test job is skipped due to Jenkins configuration"
                         return
                     }
-                    */
                     try {
                         def parameters = getCommonParameters()
 
