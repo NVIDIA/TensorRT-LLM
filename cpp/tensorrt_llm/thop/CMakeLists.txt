@@ -71,6 +71,7 @@ add_library(
   moeUtilOp.cpp
   moeCommOp.cpp
   moeLoadBalanceOp.cpp
+  mxFp4BlockScaleMoe.cpp
   fp8BlockScaleMoe.cpp
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp

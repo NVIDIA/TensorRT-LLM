@@ -24,26 +24,41 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <optional>
 
 namespace torch_ext
 {
 // self: [M, K], fp16/bf16/fp8_quantized
-// globalScale: [1] float, = (448 * 6) / self.abs().max()
+// globalScale: [1] float, = (448 * 6) / self.abs().max(). Not used when sfUseUE8M0 is true.
 // nvfp4: sfVecSize = 16, sfUseUE8M0 = false
-// mxfp4: sfVecSize = 32 (not supported yet), sfUseUE8M0 = true
+// mxfp4: sfVecSize = 32, sfUseUE8M0 = true
 // alignment: sfVecSize
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in linear layout.
 // See FP4QuantizationSFLayout enum for more details about the two layouts.
 // returns self_fp4, self_block_scale_factors
 // self_fp4: [M, K / 2], FLOAT4_E2M1X2
 // self_block_scale_factors: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
-std::tuple<at::Tensor, at::Tensor> fp4_quantize(
-    at::Tensor const& self, at::Tensor const& globalScale, int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout)
+std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::optional<at::Tensor> const& globalScale,
+    int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout)
 {
     CHECK_TH_CUDA(self);
     CHECK_CONTIGUOUS(self);
-    CHECK_INPUT(globalScale, torch::kFloat32);
-    TORCH_CHECK(sfVecSize == 16, "sfVecSize can only be 16");
+    if (sfUseUE8M0)
+    {
+        TORCH_CHECK(sfVecSize == 32, "sfVecSize can only be 32, when sfUseUE8M0 is true");
+    }
+    else
+    {
+        TORCH_CHECK(globalScale.has_value(), "globalScale is required when sfUseUE8M0 is false");
+        CHECK_INPUT(globalScale.value(), torch::kFloat32);
+        TORCH_CHECK(sfVecSize == 16, "sfVecSize can only be 16, when sfUseUE8M0 is false");
+    }
+
+    float* globalScalePtr{nullptr};
+    if (globalScale.has_value())
+    {
+        globalScalePtr = globalScale->data_ptr<float>();
+    }
 
     auto const& inputShape = self.sizes();
     auto const& rank = inputShape.size();
@@ -73,35 +88,65 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(
     auto const layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
                                            : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
 
-#define LAUNCH_FP4_QUANTIZE_KERNEL(T)                                                                                  \
-    tensorrt_llm::kernels::invokeFP4Quantization(m, k, reinterpret_cast<T*>(self.data_ptr()),                          \
-        globalScale.data_ptr<float>(), reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                               \
+#define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                                     \
+    tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(m, k, reinterpret_cast<T*>(self.data_ptr()),          \
+        globalScalePtr, reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                              \
         reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount,                   \
         at::cuda::getCurrentCUDAStream(self.get_device()));
 
-    if (self.scalar_type() == at::ScalarType::Half)
+    if (sfUseUE8M0)
     {
-        LAUNCH_FP4_QUANTIZE_KERNEL(half)
-    }
-    else if (self.scalar_type() == at::ScalarType::BFloat16)
-    {
+        if (self.scalar_type() == at::ScalarType::Half)
+        {
+            LAUNCH_FP4_QUANTIZE_KERNEL(half, 32)
+        }
+        else if (self.scalar_type() == at::ScalarType::BFloat16)
+        {
 #ifdef ENABLE_BF16
-        LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16)
+            LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 32)
 #else
-        C10_THROW_ERROR(NotImplementedError, "BFloat16 must be enabled to quantize an bf16 tensor to fp4.");
+            C10_THROW_ERROR(NotImplementedError, "BFloat16 must be enabled to quantize an bf16 tensor to fp4.");
 #endif
-    }
-    else if (self.scalar_type() == at::ScalarType::Float8_e4m3fn)
-    {
+        }
+        else if (self.scalar_type() == at::ScalarType::Float8_e4m3fn)
+        {
 #ifdef ENABLE_FP8
-        LAUNCH_FP4_QUANTIZE_KERNEL(__nv_fp8_e4m3)
+            LAUNCH_FP4_QUANTIZE_KERNEL(__nv_fp8_e4m3, 32)
 #else
-        C10_THROW_ERROR(NotImplementedError, "FP8 must be enabled to quantize an fp8 tensor to fp4.");
+            C10_THROW_ERROR(NotImplementedError, "FP8 must be enabled to quantize an fp8 tensor to fp4.");
 #endif
+        }
+        else
+        {
+            C10_THROW_ERROR(NotImplementedError, "fp4_quantize only supports input tensor with dtypes fp16/bf16/e4m3.");
+        }
     }
     else
     {
-        C10_THROW_ERROR(NotImplementedError, "fp4_quantize only supports input tensor with dtypes fp16/bf16/e4m3.");
+        if (self.scalar_type() == at::ScalarType::Half)
+        {
+            LAUNCH_FP4_QUANTIZE_KERNEL(half, 16)
+        }
+        else if (self.scalar_type() == at::ScalarType::BFloat16)
+        {
+#ifdef ENABLE_BF16
+            LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 16)
+#else
+            C10_THROW_ERROR(NotImplementedError, "BFloat16 must be enabled to quantize an bf16 tensor to fp4.");
+#endif
+        }
+        else if (self.scalar_type() == at::ScalarType::Float8_e4m3fn)
+        {
+#ifdef ENABLE_FP8
+            LAUNCH_FP4_QUANTIZE_KERNEL(__nv_fp8_e4m3, 16)
+#else
+            C10_THROW_ERROR(NotImplementedError, "FP8 must be enabled to quantize an fp8 tensor to fp4.");
+#endif
+        }
+        else
+        {
+            C10_THROW_ERROR(NotImplementedError, "fp4_quantize only supports input tensor with dtypes fp16/bf16/e4m3.");
+        }
     }
 
 #undef LAUNCH_FP4_QUANTIZE_KERNEL
@@ -113,11 +158,12 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "fp4_quantize(Tensor input, Tensor globalScale, int sfVecSize, bool sfUseUE8M0=False, bool swizzedLayout=True) "
+        "fp4_quantize(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
+        "isSfSwizzledLayout=True) "
         "-> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp4_quantize", &torch_ext::fp4_quantize);
+    m.impl("fp4_quantize", TORCH_FN(torch_ext::fp4_quantize));
 }

@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
+#include "tensorrt_llm/thop/fp8Op.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <cuda_fp16.h>
@@ -102,46 +103,6 @@ float e2M1ToFloat(uint8_t value)
     if (signBit)
         result = -result;
     return result;
-}
-
-// Given the rowIdx and colIdx in the unswizzled SFMatrix, compute the 1D offset in the swizzled SFMatrix.
-// colIdx and totalCloumn should be in SFMatrix, not activation Matrix, so no sfVecSize needed.
-int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn, tensorrt_llm::FP4QuantizationSFLayout layout)
-{
-    constexpr int kColumnGroup0Size = 4;
-    constexpr int kRowGroup0Size = 32;
-    constexpr int kRowGroup1Size = kRowGroup0Size * 4;
-
-    // Swizzled layout is used as default layout.
-    if (layout == tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED)
-    {
-        // int paddedRow = PadUpFn(totalRow, 128);
-        int paddedColumn = PadUpFn(totalColumn, 4);
-
-        int columnIdxInGroup0 = colIdx % kColumnGroup0Size;
-        int columnGroupIdx = colIdx / kColumnGroup0Size;
-        constexpr int columnGroupStride = kColumnGroup0Size * kRowGroup1Size;
-
-        int rowIdxInGroup0 = rowIdx % kRowGroup0Size;
-        int rowIdxInGroup1 = rowIdx % kRowGroup1Size / kRowGroup0Size;
-        int rowGroupIdx = rowIdx / kRowGroup1Size;
-        constexpr int rowGroup1Stride = kColumnGroup0Size;
-        constexpr int rowGroup0Stride = kColumnGroup0Size * rowGroup1Stride;
-        int rowGroupStride = kRowGroup1Size * paddedColumn;
-
-        return columnIdxInGroup0 + columnGroupIdx * columnGroupStride + rowIdxInGroup0 * rowGroup0Stride
-            + rowIdxInGroup1 * rowGroup1Stride + rowGroupIdx * rowGroupStride;
-    }
-    // Linear layout is only used in E2M1AndUFP8SFScaleToFloatV2.
-    else if (layout == tensorrt_llm::FP4QuantizationSFLayout::LINEAR)
-    {
-        // no padding needed. totalColumn is multiple of kVecSize.
-        return rowIdx * totalColumn + colIdx;
-    }
-    else
-    {
-        TLLM_THROW("Other layout not implemented yet.");
-    }
 }
 
 torch::autograd::variable_list FloatToE2M1AndUFP8SFScale(
@@ -453,8 +414,8 @@ th::Tensor E2M1AndUFP8SFScaleToFloat(th::Tensor valueE2M1, th::Tensor scaleFP8SF
 }
 
 // Used by the (fp16 -> int4) quant layer + int4 gemm network.
-th::Tensor E2M1AndUFP8SFScaleToFloatV2(th::Tensor valueE2M1, th::Tensor scaleFP8SF, th::Tensor globalScale,
-    int64_t sfVecSize, int64_t sfType, bool isSfSwizzledLayout = true)
+th::Tensor E2M1AndUFP8SFScaleToFloatV2(th::Tensor valueE2M1, th::Tensor scaleFP8SF,
+    std::optional<th::Tensor> globalScale, int64_t sfVecSize, int64_t sfType, bool isSfSwizzledLayout = true)
 {
     CHECK_CPU_INPUT(valueE2M1, FLOAT4_E2M1X2);
     CHECK_CPU_INPUT(scaleFP8SF, SF_DTYPE);
@@ -465,8 +426,13 @@ th::Tensor E2M1AndUFP8SFScaleToFloatV2(th::Tensor valueE2M1, th::Tensor scaleFP8
     th::Tensor floatTensor
         = th::zeros({packedShape[0], packedShape[1] * 2}, th::dtype(th::kFloat32).requires_grad(false));
 
-    CHECK_CPU_INPUT(globalScale, th::kFloat32);
-    float globalScaleVal = globalScale.data_ptr<float>()[0];
+    float globalScaleVal{1.0f};
+    if (sfType == 1)
+    {
+        TORCH_CHECK(globalScale.has_value(), "globalScale is required when sfType is 1.");
+        CHECK_CPU_INPUT(globalScale.value(), th::kFloat32);
+        globalScaleVal = globalScale->data_ptr<float>()[0];
+    }
 
     int hiddenDim = packedShape[1] * 2;
     int packedFp4HiddenDim = hiddenDim / 2;
