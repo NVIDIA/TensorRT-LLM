@@ -663,7 +663,7 @@ class LLM:
                 XGRAMMAR,
                 **_xgrammar_tokenizer_info(self.tokenizer))
         elif self.args.guided_decoding_backend == 'llguidance':
-            executor_config.guided_decoding_config = tllm.GuidedDecodingConfig(
+            self._executor_config.guided_decoding_config = tllm.GuidedDecodingConfig(
                 backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.
                 LLGUIDANCE,
                 **_llguidance_tokenizer_info(self.tokenizer))
