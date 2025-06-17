@@ -9,8 +9,8 @@ from pydantic import (AliasChoices, AliasPath, BaseModel, Field, computed_field,
                       field_validator, model_validator)
 from transformers import AutoConfig
 
-from tensorrt_llm.bench.tuning.utils import get_model_config
 from tensorrt_llm.bench.build.utils import get_safetensors_metadata
+from tensorrt_llm.bench.tuning.utils import get_model_config
 
 
 class BenchmarkSpecification(BaseModel):
@@ -18,7 +18,8 @@ class BenchmarkSpecification(BaseModel):
         default=None,
         description="The tuning criteria to use for benchmarking.")
     dataset_path: Optional[str] = Field(
-        default=None, description="The path to the dataset to use for benchmarking.")
+        default=None,
+        description="The path to the dataset to use for benchmarking.")
     engine_dir: Optional[Path] = Field(
         default=None,
         description="The path to the engine to use for benchmarking.")
@@ -33,11 +34,11 @@ class BenchmarkSpecification(BaseModel):
     world: Optional[WorldConfig] = Field(
         default=None, description="The world to use for benchmarking.")
 
-
     @model_validator(mode="after")
     def validate_heuristic_constraints(self):
         build_options = [
-            self.dataset_path, self.constraints.max_input_len, self.constraints.target_input_len
+            self.dataset_path, self.constraints.max_input_len,
+            self.constraints.target_input_len
         ]
         if all(opt is None for opt in build_options):
             raise ValueError(
@@ -53,7 +54,6 @@ class BenchmarkSpecification(BaseModel):
         return self
 
 
-
 class BenchmarkEnvironment(BaseModel):
     model: str = Field(default="",
                        description="The HF model name to use for benchmarking.")
@@ -66,15 +66,13 @@ class BenchmarkEnvironment(BaseModel):
     @cached_property
     @computed_field(
         description=
-        "The type of model being used, derived from the model configuration.",
-    )
+        "The type of model being used, derived from the model configuration.", )
     def model_type(self) -> str:
         return get_model_config(self.model, self.checkpoint_path).model_type
 
     @computed_field(
         description=
-        "The type of model being used, derived from the model configuration.",
-    )
+        "The type of model being used, derived from the model configuration.", )
     def checkpoint_path(self) -> Path:
         return self.checkpoint_path or self.model
 
@@ -85,12 +83,15 @@ class ScenarioSpecification(BaseModel):
     beam_width: Optional[int] = Field(
         default=None, description="The beam width to use for benchmarking.")
     concurrency: Optional[int] = Field(
-        default=None, description="The number of concurrent requests to benchmarking.")
+        default=None,
+        description="The number of concurrent requests to benchmarking.")
     eos_id: Optional[int] = Field(
-        default=-1, description="The end-of-sequence token to use for benchmarking.")
+        default=-1,
+        description="The end-of-sequence token to use for benchmarking.")
     extra_llm_api_options: Optional[Dict[str, Any]] = Field(
         default_factory=dict,
-        description="A dictionary of extra LLM API options to use for benchmarking.")
+        description=
+        "A dictionary of extra LLM API options to use for benchmarking.")
     kv_cache_free_gpu_mem_fraction: Optional[float] = Field(
         default=.9,
         description=
@@ -138,9 +139,13 @@ class TuningConstraints(BaseModel):
     target_input_len: Optional[int] = Field(
         default=None, description="The target input length to use for tuning.")
     target_output_len: Optional[int] = Field(
-        default=None, description="The target output length to use for tuning.")
+        default=None,
+        gt=0,
+        description="The target output length to use for tuning.")
     max_input_len: Optional[int] = Field(
-        default=None, description="The maximum input length to use for tuning.")
+        default=None,
+        gt=0,
+        description="The maximum input length to use for tuning.")
     max_output_len: Optional[int] = Field(
         default=None,
         description="The maximum output length to use for tuning.")
@@ -152,11 +157,40 @@ class TuningConstraints(BaseModel):
         extra = "ignore"
 
     @model_validator(mode="after")
-    def validate_max_input_len(self):
-        if self.mode == "build":
-            if self.max_input_len is None:
+    def validate_max_seq_len(self):
+        # Validate and adjust max sequence length, input length, and output length
+        lengths = {
+            "max_seq_len": self.max_seq_len,
+            "max_input_len": self.max_input_len,
+            "max_output_len": self.max_output_len
+        }
+
+        # Check which lengths are provided
+        provided_lengths = {k: v for k, v in lengths.items() if v is not None}
+
+        # If all three are provided, validate the sum
+        if len(provided_lengths) == 3:
+            if lengths["max_input_len"] + lengths["max_output_len"] != lengths[
+                    "max_seq_len"]:
                 raise ValueError(
-                    "max_input_len is required when mode is 'build'")
+                    "max_input_len + max_output_len must equal max_seq_len")
+        # If two are provided, calculate the missing one
+        elif len(provided_lengths) == 2:
+            missing_key = set(lengths.keys()) - set(provided_lengths.keys())
+            if "max_seq_len" in missing_key:
+                self.max_seq_len = lengths["max_input_len"] + lengths[
+                    "max_output_len"]
+            elif "max_input_len" in missing_key:
+                self.max_input_len = lengths["max_seq_len"] - lengths[
+                    "max_output_len"]
+            elif "max_output_len" in missing_key:
+                self.max_output_len = lengths["max_seq_len"] - lengths[
+                    "max_input_len"]
+        else:
+            raise ValueError(
+                "At least two of the following properties must be provided: "
+                "max_input_len, max_output_len, or max_seq_len")
+
         return self
 
 

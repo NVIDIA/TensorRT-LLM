@@ -11,6 +11,7 @@ from huggingface_hub import snapshot_download
 
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
+from tensorrt_llm.bench.tuning.heuristics import MaxThroughputScenario
 from tensorrt_llm.bench.tuning.utils import get_model_config
 
 # isort: off
@@ -22,8 +23,12 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
-from tensorrt_llm.bench.tuning.dataclasses import BenchmarkEnvironment, BenchmarkSpecification, ScenarioSpecification, TuningConstraints, WorldConfig
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
+from tensorrt_llm.bench.tuning.dataclasses import (BenchmarkEnvironment,
+                                                   BenchmarkSpecification,
+                                                   ScenarioSpecification,
+                                                   TuningConstraints,
+                                                   WorldConfig)
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
@@ -256,12 +261,13 @@ def throughput_command(
     scenario = ScenarioSpecification(**params)
     constraints = TuningConstraints(**params)
     world_config = WorldConfig(**params)
-    benchmark_specification = BenchmarkSpecification(
-        environment=bench_env,
-        scenario=scenario,
-        constraints=constraints,
-        world=world_config
-    )
+    benchmark_specification = BenchmarkSpecification(environment=bench_env,
+                                                     scenario=scenario,
+                                                     constraints=constraints,
+                                                     world=world_config)
+
+    scenario = MaxThroughputScenario.get_settings(scenario, world_config,
+                                                  constraints)
 
     # Parameters from CLI
     # Model, experiment, and engine params
