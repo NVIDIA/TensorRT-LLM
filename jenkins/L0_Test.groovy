@@ -957,7 +957,7 @@ def parseMultiNodeTaskConfigFromStageName(String stageName) {
         taskConfig = [
             gpu: "${matcher.group(1)}",
             system_gpu_count: "${matcher.group(2)}",
-            node_count: "${matcher.group(3)}"
+            node_count: "${matcher.group(3)}" // "node_count" might not be used currently
         ]
     }
     return taskConfig
