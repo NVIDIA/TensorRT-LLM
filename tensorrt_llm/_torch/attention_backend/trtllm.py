@@ -517,6 +517,12 @@ class TrtllmAttentionWrapper:
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
 
+    # TrtllmAttention needs to know the beam width and access to the cache indirection buffer,
+    # when beam search is enabled.
+    # TODO -- put this into the parent class instead?
+    beam_width: int = 1
+    cache_indirection: Optional[torch.Tensor] = None
+
     # TrtllmAttention needs to know the max sequence length.
     # Implemented as a property to support no cache mode.
     max_seq_len: Optional[int]
@@ -612,8 +618,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.kv_cache_manager is not None:
             self.kv_cache_block_offsets = torch.empty(
                 [
-                    self.kv_cache_manager.num_pools, self.max_num_requests, 2,
-                    self.kv_cache_manager.max_blocks_per_seq
+                    self.kv_cache_manager.num_pools, self.max_num_requests *
+                    self.beam_width, 2, self.kv_cache_manager.max_blocks_per_seq
                 ],
                 dtype=torch.int32,
                 device='cuda',
@@ -733,8 +739,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # kv block offsets
         assert self.request_ids is not None
         if self.kv_cache_manager is not None:
+            # TODO -- skip unnecessary copies
+            # Copy blocks for all context requests
             self.kv_cache_manager.impl.copy_batch_block_offsets(
-                self.host_kv_cache_block_offsets, self.request_ids)
+                self.host_kv_cache_block_offsets,
+                self.request_ids[:self.num_contexts], 1, 0)
+            # Copy blocks for all generation requests
+            self.kv_cache_manager.impl.copy_batch_block_offsets(
+                self.host_kv_cache_block_offsets,
+                self.request_ids[self.num_contexts:], self.beam_width,
+                self.num_contexts)
             self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
                 self.host_kv_cache_block_offsets[:, :self.num_seqs],
                 non_blocking=True)
@@ -1111,7 +1125,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                    metadata.max_num_tokens),
             attention_window_size=attention_window_size,
             sink_token_length=0,
-            beam_width=1,
+            beam_width=metadata.beam_width,
             sequence_length=metadata.kv_lens_cuda_runtime,
             host_past_key_value_lengths=metadata.kv_lens_runtime,
             context_lengths=metadata.prompt_lens_cuda_runtime,
@@ -1122,8 +1136,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
             block_ids_per_seq=metadata.block_ids_per_seq,
-            workspace=None,
-            cache_indirection=None,
+            workspace=metadata.workspace,
+            cache_indirection=metadata.cache_indirection,
             kv_scale_orig_quant=self.kv_scale_orig_quant,
             kv_scale_quant_orig=self.kv_scale_quant_orig,
             out_scale=out_scale,
