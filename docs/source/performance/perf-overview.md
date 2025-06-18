@@ -70,6 +70,7 @@ nvidia/Llama-3.1-405B-Instruct-FP4
 nvidia/Llama-3.1-8B-Instruct-FP8
 nvidia/Llama-3.1-70B-Instruct-FP8
 nvidia/Llama-3.1-405B-Instruct-FP8
+nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 ```
 
 #### Llama 3.1 8B FP8
