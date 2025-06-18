@@ -39,13 +39,14 @@ LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
 // DLFW torch image
-DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.04-py3"
+DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.05-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
 UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
 
 POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
+POD_TIMEOUT_SECONDS_TMP = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
 
 // Literals for easier access.
 @Field
@@ -412,7 +413,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS}]
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_TMP}]
                     volumeMounts:
                     - name: sw-tensorrt-pvc
                       mountPath: "/mnt/sw-tensorrt-pvc"
@@ -1310,68 +1311,27 @@ def checkPipInstall(pipeline, wheel_path)
 }
 
 
-def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312")
+def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312")
 {
-    def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${linuxPkgName}"
+    sh "pwd && ls -alh"
+    sh "env | sort"
+    sh "ccache -sv"
+
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", true, true)
+    if (env.alternativeTRT) {
+        sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
+    }
 
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
     sh "curl ifconfig.me || true"
     sh "nproc && free -g && hostname"
-    sh "ccache -sv"
     sh "cat ${CCACHE_DIR}/ccache.conf"
     sh "bash -c 'pip3 show tensorrt || true'"
     if (reinstall_dependencies == true) {
         sh "#!/bin/bash \n" + "pip3 uninstall -y torch"
         sh "#!/bin/bash \n" + "yum remove -y libcudnn*"
     }
-    sh "pwd && ls -alh"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
-
-    sh "env | sort"
-    sh "tar -zvxf ${linuxPkgName}"
-
-    // Check for prohibited files in the package
-    sh '''
-        echo "Checking prohibited files..."
-        FAILED=0
-
-        # Folders and their allowed files
-        declare -A ALLOWED=(
-            ["./tensorrt_llm/cpp/tensorrt_llm/kernels/internal_cutlass_kernels/src"]=""
-        )
-
-        for DIR in "${!ALLOWED[@]}"; do
-            [ -d "$DIR" ] || continue
-
-            # File check
-            ALLOWED_FILE="$DIR/${ALLOWED[$DIR]}"
-            if [ -z "${ALLOWED[$DIR]}" ]; then
-                FILES=$(find "$DIR" -type f)
-            else
-                FILES=$(find "$DIR" -type f ! -path "$ALLOWED_FILE")
-            fi
-
-            # Subdir check
-            SUBDIRS=$(find "$DIR" -mindepth 1 -type d)
-
-            # Error reporting
-            if [ -n "$FILES$SUBDIRS" ]; then
-                echo "ERROR in $DIR:"
-                [ -n "$FILES" ] && echo "Prohibited files:\n$FILES"
-                [ -n "$SUBDIRS" ] && echo "Prohibited subdirs:\n$SUBDIRS"
-                FAILED=1
-            fi
-
-            # Verify allowed file exists
-            if [ -n "${ALLOWED[$DIR]}" ] && [ ! -f "$ALLOWED_FILE" ]; then
-                echo "WARNING: Missing $ALLOWED_FILE"
-            fi
-        done
-
-        [ $FAILED -eq 0 ] || { echo "Build failed: Prohibited content found"; exit 1; }
-        echo "No prohibited files found"
-    '''
 
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install -r requirements-dev.txt")
     if (env.alternativeTRT) {
@@ -1527,6 +1487,12 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 1],
         "A10-CPP-1": ["a10", "l0_a10", 1, 1],
+        "A10-TensorRT-1": ["a10", "l0_a10", 1, 6],
+        "A10-TensorRT-2": ["a10", "l0_a10", 2, 6],
+        "A10-TensorRT-3": ["a10", "l0_a10", 3, 6],
+        "A10-TensorRT-4": ["a10", "l0_a10", 4, 6],
+        "A10-TensorRT-5": ["a10", "l0_a10", 5, 6],
+        "A10-TensorRT-6": ["a10", "l0_a10", 6, 6],
         "A30-Triton-1": ["a30", "l0_a30", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
@@ -1538,19 +1504,19 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 3],
         "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 3],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 2],
+        "H100_PCIe-TensorRT-2": ["h100-cr", "l0_h100", 2, 2],
         "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 2],
         "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 2],
+        "B200_PCIe-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
+        "B200_PCIe-TensorRT-2": ["b100-ts2", "l0_b200", 2, 2],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
+        "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
+        "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
-        "A10-TensorRT-[Post-Merge]-1": ["a10", "l0_a10", 1, 8],
-        "A10-TensorRT-[Post-Merge]-2": ["a10", "l0_a10", 2, 8],
-        "A10-TensorRT-[Post-Merge]-3": ["a10", "l0_a10", 3, 8],
-        "A10-TensorRT-[Post-Merge]-4": ["a10", "l0_a10", 4, 8],
-        "A10-TensorRT-[Post-Merge]-5": ["a10", "l0_a10", 5, 8],
-        "A10-TensorRT-[Post-Merge]-6": ["a10", "l0_a10", 6, 8],
-        "A10-TensorRT-[Post-Merge]-7": ["a10", "l0_a10", 7, 8],
-        "A10-TensorRT-[Post-Merge]-8": ["a10", "l0_a10", 8, 8],
+        "A10-TensorRT-[Post-Merge]-1": ["a10", "l0_a10", 1, 2],
+        "A10-TensorRT-[Post-Merge]-2": ["a10", "l0_a10", 2, 2],
         "A30-TensorRT-[Post-Merge]-1": ["a30", "l0_a30", 1, 6],
         "A30-TensorRT-[Post-Merge]-2": ["a30", "l0_a30", 2, 6],
         "A30-TensorRT-[Post-Merge]-3": ["a30", "l0_a30", 3, 6],
@@ -1558,16 +1524,16 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A30-TensorRT-[Post-Merge]-5": ["a30", "l0_a30", 5, 6],
         "A30-TensorRT-[Post-Merge]-6": ["a30", "l0_a30", 6, 6],
         "A30-CPP-[Post-Merge]-1": ["a30", "l0_a30", 1, 1],
-        "A30-Triton-Python-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
-        "A30-Triton-Python-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
+        "A30-Triton-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
+        "A30-Triton-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
         "A100X-TensorRT-[Post-Merge]-1": ["a100x", "l0_a100", 1, 6],
         "A100X-TensorRT-[Post-Merge]-2": ["a100x", "l0_a100", 2, 6],
         "A100X-TensorRT-[Post-Merge]-3": ["a100x", "l0_a100", 3, 6],
         "A100X-TensorRT-[Post-Merge]-4": ["a100x", "l0_a100", 4, 6],
         "A100X-TensorRT-[Post-Merge]-5": ["a100x", "l0_a100", 5, 6],
         "A100X-TensorRT-[Post-Merge]-6": ["a100x", "l0_a100", 6, 6],
-        "A100X-Triton-Python-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
-        "A100X-Triton-Python-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
+        "A100X-Triton-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
+        "A100X-Triton-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
         "L40S-TensorRT-[Post-Merge]-1": ["l40s", "l0_l40s", 1, 5],
         "L40S-TensorRT-[Post-Merge]-2": ["l40s", "l0_l40s", 2, 5],
         "L40S-TensorRT-[Post-Merge]-3": ["l40s", "l0_l40s", 3, 5],
@@ -1575,25 +1541,19 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "L40S-TensorRT-[Post-Merge]-5": ["l40s", "l0_l40s", 5, 5],
         "H100_PCIe-PyTorch-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-TensorRT-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 7],
-        "H100_PCIe-TensorRT-[Post-Merge]-2": ["h100-cr", "l0_h100", 2, 7],
-        "H100_PCIe-TensorRT-[Post-Merge]-3": ["h100-cr", "l0_h100", 3, 7],
-        "H100_PCIe-TensorRT-[Post-Merge]-4": ["h100-cr", "l0_h100", 4, 7],
-        "H100_PCIe-TensorRT-[Post-Merge]-5": ["h100-cr", "l0_h100", 5, 7],
-        "H100_PCIe-TensorRT-[Post-Merge]-6": ["h100-cr", "l0_h100", 6, 7],
-        "H100_PCIe-TensorRT-[Post-Merge]-7": ["h100-cr", "l0_h100", 7, 7],
-        "B200_PCIe-Triton-Python-[Post-Merge]-1": ["b100-ts2", "l0_b200", 1, 1],
-        "B200_PCIe-[Post-Merge]-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
-        "B200_PCIe-[Post-Merge]-TensorRT-2": ["b100-ts2", "l0_b200", 2, 2],
-        "RTX5080-[Post-Merge]-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
-        "RTX5080-[Post-Merge]-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
+        "H100_PCIe-TensorRT-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 5],
+        "H100_PCIe-TensorRT-[Post-Merge]-2": ["h100-cr", "l0_h100", 2, 5],
+        "H100_PCIe-TensorRT-[Post-Merge]-3": ["h100-cr", "l0_h100", 3, 5],
+        "H100_PCIe-TensorRT-[Post-Merge]-4": ["h100-cr", "l0_h100", 4, 5],
+        "H100_PCIe-TensorRT-[Post-Merge]-5": ["h100-cr", "l0_h100", 5, 5],
+        "B200_PCIe-Triton-[Post-Merge]-1": ["b100-ts2", "l0_b200", 1, 1],
         "H100_PCIe-TensorRT-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-8_GPUs-PyTorch-[Post-Merge]-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
-        "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
-        "DGX_H100-4_GPUs-TensorRT-[Post-Merge]-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
-        "DGX_H100-4_GPUs-TensorRT-[Post-Merge]-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
+        "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
+        "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 3, 4],
+        "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-3": ["dgx-h100-x4", "l0_dgx_h100", 3, 3, 4],
     ]
 
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
@@ -1630,9 +1590,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     // Try to match what are being tested on x86 H100_PCIe.
     // The total machine time is scaled proportionally according to the number of each GPU.
     SBSATestConfigs = [
-        "GH200-1": ["gh200", "l0_gh200", 1, 2],
-        "GH200-2": ["gh200", "l0_gh200", 2, 2],
-        "GH200-[Post-Merge]": ["gh200", "l0_gh200", 1, 1],
+        "GH200-TensorRT-[Post-Merge]-1": ["gh200", "l0_gh200", 1, 2],
+        "GH200-TensorRT-[Post-Merge]-2": ["gh200", "l0_gh200", 2, 2],
     ]
     fullSet += SBSATestConfigs.keySet()
 
@@ -1779,7 +1738,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                     env = ["LD_LIBRARY_PATH+=:/usr/local/cuda/compat"]
                 }
                 withEnv(env) {
-                    wheelName = runLLMBuildFromPackage(pipeline, cpu_arch, values[3], wheelPath, cpver)
+                    wheelName = runLLMBuild(pipeline, cpu_arch, values[3], wheelPath, cpver)
                 }
             }
 
@@ -1816,7 +1775,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         // Extra PyTorch CUDA 12.8 install
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 12.8 install Start ######"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
                         }
 
                         def libEnv = []
