@@ -990,6 +990,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     )
 
     echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
+    echo "isRerunFailed: ${isRerunFailed}"
     return isRerunFailed
 }
 
@@ -1230,8 +1231,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 } catch (Exception e) {
                     isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
                     if (isRerunFailed) {
-                        echo "The tests still failed after rerun attempt."
-                        throw e
+                        error "The tests still failed after rerun attempt."
                     }
                 }
             }
