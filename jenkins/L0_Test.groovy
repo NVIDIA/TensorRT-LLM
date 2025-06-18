@@ -470,10 +470,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
+    (IMAGE_KEY_TO_TAG): [:],
 ]
 
 String getShortenedJobName(String path)
@@ -486,6 +489,7 @@ String getShortenedJobName(String path)
         "L1_Custom": "l1-cus",
         "L1_Nightly": "l1-nt",
         "L1_Stable": "l1-stb",
+        "BuildDockerImageSanityTest": "l0-sanity",
     ]
     def parts = path.split('/')
     // Apply nameMapping to the last part (jobName)
@@ -736,6 +740,17 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 values:
                                 - "core"
                 nodeSelector: ${selectors}
+                initContainers:
+                - name: init-container
+                  image: urm.nvidia.com/docker/alpine:latest
+                  command: ["/bin/sh", "-c"]
+                  args:
+                  - |
+                    echo "Pre-pulling image..."
+                    docker pull ${image} || echo "Pull failed"
+                    echo "Initialization completed"
+                  securityContext:
+                    privileged: true
                 containers:
                   ${containerConfig}
                     env:
@@ -2238,6 +2253,78 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     return parallelJobsFiltered
 }
 
+
+
+def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
+    def testConfigs = [
+        "NGC Devel Image amd64": [
+            name: "NGC-Devel-Image-amd64-Sanity-Test",
+            k8sArch: "amd64",
+            wheelInstalled: false,
+            config: VANILLA_CONFIG,
+        ],
+        "NGC Devel Image arm64": [
+            name: "NGC-Devel-Image-arm64-Sanity-Test",
+            k8sArch: "arm64",
+            wheelInstalled: false,
+            config: LINUX_AARCH64_CONFIG,
+        ],
+        "NGC Release Image amd64": [
+            name: "NGC-Release-Image-amd64-Sanity-Test",
+            gpuType: "a10",
+            k8sArch: "amd64",
+            wheelInstalled: true,
+            config: VANILLA_CONFIG,
+        ],
+        "NGC Release Image arm64": [
+            name: "NGC-Release-Image-arm64-Sanity-Test",
+            gpuType: "gh200",
+            k8sArch: "arm64",
+            wheelInstalled: true,
+            config: LINUX_AARCH64_CONFIG,
+        ],
+    ]
+    // Update testConfigs image field using the map from globalVars
+    testConfigs.each { key, config ->
+        if (globalVars[IMAGE_KEY_TO_TAG] && globalVars[IMAGE_KEY_TO_TAG][key]) {
+            config.image = globalVars[IMAGE_KEY_TO_TAG][key]
+        }
+    }
+    // Filter out all configs that don't have image set
+    testConfigs = testConfigs.findAll { key, config ->
+        return config.image != null
+    }
+
+    echo "Filtered test configs with images:"
+    println testConfigs
+
+    def testJobs = testConfigs.collectEntries { key, values -> [values.name, {
+        if (values.wheelInstalled) {
+            stage(values.name) {
+                echo "Run ${values.name} sanity test."
+                imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
+                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                    sh "env | sort"
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name , 1, 1, true, null)
+                })
+            }
+        } else {
+            stage(values.name) {
+                imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
+                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                    sh "env | sort"
+                    def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
+                    runLLMBuildFromPackage(pipeline, cpuArch, false, "imageTest/")
+                })
+            }
+        }
+    }]}
+
+    return testJobs
+}
+
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("", "agent")
@@ -2286,6 +2373,9 @@ pipeline {
             steps
             {
                 script {
+                    if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
+                        return
+                    }
                     launchTestListCheck(this)
                 }
             }
@@ -2293,7 +2383,11 @@ pipeline {
         stage("Test") {
             steps {
                 script {
-                    parallelJobs = launchTestJobs(this, testFilter)
+                    if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
+                        parallelJobs = launchTestJobsForImagesSanityCheck(this, globalVars)
+                    } else {
+                        parallelJobs = launchTestJobs(this, testFilter)
+                    }
 
                     singleGpuJobs = parallelJobs
                     dgxJobs = [:]
