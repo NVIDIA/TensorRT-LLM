@@ -1769,7 +1769,7 @@ public:
     {
         if (finishReason == executor::FinishReason::kTIMED_OUT)
         {
-            printf("Request %ld finished by timeout after %f sec\n", mRequestId,
+            TLLM_LOG_DEBUG("Request %ld finished by timeout after %f sec", mRequestId,
                 std::chrono::duration<float>(std::chrono::steady_clock::now() - mStartTime).count());
         }
         if (finishReason == executor::FinishReason::kCANCELLED)
