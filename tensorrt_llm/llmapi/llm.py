@@ -97,6 +97,7 @@ TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
 
     Attributes:
         tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
+        llm_id (str): The unique ID of the LLM instance.
 """
 
 
@@ -883,6 +884,9 @@ class _TorchLLM(BaseLLM):
         # TODO: deprecate backend in LLM kwargs
         kwargs.pop("backend", None)
 
+        # Validate that users don't pass TrtLlmArgs-specific arguments
+        self._validate_args_for_torch_backend(kwargs)
+
         super().__init__(model,
                          tokenizer,
                          tokenizer_mode,
@@ -894,6 +898,26 @@ class _TorchLLM(BaseLLM):
                          tokenizer_revision,
                          backend='pytorch',
                          **kwargs)
+
+    def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
+        """Validate that users don't pass TrtLlmArgs-specific arguments when using PyTorch backend.
+        """
+        trtllm_fields = set(TrtLlmArgs.model_fields.keys())
+        torchllm_fields = set(TorchLlmArgs.model_fields.keys())
+
+        trtllm_specific_fields = trtllm_fields - torchllm_fields
+
+        # Check if any TrtLlmArgs-specific arguments are passed
+        trtllm_specific_args = []
+        for key in kwargs:
+            if key in trtllm_specific_fields:
+                trtllm_specific_args.append(key)
+
+        if trtllm_specific_args:
+            raise ValueError(
+                f"The following arguments are specific to TensorRT backend and cannot be used with PyTorch backend: {trtllm_specific_args}.\n"
+                f"Please use 'from tensorrt_llm._tensorrt_engine import LLM' instead to use the TensorRT backend."
+            )
 
 
 class LLM(_TorchLLM):

@@ -1591,9 +1591,6 @@ class TrtLlmArgs(BaseLlmArgs):
         return self
 
 
-LlmArgs = TrtLlmArgs
-
-
 class LoadFormat(Enum):
     AUTO = 0
     # Initialize all weights randomly.
@@ -1663,7 +1660,10 @@ class TorchLlmArgs(BaseLlmArgs):
     moe_load_balancer: Optional[Union[object, str]] = Field(
         default=None,
         description="Configuration for MoE load balancing.",
-        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+        json_schema_extra={
+            "type":
+            "Union[tensorrt_llm._torch.model_config.MoeLoadBalancerConfig, str, None]"
+        })
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.")
@@ -2080,6 +2080,8 @@ def get_model_format(model_dir: str) -> _ModelFormatKind:
     else:
         return model_format
 
+
+LlmArgs = TorchLlmArgs
 
 TRT_LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(TrtLlmArgs,
                                                                 indent=' ' * 4)
