@@ -315,7 +315,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     @property
     def is_dummy(self):
-        return self.is_attention_dp_dummy or self.is_cuda_graph_dummy
+        return self.is_attention_dp_dummy or self.is_cuda_graph_dummy or self.is_dummy_request
 
 
 def convert_wordlist(word_list) -> List[List[int]]:
