@@ -394,6 +394,13 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
                 return optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
             }
 
+            // FIXME, this depends on the number of tokens, batches per GPU and TopK (if MoE).
+            // For now just choose the smallest tileN.
+            if (optionsA.mTileN != optionsB.mTileN)
+            {
+                return optionsA.mTileN < optionsB.mTileN;
+            }
+
             return optionsA.mTileM > optionsB.mTileM;
         });
 
