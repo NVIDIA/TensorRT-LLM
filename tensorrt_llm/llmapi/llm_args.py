@@ -1727,7 +1727,8 @@ class TorchLlmArgs(BaseLlmArgs):
     stream_interval: int = Field(
         default=1,
         description=
-        "The iteration interval to create responses under the streaming mode.",
+        "The iteration interval to create responses under the streaming mode. "
+        "Set this to a larger value when the batch size is large, which helps reduce the streaming overhead.",
     )
 
     # TODO: remove backend later
