@@ -929,6 +929,7 @@ class MLA(nn.Module):
         latent_cache: torch.
         Tensor,  # compressed_kv + k_pe [context_tokens, 1, lora_size + rope_size]
         attn_metadata: TrtllmAttentionMetadata,
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         trtllm_attention = cast(TrtllmAttention, self.mha)
         # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
@@ -951,9 +952,13 @@ class MLA(nn.Module):
             dtype=torch.float,
             device='cuda',
         )
-
-        attn_output = q.new_empty((q.size(0), self.num_heads * self.v_head_dim),
-                                  dtype=q.dtype)
+        if output is None:
+            attn_output = q.new_empty(
+                (q.size(0), self.num_heads * self.v_head_dim), dtype=q.dtype)
+        else:
+            attn_output = output
+        temp_attn_output = q.new_empty(
+            (q.size(0), self.num_heads * self.v_head_dim), dtype=q.dtype)
 
         # use fake cached_cu_seq_len for chunked loop
         origin_kv_lens_cuda_runtime = attn_metadata.kv_lens_cuda_runtime
@@ -1015,6 +1020,7 @@ class MLA(nn.Module):
                 mla_context_paged_kv=full_kv,
                 mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
                 softmax_stats_tensor=self.temp_softmax_stats_tensor,
+                output=temp_attn_output,
             )
             # merge attn result
             temp_merge_op = attn_metadata.merge_op_tensor[loop_idx]
@@ -1063,6 +1069,7 @@ class MLA(nn.Module):
             mla_context_paged_kv=full_kv,
             mla_context_kv_cache_block_offsets=mla_kv_cache_block_offsets,
             softmax_stats_tensor=self.temp_softmax_stats_tensor,
+            output=temp_attn_output,
         )
         temp_merge_op = attn_metadata.merge_op_tensor[chunked_loop_num]
         trtllm_attention.merge_attention_for_mla(attn_output, temp_attn_output,
@@ -1090,7 +1097,7 @@ class MLA(nn.Module):
             if trtllm_attention.is_chunked_prefill_for_mla_context(
                     attn_metadata):
                 return self.forward_context_with_chunked_prefill(
-                    q, compressed_kv, latent_cache, attn_metadata)
+                    q, compressed_kv, latent_cache, attn_metadata, output)
             elif trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
                 return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)
