@@ -123,6 +123,7 @@ class KvCacheCreator:
             self, input_seq_len: int) -> List[trtllm.Request]:
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
         max_num_tokens = self._executor_config.max_num_tokens
+        max_beam_width = self._executor_config.max_beam_width
 
         requests = []
         input_seq_len = min(max_num_tokens, input_seq_len)
@@ -135,7 +136,8 @@ class KvCacheCreator:
             request = trtllm.Request(input_tokens,
                                      max_tokens=1,
                                      streaming=False,
-                                     sampling_config=trtllm.SamplingConfig(),
+                                     sampling_config=trtllm.SamplingConfig(
+                                         beam_width=max_beam_width, ),
                                      output_config=trtllm.OutputConfig(),
                                      end_id=-1)
             requests.append(request)
@@ -304,8 +306,13 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
+                max_beam_width=executor_config.max_beam_width,
             )
         elif is_nemotron_hybrid(config):
+            if executor_config.max_beam_width > 1:
+                raise ValueError(
+                    "MambaHybridCacheManager + beam search is not supported yet."
+                )
             config = model_engine.model.model_config.pretrained_config
             num_layers = config.hybrid_override_pattern.count("*")
             layer_mask = [
@@ -353,6 +360,7 @@ class KvCacheCreator:
                 mapping=mapping,
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
+                max_beam_width=executor_config.max_beam_width,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:

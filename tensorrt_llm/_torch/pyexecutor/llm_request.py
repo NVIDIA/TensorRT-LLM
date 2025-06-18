@@ -138,6 +138,16 @@ class LogProbStorage:
                 self.cum_log_probs[beam_idx] += sum(
                     next(iter(prob.values())).logprob for prob in probs)
 
+    def set_log_probs(self, log_probs: list[TokenLogprobs],
+                      cum_log_probs: list[float]):
+        """
+        Reset the storage and refill it with new values
+        log_probs: [beam_width, num_tokens]
+        cum_log_probs: [beam_width]
+        """
+        self.beam_width = -1
+        self.append(log_probs, cum_log_probs)
+
 
 class PyResult:
     """PyResult reimplements some features of `bindings.executor.Result` in Python"""
@@ -172,6 +182,16 @@ class PyResult:
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
+
+    def set_log_probs(self, log_probs: list[TokenLogprobs],
+                      cum_log_probs: list[float]):
+        """
+        Set log_probs and cum_log_probs to the new values
+        log_probs: [beam_width, num_tokens]
+        cum_log_probs: [beam_width]
+        """
+        if self._log_probs:
+            self._log_probs.set_log_probs(log_probs, cum_log_probs)
 
     @property
     def context_logits(self) -> torch.Tensor | None:

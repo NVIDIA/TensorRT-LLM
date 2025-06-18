@@ -108,23 +108,23 @@ def get_pp_layers(
 class KVCacheManager(BaseResourceManager):
 
     def __init__(
-        self,
-        kv_cache_config: KvCacheConfigCpp,
-        kv_cache_type: CacheTypeCpp,
-        *,
-        num_layers: int,
-        num_kv_heads: Union[int, List[Optional[int]]],
-        head_dim: int,
-        tokens_per_block: int,
-        # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
-        # It's derived from the model's BuildConfig for consistency with the C++ backend.
-        max_seq_len: int,
-        max_batch_size: int,
-        mapping: Mapping,
-        dtype: DataType = DataType.HALF,
-        spec_config: Optional["SpecConfig"] = None,
-        layer_mask: Optional[List[bool]] = None,
-    ) -> None:
+            self,
+            kv_cache_config: KvCacheConfigCpp,
+            kv_cache_type: CacheTypeCpp,
+            *,
+            num_layers: int,
+            num_kv_heads: Union[int, List[Optional[int]]],
+            head_dim: int,
+            tokens_per_block: int,
+            # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
+            # It's derived from the model's BuildConfig for consistency with the C++ backend.
+            max_seq_len: int,
+            max_batch_size: int,
+            mapping: Mapping,
+            dtype: DataType = DataType.HALF,
+            spec_config: Optional["SpecConfig"] = None,
+            layer_mask: Optional[List[bool]] = None,
+            max_beam_width: int = 1) -> None:
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
@@ -168,6 +168,7 @@ class KVCacheManager(BaseResourceManager):
         self.tokens_per_block = tokens_per_block
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+        self.max_beam_width = max_beam_width
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         # Some speculative decoding methods need to use different kv lengths for the
         # draft/target layers. Add extra tokens to haddle this issue.
@@ -198,7 +199,7 @@ class KVCacheManager(BaseResourceManager):
         max_atten_window_upper_bound = self.get_max_atten_window_upper_bound(
             blocks_in_primary_pool=self.blocks_in_primary_pool,
             tokens_per_block=tokens_per_block,
-            max_beam_width=1,
+            max_beam_width=self.max_beam_width,
             sink_token_len=sink_token_length,
             max_seq_len=max_seq_len)
 
@@ -223,7 +224,7 @@ class KVCacheManager(BaseResourceManager):
                 (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
             },
             'max_num_sequences': max_batch_size,
-            'max_beam_width': 1,  # TODO: more than 1 beam?
+            'max_beam_width': self.max_beam_width,  # TODO: more than 1 beam?
             'max_attention_window_vec': [self.max_attention_window],
             'temp_attention_window_inputs': None,
             'dtype': dtype,
@@ -297,7 +298,7 @@ class KVCacheManager(BaseResourceManager):
         generation_batch = scheduled_batch.generation_requests
         # allocate KV Cache
         for req in context_batch:
-            req_beam_width = 1  # req.sampling_config.beam_width
+            req_beam_width = req.sampling_config.beam_width
             if 'cp_type' in self.mapping.cp_config and 'star_attention' == self.mapping.cp_config[
                     'cp_type']:
                 if req.ctx_iters == 0:
@@ -336,7 +337,7 @@ class KVCacheManager(BaseResourceManager):
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
     ):
-        beam_width = 1
+        beam_width = 1  # TODO: more than 1 beam?
         requests = []
         for i, req_id in enumerate(request_ids):
             sampling_params = SamplingParams()

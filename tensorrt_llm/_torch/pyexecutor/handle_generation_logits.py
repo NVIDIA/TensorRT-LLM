@@ -27,7 +27,8 @@ class HandleGenerationLogits:
                 decoder_buffer_logits[seq_slot] = logits_view.unsqueeze(1)
 
             if llm_req.py_return_generation_logits:
-                llm_req.py_result.append_generation_logits(logits_view)
+                llm_req.py_result.append_generation_logits(
+                    decoder_buffer_logits[seq_slot])
 
             logits_index += beam_width
 

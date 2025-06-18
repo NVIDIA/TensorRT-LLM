@@ -52,27 +52,18 @@ class HandleContextLogits:
             num_decoder_logits = 1 + draft_length
             seq_slot = llm_req.seq_slot
             logits_view = logits[logits_index - num_decoder_logits:logits_index]
+            req_beam_width = llm_req.get_beam_width_by_iter()
 
-            # Create a view of logits_view with shape (logits_view.shape[0], 1, logits_view.shape[1])
-            # This creates a new tensor that shares the same underlying data
-            decoder_buffer_logits[seq_slot] = logits_view.reshape(
-                logits_view.shape[0], 1, logits_view.shape[1])
+            if req_beam_width > 1:
+                # Replicate logits across "req_beam_width" beams
+                decoder_buffer_logits[seq_slot] = torch.tile(
+                    logits_view, (1, req_beam_width, 1))
+            else:
+                decoder_buffer_logits[seq_slot] = logits_view.unsqueeze(1)
 
             # Save the last context token logits in generation logits storage
             if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
-                llm_req.py_result.append_generation_logits(logits_view)
-
-            # TODO: Implement this once we have beam width support
-            # Scatter the output logits to the decoderLogits
-            # req_beam_width = llm_req.get_beam_width_by_iter()
-            # if req_beam_width > 1:
-            #     # Tile logits of context requests
-            #     logits_shape = logits_view.shape
-            #     logits_type = logits_view.dtype
-            #     # decoder_logits = buffer_manager.gpu((req_beam_width, logits_shape[1]), logits_type)
-            #     # tensorrt_llm.runtime.kernels.tile_tensor(decoder_logits, logits_view, req_beam_width, stream)
-            #     decoder_logits = decoder_logits.unsqueeze(0)
-            # else:
-            #     decoder_buffer_logits[seq_slot] = logits_view[:logits_view.shape[0], :1, :logits_view.shape[1]]
+                llm_req.py_result.append_generation_logits(
+                    decoder_buffer_logits[seq_slot])
 
         return decoder_buffer_logits, logits_index
