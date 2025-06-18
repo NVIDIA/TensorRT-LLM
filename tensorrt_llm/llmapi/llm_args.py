@@ -1782,6 +1782,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 ) from e
         return self
 
+    @model_validator(mode="after")
+    def validate_stream_interval(self):
+        if self.stream_interval <= 0:
+            raise ValueError(
+                f"stream_interval must be positive, got {self.stream_interval}")
+        return self
+
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
