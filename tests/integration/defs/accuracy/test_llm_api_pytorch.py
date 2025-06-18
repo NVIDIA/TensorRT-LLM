@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Literal
+
 import pytest
 
 from tensorrt_llm import LLM
@@ -718,15 +720,23 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
+    @pytest.mark.parametrize("task_name", [
+        pytest.param("MMLU", marks=pytest.mark.pre_merge),
+        pytest.param("MMLU+GSM8K", marks=pytest.mark.post_merge)
+    ])
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     fp8kv, attention_dp, cuda_graph,
-                                    overlap_scheduler, torch_compile):
+                                    overlap_scheduler, torch_compile,
+                                    task_name: Literal["MMLU", "MMLU+GSM8K"]):
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
             pytest.skip("https://nvbugs/5252559")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
+        if fp8kv and task_name == "MMLU":
+            pytest.skip("No need to run MMLU for fp8kv")
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -761,13 +771,17 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if fp8kv:
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
+        tasks = task_name.split("+")
         with llm:
-            # No need to run MMLU for fp8kv
-            if not fp8kv:
-                task = MMLU(self.MODEL_NAME)
+            for t in tasks:
+                if t == "MMLU" and not fp8kv:
+                    task = MMLU(self.MODEL_NAME)
+                elif t == "GSM8K":
+                    task = GSM8K(self.MODEL_NAME)
+                else:
+                    continue
+
                 task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["H100", "H200"])
