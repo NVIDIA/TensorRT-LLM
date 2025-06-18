@@ -207,7 +207,7 @@ The data collected for the v0.20 benchmarks was run with the following file:
   cuda_graph_padding_enabled: true
 ```
 
-However, this resulted in the unintended consequence of disabling cuda graphs, due to how the pytorch backend config options are handled. We would recommend users to run with the following file to explicitly turn off cuda graphs: 
+However, this resulted in the unintended consequence of disabling cuda graphs, due to how the pytorch backend config options are handled. We would recommend users to run with the following file to explicitly turn off cuda graphs:
 
 `llm_options.yml`
 ```yaml
