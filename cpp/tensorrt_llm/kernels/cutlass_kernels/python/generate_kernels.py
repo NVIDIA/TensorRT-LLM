@@ -801,13 +801,28 @@ if __name__ == "__main__":
         op_group.append(op)
         op_groups[dict_key] = op_group
 
-    file_counter = 1
-    for key, value in op_groups.items():
-        gemm_kind, _, _, is_mixed_dtype_grouped = key
+    gathered_op_groups = {}
+    for key, operations in op_groups.items():
+        gemm_kind, _, _, is_mixed_dtype_grouped_val = key
+        file_counter = 0 if gemm_kind == GemmKind.Gemm else 1
         out_file = os.path.join(
             output_dir, GemmKindNames[gemm_kind],
             f"cutlass_kernel_file_{file_counter}.generated.cu")
-        inl_file = [moe_mixed_gemm_inl
-                    ] if is_mixed_dtype_grouped else inl_map[key[:2]]
-        write_file(inl_file, value, out_file)
-        file_counter += 1
+        # inl_file = [moe_mixed_gemm_inl
+        #             ] if is_mixed_dtype_grouped_val else inl_map[key[:2]]
+        inl_file = moe_mixed_gemm_inl if is_mixed_dtype_grouped_val else inl_map[
+            key[:2]][0]
+
+        if gemm_kind not in gathered_op_groups:
+            gathered_values = [out_file, [inl_file], operations]
+            gathered_op_groups[gemm_kind] = gathered_values
+        else:
+            in_file_list = gathered_op_groups[gemm_kind][1]
+            if inl_file not in in_file_list:
+                in_file_list.append(inl_file)
+            gathered_op_groups[gemm_kind][1] = in_file_list
+            gathered_op_groups[gemm_kind][2].extend(operations)
+
+    for gemm_kind, gathered_values in gathered_op_groups.items():
+        out_file, inl_file_list, operations = gathered_values
+        write_file(inl_file_list, operations, out_file)
