@@ -797,8 +797,9 @@ class TRTLLMSampler(Sampler):
     def _finalize_request(self, request: LlmRequest, streaming: bool):
         """ Finalizes the request. This is necessary for beam search. """
         seq_slot = request.seq_slot
-        event = self.algs.decoder.finalize(self.algs.decoder_state, seq_slot,
-                                           request.sampling_config, streaming)
+        event = self.algs.decoder.finalize(self.store["decoder_state"],
+                                           seq_slot, request.sampling_config,
+                                           streaming)
         return event
 
     def _post_process_request(self, request: LlmRequest,
@@ -813,15 +814,15 @@ class TRTLLMSampler(Sampler):
         finalize_event.synchronize()
 
         # Get these values again, as they might have changed during the finalize step
-        output_ids_host = self.algs.decoder_state.gathered_ids.to(
+        output_ids_host = self.store["decoder_state"].gathered_ids.to(
             'cpu', non_blocking=False)
-        sequence_lengths_host = self.algs.decoder_state.sequence_lengths.to(
+        sequence_lengths_host = self.store["decoder_state"].sequence_lengths.to(
             'cpu', non_blocking=False)
 
         if request.py_return_log_probs:
-            log_probs_host = self.algs.decoder_state.log_probs.to(
+            log_probs_host = self.store["decoder_state"].log_probs.to(
                 'cpu', non_blocking=False)
-            cum_log_probs_host = self.algs.decoder_state.cum_log_probs.to(
+            cum_log_probs_host = self.store["decoder_state"].cum_log_probs.to(
                 'cpu', non_blocking=False)
 
         generated_tokens = [[0]] * beam_width
