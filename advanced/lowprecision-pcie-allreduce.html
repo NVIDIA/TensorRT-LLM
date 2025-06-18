@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -61,7 +61,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc1" />
+  <meta name="docsearch:version" content="0.21.0rc2" />
 
 
   </head>
@@ -447,6 +447,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/ci-overview.html">Continuous Integration Overview</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -550,12 +551,11 @@ This feature is optimized for PCIe-based GPU topologies and may affect model acc
 </pre></div>
 </div>
 <ol class="arabic simple" start="2">
-<li><p><strong>Environment variable control</strong> with AUTO strategy:</p></li>
+<li><p>Enable by LlmArgs</p></li>
 </ol>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">//</span> <span class="n">In</span> <span class="n">your</span> <span class="n">code</span>
-<span class="n">AllReduce</span> <span class="n">allreduce</span><span class="p">(</span><span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span> <span class="n">strategy</span><span class="o">=</span><span class="n">AllReduceStrategy</span><span class="o">.</span><span class="n">AUTO</span><span class="p">);</span>
-<span class="o">//</span> <span class="n">Set</span> <span class="n">environment</span> <span class="n">variable</span> <span class="n">before</span> <span class="n">running</span>
-<span class="n">export</span> <span class="n">FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY</span><span class="o">=</span><span class="mi">1</span>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">Set</span> <span class="n">allreduce_strategy</span> <span class="n">field</span> <span class="ow">in</span> <span class="n">LlmArgs</span><span class="o">.</span>
+<span class="n">Candidates</span> <span class="n">of</span> <span class="n">strategies</span> <span class="n">are</span> <span class="s2">&quot;AUTO&quot;</span><span class="p">,</span> <span class="s2">&quot;NCCL&quot;</span><span class="p">,</span> <span class="s2">&quot;UB&quot;</span><span class="p">,</span> <span class="s2">&quot;MINLATENCY&quot;</span><span class="p">,</span> <span class="s2">&quot;ONESHOT&quot;</span><span class="p">,</span> <span class="s2">&quot;TWOSHOT&quot;</span><span class="p">,</span> <span class="s2">&quot;LOWPRECISION&quot;</span> <span class="ow">and</span> <span class="s2">&quot;MNNVL&quot;</span><span class="o">.</span>
+<span class="n">If</span> <span class="n">no</span> <span class="n">strategy</span> <span class="ow">is</span> <span class="nb">set</span><span class="p">,</span> <span class="n">AUTO</span> <span class="n">will</span> <span class="n">be</span> <span class="nb">set</span><span class="o">.</span>
 </pre></div>
 </div>
 </section>
@@ -568,12 +568,6 @@ This feature is optimized for PCIe-based GPU topologies and may affect model acc
 <li><p>Automatically falls back to other strategies when no performance benefit is expected (e.g., with NVLink or small messages)</p></li>
 </ul>
 <p>Users should evaluate the precision impact on their specific models and workloads.</p>
-</section>
-<section id="environment-variables">
-<h2>Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading">#</a></h2>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY</span></code>: When set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, forces the use of low-precision algorithm with AUTO strategy. If the algorithm determines it cannot provide performance benefits, it will automatically fall back to other strategies.</p></li>
-</ul>
 <p><strong>Note</strong>: When compiling TensorRT-LLM without enabling the <code class="docutils literal notranslate"><span class="pre">ENABLE_FP8</span></code> option, setting Low Precision allreduce will not take effect.</p>
 </section>
 </section>
@@ -613,7 +607,6 @@ This feature is optimized for PCIe-based GPU topologies and may affect model acc
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#topology-requirements">Topology Requirements</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#usage">Usage</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-and-accuracy-considerations">Performance and Accuracy Considerations</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#environment-variables">Environment Variables</a></li>
 </ul>
   </nav></div>
 
@@ -708,9 +701,9 @@ This feature is optimized for PCIe-based GPU topologies and may affect model acc
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 09, 2025.</p>
+  <p>Last updated on June 16, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
   
 </div></div>
       

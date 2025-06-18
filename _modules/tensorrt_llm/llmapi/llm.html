@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc1" />
+  <meta name="docsearch:version" content="0.21.0rc2" />
 
 
   </head>
@@ -442,6 +442,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/ci-overview.html">Continuous Integration Overview</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -536,7 +537,8 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">..executor.postproc_worker</span><span class="w"> </span><span class="kn">import</span> <span class="n">PostprocParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..executor.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">create_mpi_comm_session</span><span class="p">,</span>
                               <span class="n">get_spawn_proxy_process_env</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..inputs</span><span class="w"> </span><span class="kn">import</span> <span class="n">PromptInputs</span><span class="p">,</span> <span class="n">create_input_processor</span><span class="p">,</span> <span class="n">prompt_inputs</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..inputs</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">PromptInputs</span><span class="p">,</span> <span class="n">create_input_processor</span><span class="p">,</span>
+                      <span class="n">create_input_processor_with_hash</span><span class="p">,</span> <span class="n">prompt_inputs</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span> <span class="n">PybindMirror</span><span class="p">,</span> <span class="n">TorchLlmArgs</span><span class="p">,</span>
@@ -643,6 +645,16 @@
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">llm_args_cls</span> <span class="o">=</span> <span class="n">TrtLlmArgs</span>
 
+            <span class="c1"># check the kwargs and raise ValueError directly</span>
+            <span class="n">valid_keys</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span>
+                <span class="nb">list</span><span class="p">(</span><span class="n">llm_args_cls</span><span class="o">.</span><span class="n">model_fields</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span> <span class="o">+</span>
+                <span class="p">[</span><span class="s1">&#39;_mpi_session&#39;</span><span class="p">,</span> <span class="s1">&#39;backend&#39;</span><span class="p">])</span>
+            <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">valid_keys</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> got invalid argument: </span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">&quot;</span>
+                    <span class="p">)</span>
+
             <span class="bp">self</span><span class="o">.</span><span class="n">args</span> <span class="o">=</span> <span class="n">llm_args_cls</span><span class="o">.</span><span class="n">from_kwargs</span><span class="p">(</span>
                 <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
                 <span class="n">tokenizer</span><span class="o">=</span><span class="n">tokenizer</span><span class="p">,</span>
@@ -702,10 +714,10 @@
 
             <span class="bp">self</span><span class="o">.</span><span class="n">_build_model</span><span class="p">()</span>
 
-        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
-            <span class="k">raise</span> <span class="n">e</span>
+            <span class="k">raise</span>
 
         <span class="n">exception_handler</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;shutdown&#39;</span><span class="p">)</span>
         <span class="n">atexit</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">LLM</span><span class="o">.</span><span class="n">_shutdown_wrapper</span><span class="p">,</span> <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span><span class="p">(</span><span class="bp">self</span><span class="p">))</span></div>
@@ -862,22 +874,38 @@
                 <span class="n">sampling_params</span><span class="o">.</span><span class="n">add_special_tokens</span> <span class="o">=</span> <span class="kc">False</span>
 
         <span class="n">query_token_ids</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">multimodal_input</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">multimodal_embedding</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">mrope_config</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="s2">&quot;prompt_token_ids&quot;</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
+            <span class="c1"># TODO: if specify prompt_token_ids, the mm hashing is not supported yet</span>
             <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt_token_ids&#39;</span><span class="p">]</span>
             <span class="n">prompt</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="n">query_token_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;query_token_ids&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">elif</span> <span class="s2">&quot;prompt&quot;</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
-            <span class="k">with</span> <span class="n">nvtx_range_debug</span><span class="p">(</span><span class="s2">&quot;input_processor&quot;</span><span class="p">):</span>
-                <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">extra_processed_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">(</span>
-                    <span class="n">inputs</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+            <span class="k">if</span> <span class="s1">&#39;multi_modal_data&#39;</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
+                <span class="c1"># TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)</span>
+                <span class="c1"># to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.</span>
+                <span class="c1"># In the future, we should refactor this to:</span>
+                <span class="c1"># 1. Extend support for more modalities and models</span>
+                <span class="c1"># 2. Decouple input processor into distinct phases (preprocessor (all preprocessing logics), vision model (fuse in model fwd), etc.</span>
+                <span class="n">input_processor_with_hash</span> <span class="o">=</span> <span class="n">create_input_processor_with_hash</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">)</span>
+                <span class="k">with</span> <span class="n">nvtx_range_debug</span><span class="p">(</span><span class="s2">&quot;input_processor_with_hash&quot;</span><span class="p">):</span>
+                    <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">extra_processed_inputs</span> <span class="o">=</span> <span class="n">input_processor_with_hash</span><span class="p">(</span>
+                        <span class="n">inputs</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">with</span> <span class="n">nvtx_range_debug</span><span class="p">(</span><span class="s2">&quot;input_processor&quot;</span><span class="p">):</span>
+                    <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">extra_processed_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">(</span>
+                        <span class="n">inputs</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
             <span class="n">prompt</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt&#39;</span><span class="p">]</span>
             <span class="k">if</span> <span class="n">extra_processed_inputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">query_token_ids</span> <span class="o">=</span> <span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;query_token_ids&#39;</span><span class="p">)</span>
                 <span class="n">multimodal_embedding</span> <span class="o">=</span> <span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
                     <span class="s1">&#39;mm_embedding&#39;</span><span class="p">)</span>
                 <span class="n">mrope_config</span> <span class="o">=</span> <span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;mrope_config&#39;</span><span class="p">)</span>
+                <span class="n">multimodal_input</span> <span class="o">=</span> <span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                    <span class="s1">&#39;multimodal_input&#39;</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;The inputs must be type str or list of int, but got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -897,6 +925,7 @@
             <span class="n">lora_request</span><span class="o">=</span><span class="n">lora_request</span><span class="p">,</span>
             <span class="n">prompt_adapter_request</span><span class="o">=</span><span class="n">prompt_adapter_request</span><span class="p">,</span>
             <span class="n">streaming</span><span class="o">=</span><span class="n">streaming</span><span class="p">,</span>
+            <span class="n">multimodal_input</span><span class="o">=</span><span class="n">multimodal_input</span><span class="p">,</span>
             <span class="n">multimodal_embedding</span><span class="o">=</span><span class="n">multimodal_embedding</span><span class="p">,</span>
             <span class="n">mrope_config</span><span class="o">=</span><span class="n">mrope_config</span><span class="p">,</span>
             <span class="n">kv_cache_retention_config</span><span class="o">=</span><span class="n">kv_cache_retention_config</span><span class="p">,</span>
@@ -1124,7 +1153,7 @@
         <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="n">max_num_tokens</span> <span class="ow">or</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span>
         <span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span> <span class="ow">or</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span>
 
-        <span class="n">executor_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">ExecutorConfig</span><span class="p">(</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">ExecutorConfig</span><span class="p">(</span>
             <span class="n">max_beam_width</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">,</span>
             <span class="n">scheduler_config</span><span class="o">=</span><span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">scheduler_config</span><span class="p">),</span>
@@ -1136,20 +1165,20 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># also set executor_config.max_seq_len in TRT workflow, to deduce default max_tokens</span>
             <span class="k">if</span> <span class="n">max_seq_len</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">executor_config</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">engine_config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="o">/</span>
                                                             <span class="s2">&quot;config.json&quot;</span><span class="p">)</span>
-                <span class="n">executor_config</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;FORCE_DETERMINISTIC&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span><span class="p">:</span>
             <span class="c1"># Disable KV cache reuse for deterministic mode</span>
-            <span class="n">executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_block_reuse</span> <span class="o">=</span> <span class="kc">False</span>
-            <span class="n">executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_partial_reuse</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_block_reuse</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_partial_reuse</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">peft_cache_config</span><span class="p">)</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span><span class="p">:</span>
             <span class="n">engine_config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="o">/</span>
@@ -1158,16 +1187,16 @@
             <span class="n">max_lora_rank</span> <span class="o">=</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">max_lora_rank</span>
             <span class="n">num_lora_modules</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="o">*</span> \
                 <span class="nb">len</span><span class="p">(</span><span class="n">lora_config</span><span class="o">.</span><span class="n">lora_target_modules</span> <span class="o">+</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">missing_qkv_modules</span><span class="p">)</span>
-            <span class="n">executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">PeftCacheConfig</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">PeftCacheConfig</span><span class="p">(</span>
                 <span class="n">num_device_module_layer</span><span class="o">=</span><span class="n">max_lora_rank</span> <span class="o">*</span> <span class="n">num_lora_modules</span> <span class="o">*</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_loras</span><span class="p">,</span>
                 <span class="n">num_host_module_layer</span><span class="o">=</span><span class="n">max_lora_rank</span> <span class="o">*</span> <span class="n">num_lora_modules</span> <span class="o">*</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_cpu_loras</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">executor_config</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="o">==</span> <span class="s1">&#39;xgrammar&#39;</span><span class="p">:</span>
-            <span class="n">executor_config</span><span class="o">.</span><span class="n">guided_decoding_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">guided_decoding_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="p">(</span>
                 <span class="n">backend</span><span class="o">=</span><span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="o">.</span><span class="n">GuidedDecodingBackend</span><span class="o">.</span>
                 <span class="n">XGRAMMAR</span><span class="p">,</span>
                 <span class="o">**</span><span class="n">_xgrammar_tokenizer_info</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">))</span>
@@ -1176,18 +1205,18 @@
                 <span class="sa">f</span><span class="s2">&quot;Unrecognized guided decoding backend </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
 
-        <span class="n">executor_config</span><span class="o">.</span><span class="n">normalize_log_probs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">normalize_log_probs</span>
-        <span class="n">executor_config</span><span class="o">.</span><span class="n">enable_chunked_context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_prefill</span>
-        <span class="n">executor_config</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">normalize_log_probs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">normalize_log_probs</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">enable_chunked_context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_prefill</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">executor_config</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">executor_config</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">cache_transceiver_config</span><span class="p">)</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">update_executor_config</span>
         <span class="n">update_executor_config</span><span class="p">(</span>
-            <span class="n">executor_config</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="p">,</span>
             <span class="n">backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span>
             <span class="n">pytorch_backend_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">get_pytorch_backend_config</span><span class="p">()</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">]</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
@@ -1199,14 +1228,14 @@
             <span class="n">trt_engine_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span>
             <span class="n">max_input_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_input_len</span><span class="p">,</span>
             <span class="n">max_seq_len</span><span class="o">=</span><span class="n">max_seq_len</span><span class="p">)</span>
-        <span class="n">executor_config</span><span class="o">.</span><span class="n">llm_parallel_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span>
-        <span class="n">return_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span> <span class="ow">or</span> <span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
-            <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">gather_context_logits</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">llm_parallel_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span>
+        <span class="n">return_logits</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span>
+                         <span class="ow">or</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
+                             <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">gather_context_logits</span><span class="p">))</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span>
-            <span class="n">executor_config</span><span class="o">=</span><span class="n">executor_config</span><span class="p">,</span>
+            <span class="n">executor_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="p">,</span>
             <span class="n">batched_logits_processor</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batched_logits_processor</span><span class="p">,</span>
             <span class="n">model_world_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
             <span class="n">mpi_session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">,</span>
@@ -1446,9 +1475,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 09, 2025.</p>
+  <p>Last updated on June 16, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
   
 </div></div>
       

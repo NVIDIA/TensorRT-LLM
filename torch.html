@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc1" />
+  <meta name="docsearch:version" content="0.21.0rc2" />
 
 
   </head>
@@ -449,6 +449,7 @@
 <li class="toctree-l1"><a class="reference internal" href="reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="reference/ci-overview.html">Continuous Integration Overview</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -565,6 +566,24 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
 </pre></div>
 </div>
 </section>
+<section id="sampling">
+<h2>Sampling<a class="headerlink" href="#sampling" title="Link to this heading">#</a></h2>
+<p>The PyTorch backend supports most of the sampling features that are supported on the C++ backend, such as temperature, top-k and top-p sampling, stop words, bad words, penalty, context and generation logits, and log probs.</p>
+<p>In order to use this feature, it is necessary to enable option <code class="docutils literal notranslate"><span class="pre">enable_trtllm_sampler</span></code> in the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> class, and pass a <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code> object with the desired options as well. The following example prepares two identical prompts which will give different results due to the sampling parameters chosen:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s1">&#39;nvidia/Llama-3.1-8B-Instruct-FP8&#39;</span><span class="p">,</span>
+          <span class="n">enable_trtllm_sampler</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span>
+        <span class="n">temperature</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
+        <span class="n">top_k</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+        <span class="n">top_p</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span>
+    <span class="p">)</span>
+<span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">],</span> <span class="n">sampling_params</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>When using speculative decoders such as MTP or Eagle-3, the <code class="docutils literal notranslate"><span class="pre">enable_trtllm_sampler</span></code> option is not yet supported and therefore the subset of sampling options available is more restricted.</p>
+</section>
 <section id="developer-guide">
 <h2>Developer Guide<a class="headerlink" href="#developer-guide" title="Link to this heading">#</a></h2>
 <ul class="simple">
@@ -640,6 +659,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quick-start">Quick Start</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quantization">Quantization</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#sampling">Sampling</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#developer-guide">Developer Guide</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#key-components">Key Components</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#known-issues">Known Issues</a></li>
@@ -737,9 +757,9 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 09, 2025.</p>
+  <p>Last updated on June 16, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
   
 </div></div>
       

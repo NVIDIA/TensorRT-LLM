@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc1" />
+  <meta name="docsearch:version" content="0.21.0rc2" />
 
 
   </head>
@@ -442,6 +442,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/ci-overview.html">Continuous Integration Overview</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -517,8 +518,7 @@
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">DisaggregatedParams</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Disaggregated seving parameters</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Disaggregated seving parameters.</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        request_type (str): The type of request (&quot;context_only&quot; or &quot;generation_only&quot;)</span>
@@ -536,10 +536,9 @@
 <div class="viewcode-block" id="DisaggregatedParams.get_context_phase_params">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.get_context_phase_params">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_context_phase_params</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">tllme</span><span class="o">.</span><span class="n">ContextPhaseParams</span><span class="p">:</span>
-
-        <span class="k">return</span> <span class="n">tllme</span><span class="o">.</span><span class="n">ContextPhaseParams</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">first_gen_tokens</span><span class="p">,</span>
-                                        <span class="bp">self</span><span class="o">.</span><span class="n">ctx_request_id</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">opaque_state</span><span class="p">,</span>
-                                        <span class="bp">self</span><span class="o">.</span><span class="n">draft_tokens</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="n">tllme</span><span class="o">.</span><span class="n">ContextPhaseParams</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">first_gen_tokens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">ctx_request_id</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">opaque_state</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">draft_tokens</span>
+        <span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="DisaggregatedParams.get_request_type">
@@ -553,7 +552,8 @@
             <span class="k">return</span> <span class="n">tllme</span><span class="o">.</span><span class="n">RequestType</span><span class="o">.</span><span class="n">REQUEST_TYPE_CONTEXT_AND_GENERATION</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;Unknown request type: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">request_type</span><span class="si">}</span><span class="s2">. Must be context_only, generation_only or context_and_generation&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;Unknown request type: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">request_type</span><span class="si">}</span><span class="s2">. Must be context_only, generation_only or &quot;</span>
+                <span class="s2">&quot;context_and_generation&quot;</span>
             <span class="p">)</span></div>
 </div>
 
@@ -668,9 +668,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 09, 2025.</p>
+  <p>Last updated on June 16, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
   
 </div></div>
       

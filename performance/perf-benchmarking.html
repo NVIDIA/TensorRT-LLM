@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc1" />
+  <meta name="docsearch:version" content="0.21.0rc2" />
 
 
   </head>
@@ -449,6 +449,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/ci-overview.html">Continuous Integration Overview</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -1001,6 +1002,75 @@ Request<span class="w"> </span>Throughput<span class="w"> </span><span class="o"
 Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</span>ms<span class="o">)</span>:<span class="w">             </span><span class="m">18563</span>.6825
 </pre></div>
 </div>
+<section id="benchmarking-with-lora-adapters-in-pytorch-workflow">
+<h4>Benchmarking with LoRA Adapters in PyTorch workflow<a class="headerlink" href="#benchmarking-with-lora-adapters-in-pytorch-workflow" title="Link to this heading">#</a></h4>
+<p>The PyTorch workflow supports benchmarking with LoRA (Low-Rank Adaptation) adapters. This requires preparing a dataset with LoRA metadata and configuring the LoRA settings.</p>
+<p><strong>Preparing LoRA Dataset</strong></p>
+<p>Use <code class="docutils literal notranslate"><span class="pre">prepare_dataset.py</span></code> with LoRA-specific options to generate requests with LoRA metadata:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--stdout<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--rand-task-id<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tokenizer<span class="w"> </span>/path/to/tokenizer<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--lora-dir<span class="w"> </span>/path/to/loras<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>token-norm-dist<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--num-requests<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--input-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--input-stdev<span class="w"> </span><span class="m">16</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output-stdev<span class="w"> </span><span class="m">24</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>&gt;<span class="w"> </span>synthetic_lora_data.json
+</pre></div>
+</div>
+<p>Key LoRA options:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">--lora-dir</span></code>: Parent directory containing LoRA adapter subdirectories named by their task IDs (e.g., <code class="docutils literal notranslate"><span class="pre">0/</span></code>, <code class="docutils literal notranslate"><span class="pre">1/</span></code>, etc.)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--rand-task-id</span></code>: Range of LoRA task IDs to randomly assign to requests</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--task-id</span></code>: Fixed LoRA task ID for all requests (alternative to <code class="docutils literal notranslate"><span class="pre">--rand-task-id</span></code>)</p></li>
+</ul>
+<p>The generated dataset will include LoRA request metadata. Below is an example of a single such request data entry:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;task_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;input_ids&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">3452</span><span class="p">,</span><span class="w"> </span><span class="mi">88226</span><span class="p">,</span><span class="w"> </span><span class="mi">102415</span><span class="p">,</span><span class="w"> </span><span class="err">...</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;output_tokens&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">152</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;lora_request&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;lora_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;lora_0&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lora_int_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;lora_path&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;/path/to/loras/0&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p><strong>LoRA Configuration</strong></p>
+<p>Create an <code class="docutils literal notranslate"><span class="pre">extra-llm-api-options.yaml</span></code> file with LoRA configuration:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">lora_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">lora_dir</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/path/to/loras/0</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/path/to/loras/1</span>
+<span class="w">  </span><span class="nt">max_lora_rank</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">64</span>
+<span class="w">  </span><span class="nt">lora_target_modules</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">attn_q</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">attn_k</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">attn_v</span>
+<span class="w">  </span><span class="nt">trtllm_modules_to_hf_modules</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">attn_q</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">q_proj</span>
+<span class="w">    </span><span class="nt">attn_k</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">k_proj</span>
+<span class="w">    </span><span class="nt">attn_v</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v_proj</span>
+</pre></div>
+</div>
+<p><strong>Running LoRA Benchmark</strong></p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>/path/to/base/model<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>throughput<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dataset<span class="w"> </span>synthetic_lora_data.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--extra_llm_api_options<span class="w"> </span>extra-llm-api-options.yaml
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The LoRA directory structure should have task-specific subdirectories named by their task IDs (e.g., <code class="docutils literal notranslate"><span class="pre">loras/0/</span></code>, <code class="docutils literal notranslate"><span class="pre">loras/1/</span></code>).
+Each subdirectory should contain the LoRA adapter files for that specific task.</p>
+</div>
+</section>
 <section id="running-multi-modal-models-in-the-pytorch-workflow">
 <h4>Running multi-modal models in the PyTorch Workflow<a class="headerlink" href="#running-multi-modal-models-in-the-pytorch-workflow" title="Link to this heading">#</a></h4>
 <p>To benchmark multi-modal models with PyTorch workflow, you can follow the similar approach as above.</p>
@@ -1129,6 +1199,7 @@ above:</p>
 <span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
 <span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
 <span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
 </pre></div>
 </div>
 <p>The checkpoints above are quantized to run with a compute precision of <code class="docutils literal notranslate"><span class="pre">FP8</span></code> and default to no KV cache quantization (full
@@ -1434,6 +1505,7 @@ The choices are specified with a YAML file like the following example (<code cla
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#running-with-the-pytorch-workflow">Running with the PyTorch Workflow</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmarking-with-lora-adapters-in-pytorch-workflow">Benchmarking with LoRA Adapters in PyTorch workflow</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#running-multi-modal-models-in-the-pytorch-workflow">Running multi-modal models in the PyTorch Workflow</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#quantization-in-the-pytorch-flow">Quantization in the PyTorch Flow</a></li>
 </ul>
@@ -1543,9 +1615,9 @@ The choices are specified with a YAML file like the following example (<code cla
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 09, 2025.</p>
+  <p>Last updated on June 16, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
   
 </div></div>
       
