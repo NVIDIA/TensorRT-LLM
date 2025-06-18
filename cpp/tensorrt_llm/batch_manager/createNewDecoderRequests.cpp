@@ -660,6 +660,7 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
             decoderRequest.stopWordsList->squeeze(0);
         }
 
+        TLLM_CHECK(llmReq->mSeqSlot.has_value());
         newRequest(llmReq->mSeqSlot.value(), decoderRequest, llmReq->mSamplingConfig, modelConfig, decoderState,
             runtimeStream, decoderStream, maxSequenceLength);
 

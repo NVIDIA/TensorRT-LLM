@@ -214,8 +214,8 @@ public:
         torch::optional<torch::Tensor> token_final_scales, torch::Tensor const& fc1_expert_weights,
         torch::Tensor const& fc2_expert_weights, torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales,
         torch::optional<torch::Tensor> input_sf, int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size,
-        int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank, bool min_latency_mode,
-        torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+        int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank, bool const enable_alltoall,
+        bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -284,7 +284,7 @@ public:
             fc1_expert_weights.const_data_ptr(), nullptr, activation_type, fc2_expert_weights.const_data_ptr(), nullptr,
             quant_params, num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.workspace), output.data_ptr(),
-            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
+            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 
         return output;
@@ -295,7 +295,7 @@ public:
         torch::Tensor const& fc1_expert_weights, torch::Tensor const& fc2_expert_weights,
         torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales, torch::optional<torch::Tensor> input_sf,
         int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-        int64_t const cluster_size, int64_t const cluster_rank, bool min_latency_mode,
+        int64_t const cluster_size, int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
         torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
         std::lock_guard<std::mutex> lock(mMutex);
@@ -374,7 +374,7 @@ public:
             fc1_expert_weights.const_data_ptr(), nullptr, activation_type, fc2_expert_weights.const_data_ptr(), nullptr,
             quant_params, num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.workspace), output.data_ptr(),
-            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
+            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 
         return std::make_tuple(output, num_active_experts_per_node, experts_to_token_score, active_expert_global_ids);
@@ -389,7 +389,8 @@ public:
     void runGemmProfile(torch::Tensor const& input, torch::Tensor const& fc1_expert_weights,
         torch::Tensor const& fc2_expert_weights, int64_t const top_k, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
-        bool const min_latency_mode, int64_t const gemm_idx, int64_t const profile_id, bool const do_preparation)
+        bool const enable_alltoall, bool const min_latency_mode, int64_t const gemm_idx, int64_t const profile_id,
+        bool const do_preparation)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -436,7 +437,7 @@ public:
                 tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                 hidden_size, inter_size, group_size, ActivationType::Swiglu, USE_BIAS, USE_LORA, min_latency_mode,
-                /*need_weights*/ false, parallelism_config);
+                /*need_weights*/ false, parallelism_config, enable_alltoall);
 
             freeProfileWorkspace();
             size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);

@@ -348,9 +348,9 @@ public:
         ActivationType fc1_activation_type, void const* fc2_expert_weights, void const* fc2_expert_biases,
         QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int const num_experts, int const experts_per_token, char* workspace_ptr, void* final_output,
-        int* expanded_source_row_to_expanded_dest_row, MOEParallelismConfig parallelism_config, bool use_lora,
-        LoraParams& lora_params, bool use_fp8_block_scaling, bool min_latency_mode,
-        MoeMinLatencyParams& min_latency_params, cudaStream_t stream)
+        int* expanded_source_row_to_expanded_dest_row, MOEParallelismConfig parallelism_config,
+        bool const enable_alltoall, bool use_lora, LoraParams& lora_params, bool use_fp8_block_scaling,
+        bool min_latency_mode, MoeMinLatencyParams& min_latency_params, cudaStream_t stream)
         = 0;
 
     // Aliases for profiling the gemms
@@ -378,8 +378,8 @@ public:
         int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
         int64_t const experts_per_token, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
         bool use_fp8_block_scaling, cudaStream_t stream, MOEParallelismConfig parallelism_config,
-        cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode, int* num_active_experts_per,
-        int* active_expert_global_ids, int start_expert)
+        bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
+        int* num_active_experts_per, int* active_expert_global_ids, int start_expert)
         = 0;
 
     virtual std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
@@ -486,9 +486,9 @@ public:
         ActivationType fc1_activation_type, void const* fc2_expert_weights, void const* fc2_expert_biases,
         QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int const num_experts, int const experts_per_token, char* workspace_ptr, void* final_output,
-        int* expanded_source_row_to_expanded_dest_row, MOEParallelismConfig parallelism_config, bool use_lora,
-        LoraParams& lora_params, bool use_fp8_block_scaling, bool min_latency_mode,
-        MoeMinLatencyParams& min_latency_params, cudaStream_t stream) override;
+        int* expanded_source_row_to_expanded_dest_row, MOEParallelismConfig parallelism_config,
+        bool const enable_alltoall, bool use_lora, LoraParams& lora_params, bool use_fp8_block_scaling,
+        bool min_latency_mode, MoeMinLatencyParams& min_latency_params, cudaStream_t stream) override;
 
     // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
     static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
@@ -521,8 +521,9 @@ public:
         int64_t const* const num_valid_tokens_ptr, int64_t const num_rows, int64_t const expanded_num_rows,
         int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
         int64_t const experts_per_token, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
-        cudaStream_t stream, MOEParallelismConfig parallelism_config, cutlass_extensions::CutlassGemmConfig config,
-        bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids, int start_expert);
+        cudaStream_t stream, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
+        cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode, int* num_active_experts_per,
+        int* active_expert_global_ids, int start_expert);
 
     // Overrides to allow us to forward on to the internal functions with the pointers using the correct type
     void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -558,8 +559,8 @@ public:
         int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node,
         int64_t const experts_per_token, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
         bool use_fp8_block_scaling, cudaStream_t stream, MOEParallelismConfig parallelism_config,
-        cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode, int* num_active_experts_per,
-        int* active_expert_global_ids, int start_expert) override
+        bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
+        int* num_active_experts_per, int* active_expert_global_ids, int start_expert) override
     {
         auto* block_scale_gemm_runner = use_fp8_block_scaling ? getBlockScaleGemmRunner() : nullptr;
         return Self::gemm2(moe_gemm_runner_, block_scale_gemm_runner, static_cast<T const*>(input), gemm_output,
@@ -569,8 +570,8 @@ public:
             token_topk_unpermuted_scales, token_topk_permuted_scales, expanded_source_row_to_expanded_dest_row,
             expanded_dest_row_to_expanded_source_row, expert_for_source_row, num_valid_tokens_ptr, num_rows,
             expanded_num_rows, hidden_size, inter_size, num_experts_per_node, experts_per_token, alpha_scale_ptr_array,
-            use_lora, fc2_lora, stream, parallelism_config, config, min_latency_mode, num_active_experts_per,
-            active_expert_global_ids, start_expert);
+            use_lora, fc2_lora, stream, parallelism_config, enable_alltoall, config, min_latency_mode,
+            num_active_experts_per, active_expert_global_ids, start_expert);
     }
 
     virtual size_t getGemmWorkspaceSize(int num_experts_per_node) const override
@@ -697,10 +698,11 @@ private:
         OutputType* const final_output, int64_t const* const expert_first_token_offset,
         WeightType const* const fc2_expert_weights, ScaleBiasType const* const fc2_expert_biases,
         float const* const token_topk_unpermuted_scales, int const* const expanded_source_row_to_expanded_dest_row,
-        int const* const expert_for_source_row, int64_t const* const num_valid_tokens_ptr, int64_t const num_rows,
-        int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const inter_size,
-        int const num_experts_per_node, int64_t const k, MOEParallelismConfig parallelism_config,
-        QuantParams& quant_params, cudaStream_t stream);
+        int const* const expanded_dest_row_to_expanded_source_row, int const* const expert_for_source_row,
+        int64_t const* const num_valid_tokens_ptr, int64_t const num_rows, int64_t const expanded_num_rows,
+        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node, int64_t const k,
+        MOEParallelismConfig parallelism_config, bool const enable_alltoall, QuantParams& quant_params,
+        cudaStream_t stream);
 
     T const* applyPrequantScale(void* smoothed_act, void const* permuted_data, void const* prequant_scales,
         int64_t const* num_valid_tokens_ptr, int64_t const expanded_num_rows, int64_t const seq_len, bool const use_awq,
@@ -770,7 +772,7 @@ public:
     void init(CutlassMoeFCRunnerInterface& runner, GemmToProfile gemm_to_profile, nvinfer1::DataType dtype,
         nvinfer1::DataType wtype, nvinfer1::DataType otype, int num_experts, int k, int64_t hidden_size,
         int64_t inter_size, int64_t group_size, ActivationType activation_type, bool bias, bool use_lora,
-        bool min_latency_mode, bool need_weights, MOEParallelismConfig parallelism_config)
+        bool min_latency_mode, bool need_weights, MOEParallelismConfig parallelism_config, bool const enable_alltoall)
     {
         mInterface = &runner;
         mGemmToProfile = gemm_to_profile;
@@ -789,6 +791,7 @@ public:
         mMinLatencyMode = min_latency_mode;
         mNeedWeights = need_weights;
         mParallelismConfig = parallelism_config;
+        mEnableAlltoall = enable_alltoall;
         mSM = common::getSMVersion();
         mSorter.updateNumExperts(mNumExpertsPerNode);
     }
@@ -815,6 +818,7 @@ public:
     int64_t mGroupSize{};
     ActivationType mActivationType{};
     MOEParallelismConfig mParallelismConfig{};
+    bool mEnableAlltoall = false;
 
     int mSampleIndex = 0;
 
