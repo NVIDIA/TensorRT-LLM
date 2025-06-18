@@ -964,17 +964,18 @@ void WindowBlockManager::removeBlockFromHashMap(BlockPtr const& block)
     TLLM_LOG_DEBUG("Trying to remove block %d by %zx that is not in hash map", block->getBlockId(), block->getHash());
 }
 
-void BlockManager::onboardBlock(BlockPtr const& offloadBlock, SizeType32 windowSize)
+void BlockManager::onboardBlock(
+    BlockPtr const& offloadBlock, executor::KvCacheRetentionConfig const& config, SizeType32 windowSize)
 {
-    mWindowBlockManagers.at(windowSize).onboardBlock(offloadBlock);
+    mWindowBlockManagers.at(windowSize).onboardBlock(offloadBlock, config);
 }
 
-void WindowBlockManager::onboardBlock(BlockPtr const& offloadBlock)
+void WindowBlockManager::onboardBlock(BlockPtr const& offloadBlock, executor::KvCacheRetentionConfig const& config)
 {
     if (mOnboardBlocks && !offloadBlock->isPrimary())
     {
         auto block = getFreeBlock();
-        mTransferManager->onboard(offloadBlock, block, mPools);
+        mTransferManager->onboard(offloadBlock, block, mPools, 0, config.getTransferMode(), config.getDirectory());
         // swap linear block offsets (i.e. make block the offload block and vice versa)
         offloadBlock->swapMemoryPoolBlockOffset(block);
 
@@ -1056,7 +1057,8 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
 }
 
 SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
-    GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions)
+    GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
+    executor::KvCacheRetentionConfig const& config)
 {
     SizeType32 numMatchedTokens{0};
     auto searchRoot = mCachedBlocksRoot;
@@ -1091,7 +1093,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 {
                     // Somebody else is using block or it is not a leaf, copy reusable tokens
                     auto newBlock = getFreeBlock(matchingBlock->getPriority(), matchingBlock->getDurationMs());
-                    mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched);
+                    mTransferManager->onboard(
+                        matchingBlock, newBlock, mPools, 0, config.getTransferMode(), config.getDirectory());
                     // TODO: (optional) Send out event
                     matchingBlock = newBlock;
                     TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Copied partially filled block %d", mLogPrefix.c_str(),
@@ -1117,7 +1120,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 addBlockToHashMap(matchingBlock);
                 searchRoot = matchingBlock;
             }
-            onboardBlock(matchingBlock);
+            onboardBlock(matchingBlock, config);
             addBlockToAllBeams(matchingBlock, sequence);
             // TODO: only add once for reused blocks
             ++mReusedBlocks;
@@ -1232,7 +1235,8 @@ void WindowBlockManager::addSequence(
 
     TLLM_CHECK(perBlockRetentions.size() == (size_t) numContextBlocks);
 
-    auto const prepopulatedPromptLen = loadOrAllocateBlocks(blockKeys, numContextBlocks, sequence, perBlockRetentions);
+    auto const prepopulatedPromptLen = loadOrAllocateBlocks(
+        blockKeys, numContextBlocks, sequence, perBlockRetentions, config.value_or(executor::KvCacheRetentionConfig()));
     mReusedTokens += static_cast<double>(prepopulatedPromptLen);
     mTotalInputTokens += static_cast<double>(uniqueTokens.size());
     llmRequest.setPrepopulatedPromptLen(prepopulatedPromptLen, getTokensPerBlock());

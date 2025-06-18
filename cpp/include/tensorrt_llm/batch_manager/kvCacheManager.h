@@ -697,7 +697,7 @@ public:
 
     //! \brief Bring offloaded block from secondary to primary memory.
     //! \details Does nothing if block is already in primary memory.
-    void onboardBlock(BlockPtr const& offloadBlock);
+    void onboardBlock(BlockPtr const& offloadBlock, executor::KvCacheRetentionConfig const& config);
 
     //! \brief Bring block from primary to secondary memory.
     //! \details Does nothing if block is already in secondary memory.
@@ -759,7 +759,8 @@ private:
     //! \param sequence Sequence to which blocks are assigned.
     //! \return Number of matched tokens from loaded blocks.
     SizeType32 loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
-        GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions);
+        GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
+        executor::KvCacheRetentionConfig const& config);
 
     //! \brief Free block and all it's descendants. This makes block a claimed leaf block.
     void freeChildren(BlockPtr const& block, executor::RetentionPriority priority,
@@ -908,7 +909,8 @@ public:
 
     //! \brief Bring block from primary to secondary memory for window size.
     //! \details Does nothing if block is already in primary memory.
-    void onboardBlock(BlockPtr const& offloadBlock, SizeType32 windowSize);
+    void onboardBlock(
+        BlockPtr const& offloadBlock, executor::KvCacheRetentionConfig const& config, SizeType32 windowSize);
 
     //! \brief Bring block from primary to secondary memory for window size.
     //! \details Does nothing if block is already in secondary memory.
