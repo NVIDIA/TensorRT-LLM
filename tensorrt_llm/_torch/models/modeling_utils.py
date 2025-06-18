@@ -741,27 +741,13 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                         if p is not None:
                             p.data.copy_(module_weights[n][:])
 
-    if os.environ.get("TRT_LLM_LOAD_WEIGHTS_IN_PARALLEL", False):
+    if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
+                      False) in ["True", "true", "1", "yes", "y"]:
+        for name, module in tqdm(list(model.named_modules()),
+                                 desc="Loading weights"):
+            load_single_module(name, module)
+    else:
         pbar = tqdm(list(model.named_modules()),
                     desc="Loading weights concurrently")
         args_list = [(name, module) for name, module in model.named_modules()]
         run_concurrently(load_single_module, args_list, pbar=pbar)
-        # from concurrent import futures
-
-        # # TODO use a better way to get the number of max workers
-        # with futures.ThreadPoolExecutor(max_workers=10) as executor:
-        #     futures = [
-        #         executor.submit(load_single_module, name, module)
-        #         for name, module in tqdm(list(model.named_modules()),
-        #                                  desc="Loading weights concurrently")
-        #     ]
-        #     pbar = tqdm(list(model.named_modules()), desc="Loading weights concurrently")
-
-        #     for future in futures:
-        #         future.result()
-        #         pbar.update(1)
-
-    else:
-        for name, module in tqdm(list(model.named_modules()),
-                                 desc="Loading weights"):
-            load_single_module(name, module)
