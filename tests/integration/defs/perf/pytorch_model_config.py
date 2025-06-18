@@ -78,6 +78,17 @@ def get_model_yaml_config(model_label: str,
                 'cuda_graph_batch_sizes': [128]
             }
         },
+        # Deepseek_v3_lite_cases
+        {
+            'patterns':
+            'deepseek_v3_lite_nvfp4-bench-pytorch-streaming-float4-maxbs:2048-maxnt:8192-input_output_len:256,256-reqs:200',
+            'config': {
+                'print_iter_log': True,
+                'use_cuda_graph': True,
+                'cuda_graph_padding_enabled': True,
+                'cuda_graph_batch_sizes': [1, 512, 1024, 2048]
+            }
+        },
         # Llama Nemotron models with attention_dp disabled to prevent hangs
         {
             'patterns': [
