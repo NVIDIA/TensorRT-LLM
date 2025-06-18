@@ -1108,6 +1108,7 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.timeout(5400)
 @pytest.mark.skip_less_device_memory(80000)
 class TestLlama3_3NemotronSuper49Bv1(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
