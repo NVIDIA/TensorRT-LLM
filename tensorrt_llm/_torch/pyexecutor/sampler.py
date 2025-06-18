@@ -306,7 +306,7 @@ class TorchSampler(Sampler):
             self.handle_logits(req, state, beam=self.BEAM, count=1)
             req.py_decoding_iter += 1
 
-        for req in state.scheduled_requests.all_requests():
+        for req in state.scheduled_requests.generation_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             new_token = add_token(req, new_tokens, beam=self.BEAM)
