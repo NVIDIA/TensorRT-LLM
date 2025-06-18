@@ -1267,7 +1267,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
-        [(1, 1, 1, False, False, True)],
+        [(1, 1, 1, False, True, True)],
         ids=["latency"])
     def test_fp8_block_scales(self, tp_size, pp_size, ep_size, attention_dp,
                               cuda_graph, overlap_scheduler):
@@ -1275,6 +1275,27 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                               use_cuda_graph=cuda_graph)
 
         llm = LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  **pytorch_config,
+                  enable_attention_dp=attention_dp)
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
+        [(1, 1, 1, False, True, True)],
+        ids=["latency"])
+    def test_bf16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
+                  overlap_scheduler):
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
+                              use_cuda_graph=cuda_graph)
+
+        llm = LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B",
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
