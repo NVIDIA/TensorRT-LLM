@@ -26,9 +26,9 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 BACKEND_ROOT=${BACKEND_ROOT:='/opt/tritonserver/tensorrtllm_backend'}
-BASE_DIR=${BACKEND_ROOT}/ci/L0_backend_trtllm
-GPT_DIR=${BACKEND_ROOT}/tensorrt_llm/examples/models/core/gpt
-TRTLLM_DIR=${BACKEND_ROOT}/tensorrt_llm/
+BASE_DIR=${LLM_BACKEND_ROOT}/ci/L0_backend_trtllm
+TRTLLM_DIR=${LLM_ROOT}
+GPT_DIR=${TRTLLM_DIR}/examples/models/core/gpt
 
 function build_base_model {
     local NUM_GPUS=$1
