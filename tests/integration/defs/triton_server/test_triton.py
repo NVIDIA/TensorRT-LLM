@@ -8,8 +8,6 @@ def run_shell_command(command, llm_root):
     env = os.environ.copy()
     env["LLM_ROOT"] = llm_root
     env["LLM_BACKEND_ROOT"] = os.path.join(llm_root, "triton_backend")
-    env["TEST_ROOT"] = os.path.join(llm_root,
-                                    "tests/integration/defs/triton_server")
     env["NVIDIA_TRITON_SERVER_VERSION"] = os.environ.get(
         "NVIDIA_TRITON_SERVER_VERSION", "25.03")
     subprocess.run(command, env=env, check=True, shell=True)
