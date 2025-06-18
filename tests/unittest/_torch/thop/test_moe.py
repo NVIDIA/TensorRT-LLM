@@ -751,6 +751,14 @@ def check_accuracy(a, b, atol, rtol, percent):
                         (mismatch_percent, rtol))
 
 
+def are_groups_valid(top_k_groups, n_groups):
+    if top_k_groups is None or n_groups is None:
+        return False
+    if top_k_groups == 0 or n_groups == 0:
+        return False
+    return True
+
+
 @pytest.mark.skipif(
     getSMVersion() != 100,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -808,11 +816,23 @@ class TestMoeFP8:
 
         assert top_k <= num_experts
         assert top_k <= 8
-        assert top_k_groups <= 4
-        assert num_experts > n_groups
-        assert num_experts % n_groups == 0
         assert num_experts % 4 == 0
-        assert top_k < (top_k_groups * num_experts / n_groups)
+        assert hidden_size % 128 == 0
+        assert intermediate_size % 128 == 0
+
+        if are_groups_valid(top_k_groups, n_groups):
+            assert top_k_groups <= 4
+            assert num_experts > n_groups
+            assert num_experts % n_groups == 0
+            assert top_k < (top_k_groups * num_experts / n_groups)
+
+        num_processed_tokens_per_expert = num_tokens * top_k / num_experts
+        # FIXME: tile_tokens_dim is hardcoded for now
+        tile_tokens_dim = 8
+        if 256 < num_processed_tokens_per_expert and num_processed_tokens_per_expert <= 512:
+            tile_tokens_dim = 16
+        elif num_processed_tokens_per_expert > 512:
+            tile_tokens_dim = 32
 
         expert_logits = torch.randn((num_tokens, num_experts),
                                     device='cuda').to(torch.float)
@@ -923,6 +943,18 @@ class TestMoeFp4:
                 },
                 id="RoutingRenormalize"),
             pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 4,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize
+            },
+            id="RoutingRenormalize_topk_4"),
+            pytest.param(
                 {
                     "num_experts": 128,
                     "top_k": 8,
@@ -1002,11 +1034,14 @@ class TestMoeFp4:
 
         assert top_k <= num_experts
         assert top_k <= 8
-        if (top_k_groups is not None) and (n_groups is not None):
+        assert hidden_size % 128 == 0
+        assert intermediate_size % 128 == 0
+        assert num_experts % 4 == 0
+
+        if are_groups_valid(top_k_groups, n_groups):
             assert top_k_groups <= 4
             assert num_experts > n_groups
             assert num_experts % n_groups == 0
-            assert num_experts % 4 == 0
             assert top_k < (top_k_groups * num_experts / n_groups)
 
         if routing_method_type == RoutingMethodType.DeepSeekV3:
@@ -1233,11 +1268,15 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
 
     assert top_k <= num_experts
     assert top_k <= 8
-    assert top_k_groups <= 4
-    assert num_experts > n_groups
-    assert n_groups == 0 or num_experts % n_groups == 0
     assert num_experts % 4 == 0
-    assert n_groups == 0 or top_k < (top_k_groups * num_experts / n_groups)
+    assert hidden_size % 128 == 0
+    assert intermediate_size % 128 == 0
+
+    if are_groups_valid(top_k_groups, n_groups):
+        assert top_k_groups <= 4
+        assert num_experts > n_groups
+        assert num_experts % n_groups == 0
+        assert top_k < (top_k_groups * num_experts / n_groups)
 
     expert_logits = torch.randn((num_tokens, num_experts),
                                 device='cuda').to(torch.float)
@@ -1362,7 +1401,19 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.Renormalize
             },
-            id="RoutingRenormalize"),
+            id="RoutingRenormalize_topk_8"),
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 4,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize
+            },
+            id="RoutingRenormalize_topk_4"),
     ],
 )
 @pytest.mark.parametrize("dtype_activation", ["mxfp8", "bf16"])
@@ -1386,10 +1437,10 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     is_mx_fp8 = dtype_activation == "mxfp8"
 
     assert top_k <= num_experts
-    assert top_k == 8
+    assert top_k <= 8
     assert hidden_size % 128 == 0
     assert intermediate_size % 128 == 0
-    if (top_k_groups is not None) and (n_groups is not None):
+    if are_groups_valid(top_k_groups, n_groups):
         assert top_k_groups == 4
         assert num_experts > n_groups
         assert num_experts % n_groups == 0

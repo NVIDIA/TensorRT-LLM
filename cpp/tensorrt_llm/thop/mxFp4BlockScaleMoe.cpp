@@ -50,23 +50,31 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
         TORCH_CHECK(routing_bias.value().dim() == 1, "routing_bias must be 1D.");
         TORCH_CHECK(routing_bias.value().sizes()[0] == num_experts, "routing_bias has incorrect shape.");
     }
-    TORCH_CHECK(top_k == 8, "Current routing kernel only supports top_k=8.");
-    if (topk_group.has_value())
+
+    if (n_group.has_value() && n_group.value() != 0)
     {
-        TORCH_CHECK(topk_group.value() == 4, "Current routing kernel only supports topk_group=4.");
-    }
-    TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
-    if (n_group.has_value())
-    {
+        TORCH_CHECK(static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3,
+            "Routing kernel with groups implies DeepSeekV3 routing method.");
+        TORCH_CHECK(topk_group.has_value(), "if n_group is given, topk_group must be given");
         TORCH_CHECK(num_experts % n_group.value() == 0, "num_experts must be divisible by n_group");
-    }
-    TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
-    // This check ensures we have enough experts in the selected groups to handle the top_k routing
-    if (topk_group.has_value() && n_group.has_value())
-    {
+        TORCH_CHECK(top_k <= 8 && top_k > 0, "Current routing kernel (with groups) only supports top_k<=8 && top_k>0.");
+        TORCH_CHECK(topk_group.value() <= 4 && topk_group.value() > 0,
+            "Current routing kernel only (with groups) supports topk_group<=4 && topk_group > 0.");
+        TORCH_CHECK(topk_group.value() <= n_group.value(), "n_group must not be smaller than topk_group.");
+        // This check ensures we have enough experts in the selected groups to handle the top_k routing
         TORCH_CHECK(top_k < (topk_group.value() * num_experts / n_group.value()),
             "top_k must be less than total number of experts in selected groups");
     }
+    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize
+        || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::RenormalizeNaive)
+    {
+        TORCH_CHECK(top_k <= 8 && top_k > 0,
+            "Current routing kernel (no groups, renormalize) only supports top_k<=8 && top_k>0.");
+    }
+
+    TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
+    TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
+
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoERunnerArgs args;
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
 
@@ -88,8 +96,8 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
     args.num_experts = num_experts;
     args.hidden_size = hidden_states.sizes()[1];
     args.top_k = top_k;
-    args.n_group = n_group.value_or(1);
-    args.topk_group = topk_group.value_or(top_k);
+    args.n_group = n_group.value_or(0);
+    args.topk_group = topk_group.value_or(0);
     args.local_expert_offset = local_expert_offset;
     args.local_num_experts = local_num_experts;
     args.routed_scaling_factor = routed_scaling_factor.value_or(1.0);
