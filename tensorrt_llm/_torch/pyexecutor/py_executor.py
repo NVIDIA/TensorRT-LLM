@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
                                  is_trace_enabled, nvtx_range, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
@@ -215,7 +216,7 @@ class PyExecutor:
 
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
-            "kv_cache_manager")
+            ResourceManagerType.KV_CACHE_MANAGER)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
 
         if self.draft_model_engine is not None and self.kv_cache_manager is not None:
@@ -405,7 +406,7 @@ class PyExecutor:
 
     def get_latest_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
-            "kv_cache_manager")
+            ResourceManagerType.KV_CACHE_MANAGER)
         if not kv_cache_manager or not self.enable_kv_cache_events:
             return []
 
@@ -529,7 +530,7 @@ class PyExecutor:
         # staticBatchingStats is not used in pytorch path
         stats.static_batching_stats = StaticBatchingStats()
         spec_resource_manager = self.resource_manager.resource_managers.get(
-            "spec_resource_manager")
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
         if spec_resource_manager is not None:
             stats.specdec_stats = SpecDecodingStats()
         return stats
@@ -606,7 +607,7 @@ class PyExecutor:
         stats.iter = self.model_engine.iter_counter
 
         kv_cache_manager = self.resource_manager.resource_managers.get(
-            "kv_cache_manager")
+            ResourceManagerType.KV_CACHE_MANAGER)
         if kv_cache_manager is not None:
             kv_stats = kv_cache_manager.get_kv_cache_stats()
             kv_stats_to_save = KvCacheStats()
@@ -1308,7 +1309,7 @@ class PyExecutor:
 
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
-            "kv_cache_manager")
+            ResourceManagerType.KV_CACHE_MANAGER)
         if not kv_cache_manager:
             return
         # Flush iteration events at each iteration to ensure that events have enough time
@@ -1514,7 +1515,7 @@ class PyExecutor:
             )[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
-                'spec_resource_manager')
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests([0])
             self.active_requests.append(llm_request)
@@ -1528,7 +1529,7 @@ class PyExecutor:
             disagg_gen_init_to_prepare.paused_requests = []
 
             self.resource_manager.resource_managers[
-                'kv_cache_manager'].prepare_resources(
+                ResourceManagerType.KV_CACHE_MANAGER].prepare_resources(
                     disagg_gen_init_to_prepare)
 
             # Trigger KV cache exchange for new disagg_gen_init_requests
@@ -1590,7 +1591,7 @@ class PyExecutor:
                                                 req.is_finished_due_to_length):
                 self.kv_cache_transceiver.respond_and_send_async(req)
                 self.resource_manager.resource_managers[
-                    "seq_slot_manager"].free_resources(req)
+                    ResourceManagerType.SEQ_SLOT_MANAGER].free_resources(req)
 
         self.kv_cache_transceiver.check_context_transfer_status(0)
 
