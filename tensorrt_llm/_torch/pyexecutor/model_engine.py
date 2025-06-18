@@ -1032,7 +1032,6 @@ class PyTorchModelEngine(ModelEngine):
                         return t
                     if t not in memo:
                         memo[t] = torch.empty_like(t, device='cuda')
-                        # logger.info(f"init_meta_tensor: {memo[t].device}")
                     return memo[t]
 
                 model._apply(init_meta_tensor)
