@@ -103,6 +103,7 @@ class LLaMAConfig(PretrainedConfig):
 
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
+            orig_model_type = hf_config.model_type
         else:
             hf_config_dir = str(hf_config_or_dir)
             if "vila" in hf_config_dir.lower():
@@ -116,26 +117,23 @@ class LLaMAConfig(PretrainedConfig):
 
             hf_config = transformers.AutoConfig.from_pretrained(
                 hf_config_dir, trust_remote_code=trust_remote_code)
+            orig_model_type = hf_config.model_type
             if hf_config.model_type == "llava":
-                orig_conf = hf_config
                 # LLaVA = Vision model + Llama LLM
                 # We load a llava config and use its' text config as llama config
                 from transformers import LlavaConfig
                 hf_config = LlavaConfig.from_pretrained(
                     hf_config_dir).text_config
             if hf_config.model_type == "llava_next":
-                orig_conf = hf_config
                 from transformers import LlavaNextConfig
                 hf_config = LlavaNextConfig.from_pretrained(
                     hf_config_dir).text_config
             if hf_config.model_type == "llava_llama":
-                orig_conf = hf_config
                 hf_config.llm_cfg["architecture"] = hf_config.llm_cfg[
                     "architectures"][0]
                 hf_config.llm_cfg["dtype"] = hf_config.llm_cfg["torch_dtype"]
                 hf_config = PretrainedConfig.from_dict(hf_config.llm_cfg)
             if hf_config.model_type == "Llama_Nemotron_Nano_VL":
-                orig_conf = hf_config
                 hf_config = hf_config.llm_config
 
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
@@ -185,38 +183,36 @@ class LLaMAConfig(PretrainedConfig):
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
         tie_word_embeddings = getattr(hf_config, 'tie_word_embeddings', False)
 
-        return (
-            cls(
-                architecture=hf_config.architectures[0],
-                dtype=dtype,
-                num_hidden_layers=hf_config.num_hidden_layers,
-                num_attention_heads=hf_config.num_attention_heads,
-                hidden_size=hf_config.hidden_size,
-                intermediate_size=hf_config.intermediate_size,
-                num_key_value_heads=num_key_value_heads,
-                head_size=head_size,
-                vocab_size=hf_config.vocab_size,
-                position_embedding_type='rope_gpt_neox',
-                max_position_embeddings=hf_config.max_position_embeddings,
-                hidden_act=hidden_act,
-                norm_epsilon=norm_epsilon,
-                attn_bias=attn_bias,
-                rotary_base=rotary_base,
-                rotary_scaling=rotary_scaling,
-                residual_mlp=residual_mlp,
-                disable_weight_only_quant_plugin=disable_weight_only_quant_plugin,
-                moe=moe_config,
-                mapping=mapping,
-                quantization=quant_config,
-                remove_duplicated_kv_heads=remove_duplicated_kv_heads,
-                tie_word_embeddings=tie_word_embeddings,
-                embedding_multiplier=embedding_multiplier,
-                attention_multiplier=attention_multiplier,
-                residual_multiplier=residual_multiplier,
-                output_multiplier_scale=output_multiplier_scale,
-                **kwargs
-            ),
-            orig_conf
+        return cls(
+            architecture=hf_config.architectures[0],
+            orig_model_type=orig_model_type,
+            dtype=dtype,
+            num_hidden_layers=hf_config.num_hidden_layers,
+            num_attention_heads=hf_config.num_attention_heads,
+            hidden_size=hf_config.hidden_size,
+            intermediate_size=hf_config.intermediate_size,
+            num_key_value_heads=num_key_value_heads,
+            head_size=head_size,
+            vocab_size=hf_config.vocab_size,
+            position_embedding_type='rope_gpt_neox',
+            max_position_embeddings=hf_config.max_position_embeddings,
+            hidden_act=hidden_act,
+            norm_epsilon=norm_epsilon,
+            attn_bias=attn_bias,
+            rotary_base=rotary_base,
+            rotary_scaling=rotary_scaling,
+            residual_mlp=residual_mlp,
+            disable_weight_only_quant_plugin=disable_weight_only_quant_plugin,
+            moe=moe_config,
+            mapping=mapping,
+            quantization=quant_config,
+            remove_duplicated_kv_heads=remove_duplicated_kv_heads,
+            tie_word_embeddings=tie_word_embeddings,
+            embedding_multiplier=embedding_multiplier,
+            attention_multiplier=attention_multiplier,
+            residual_multiplier=residual_multiplier,
+            output_multiplier_scale=output_multiplier_scale,
+            **kwargs
         )
 
     @classmethod
