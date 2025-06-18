@@ -184,13 +184,15 @@ SUPPORTED_GEMMA_MODEL_GROUP = ["gemma3"]
 SUPPORTED_LLAMA_MODEL_GROUP = ["mllama", "llama4"]
 SUPPORTED_LLAVA_IMAGE_MODEL_GROUP = ["llava_llama", "llava_next"]
 SUPPORTED_LLAVA_VIDEO_MODEL_GROUP = ["llava_llama"]
+SUPPORTED_MISTRAL_IMAGE_MODEL_GROUP = ["mistral3"]
 SUPPORTED_HYPERCLOVAX_MODEL_GROUP = ["hyperclovax_vlm"]
 
 ALL_SUPPORTED_IMAGE_MODELS = SUPPORTED_QWEN_MODEL_GROUP \
     + SUPPORTED_LLAMA_MODEL_GROUP \
     + SUPPORTED_LLAVA_IMAGE_MODEL_GROUP \
     + SUPPORTED_HYPERCLOVAX_MODEL_GROUP \
-    + SUPPORTED_GEMMA_MODEL_GROUP
+    + SUPPORTED_GEMMA_MODEL_GROUP \
+    + SUPPORTED_MISTRAL_IMAGE_MODEL_GROUP
 
 ALL_SUPPORTED_VIDEO_MODELS = SUPPORTED_QWEN_MODEL_GROUP \
     + SUPPORTED_LLAVA_VIDEO_MODEL_GROUP
@@ -217,6 +219,9 @@ PLACEHOLDER_PLACEMENT_MAP = {
     "mllama": MultimodalPlaceholderPlacement.BEFORE_TEXT,
     "hyperclovax_vlm": MultimodalPlaceholderPlacement.AFTER_TEXT,
     "gemma3": MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    # TODO: double check if this is correct. I'm assuming this based on the prompt from vLLM
+    # having a bunch of `[IMG][IMG]...` text after the text prompt.
+    "mistral3": MultimodalPlaceholderPlacement.AFTER_TEXT,
 }
 assert len(PLACEHOLDER_PLACEMENT_MAP) == len(ALL_SUPPORTED_MULTIMODAL_MODELS)
 
@@ -247,6 +252,11 @@ def retrieve_multimodal_placeholder(model_type: str, modality: str,
                     '<|im_start|>user (vector)\n<|dummy3|><|im_end|>\n' + \
                     '<|im_start|>image/aux\n다음 중 ocr은 사진에서 검출된 글자이고, lens_keyword는 사진에서 추출된 keyword와 bbox 위치입니다.' + \
                     'bbox는 0~1 사이로 정규화된 [x1, y1, x2, y2]의 형태입니다. 참고하여 답변하세요. {"ocr": "", "lens_keywords": "", "lens_local_keywords": ""}'
+        elif model_type in SUPPORTED_MISTRAL_IMAGE_MODEL_GROUP:
+            # ? How to make sure this is correct? I am purely basing this off of:
+            # https://huggingface.co/docs/transformers/v4.51.3/en/model_doc/mistral3#transformers.
+            # Mistral3ForConditionalGeneration.forward.example
+            return "[IMG]"
         raise TypeError(
             f"For image modality, only {ALL_SUPPORTED_IMAGE_MODELS} are supported but got {model_type}"
         )
