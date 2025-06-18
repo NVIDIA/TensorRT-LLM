@@ -17,7 +17,7 @@ l0_dgx_h100:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/multi_gpu
   - unittest/_torch/auto_deploy/unit/multigpu
-  - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4"
+  - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4 or gpu2"
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp2pp2-attn_backend=TRTLLM-torch_compile=False]
