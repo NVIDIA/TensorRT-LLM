@@ -294,6 +294,9 @@ class GenerationResultBase:
                     handler(response.error_msg)
 
             response_result = response.result
+            if hasattr(response_result, "_result"):
+                response_result.deserialize()
+
             self._done = response_result.is_final
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter

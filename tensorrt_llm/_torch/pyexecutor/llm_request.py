@@ -1,4 +1,5 @@
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import List, Optional, Union
 
 import torch
 
@@ -205,43 +206,36 @@ class LlmResult:
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs'))
 
-    def __init__(self, result: tensorrt_llm.bindings.executor.Result,
-                 py_result: PyResult):
+    def __init__(self,
+                 result: Union[bytes, tensorrt_llm.bindings.executor.Result],
+                 py_result: PyResult,
+                 is_final: bool = False):
         self._result = result
         self._py_result = py_result
+        self.is_final = is_final
 
     def __getattr__(self, item):
         if item in self.py_result_properties:
             return getattr(self._py_result, item)
-        return getattr(self._result, item)
+        if item == 'is_final':
+            return object.__getattribute__(self, 'is_final')
+        result = object.__getattribute__(self, '_result')
+        return getattr(result, item)
+
+    def deserialize(self):
+        self._result = tensorrt_llm.bindings.executor.deserialize_result(
+            self._result)
 
 
+@dataclass
 class LlmResponse:
-    """LlmResponse wraps `bindings.executor.Response` but detour some features to Python implementation"""
+    request_id: int
+    error_msg: Optional[str] = None
+    result: Optional[LlmResult] = None
+    client_id: Optional[int] = None
 
-    def __init__(self, response: tensorrt_llm.bindings.executor.Response,
-                 py_result: PyResult):
-        self._response = response
-        self._py_result = py_result
-
-    def __getstate__(self):
-        return self._response, self._py_result
-
-    def __setstate__(self, state):
-        self._response, self._py_result = state
-
-    @property
-    def result(self) -> tensorrt_llm.bindings.executor.Result:
-        return LlmResult(
-            self._response.result,
-            self._py_result)  # LlmResult masquerades bindings.executor.Result
-
-    @property
-    def _is_llm_response(self) -> bool:
-        return True
-
-    def __getattr__(self, item):
-        return getattr(self._response, item)
+    def has_error(self):
+        return self.error_msg is not None
 
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
@@ -273,6 +267,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             **kwargs)
         self.py_client_id = client_id
         self.py_request_id = self.request_id
+        self.py_llm_request_type = self.llm_request_type
         self.py_end_id = self.end_id
         self.py_prompt_len = self.prompt_len
         self.py_orig_prompt_len = self.orig_prompt_len
@@ -286,6 +281,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
         self.py_lora_task_layer_module_configs = None
+
+        self.py_tokens = super().get_tokens()
 
         self.py_return_log_probs = return_log_probs
         self.py_return_context_logits = return_context_logits
@@ -302,13 +299,19 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   return_generation_logits,
                                   exclude_last_generation_logits)
 
+    def is_generation_only_request(self):
+        return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+
     def create_response(
             self,
             use_fast_logits=False,
             mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
-        response = super().create_response(use_fast_logits, mpi_world_rank)
-        return LlmResponse(response,
-                           self.py_result) if response is not None else None
+        result, is_final = super().create_serialized_result(
+            use_fast_logits, mpi_world_rank)
+        return LlmResponse(
+            request_id=self.py_request_id,
+            result=LlmResult(result, self.py_result, is_final),
+            client_id=self.py_client_id) if len(result) > 0 else None
 
     @property
     def is_dummy(self):
