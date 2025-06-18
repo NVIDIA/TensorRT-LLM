@@ -50,8 +50,6 @@ struct KernelParams
     //
     //////////////////////////////////////////////////////////////////////////////////////////////////
 
-    // Maximum number of batch
-    static constexpr int MaxBatchSize = 256;
     // Maximum number of CTAs
     static constexpr int MaxNumCtas = 2048;
 
@@ -726,11 +724,6 @@ struct KernelParams
         // Create the return struct.
         KernelParams params;
 
-        if (options.mNumBatches > KernelParams::MaxBatchSize)
-        {
-            throw std::runtime_error("GEMM batch limit reached.");
-        }
-
         params.ptrRouteMap = routeMap;
         params.numTokens = options.mNumTokens;
 
@@ -870,8 +863,8 @@ struct KernelParams
 
                     // Build TMA descriptor for gmem B block scaling factors.
                     int32_t const numEltsPerSf = tg::dtypeNumEltsPerSf(options.mDtypeB);
-                    // Pad number of scaling factors to the nearest multiple of 16 because of the TMA 16B alignment
-                    // requirement.
+                    // Pad number of scaling factors to the nearest multiple of 16 because of the TMA 16B
+                    // alignment requirement.
                     auto numSfsInK = options.mK / numEltsPerSf;
                     numSfsInK = ceilDiv(numSfsInK, 16) * 16;
 
