@@ -39,7 +39,7 @@ LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
 // DLFW torch image
-DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.04-py3"
+DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.05-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -1311,68 +1311,27 @@ def checkPipInstall(pipeline, wheel_path)
 }
 
 
-def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312")
+def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312")
 {
-    def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${linuxPkgName}"
+    sh "pwd && ls -alh"
+    sh "env | sort"
+    sh "ccache -sv"
+
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", true, true)
+    if (env.alternativeTRT) {
+        sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
+    }
 
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
     sh "curl ifconfig.me || true"
     sh "nproc && free -g && hostname"
-    sh "ccache -sv"
     sh "cat ${CCACHE_DIR}/ccache.conf"
     sh "bash -c 'pip3 show tensorrt || true'"
     if (reinstall_dependencies == true) {
         sh "#!/bin/bash \n" + "pip3 uninstall -y torch"
         sh "#!/bin/bash \n" + "yum remove -y libcudnn*"
     }
-    sh "pwd && ls -alh"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
-
-    sh "env | sort"
-    sh "tar -zvxf ${linuxPkgName}"
-
-    // Check for prohibited files in the package
-    sh '''
-        echo "Checking prohibited files..."
-        FAILED=0
-
-        # Folders and their allowed files
-        declare -A ALLOWED=(
-            ["./tensorrt_llm/cpp/tensorrt_llm/kernels/internal_cutlass_kernels/src"]=""
-        )
-
-        for DIR in "${!ALLOWED[@]}"; do
-            [ -d "$DIR" ] || continue
-
-            # File check
-            ALLOWED_FILE="$DIR/${ALLOWED[$DIR]}"
-            if [ -z "${ALLOWED[$DIR]}" ]; then
-                FILES=$(find "$DIR" -type f)
-            else
-                FILES=$(find "$DIR" -type f ! -path "$ALLOWED_FILE")
-            fi
-
-            # Subdir check
-            SUBDIRS=$(find "$DIR" -mindepth 1 -type d)
-
-            # Error reporting
-            if [ -n "$FILES$SUBDIRS" ]; then
-                echo "ERROR in $DIR:"
-                [ -n "$FILES" ] && echo "Prohibited files:\n$FILES"
-                [ -n "$SUBDIRS" ] && echo "Prohibited subdirs:\n$SUBDIRS"
-                FAILED=1
-            fi
-
-            # Verify allowed file exists
-            if [ -n "${ALLOWED[$DIR]}" ] && [ ! -f "$ALLOWED_FILE" ]; then
-                echo "WARNING: Missing $ALLOWED_FILE"
-            fi
-        done
-
-        [ $FAILED -eq 0 ] || { echo "Build failed: Prohibited content found"; exit 1; }
-        echo "No prohibited files found"
-    '''
 
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install -r requirements-dev.txt")
     if (env.alternativeTRT) {
@@ -1779,7 +1738,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                     env = ["LD_LIBRARY_PATH+=:/usr/local/cuda/compat"]
                 }
                 withEnv(env) {
-                    wheelName = runLLMBuildFromPackage(pipeline, cpu_arch, values[3], wheelPath, cpver)
+                    wheelName = runLLMBuild(pipeline, cpu_arch, values[3], wheelPath, cpver)
                 }
             }
 
@@ -1816,7 +1775,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         // Extra PyTorch CUDA 12.8 install
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 12.8 install Start ######"
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
                         }
 
                         def libEnv = []
