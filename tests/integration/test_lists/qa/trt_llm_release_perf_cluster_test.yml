@@ -16,6 +16,7 @@ trt_llm_release_perf_cluster_test:
   - perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20]
   - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-input_output_len:1000,1000-quant:fp8]
   - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-input_output_len:500,2000-quant:fp8]
+  - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-streaming-float4-maxbs:2048-maxnt:8192-input_output_len:256,256-reqs:200]
 
 - condition:
     ranges:

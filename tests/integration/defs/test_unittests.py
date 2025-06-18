@@ -68,7 +68,6 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     test_root = tests_path()
     dry_run = False
-    passed = True
 
     my_test_prefix = request.config.getoption("--test-prefix")
     if my_test_prefix:
@@ -153,8 +152,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             output_dir,
             f'parallel-sub-results-unittests-{case_fn}.xml.intermediate')
         parallel_command = command + [
-            "-n", f"{num_workers}", '--reruns', '3',
-            f"--junitxml={parallel_output_xml}"
+            "-n", f"{num_workers}", f"--junitxml={parallel_output_xml}"
         ]
         passed = run_command(parallel_command)
 
@@ -170,11 +168,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 output_dir,
                 f'retry-sub-results-unittests-{case_fn}.xml.intermediate')
             # Run failed case sequentially.
-            command = [
-                '-m', 'pytest', "-p", "no:xdist", ignore_opt, "-v", '--lf',
-                f"--junitxml={retry_output_xml}"
-            ] + arg_list
-            passed = run_command(command)
+            retry_command = command + [
+                "-p", "no:xdist", '--lf', f"--junitxml={retry_output_xml}"
+            ]
+            passed = run_command(retry_command)
 
             if os.path.exists(retry_output_xml):
                 merge_report(parallel_output_xml, retry_output_xml, output_xml,

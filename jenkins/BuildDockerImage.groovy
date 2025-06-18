@@ -193,15 +193,15 @@ def buildImage(config, imageKeyToTag)
     def postTag = config.postTag
     def dependent = config.dependent
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
-    def makefileStage = config.makefileStage
+    def dockerfileStage = config.dockerfileStage
 
     def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
 
     def dependentTag = tag.replace("${arch}-${target}-", "${arch}-${dependent.target}-")
 
-    def imageWithTag = "${IMAGE_NAME}/${makefileStage}:${tag}"
-    def dependentImageWithTag = "${IMAGE_NAME}/${dependent.makefileStage}:${dependentTag}"
-    def customImageWithTag = "${IMAGE_NAME}/${makefileStage}:${customTag}"
+    def imageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${tag}"
+    def dependentImageWithTag = "${IMAGE_NAME}/${dependent.dockerfileStage}:${dependentTag}"
+    def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
 
     if (target == "ngc-release") {
         if (params.triggerType == "post-merge") {
@@ -261,7 +261,7 @@ def buildImage(config, imageKeyToTag)
                     cd ${LLM_ROOT} && make -C docker ${dependent.target}_${action} \
                     TORCH_INSTALL_TYPE=${torchInstallType} \
                     IMAGE_WITH_TAG=${dependentImageWithTag} \
-                    STAGE=${dependent.makefileStage} \
+                    STAGE=${dependent.dockerfileStage} \
                     BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                     """
                 }
@@ -286,7 +286,7 @@ def buildImage(config, imageKeyToTag)
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${imageWithTag} \
-                STAGE=${makefileStage} \
+                STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """
             }
@@ -298,7 +298,7 @@ def buildImage(config, imageKeyToTag)
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${customImageWithTag} \
-                STAGE=${makefileStage} \
+                STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """
             }
@@ -330,7 +330,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         arch: "amd64",
         build_wheel: false,
         dependent: [:],
-        makefileStage: "tritondevel",
+        dockerfileStage: "tritondevel",
     ]
 
     def release_action = params.action
@@ -340,7 +340,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
-            makefileStage: "release",
+            dockerfileStage: "release",
         ],
         "Build trtllm release (SBSA)": [
             target: "trtllm",
@@ -348,7 +348,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             customTag: LLM_BRANCH_TAG + "-sbsa",
             build_wheel: true,
             arch: "arm64",
-            makefileStage: "release",
+            dockerfileStage: "release",
         ],
         "Build CI image (x86_64 tritondevel)": [:],
         "Build CI image (SBSA tritondevel)": [
@@ -359,7 +359,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             args: "PYTHON_VERSION=3.10.12",
             postTag: "-py310",
         ],
-        "Build CI image(RockyLinux8 Python312)": [
+        "Build CI image (RockyLinux8 Python312)": [
             target: "rockylinux8",
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
@@ -371,11 +371,11 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             build_wheel: true,
             dependent: [
                 target: "ngc-devel",
-                makefileStage: "devel",
+                dockerfileStage: "devel",
             ],
-            makefileStage: "release",
+            dockerfileStage: "release",
         ],
-        "Build NGC devel and release(SBSA)": [
+        "Build NGC devel and release (SBSA)": [
             target: "ngc-release",
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
@@ -383,9 +383,9 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             build_wheel: true,
             dependent: [
                 target: "ngc-devel",
-                makefileStage: "devel",
+                dockerfileStage: "devel",
             ],
-            makefileStage: "release",
+            dockerfileStage: "release",
         ],
     ]
     // Override all fields in build config with default values
@@ -423,7 +423,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     }
 
     echo "enableFailFast is: ${params.enableFailFast}, but we currently don't use it due to random ucxx issue"
-    //pipeline.failFast = params.enableFailFast
+    // pipeline.failFast = params.enableFailFast
     pipeline.parallel buildJobs
 
 }
@@ -459,7 +459,7 @@ pipeline {
         PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
     }
     stages {
-        stage("Setup environment") {
+        stage("Setup Environment") {
             steps {
                 script {
                     echo "branch is: ${LLM_BRANCH}"
@@ -490,9 +490,7 @@ pipeline {
                     echo "imageKeyToTag is: ${imageKeyToTagJson}"
                     writeFile file: "imageKeyToTag.json", text: imageKeyToTagJson
                     archiveArtifacts artifacts: 'imageKeyToTag.json', fingerprint: true
-                    retry(3) {
-                        trtllm_utils.uploadArtifacts("imageKeyToTag.json", "${UPLOAD_PATH}/")
-                    }
+                    trtllm_utils.uploadArtifacts("imageKeyToTag.json", "${UPLOAD_PATH}/")
                 }
             }
         }

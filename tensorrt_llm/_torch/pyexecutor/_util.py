@@ -21,11 +21,11 @@ from ..speculative import get_spec_decoder
 from .config_utils import is_mla, is_nemotron_hybrid
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
-from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
-                           PyTorchModelEngine)
+from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
-                               PeftCacheManager, ResourceManager)
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
 from .sampler import (EarlyStopSampler, TorchSampler, TorchStarAttentionSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -245,7 +245,7 @@ class KvCacheCreator:
             f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
         )
         kv_stats = py_executor.resource_manager.resource_managers.get(
-            "kv_cache_manager").get_kv_cache_stats()
+            ResourceManagerType.KV_CACHE_MANAGER).get_kv_cache_stats()
 
         kv_cache_max_tokens = self._cal_max_tokens(
             peak_memory, total_gpu_memory, fraction,
@@ -349,7 +349,7 @@ class KvCacheCreator:
                 spec_config=spec_config,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
-        if model_engine.kv_cache_manager_key == KV_CACHE_MANAGER_KEY:
+        if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
             executor_config.max_seq_len = kv_cache_manager.max_seq_len
 
         return kv_cache_manager
@@ -360,17 +360,19 @@ class KvCacheCreator:
         draft_kv_cache_manager = self._create_kv_cache_manager(
             self._draft_model_engine
         ) if self._draft_model_engine is not None else None
-        resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
-        resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
+        resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
+        resources[
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
 
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model and draft model (if applicable)."""
-        resources[KV_CACHE_MANAGER_KEY].shutdown()
-        del resources[KV_CACHE_MANAGER_KEY]
-        draft_kv_cache_manager = resources[DRAFT_KV_CACHE_MANAGER_KEY]
+        resources[ResourceManagerType.KV_CACHE_MANAGER].shutdown()
+        del resources[ResourceManagerType.KV_CACHE_MANAGER]
+        draft_kv_cache_manager = resources[
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
         if draft_kv_cache_manager:
             draft_kv_cache_manager.shutdown()
-        del resources[DRAFT_KV_CACHE_MANAGER_KEY]
+        del resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
 
 
 def create_py_executor_instance(
@@ -386,7 +388,7 @@ def create_py_executor_instance(
         sampler,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
-    kv_cache_manager = resources.get(KV_CACHE_MANAGER_KEY, None)
+    kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
     spec_config = model_engine.spec_config
     if mapping.is_last_pp_rank(
@@ -463,22 +465,23 @@ def create_py_executor_instance(
             model_config=model_binding_config,
             world_config=world_config,
         )
-        resources["peft_cache_manager"] = peft_cache_manager
+        resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules)
 
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
 
-    resources["seq_slot_manager"] = SeqSlotManager(max_num_sequences)
+    resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
+        max_num_sequences)
 
     resource_manager = ResourceManager(resources)
 
     # Make sure the kv cache manager is always invoked last as it could
     # depend on the results of other resource managers.
     if kv_cache_manager is not None:
-        resource_manager.resource_managers.move_to_end("kv_cache_manager",
-                                                       last=True)
+        resource_manager.resource_managers.move_to_end(
+            ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     capacity_scheduler = BindCapacityScheduler(
         max_num_sequences,

@@ -239,6 +239,13 @@ def _xgrammar_tokenizer_info(tokenizer):
         raise ValueError(f"Unsupported tokenizer type: {type(tokenizer)}")
 
 
+def _llguidance_tokenizer_info(tokenizer):
+    tokenizer_info = _xgrammar_tokenizer_info(tokenizer)
+    if tokenizer_info.get("tokenizer_str") is None:
+        raise ValueError("missing tokenizer_str")
+    return tokenizer_info
+
+
 def load_hf_tokenizer(model_dir: str,
                       trust_remote_code: bool = True,
                       use_fast: bool = True) -> Optional[TransformersTokenizer]:
