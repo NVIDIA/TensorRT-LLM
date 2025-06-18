@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Performance Analysis &#8212; TensorRT-LLM</title>
+    <title>Continuous Integration Overview &#8212; TensorRT-LLM</title>
   
   
   
@@ -47,7 +47,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'performance/perf-analysis';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'reference/ci-overview';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
@@ -58,8 +58,8 @@
     <link rel="icon" href="../_static/favicon.png"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Troubleshooting" href="../reference/troubleshooting.html" />
-    <link rel="prev" title="Useful Runtime Options" href="performance-tuning-guide/useful-runtime-flags.html" />
+    <link rel="next" title="H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token" href="../blogs/H100vsA100.html" />
+    <link rel="prev" title="Memory Usage of TensorRT-LLM" href="memory.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -429,27 +429,27 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
-<ul class="current nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="perf-overview.html">Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1 has-children"><a class="reference internal" href="performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../reference/ci-overview.html">Continuous Integration Overview</a></li>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Continuous Integration Overview</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -494,7 +494,7 @@
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Performance Analysis</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Continuous Integration Overview</span></li>
   </ul>
 </nav>
 </div>
@@ -511,96 +511,108 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="performance-analysis">
-<span id="perf-analysis"></span><h1>Performance Analysis<a class="headerlink" href="#performance-analysis" title="Link to this heading">#</a></h1>
-<p>NVIDIA Nsight Systems reports at the application level are highly informative. Metric sampling capabilities have increased over generations and provide a clean middle-ground between timing analysis and kernel-level deep dives with NVIDIA Nsight Compute.</p>
-<p>Given the potential long runtimes of Large Languages Models (LLMs) and the diversity of workloads a model may experience during a single inference pass or binary execution, we have added features to TensorRT-LLM to get the most out of Nsight Systems capabilities. This document outlines those features as well as provides examples of how to best utilize them to understand your application.</p>
-<section id="feature-descriptions">
-<h2>Feature Descriptions<a class="headerlink" href="#feature-descriptions" title="Link to this heading">#</a></h2>
-<p>The main functionality here:</p>
-<ul class="simple">
-<li><p>Relies on toggling the CUDA profiler runtime API on and off.</p></li>
-<li><p>(PyTorch workflow only) Toggling the PyTorch profiler on and off.</p></li>
-<li><p>Provides a means to understand which regions a user may want to focus on.</p></li>
-</ul>
-<p>Toggling the CUDA profiler runtime API on and off:</p>
-<ul class="simple">
-<li><p>Allows users to know specifically what the profiled region corresponds to.</p></li>
-<li><p>Results in smaller files to post-process (for metric extraction or similar).</p></li>
-</ul>
-<p>(PyTorch workflow only) Toggling the PyTorch profiler on and off:</p>
-<ul class="simple">
-<li><p>Help users to analysis the performance breakdown in the model.</p></li>
-<li><p>Results in smaller files to post-process (for metric extraction or similar).</p></li>
-</ul>
-</section>
-<section id="coordinating-with-nvidia-nsight-systems-launch">
-<h2>Coordinating with NVIDIA Nsight Systems Launch<a class="headerlink" href="#coordinating-with-nvidia-nsight-systems-launch" title="Link to this heading">#</a></h2>
-<p>Consult the Nsight Systems User Guide for full overview of options.</p>
-<p>On the PyTorch workflow, basic NVTX markers are by default provided. On the C++/TensorRT workflow, append <code class="docutils literal notranslate"><span class="pre">--nvtx</span></code> when calling <code class="docutils literal notranslate"><span class="pre">scripts/build_wheel.py</span></code> script to compile, and clean build the code.</p>
-<section id="only-collect-specific-iterations">
-<h3>Only collect specific iterations<a class="headerlink" href="#only-collect-specific-iterations" title="Link to this heading">#</a></h3>
-<p>To reduce the Nsight Systems profile size, and to control that only specific iterations are collected, set environment variable <code class="docutils literal notranslate"><span class="pre">TLLM_PROFILE_START_STOP=A-B</span></code>, and append <code class="docutils literal notranslate"><span class="pre">-c</span> <span class="pre">cudaProfilerApi</span></code> to <code class="docutils literal notranslate"><span class="pre">nsys</span> <span class="pre">profile</span></code> command.</p>
-</section>
-<section id="enable-more-nvtx-markers-for-debugging">
-<h3>Enable more NVTX markers for debugging<a class="headerlink" href="#enable-more-nvtx-markers-for-debugging" title="Link to this heading">#</a></h3>
-<p>Set environment variable <code class="docutils literal notranslate"><span class="pre">TLLM_NVTX_DEBUG=1</span></code>.</p>
-</section>
-<section id="enable-garbage-collection-gc-nvtx-markers">
-<h3>Enable garbage collection (GC) NVTX markers<a class="headerlink" href="#enable-garbage-collection-gc-nvtx-markers" title="Link to this heading">#</a></h3>
-<p>Set environment variable <code class="docutils literal notranslate"><span class="pre">TLLM_PROFILE_RECORD_GC=1</span></code>.</p>
-</section>
-<section id="enable-gil-information-in-nvtx-markers">
-<h3>Enable GIL information in NVTX markers<a class="headerlink" href="#enable-gil-information-in-nvtx-markers" title="Link to this heading">#</a></h3>
-<p>Append “python-gil” to Nsys “-t” option.</p>
-</section>
-</section>
-<section id="coordinating-with-pytorch-profiler-pytorch-workflow-only">
-<h2>Coordinating with PyTorch profiler (PyTorch workflow only)<a class="headerlink" href="#coordinating-with-pytorch-profiler-pytorch-workflow-only" title="Link to this heading">#</a></h2>
-<section id="collect-pytorch-profiler-results">
-<h3>Collect PyTorch profiler results<a class="headerlink" href="#collect-pytorch-profiler-results" title="Link to this heading">#</a></h3>
+  <section id="continuous-integration-overview">
+<h1>Continuous Integration Overview<a class="headerlink" href="#continuous-integration-overview" title="Link to this heading">#</a></h1>
+<p>This page explains how TensorRT‑LLM’s CI is organized and how individual tests map to Jenkins stages. Most stages execute integration tests defined in YAML files, while unit tests run as part of a merge‑request pipeline. The sections below describe how to locate a test and trigger the stage that runs it.</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ol class="arabic simple">
-<li><p>Set environment variable <code class="docutils literal notranslate"><span class="pre">TLLM_PROFILE_START_STOP=A-B</span></code> to specify the range of the iterations to be collected.</p></li>
-<li><p>Set environment variable <code class="docutils literal notranslate"><span class="pre">TLLM_TORCH_PROFILE_TRACE=&lt;path&gt;</span></code>, and the results will be saved to <code class="docutils literal notranslate"><span class="pre">&lt;path&gt;</span></code>.</p></li>
+<li><p><a class="reference internal" href="#ci-pipelines">CI pipelines</a></p></li>
+<li><p><a class="reference internal" href="#test-definitions">Test definitions</a></p></li>
+<li><p><a class="reference internal" href="#unit-tests">Unit tests</a></p></li>
+<li><p><a class="reference internal" href="#jenkins-stage-names">Jenkins stage names</a></p></li>
+<li><p><a class="reference internal" href="#finding-the-stage-for-a-test">Finding the stage for a test</a></p></li>
+<li><p><a class="reference internal" href="#waiving-tests">Waiving tests</a></p></li>
+<li><p><a class="reference internal" href="#triggering-ci-best-practices">Triggering CI Best Practices</a></p></li>
 </ol>
 </section>
-<section id="visualize-the-pytorch-profiler-results">
-<h3>Visualize the PyTorch profiler results<a class="headerlink" href="#visualize-the-pytorch-profiler-results" title="Link to this heading">#</a></h3>
-<p>Use <a class="reference internal" href="#chrome://tracing/"><span class="xref myst">chrome://tracing/</span></a> to inspect the saved profile.</p>
+<section id="ci-pipelines">
+<h2>CI pipelines<a class="headerlink" href="#ci-pipelines" title="Link to this heading">#</a></h2>
+<p>Pull requests do not start testing by themselves. Developers trigger the CI by commenting <code class="docutils literal notranslate"><span class="pre">/bot</span> <span class="pre">run</span></code> (optionally with arguments) on the pull request (see <span class="xref myst">Pull Request Template</span> for more details). That kicks off the <strong>merge-request pipeline</strong> (defined in <code class="docutils literal notranslate"><span class="pre">jenkins/L0_MergeRequest.groovy</span></code>), which runs unit tests and integration tests whose YAML entries specify <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">pre_merge</span></code>. Once a pull request is merged, a separate <strong>post-merge pipeline</strong> (defined in <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>) runs every test marked <code class="docutils literal notranslate"><span class="pre">post_merge</span></code> across all supported GPU configurations.</p>
+<p><code class="docutils literal notranslate"><span class="pre">stage</span></code> tags live in the YAML files under <code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/test-db/</span></code>. Searching those files for <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">pre_merge</span></code> shows exactly which tests the merge-request pipeline covers.</p>
 </section>
-</section>
-<section id="examples">
-<h2>Examples<a class="headerlink" href="#examples" title="Link to this heading">#</a></h2>
-<p>Consult the Nsight Systems User Guide for full overview of MPI-related options.</p>
-<section id="profiling-specific-iterations-on-a-trtllm-bench-trtllm-serve-run">
-<h3>Profiling specific iterations on a trtllm-bench/trtllm-serve run<a class="headerlink" href="#profiling-specific-iterations-on-a-trtllm-bench-trtllm-serve-run" title="Link to this heading">#</a></h3>
-<p>Say we want to profile iterations 100 to 150 on a trtllm-bench/trtllm-serve run, we want to collect as much information as possible for debugging, such as GIL, debugging NVTX markers, etc:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
-
-<span class="c1"># Prepare dataset for the benchmark</span>
-python3<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--tokenizer<span class="o">=</span><span class="si">${</span><span class="nv">MODEL_PATH</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--stdout<span class="w"> </span>token-norm-dist<span class="w"> </span>--num-requests<span class="o">=</span><span class="si">${</span><span class="nv">NUM_SAMPLES</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--input-mean<span class="o">=</span><span class="m">1000</span><span class="w"> </span>--output-mean<span class="o">=</span><span class="m">1000</span><span class="w"> </span>--input-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/dataset.txt
-
-<span class="c1"># Benchmark and profile</span>
-<span class="nv">TLLM_PROFILE_START_STOP</span><span class="o">=</span><span class="m">100</span>-150<span class="w"> </span>nsys<span class="w"> </span>profile<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-o<span class="w"> </span>trace<span class="w"> </span>-f<span class="w"> </span><span class="nb">true</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-t<span class="w"> </span><span class="s1">&#39;cuda,nvtx,python-gil&#39;</span><span class="w"> </span>-c<span class="w"> </span>cudaProfilerApi<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--cuda-graph-trace<span class="w"> </span>node<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-e<span class="w"> </span><span class="nv">TLLM_PROFILE_RECORD_GC</span><span class="o">=</span><span class="m">1</span>,TLLM_LLMAPI_ENABLE_NVTX<span class="o">=</span><span class="m">1</span>,TLLM_TORCH_PROFILE_TRACE<span class="o">=</span>trace.json<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--trace-fork-before-exec<span class="o">=</span><span class="nb">true</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>trtllm-bench<span class="w"> </span><span class="se">\ </span><span class="c1"># or trtllm-serve command</span>
-<span class="w">    </span>--model<span class="w"> </span>deepseek-ai/DeepSeek-V3<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--model_path<span class="w"> </span><span class="si">${</span><span class="nv">MODEL_PATH</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>throughput<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--dataset<span class="w"> </span>/tmp/dataset.txt<span class="w"> </span>--warmup<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--streaming
+<section id="test-definitions">
+<h2>Test definitions<a class="headerlink" href="#test-definitions" title="Link to this heading">#</a></h2>
+<p>Integration tests are listed under <code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/test-db/</span></code>. Most YAML files are named after the GPU or configuration they run on (for example <code class="docutils literal notranslate"><span class="pre">l0_a100.yml</span></code>). Some files, like <code class="docutils literal notranslate"><span class="pre">l0_sanity_check.yml</span></code>, use wildcards and can run on multiple hardware types. Entries contain conditions and a list of tests. Two important terms in each entry are:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">stage</span></code>: either <code class="docutils literal notranslate"><span class="pre">pre_merge</span></code> or <code class="docutils literal notranslate"><span class="pre">post_merge</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">backend</span></code>: <code class="docutils literal notranslate"><span class="pre">pytorch</span></code>, <code class="docutils literal notranslate"><span class="pre">tensorrt</span></code> or <code class="docutils literal notranslate"><span class="pre">triton</span></code>.</p></li>
+</ul>
+<p>Example from <code class="docutils literal notranslate"><span class="pre">l0_a100.yml</span></code>:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="w">      </span><span class="nt">terms</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">stage</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">post_merge</span>
+<span class="w">        </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">triton</span>
+<span class="w"> </span><span class="w w-Error"> </span><span class="nt">tests</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]</span>
 </pre></div>
 </div>
-<p>The Nsight Systems reports will be saved to <code class="docutils literal notranslate"><span class="pre">trace.nsys-rep</span></code>. Use NVIDIA Nsight Systems application to open it.</p>
-<p>The PyTorch profiler results will be saved to <code class="docutils literal notranslate"><span class="pre">trace.json</span></code>. Use <a class="reference internal" href="#chrome://tracing/"><span class="xref myst">chrome://tracing/</span></a> to inspect the saved profile.</p>
+</section>
+<section id="unit-tests">
+<h2>Unit tests<a class="headerlink" href="#unit-tests" title="Link to this heading">#</a></h2>
+<p>Unit tests live under <code class="docutils literal notranslate"><span class="pre">tests/unittest/</span></code> and run during the merge-request pipeline. They are invoked from <code class="docutils literal notranslate"><span class="pre">jenkins/L0_MergeRequest.groovy</span></code> and do not require mapping to specific hardware stages.</p>
+</section>
+<section id="jenkins-stage-names">
+<h2>Jenkins stage names<a class="headerlink" href="#jenkins-stage-names" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code> maps stage names to these YAML files.  For A100 the mapping includes:</p>
+<div class="highlight-groovy notranslate"><div class="highlight"><pre><span></span><span class="w">    </span><span class="s2">&quot;A100X-Triton-Python-[Post-Merge]-1&quot;</span><span class="o">:</span><span class="w"> </span><span class="o">[</span><span class="s2">&quot;a100x&quot;</span><span class="o">,</span><span class="w"> </span><span class="s2">&quot;l0_a100&quot;</span><span class="o">,</span><span class="w"> </span><span class="mi">1</span><span class="o">,</span><span class="w"> </span><span class="mi">2</span><span class="o">],</span>
+<span class="w">    </span><span class="s2">&quot;A100X-Triton-Python-[Post-Merge]-2&quot;</span><span class="o">:</span><span class="w"> </span><span class="o">[</span><span class="s2">&quot;a100x&quot;</span><span class="o">,</span><span class="w"> </span><span class="s2">&quot;l0_a100&quot;</span><span class="o">,</span><span class="w"> </span><span class="mi">2</span><span class="o">,</span><span class="w"> </span><span class="mi">2</span><span class="o">],</span>
+</pre></div>
+</div>
+<p>The array elements are: GPU type, YAML file (without extension), shard index, and total number of shards. Only tests with <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code> from that YAML file are selected when a <code class="docutils literal notranslate"><span class="pre">Post-Merge</span></code> stage runs.</p>
+</section>
+<section id="finding-the-stage-for-a-test">
+<h2>Finding the stage for a test<a class="headerlink" href="#finding-the-stage-for-a-test" title="Link to this heading">#</a></h2>
+<ol class="arabic simple">
+<li><p>Locate the test in the appropriate YAML file under <code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/test-db/</span></code> and note its <code class="docutils literal notranslate"><span class="pre">stage</span></code> and <code class="docutils literal notranslate"><span class="pre">backend</span></code> values.</p></li>
+<li><p>Search <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code> for a stage whose YAML file matches (for example <code class="docutils literal notranslate"><span class="pre">l0_a100</span></code>) and whose name contains <code class="docutils literal notranslate"><span class="pre">[Post-Merge]</span></code> if the YAML entry uses <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code>.</p></li>
+<li><p>The resulting stage name(s) are what you pass to Jenkins via the <code class="docutils literal notranslate"><span class="pre">stage_list</span></code> parameter when triggering a job.</p></li>
+</ol>
+<section id="example">
+<h3>Example<a class="headerlink" href="#example" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]</span></code> appears in <code class="docutils literal notranslate"><span class="pre">l0_a100.yml</span></code> under <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code> and <code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">triton</span></code>.  The corresponding Jenkins stages are <code class="docutils literal notranslate"><span class="pre">A100X-Triton-Python-[Post-Merge]-1</span></code> and <code class="docutils literal notranslate"><span class="pre">A100X-Triton-Python-[Post-Merge]-2</span></code> (two shards).</p>
+<p>To run the same tests on your pull request, comment:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>/bot<span class="w"> </span>run<span class="w"> </span>--stage-list<span class="w"> </span><span class="s2">&quot;A100X-Triton-Python-[Post-Merge]-1,A100X-Triton-Python-[Post-Merge]-2&quot;</span>
+</pre></div>
+</div>
+<p>This executes the same tests that run post-merge for this hardware/backend.</p>
+</section>
+</section>
+<section id="waiving-tests">
+<h2>Waiving tests<a class="headerlink" href="#waiving-tests" title="Link to this heading">#</a></h2>
+<p>Sometimes a test is known to fail due to a bug or unsupported feature. Instead
+of removing it from the YAML test lists, add the test name to
+<code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/waives.txt</span></code>. Every CI run passes this file to
+pytest via <code class="docutils literal notranslate"><span class="pre">--waives-file</span></code>, so the listed tests are skipped automatically.</p>
+<p>Each line contains the fully qualified test name followed by an optional
+<code class="docutils literal notranslate"><span class="pre">SKIP</span> <span class="pre">(reason)</span></code> marker. A <code class="docutils literal notranslate"><span class="pre">full:GPU_TYPE/</span></code> prefix restricts the waive to a
+specific hardware family. Example:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>examples/test_openai.py::test_llm_openai_triton_1gpu SKIP (https://nvbugspro.nvidia.com/bug/4963654)
+full:GH200/examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct] SKIP (arm is not supported)
+</pre></div>
+</div>
+<p>Changes to <code class="docutils literal notranslate"><span class="pre">waives.txt</span></code> should include a bug link or brief explanation so other
+developers understand why the test is disabled.</p>
+</section>
+<section id="triggering-ci-best-practices">
+<h2>Triggering CI Best Practices<a class="headerlink" href="#triggering-ci-best-practices" title="Link to this heading">#</a></h2>
+<section id="triggering-post-merge-tests">
+<h3>Triggering Post-merge tests<a class="headerlink" href="#triggering-post-merge-tests" title="Link to this heading">#</a></h3>
+<p>When you only need to verify a handful of post-merge tests, avoid the heavy
+<code class="docutils literal notranslate"><span class="pre">/bot</span> <span class="pre">run</span> <span class="pre">--post-merge</span></code> command. Instead, specify exactly which stages to run:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>/bot<span class="w"> </span>run<span class="w"> </span>--stage-list<span class="w"> </span><span class="s2">&quot;stage-A,stage-B&quot;</span>
+</pre></div>
+</div>
+<p>This runs <strong>only</strong> the stages listed. You can also add stages on top of the
+default pre-merge set:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>/bot<span class="w"> </span>run<span class="w"> </span>--extra-stage<span class="w"> </span><span class="s2">&quot;stage-A,stage-B&quot;</span>
+</pre></div>
+</div>
+<p>Both options accept any stage name defined in <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>. Being
+selective keeps CI turnaround fast and conserves hardware resources.</p>
+</section>
+<section id="avoiding-unnecessary-disable-fail-fast-usage">
+<h3>Avoiding unnecessary <code class="docutils literal notranslate"><span class="pre">--disable-fail-fast</span></code> usage<a class="headerlink" href="#avoiding-unnecessary-disable-fail-fast-usage" title="Link to this heading">#</a></h3>
+<p>Avoid habitually using <code class="docutils literal notranslate"><span class="pre">--disable-fail-fast</span></code> as it wastes scarce hardware resources. The CI system automatically reuses successful test stages when commits remain unchanged, and subsequent <code class="docutils literal notranslate"><span class="pre">/bot</span> <span class="pre">run</span></code> commands only retry failed stages. Overusing <code class="docutils literal notranslate"><span class="pre">--disable-fail-fast</span></code> keeps failed pipelines consuming resources (like DGX-H100s), increasing queue backlogs and reducing team efficiency.</p>
 </section>
 </section>
 </section>
@@ -616,20 +628,20 @@ python3<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w">
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="performance-tuning-guide/useful-runtime-flags.html"
+       href="memory.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Useful Runtime Options</p>
+        <p class="prev-next-title">Memory Usage of TensorRT-LLM</p>
       </div>
     </a>
     <a class="right-next"
-       href="../reference/troubleshooting.html"
+       href="../blogs/H100vsA100.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Troubleshooting</p>
+        <p class="prev-next-title">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -654,21 +666,19 @@ python3<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w">
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#feature-descriptions">Feature Descriptions</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#coordinating-with-nvidia-nsight-systems-launch">Coordinating with NVIDIA Nsight Systems Launch</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#only-collect-specific-iterations">Only collect specific iterations</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-more-nvtx-markers-for-debugging">Enable more NVTX markers for debugging</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-garbage-collection-gc-nvtx-markers">Enable garbage collection (GC) NVTX markers</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#enable-gil-information-in-nvtx-markers">Enable GIL information in NVTX markers</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#ci-pipelines">CI pipelines</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#test-definitions">Test definitions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#unit-tests">Unit tests</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#jenkins-stage-names">Jenkins stage names</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#finding-the-stage-for-a-test">Finding the stage for a test</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#example">Example</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#coordinating-with-pytorch-profiler-pytorch-workflow-only">Coordinating with PyTorch profiler (PyTorch workflow only)</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#collect-pytorch-profiler-results">Collect PyTorch profiler results</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#visualize-the-pytorch-profiler-results">Visualize the PyTorch profiler results</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#examples">Examples</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#profiling-specific-iterations-on-a-trtllm-bench-trtllm-serve-run">Profiling specific iterations on a trtllm-bench/trtllm-serve run</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#waiving-tests">Waiving tests</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#triggering-ci-best-practices">Triggering CI Best Practices</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#triggering-post-merge-tests">Triggering Post-merge tests</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#avoiding-unnecessary-disable-fail-fast-usage">Avoiding unnecessary <code class="docutils literal notranslate"><span class="pre">--disable-fail-fast</span></code> usage</a></li>
 </ul>
 </li>
 </ul>

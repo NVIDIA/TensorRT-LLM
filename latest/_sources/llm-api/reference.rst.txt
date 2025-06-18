@@ -136,6 +136,11 @@ API Reference
     :undoc-members:
     :special-members: __init__
     :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.TorchCompileConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
 .. autoclass:: tensorrt_llm.llmapi.LlmArgs
     :members:
     :undoc-members:

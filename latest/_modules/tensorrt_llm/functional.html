@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc1" />
+  <meta name="docsearch:version" content="0.21.0rc2" />
 
 
   </head>
@@ -442,6 +442,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/ci-overview.html">Continuous Integration Overview</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -529,6 +530,7 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Union</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="c1"># isort: off</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">trt</span>
@@ -4732,7 +4734,8 @@
     <span class="n">AUTO</span> <span class="o">=</span> <span class="mi">3</span>
     <span class="n">ONESHOT</span> <span class="o">=</span> <span class="mi">4</span>
     <span class="n">TWOSHOT</span> <span class="o">=</span> <span class="mi">5</span>
-    <span class="n">LOWPRECISION</span> <span class="o">=</span> <span class="mi">6</span></div>
+    <span class="n">LOWPRECISION</span> <span class="o">=</span> <span class="mi">6</span>
+    <span class="n">MNNVL</span> <span class="o">=</span> <span class="mi">7</span></div>
 
 
 
@@ -4747,7 +4750,7 @@
     <span class="n">RESIDUAL_RMS_NORM_QUANT_NVFP4</span> <span class="o">=</span> <span class="mi">5</span>
     <span class="n">RESIDUAL_RMS_NORM_OUT_QUANT_FP8</span> <span class="o">=</span> <span class="mi">6</span>
     <span class="n">RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4</span> <span class="o">=</span> <span class="mi">7</span>
-    <span class="n">MOE_ALLREDUCE_RESIDUAL_RMS_NORM</span> <span class="o">=</span> <span class="mi">8</span></div>
+    <span class="n">MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM</span> <span class="o">=</span> <span class="mi">8</span></div>
 
 
 
@@ -4764,7 +4767,8 @@
                  <span class="n">scale</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">norm_pre_residual_weight</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-06</span><span class="p">,</span>
-                 <span class="n">enable_allreduce</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">):</span>
+                 <span class="n">enable_allreduce</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+                 <span class="n">trigger_completion_at_end</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">strategy</span> <span class="o">=</span> <span class="n">strategy</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">fusion_op</span> <span class="o">=</span> <span class="n">fusion_op</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">bias</span> <span class="o">=</span> <span class="n">bias</span>
@@ -4775,6 +4779,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">eps</span> <span class="o">=</span> <span class="n">eps</span>
         <span class="c1"># For torch path only, has no effect on TRT path</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">enable_allreduce</span> <span class="o">=</span> <span class="n">enable_allreduce</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">trigger_completion_at_end</span> <span class="o">=</span> <span class="n">trigger_completion_at_end</span>
         <span class="k">assert</span> <span class="n">fusion_op</span> <span class="o">==</span> <span class="n">AllReduceFusionOp</span><span class="o">.</span><span class="n">NONE</span><span class="o">.</span><span class="n">value</span> <span class="ow">or</span> <span class="p">(</span><span class="n">residual</span>
                                                              <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
 
@@ -4802,6 +4807,51 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">strategy</span> <span class="o">==</span> <span class="n">AllReduceStrategy</span><span class="o">.</span><span class="n">AUTO</span> <span class="ow">and</span> <span class="n">default_net</span><span class="p">(</span>
         <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">user_buffer</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">strategy</span> <span class="o">=</span> <span class="n">AllReduceStrategy</span><span class="o">.</span><span class="n">UB</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="MoEAllReduceParams">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.MoEAllReduceParams">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">MoEAllReduceParams</span><span class="p">(</span><span class="n">AllReduceParams</span><span class="p">):</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="n">device_num_experts</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">expert_scale_factor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">expanded_idx_to_permuted_idx</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">shared_expert_output</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">bias</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">residual</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">norm_weight</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">scale</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">norm_pre_residual_weight</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-06</span><span class="p">,</span>
+                 <span class="n">enable_allreduce</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+                 <span class="n">is_cutlass_min_latency</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
+            <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
+            <span class="n">residual</span><span class="o">=</span><span class="n">residual</span><span class="p">,</span>
+            <span class="n">norm_weight</span><span class="o">=</span><span class="n">norm_weight</span><span class="p">,</span>
+            <span class="n">scale</span><span class="o">=</span><span class="n">scale</span><span class="p">,</span>
+            <span class="n">norm_pre_residual_weight</span><span class="o">=</span><span class="n">norm_pre_residual_weight</span><span class="p">,</span>
+            <span class="n">eps</span><span class="o">=</span><span class="n">eps</span><span class="p">,</span>
+            <span class="n">enable_allreduce</span><span class="o">=</span><span class="n">enable_allreduce</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">device_num_experts</span> <span class="o">=</span> <span class="n">device_num_experts</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">expert_scale_factor</span> <span class="o">=</span> <span class="n">expert_scale_factor</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">expanded_idx_to_permuted_idx</span> <span class="o">=</span> <span class="n">expanded_idx_to_permuted_idx</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">shared_expert_output</span> <span class="o">=</span> <span class="n">shared_expert_output</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_cutlass_min_latency</span> <span class="o">=</span> <span class="n">is_cutlass_min_latency</span>
+
+<div class="viewcode-block" id="MoEAllReduceParams.is_valid">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.MoEAllReduceParams.is_valid">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_valid</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_cutlass_min_latency</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device_num_experts</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                    <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">expert_scale_factor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                    <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">shared_expert_output</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">expanded_idx_to_permuted_idx</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span></div>
 </div>
 
 
@@ -5711,6 +5761,7 @@
         <span class="k">return</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="n">dim</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span></div>
 
 
+    <span class="c1"># Note: When not using deepseek_yarn, make sure to set mscale_all_dim to 0.0.</span>
 <div class="viewcode-block" id="RopeEmbeddingUtils.create_sinusoidal_positions_yarn">
 <a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_yarn">[docs]</a>
     <span class="nd">@staticmethod</span>
@@ -5725,24 +5776,19 @@
             <span class="n">mscale</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span>
             <span class="n">mscale_all_dim</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span>
             <span class="n">duplicate_data</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
-            <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">):</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">):</span>
 
         <span class="c1"># Copy from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/modeling_deepseek.py</span>
         <span class="c1"># Inverse dim formula to find dim based on number of rotations</span>
-        <span class="k">def</span><span class="w"> </span><span class="nf">yarn_find_correction_dim</span><span class="p">(</span><span class="n">num_rotations</span><span class="p">,</span>
-                                     <span class="n">dim</span><span class="p">,</span>
-                                     <span class="n">base</span><span class="o">=</span><span class="mi">10000</span><span class="p">,</span>
-                                     <span class="n">max_position_embeddings</span><span class="o">=</span><span class="mi">2048</span><span class="p">):</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">yarn_find_correction_dim</span><span class="p">(</span><span class="n">num_rotations</span><span class="p">,</span> <span class="n">dim</span><span class="p">,</span> <span class="n">base</span><span class="p">,</span>
+                                     <span class="n">max_position_embeddings</span><span class="p">):</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">dim</span> <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">max_position_embeddings</span> <span class="o">/</span>
                                    <span class="p">(</span><span class="n">num_rotations</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">pi</span><span class="p">)))</span> <span class="o">/</span> <span class="p">(</span>
                                        <span class="mi">2</span> <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">base</span><span class="p">))</span>
 
         <span class="c1"># Find dim range bounds based on rotations</span>
-        <span class="k">def</span><span class="w"> </span><span class="nf">yarn_find_correction_range</span><span class="p">(</span><span class="n">low_rot</span><span class="p">,</span>
-                                       <span class="n">high_rot</span><span class="p">,</span>
-                                       <span class="n">dim</span><span class="p">,</span>
-                                       <span class="n">base</span><span class="o">=</span><span class="mi">10000</span><span class="p">,</span>
-                                       <span class="n">max_position_embeddings</span><span class="o">=</span><span class="mi">2048</span><span class="p">):</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">yarn_find_correction_range</span><span class="p">(</span><span class="n">low_rot</span><span class="p">,</span> <span class="n">high_rot</span><span class="p">,</span> <span class="n">dim</span><span class="p">,</span> <span class="n">base</span><span class="p">,</span>
+                                       <span class="n">max_position_embeddings</span><span class="p">):</span>
             <span class="n">low</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">floor</span><span class="p">(</span>
                 <span class="n">yarn_find_correction_dim</span><span class="p">(</span><span class="n">low_rot</span><span class="p">,</span> <span class="n">dim</span><span class="p">,</span> <span class="n">base</span><span class="p">,</span>
                                          <span class="n">max_position_embeddings</span><span class="p">))</span>
@@ -5755,7 +5801,7 @@
                 <span class="n">high</span> <span class="o">=</span> <span class="n">dim</span> <span class="o">-</span> <span class="mi">1</span>
             <span class="k">return</span> <span class="n">low</span><span class="p">,</span> <span class="n">high</span>  <span class="c1"># Clamp values just in case</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">yarn_get_mscale</span><span class="p">(</span><span class="n">scale</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">mscale</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">yarn_get_mscale</span><span class="p">(</span><span class="n">scale</span><span class="p">,</span> <span class="n">mscale</span><span class="p">):</span>
             <span class="k">if</span> <span class="n">scale</span> <span class="o">&lt;=</span> <span class="mi">1</span><span class="p">:</span>
                 <span class="k">return</span> <span class="mf">1.0</span>
             <span class="k">return</span> <span class="mf">0.1</span> <span class="o">*</span> <span class="n">mscale</span> <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">scale</span><span class="p">)</span> <span class="o">+</span> <span class="mf">1.0</span>
@@ -5764,13 +5810,13 @@
             <span class="k">if</span> <span class="nb">min</span> <span class="o">==</span> <span class="nb">max</span><span class="p">:</span>
                 <span class="nb">max</span> <span class="o">+=</span> <span class="mf">0.001</span>  <span class="c1"># Prevent singularity</span>
 
-            <span class="n">linear_func</span> <span class="o">=</span> <span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">dim</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span> <span class="o">-</span> <span class="nb">min</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="nb">max</span> <span class="o">-</span> <span class="nb">min</span><span class="p">)</span>
-            <span class="n">ramp_func</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">clip</span><span class="p">(</span><span class="n">linear_func</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">linear_func</span> <span class="o">=</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">dim</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span> <span class="o">-</span> <span class="nb">min</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="nb">max</span> <span class="o">-</span> <span class="nb">min</span><span class="p">)</span>
+            <span class="n">ramp_func</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="n">linear_func</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">ramp_func</span>
 
-        <span class="n">freq_extra</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="n">base</span><span class="o">**</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dim</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span> <span class="o">/</span> <span class="n">dim</span><span class="p">))</span>
-        <span class="n">freq_inter</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="n">scaling_factor</span> <span class="o">*</span>
-                            <span class="n">base</span><span class="o">**</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dim</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span> <span class="o">/</span> <span class="n">dim</span><span class="p">))</span>
+        <span class="n">pos_freqs</span> <span class="o">=</span> <span class="n">base</span><span class="o">**</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dim</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span> <span class="o">/</span> <span class="n">dim</span><span class="p">)</span>
+        <span class="n">freq_extra</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="n">pos_freqs</span>
+        <span class="n">freq_inter</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="n">scaling_factor</span> <span class="o">*</span> <span class="n">pos_freqs</span><span class="p">)</span>
 
         <span class="n">low</span><span class="p">,</span> <span class="n">high</span> <span class="o">=</span> <span class="n">yarn_find_correction_range</span><span class="p">(</span>
             <span class="n">beta_fast</span><span class="p">,</span>
@@ -5779,28 +5825,23 @@
             <span class="n">base</span><span class="p">,</span>
             <span class="n">original_max_position_embeddings</span><span class="p">,</span>
         <span class="p">)</span>
-        <span class="n">inv_freq_mask</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">-</span> <span class="n">yarn_linear_ramp_mask</span><span class="p">(</span><span class="n">low</span><span class="p">,</span> <span class="n">high</span><span class="p">,</span>
-                                                    <span class="n">dim</span> <span class="o">//</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="n">inv_freq_mask</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">yarn_linear_ramp_mask</span><span class="p">(</span><span class="n">low</span><span class="p">,</span> <span class="n">high</span><span class="p">,</span> <span class="n">dim</span> <span class="o">//</span> <span class="mi">2</span><span class="p">))</span>
         <span class="n">inv_freq</span> <span class="o">=</span> <span class="n">freq_inter</span> <span class="o">*</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">inv_freq_mask</span><span class="p">)</span> <span class="o">+</span> <span class="n">freq_extra</span> <span class="o">*</span> <span class="n">inv_freq_mask</span>
-        <span class="n">sinusoid_inp</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">expand_dims</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s2">&quot;i , j -&gt; i j&quot;</span><span class="p">,</span>
-                                                <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">num_pos</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">),</span>
-                                                <span class="n">inv_freq</span><span class="p">,</span>
-                                                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">),</span>
-                                      <span class="n">axis</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="n">t</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">num_pos</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="n">sinusoid_inp</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s2">&quot;i,j -&gt; ij&quot;</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">inv_freq</span><span class="p">)</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
 
         <span class="n">_mscale</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span>
             <span class="n">yarn_get_mscale</span><span class="p">(</span><span class="n">scaling_factor</span><span class="p">,</span> <span class="n">mscale</span><span class="p">)</span> <span class="o">/</span>
             <span class="n">yarn_get_mscale</span><span class="p">(</span><span class="n">scaling_factor</span><span class="p">,</span> <span class="n">mscale_all_dim</span><span class="p">))</span>
 
         <span class="k">if</span> <span class="n">duplicate_data</span><span class="p">:</span>
-            <span class="n">emb</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">((</span><span class="n">sinusoid_inp</span><span class="p">,</span> <span class="n">sinusoid_inp</span><span class="p">),</span> <span class="n">axis</span><span class="o">=-</span><span class="mi">2</span><span class="p">)</span>
+            <span class="n">emb</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">((</span><span class="n">sinusoid_inp</span><span class="p">,</span> <span class="n">sinusoid_inp</span><span class="p">),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">2</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">emb</span> <span class="o">=</span> <span class="n">sinusoid_inp</span>
 
-        <span class="n">concat</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">((</span><span class="n">np</span><span class="o">.</span><span class="n">cos</span><span class="p">(</span><span class="n">emb</span><span class="p">)</span> <span class="o">*</span> <span class="n">_mscale</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">sin</span><span class="p">(</span><span class="n">emb</span><span class="p">)</span> <span class="o">*</span> <span class="n">_mscale</span><span class="p">),</span>
-                                <span class="n">axis</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
-
-        <span class="k">return</span> <span class="n">inv_freq</span><span class="p">,</span> <span class="n">concat</span><span class="o">.</span><span class="n">reshape</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">))</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span></div>
+        <span class="n">concat</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">((</span><span class="n">torch</span><span class="o">.</span><span class="n">cos</span><span class="p">(</span><span class="n">emb</span><span class="p">)</span> <span class="o">*</span> <span class="n">_mscale</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">sin</span><span class="p">(</span><span class="n">emb</span><span class="p">)</span> <span class="o">*</span> <span class="n">_mscale</span><span class="p">),</span>
+                           <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">inv_freq</span><span class="o">.</span><span class="n">numpy</span><span class="p">(),</span> <span class="n">concat</span><span class="o">.</span><span class="n">reshape</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">))</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span></div>
 
 
 <div class="viewcode-block" id="RopeEmbeddingUtils.rotate_every_two">
@@ -8681,9 +8722,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 09, 2025.</p>
+  <p>Last updated on June 16, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
   
 </div></div>
       

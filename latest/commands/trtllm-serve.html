@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc1" />
+  <meta name="docsearch:version" content="0.21.0rc2" />
 
 
   </head>
@@ -449,6 +449,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/ci-overview.html">Continuous Integration Overview</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -637,6 +638,96 @@
 <h3>Completions API<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
 <p>You can query Completions API with any http clients, a typical example is OpenAI Python client:</p>
 <p>Another example uses <code class="docutils literal notranslate"><span class="pre">curl</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#! /usr/bin/env bash</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span><span class="c1"># SINGLE IMAGE INFERENCE</span>
+<span class="linenos"> 4</span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
+<span class="linenos"> 5</span><span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w">  </span><span class="se">\</span>
+<span class="linenos"> 6</span><span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="linenos"> 7</span><span class="s1">        &quot;model&quot;: &quot;Qwen2.5-VL-3B-Instruct&quot;,</span>
+<span class="linenos"> 8</span><span class="s1">        &quot;messages&quot;:[{</span>
+<span class="linenos"> 9</span><span class="s1">            &quot;role&quot;: &quot;system&quot;,</span>
+<span class="linenos">10</span><span class="s1">            &quot;content&quot;: &quot;You are a helpful assistant.&quot;</span>
+<span class="linenos">11</span><span class="s1">        }, {</span>
+<span class="linenos">12</span><span class="s1">            &quot;role&quot;: &quot;user&quot;,</span>
+<span class="linenos">13</span><span class="s1">            &quot;content&quot;: [</span>
+<span class="linenos">14</span><span class="s1">                {</span>
+<span class="linenos">15</span><span class="s1">                    &quot;type&quot;: &quot;text&quot;,</span>
+<span class="linenos">16</span><span class="s1">                    &quot;text&quot;: &quot;Describe the natural environment in the image.&quot;</span>
+<span class="linenos">17</span><span class="s1">                },</span>
+<span class="linenos">18</span><span class="s1">                {</span>
+<span class="linenos">19</span><span class="s1">                    &quot;type&quot;:&quot;image_url&quot;,</span>
+<span class="linenos">20</span><span class="s1">                    &quot;image_url&quot;: {</span>
+<span class="linenos">21</span><span class="s1">                        &quot;url&quot;: &quot;https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png&quot;</span>
+<span class="linenos">22</span><span class="s1">                    }</span>
+<span class="linenos">23</span><span class="s1">                }</span>
+<span class="linenos">24</span><span class="s1">            ]</span>
+<span class="linenos">25</span><span class="s1">        }],</span>
+<span class="linenos">26</span><span class="s1">        &quot;max_tokens&quot;: 64,</span>
+<span class="linenos">27</span><span class="s1">        &quot;temperature&quot;: 0</span>
+<span class="linenos">28</span><span class="s1">    }&#39;</span>
+<span class="linenos">29</span>
+<span class="linenos">30</span><span class="c1"># MULTI IMAGE INFERENCE</span>
+<span class="linenos">31</span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
+<span class="linenos">32</span><span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">33</span><span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="linenos">34</span><span class="s1">        &quot;model&quot;: &quot;Qwen2.5-VL-3B-Instruct&quot;,</span>
+<span class="linenos">35</span><span class="s1">        &quot;messages&quot;:[{</span>
+<span class="linenos">36</span><span class="s1">            &quot;role&quot;: &quot;system&quot;,</span>
+<span class="linenos">37</span><span class="s1">            &quot;content&quot;: &quot;You are a helpful assistant.&quot;</span>
+<span class="linenos">38</span><span class="s1">        }, {</span>
+<span class="linenos">39</span><span class="s1">            &quot;role&quot;: &quot;user&quot;,</span>
+<span class="linenos">40</span><span class="s1">            &quot;content&quot;: [</span>
+<span class="linenos">41</span><span class="s1">                {</span>
+<span class="linenos">42</span><span class="s1">                    &quot;type&quot;: &quot;text&quot;,</span>
+<span class="linenos">43</span><span class="s1">                    &quot;text&quot;:&quot;Tell me the difference between two images&quot;</span>
+<span class="linenos">44</span><span class="s1">                },</span>
+<span class="linenos">45</span><span class="s1">                {</span>
+<span class="linenos">46</span><span class="s1">                    &quot;type&quot;:&quot;image_url&quot;,</span>
+<span class="linenos">47</span><span class="s1">                    &quot;image_url&quot;: {</span>
+<span class="linenos">48</span><span class="s1">                        &quot;url&quot;: &quot;https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png&quot;</span>
+<span class="linenos">49</span><span class="s1">                    }</span>
+<span class="linenos">50</span><span class="s1">                },</span>
+<span class="linenos">51</span><span class="s1">                {</span>
+<span class="linenos">52</span><span class="s1">                    &quot;type&quot;:&quot;image_url&quot;,</span>
+<span class="linenos">53</span><span class="s1">                    &quot;image_url&quot;: {</span>
+<span class="linenos">54</span><span class="s1">                        &quot;url&quot;: &quot;https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png&quot;</span>
+<span class="linenos">55</span><span class="s1">                    }</span>
+<span class="linenos">56</span><span class="s1">                }</span>
+<span class="linenos">57</span><span class="s1">            ]</span>
+<span class="linenos">58</span><span class="s1">        }],</span>
+<span class="linenos">59</span><span class="s1">        &quot;max_tokens&quot;: 64,</span>
+<span class="linenos">60</span><span class="s1">        &quot;temperature&quot;: 0</span>
+<span class="linenos">61</span><span class="s1">    }&#39;</span>
+<span class="linenos">62</span>
+<span class="linenos">63</span><span class="c1"># SINGLE VIDEO INFERENCE</span>
+<span class="linenos">64</span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
+<span class="linenos">65</span><span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="linenos">66</span><span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="linenos">67</span><span class="s1">        &quot;model&quot;: &quot;Qwen2.5-VL-3B-Instruct&quot;,</span>
+<span class="linenos">68</span><span class="s1">        &quot;messages&quot;:[{</span>
+<span class="linenos">69</span><span class="s1">            &quot;role&quot;: &quot;system&quot;,</span>
+<span class="linenos">70</span><span class="s1">            &quot;content&quot;: &quot;You are a helpful assistant.&quot;</span>
+<span class="linenos">71</span><span class="s1">        }, {</span>
+<span class="linenos">72</span><span class="s1">            &quot;role&quot;: &quot;user&quot;,</span>
+<span class="linenos">73</span><span class="s1">            &quot;content&quot;: [</span>
+<span class="linenos">74</span><span class="s1">                {</span>
+<span class="linenos">75</span><span class="s1">                    &quot;type&quot;: &quot;text&quot;,</span>
+<span class="linenos">76</span><span class="s1">                    &quot;text&quot;:&quot;Tell me what you see in the video briefly.&quot;</span>
+<span class="linenos">77</span><span class="s1">                },</span>
+<span class="linenos">78</span><span class="s1">                {</span>
+<span class="linenos">79</span><span class="s1">                    &quot;type&quot;:&quot;video_url&quot;,</span>
+<span class="linenos">80</span><span class="s1">                    &quot;video_url&quot;: {</span>
+<span class="linenos">81</span><span class="s1">                        &quot;url&quot;: &quot;https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4&quot;</span>
+<span class="linenos">82</span><span class="s1">                    }</span>
+<span class="linenos">83</span><span class="s1">                }</span>
+<span class="linenos">84</span><span class="s1">            ]</span>
+<span class="linenos">85</span><span class="s1">        }],</span>
+<span class="linenos">86</span><span class="s1">        &quot;max_tokens&quot;: 64,</span>
+<span class="linenos">87</span><span class="s1">        &quot;temperature&quot;: 0</span>
+<span class="linenos">88</span><span class="s1">    }&#39;</span>
+</pre></div>
+</div>
 </section>
 </section>
 <section id="benchmark">
@@ -954,12 +1045,6 @@ However, for the PyTorch backend, specified with the <code class="docutils liter
 <dd><p>Server role. Specify this value only if running in disaggregated mode.</p>
 </dd></dl>
 
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-0">
-<span class="sig-name descname"><span class="pre">--trust_remote_code</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;trust_remote_code&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-0" title="Link to this definition">#</a></dt>
-<dd><p>Whether to trust remote code.</p>
-</dd></dl>
-
 <p class="rubric">Arguments</p>
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-arg-MODEL">
@@ -1136,9 +1221,9 @@ However, for the PyTorch backend, specified with the <code class="docutils liter
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 09, 2025.</p>
+  <p>Last updated on June 16, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
   
 </div></div>
       

@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc1" />
+  <meta name="docsearch:version" content="0.21.0rc2" />
 
 
   </head>
@@ -449,6 +449,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/ci-overview.html">Continuous Integration Overview</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -571,20 +572,23 @@
 <li><p><strong>batching_type</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BatchingType" title="tensorrt_llm.llmapi.llm_args.BatchingType"><em>tensorrt_llm.llmapi.llm_args.BatchingType</em></a><em>]</em>) – Batching type. Defaults to None.</p></li>
 <li><p><strong>normalize_log_probs</strong> (<em>bool</em>) – Normalize log probabilities. Defaults to False.</p></li>
 <li><p><strong>max_batch_size</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum batch size. Defaults to None.</p></li>
-<li><p><strong>max_input_len</strong> (<em>int</em>) – The maximum input length. Defaults to 1024.</p></li>
+<li><p><strong>max_input_len</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum input length. Defaults to None.</p></li>
 <li><p><strong>max_seq_len</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum sequence length. Defaults to None.</p></li>
-<li><p><strong>max_beam_width</strong> (<em>int</em>) – The maximum beam width. Defaults to 1.</p></li>
+<li><p><strong>max_beam_width</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum beam width. Defaults to None.</p></li>
 <li><p><strong>max_num_tokens</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum number of tokens. Defaults to None.</p></li>
-<li><p><strong>backend</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The backend to use. Defaults to None.</p></li>
 <li><p><strong>gather_generation_logits</strong> (<em>bool</em>) – Gather generation logits. Defaults to False.</p></li>
+<li><p><strong>num_postprocess_workers</strong> (<em>int</em>) – The number of processes used for postprocessing the generated tokens, including detokenization. Defaults to 0.</p></li>
+<li><p><strong>postprocess_tokenizer_dir</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The path to the tokenizer directory for postprocessing. Defaults to None.</p></li>
+<li><p><strong>reasoning_parser</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The parser to separate reasoning content from output. Defaults to None.</p></li>
+<li><p><strong>backend</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The backend to use for this LLM instance. Defaults to None.</p></li>
 <li><p><strong>enable_tqdm</strong> (<em>bool</em>) – Enable tqdm for progress bar. Defaults to False.</p></li>
-<li><p><strong>build_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BuildConfig" title="tensorrt_llm.builder.BuildConfig"><em>tensorrt_llm.builder.BuildConfig</em></a><em>]</em>) – Build config. Defaults to None.</p></li>
 <li><p><strong>workspace</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The workspace for the model. Defaults to None.</p></li>
 <li><p><strong>enable_build_cache</strong> (<em>Union</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BuildCacheConfig" title="tensorrt_llm.llmapi.build_cache.BuildCacheConfig"><em>tensorrt_llm.llmapi.build_cache.BuildCacheConfig</em></a><em>, </em><em>bool</em><em>]</em>) – Enable build cache. Defaults to False.</p></li>
 <li><p><strong>extended_runtime_perf_knob_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig" title="tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig"><em>tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig</em></a><em>]</em>) – Extended runtime perf knob config. Defaults to None.</p></li>
 <li><p><strong>calib_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.CalibConfig" title="tensorrt_llm.llmapi.llm_args.CalibConfig"><em>tensorrt_llm.llmapi.llm_args.CalibConfig</em></a><em>]</em>) – Calibration config. Defaults to None.</p></li>
 <li><p><strong>embedding_parallel_mode</strong> (<em>str</em>) – The embedding parallel mode. Defaults to SHARDING_ALONG_VOCAB.</p></li>
 <li><p><strong>fast_build</strong> (<em>bool</em>) – Enable fast build. Defaults to False.</p></li>
+<li><p><strong>build_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BuildConfig" title="tensorrt_llm.builder.BuildConfig"><em>tensorrt_llm.builder.BuildConfig</em></a><em>]</em>) – Build config. Defaults to None.</p></li>
 <li><p><strong>kwargs</strong> (<em>Any</em>) – Advanced arguments passed to <cite>LlmArgs</cite>.</p></li>
 </ul>
 </dd>
@@ -1657,7 +1661,7 @@ The BatchedLogitsProcessor class is recommended for callback creation. The callb
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/disaggregated_params.html#DisaggregatedParams"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.DisaggregatedParams" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
-<p>Disaggregated seving parameters</p>
+<p>Disaggregated seving parameters.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1999,7 +2003,7 @@ validated to form a valid model.</p>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -2762,6 +2766,11 @@ validated to form a valid model.</p>
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.QuantAlgo.W4A8_MXFP4_FP8">
+<span class="sig-name descname"><span class="pre">W4A8_MXFP4_FP8</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'W4A8_MXFP4_FP8'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.QuantAlgo.W4A8_MXFP4_FP8" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.QuantAlgo.W4A8_QSERVE_PER_CHANNEL">
 <span class="sig-name descname"><span class="pre">W4A8_QSERVE_PER_CHANNEL</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'W4A8_QSERVE_PER_CHANNEL'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.QuantAlgo.W4A8_QSERVE_PER_CHANNEL" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -3306,6 +3315,53 @@ Whether to use a common pool for all requests, or the pool is private for each r
 
 </dd></dl>
 
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">TorchCompileConfig</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_fullgraph</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_inductor_enabled</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_piecewise_cuda_graph</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_enable_userbuffers</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchCompileConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">BaseModel</span></code></p>
+<p>Configuration for torch.compile.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.model_config">
+<span class="sig-name descname"><span class="pre">model_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">ConfigDict</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.model_config" title="Link to this definition">#</a></dt>
+<dd><p>Configuration for the model, should be a dictionary conforming to [<cite>ConfigDict</cite>][pydantic.config.ConfigDict].</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_enable_userbuffers">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_enable_userbuffers</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_enable_userbuffers" title="Link to this definition">#</a></dt>
+<dd><p>When torch compile is enabled, userbuffers is enabled by default.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_fullgraph">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_fullgraph</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_fullgraph" title="Link to this definition">#</a></dt>
+<dd><p>Enable full graph compilation in torch.compile.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_inductor_enabled">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_inductor_enabled</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_inductor_enabled" title="Link to this definition">#</a></dt>
+<dd><p>Enable inductor backend in torch.compile.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_piecewise_cuda_graph">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_piecewise_cuda_graph</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_piecewise_cuda_graph" title="Link to this definition">#</a></dt>
+<dd><p>Enable piecewise CUDA graph in torch.compile.</p>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LlmArgs">
 <span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">LlmArgs</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LlmArgs" title="Link to this definition">#</a></dt>
@@ -3358,17 +3414,17 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">batching_type:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.BatchingType</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">normalize_log_probs:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_batch_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">max_input_len:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1024</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_input_len:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_seq_len:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">max_beam_width:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_beam_width:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_num_tokens:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">gather_generation_logits:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">_num_postprocess_workers:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">_postprocess_tokenizer_dir:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">_reasoning_parser:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">num_postprocess_workers:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">postprocess_tokenizer_dir:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">reasoning_parser:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">_mpi_session:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">build_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_cuda_graph:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cuda_graph_batch_sizes:</span> <span class="pre">~typing.List[int]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
@@ -3382,20 +3438,13 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">mixed_sampler:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_trtllm_sampler:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_dtype:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'auto'</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">use_kv_cache:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_iter_perf_stats:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_iter_req_stats:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">print_iter_log:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_enabled:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_fullgraph:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_inductor_enabled:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_piecewise_cuda_graph:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_enable_userbuffers:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.TorchCompileConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">autotuner_enabled:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_layerwise_nvtx_marker:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">auto_deploy_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_min_latency:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">**extra_data:</span> <span class="pre">~typing.Any</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs" title="Link to this definition">#</a></dt>
@@ -3407,20 +3456,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.auto_deploy_config">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">auto_deploy_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">object</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.auto_deploy_config" title="Link to this definition">#</a></dt>
-<dd><p>Auto deploy config.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Validated by<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3433,7 +3480,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3446,7 +3504,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3464,7 +3533,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3477,8 +3557,19 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_max_batch_size</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3491,7 +3582,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3528,7 +3630,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3541,7 +3654,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3554,7 +3678,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3567,7 +3702,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3580,7 +3726,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3593,7 +3750,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3609,6 +3777,11 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <span class="sig-name descname"><span class="pre">get_pytorch_backend_config</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">PyTorchConfig</span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.get_pytorch_backend_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.get_pytorch_backend_config" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.init_backend">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">init_backend</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">backend</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.init_backend"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.init_backend" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.kv_cache_dtype">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">kv_cache_dtype</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'auto'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.kv_cache_dtype" title="Link to this definition">#</a></dt>
@@ -3616,7 +3789,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3630,7 +3814,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">convert_load_format</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3715,7 +3910,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3723,15 +3929,23 @@ Whether to use a common pool for all requests, or the pool is private for each r
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.model_config">
-<span class="sig-name descname"><span class="pre">model_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">ConfigDict</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'arbitrary_types_allowed':</span> <span class="pre">True,</span> <span class="pre">'extra':</span> <span class="pre">'allow'}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.model_config" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">model_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">ConfigDict</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'arbitrary_types_allowed':</span> <span class="pre">True,</span> <span class="pre">'extra':</span> <span class="pre">'forbid'}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.model_config" title="Link to this definition">#</a></dt>
 <dd><p>Configuration for the model, should be a dictionary conforming to [<cite>ConfigDict</cite>][pydantic.config.ConfigDict].</p>
 </dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.model_post_init">
-<span class="sig-name descname"><span class="pre">model_post_init</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">_TorchLlmArgs__context</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.model_post_init"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.model_post_init" title="Link to this definition">#</a></dt>
-<dd><p>Override this method to perform additional initialization after <cite>__init__</cite> and <cite>model_construct</cite>.
-This is useful if you want to do some validation that requires the entire model to be initialized.</p>
+<span class="sig-name descname"><span class="pre">model_post_init</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">context</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Any</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.model_post_init" title="Link to this definition">#</a></dt>
+<dd><p>This function is meant to behave like a BaseModel method to initialise private attributes.</p>
+<p>It takes context as an argument since that’s what pydantic-core passes when calling it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>self</strong> – The BaseModel instance.</p></li>
+<li><p><strong>context</strong> – The context.</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -3741,7 +3955,18 @@ This is useful if you want to do some validation that requires the entire model 
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3754,7 +3979,18 @@ This is useful if you want to do some validation that requires the entire model 
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3767,7 +4003,18 @@ This is useful if you want to do some validation that requires the entire model 
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3780,72 +4027,42 @@ This is useful if you want to do some validation that requires the entire model 
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_enable_userbuffers">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_enable_userbuffers</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_enable_userbuffers" title="Link to this definition">#</a></dt>
-<dd><p>When torch compile is enabled, userbuffers is enabled by default.</p>
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_config">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#tensorrt_llm.llmapi.TorchCompileConfig" title="tensorrt_llm.llmapi.llm_args.TorchCompileConfig"><span class="pre">TorchCompileConfig</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_config" title="Link to this definition">#</a></dt>
+<dd><p>Torch compile config.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_enabled">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_enabled</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_enabled" title="Link to this definition">#</a></dt>
-<dd><p>Enable torch.compile optimization.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Validated by<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_fullgraph">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_fullgraph</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_fullgraph" title="Link to this definition">#</a></dt>
-<dd><p>Enable full graph compilation in torch.compile.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Validated by<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_inductor_enabled">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_inductor_enabled</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_inductor_enabled" title="Link to this definition">#</a></dt>
-<dd><p>Enable inductor backend in torch.compile.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Validated by<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_piecewise_cuda_graph">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_piecewise_cuda_graph</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_piecewise_cuda_graph" title="Link to this definition">#</a></dt>
-<dd><p>Enable piecewise CUDA graph in torch.compile.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Validated by<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3858,20 +4075,18 @@ This is useful if you want to do some validation that requires the entire model 
 <dl class="field-list simple">
 <dt class="field-odd">Validated by<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.use_kv_cache">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">use_kv_cache</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.use_kv_cache" title="Link to this definition">#</a></dt>
-<dd><p>Whether to use KV cache.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Validated by<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3892,6 +4107,11 @@ This is useful if you want to do some validation that requires the entire model 
 <em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_cuda_graph_max_batch_size</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">cuda_graph_max_batch_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_cuda_graph_max_batch_size"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_max_batch_size" title="Link to this definition">#</a></dt>
 <dd><p>Validate cuda_graph_max_batch_size is non-negative.</p>
 </dd></dl>
+
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_moe_load_balancer">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_moe_load_balancer</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_moe_load_balancer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_moe_load_balancer" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 </dd></dl>
 
@@ -3942,28 +4162,27 @@ This is useful if you want to do some validation that requires the entire model 
 <dd><em class="sig-param"><span class="n"><span class="pre">batching_type:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.BatchingType</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">normalize_log_probs:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_batch_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">max_input_len:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1024</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_input_len:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_seq_len:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">max_beam_width:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_beam_width:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_num_tokens:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">gather_generation_logits:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">_num_postprocess_workers:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">_postprocess_tokenizer_dir:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">_reasoning_parser:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">num_postprocess_workers:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">postprocess_tokenizer_dir:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">reasoning_parser:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">_mpi_session:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">auto_parallel:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">auto_parallel_world_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_tqdm:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">build_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">workspace:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_build_cache:</span> <span class="pre">object</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">extended_runtime_perf_knob_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">calib_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.CalibConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">embedding_parallel_mode:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'SHARDING_ALONG_VOCAB'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">fast_build:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">**extra_data:</span> <span class="pre">~typing.Any</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">build_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs" title="Link to this definition">#</a></dt>
@@ -4025,12 +4244,51 @@ This is useful if you want to do some validation that requires the entire model 
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.build_config">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">build_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">object</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.build_config" title="Link to this definition">#</a></dt>
 <dd><p>Build config.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">setup_embedding_parallel_mode</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_auto_parallel</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_enable_build_cache</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.calib_config">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">calib_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#tensorrt_llm.llmapi.CalibConfig" title="tensorrt_llm.llmapi.llm_args.CalibConfig"><span class="pre">CalibConfig</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.calib_config" title="Link to this definition">#</a></dt>
 <dd><p>Calibration config.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_calib_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">setup_embedding_parallel_mode</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_auto_parallel</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_enable_build_cache</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py attribute">
@@ -4061,31 +4319,131 @@ This is useful if you want to do some validation that requires the entire model 
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.embedding_parallel_mode">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">embedding_parallel_mode</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'SHARDING_ALONG_VOCAB'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.embedding_parallel_mode" title="Link to this definition">#</a></dt>
 <dd><p>The embedding parallel mode.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">setup_embedding_parallel_mode</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_auto_parallel</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_enable_build_cache</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.enable_build_cache">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_build_cache</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">object</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_build_cache" title="Link to this definition">#</a></dt>
 <dd><p>Enable build cache.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">setup_embedding_parallel_mode</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_auto_parallel</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_enable_build_cache</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.enable_tqdm">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_tqdm</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_tqdm" title="Link to this definition">#</a></dt>
 <dd><p>Enable tqdm for progress bar.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">setup_embedding_parallel_mode</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_auto_parallel</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_enable_build_cache</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.extended_runtime_perf_knob_config">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">extended_runtime_perf_knob_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig" title="tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig"><span class="pre">ExtendedRuntimePerfKnobConfig</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.extended_runtime_perf_knob_config" title="Link to this definition">#</a></dt>
 <dd><p>Extended runtime perf knob config.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">setup_embedding_parallel_mode</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_auto_parallel</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_enable_build_cache</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.fast_build">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">fast_build</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.fast_build" title="Link to this definition">#</a></dt>
 <dd><p>Enable fast build.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">setup_embedding_parallel_mode</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_auto_parallel</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_enable_build_cache</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
+
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.init_calib_config">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">init_calib_config</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">calib_config</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs.init_calib_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.init_calib_config" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.max_cpu_loras">
@@ -4161,21 +4519,63 @@ This is useful if you want to do some validation that requires the entire model 
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.model_config">
-<span class="sig-name descname"><span class="pre">model_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">ConfigDict</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'arbitrary_types_allowed':</span> <span class="pre">True,</span> <span class="pre">'extra':</span> <span class="pre">'allow'}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_config" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">model_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">ConfigDict</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'arbitrary_types_allowed':</span> <span class="pre">True,</span> <span class="pre">'extra':</span> <span class="pre">'forbid'}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_config" title="Link to this definition">#</a></dt>
 <dd><p>Configuration for the model, should be a dictionary conforming to [<cite>ConfigDict</cite>][pydantic.config.ConfigDict].</p>
 </dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.model_post_init">
-<span class="sig-name descname"><span class="pre">model_post_init</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">_TrtLlmArgs__context</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs.model_post_init"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_post_init" title="Link to this definition">#</a></dt>
-<dd><p>Override this method to perform additional initialization after <cite>__init__</cite> and <cite>model_construct</cite>.
-This is useful if you want to do some validation that requires the entire model to be initialized.</p>
+<span class="sig-name descname"><span class="pre">model_post_init</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">context</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Any</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_post_init" title="Link to this definition">#</a></dt>
+<dd><p>This function is meant to behave like a BaseModel method to initialise private attributes.</p>
+<p>It takes context as an argument since that’s what pydantic-core passes when calling it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>self</strong> – The BaseModel instance.</p></li>
+<li><p><strong>context</strong> – The context.</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
+
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.setup_embedding_parallel_mode">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">setup_embedding_parallel_mode</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs.setup_embedding_parallel_mode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.setup_embedding_parallel_mode" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.validate_auto_parallel">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_auto_parallel</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs.validate_auto_parallel"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_auto_parallel" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.validate_enable_build_cache">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_enable_build_cache</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TrtLlmArgs.validate_enable_build_cache"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_enable_build_cache" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TrtLlmArgs.workspace">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">workspace</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.workspace" title="Link to this definition">#</a></dt>
 <dd><p>The workspace for the model.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">setup_embedding_parallel_mode</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_auto_parallel</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_enable_build_cache</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -4515,6 +4915,7 @@ This is useful if you want to do some validation that requires the entire model 
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.W4A16_AWQ"><code class="docutils literal notranslate"><span class="pre">W4A16_AWQ</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.W4A16_GPTQ"><code class="docutils literal notranslate"><span class="pre">W4A16_GPTQ</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.W4A8_AWQ"><code class="docutils literal notranslate"><span class="pre">W4A8_AWQ</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.W4A8_MXFP4_FP8"><code class="docutils literal notranslate"><span class="pre">W4A8_MXFP4_FP8</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.W4A8_QSERVE_PER_CHANNEL"><code class="docutils literal notranslate"><span class="pre">W4A8_QSERVE_PER_CHANNEL</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.W4A8_QSERVE_PER_GROUP"><code class="docutils literal notranslate"><span class="pre">W4A8_QSERVE_PER_GROUP</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.QuantAlgo.W8A16"><code class="docutils literal notranslate"><span class="pre">W8A16</span></code></a></li>
@@ -4600,10 +5001,17 @@ This is useful if you want to do some validation that requires the entire model 
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.NGramDecodingConfig.prompt_lookup_num_tokens"><code class="docutils literal notranslate"><span class="pre">prompt_lookup_num_tokens</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig"><code class="docutils literal notranslate"><span class="pre">TorchCompileConfig</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_enable_userbuffers"><code class="docutils literal notranslate"><span class="pre">torch_compile_enable_userbuffers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_fullgraph"><code class="docutils literal notranslate"><span class="pre">torch_compile_fullgraph</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_inductor_enabled"><code class="docutils literal notranslate"><span class="pre">torch_compile_inductor_enabled</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_piecewise_cuda_graph"><code class="docutils literal notranslate"><span class="pre">torch_compile_piecewise_cuda_graph</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LlmArgs"><code class="docutils literal notranslate"><span class="pre">LlmArgs</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs"><code class="docutils literal notranslate"><span class="pre">TorchLlmArgs</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.attn_backend"><code class="docutils literal notranslate"><span class="pre">attn_backend</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.auto_deploy_config"><code class="docutils literal notranslate"><span class="pre">auto_deploy_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.autotuner_enabled"><code class="docutils literal notranslate"><span class="pre">autotuner_enabled</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.build_config"><code class="docutils literal notranslate"><span class="pre">build_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.convert_load_format"><code class="docutils literal notranslate"><span class="pre">convert_load_format</span></code></a></li>
@@ -4624,6 +5032,7 @@ This is useful if you want to do some validation that requires the entire model 
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.enable_trtllm_sampler"><code class="docutils literal notranslate"><span class="pre">enable_trtllm_sampler</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.extra_resource_managers"><code class="docutils literal notranslate"><span class="pre">extra_resource_managers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.get_pytorch_backend_config"><code class="docutils literal notranslate"><span class="pre">get_pytorch_backend_config()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.init_backend"><code class="docutils literal notranslate"><span class="pre">init_backend</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.kv_cache_dtype"><code class="docutils literal notranslate"><span class="pre">kv_cache_dtype</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.load_format"><code class="docutils literal notranslate"><span class="pre">load_format</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_cpu_loras"><code class="docutils literal notranslate"><span class="pre">max_cpu_loras</span></code></a><ul class="nav section-nav flex-column">
@@ -4651,15 +5060,11 @@ This is useful if you want to do some validation that requires the entire model 
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.moe_load_balancer"><code class="docutils literal notranslate"><span class="pre">moe_load_balancer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.moe_max_num_tokens"><code class="docutils literal notranslate"><span class="pre">moe_max_num_tokens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.print_iter_log"><code class="docutils literal notranslate"><span class="pre">print_iter_log</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_enable_userbuffers"><code class="docutils literal notranslate"><span class="pre">torch_compile_enable_userbuffers</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_enabled"><code class="docutils literal notranslate"><span class="pre">torch_compile_enabled</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_fullgraph"><code class="docutils literal notranslate"><span class="pre">torch_compile_fullgraph</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_inductor_enabled"><code class="docutils literal notranslate"><span class="pre">torch_compile_inductor_enabled</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_piecewise_cuda_graph"><code class="docutils literal notranslate"><span class="pre">torch_compile_piecewise_cuda_graph</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_config"><code class="docutils literal notranslate"><span class="pre">torch_compile_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.use_cuda_graph"><code class="docutils literal notranslate"><span class="pre">use_cuda_graph</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.use_kv_cache"><code class="docutils literal notranslate"><span class="pre">use_kv_cache</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_config"><code class="docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_max_batch_size"><code class="docutils literal notranslate"><span class="pre">validate_cuda_graph_max_batch_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_moe_load_balancer"><code class="docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs"><code class="docutils literal notranslate"><span class="pre">TrtLlmArgs</span></code></a><ul class="nav section-nav flex-column">
@@ -4689,6 +5094,7 @@ This is useful if you want to do some validation that requires the entire model 
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.enable_tqdm"><code class="docutils literal notranslate"><span class="pre">enable_tqdm</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.extended_runtime_perf_knob_config"><code class="docutils literal notranslate"><span class="pre">extended_runtime_perf_knob_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.fast_build"><code class="docutils literal notranslate"><span class="pre">fast_build</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.init_calib_config"><code class="docutils literal notranslate"><span class="pre">init_calib_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_cpu_loras"><code class="docutils literal notranslate"><span class="pre">max_cpu_loras</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id26"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id27"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
@@ -4709,6 +5115,9 @@ This is useful if you want to do some validation that requires the entire model 
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_post_init"><code class="docutils literal notranslate"><span class="pre">model_post_init()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.setup_embedding_parallel_mode"><code class="docutils literal notranslate"><span class="pre">setup_embedding_parallel_mode</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_auto_parallel"><code class="docutils literal notranslate"><span class="pre">validate_auto_parallel</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.validate_enable_build_cache"><code class="docutils literal notranslate"><span class="pre">validate_enable_build_cache</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.workspace"><code class="docutils literal notranslate"><span class="pre">workspace</span></code></a></li>
 </ul>
 </li>
@@ -4806,9 +5215,9 @@ This is useful if you want to do some validation that requires the entire model 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 09, 2025.</p>
+  <p>Last updated on June 16, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
   
 </div></div>
       

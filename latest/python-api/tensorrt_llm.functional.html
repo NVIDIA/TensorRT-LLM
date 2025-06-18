@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc1" />
+  <meta name="docsearch:version" content="0.21.0rc2" />
 
 
   </head>
@@ -449,6 +449,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/ci-overview.html">Continuous Integration Overview</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -535,8 +536,8 @@
 <dd></dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="tensorrt_llm.functional.AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM">
-<span class="sig-name descname"><span class="pre">MOE_ALLREDUCE_RESIDUAL_RMS_NORM</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">8</span></em><a class="headerlink" href="#tensorrt_llm.functional.AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="tensorrt_llm.functional.AllReduceFusionOp.MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM">
+<span class="sig-name descname"><span class="pre">MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">8</span></em><a class="headerlink" href="#tensorrt_llm.functional.AllReduceFusionOp.MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -590,6 +591,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">norm_pre_residual_weight</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.functional.Tensor" title="tensorrt_llm.functional.Tensor"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eps</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1e-06</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_allreduce</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">trigger_completion_at_end</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/functional.html#AllReduceParams"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.functional.AllReduceParams" title="Link to this definition">#</a></dt>
@@ -646,6 +648,11 @@
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.functional.AllReduceStrategy.MIN_LATENCY">
 <span class="sig-name descname"><span class="pre">MIN_LATENCY</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></em><a class="headerlink" href="#tensorrt_llm.functional.AllReduceStrategy.MIN_LATENCY" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.functional.AllReduceStrategy.MNNVL">
+<span class="sig-name descname"><span class="pre">MNNVL</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">7</span></em><a class="headerlink" href="#tensorrt_llm.functional.AllReduceStrategy.MNNVL" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -879,6 +886,34 @@ self.max = [dim 0 max, dim 1 max]</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.functional.MLPType.MLP">
 <span class="sig-name descname"><span class="pre">MLP</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></em><a class="headerlink" href="#tensorrt_llm.functional.MLPType.MLP" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.functional.MoEAllReduceParams">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.functional.</span></span><span class="sig-name descname"><span class="pre">MoEAllReduceParams</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">device_num_experts</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.functional.Tensor" title="tensorrt_llm.functional.Tensor"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">expert_scale_factor</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.functional.Tensor" title="tensorrt_llm.functional.Tensor"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">expanded_idx_to_permuted_idx</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.functional.Tensor" title="tensorrt_llm.functional.Tensor"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">shared_expert_output</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.functional.Tensor" title="tensorrt_llm.functional.Tensor"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">bias</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.functional.Tensor" title="tensorrt_llm.functional.Tensor"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">residual</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.functional.Tensor" title="tensorrt_llm.functional.Tensor"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">norm_weight</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.functional.Tensor" title="tensorrt_llm.functional.Tensor"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">scale</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.functional.Tensor" title="tensorrt_llm.functional.Tensor"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">norm_pre_residual_weight</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.functional.Tensor" title="tensorrt_llm.functional.Tensor"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">eps</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1e-06</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_allreduce</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">is_cutlass_min_latency</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/functional.html#MoEAllReduceParams"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.functional.MoEAllReduceParams" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#tensorrt_llm.functional.AllReduceParams" title="tensorrt_llm.functional.AllReduceParams"><code class="xref py py-class docutils literal notranslate"><span class="pre">AllReduceParams</span></code></a></p>
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.functional.MoEAllReduceParams.is_valid">
+<span class="sig-name descname"><span class="pre">is_valid</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/functional.html#MoEAllReduceParams.is_valid"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.functional.MoEAllReduceParams.is_valid" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1134,17 +1169,17 @@ self.max = [dim 0 max, dim 1 max]</p>
 <em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">create_sinusoidal_positions_yarn</span></span><span class="sig-paren">(</span>
 
 <dl>
-<dd><em class="sig-param"><span class="n"><span class="pre">num_pos:</span> <span class="pre">int</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">dim:</span> <span class="pre">int</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">base:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">10000</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">scaling_factor:</span> <span class="pre">float</span> <span class="pre">=</span> <span class="pre">1.0</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">original_max_position_embeddings:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">4096</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">beta_fast:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">32</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">beta_slow:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">mscale:</span> <span class="pre">float</span> <span class="pre">=</span> <span class="pre">1.0</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">mscale_all_dim:</span> <span class="pre">float</span> <span class="pre">=</span> <span class="pre">1.0</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">duplicate_data:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">dtype=&lt;class</span> <span class="pre">'numpy.float32'&gt;</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">num_pos</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">dim</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">base</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">10000</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">scaling_factor</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1.0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">original_max_position_embeddings</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">4096</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">beta_fast</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">32</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">beta_slow</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">mscale</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1.0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">mscale_all_dim</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1.0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">duplicate_data</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">torch.float32</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/functional.html#RopeEmbeddingUtils.create_sinusoidal_positions_yarn"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_yarn" title="Link to this definition">#</a></dt>
@@ -6628,7 +6663,7 @@ function creates a constant tensor.</p></li>
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceFusionOp"><code class="docutils literal notranslate"><span class="pre">AllReduceFusionOp</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceFusionOp.LAST_PROCESS_FOR_UB"><code class="docutils literal notranslate"><span class="pre">LAST_PROCESS_FOR_UB</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM"><code class="docutils literal notranslate"><span class="pre">MOE_ALLREDUCE_RESIDUAL_RMS_NORM</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceFusionOp.MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM"><code class="docutils literal notranslate"><span class="pre">MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceFusionOp.NONE"><code class="docutils literal notranslate"><span class="pre">NONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceFusionOp.RESIDUAL_RMS_NORM"><code class="docutils literal notranslate"><span class="pre">RESIDUAL_RMS_NORM</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8"><code class="docutils literal notranslate"><span class="pre">RESIDUAL_RMS_NORM_OUT_QUANT_FP8</span></code></a></li>
@@ -6649,6 +6684,7 @@ function creates a constant tensor.</p></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceStrategy.AUTO"><code class="docutils literal notranslate"><span class="pre">AUTO</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceStrategy.LOWPRECISION"><code class="docutils literal notranslate"><span class="pre">LOWPRECISION</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceStrategy.MIN_LATENCY"><code class="docutils literal notranslate"><span class="pre">MIN_LATENCY</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceStrategy.MNNVL"><code class="docutils literal notranslate"><span class="pre">MNNVL</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceStrategy.NCCL"><code class="docutils literal notranslate"><span class="pre">NCCL</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceStrategy.ONESHOT"><code class="docutils literal notranslate"><span class="pre">ONESHOT</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceStrategy.TWOSHOT"><code class="docutils literal notranslate"><span class="pre">TWOSHOT</span></code></a></li>
@@ -6686,6 +6722,10 @@ function creates a constant tensor.</p></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.MLPType.FusedGatedMLP"><code class="docutils literal notranslate"><span class="pre">FusedGatedMLP</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.MLPType.GatedMLP"><code class="docutils literal notranslate"><span class="pre">GatedMLP</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.MLPType.MLP"><code class="docutils literal notranslate"><span class="pre">MLP</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.MoEAllReduceParams"><code class="docutils literal notranslate"><span class="pre">MoEAllReduceParams</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.MoEAllReduceParams.is_valid"><code class="docutils literal notranslate"><span class="pre">is_valid()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.PositionEmbeddingType"><code class="docutils literal notranslate"><span class="pre">PositionEmbeddingType</span></code></a><ul class="nav section-nav flex-column">
@@ -7006,9 +7046,9 @@ function creates a constant tensor.</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 09, 2025.</p>
+  <p>Last updated on June 16, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
   
 </div></div>
       

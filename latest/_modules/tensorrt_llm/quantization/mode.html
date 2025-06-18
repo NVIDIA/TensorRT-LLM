@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc1" />
+  <meta name="docsearch:version" content="0.21.0rc2" />
 
 
   </head>
@@ -442,6 +442,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../reference/ci-overview.html">Continuous Integration Overview</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -551,6 +552,7 @@
     <span class="n">INT8</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">MIXED_PRECISION</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">NVFP4</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
+    <span class="n">W4A8_MXFP4_FP8</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">NO_QUANT</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span></div>
 
 
@@ -601,6 +603,8 @@
     <span class="c1"># FP4</span>
     <span class="n">NVFP4</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">NVFP4_KV_CACHE</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
+    <span class="c1"># W4A8 MXFP4</span>
+    <span class="n">W4A8_MXFP4_FP8</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
 
     <span class="c1"># The smallest power-of-two that is not used by a flag. Do not call auto() after that line.</span>
     <span class="n">COUNT</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
@@ -686,6 +690,9 @@
     <span class="k">def</span><span class="w"> </span><span class="nf">has_nvfp4</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">NVFP4</span><span class="p">)</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">has_w4a8_mxfp4_fp8</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">W4A8_MXFP4_FP8</span><span class="p">)</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">has_weight_quant</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">INT4_WEIGHTS</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">INT8_WEIGHTS</span><span class="p">)</span>
 
@@ -696,7 +703,8 @@
                               <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">FP8_QDQ</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">FP8_ROWWISE</span>
                               <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">W4A8_QSERVE</span>
                               <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">FP8_1x128_128x128</span>
-                              <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">NVFP4</span><span class="p">)</span>
+                              <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">NVFP4</span>
+                              <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">W4A8_MXFP4_FP8</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">exclude_kv_cache</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">has_quant</span>
 
@@ -731,7 +739,8 @@
                          <span class="n">use_fp8_block_scales</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                          <span class="n">use_fp8_rowwise</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                          <span class="n">use_nvfp4</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                         <span class="n">use_w4a8_qserve</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+                         <span class="n">use_w4a8_qserve</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                         <span class="n">use_w4a8_mxfp4_fp8</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
 
         <span class="k">def</span><span class="w"> </span><span class="nf">raise_error</span><span class="p">():</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unsupported combination of QuantMode args: &quot;</span>
@@ -747,7 +756,8 @@
                              <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_fp8_block_scales</span><span class="si">=}</span><span class="s2">, &quot;</span>
                              <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_fp8_rowwise</span><span class="si">=}</span><span class="s2">, &quot;</span>
                              <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_nvfp4</span><span class="si">=}</span><span class="s2">, &quot;</span>
-                             <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_w4a8_qserve</span><span class="si">=}</span><span class="s2">&quot;</span><span class="p">)</span>
+                             <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_w4a8_qserve</span><span class="si">=}</span><span class="s2">, &quot;</span>
+                             <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_w4a8_mxfp4_fp8</span><span class="si">=}</span><span class="s2">&quot;</span><span class="p">)</span>
 
         <span class="c1"># We must quantize weights when we quantize activations.</span>
         <span class="k">if</span> <span class="n">quantize_activations</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">quantize_weights</span><span class="p">:</span>
@@ -801,6 +811,9 @@
         <span class="c1"># W4A8 QServe</span>
         <span class="k">if</span> <span class="n">use_w4a8_qserve</span><span class="p">:</span>
             <span class="n">mode</span> <span class="o">=</span> <span class="n">mode</span> <span class="o">|</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">W4A8_QSERVE</span>
+
+        <span class="k">if</span> <span class="n">use_w4a8_mxfp4_fp8</span><span class="p">:</span>
+            <span class="n">mode</span> <span class="o">=</span> <span class="n">mode</span> <span class="o">|</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">W4A8_MXFP4_FP8</span>
 
         <span class="k">return</span> <span class="n">mode</span>
 
@@ -875,6 +888,8 @@
             <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">from_description</span><span class="p">(</span><span class="n">use_fp8_block_scales</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">NVFP4</span><span class="p">:</span>
             <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">from_description</span><span class="p">(</span><span class="n">use_nvfp4</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_MXFP4_FP8</span><span class="p">:</span>
+            <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">from_description</span><span class="p">(</span><span class="n">use_w4a8_mxfp4_fp8</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
 
@@ -907,6 +922,8 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">has_fp8_block_scales</span><span class="p">(),</span>
             <span class="s1">&#39;enable_nvfp4&#39;</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">has_nvfp4</span><span class="p">(),</span>
+            <span class="s1">&#39;enable_w4a8_mxfp4_fp8&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">has_w4a8_mxfp4_fp8</span><span class="p">(),</span>
             <span class="s1">&#39;fp8_kv_cache&#39;</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">(),</span>
             <span class="s1">&#39;use_weight_only&#39;</span><span class="p">:</span>
@@ -1034,9 +1051,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 09, 2025.</p>
+  <p>Last updated on June 16, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
   
 </div></div>
       

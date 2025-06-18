@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc1" />
+  <meta name="docsearch:version" content="0.21.0rc2" />
 
 
   </head>
@@ -449,6 +449,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/ci-overview.html">Continuous Integration Overview</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -859,7 +860,8 @@
 <dl class="py method">
 <dt class="sig sig-object py" id="tensorrt_llm.models.CogVLMForCausalLM.default_plugin_config">
 <span class="sig-name descname"><span class="pre">default_plugin_config</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/cogvlm/model.html#CogVLMForCausalLM.default_plugin_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.CogVLMForCausalLM.default_plugin_config" title="Link to this definition">#</a></dt>
-<dd><p>Return the default plugin config for this model, when the plugin_config value is not given in to_trt() call.
+<dd><p>Return the default plugin config for this model.</p>
+<p>This is used when the plugin_config value is not given in to_trt() call.
 If users need to set different plugin configs, they can start from the return object and change it.</p>
 </dd></dl>
 
@@ -876,10 +878,16 @@ If users need to set different plugin configs, they can start from the return ob
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/cogvlm/model.html#CogVLMForCausalLM.from_hugging_face"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.CogVLMForCausalLM.from_hugging_face" title="Link to this definition">#</a></dt>
-<dd><p>Create LLM object and load weights from hugging face
-:param hf_model_dir: the hugging face model directory
-:param dtype: str, the default weights data type when loading from the hugging face model
-:param mapping: Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p>
+<dd><p>Create LLM object and load weights from hugging face.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hf_model_dir</strong> – the hugging face model directory</p></li>
+<li><p><strong>dtype</strong> – str, the default weights data type when loading from the hugging face model</p></li>
+<li><p><strong>mapping</strong> – Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py method">
@@ -1044,8 +1052,12 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/enc_dec/model.html#DecoderModel.use_lora"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.DecoderModel.use_lora" title="Link to this definition">#</a></dt>
-<dd><p>Load lora weights from the give config to the module
-:param lora_config: the lora config</p>
+<dd><p>Load lora weights from the give config to the module.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>lora_config</strong> – the lora config</p>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -1073,10 +1085,16 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/deepseek_v1/model.html#DeepseekForCausalLM.from_hugging_face"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.DeepseekForCausalLM.from_hugging_face" title="Link to this definition">#</a></dt>
-<dd><p>Create LLM object and load weights from hugging face
-:param hf_model_dir: the hugging face model directory
-:param dtype: str, the default weights data type when loading from the hugging face model
-:param mapping: Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p>
+<dd><p>Create LLM object and load weights from hugging face.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hf_model_dir</strong> – the hugging face model directory</p></li>
+<li><p><strong>dtype</strong> – str, the default weights data type when loading from the hugging face model</p></li>
+<li><p><strong>mapping</strong> – Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -1107,10 +1125,16 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/deepseek_v2/model.html#DeepseekV2ForCausalLM.from_hugging_face"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.DeepseekV2ForCausalLM.from_hugging_face" title="Link to this definition">#</a></dt>
-<dd><p>Create LLM object and load weights from hugging face
-:param hf_model_dir: the hugging face model directory
-:param dtype: str, the default weights data type when loading from the hugging face model
-:param mapping: Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p>
+<dd><p>Create LLM object and load weights from hugging face.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hf_model_dir</strong> – the hugging face model directory</p></li>
+<li><p><strong>dtype</strong> – str, the default weights data type when loading from the hugging face model</p></li>
+<li><p><strong>mapping</strong> – Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -1292,14 +1316,18 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/enc_dec/model.html#EncoderModel.use_lora"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.EncoderModel.use_lora" title="Link to this definition">#</a></dt>
-<dd><p>Load lora weights from the give config to the module
-:param lora_config: the lora config</p>
+<dd><p>Load lora weights from the give config to the module.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>lora_config</strong> – the lora config</p>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="tensorrt_llm.models.EncoderModel.use_prompt_tuning">
 <span class="sig-name descname"><span class="pre">use_prompt_tuning</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/enc_dec/model.html#EncoderModel.use_prompt_tuning"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.EncoderModel.use_prompt_tuning" title="Link to this definition">#</a></dt>
-<dd><p>Enable p tuning when build the TRT engine, call this before to_trt</p>
+<dd><p>Enable p tuning when build the TRT engine, call this before to_trt.</p>
 </dd></dl>
 
 </dd></dl>
@@ -1531,8 +1559,12 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/gpt/model.html#GPTForCausalLM.use_lora"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.GPTForCausalLM.use_lora" title="Link to this definition">#</a></dt>
-<dd><p>Load lora weights from the give config to the module
-:param lora_config: the lora config</p>
+<dd><p>Load lora weights from the give config to the module.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>lora_config</strong> – the lora config</p>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -1587,10 +1619,16 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/gptj/model.html#GPTJForCausalLM.from_hugging_face"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.GPTJForCausalLM.from_hugging_face" title="Link to this definition">#</a></dt>
-<dd><p>Create LLM object and load weights from hugging face
-:param hf_model_dir: the hugging face model directory
-:param dtype: str, the default weights data type when loading from the hugging face model
-:param mapping: Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p>
+<dd><p>Create LLM object and load weights from hugging face.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hf_model_dir</strong> – the hugging face model directory</p></li>
+<li><p><strong>dtype</strong> – str, the default weights data type when loading from the hugging face model</p></li>
+<li><p><strong>mapping</strong> – Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -1811,10 +1849,16 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/gemma/model.html#GemmaForCausalLM.from_hugging_face"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.GemmaForCausalLM.from_hugging_face" title="Link to this definition">#</a></dt>
-<dd><p>Create LLM object and load weights from hugging face
-:param hf_model_dir: the hugging face model directory
-:param dtype: str, the default weights data type when loading from the hugging face model
-:param mapping: Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p>
+<dd><p>Create LLM object and load weights from hugging face.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hf_model_dir</strong> – the hugging face model directory</p></li>
+<li><p><strong>dtype</strong> – str, the default weights data type when loading from the hugging face model</p></li>
+<li><p><strong>mapping</strong> – Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py method">
@@ -1844,8 +1888,12 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/models/gemma/model.html#GemmaForCausalLM.use_lora"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.GemmaForCausalLM.use_lora" title="Link to this definition">#</a></dt>
-<dd><p>Load lora weights from the give config to the module
-:param lora_config: the lora config</p>
+<dd><p>Load lora weights from the give config to the module.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>lora_config</strong> – the lora config</p>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -1923,7 +1971,8 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="tensorrt_llm.models.LLaMAForCausalLM.default_plugin_config">
 <span class="sig-name descname"><span class="pre">default_plugin_config</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/llama/model.html#LLaMAForCausalLM.default_plugin_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.LLaMAForCausalLM.default_plugin_config" title="Link to this definition">#</a></dt>
-<dd><p>Return the default plugin config for this model, when the plugin_config value is not given in to_trt() call.
+<dd><p>Return the default plugin config for this model.</p>
+<p>This is used when the plugin_config value is not given in to_trt() call.
 If users need to set different plugin configs, they can start from the return object and change it.</p>
 </dd></dl>
 
@@ -1991,8 +2040,12 @@ If users need to set different plugin configs, they can start from the return ob
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/llama/model.html#LLaMAForCausalLM.use_lora"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.LLaMAForCausalLM.use_lora" title="Link to this definition">#</a></dt>
-<dd><p>Load lora weights from the give config to the module
-:param lora_config: the lora config</p>
+<dd><p>Load lora weights from the give config to the module.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>lora_config</strong> – the lora config</p>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -2185,8 +2238,12 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/mllama/model.html#MLLaMAForCausalLM.use_lora"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.MLLaMAForCausalLM.use_lora" title="Link to this definition">#</a></dt>
-<dd><p>Load lora weights from the give config to the module
-:param lora_config: the lora config</p>
+<dd><p>Load lora weights from the give config to the module.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>lora_config</strong> – the lora config</p>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -2265,10 +2322,16 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/mamba/model.html#MambaForCausalLM.from_hugging_face"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.MambaForCausalLM.from_hugging_face" title="Link to this definition">#</a></dt>
-<dd><p>Create LLM object and load weights from hugging face
-:param hf_model_dir: the hugging face model directory
-:param dtype: str, the default weights data type when loading from the hugging face model
-:param mapping: Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p>
+<dd><p>Create LLM object and load weights from hugging face.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hf_model_dir</strong> – the hugging face model directory</p></li>
+<li><p><strong>dtype</strong> – str, the default weights data type when loading from the hugging face model</p></li>
+<li><p><strong>mapping</strong> – Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py method">
@@ -2358,10 +2421,16 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/medusa/model.html#MedusaForCausalLm.from_hugging_face"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.MedusaForCausalLm.from_hugging_face" title="Link to this definition">#</a></dt>
-<dd><p>Create LLM object and load weights from hugging face
-:param hf_model_dir: the hugging face model directory
-:param dtype: str, the default weights data type when loading from the hugging face model
-:param mapping: Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p>
+<dd><p>Create LLM object and load weights from hugging face.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hf_model_dir</strong> – the hugging face model directory</p></li>
+<li><p><strong>dtype</strong> – str, the default weights data type when loading from the hugging face model</p></li>
+<li><p><strong>mapping</strong> – Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -2426,10 +2495,16 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/phi3/model.html#Phi3ForCausalLM.from_hugging_face"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.Phi3ForCausalLM.from_hugging_face" title="Link to this definition">#</a></dt>
-<dd><p>Create LLM object and load weights from hugging face
-:param hf_model_dir: the hugging face model directory
-:param dtype: str, the default weights data type when loading from the hugging face model
-:param mapping: Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p>
+<dd><p>Create LLM object and load weights from hugging face.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hf_model_dir</strong> – the hugging face model directory</p></li>
+<li><p><strong>dtype</strong> – str, the default weights data type when loading from the hugging face model</p></li>
+<li><p><strong>mapping</strong> – Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py method">
@@ -2441,8 +2516,12 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/phi3/model.html#Phi3ForCausalLM.use_lora"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.Phi3ForCausalLM.use_lora" title="Link to this definition">#</a></dt>
-<dd><p>Load lora weights from the give config to the module
-:param lora_config: the lora config</p>
+<dd><p>Load lora weights from the give config to the module.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>lora_config</strong> – the lora config</p>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -2507,10 +2586,16 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/phi/model.html#PhiForCausalLM.from_hugging_face"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.PhiForCausalLM.from_hugging_face" title="Link to this definition">#</a></dt>
-<dd><p>Create LLM object and load weights from hugging face
-:param hf_model_dir: the hugging face model directory
-:param dtype: str, the default weights data type when loading from the hugging face model
-:param mapping: Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p>
+<dd><p>Create LLM object and load weights from hugging face.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hf_model_dir</strong> – the hugging face model directory</p></li>
+<li><p><strong>dtype</strong> – str, the default weights data type when loading from the hugging face model</p></li>
+<li><p><strong>mapping</strong> – Mapping, specify the multi-gpu parallel strategy, when it’s None, single GPU is used</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py method">
@@ -2522,8 +2607,12 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/models/phi/model.html#PhiForCausalLM.use_lora"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.models.PhiForCausalLM.use_lora" title="Link to this definition">#</a></dt>
-<dd><p>Load lora weights from the give config to the module
-:param lora_config: the lora config</p>
+<dd><p>Load lora weights from the give config to the module.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>lora_config</strong> – the lora config</p>
+</dd>
+</dl>
 </dd></dl>
 
 </dd></dl>
@@ -3580,9 +3669,9 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 09, 2025.</p>
+  <p>Last updated on June 16, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/9c012d5">9c012d5</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
   
 </div></div>
       
