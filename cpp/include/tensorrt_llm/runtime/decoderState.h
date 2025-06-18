@@ -48,12 +48,12 @@ public:
     using DecodingInputPtr = std::unique_ptr<DecodingInput>;
     using DecodingOutputPtr = std::unique_ptr<DecodingOutput>;
 
-    DecoderState(nvinfer1::DataType dtype, BufferManager const& bufferManager);
+    DecoderState();
 
     //! @brief Setup buffers for the decoder excluding speculative decoding.
     void setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
-        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, ModelConfig const& modelConfig,
-        WorldConfig const& worldConfig, BufferManager const& bufferManager);
+        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType dtype,
+        ModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& bufferManager);
 
     //! @brief Setup buffers for the cache indirection.
     //! @details This is used for beam search on pipeline parallel ranks without a decoder.
@@ -188,9 +188,13 @@ public:
     [[nodiscard]] DecodingOutput& getJointDecodingOutput() const;
 
 private:
+    void setupBuffers(nvinfer1::DataType dtype, BufferManager const& bufferManager);
+    void reshapeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+        SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, ModelConfig const& modelConfig,
+        WorldConfig const& worldConfig, BufferManager const& bufferManager);
+
     void setupSpeculativeDecodingBuffers(
         SpeculativeDecodingMode speculativeDecodingMode, nvinfer1::DataType dtype, BufferManager const& bufferManager);
-
     void reshapeSpeculativeDecodingBuffers(SpeculativeDecodingMode const& speculativeDecodingMode,
         SizeType32 maxTokensPerEngineStep, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
         BufferManager const& bufferManager);

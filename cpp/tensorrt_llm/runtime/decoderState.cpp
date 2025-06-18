@@ -45,7 +45,26 @@ void BeamSearchBuffers::reshape(SizeType32 maxBeamWidth, SizeType32 maxSequenceL
     mCumLogProbsTmp->reshape(ITensor::makeShape({1, maxBeamWidth}));
 }
 
-DecoderState::DecoderState(nvinfer1::DataType dtype, BufferManager const& bufferManager)
+DecoderState::DecoderState()
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    mJointDecodingInput = std::make_unique<DecodingInput>();
+    mJointDecodingOutput = std::make_unique<DecodingOutput>();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+    SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+    WorldConfig const& worldConfig, BufferManager const& bufferManager)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    setupBuffers(dtype, bufferManager);
+    reshapeBuffers(maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength, modelConfig,
+        worldConfig, bufferManager);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void DecoderState::setupBuffers(nvinfer1::DataType dtype, BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
@@ -53,7 +72,6 @@ DecoderState::DecoderState(nvinfer1::DataType dtype, BufferManager const& buffer
     auto constexpr nvFloatType = TRTDataType<float>::value;
 
     auto& dInput = mJointDecodingInput;
-    dInput = std::make_unique<DecodingInput>();
     TLLM_CHECK(static_cast<bool>(dInput));
     dInput->logits = bufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dInput->endIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
@@ -63,7 +81,6 @@ DecoderState::DecoderState(nvinfer1::DataType dtype, BufferManager const& buffer
     dInput->lengths = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
 
     auto& dOutput = mJointDecodingOutput;
-    dOutput = std::make_unique<DecodingOutput>();
     TLLM_CHECK(static_cast<bool>(dOutput));
     dOutput->ids = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
     dOutput->gatheredIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
@@ -183,7 +200,7 @@ void DecoderState::setupSpeculativeDecodingBuffers(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+void DecoderState::reshapeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
     SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig, BufferManager const& bufferManager)
 {
