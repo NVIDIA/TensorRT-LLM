@@ -1,4 +1,3 @@
-import enum
 import inspect
 import os
 from contextlib import contextmanager
@@ -9,15 +8,6 @@ import torch
 import torch.nn as nn
 
 import tensorrt_llm
-
-
-class DumpStyle(enum.IntEnum):
-    BINARY = 1
-    TEXT = 2
-
-
-class DebugFeatures(enum.IntEnum):
-    DUMPTENSOR = 1
 
 
 # A context container which contains the running states, such as the layer structures,
@@ -38,7 +28,6 @@ class DebuggerContext:
         self.forward_pre_hook_handles = {}
         self.log_folder = dest_folder
         self.is_pre_forward = True
-        self.dump_style: DumpStyle = DumpStyle.BINARY
         self.is_log_folder_inited: bool = False
 
     def set_log_folder(self, log_folder):
@@ -143,11 +132,18 @@ def set_current_debug_ctx(ctx):
     debug_ctx = ctx
 
 
-# The hook is registered to module with torch.nn.modules.module.register_module_forward_pre_hook.
-# This hook will be executed before module's forward is called.
-# It will record module tree into debugCtx and call debugCtx's do_actions function
-# to execute all hooks registered to debugCtx on current module.
 def module_pre_forward(module: nn.Module, input: torch.Tensor):
+    """
+    The hook is registered to module with torch.nn.modules.module.register_module_forward_pre_hook.
+    This hook will be executed before module's forward is called.
+    It will record module tree into debugCtx and call debugCtx's do_actions function
+    to execute all hooks registered to debugCtx on current module.
+    Args:
+        module (nn.Module): the module this hook is executed on.
+        input (torch.Tensor): the input tensors of module.forward.
+    Returns:
+        the input tensors
+    """
     debug_ctx = get_current_debug_ctx()
     debug_ctx.mark_in_pre_forward(True)
     name = module.name if hasattr(module, "name") else module.__class__.__name__
@@ -167,12 +163,20 @@ def module_pre_forward(module: nn.Module, input: torch.Tensor):
     return input
 
 
-# The hook is registered to module with torch.nn.modules.module.register_module_forward_hook.
-# This hook will be executed before module's forward is called.
-# It will record module tree into debugCtx and call debugCtx's do_actions function
-# to execute all hooks registered to debugCtx on current module.
 def module_after_forward(module: nn.Module, input: torch.Tensor,
                          output: torch.Tensor):
+    """
+    The hook is registered to module with torch.nn.modules.module.register_module_forward_hook.
+    This hook will be executed before module's forward is called.
+    It will record module tree into debugCtx and call debugCtx's do_actions function
+    to execute all hooks registered to debugCtx on current module.
+    Args:
+        module (nn.Module): the module this hook is executed on.
+        input (torch.Tensor): the input tensors of module.forward.
+        output (torch.Tensor): the output tensors returned from module.forward.
+    Returns:
+        the input tensors
+    """
     debug_ctx = get_current_debug_ctx()
     debug_ctx.mark_in_pre_forward(False)
     debug_ctx.do_actions(module, [input, output],
@@ -182,22 +186,28 @@ def module_after_forward(module: nn.Module, input: torch.Tensor,
     return output
 
 
-# The function style to interface to enable debugger on all classes inherit from nn.Module.
-# Example:
-#       from tensorrt_llm._torch.debug.debug_hook import enable_debug_all_modules
-#       model_config = ModelConfig(pretrained_config=llama_config,
-#                                   attn_backend=backend)
-#       llama = LlamaForCausalLM(model_config).to(dtype).to(device)
-#       llama.load_weights(hf_llama.state_dict())
-#       with torch.inference_mode():
-#           enable_debug_all_modules(r"tensor_dump"):
-#           attn_metadata.prepare()
-#           logits = llama.forward(input_ids=input_ids,
-#                                   position_ids=position_ids,
-#                                   attn_metadata=attn_metadata)
-#
-# Note: this method need user to disable debug by calling disable_debug_all_modules
 def enable_debug_all_modules(dest_folder: Optional[str] = None, ):
+    """
+    The function style to interface to enable debugger on all classes inherit from nn.Module.
+    Example:
+          from tensorrt_llm._torch.debug.debug_hook import enable_debug_all_modules
+          model_config = ModelConfig(pretrained_config=llama_config,
+                                      attn_backend=backend)
+          llama = LlamaForCausalLM(model_config).to(dtype).to(device)
+          llama.load_weights(hf_llama.state_dict())
+          with torch.inference_mode():
+              enable_debug_all_modules(r"tensor_dump"):
+              attn_metadata.prepare()
+              logits = llama.forward(input_ids=input_ids,
+                                      position_ids=position_ids,
+                                      attn_metadata=attn_metadata)
+
+    Note: this method need user to disable debug by calling disable_debug_all_modules
+    Args:
+        dest_folder: the working directory where the hook dumped data/info to.
+    Returns:
+        None
+    """
     assert get_current_debug_ctx() is None, ""
     debug_ctx = DebuggerContext(dest_folder)
     set_current_debug_ctx(debug_ctx)
@@ -213,11 +223,6 @@ def enable_debug_all_modules(dest_folder: Optional[str] = None, ):
         debug_ctx.module_forward_hook_handle = torch.nn.modules.module.register_module_forward_hook(
             module_after_forward)
 
-    # TODO: Use ENV to enable debug features
-    # features: DebugFeatures = DebugFeatures.DUMPTENSOR
-    # if features | DebugFeatures.DUMPTENSOR:
-    #     register_tensor_dump_hook(debug_ctx)
-
 
 def disable_debug_all_modules():
     assert get_current_debug_ctx() is not None, ""
@@ -225,31 +230,45 @@ def disable_debug_all_modules():
     set_current_debug_ctx(None)
 
 
-# The context manager style interface to enable debugger on all classes inherit from nn.Module.
-# Example:
-#       from tensorrt_llm._torch.debug.debug_hook import debugger_addon_all_modules
-#       model_config = ModelConfig(pretrained_config=llama_config,
-#                                   attn_backend=backend)
-#       llama = LlamaForCausalLM(model_config).to(dtype).to(device)
-#       llama.load_weights(hf_llama.state_dict())
-#        with torch.inference_mode() and debugger_addon_all_modules(r"tensor_dump"):
-#            attn_metadata.prepare()
-#            logits = llama.forward(input_ids=input_ids,
-#                                   position_ids=position_ids,
-#                                   attn_metadata=attn_metadata)
 @contextmanager
 def debugger_addon_all_modules(dest_folder: Optional[str] = None):
+    """
+    The context manager style interface to enable debugger on all classes inherit from nn.Module.
+    Example:
+          from tensorrt_llm._torch.debug.debug_hook import debugger_addon_all_modules
+          model_config = ModelConfig(pretrained_config=llama_config,
+                                      attn_backend=backend)
+          llama = LlamaForCausalLM(model_config).to(dtype).to(device)
+          llama.load_weights(hf_llama.state_dict())
+           with torch.inference_mode() and debugger_addon_all_modules(r"tensor_dump"):
+               attn_metadata.prepare()
+               logits = llama.forward(input_ids=input_ids,
+                                      position_ids=position_ids,
+                                      attn_metadata=attn_metadata)
+    Args:
+        dest_folder: the working directory where the hook dumped data/info to.
+    Returns:
+        None
+    """
     try:
         enable_debug(dest_folder, filter)
     finally:
         disable_debug()
 
 
-# The hook is registered to module with module.register_forward_pre_hook.
-# This hook will be executed before module's forward is called.
-# It will record module tree into debugCtx and call debugCtx's do_actions function
-# to execute all hooks registered to debugCtx on current module.
 def pre_forward(module: nn.Module, args, kwargs):
+    """
+    The hook is registered to module with module.register_forward_pre_hook.
+    This hook will be executed before module's forward is called.
+    It will record module tree into debugCtx and call debugCtx's do_actions function
+    to execute all hooks registered to debugCtx on current module.
+    Args:
+        module (nn.Module): the module this hook is executed on.
+        args: the positional args of module.forward.
+        kwargs (dict): the kwargs to module.forward
+    Returns:
+        None
+    """
     name = module.name if hasattr(module, "name") else module.__class__.__name__
     debug_ctx = get_current_debug_ctx()
     assert debug_ctx is not None, "DebugContext instance shall not be None."
@@ -270,11 +289,20 @@ def pre_forward(module: nn.Module, args, kwargs):
     return None
 
 
-# The hook is registered to module with module.register_forward_hook.
-# This hook will be executed after module's forward is called.
-# It will remove module from debugCtx and call debugCtx's do_actions function
-# to execute all hooks registered to debugCtx on current module.
 def after_forward(module: nn.Module, args, kwargs, output):
+    """
+    The hook is registered to module with module.register_forward_hook.
+    This hook will be executed after module's forward is called.
+    It will remove module from debugCtx and call debugCtx's do_actions function
+    to execute all hooks registered to debugCtx on current module.
+    Args:
+        module (nn.Module): the module this hook is executed on.
+        args: the positional args of module.forward.
+        kwargs (dict): the kwargs to module.forward
+        output: the returned values (tensors) from module.forward()
+    Returns:
+        None
+    """
     debug_ctx = get_current_debug_ctx()
     debug_ctx.mark_in_pre_forward(False)
     debug_ctx.do_actions(module, [args, output],
@@ -288,24 +316,32 @@ def after_forward(module: nn.Module, args, kwargs, output):
     return None
 
 
-# The function style to interface to enable debugger on model.
-# If filter is provided, it will be used to filter out satisfied module to register hook.
-# If filter is not provided, all modules will be registered with hooks.
-# Example:
-#       from tensorrt_llm._torch.debug.debug_hook import enable_debug
-#       model_config = ModelConfig(pretrained_config=llama_config,
-#                                   attn_backend=backend)
-#       llama = LlamaForCausalLM(model_config).to(dtype).to(device)
-#       llama.load_weights(hf_llama.state_dict())
-#       with torch.inference_mode():
-#           enable_debug(llama, r"tensor_dump"):
-#           attn_metadata.prepare()
-#           logits = llama.forward(input_ids=input_ids,
-#                                   position_ids=position_ids,
-#                                   attn_metadata=attn_metadata)
-#
-# Note: this method need user to disable debug by calling disable_debug
 def enable_debug(model, dest_folder: Optional[str] = None, filter=None):
+    """
+    The function style to interface to enable debugger on model.
+    If filter is provided, it will be used to filter out satisfied module to register hook.
+    If filter is not provided, all modules will be registered with hooks.
+    Example:
+        from tensorrt_llm._torch.debug.debug_hook import enable_debug
+        model_config = ModelConfig(pretrained_config=llama_config,
+                                    attn_backend=backend)
+        llama = LlamaForCausalLM(model_config).to(dtype).to(device)
+        llama.load_weights(hf_llama.state_dict())
+        with torch.inference_mode():
+            enable_debug(llama, r"tensor_dump"):
+            attn_metadata.prepare()
+            logits = llama.forward(input_ids=input_ids,
+                                    position_ids=position_ids,
+                                    attn_metadata=attn_metadata)
+
+    Note: this method need user to disable debug by calling disable_debug
+    Args:
+        model (nn.Module): the model to enable debug hook.
+        dest_folder: the working directory set to debug context to set where the hook dumped data/info.
+        filter: a filter to decide what modules will be registered with debug hook.
+    Returns:
+        None
+    """
     debug_ctx = get_current_debug_ctx()
     assert debug_ctx is None, "DebugContext shall be None when enable debugger context."
     debug_ctx = DebuggerContext(dest_folder)
@@ -331,14 +367,11 @@ def enable_debug(model, dest_folder: Optional[str] = None, filter=None):
                     submodule] = submodule.register_forward_pre_hook(
                         pre_forward, with_kwargs=True)
 
-    # TODO: Use ENV to enable debug features
-    # features: DebugFeatures = DebugFeatures.DUMPTENSOR
-    # if features | DebugFeatures.DUMPTENSOR:
-    #     register_tensor_dump_hook(debug_ctx)
 
-
-# The function style to interface to disable debugger on model.
 def disable_debug():
+    """
+    The function style to interface to disable debugger on model.
+    """
     debug_ctx = get_current_debug_ctx()
     assert debug_ctx is not None, "DebugContext shall be None when enable debugger context."
     debug_ctx.clear_state()
@@ -353,22 +386,30 @@ def disable_debug():
     set_current_debug_ctx(None)
 
 
-# The context manager style interface to enable debugger on model.
-# If filter is provided, it will be used to filter out satisfied module to register hook.
-# If filter is not provided, all modules will be registered with hooks.
-# Example:
-#       from tensorrt_llm._torch.debug.debug_hook import debug_mode
-#       model_config = ModelConfig(pretrained_config=llama_config,
-#                                   attn_backend=backend)
-#       llama = LlamaForCausalLM(model_config).to(dtype).to(device)
-#       llama.load_weights(hf_llama.state_dict())
-#        with torch.inference_mode() and debug_mode(llama, r"tensor_dump"):
-#            attn_metadata.prepare()
-#            logits = llama.forward(input_ids=input_ids,
-#                                   position_ids=position_ids,
-#                                   attn_metadata=attn_metadata)
 @contextmanager
 def debug_mode(model, dest_folder: Optional[str] = None, filter=None):
+    """
+    The context manager style interface to enable debugger on model.
+    If filter is provided, it will be used to filter out satisfied module to register hook.
+    If filter is not provided, all modules will be registered with hooks.
+    Example:
+        from tensorrt_llm._torch.debug.debug_hook import debug_mode
+        model_config = ModelConfig(pretrained_config=llama_config,
+                                    attn_backend=backend)
+        llama = LlamaForCausalLM(model_config).to(dtype).to(device)
+        llama.load_weights(hf_llama.state_dict())
+        with torch.inference_mode() and debug_mode(llama, r"tensor_dump"):
+            attn_metadata.prepare()
+            logits = llama.forward(input_ids=input_ids,
+                                    position_ids=position_ids,
+                                    attn_metadata=attn_metadata)
+    Args:
+        model (nn.Module): the model to enable debug hook.
+        dest_folder: the working directory set to debug context to set where the hook dumped data/info.
+        filter: a filter to decide what modules will be registered with debug hook.
+    Returns:
+        None
+    """
     try:
         enable_debug(model, dest_folder, filter)
         yield model
@@ -456,5 +497,5 @@ def dump_tensor(module: nn.Module, data_tensor, debug_ctx: DebuggerContext):
 def register_tensor_dump_hook():
     debug_ctx = get_current_debug_ctx()
     assert debug_ctx is not None, ""
-    # debug_ctx.register_pre_forward_action(DumpTensorFilter(), dump_tensor)
+    debug_ctx.register_pre_forward_action(DumpTensorFilter(), dump_tensor)
     debug_ctx.register_after_forward_action(DumpTensorFilter(), dump_tensor)
