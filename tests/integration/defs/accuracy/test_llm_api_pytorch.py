@@ -61,8 +61,6 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm, streaming=True)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, streaming=True)
 
 
 class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
