@@ -92,3 +92,8 @@ nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
     accuracy: 94.16
 kanana-1.5-2.1b-instruct-2505:
   - accuracy: 75.81
+speakleash/Bielik-11B-v2.2-Instruct:
+  - accuracy: 41.51
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 40.41
