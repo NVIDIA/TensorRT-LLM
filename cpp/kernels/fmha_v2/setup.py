@@ -189,7 +189,8 @@ namespace kernels
 ns_close = r"""
 // clang-format on
 } // namespace kernels
-} // namespace tensorrt_llm""" if generate_cu_trtllm else ""
+} // namespace tensorrt_llm
+""" if generate_cu_trtllm else ""
 
 copyright = '''\
 /***************************************************************************************************
@@ -1430,7 +1431,6 @@ using Ktraits = {kernel_traits_header}
                 {loop_step},
                 {kv_loop_step},
                 {head_size},
-                {head_size_v},
                 {q_tile_buffers},
                 {kv_tile_buffers},
                 NUM_COMPUTE_GROUPS,
@@ -1453,7 +1453,6 @@ using Ktraits_causal = {kernel_traits_header}
                        {loop_step},
                        {kv_loop_step},
                        {head_size},
-                       {head_size_v},
                        {q_tile_buffers},
                        {kv_tile_buffers},
                        NUM_COMPUTE_GROUPS,
@@ -1473,7 +1472,6 @@ using Ktraits_sliding_or_chunked_causal = {kernel_traits_header}
                                       {loop_step},
                                       {kv_loop_step},
                                       {head_size},
-                                      {head_size_v},
                                       {q_tile_buffers},
                                       {kv_tile_buffers},
                                       NUM_COMPUTE_GROUPS,
@@ -1493,7 +1491,6 @@ using Ktraits_custom_mask = {kernel_traits_header}
                             {loop_step},
                             {kv_loop_step},
                             {head_size},
-                            {head_size_v},
                             {q_tile_buffers},
                             {kv_tile_buffers},
                             NUM_COMPUTE_GROUPS,
@@ -2884,7 +2881,6 @@ def get_kernel_traits_code(specs_names):
                                   {loop_step},
                                   {kv_loop_step},
                                   {head_size},
-                                  {head_size_v},
                                   {q_tile_buffers},
                                   {kv_tile_buffers},
                                   NUM_COMPUTE_GROUPS,
@@ -3059,8 +3055,8 @@ def get_cubin_header(kernel_traits, specs_names):
     cubins_dict = {}
     cubin_lens_dict = {}
     for kspec, fname, lname, kname in specs_names:
-        # only generate hopper sage cubin header
-        if generate_cu_trtllm and not ('sage' in kname and 'sm90' in kname):
+        # only generate hopper cubin header
+        if generate_cu_trtllm and not 'sm90' in kname:
             continue
         name = fname.replace('.', '_')
         data = 'extern unsigned char cubin_{name}_cubin[];'.format(name=name)
@@ -3213,7 +3209,7 @@ def get_cubin_header(kernel_traits, specs_names):
             if generate_cu_trtllm:
 
                 def get_lname_from_kname(kname: str) -> str:
-                    if 'sage' in kname and 'sm90' in kname:
+                    if 'sm90' in kname:
                         return 'nullptr'
                     lname = kname.replace('_kernel', '')
                     mask_types = [
@@ -3232,7 +3228,7 @@ def get_cubin_header(kernel_traits, specs_names):
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
 {is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {lname}}}\
-'''.format(**locals()) if 'sage' in kname and 'sm90' in kname else '''\
+'''.format(**locals()) if 'sm90' in kname else '''\
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
 0, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
@@ -3342,6 +3338,7 @@ static const struct FusedMultiHeadAttentionKernelMetaInfoV2
 {metadata_v2}
 }};
 {local_ns_close}
+
 '''.format(**locals(), copyright=copyright)
 
     else:
@@ -3407,6 +3404,111 @@ static const struct TestMetaV2
     return code
 
 
+def modify_cubin_header(cubin_header):
+    # for paged context fmha cases
+    target = "#ifndef EXCLUDE_SM_90"
+
+    first_addition = """extern unsigned char cubin_fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_tma_ws_sm90_cu_cubin[];
+extern unsigned char cubin_fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_tma_ws_sm90_cu_cubin[];"""
+
+    second_addition = """extern uint32_t cubin_fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_tma_ws_sm90_cu_cubin_len;
+extern uint32_t cubin_fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_tma_ws_sm90_cu_cubin_len;"""
+
+    third_addition = """{ DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 128, 192, 128, 0, 0, 0, kSM_90, cubin_fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_bf16_64_128_S_qkv_192x128_causal_tma_ws_sm90_kernel", 213248, 384, 64, 1, 0, false, true, true, true, false, false, false, false, nullptr},
+{ DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 128, 192, 128, 0, 0, 0, kSM_90, cubin_fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_tma_ws_sm90_cu_cubin, cubin_fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_tma_ws_sm90_cu_cubin_len, "fmha_v2_flash_attention_bf16_64_128_S_q_paged_kv_192x128_causal_tma_ws_sm90_kernel", 213248, 384, 64, 1, 2, false, true, true, true, false, false, false, false, nullptr},"""
+
+    result = cubin_header
+    offset = 0
+    pos = -1
+
+    def add_kernel_line(result, target, addition, pos, offset):
+        if pos == -1:
+            pos = result.find(target)
+        else:
+            pos = result.find(target, pos + len(target) + offset)
+        if pos != -1:
+            end_pos = result.find('\n', pos)
+            if end_pos == -1:
+                end_pos = len(result)
+            result = result[:end_pos + 1] + addition + result[end_pos:]
+            offset += len(addition)
+        return result, offset, pos
+
+    result, offset, pos = add_kernel_line(result, target, first_addition, pos,
+                                          offset)
+
+    result, offset, pos = add_kernel_line(result, target, second_addition, pos,
+                                          offset)
+
+    result, offset, pos = add_kernel_line(result, target, third_addition, pos,
+                                          offset)
+
+    # for CI cases
+    def add_kernel_line(result, target, addition):
+        pos = result.find(target)
+        if pos != -1:
+            end_pos = result.find('\n', pos)
+            if end_pos == -1:
+                end_pos = len(result)
+            result = result[:end_pos + 1] + addition + result[end_pos:]
+        return result
+
+    target = "#ifndef EXCLUDE_SM_89"
+    addition = """extern unsigned char cubin_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_cu_cubin[];
+extern uint32_t cubin_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_cu_cubin_len;
+extern unsigned char cubin_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_paged_kv_576x512_output_bf16_sm89_cu_cubin[];
+extern uint32_t cubin_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_paged_kv_576x512_output_bf16_sm89_cu_cubin_len;"""
+    result = add_kernel_line(result, target, addition)
+
+    target = "#ifndef EXCLUDE_SM_86"
+    addition = """extern unsigned char cubin_fmha_v2_flash_attention_bf16_64_32_S_q_paged_kv_64_sm86_cu_cubin[];
+extern uint32_t cubin_fmha_v2_flash_attention_bf16_64_32_S_q_paged_kv_64_sm86_cu_cubin_len;"""
+    result = add_kernel_line(result, target, addition)
+
+    target = "#ifndef EXCLUDE_SM_80"
+    addition = """extern unsigned char cubin_fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_sm80_cu_cubin[];
+extern uint32_t cubin_fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_sm80_cu_cubin_len;
+extern unsigned char cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin[];
+extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len;"""
+    result = add_kernel_line(result, target, addition)
+
+    def modify_kernel_line(result, target, new_line):
+        lines = result.split('\n')
+        for i, line in enumerate(lines):
+            if target in line:
+                lines[i] = new_line
+                break
+        return '\n'.join(lines)
+
+    target = "fmha_v2_flash_attention_bf16_64_32_S_qkv_128_causal_sm89_kernel_nl"
+    new_line = '{ DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 32, 128, 128, 0, 0, 0, kSM_89, cubin_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_cu_cubin, cubin_fmha_v2_flash_attention_bf16_64_32_S_qkv_128_sm89_cu_cubin_len, "fmha_v2_flash_attention_bf16_64_32_S_qkv_128_causal_sm89_kernel_nl", 32768, 128, 64, 1, 0, false, true, false, true, true, false, false, true, nullptr},'
+    result = modify_kernel_line(result, target, new_line)
+
+    target = "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_paged_kv_576x512_output_bf16_sm89_kernel_nl_tiled"
+    new_line = '{ DATA_TYPE_E4M3, DATA_TYPE_BF16, 0, 64, 64, 576, 512, 0, 0, 0, kSM_89, cubin_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_paged_kv_576x512_output_bf16_sm89_cu_cubin, cubin_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_paged_kv_576x512_output_bf16_sm89_cu_cubin_len, "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_paged_kv_576x512_output_bf16_sm89_kernel_nl_tiled", 65536, 128, 64, 0, 2, false, true, false, true, true, true, false, true, nullptr},'
+    result = modify_kernel_line(result, target, new_line)
+
+    target = "fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_causal_sm80_kernel_nl_tiled"
+    new_line = '{ DATA_TYPE_FP16, DATA_TYPE_FP16, 0, 128, 128, 64, 64, 0, 0, 0, kSM_80, cubin_fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_sm80_cu_cubin, cubin_fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_sm80_cu_cubin_len, "fmha_v2_flash_attention_fp16_128_128_S_q_paged_kv_64_causal_sm80_kernel_nl_tiled", 65536, 128, 128, 1, 2, false, true, false, false, true, true, false, true, nullptr},'
+    result = modify_kernel_line(result, target, new_line)
+
+    target = "fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_causal_sm80_kernel_nl_tiled"
+    new_line = '{ DATA_TYPE_FP16, DATA_TYPE_FP16, 0, 64, 128, 128, 128, 0, 0, 0, kSM_80, cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin, cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len, "fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_causal_sm80_kernel_nl_tiled", 81920, 128, 64, 1, 2, false, true, false, false, true, true, false, true, nullptr},'
+    result = modify_kernel_line(result, target, new_line)
+
+    target = "fmha_v2_flash_attention_bf16_64_32_S_q_paged_kv_64_causal_sm86_kernel_nl"
+    new_line = '{ DATA_TYPE_BF16, DATA_TYPE_BF16, 0, 64, 32, 64, 64, 0, 0, 0, kSM_86, cubin_fmha_v2_flash_attention_bf16_64_32_S_q_paged_kv_64_sm86_cu_cubin, cubin_fmha_v2_flash_attention_bf16_64_32_S_q_paged_kv_64_sm86_cu_cubin_len, "fmha_v2_flash_attention_bf16_64_32_S_q_paged_kv_64_causal_sm86_kernel_nl", 16384, 128, 64, 1, 2, false, true, false, true, true, false, false, true, nullptr},'
+    result = modify_kernel_line(result, target, new_line)
+
+    # make sure only one empty line at the end
+    lines = result.split('\n')
+    while lines and not lines[-1].strip():
+        lines.pop()
+    lines.append('')
+
+    return '\n'.join(lines)
+
+
 def generate_files(specs_names):
 
     kfiles = []
@@ -3447,7 +3549,6 @@ def generate_files(specs_names):
         f.write(print_kernel_traits_code)
 
     # Make sure we have a bin directory.
-    # TEMP disable this until sm90 is in a good shape [Timmy, do not MR.]
     if not os.path.exists('bin'):
         os.mkdir('bin')
     cmd = 'nvcc -I src -Xcompiler -Wno-enum-compare --std=c++17 -o bin/print_traits.exe generated/print_kernel_traits.cu'.split(
@@ -3469,6 +3570,8 @@ def generate_files(specs_names):
     # this gives: kname, smem bytes, threads_per_cta, loop_step
     kernel_traits = [traits.split() for traits in output.splitlines()]
     cubin_header = get_cubin_header(kernel_traits, valid_specs_names)
+    if generate_cu_trtllm:
+        cubin_header = modify_cubin_header(cubin_header)
 
     with open('./generated/fmha_cubin.h', 'w') as f:
         f.write(cubin_header)
@@ -3549,10 +3652,7 @@ def enumerate_hgmma_ldgsts_kernels(specs, sm=90, dtype='fp16'):
 
 
 # Note this will be used in TRT-LLM.
-def enumerate_hgmma_flash_warpspec_kernels(specs,
-                                           sm=90,
-                                           dtype='fp16',
-                                           head_size_v=0):
+def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='fp16'):
 
     scheduling_mode = int(os.getenv('SCHEDULING_MODE', '1'))
 
@@ -3575,7 +3675,6 @@ def enumerate_hgmma_flash_warpspec_kernels(specs,
                 dtype=dtype,
                 seq_len=0,  # support any sequence length
                 head_size=[32, 40, 48, 64],
-                head_size_v=head_size_v,
                 warps_m=4,  #4x1 warpgroups
                 warps_n=1,
                 version=2,
@@ -3608,7 +3707,6 @@ def enumerate_hgmma_flash_warpspec_kernels(specs,
                 dtype=dtype,
                 seq_len=0,  # support any sequence length
                 head_size=[72, 80, 96, 104, 128],
-                head_size_v=head_size_v,
                 warps_m=4,  #4x1 warpgroups
                 warps_n=1,
                 version=2,
@@ -3641,7 +3739,6 @@ def enumerate_hgmma_flash_warpspec_kernels(specs,
                 dtype=dtype,
                 seq_len=0,  # support any sequence length
                 head_size=[160, 192, 256],
-                head_size_v=head_size_v,
                 warps_m=4,  #4x1 warpgroups
                 warps_n=1,
                 version=2,
@@ -3656,40 +3753,6 @@ def enumerate_hgmma_flash_warpspec_kernels(specs,
                 has_noloop=0,
                 noloop_step=64,
                 kv_loop_step=64,
-                kv_tile_buffers=2,  # only used by warp specialized kernels
-                unroll_threshold=1,
-                has_scale_max=False,
-                flash_attention=True,
-                warp_specialization=True,
-                alibi=alibi,
-                enable_attn_logit_softcapping=enable_attn_logit_softcapping,
-                return_softmax_stats=return_softmax,
-                scheduling_mode=scheduling_mode,
-                input_layout=input_layout))
-
-        # for deepseek context 192/128, kv_step=128
-        specs.append(
-            kernel_spec(
-                sm=sm,
-                sm_mma=90,
-                dtype=dtype,
-                seq_len=0,  # support any sequence length
-                head_size=192,
-                head_size_v=128,
-                warps_m=4,  #4x1 warpgroups
-                warps_n=1,
-                version=2,
-                interleaved=False,
-                ldgsts_q=
-                False,  # for Hopper kernels, ldgsts = False signals TMA usage.
-                ldgsts_k=False,
-                ldgsts_v=False,
-                share_smem_k_v=False,
-                loop_step=64,
-                q_tile_buffers=1,  # only used by warp specialized kernels
-                has_noloop=0,
-                noloop_step=64,
-                kv_loop_step=128,
                 kv_tile_buffers=2,  # only used by warp specialized kernels
                 unroll_threshold=1,
                 has_scale_max=False,
@@ -6264,21 +6327,7 @@ def enumerate_kernels():
                   and kspec.cross_mha     == False
                   and kspec.flash_attention == True
                   and kspec.warp_specialization == False
-                  and kspec.tiled == True
-                  and not (kspec.sm == 90 and (kspec.head_size, kspec.head_size_v) == (192, 128)))
-                  # Deepseek MLA (hopper-style context 192/128 packed + paged)
-                  or (kspec.sm            == 90
-                  and kspec.dtype         == 'bf16'
-                  and kspec.head_size     == 192
-                  and kspec.head_size_v   == 128
-                  and kspec.sage_block_sizes is None
-                  and kspec.version       == 2
-                  and kspec.cross_mha     == False
-                  and kspec.flash_attention == True
-                  and kspec.warp_specialization == True
-                  and kspec.input_layout in [InputLayout.PACKED_QKV, InputLayout.Q_PAGED_KV]
-                  and kspec.alibi == False
-                  and kspec.enable_attn_logit_softcapping == False)
+                  and kspec.tiled == True)
                   # SageAttention (warp_spec, head_size in (80, 128), packed QKV, padding mask)
                   or (kspec.sm            == 90
                   and kspec.head_size     in [80, 128]

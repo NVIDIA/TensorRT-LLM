@@ -248,7 +248,7 @@ class GSM8K(LmEvalEvaluator):
                   default=False,
                   help="Whether to apply chat template.")
     @click.option("--system_prompt",
-                  type=Optional[str],
+                  type=str,
                   default=None,
                   help="System prompt.")
     @click.option("--max_input_length",
@@ -291,7 +291,7 @@ class GPQADiamond(LmEvalEvaluator):
                   default=False,
                   help="Whether to apply chat template.")
     @click.option("--system_prompt",
-                  type=Optional[str],
+                  type=str,
                   default=None,
                   help="System prompt.")
     @click.option("--max_input_length",
@@ -334,7 +334,7 @@ class GPQAMain(LmEvalEvaluator):
                   default=False,
                   help="Whether to apply chat template.")
     @click.option("--system_prompt",
-                  type=Optional[str],
+                  type=str,
                   default=None,
                   help="System prompt.")
     @click.option("--max_input_length",
@@ -377,7 +377,7 @@ class GPQAExtended(LmEvalEvaluator):
                   default=False,
                   help="Whether to apply chat template.")
     @click.option("--system_prompt",
-                  type=Optional[str],
+                  type=str,
                   default=None,
                   help="System prompt.")
     @click.option("--max_input_length",

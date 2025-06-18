@@ -3,119 +3,17 @@ import io
 # possible to mitigate the primary risk of code injection via pickle.
 import pickle  # nosec B403
 
-# These are the base classes that are generally serialized by the ZeroMQ IPC.
-# If a class is needed by ZMQ routinely it should be added here. If
-# it is only needed in a single instance the class can be added at runtime
-# using register_approved_ipc_class.
-BASE_ZMQ_CLASSES = {
+# This is an example class (white list) to showcase how to guard serialization with approved classes.
+# If a class is needed routinely it should be added into the whitelist. If it is only needed in a single instance
+# the class can be added at runtime using register_approved_class.
+BASE_EXAMPLE_CLASSES = {
     "builtins": [
         "Exception", "ValueError", "NotImplementedError", "AttributeError",
-        "AssertionError"
+        "AssertionError", "RuntimeError"
     ],  # each Exception Error class needs to be added explicitly
     "collections": ["OrderedDict"],
-    "datetime": ["timedelta"],
-    "pathlib": ["PosixPath"],
-    "llmapi.run_llm_with_postproc": ["perform_faked_oai_postprocess"
-                                     ],  # only used in tests
-    ### starting import of torch models classes. They are used in test_llm_multi_gpu.py.
-    "tensorrt_llm._torch.model_config": ["MoeLoadBalancerConfig"],
-    "tensorrt_llm._torch.models.modeling_bert":
-    ["BertForSequenceClassification"],
-    "tensorrt_llm._torch.models.modeling_clip": ["CLIPVisionModel"],
-    "tensorrt_llm._torch.models.modeling_deepseekv3": ["DeepseekV3ForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_gemma3": ["Gemma3ForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_hyperclovax": ["HCXVisionForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_llama": [
-        "Eagle3LlamaForCausalLM",
-        "LlamaForCausalLM",
-        "Llama4ForCausalLM",
-        "Llama4ForConditionalGeneration",
-    ],
-    "tensorrt_llm._torch.models.modeling_llava_next": ["LlavaNextModel"],
-    "tensorrt_llm._torch.models.modeling_mistral": ["MistralForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_mixtral": ["MixtralForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_mllama":
-    ["MllamaForConditionalGeneration"],
-    "tensorrt_llm._torch.models.modeling_nemotron": ["NemotronForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_nemotron_h": ["NemotronHForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_nemotron_nas":
-    ["NemotronNASForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_qwen":
-    ["Qwen2ForCausalLM", "Qwen2ForProcessRewardModel", "Qwen2ForRewardModel"],
-    "tensorrt_llm._torch.models.modeling_qwen2vl":
-    ["Qwen2VLModel", "Qwen2_5_VLModel"],
-    "tensorrt_llm._torch.models.modeling_qwen3": ["Qwen3ForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_qwen3_moe": ["Qwen3MoeForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_qwen_moe": ["Qwen2MoeForCausalLM"],
-    "tensorrt_llm._torch.models.modeling_siglip": ["SiglipVisionModel"],
-    "tensorrt_llm._torch.models.modeling_vila": ["VilaModel"],
-    ### ending import of torch models classes
-    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
-    "tensorrt_llm._torch.pyexecutor.llm_request":
-    ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
-    "tensorrt_llm._torch.speculative.mtp": ["MTPConfig"],
-    "tensorrt_llm._torch.speculative.interface": ["SpeculativeDecodingMode"],
-    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
-    "tensorrt_llm.auto_parallel.config": ["AutoParallelConfig", "CostModel"],
-    "tensorrt_llm.auto_parallel.cluster_info":
-    ["ClusterInfo", "MathThroughput"],
-    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
-    "tensorrt_llm.bindings.executor": [
-        "BatchingType", "CacheTransceiverConfig", "CapacitySchedulerPolicy",
-        "ContextPhaseParams", "ContextChunkingPolicy", "DynamicBatchConfig",
-        "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
-        "FinishReason", "KvCacheConfig", "KvCacheTransferMode",
-        "KvCacheRetentionConfig",
-        "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
-        "SchedulerConfig"
-    ],
-    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig"],
-    "tensorrt_llm._torch.model_config": ["MoeLoadBalancerConfig"],
-    "tensorrt_llm.builder": ["BuildConfig"],
-    "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
-    "tensorrt_llm.inputs.multimodal": ["MultimodalInput"],
-    "tensorrt_llm.executor.postproc_worker": [
-        "PostprocArgs", "PostprocParams", "PostprocWorkerConfig",
-        "PostprocWorker.Input", "PostprocWorker.Output"
-    ],
-    "tensorrt_llm.executor.request": [
-        "CancellingRequest", "GenerationRequest", "LoRARequest",
-        "PromptAdapterRequest"
-    ],
-    "tensorrt_llm.executor.result": [
-        "CompletionOutput", "DetokenizedGenerationResultBase",
-        "GenerationResult", "GenerationResultBase", "IterationResult",
-        "Logprob", "LogProbsResult", "ResponseWrapper"
-    ],
-    "tensorrt_llm.executor.utils": ["ErrorResponse", "WorkerCommIpcAddrs"],
-    "tensorrt_llm.executor.worker": ["GenerationExecutorWorker", "worker_main"],
-    "tensorrt_llm.llmapi.llm_args": [
-        "_ModelFormatKind", "_ParallelConfig", "CalibConfig",
-        "CapacitySchedulerPolicy", "KvCacheConfig", "LookaheadDecodingConfig",
-        "TrtLlmArgs", "SchedulerConfig", "LoadFormat", "DynamicBatchConfig"
-    ],
-    "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
-    "tensorrt_llm.llmapi.llm_utils":
-    ["CachedModelLoader._node_build_task", "LlmBuildStats"],
-    "tensorrt_llm.llmapi.tokenizer": ["TransformersTokenizer"],
-    "tensorrt_llm.lora_manager": ["LoraConfig"],
-    "tensorrt_llm.mapping": ["Mapping"],
-    "tensorrt_llm.models.modeling_utils":
-    ["QuantConfig", "SpeculativeDecodingMode"],
-    "tensorrt_llm.plugin.plugin": ["PluginConfig"],
-    "tensorrt_llm.sampling_params":
-    ["SamplingParams", "GuidedDecodingParams", "GreedyDecodingParams"],
-    "tensorrt_llm.serve.postprocess_handlers": [
-        "chat_response_post_processor", "chat_stream_post_processor",
-        "completion_stream_post_processor",
-        "completion_response_post_processor", "CompletionPostprocArgs",
-        "ChatPostprocArgs"
-    ],
     "torch._utils": ["_rebuild_tensor_v2"],
     "torch.storage": ["_load_from_bytes"],
-    "transformers.tokenization_utils_fast": ["PreTrainedTokenizerFast"],
-    "tokenizers": ["Tokenizer", "AddedToken"],
-    "tokenizers.models": ["Model"],
 }
 
 
@@ -124,13 +22,13 @@ def _register_class(dict, obj):
     if name is None:
         name = obj.__name__
     module = pickle.whichmodule(obj, name)
-    if module not in BASE_ZMQ_CLASSES.keys():
-        BASE_ZMQ_CLASSES[module] = []
-    BASE_ZMQ_CLASSES[module].append(name)
+    if module not in dict.keys():
+        dict[module] = []
+    dict[module].append(name)
 
 
-def register_approved_ipc_class(obj):
-    _register_class(BASE_ZMQ_CLASSES, obj)
+def register_approved_class(obj):
+    _register_class(BASE_EXAMPLE_CLASSES, obj)
 
 
 class Unpickler(pickle.Unpickler):
