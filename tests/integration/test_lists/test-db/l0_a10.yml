@@ -40,7 +40,7 @@ l0_a10:
   - cpp/test_e2e.py::test_model[-redrafter-86]
   - cpp/test_e2e.py::test_model[-mamba-86]
   - cpp/test_e2e.py::test_model[-recurrentgemma-86]
-  - cpp/test_e2e.py::test_model[-eagle-86]
+  - cpp/test_e2e.py::test_model[-eagle-86] TIMEOUT (90)
 - condition:
     ranges:
       system_gpu_count:
