@@ -945,7 +945,7 @@ def getMakoOpts(getMakoScript, makoArgs=[]) {
     // Split each line of turtle output into a list
     def turtleOutList = turtleOutput.split("\n")
 
-    def makoOptsJson = transformMakoArgsToJson(turtleOutput)
+    def makoOptsJson = transformMakoArgsToJson(turtleOutList)
 
     return makoOptsJson
 }
