@@ -37,7 +37,8 @@ from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
-from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
+from .tokenizer import (TokenizerBase, _llguidance_tokenizer_info,
+                        _xgrammar_tokenizer_info)
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
                     print_colored_debug)
@@ -663,6 +664,11 @@ class BaseLLM:
                 backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.
                 XGRAMMAR,
                 **_xgrammar_tokenizer_info(self.tokenizer))
+        elif self.args.guided_decoding_backend == 'llguidance':
+            self._executor_config.guided_decoding_config = tllm.GuidedDecodingConfig(
+                backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.
+                LLGUIDANCE,
+                **_llguidance_tokenizer_info(self.tokenizer))
         elif self.args.guided_decoding_backend is not None:
             raise ValueError(
                 f"Unrecognized guided decoding backend {self.args.guided_decoding_backend}"
