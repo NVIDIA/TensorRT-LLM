@@ -134,7 +134,6 @@ class GenerationExecutorWorker(GenerationExecutor):
             else:
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
-            args["engine_dir"] = executor_config.trt_engine_dir
             return create_executor(**args)
 
         self.engine = _create_engine()
