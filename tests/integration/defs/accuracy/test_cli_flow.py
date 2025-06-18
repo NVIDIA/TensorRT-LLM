@@ -213,7 +213,7 @@ class TestLlama3_3NemotronSuper49Bv1(CliFlowAccuracyTestHarness):
     @pytest.mark.skip(
         reason="nemotron-nas scripts have to accommodate fp8 flags")
     @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
     def test_fp8_prequantized_tp2(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
@@ -233,7 +233,7 @@ class TestLlama3_1NemotronNano8Bv1(CliFlowAccuracyTestHarness):
         self.run(tasks=[MMLU(self.MODEL_NAME)], dtype='auto')
 
     @skip_pre_hopper
-    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
     def test_fp8_prequantized(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
@@ -269,7 +269,7 @@ class TestNemotronUltra(CliFlowAccuracyTestHarness):
         reason="nemotron-nas scripts have to accommodate fp8 flags")
     @skip_pre_hopper
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
     @parametrize_with_ids("cuda_graph", [False, True])
     @pytest.mark.parametrize("tp_size,pp_size", [(8, 1)], ids=["tp8"])
     def test_fp8_prequantized(self, cuda_graph, tp_size, pp_size, mocker):
@@ -951,7 +951,7 @@ class TestLlama3_3_70BInstruct(CliFlowAccuracyTestHarness):
         self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=8, dtype='auto')
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_device_not_contain(["H100", "B200"])
+    @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
     def test_fp8_prequantized_tp4(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
