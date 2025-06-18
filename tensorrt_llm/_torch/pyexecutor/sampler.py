@@ -25,7 +25,7 @@ from tensorrt_llm.mapping import Mapping
 
 from .llm_request import LlmRequest, LlmRequestState
 from .scheduler import ScheduledRequests
-
+from .finish_reason import FinishedState
 
 @dataclass(kw_only=True)
 class SampleStateTensors:
@@ -550,6 +550,7 @@ class TRTLLMSampler(Sampler):
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateTRTLLM:
+        
         batch_size = scheduled_requests.batch_size
 
         self.setup_sampler_step(scheduled_requests.context_requests)
@@ -678,9 +679,9 @@ class TRTLLMSampler(Sampler):
                         state.host.cum_log_probs[seq_slot * beam_width +
                                                  beam].item())
 
-                finish_reason = finish_reasons_host[seq_slot * beam_width +
-                                                    beam].item()
-                request.set_finished_reason(FinishReason(finish_reason), beam)
+                finish_reason = FinishedState(finish_reasons_host[seq_slot * beam_width +
+                                                    beam].item()).to_finish_reason()
+                request.set_finished_reason(finish_reason, beam)
 
             if request.py_return_log_probs:
                 request.py_result.append_log_probs([log_probs], cum_log_probs)
