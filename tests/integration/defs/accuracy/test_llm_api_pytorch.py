@@ -1361,8 +1361,11 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
         [(1, 1, 1, True, True, True, "CUTLASS"),
-         (1, 1, 1, False, True, True, "TRTLLM")],
-        ids=["latency_moe_cutlass", "latency_moe_trtllm"],
+         (1, 1, 1, False, True, True, "TRTLLM"),
+         (4, 1, 4, False, True, True, "CUTLASS"),
+         (4, 1, 4, False, True, True, "TRTLLM"),
+         ],
+        ids=["latency_moe_cutlass", "latency_moe_trtllm", "4gpu_latency_moe_trtllm", "4gpu_latency_moe_cutlass"],
     )
     def test_nvfp4(
         self,
