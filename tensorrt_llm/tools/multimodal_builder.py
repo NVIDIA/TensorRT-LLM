@@ -1270,10 +1270,7 @@ def build_qwen2_vl_engine(args):
                      max_hw_dims=args.max_hw_dims)
 
 def build_llama_nemotron_nano_vl_engine(args):
-    model = AutoModel.from_pretrained(
-        args.model_path,
-        trust_remote_code=True,
-    )
+    model = AutoModel.from_pretrained(args.model_path)
 
     class RadioWithNeck(torch.nn.Module):
         def __init__(self, model):
