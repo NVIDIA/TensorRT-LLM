@@ -15,7 +15,7 @@ from ...distributed import MPIDist
 from ...pyexecutor.config import PyTorchConfig
 from ...pyexecutor.model_engine import ModelEngine
 from ...pyexecutor.py_executor import PyExecutor
-from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager
+from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager, ResourceManagerType
 from ...pyexecutor.sampler import TorchSampler
 from ...pyexecutor.scheduler import (
     BindCapacityScheduler,
@@ -151,7 +151,9 @@ class ADEngine(ModelEngine):
     ) -> bool:
         """Prepare inputs for AD Model from scheduled requests."""
         # cache manager
-        kv_cache_manager = resource_manager.get_resource_manager("kv_cache_manager")
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
 
         # requests in order of context, extend (generate with draft), generate
         context_requests = scheduled_requests.context_requests
@@ -290,8 +292,8 @@ def create_autodeploy_executor(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
     )
-    resource_manager = ResourceManager({"kv_cache_manager": kv_cache_manager})
-    resource_manager.resource_managers.move_to_end("kv_cache_manager", last=True)
+    resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+    resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # scheduling
     capacitor_scheduler = BindCapacityScheduler(max_batch_size, kv_cache_manager.impl)

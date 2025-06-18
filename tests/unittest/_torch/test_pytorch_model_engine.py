@@ -9,8 +9,13 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+# isort: off
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             ResourceManager)
+                                                             ResourceManager,
+                                                             ResourceManagerType
+                                                             )
+# isort: on
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi import SamplingParams
@@ -181,7 +186,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
     def test_position_id_preparation(self):
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
         resource_manager = ResourceManager(
-            {"kv_cache_manager": kv_cache_manager})
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
         prompt_len = 256
         requests = [_create_request(prompt_len, 0)]
@@ -225,7 +230,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
     def test_warmup(self):
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
         resource_manager = ResourceManager(
-            {"kv_cache_manager": kv_cache_manager})
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
         # Test with a huge batch size. The warmup run should bail out of
         # warmup instead of crashing (there's not enough KV cache space for this).
@@ -245,7 +250,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                enable_layerwise_nvtx_marker=True)
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
         resource_manager = ResourceManager(
-            {"kv_cache_manager": kv_cache_manager})
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
         prompt_len = 32
         requests = [_create_request(prompt_len, 0)]
