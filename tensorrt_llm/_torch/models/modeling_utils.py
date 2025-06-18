@@ -632,6 +632,42 @@ def filter_weights(prefix, weights: Dict):
     return result
 
 
+def run_concurrently(func,
+                     args_list,
+                     reduce_func=None,
+                     pbar=None,
+                     num_workers=None):
+    """
+    Run a function concurrently with a list of arguments.
+    func: the function to run concurrently.
+    args_list: a list of tuples of arguments for the function.
+    reduce_func: an optional function to reduce the results.
+    pbar: an optional tqdm progress bar.
+    """
+    from concurrent import futures
+    with futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all tasks
+        future_to_result = {
+            executor.submit(func, *arg): arg
+            for arg in args_list
+        }
+
+        # Process completed tasks as they finish
+        for result in futures.as_completed(future_to_result):
+            arg = future_to_result[result]
+            try:
+                part_weights = result.result()
+                if reduce_func:
+                    reduce_func(part_weights)
+                if pbar:
+                    pbar.update(1)
+            except Exception as e:
+                logger.error(
+                    f"Error executing {func.__name__} with args {arg}: {str(e)}"
+                )
+                raise
+
+
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
                        skip_modules: List[str] = [],
@@ -706,20 +742,24 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                             p.data.copy_(module_weights[n][:])
 
     if os.environ.get("TRT_LLM_LOAD_WEIGHTS_IN_PARALLEL", False):
-        from concurrent import futures
+        pbar = tqdm(list(model.named_modules()),
+                    desc="Loading weights concurrently")
+        args_list = [(name, module) for name, module in model.named_modules()]
+        run_concurrently(load_single_module, args_list, pbar=pbar)
+        # from concurrent import futures
 
-        # TODO use a better way to get the number of max workers
-        with futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [
-                executor.submit(load_single_module, name, module)
-                for name, module in tqdm(list(model.named_modules()),
-                                         desc="Loading weights")
-            ]
-            pbar = tqdm(list(model.named_modules()), desc="Loading weights")
+        # # TODO use a better way to get the number of max workers
+        # with futures.ThreadPoolExecutor(max_workers=10) as executor:
+        #     futures = [
+        #         executor.submit(load_single_module, name, module)
+        #         for name, module in tqdm(list(model.named_modules()),
+        #                                  desc="Loading weights concurrently")
+        #     ]
+        #     pbar = tqdm(list(model.named_modules()), desc="Loading weights concurrently")
 
-            for future in futures:
-                future.result()
-                pbar.update(1)
+        #     for future in futures:
+        #         future.result()
+        #         pbar.update(1)
 
     else:
         for name, module in tqdm(list(model.named_modules()),

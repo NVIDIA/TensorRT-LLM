@@ -49,7 +49,7 @@ from ..metadata import KVCacheParams
 from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
-                                     timing)
+                                     run_concurrently, timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, maybe_create_moe_load_balancer)
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
@@ -187,25 +187,12 @@ def load_weights(checkpoint_dir: str):
 
         pbar = tqdm.tqdm(total=len(weight_files),
                          desc="Loading safetensors weights in parallel")
-        # Use ThreadPoolExecutor to load weights concurrently
-        from concurrent import futures
-        with futures.ThreadPoolExecutor() as executor:
-            # Submit all file loading tasks
-            future_to_file = {
-                executor.submit(load_safetensors_file, file): file
-                for file in weight_files
-            }
 
-            # Process completed tasks as they finish
-            for future in futures.as_completed(future_to_file):
-                file = future_to_file[future]
-                try:
-                    part_weights = future.result()
-                    weights.update(part_weights)
-                    pbar.update(1)
-                except Exception as e:
-                    logger.error(f"Error loading {file}: {str(e)}")
-                    raise
+        # Note that the function is called with a tuple of arguments, hence we need to wrap the arguments in a tuple via [(w,) for w in weight_files]
+        # specifically the comma right after the w is important to make it a tuple.
+        run_concurrently(load_safetensors_file, [(w, ) for w in weight_files],
+                         reduce_func=weights.update,
+                         pbar=pbar)
 
         return weights
 
@@ -215,7 +202,7 @@ def load_weights(checkpoint_dir: str):
 
     if weight_files:
 
-        def load_bin_file(file):
+        def load_bin_or_path_file(file):
             try:
                 part_weights = torch.load(file,
                                           weights_only=True,
@@ -234,23 +221,11 @@ def load_weights(checkpoint_dir: str):
 
         pbar = tqdm.tqdm(total=len(weight_files),
                          desc="Loading bin weights in parallel")
-        with futures.ThreadPoolExecutor() as executor:
-            future_to_file = {
-                executor.submit(load_bin_file, file): file
-                for file in weight_files
-            }
-
-            # Process completed tasks as they finish
-            for future in futures.as_completed(future_to_file):
-                file = future_to_file[future]
-                try:
-                    part_weights = future.result()
-                    weights.update(part_weights)
-                    pbar.update(1)
-                except Exception as e:
-                    logger.error(f"Error loading {file}: {str(e)}")
-                    raise
-
+        # Note that the function is called with a tuple of arguments, hence we need to wrap the arguments in a tuple via [(w,) for w in weight_files]
+        # specifically the comma right after the w is important to make it a tuple.
+        run_concurrently(load_bin_or_path_file, [(w, ) for w in weight_files],
+                         reduce_func=weights.update,
+                         pbar=pbar)
         return weights
 
     raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
