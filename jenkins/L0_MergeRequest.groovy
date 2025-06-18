@@ -693,17 +693,30 @@ def getOnlyDocsFileChanged(pipeline, testFilter, globalVars) {
         return false
     }
 
+    // TODO: Add more docs path to the list, e.g. *.md files in other directories
+    def docsFileList = [
+        "docs/",
+    ]
+
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
     if (!changedFileList || changedFileList.isEmpty()) {
         return false
     }
 
-    // Check if only docs files are changed
     for (file in changedFileList) {
-        if (!file.startsWith("docs/")) {
+        def isDocsFile = false
+        for (prefix in docsFileList) {
+            if (file.startsWith(prefix)) {
+                isDocsFile = true
+                break
+            }
+        }
+        if (!isDocsFile) {
+            pipeline.echo("Found non-docs file: ${file}")
             return false
         }
     }
+    pipeline.echo("Only docs files changed.")
     return true
 }
 
@@ -976,7 +989,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 def stageName = "Build"
                 stage(stageName) {
                     if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
-                        echo "SBSA build job is skipped due to Jenkins configuration"
+                        echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                         return
                     }
                     def parameters = getCommonParameters()
@@ -1012,7 +1025,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP || testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
-                        echo "SBSA test job is skipped due to Jenkins configuration"
+                        echo "SBSA test job is skipped due to Jenkins configuration or conditional pipeline run"
                         return
                     }
                     try {

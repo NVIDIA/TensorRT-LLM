@@ -1889,16 +1889,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }
     }]]}
 
-    // Check if only docs files are changed, if true, run doc build stage only.
-    if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
-        echo "Only docs files are changed, run doc build stage only."
-        return docBuildJobs.collectEntries{key, values -> [key, [values[0], {
-            trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
-                values[1]()
-            })
-        }]]}
-    }
-
     // Python version and OS for sanity check
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
@@ -2176,6 +2166,12 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") }
             println parallelJobsFiltered.keySet()
         }
+    }
+
+    if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+        echo "Only docs files are changed, run doc build stage only."
+        parallelJobsFiltered = docBuildJobs
+        println parallelJobsFiltered.keySet()
     }
 
     // Check --stage-list, only run the stages in stage-list.
