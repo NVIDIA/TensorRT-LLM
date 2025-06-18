@@ -35,14 +35,14 @@ TIMEOUT_KEEP_ALIVE = 10  # seconds.
 class OpenAIDisaggServer:
 
     def __init__(self,
-                 ctx_servers: List[str] = None,
-                 gen_servers: List[str] = None,
+                 ctx_servers: List[str],
+                 gen_servers: List[str],
                  req_timeout_secs: int = 180,
                  server_start_timeout_secs: int = 180,
                  ctx_router_config: Optional[RouterConfig] = None,
                  gen_router_config: Optional[RouterConfig] = None,
                  conditional_disagg_config: Optional[ConditionalDisaggConfig] = None,
-                 metadata_server_cfg: MetadataServerConfig = None):
+                 metadata_server_cfg: Optional[MetadataServerConfig] = None):
 
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
@@ -76,8 +76,8 @@ class OpenAIDisaggServer:
 
             if self.metadata_server:
                 logger.info("Starting server monitoring via metadata service")
-                await self.ctx_router.start_server_monitoring()
-                await self.gen_router.start_server_monitoring()
+                await self.ctx_router.start_server_monitoring(metadata_server_cfg.refresh_interval)
+                await self.gen_router.start_server_monitoring(metadata_server_cfg.refresh_interval)
 
             yield
 
