@@ -517,7 +517,11 @@ def create_dummy_requests(
         req.paged_kv_block_ids = []
         if is_gen:
             req.state = LlmRequestState.GENERATION_IN_PROGRESS
-            req.prompt_len = token_num - 1
+            if token_num > 1:
+                req.prompt_len = token_num - 1
+            else:
+                req.add_new_token(1, 0)
+                req.prompt_len = 1
             req.py_draft_tokens = [1] * max_num_draft_tokens
         req.py_prompt_len = req.prompt_len
         requests.append(req)
