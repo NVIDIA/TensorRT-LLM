@@ -25,6 +25,8 @@ LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefi
 
 LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
+RUN_SANITY_CHECK = env.runSanityCheck ?: false
+
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
@@ -37,10 +39,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
+    (IMAGE_KEY_TO_TAG): [:],
 ]
 
 @Field
@@ -429,6 +434,17 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
 }
 
 
+def getCommonParameters()
+{
+    return [
+        'gitlabSourceRepoHttpUrl': LLM_REPO,
+        'gitlabCommit': env.gitlabCommit,
+        'artifactPath': ARTIFACT_PATH,
+        'uploadPath': UPLOAD_PATH,
+    ]
+}
+
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("agent")
@@ -491,6 +507,108 @@ pipeline {
                     writeFile file: "imageKeyToTag.json", text: imageKeyToTagJson
                     archiveArtifacts artifacts: 'imageKeyToTag.json', fingerprint: true
                     trtllm_utils.uploadArtifacts("imageKeyToTag.json", "${UPLOAD_PATH}/")
+                }
+            }
+        }
+        stage("Wait for build jobs finish") {
+            when {
+                expression {
+                    RUN_SANITY_CHECK
+                }
+            }
+            steps {
+                script {
+                    collectResultPodSpec = createKubernetesPodConfig("agent")
+                    trtllm_utils.launchKubernetesPod(this, collectResultPodSpec, "alpine", {
+                        // Install wget
+                        trtllm_utils.llmExecStepWithRetry(this, script: "apk add --no-cache wget")
+
+                        // Poll for build artifacts
+                        def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
+                        def requiredFiles = [
+                            "TensorRT-LLM-GH200.tar.gz",
+                            "tensorrt-llm-release-src-",
+                            "tensorrt-llm-sbsa-release-src-",
+                            "TensorRT-LLM.tar.gz"
+                        ]
+                        def maxWaitMinutes = 180
+                        def pollIntervalSeconds = 60
+
+                        echo "Waiting for build artifacts..."
+                        echo "Required files: ${requiredFiles}"
+
+                        def startTime = System.currentTimeMillis()
+                        def maxWaitMs = maxWaitMinutes * 60 * 1000
+
+                        while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
+                            def missingFiles = []
+
+                            try {
+                                trtllm_utils.llmExecStepWithRetry(this, script: "wget ${artifactBaseUrl} -O index.html", allowStepFailed: true)
+                                def indexContent = sh(script: "cat index.html 2>/dev/null || echo ''", returnStdout: true).trim()
+
+                                for (file in requiredFiles) {
+                                    if (!indexContent.contains(file)) {
+                                        missingFiles.add(file)
+                                    }
+                                }
+
+                                sh(script: "rm -f index.html", returnStdout: false)
+
+                            } catch (Exception e) {
+                                echo "Error checking artifacts: ${e.message}"
+                                missingFiles = requiredFiles.clone()
+                                sh(script: "rm -f index.html", returnStdout: false)
+                            }
+
+                            if (missingFiles.isEmpty()) {
+                                echo "All build artifacts are ready!"
+                                return
+                            }
+
+                            def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                            echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
+                            echo "Missing files: ${missingFiles}"
+                            sleep(pollIntervalSeconds)
+                        }
+
+                        def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                        error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
+                    })
+                }
+            }
+        }
+        stage("Sanity Check") {
+            when {
+                expression {
+                    RUN_SANITY_CHECK
+                }
+            }
+            steps {
+                script {
+                    globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
+                    def parameters = getCommonParameters()
+                    parameters += [
+                        'enableFailFast': false,
+                        'branch': LLM_BRANCH,
+                        'globalVars': globalVarsJson,
+                    ]
+
+                    echo "trigger BuildDockerImageSanityTest job, params: ${parameters}"
+
+                    def status = ""
+                    def jobName = "/LLM/helpers/BuildDockerImageSanityTest"
+                    def handle = build(
+                        job: jobName,
+                        parameters: trtllm_utils.toBuildParameters(parameters),
+                        propagate: false,
+                    )
+                    status = handle.getBuildResult().toString()
+
+                    if (status != "SUCCESS") {
+                        error "Downstream job did not succeed"
+                    }
                 }
             }
         }
