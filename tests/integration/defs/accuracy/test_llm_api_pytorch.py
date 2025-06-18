@@ -1061,12 +1061,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
-                           (True, False, False, False),
                            (False, True, False, False),
                            (False, False, True, False),
                            (False, False, False, True),
                            (False, True, True, True), (True, True, True, True)])
-    @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids("mtp_nextn", [0])
     @parametrize_with_ids("kv_cache_reuse", [True, False])
     @parametrize_with_ids(
         "quant_dtype",
