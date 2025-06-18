@@ -94,8 +94,6 @@ EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'max_seq_len',
     'tokens_per_block',
     'mapping',
-    'hf_model_dir',
-    'trt_engine_dir',
 ]
 
 
@@ -106,8 +104,6 @@ def update_executor_config(
         mapping: Optional[Mapping] = None,
         build_config: Optional[BuildConfig] = None,
         speculative_config: Optional[SpecConfig] = None,
-        hf_model_dir: Optional[str] = None,
-        trt_engine_dir: Optional[str] = None,
         max_input_len: Optional[int] = None,
         max_seq_len: Optional[int] = None):
     if backend is None:
@@ -129,9 +125,6 @@ def update_executor_config(
     build_config = build_config or BuildConfig()
     # TODO: move to pure-Python KvCacheConfig, and remove dependency on build_config.
     executor_config.tokens_per_block = executor_config.tokens_per_block or build_config.plugin_config.tokens_per_block
-
-    executor_config.hf_model_dir = hf_model_dir
-    executor_config.trt_engine_dir = trt_engine_dir
 
     if max_input_len is not None:
         executor_config.max_input_len = max_input_len
