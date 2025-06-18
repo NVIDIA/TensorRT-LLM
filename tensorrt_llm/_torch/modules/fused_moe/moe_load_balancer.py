@@ -302,6 +302,7 @@ class SingleLayerMoeLoadBalancer:
         self.load_expert_ids = list(range(load_expert_start, load_expert_end))
 
         self.statistic_flag_tensor = None
+        self.local_statistic_tensor = None
 
         self.cudagraph_stream = None
         self.cudagraph_event = None
@@ -510,6 +511,54 @@ class SingleLayerMoeLoadBalancer:
                 gathered_raw_expert_ids, self.statistic_flag_tensor,
                 self.single_layer_load_balancer_ptr, is_first_stage,
                 is_last_stage)
+
+    def local_statistic(self, local_raw_expert_ids: torch.Tensor,
+                        is_first_stage: bool, is_last_stage: bool):
+        """
+        Perform local statistics on the expert IDs.
+
+        Args:
+            local_raw_expert_ids: The gathered raw expert IDs from all ranks
+            is_first_stage: Whether this is the first stage
+            is_last_stage: Whether this is the last stage
+        """
+        if self.updates_enabled:
+            assert isinstance(self.statistic_flag_tensor, torch.Tensor)
+            if is_first_stage:
+                assert self.local_statistic_tensor is None
+                self.local_statistic_tensor = torch.empty(
+                    (self.expert_count, ),
+                    dtype=torch.int32,
+                    device=torch.device('cuda'))
+            torch.ops.trtllm.moe_hierarchical_statistic_local_device(
+                local_raw_expert_ids, self.local_statistic_tensor,
+                self.statistic_flag_tensor, self.single_layer_load_balancer_ptr,
+                is_first_stage, is_last_stage)
+
+    def get_local_statistic_tensor(self):
+        """
+        Get the local statistic tensor. Should perform allreduce on it and then call update_statistic
+        Returns:
+            The local statistic tensor if using statistic else None
+        """
+        if self.updates_enabled:
+            assert self.local_statistic_tensor is not None
+            return self.local_statistic_tensor
+        return None
+
+    def update_statistic(self, global_statistic_tensor: torch.Tensor):
+        """
+        Perform update with global statistics.
+
+        Args:
+            global_statistic_tensor: global statistics info, should have shape (self.expert_count,)
+        """
+        if self.updates_enabled:
+            assert isinstance(self.statistic_flag_tensor, torch.Tensor)
+            torch.ops.trtllm.moe_hierarchical_statistic_update(
+                global_statistic_tensor, self.statistic_flag_tensor,
+                self.single_layer_load_balancer_ptr)
+            self.local_statistic_tensor = None
 
     def route(self,
               token_selected_experts: torch.Tensor,
