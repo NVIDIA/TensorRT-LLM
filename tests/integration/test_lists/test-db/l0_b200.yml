@@ -64,7 +64,7 @@ l0_b200:
       - '*b100*'
       linux_distribution_name: ubuntu*
     terms:
-      stage: post_merge
+      stage: pre_merge
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------

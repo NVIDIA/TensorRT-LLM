@@ -592,6 +592,7 @@ class CutlassFusedMoE(MoE):
             ep_rank=ep_rank,
             cluster_size=cluster_size,
             cluster_rank=cluster_rank,
+            enable_alltoall=self.enable_alltoall,
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
             use_w4a8_group_scaling=use_w4a8_group_scaling,
             min_latency_mode=cutlass_min_latency_mode,
