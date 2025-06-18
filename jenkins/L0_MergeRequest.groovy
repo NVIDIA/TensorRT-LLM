@@ -1081,6 +1081,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'branch': branch,
                         'action': "push",
                         'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
+                        'runSanityCheck': true,
                         'globalVars': globalVarsJson,
                     ]
 
