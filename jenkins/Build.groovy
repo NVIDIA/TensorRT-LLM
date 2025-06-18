@@ -495,120 +495,6 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     }
 }
 
-def prepareBuildLib(pipeline, triple, pre_cxx11abi)
-{
-    def libraries = [
-        "batch_manager",
-        "executor",
-        "internal_cutlass_kernels",
-    ]
-    if ((triple == X86_64_TRIPLE && pre_cxx11abi) || (triple == AARCH64_TRIPLE && !pre_cxx11abi)) {
-        libraries += [
-            "ucx_wrapper",
-        ]
-    }
-
-    def artifacts = [:]
-    for (library_name in libraries) {
-        def libdir
-        def is_static
-        if (library_name == "batch_manager") {
-            libdir = "tensorrt_llm/batch_manager"
-            is_static = true
-        } else if (library_name == "executor") {
-            libdir = "tensorrt_llm/executor"
-            is_static = true
-        } else if (library_name == "internal_cutlass_kernels"){
-            libdir = "tensorrt_llm/kernels/internal_cutlass_kernels"
-            is_static = true
-        } else if (library_name == "ucx_wrapper") {
-            libdir = "tensorrt_llm/executor/cache_transmission/ucx_utils"
-        }
-
-        def libname = "libtensorrt_llm_" + library_name
-        def ext = ".so"
-        if (is_static) {
-            libname += "_static"
-            ext = ".a"
-        }
-        def filepath = "${LLM_ROOT}/cpp/build/" + libdir + "/" + libname + ext
-        def uploadname = libname + ext
-        if (is_static && pre_cxx11abi) {
-            uploadname = libname + ".pre_cxx11" + ext
-        }
-        def uploadpath = "${triple}/${uploadname}"
-        artifacts[uploadpath] = filepath
-    }
-
-    def cpver = "cp312"
-    if (triple == X86_64_TRIPLE) {
-        cpver = "cp310"
-    }
-
-    return [artifacts, {
-        buildWheelInContainer(pipeline, libraries, triple, false, pre_cxx11abi, cpver)
-    }]
-}
-
-def prepareLLMPackage(pipeline, archTriple=X86_64_TRIPLE)
-{
-    def tarFileName = "TensorRT-LLM.tar.gz"
-    def linuxPkgName = "tensorrt-llm-release-src-${env.gitlabCommit}.tar.gz"
-    if (archTriple == AARCH64_TRIPLE) {
-        tarFileName = "TensorRT-LLM-GH200.tar.gz"
-        linuxPkgName = "tensorrt-llm-sbsa-release-src-${env.gitlabCommit}.tar.gz"
-    }
-    def artifacts = ["${linuxPkgName}": "${LLM_ROOT}/${linuxPkgName}"]
-    return [artifacts, { runLLMPackage(pipeline, archTriple, tarFileName, linuxPkgName) }]
-}
-
-def runLLMPackage(pipeline, archTriple, tarFileName, linuxPkgName)
-{
-    // Random sleep to avoid resource contention
-    sleep(10 * Math.random())
-    sh "curl ifconfig.me || true"
-    sh "nproc && free -g && hostname"
-
-    // Step 1: create LLM_ROOT dir and download code
-    sh "pwd && ls -alh"
-    sh "mkdir ${LLM_ROOT}"
-    def llmPath = sh (script: "realpath ${LLM_ROOT}",returnStdout: true).trim()
-
-    // Download tar generated from build jobs
-    def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarFileName}"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
-    // The path TensorRT-LLM/src is defined in the build job
-    sh "cd ${llmPath} && tar -zxf ${tarFileName} TensorRT-LLM/src"
-    // create a additional `pkg/tensorrt_llm` folder to make sure the generated tar.gz has only one tensorrt_llm folder
-    def llmPackage = "${llmPath}/TensorRT-LLM/pkg/"
-    sh "rm -rf ${llmPackage}"
-    sh "mkdir -p ${llmPackage}"
-    sh "mv ${llmPath}/TensorRT-LLM/src ${llmPackage}/tensorrt_llm"
-
-    // download libs
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: """
-        pip3 install gitignore_parser && \
-        python3 ${llmPackage}/tensorrt_llm/scripts/package_trt_llm.py \
-        --lib_list oss \
-        --arch ${archTriple} \
-        --download ${env.gitlabCommit} \
-        --addr https://urm.nvidia.com/artifactory/${ARTIFACT_PATH} \
-        -v \
-        ${llmPackage}/tensorrt_llm
-    """)
-
-    // clean the internal files and create one tar package
-    sh """cd ${llmPackage}/tensorrt_llm && \
-        python3 ${llmPackage}/tensorrt_llm/scripts/package_trt_llm.py \
-        --lib_list oss \
-        --clean \
-        --package ${llmPath}/${linuxPkgName} \
-        ${llmPackage}/tensorrt_llm
-    """
-
-    sh "cd ${llmPath} && ls -alh"
-}
-
 def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
 {
     stage("Show Environment") {
@@ -634,10 +520,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64 : CONFIG_LINUX_X86_64_VANILLA),
         "Build TRT-LLM LLVM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM),
-    ] + [true, false].collectEntries{ cxx11 -> [
-        "Build libs (cxx11=${cxx11})".toString(), [wheelDockerImage] + prepareBuildLib(
-            pipeline, cpu_arch, !cxx11),
-    ]}
+    ]
 
     if (cpu_arch == X86_64_TRIPLE) {
         buildConfigs += [
@@ -645,10 +528,6 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
             pipeline, CONFIG_LINUX_X86_64_SINGLE_DEVICE),
         ]
     }
-
-    def packageConf = prepareLLMPackage(pipeline, cpu_arch)
-    def artifacts = packageConf[0]
-    def runner = packageConf[1]
 
     rtServer (
         id: 'Artifactory',
@@ -661,17 +540,6 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         timeout: 300
     )
     def reuseArtifactPath = env.reuseArtifactPath
-    if (reuseArtifactPath) {
-        def stageName = "Reuse Check"
-        newArtifacts = downloadArtifacts(stageName, reuseArtifactPath, artifacts)
-        if (!newArtifacts) {
-            echo "previous package does not exist, rebuild all the artifacts"
-            reuseArtifactPath = null
-        } else {
-            artifacts = newArtifacts
-            runner = null
-        }
-    }
 
     def k8s_cpu = "amd64"
     if (cpu_arch == AARCH64_TRIPLE) {
@@ -705,14 +573,6 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
     stage("Build") {
         pipeline.parallel parallelJobs
     } // Build stage
-    stage("Package") {
-        container("trt-llm") {
-            if (!reuseArtifactPath) {
-                runner()
-            }
-            uploadArtifacts(artifacts)
-        }
-    }
 }
 
 pipeline {
