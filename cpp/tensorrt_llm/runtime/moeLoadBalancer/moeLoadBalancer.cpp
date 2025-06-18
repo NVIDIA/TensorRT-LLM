@@ -921,13 +921,10 @@ void MoeLoadBalancer::finalizeModel()
     }
     if (mLayerUpdatesPerIter > 0)
     {
+        mWorkerThreadStopped = false;
         mMultiThreadWorker->start();
         generateUpdatePlan();
         startThreads();
-    }
-    else
-    {
-        mWorkerThreadStopped = true;
     }
     mModelFinalized = true;
 }

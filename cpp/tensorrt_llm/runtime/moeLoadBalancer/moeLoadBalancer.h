@@ -293,7 +293,7 @@ private:
     void workerThread();
     std::mutex mWorkerThreadMutex;
     std::condition_variable mWorkerThreadCondition;
-    bool mWorkerThreadStopped = false;
+    bool mWorkerThreadStopped = true;
     int64_t mWarmUpUntilIter = -1;
 
     // we use a separate thread to compute and update weights to avoid possible blocking for next layer due to slow
