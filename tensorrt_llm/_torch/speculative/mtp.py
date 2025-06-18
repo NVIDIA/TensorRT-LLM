@@ -745,12 +745,13 @@ class MTPWorker(nn.Module):
             logits = logits.unsqueeze(0)
 
         # The return buffer
-        accepted_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
-                                      dtype=torch.int,
-                                      device=logits.device)
-        num_accepted_tokens = torch.ones(batch_size,
+        if self.spec_config.use_relaxed_acceptance_for_thinking or not self.is_thop:
+            accepted_tokens = torch.ones((batch_size, (mtp_num_modules + 1)),
                                          dtype=torch.int,
                                          device=logits.device)
+            num_accepted_tokens = torch.ones(batch_size,
+                                             dtype=torch.int,
+                                             device=logits.device)
         if self.spec_config.use_relaxed_acceptance_for_thinking:
             mtp_relaxed_delta_pool = spec_metadata.mtp_hidden_states_manager.mtp_relaxed_delta_pool
 
@@ -1068,7 +1069,6 @@ class MTPEagleWorker(MTPWorker):
     def __init__(self, spec_config: MTPConfig):
         super().__init__(spec_config)
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
-        self.is_thop = False
 
     def forward(
         self,
