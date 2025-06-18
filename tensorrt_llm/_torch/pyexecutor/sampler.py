@@ -304,22 +304,22 @@ class TorchSampler(Sampler):
         new_tokens = state.host.new_tokens
 
         for req in state.scheduled_requests.all_requests():
-            if req.context_remaining_length != 0:
+            is_chunking = (not req.is_context_finished) and (
+                req.context_remaining_length != 0)
+            if is_chunking or req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
-            if req.state != LlmRequestState.GENERATION_COMPLETE:
-                new_token = add_token(req, new_tokens, beam=self.BEAM)
-                processed = 1
-                stop = self._handle_stop_criteria(req,
-                                                  new_token,
-                                                  beam=self.BEAM)
-                if not stop and len(req.py_draft_tokens) > 0:
-                    num_accepted = self.process_draft_tokens(
-                        req, new_tokens, new_token)
-                    req.py_num_accepted_draft_tokens = num_accepted
-                    req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
-                    processed += num_accepted
-                self.handle_logits(req, state, beam=self.BEAM, count=processed)
-                req.py_decoding_iter += 1
+
+            new_token = add_token(req, new_tokens, beam=self.BEAM)
+            processed = 1
+            stop = self._handle_stop_criteria(req, new_token, beam=self.BEAM)
+            if not stop and len(req.py_draft_tokens) > 0:
+                num_accepted = self.process_draft_tokens(
+                    req, new_tokens, new_token)
+                req.py_num_accepted_draft_tokens = num_accepted
+                req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
+                processed += num_accepted
+            self.handle_logits(req, state, beam=self.BEAM, count=processed)
+            req.py_decoding_iter += 1
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs: dict[str, torch.Tensor]) -> SampleState:
