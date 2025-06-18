@@ -23,10 +23,11 @@ import scipy
 import yaml
 
 import tensorrt_llm.evaluate
-from tensorrt_llm._torch import LLM as PyTorchLLM
+from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.speculative import SpecConfig
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi import LLM, SamplingParams
+from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig

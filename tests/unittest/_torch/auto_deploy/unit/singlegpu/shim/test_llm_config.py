@@ -2,9 +2,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy.shim.demollm import DemoLLM
 from tensorrt_llm._torch.auto_deploy.transformations.transform import InferenceOptimizer
-from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.llmapi.llm_args import TorchCompileConfig, _AutoDeployLlmArgs
 
 # ================================

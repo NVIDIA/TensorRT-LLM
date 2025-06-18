@@ -25,10 +25,11 @@ import torch
 import transformers
 from utils.util import skip_single_gpu
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (GenerationExecutorWorker, LoRARequest,
                                    PromptAdapterRequest, RequestError)
-from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
+from tensorrt_llm.llmapi import (BuildCacheConfig, EagleDecodingConfig,
                                  KvCacheConfig, KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)

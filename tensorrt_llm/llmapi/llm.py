@@ -896,7 +896,7 @@ class _TorchLLM(BaseLLM):
                          **kwargs)
 
 
-class LLM(_TrtLLM):
+class LLM(_TorchLLM):
 
     def __init__(self,
                  model: Union[str, Path],
@@ -915,15 +915,13 @@ class LLM(_TrtLLM):
                          revision, tokenizer_revision, **kwargs)
 
 
-_LLM_REPR = "TrtLLM"
+_LLM_REPR = "TorchLLM"
 
 # sphinx will ignore the LLM's docstring if it is not explicitly set
 LLM.__doc__ = \
     f"""LLM class is the main class for running a LLM model.
 
-    This class is an alias of {_LLM_REPR}. You can switch between the TensorRT backend
-    and the PyTorch backend by setting the TLLM_USE_TRT_ENGINE environment to 1 or 0.
-    The default backend is the TensorRT backend.
+    This class is an alias of {_LLM_REPR}.
 
     Parameters:
-""" + TRT_LLM_DOCSTRING
+""" + TORCH_LLM_DOCSTRING

@@ -17,9 +17,10 @@ import yaml
 from pydantic import BaseModel
 
 import tensorrt_llm
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import GenerationResult
 from tensorrt_llm.executor.result import TokenLogprobs
-from tensorrt_llm.llmapi import (LLM, CalibConfig, CompletionOutput,
+from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
                                  RequestOutput, SamplingParams)
 from tensorrt_llm.llmapi.llm_utils import LlmArgs

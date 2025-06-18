@@ -5,8 +5,9 @@ import pytest
 from api_stability_core import (ApiStabilityTestHarness, ClassSnapshot,
                                 MethodSnapshot)
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bindings import executor as tllme
-from tensorrt_llm.llmapi import (LLM, CalibConfig, CompletionOutput,
+from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
                                  RequestOutput)
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,

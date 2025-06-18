@@ -5,8 +5,8 @@ import pytest
 import yaml
 
 import tensorrt_llm.bindings.executor as tle
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.llm import LLM as TorchLLM
-from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.llmapi.llm_args import *
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
 

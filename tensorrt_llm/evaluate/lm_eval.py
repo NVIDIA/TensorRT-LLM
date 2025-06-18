@@ -28,8 +28,9 @@ try:
 except ImportError:
     TemplateLM = object
 
-from .._torch import LLM as PyTorchLLM
-from ..llmapi import LLM, RequestOutput
+from .. import LLM as PyTorchLLM
+from .._tensorrt_engine import LLM
+from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .interface import Evaluator
