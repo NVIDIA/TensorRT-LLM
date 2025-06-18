@@ -91,6 +91,9 @@ TESTER_MEMORY = "96Gi"
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 
+ENABLE_NGC_DEVEL_IMAGE_TEST = env.enableNgcDevelImageTest ? env.enableNgcDevelImageTest : false
+ENABLE_NGC_RELEASE_IMAGE_TEST = env.enableNgcReleaseImageTest ? env.enableNgcReleaseImageTest : false
+
 def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def remote = [
@@ -2284,6 +2287,14 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
             config: LINUX_AARCH64_CONFIG,
         ],
     ]
+    if (!ENABLE_NGC_DEVEL_IMAGE_TEST) {
+        testConfigs -= ["NGC Devel Image amd64", "NGC Devel Image arm64"]
+        echo "NGC Devel Image test is disabled."
+    }
+    if (!ENABLE_NGC_RELEASE_IMAGE_TEST) {
+        testConfigs -= ["NGC Release Image amd64", "NGC Release Image arm64"]
+        echo "NGC Release Image test is disabled."
+    }
     // Update testConfigs image field using the map from globalVars
     testConfigs.each { key, config ->
         if (globalVars[IMAGE_KEY_TO_TAG] && globalVars[IMAGE_KEY_TO_TAG][key]) {
