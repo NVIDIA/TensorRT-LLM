@@ -125,6 +125,10 @@ class LlmManager:
             while not self._stop.is_set():
                 async for stats in self.llm.get_stats_async(2):
                     await socket.send_json(stats)
+                # NOTE: This is a WAR to force this loop to relinquish control
+                # that was preventing other async tasks from holding the event
+                # loop. If we don't
+                await asyncio.sleep(0)
 
             # Wrap up by sending any remaining statistics data
             logger.debug("Iteration log worker wrapping up...")
