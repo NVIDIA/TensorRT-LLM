@@ -252,16 +252,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("mtp_nextn",
                           [0, pytest.param(2, marks=skip_pre_hopper)])
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
-        ctx_server_config = {
-            "pytorch_backend_config": {
-                "disable_overlap_scheduler": True
-            }
-        }
-        gen_server_config = {
-            "pytorch_backend_config": {
-                "disable_overlap_scheduler": not overlap_scheduler
-            }
-        }
+        ctx_server_config = {"disable_overlap_scheduler": True}
+        gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
