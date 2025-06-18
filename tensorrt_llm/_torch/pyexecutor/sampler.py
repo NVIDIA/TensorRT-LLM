@@ -298,15 +298,20 @@ class TorchSampler(Sampler):
             state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens
 
-        for req in state.scheduled_requests.all_requests():
-            is_chunking = (not req.is_context_finished) and (
-                req.context_remaining_length != 0)
-            if is_chunking or req.state == LlmRequestState.GENERATION_COMPLETE:
+        for req in state.scheduled_requests.context_requests:
+            if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
-
             new_token = add_token(req, new_tokens, beam=self.BEAM)
-            processed = 1
             stop = self._handle_stop_criteria(req, new_token, beam=self.BEAM)
+            self.handle_logits(req, state, beam=self.BEAM, count=1)
+            req.py_decoding_iter += 1
+
+        for req in state.scheduled_requests.all_requests():
+            if req.state == LlmRequestState.GENERATION_COMPLETE:
+                continue
+            new_token = add_token(req, new_tokens, beam=self.BEAM)
+            stop = self._handle_stop_criteria(req, new_token, beam=self.BEAM)
+            processed = 1
             if not stop and len(req.py_draft_tokens) > 0:
                 num_accepted = self.process_draft_tokens(
                     req, new_tokens, new_token)
