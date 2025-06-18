@@ -15,9 +15,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.resource_manager import (ResourceManager,
-                                                             ResourceManagerType
-                                                             )
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
                                  is_trace_enabled, nvtx_range, trace_func)
@@ -163,7 +161,7 @@ class BatchStatePP(BatchState):
 class PyExecutor:
 
     def __init__(self,
-                 resource_manager: ResourceManager,
+                 resource_manager,
                  scheduler: RequestScheduler,
                  model_engine: ModelEngine,
                  sampler: Sampler,
