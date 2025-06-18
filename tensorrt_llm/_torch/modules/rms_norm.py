@@ -32,8 +32,9 @@ class RMSNorm(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor] = ...,
+        use_flash_infer: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if IS_FLASHINFER_AVAILABLE:
+        if IS_FLASHINFER_AVAILABLE and use_flash_infer:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
                                       flashinfer_rmsnorm)
             if isinstance(residual, torch.Tensor):
