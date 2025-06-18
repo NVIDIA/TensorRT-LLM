@@ -862,6 +862,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("https://nvbugs/5252559")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
+        if not attention_dp and (tp_size > 1 or ep_size > 1):
+            pytest.skip("https://nvbugs/5336321")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
             torch_compile_fullgraph=True,
@@ -1106,6 +1108,7 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.timeout(5400)
 @pytest.mark.skip_less_device_memory(80000)
 class TestLlama3_3NemotronSuper49Bv1(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Llama-3_3-Nemotron-Super-49B-v1"
@@ -1476,7 +1479,7 @@ class TestKanana_Instruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "kanana-1.5-2.1b-instruct-2505"
     MODEL_PATH = f"{llm_models_root()}/kanana-1.5-2.1b-instruct-2505"
 
-    @pytest.mark.skip_not_contain(["H20", "H100"])
+    @pytest.mark.skip_device_not_contain(["H20", "H100"])
     def test_auto_dtype(self):
         "RCCA: https://nvbugspro.nvidia.com/bug/5310520"
         pytorch_config = dict(duse_cuda_graph=True,
@@ -1484,6 +1487,25 @@ class TestKanana_Instruct(LlmapiAccuracyTestHarness):
                               cuda_graph_max_batch_size=384)
         with LLM(self.MODEL_PATH, **pytorch_config,
                  enable_attention_dp=True) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestBielik11BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "speakleash/Bielik-11B-v2.2-Instruct"
+
+    def test_auto_dtype(self):
+        with LLM(f"{llm_models_root()}/Bielik-11B-v2.2-Instruct") as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    def test_fp8(self):
+        with LLM(f"{llm_models_root()}/Bielik-11B-v2.2-Instruct-FP8") as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
