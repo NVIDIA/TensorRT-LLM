@@ -551,7 +551,6 @@ class TRTLLMSampler(Sampler):
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateTRTLLM:
-
         batch_size = scheduled_requests.batch_size
 
         self.setup_sampler_step(scheduled_requests.context_requests)
