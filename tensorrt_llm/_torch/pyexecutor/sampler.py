@@ -702,13 +702,19 @@ class TRTLLMSampler(Sampler):
                                     self.MAX_DECODING_TOKENS, buffer_manager)
                 for _ in range(self.num_micro_batches)
             ],
+            "sequence_lengths_host":
+            torch.empty((
+                self.max_num_sequences,
+                self.executor_config.max_beam_width,
+            ),
+                        dtype=torch.int),
             "decoder_state":
             DecoderState(),
             "decoding_input": [None] * self.num_micro_batches,
         }
 
         self.store["decoder_state"].setup(
-            max_batch_size=self.executor_config.max_batch_size,
+            max_num_sequences=self.max_num_sequences,
             max_beam_width=self.executor_config.max_beam_width,
             max_attention_window=self.max_attention_window,
             sink_token_length=0,
@@ -724,7 +730,7 @@ class TRTLLMSampler(Sampler):
         self.algs.decoder = GptDecoderBatched(stream=self.store["torch_stream"])
         self.algs.decoder.setup(
             mode=self.decoding_mode,
-            max_batch_size=self.executor_config.max_batch_size,
+            max_num_sequences=self.max_num_sequences,
             max_beam_width=self.executor_config.max_beam_width,
             dtype=self.logits_datatype,
             model_config=self.model_config,

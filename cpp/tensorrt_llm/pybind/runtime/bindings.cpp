@@ -312,10 +312,10 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tr::decoder::DecoderState>(m, "DecoderState")
         .def(py::init<>())
-        .def("setup", &tr::decoder::DecoderState::setup, py::arg("max_batch_size"), py::arg("max_beam_width"),
+        .def("setup", &tr::decoder::DecoderState::setup, py::arg("max_num_sequences"), py::arg("max_beam_width"),
             py::arg("max_attention_window"), py::arg("sink_token_length"), py::arg("max_sequence_length"),
             py::arg("dtype"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
-        .def("setup_cache_indirection", &tr::decoder::DecoderState::setupCacheIndirection, py::arg("max_batch_size"),
+        .def("setup_cache_indirection", &tr::decoder::DecoderState::setupCacheIndirection, py::arg("max_num_sequences"),
             py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("buffer_manager"))
         .def("setup_speculative_decoding", &tr::decoder::DecoderState::setupSpeculativeDecoding,
             py::arg("speculative_decoding_mode"), py::arg("max_tokens_per_engine_step"), py::arg("dtype"),
@@ -371,7 +371,7 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
         .def(py::init<tr::GptDecoderBatched::CudaStreamPtr>(), py::arg("stream"))
-        .def("setup", &tr::GptDecoderBatched::setup, py::arg("mode"), py::arg("max_batch_size"),
+        .def("setup", &tr::GptDecoderBatched::setup, py::arg("mode"), py::arg("max_num_sequences"),
             py::arg("max_beam_width"), py::arg("dtype"), py::arg("model_config"), py::arg("world_config"))
         .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("decoder_state"), py::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
