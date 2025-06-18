@@ -778,18 +778,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 chunk_size = self.runtime_features.normal_chunk_size
                 self.chunked_loop_num = (self.max_ctx_cached_token_len +
                                          chunk_size - 1) // chunk_size
-                # [toal_token_q, num_heads, 2] -> [toal_token_q, num_heads] float2
-                self.softmax_stats_tensor = torch.empty(
-                    (self.num_ctx_tokens, self.num_heads, 2),
-                    dtype=torch.float,
-                    device='cuda',
-                )
-                self.temp_softmax_stats_tensor = torch.empty(
-                    (self.num_ctx_tokens, self.num_heads, 2),
-                    dtype=torch.float,
-                    device='cuda',
-                )
-
                 self.chunked_seq_len = torch.empty(
                     (self.chunked_loop_num, self.num_seqs),
                     dtype=torch.int,
