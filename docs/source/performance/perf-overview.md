@@ -67,7 +67,7 @@ nvidia/Llama-3.1-405B-Instruct-FP4
 ### FP8 Models:
 ```
 nvidia/Llama-3.1-8B-Instruct-FP8
-nvidia/Llama-3.1-70B-Instruct-FP8
+nvidia/Llama-3.3-70B-Instruct-FP8
 nvidia/Llama-3.1-405B-Instruct-FP8
 nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 ```
@@ -90,7 +90,7 @@ nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 | 5000, 500                    |    | 3,813.69          | 3,394.54         |
 | 20000, 2000                  |    | 1,696.66          | 1,345.42         |
 
-#### Llama 3.1 70B FP8
+#### Llama 3.3 70B FP8
 
 |                          | GPU:   | H200 141GB HBM3   |          |           |           | H100 80GB HBM3   |          |           |           |
 |:-----------------------------|:---|:------------------|:---------|:----------|:----------|:-----------------|:---------|:----------|:----------|
