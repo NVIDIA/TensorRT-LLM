@@ -66,6 +66,8 @@ public:
 
     static float constexpr kNegativeInfinity = -1e20f;
 
+    DecodingOutput() = default;
+
     explicit DecodingOutput(TensorPtr ids, TensorPtr gatheredIds)
         : ids{std::move(ids)}
         , gatheredIds{std::move(gatheredIds)}

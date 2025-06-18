@@ -53,22 +53,21 @@ DecoderState::DecoderState(nvinfer1::DataType dtype, BufferManager const& buffer
     auto constexpr nvFloatType = TRTDataType<float>::value;
 
     auto& dInput = mJointDecodingInput;
-    { // prevent reusing these vars after std::move
-        auto dummyLogits = bufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
-        auto endIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-        auto batchSlots = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType);
-        dInput = std::make_unique<DecodingInput>(
-            0, 0, 0, 0, std::move(dummyLogits), std::move(endIds), std::move(batchSlots));
-    }
+    dInput = std::make_unique<DecodingInput>();
+    TLLM_CHECK(static_cast<bool>(dInput));
+    dInput->logits = bufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
+    dInput->endIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
+    dInput->batchSlots = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType);
+
     dInput->sequenceLimitLength = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dInput->lengths = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
 
     auto& dOutput = mJointDecodingOutput;
-    { // prevent reusing these vars after std::move
-        auto outputIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-        auto gatheredOutputIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
-        dOutput = std::make_unique<DecodingOutput>(std::move(outputIds), std::move(gatheredOutputIds));
-    }
+    dOutput = std::make_unique<DecodingOutput>();
+    TLLM_CHECK(static_cast<bool>(dOutput));
+    dOutput->ids = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
+    dOutput->gatheredIds = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
+
     dOutput->newTokensSteps = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
     dOutput->parentIds = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
 
