@@ -143,8 +143,9 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         if not enable_chunked_prefill and max_num_tokens < dataset_metadata.max_isl:
             logger.warning(
                 f"Chunked prefill is disabled, but max_num_tokens ({max_num_tokens}) is less than the max ISL ({dataset_metadata.max_isl}). "
-                f"Forcing max_num_tokens to {dataset_metadata.max_isl}.")
-            max_num_tokens = dataset_metadata.max_isl
+                f"Forcing max_num_tokens to {dataset_metadata.max_isl + max_batch_size}."
+            )
+            max_num_tokens = dataset_metadata.max_isl + max_batch_size
 
     pyt_options = {
         "use_cuda_graph":

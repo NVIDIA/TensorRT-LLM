@@ -384,20 +384,22 @@ print(os.path.dirname(torch.__file__),end='');"
   set(USE_SYSTEM_NVTX ON)
   set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
   find_package(Torch REQUIRED)
-
-  message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
-  add_compile_options(${TORCH_CXX_FLAGS})
   add_compile_definitions(TORCH_CUDA=1)
 
-  if(DEFINED USE_CXX11_ABI)
-    parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
-    if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
-       AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL ${USE_CXX11_ABI})
-      message(
-        WARNING
-          "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
-          "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
-          "setting will be discarded.")
+  if(DEFINED TORCH_CXX_FLAGS)
+    message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
+    add_compile_options(${TORCH_CXX_FLAGS})
+    if(DEFINED USE_CXX11_ABI)
+      parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
+      if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
+         AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL
+             ${USE_CXX11_ABI})
+        message(
+          WARNING
+            "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
+            "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
+            "setting will be discarded.")
+      endif()
     endif()
   endif()
 

@@ -787,11 +787,11 @@ protected:
 
     void runMoEPermute(std::vector<DataType> h_hidden_states, std::vector<int> h_token_selected_experts,
         std::vector<float> h_token_final_scales, int64_t hidden_size, int64_t num_experts, int64_t k,
-        MOEParallelismConfig parallelism_config = {})
+        MOEParallelismConfig parallelism_config = {}, bool const enable_alltoall = false)
     {
         initBuffersPermute(std::move(h_hidden_states), std::move(h_token_selected_experts),
             std::move(h_token_final_scales), hidden_size, num_experts, k, parallelism_config);
-        runMoEPermute(parallelism_config);
+        runMoEPermute(parallelism_config, enable_alltoall);
     }
 
     auto getWeights(MOEParallelismConfig parallelism_config)
@@ -964,7 +964,7 @@ protected:
         return tactics;
     }
 
-    void runMoEPermute(MOEParallelismConfig parallelism_config)
+    void runMoEPermute(MOEParallelismConfig parallelism_config, bool const enable_alltoall = false)
     {
         // Clear the buffers to blank so we can assume zero if not written
         resetOutBuffers();
@@ -1025,8 +1025,8 @@ protected:
         mMoERunner.setTactic(tactic1, tactic2);
         mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr, mActType,
             weight2_ptr, bias2_ptr, quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size,
-            mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params,
-            useFp8BlockScales, minLatencyMode, min_latency_params, stream);
+            mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, enable_alltoall,
+            mUseLora, lora_params, useFp8BlockScales, minLatencyMode, min_latency_params, stream);
 
         check_cuda_error(cudaStreamSynchronize(stream));
     }
@@ -1195,6 +1195,26 @@ protected:
         return output;
     }
 
+    void compareSourceToExpandedMap(std::vector<int> const& expected_experts,
+        std::vector<int> const& source_to_expanded_map, std::vector<int> const& reference_map)
+    {
+        ASSERT_EQ(expected_experts.size(), source_to_expanded_map.size());
+        ASSERT_EQ(expected_experts.size(), reference_map.size());
+
+        for (size_t i = 0; i < expected_experts.size(); i++)
+        {
+            // Note: Only check valid positions (expert ids on the current rank).
+            if (expected_experts[i] < mNumExperts)
+            {
+                int token_id = i / mK;
+                int expert_id = i % mK;
+                int interleaved_index = expert_id * mTotalTokens + token_id;
+                ASSERT_EQ(source_to_expanded_map[interleaved_index], reference_map[interleaved_index])
+                    << "Incorrect source_to_expanded_map for token: " << token_id << " expert: " << expert_id;
+            }
+        }
+    }
+
     void compareFinal(std::vector<int> const& expected_experts, std::vector<float> const& token_final_scales,
         std::vector<OutputType> const& input_data, std::vector<OutputType> final_results = {})
     {
@@ -1237,9 +1257,11 @@ protected:
     {
         mInterSizeFraction = inter_size_fraction;
         // 2 experts per rank
-        ParallelismTest(k, 1, num_experts / 2, hidden_size, num_experts, num_tokens);
+        ParallelismTest(k, 1, num_experts / 2, hidden_size, num_experts, num_tokens, false);
+        // 2 experts per rank, enable alltoall
+        ParallelismTest(k, 1, num_experts / 2, hidden_size, num_experts, num_tokens, true);
         // 1 expert per rank
-        ParallelismTest(k, 1, num_experts, hidden_size, num_experts, num_tokens);
+        ParallelismTest(k, 1, num_experts, hidden_size, num_experts, num_tokens, false);
     }
 
     // Tensor parallel tests default to inter_size_fraction = 1.0f so that all ranks have interesting values
@@ -1260,14 +1282,13 @@ protected:
         // 2 experts per rank
         ParallelismTest(k, 2, num_experts / 2, hidden_size, num_experts, num_tokens);
         ParallelismTest(k, 8, num_experts / 2, hidden_size, num_experts, num_tokens);
-
         // 1 expert per rank
         ParallelismTest(k, 2, num_experts, hidden_size, num_experts, num_tokens);
         ParallelismTest(k, 8, num_experts, hidden_size, num_experts, num_tokens);
     }
 
     void ParallelismTest(int k = 1, int tp_size = 4, int ep_size = 2, int64_t hidden_size = DEFAULT_HIDDEN_SIZE,
-        int64_t num_experts = 4, int64_t num_tokens = 3);
+        int64_t num_experts = 4, int64_t num_tokens = 3, bool const enable_alltoall = false);
 };
 
 template <class WeightParams>
@@ -1361,7 +1382,7 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
 
         auto proj_map = getDataFromDevice(mSourceToExpandedMap, mTotalTokens * k);
         auto permute_map = calcPermuteMapExpertParallel(expected_experts);
-        ASSERT_EQ(permute_map, proj_map);
+        compareSourceToExpandedMap(expected_experts, proj_map, permute_map);
         compareFinal(expected_experts, token_final_scales, raw_unquant_input);
     }
 }
@@ -1526,7 +1547,7 @@ std::vector<int> MixtureOfExpertsTest<TypeParam_>::calcPermuteMapExpertParallel(
     std::vector<int> map(expected_experts.size());
     auto getInterleavedIndex = [this](int i) { return (i % mK) * mTotalTokens + i / mK; };
     int map_idx = 0;
-    for (int expert = 0; expert < mNumExperts * 2; expert++)
+    for (int expert = 0; expert < mNumExperts; expert++)
     {
         for (int i = 0; i < map.size(); i++)
         {
@@ -1539,8 +1560,8 @@ std::vector<int> MixtureOfExpertsTest<TypeParam_>::calcPermuteMapExpertParallel(
 }
 
 template <class TypeParam_>
-void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
-    int k, int tp_size, int ep_size, int64_t hidden_size, int64_t num_experts, int64_t num_tokens)
+void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(int k, int tp_size, int ep_size, int64_t hidden_size,
+    int64_t num_experts, int64_t num_tokens, bool const enable_alltoall)
 {
     if (FP8 || FP4)
     {
@@ -1586,7 +1607,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 {
                     // Only need to init the inputs on the first iteration
                     runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
-                        MOEParallelismConfig{tp_size, i, ep_size, j});
+                        MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
                     bool should_be_deterministic
                         = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
@@ -1594,7 +1615,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
                         mMemsetValue = ~mMemsetValue; // Also check it doesn't depend on uninitialised memory
                         runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
-                            MOEParallelismConfig{tp_size, i, ep_size, j});
+                            MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
                         auto second_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
                         ASSERT_TRUE(std::equal(first_iter.begin(), first_iter.end(), second_iter.begin()))
                             << "Running permute a second time does not generate the same results";
@@ -1602,13 +1623,13 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 }
                 else
                 {
-                    runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j});
+                    runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
                     bool should_be_deterministic
                         = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
-                        runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j});
+                        runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
                         auto second_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
                         ASSERT_TRUE(std::equal(first_iter.begin(), first_iter.end(), second_iter.begin()))
                             << "Running permute a second time does not generate the same results";
@@ -1618,9 +1639,12 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 auto masked_expected_experts = maskSelectedExpertsForTP(expected_experts, ep_size, j);
                 auto proj_map = getDataFromDevice(mSourceToExpandedMap, mTotalTokens * k);
                 auto permute_map = calcPermuteMapExpertParallel(masked_expected_experts);
-                ASSERT_EQ(permute_map, proj_map) << "Iteration " << i << " " << j << " seq len " << num_tokens;
+                compareSourceToExpandedMap(masked_expected_experts, proj_map, permute_map);
 
                 // Do the final reduce
+                // Note: For enable_alltoall=false, the invalid positions (expert ids outside the current rank) are
+                // filled with 0 by mMoERunner.runMoe. For enable_alltoall=true, the invalid positions are untouched by
+                // mMoERunner.runMoe, but they are filled with 0 by resetOutBuffers.
                 auto iter_results = getDataFromDevice(mFinalOutput, mTotalTokens * hidden_size);
                 std::transform(
                     iter_results.cbegin(), iter_results.cend(), results.cbegin(), results.begin(), std::plus<>{});
@@ -1897,7 +1921,7 @@ TYPED_TEST(LargeMixtureOfExpertsTest, RunProfiler)
             this->FP8 ? nvinfer1::DataType::kFP8 : nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k,
             this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4, this->mGroupSize, ActivationType::Geglu, false,
             this->mUseLora, /*min_latency_mode=*/false,
-            /*need_weights=*/true, MOEParallelismConfig{});
+            /*need_weights=*/true, MOEParallelismConfig{}, /*enable_alltoall=*/false);
 
         auto ws_size = backend.getWorkspaceSize(128);
 
@@ -1938,7 +1962,8 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         {
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
                 nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, ep - 1});
+                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, ep - 1},
+                /*enable_alltoall=*/false);
 
             auto ws_size = backend.getWorkspaceSize(num_tokens);
             auto workspace = this->allocBuffer<char>(ws_size);
