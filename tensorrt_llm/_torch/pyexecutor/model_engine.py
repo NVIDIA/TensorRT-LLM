@@ -1172,7 +1172,7 @@ class PyTorchModelEngine(ModelEngine):
             gather_ids.append(len(input_ids) - 1)
             sequence_lengths.append(len(prompt_tokens))
             prompt_lengths.append(len(prompt_tokens))
-            past_seen_token_num = request.context_current_position
+            past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
             multimodal_embedding = request.multimodal_embedding
             if multimodal_embedding is not None:

@@ -30,10 +30,6 @@ class TllmRuntime;
 namespace tensorrt_llm::batch_manager
 {
 
-class DecoderBuffers;
-
-namespace tr = tensorrt_llm::runtime;
-
 class LogitsPostProcessor : Algorithm
 {
 public:
@@ -48,8 +44,8 @@ public:
     LogitsPostProcessor() = default;
 
     bool operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
-        bool replicateLogitsPostProcessor, DecoderBuffers& decoderBuffers, tr::WorldConfig const& worldConfig,
-        tr::TllmRuntime& runtime,
+        bool replicateLogitsPostProcessor, std::vector<batch_manager::LlmRequest::TensorPtr>& seqSlotLogits,
+        runtime::WorldConfig const& worldConfig, runtime::TllmRuntime& runtime,
         std::optional<LogitsPostProcessorBatched> logitsPostProcessorBatched = std::nullopt) const;
 };
 
