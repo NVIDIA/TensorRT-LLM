@@ -12,7 +12,6 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
-import tensorrt_llm.executor.serialization as serialization
 from tensorrt_llm.logger import logger
 
 from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
@@ -59,6 +58,7 @@ class GenerationExecutorWorker(GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
@@ -126,6 +126,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                     create_py_executor
                 create_executor = create_py_executor
                 args["lora_config"] = lora_config
+                args[
+                    "garbage_collection_gen0_threshold"] = garbage_collection_gen0_threshold
             elif executor_config.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
@@ -596,11 +598,8 @@ def worker_main(
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
-    BASE_ZMQ_CLASSES: Dict = serialization.BASE_ZMQ_CLASSES,
+    garbage_collection_gen0_threshold: Optional[int] = None,
 ) -> None:
-    # The base classes for ZMQ serialization. Passed through from the parent process to ensure
-    # that children processes include any classes added at runtime (such as those from `register_approved_ipc_class`).
-    serialization.BASE_ZMQ_CLASSES = BASE_ZMQ_CLASSES
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
                         "green")
@@ -690,17 +689,17 @@ def worker_main(
             str, Optional[bytes]] = worker_queues.result_queue_addr
 
         assert result_queues is not None
-        assert postproc_worker_config.postprocess_tokenizer_dir is not None
         postproc_worker_pool = ProcessPoolExecutor(
             max_workers=postproc_worker_config.num_postprocess_workers)
         assert isinstance(proxy_result_queue, tuple)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
-                postproc_worker_main, result_queues[i].address,
+                postproc_worker_main,
+                result_queues[i].address,
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
-                serialization.BASE_ZMQ_CLASSES)
+            )
             postprocess_worker_futures.append(fut)
 
     # Error handling in the Worker/MPI process
@@ -725,7 +724,8 @@ def worker_main(
             batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
-            lora_config=lora_config)
+            lora_config=lora_config,
+            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())

@@ -19,6 +19,8 @@ import torch
 from einops import rearrange, repeat
 from torch import nn
 
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+
 from ...attention_backend import AttentionMetadata
 from ...model_config import ModelConfig
 from ..linear import Linear, TensorParallelMode
@@ -88,15 +90,14 @@ class Mamba2Mixer(nn.Module):
         self.is_paged_state = False
 
         # in_proj
-        self.in_proj = Linear(
-            d_model,
-            d_in_proj,
-            bias=bias,
-            dtype=dtype,
-            mapping=self.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            quant_config=config.get_quant_config(),
-        )
+        self.in_proj = Linear(d_model,
+                              d_in_proj,
+                              bias=bias,
+                              dtype=dtype,
+                              mapping=self.mapping,
+                              tensor_parallel_mode=TensorParallelMode.COLUMN,
+                              quant_config=config.get_quant_config(),
+                              allreduce_strategy=config.allreduce_strategy)
 
         # conv1d, reuse Linear to store weights since it has support for TP > 1 already
         self.conv1d = Linear(
@@ -108,7 +109,7 @@ class Mamba2Mixer(nn.Module):
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-        )
+            allreduce_strategy=config.allreduce_strategy)
 
         # A
         self.A = nn.Parameter(
@@ -138,29 +139,29 @@ class Mamba2Mixer(nn.Module):
         )
 
         # out_proj
-        self.out_proj = Linear(
-            d_inner,
-            d_model,
-            bias=bias,
-            dtype=dtype,
-            mapping=self.mapping,
-            tensor_parallel_mode=TensorParallelMode.ROW,
-            quant_config=config.get_quant_config(),
-        )
+        self.out_proj = Linear(d_inner,
+                               d_model,
+                               bias=bias,
+                               dtype=dtype,
+                               mapping=self.mapping,
+                               tensor_parallel_mode=TensorParallelMode.ROW,
+                               quant_config=config.get_quant_config(),
+                               allreduce_strategy=config.allreduce_strategy)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        mamba_metadata: Mamba2Metadata,
     ) -> torch.Tensor:
 
         # calculate split size
-        num_contexts = attn_metadata.num_contexts
-        num_generations = attn_metadata.seq_lens.shape[0] - num_contexts
-        sum_seq = torch.cumsum(attn_metadata.seq_lens, dim=0)
-        split_ctx = sum_seq[num_contexts - 1] if num_contexts > 0 else 0
-        split_gen = sum_seq[-1] - split_ctx
-        split_size = [split_ctx, split_gen]
+        num_prefills = attn_metadata.num_contexts
+        num_decodes = attn_metadata.seq_lens.shape[0] - num_prefills
+        num_prefill_tokens = attn_metadata.num_ctx_tokens
+        num_decode_tokens = attn_metadata.num_tokens - num_prefill_tokens
+        seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
+        batch_split_size = [num_prefills, num_decodes]
 
         state_indices = attn_metadata.kv_cache_manager.get_state_indices()
 
@@ -168,169 +169,130 @@ class Mamba2Mixer(nn.Module):
         is_warmup = state_indices.numel() == 0
         if is_warmup:
             # in this case, assume batch takes first indices in mamba cache
-            state_indices = torch.arange(num_contexts + num_generations,
+            state_indices = torch.arange(num_prefills + num_decodes,
                                          device=state_indices.device,
                                          dtype=state_indices.dtype)
 
-        split_indices = torch.split(state_indices,
-                                    [num_contexts, num_generations])
-
-        split_seq_lens = torch.split(attn_metadata.seq_lens,
-                                     [num_contexts, num_generations])
+        state_indices_p, state_indices_d = torch.split(state_indices,
+                                                       batch_split_size)
+        conv_states = attn_metadata.kv_cache_manager.get_conv_states(
+            self.layer_idx)
+        ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
+            self.layer_idx)
 
         # in_proj
         zxbcdt = self.in_proj(hidden_states)
-        split_zxbcdt = torch.split(zxbcdt, split_size, dim=0)
-
-        # a batch can have either:
-        # * only context requests
-        # * only generation requests
-        # * both context and generation requests
-        # req_type = 0 -> context
-        # req_type = 1 -> generation
-        batch = None
-        # both context and generation requests
-        if num_contexts > 0 and num_generations > 0:
-            batch = [0, 1]
-        # only context requests
-        elif num_contexts > 0:
-            batch = [0]
-        # only generation requests
-        elif num_generations > 0:
-            batch = [1]
+        z, xbc, dt = torch.split(
+            zxbcdt,
+            [self.tp_d_inner, self.tp_conv_dim, self.tp_nheads],
+            dim=-1,
+        )
+        z_p, z_d = torch.split(z, seqlen_split_size, dim=0)
+        xbc_p, xbc_d = torch.split(xbc, seqlen_split_size, dim=0)
+        dt_p, dt_d = torch.split(dt, seqlen_split_size, dim=0)
 
         out = []
-        for req_type in batch:
 
-            indices = split_indices[req_type].to(torch.device("cuda"))
-            conv_states = attn_metadata.kv_cache_manager.get_conv_states(
-                self.layer_idx)
-            ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
-                self.layer_idx)
+        if num_prefills > 0:
 
-            z, xbc, dt = torch.split(
-                split_zxbcdt[req_type],
-                [self.tp_d_inner, self.tp_conv_dim, self.tp_nheads],
-                dim=-1,
+            cu_seqlens = mamba_metadata.cu_seqlens[:num_prefills + 1]
+            seq_idx = mamba_metadata.seq_idx
+
+            xbc_p = causal_conv1d_fn(xbc_p.transpose(0, 1),
+                                     self.conv1d.weight,
+                                     self.conv1d.bias,
+                                     activation="silu",
+                                     conv_states=conv_states,
+                                     query_start_loc=cu_seqlens,
+                                     cache_indices=state_indices_p).transpose(
+                                         0, 1)
+
+            x_p, B_p, C_p = torch.split(xbc_p.unsqueeze(0), [
+                self.tp_d_inner,
+                self.tp_ngroups * self.d_state,
+                self.tp_ngroups * self.d_state,
+            ],
+                                        dim=-1)
+
+            x_p = rearrange(x_p, "b l (h p) -> b l h p", h=self.tp_nheads)
+            dt_p = dt_p.unsqueeze(0)
+            B_p = rearrange(B_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
+            C_p = rearrange(C_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
+            z_p = rearrange(z_p.unsqueeze(0),
+                            "b l (h p) -> b l h p",
+                            h=self.tp_nheads)
+
+            y, current_ssm_states = mamba_chunk_scan_combined(
+                x_p,
+                dt_p,
+                self.A,
+                B_p,
+                C_p,
+                chunk_size=self.chunk_size,
+                D=self.D,
+                z=z_p,
+                dt_bias=self.dt_bias,
+                initial_states=None,
+                dt_softplus=self.delta_softplus,
+                cu_seqlens=cu_seqlens,
+                seq_idx=seq_idx,
+                return_varlen_states=True,
+                return_final_states=False,
             )
+            out.append(rearrange(y, "b l h p -> (b l) (h p)"))
 
-            # prefill
-            if req_type == 0:
+            # copy new ssm state
+            ssm_states[state_indices_p] = current_ssm_states
 
-                cu_seqlens = (torch.cat(
-                    [
-                        torch.zeros(1),
-                        torch.cumsum(split_seq_lens[req_type], dim=0)
-                    ],
-                    dim=0,
-                ).to(torch.int32).to(torch.device("cuda")))
+        if num_decodes > 0:
+            xbc_d = causal_conv1d_update(xbc_d,
+                                         conv_states,
+                                         self.conv1d.weight,
+                                         self.conv1d.bias,
+                                         activation="silu",
+                                         conv_state_indices=state_indices_d)
 
-                seq_idx = torch.repeat_interleave(
-                    torch.arange(len(split_seq_lens[req_type]),
-                                 dtype=torch.int32,
-                                 device=cu_seqlens.device),
-                    cu_seqlens.diff(),
-                    output_size=cu_seqlens[-1]).unsqueeze(0)
-
-                xbc = causal_conv1d_fn(xbc.transpose(0, 1),
-                                       self.conv1d.weight,
-                                       self.conv1d.bias,
-                                       activation="silu",
-                                       conv_states=conv_states,
-                                       query_start_loc=cu_seqlens,
-                                       cache_indices=indices).transpose(0, 1)
-
-                x, B, C = torch.split(xbc.unsqueeze(0), [
+            x_d, B_d, C_d = torch.split(
+                xbc_d,
+                [
                     self.tp_d_inner,
                     self.tp_ngroups * self.d_state,
                     self.tp_ngroups * self.d_state,
                 ],
-                                      dim=-1)
+                dim=-1,
+            )
 
-                x = rearrange(x, "b l (h p) -> b l h p", h=self.tp_nheads)
-                dt = dt.unsqueeze(0)
-                B = rearrange(B, "b l (g n) -> b l g n", g=self.tp_ngroups)
-                C = rearrange(C, "b l (g n) -> b l g n", g=self.tp_ngroups)
-                z = rearrange(z.unsqueeze(0),
-                              "b l (h p) -> b l h p",
-                              h=self.tp_nheads)
+            x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
+            dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
+            B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
+            C_d = rearrange(C_d, "b (g n) -> b g n", g=self.tp_ngroups)
+            z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
 
-                y, current_ssm_states = mamba_chunk_scan_combined(
-                    x,
-                    dt,
-                    self.A,
-                    B,
-                    C,
-                    chunk_size=self.chunk_size,
-                    D=self.D,
-                    z=z,
-                    dt_bias=self.dt_bias,
-                    initial_states=None,
-                    dt_softplus=self.delta_softplus,
-                    cu_seqlens=cu_seqlens,
-                    seq_idx=seq_idx,
-                    return_varlen_states=True,
-                    return_final_states=False,
-                )
-                y = rearrange(y, "b l h p -> (b l) (h p)")
+            A = repeat(self.A, "h -> h p n", p=self.head_dim,
+                       n=self.d_state).to(dtype=torch.float32)
+            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
+            D = repeat(self.D, "h -> h p", p=self.head_dim)
 
-                # copy new ssm state
-                ssm_states[indices] = current_ssm_states
+            y = selective_state_update(
+                ssm_states,
+                x_d,
+                dt_d,
+                A,
+                B_d,
+                C_d,
+                D,
+                z=z_d,
+                dt_bias=dt_bias,
+                dt_softplus=self.delta_softplus,
+                state_batch_indices=state_indices_d,
+            )
 
-            # decode
-            else:
-                xbc = causal_conv1d_update(xbc,
-                                           conv_states,
-                                           self.conv1d.weight,
-                                           self.conv1d.bias,
-                                           activation="silu",
-                                           conv_state_indices=indices)
-
-                x, B, C = torch.split(
-                    xbc,
-                    [
-                        self.tp_d_inner,
-                        self.tp_ngroups * self.d_state,
-                        self.tp_ngroups * self.d_state,
-                    ],
-                    dim=-1,
-                )
-
-                A = repeat(self.A,
-                           "h -> h p n",
-                           p=self.head_dim,
-                           n=self.d_state).to(dtype=torch.float32)
-                dt = repeat(dt, "b h -> b h p", p=self.head_dim)
-                dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
-                D = repeat(self.D, "h -> h p", p=self.head_dim)
-                B = rearrange(B, "b (g n) -> b g n", g=self.tp_ngroups)
-                C = rearrange(C, "b (g n) -> b g n", g=self.tp_ngroups)
-                x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.head_dim)
-                z = rearrange(z, "b (h p) -> b h p", p=self.head_dim)
-
-                y = selective_state_update(
-                    ssm_states,
-                    x_reshaped,
-                    dt,
-                    A,
-                    B,
-                    C,
-                    D,
-                    z=z,
-                    dt_bias=dt_bias,
-                    dt_softplus=self.delta_softplus,
-                    state_batch_indices=indices,
-                )
-
-                y = rearrange(y, "b h p -> b (h p)")
-
-            # gated norm
-            y = self.norm(y)
-
-            # append output
-            out.append(y)
+            out.append(rearrange(y, "b h p -> b (h p)"))
 
         out = torch.cat(out, dim=0)
+
+        # norm
+        out = self.norm(out)
 
         # out_proj
         out = self.out_proj(out)

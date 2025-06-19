@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 
 namespace tensorrt_llm::batch_manager
@@ -39,8 +40,34 @@ runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool
 
 template class GenericLlmRequest<runtime::ITensor::SharedPtr>;
 
-/// Note that there is some dependency on the order of operations in this method. Modify with care!
 std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits, int32_t mpiWorldRank)
+{
+    auto requestId = isChild() ? mParentRequestId : mRequestId;
+    auto result = createResult(useFastLogits, mpiWorldRank);
+    if (result.has_value())
+    {
+        return executor::Response(requestId, result.value(), mClientId);
+    }
+    return std::nullopt;
+}
+
+void LlmRequest::createSerializedResult(
+    std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits, int32_t mpiWorldRank)
+{
+    auto result = createResult(useFastLogits, mpiWorldRank);
+    if (result.has_value())
+    {
+        std::ostringstream oStream;
+        executor::serialize_utils::serialize(result.value(), oStream);
+        auto str = oStream.str();
+        serializedResult.resize(str.size());
+        std::copy(str.begin(), str.end(), serializedResult.begin());
+        isFinal = result.value().isFinal;
+    }
+}
+
+/// Note that there is some dependency on the order of operations in this method. Modify with care!
+std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int32_t mpiWorldRank)
 {
     TLLM_CHECK(!isDisaggContextCompleteState());
     if (!(isFinished() || (mIsStreaming && mState == LlmRequestState::kGENERATION_IN_PROGRESS)))
@@ -192,11 +219,7 @@ std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits,
 
     // Update position of last sent response
     setMaxSentTokenLen(maxNbTokens);
-
-    auto requestId = isChild() ? mParentRequestId : mRequestId;
-    auto response = executor::Response(requestId, std::move(result), mClientId);
-
-    return response;
+    return result;
 }
 
 void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,

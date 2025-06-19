@@ -14,6 +14,7 @@
 # limitations under the License.
 # # Force resource release after test
 import pytest
+import torch
 import tqdm
 
 
@@ -48,3 +49,43 @@ def pytest_runtest_protocol(item, nextitem):
 
                 torch.cuda.empty_cache()
             break
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--test-prefix",
+        "-P",
+        action="store",
+        default=None,
+        help=
+        "Prepend a prefix to the test names. Useful for distinguishing different test runs in a test report."
+    )
+
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_collection_modifyitems(session, config, items):
+    test_prefix = config.getoption("--test-prefix")
+
+    yield
+
+    if test_prefix:
+        # Override the internal nodeid of each item to contain the correct test prefix.
+        # This is needed for reporting to correctly process the test name in order to bucket
+        # it into the appropriate test suite.
+        for item in items:
+            item._nodeid = f"{test_prefix}/{item._nodeid}"
+
+
+def pytest_sessionstart(session):
+    # To counter TransformerEngine v2.3's lazy_compile deferral,
+    # which will cause Pytest thinks there's a thread leakage.
+    import torch._inductor.async_compile  # noqa: F401
+
+
+@pytest.fixture(autouse=True)
+def torch_empty_cache() -> None:
+    """
+    Automatically empty the torch CUDA cache before each test, to reduce risk of OOM errors.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()

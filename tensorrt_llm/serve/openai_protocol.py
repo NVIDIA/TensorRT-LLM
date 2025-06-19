@@ -22,14 +22,6 @@ class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    def __init_subclass__(cls, **kwargs):
-        """
-        This method is called when a class inherits from OpenAIBaseModel.
-        """
-        # Register subclass as an approved class for deserialization across IPC boundaries.
-        super().__init_subclass__(**kwargs)
-        register_approved_ipc_class(cls)
-
 
 class StreamOptions(OpenAIBaseModel):
     include_usage: Optional[bool] = True

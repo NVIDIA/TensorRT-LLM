@@ -115,6 +115,7 @@ def quant_cfg_choices():
     QUANT_CFG_CHOICES = {
         "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
         "fp8": mtq.FP8_DEFAULT_CFG,
+        "fp8_pc_pt": mtq.FP8_PER_CHANNEL_PER_TOKEN_CFG,
         "int4_awq": mtq.INT4_AWQ_CFG,
         "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
         "int8_wo": EMPTY_CFG,
@@ -512,6 +513,7 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
         "int8": "INT8_DEFAULT_CFG",
         "int8_sq": "INT8_SMOOTHQUANT_CFG",
         "fp8": "FP8_DEFAULT_CFG",
+        "fp8_pc_pt": "FP8_PER_CHANNEL_PER_TOKEN_CFG",
         "int4_awq": "INT4_AWQ_CFG",
         "w4a8_awq": "W4A8_AWQ_BETA_CFG",
     }

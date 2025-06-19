@@ -77,14 +77,20 @@ void TFusedMultiHeadAttentionXMMAKernel<TKernelMeta, TKernelParam>::loadXMMAKern
             }
             else
             {
-                TLLM_CU_CHECK(mDriver->cuModuleLoadData(&hmod, kernelMeta.mCubin));
+                if (kernelMeta.mCubin != nullptr)
+                {
+                    TLLM_CU_CHECK(mDriver->cuModuleLoadData(&hmod, kernelMeta.mCubin));
+                }
                 mModules.insert(std::make_pair(kernelMeta.mCubin, hmod));
             }
 
             FusedMultiHeadAttentionKernelInfo funcInfo;
             funcInfo.mMetaInfoIndex = i;
-            TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
-            if (kernelMeta.mSharedMemBytes >= 48 * 1024)
+            if (kernelMeta.mCubin != nullptr)
+            {
+                TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
+            }
+            if (kernelMeta.mSharedMemBytes >= 48 * 1024 && kernelMeta.mCubin != nullptr)
             {
                 TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
                     CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes));
@@ -272,6 +278,11 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
     }
 
     auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
+    if (kernelMeta.launcher != nullptr)
+    {
+        kernelMeta.launcher(params, launch_params, stream);
+        return;
+    }
     const CUfunction func = findIter->second.mDeviceFunction;
 
     void* kernelParams[] = {&params, nullptr};

@@ -36,6 +36,11 @@
 namespace tensorrt_llm::runtime
 {
 class TllmRuntime;
+
+namespace decoder
+{
+class DecoderState;
+} // namespace decoder
 } // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::batch_manager
@@ -171,14 +176,13 @@ public:
     std::unique_ptr<EncoderBuffers> encoderBuffers;
 
     //! Medusa
-    std::unique_ptr<MedusaBuffers> medusaBuffers;
-
+    std::unique_ptr<MedusaBuffers> mMedusaBuffers;
     //! Lookahead decoding
-    std::optional<runtime::LookaheadRuntimeBuffers> lookaheadBuffers;
+    std::unique_ptr<runtime::LookaheadRuntimeBuffers> mLookaheadBuffers;
     //! Explicit draft tokens decoding
-    std::optional<runtime::ExplicitDraftTokensBuffers> explicitDraftTokensBuffers;
+    std::unique_ptr<runtime::ExplicitDraftTokensBuffers> mExplicitDraftTokensBuffers;
     //! Eagle decoding
-    std::optional<runtime::EagleBuffers> eagleBuffers;
+    std::unique_ptr<runtime::EagleBuffers> mEagleBuffers;
 
     //! Language adapter routing information if language adapter is presented, [numTokens, numLanguages]
     TensorPtr languageAdapterRoutings;
@@ -275,20 +279,22 @@ public:
 
     std::tuple<SizeType32, TensorMap const&, TensorMap&> prepareStep(RequestVector const& contextRequests,
         RequestVector const& genRequests, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
-        DecoderBuffers& decoderBuffers, kv_cache_manager::BaseKVCacheManager* kvCacheManager,
-        kv_cache_manager::BaseKVCacheManager* crossKvCacheManager, rnn_state_manager::RnnStateManager* rnnStateManager,
-        PeftTable const& peftTable, runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
+        DecoderBuffers& decoderBuffers, runtime::decoder::DecoderState const& decoderState,
+        kv_cache_manager::BaseKVCacheManager* kvCacheManager, kv_cache_manager::BaseKVCacheManager* crossKvCacheManager,
+        rnn_state_manager::RnnStateManager* rnnStateManager, PeftTable const& peftTable,
+        runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
         OptionalRef<runtime::ITensor const> newOutputTokens = std::nullopt);
 
     void prepareBuffersForCudaGraph(SizeType32 maxSequenceLength);
 
-    void prepareExplicitDraftTokenBuffers(DecoderBuffers& decoderBuffers, runtime::TllmRuntime const& runtime,
-        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
+    void prepareExplicitDraftTokenBuffers(runtime::ExplicitDraftTokensBuffers::Inputs const& explicitDraftTokensBuffers,
+        runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
+        runtime::WorldConfig const& worldConfig);
 
     void prepareEagleBuffers(RequestVector const& contextRequests, RequestVector const& genRequests,
-        DecoderBuffers& decoderBuffers, runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig);
+        runtime::EagleBuffers::Inputs const& eagleBuffers, runtime::TllmRuntime const& runtime,
+        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 
 private:
     void create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
@@ -297,9 +303,6 @@ private:
         executor::DecodingConfig const& decodingConfig, bool gatherGenerationLogits,
         std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs = std::nullopt);
 
-    void reshape(runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits);
-
     //! @brief set max sizes for pre-allocation
     void setMaxBufferSizes(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, runtime::ModelConfig const& modelConfig,
         std::optional<SizeType32> maxNumRuntimeTokens);
@@ -307,9 +310,12 @@ private:
     //! @brief set sizes depending on scheduled requests
     void setBufferSizes(RequestVector const& contextRequests, RequestVector const& genRequests);
 
+    void reshape(runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
+        runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits);
+
     void setFromInputs(RequestVector const& contextRequests, RequestVector const& genRequests, SizeType32 maxBeamWidth,
         SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers,
-        kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
+        runtime::decoder::DecoderState const& decoderState, kv_cache_manager::BaseKVCacheManager* kvCacheManagerPtr,
         kv_cache_manager::BaseKVCacheManager* crossKvCacheManagerPtr,
         rnn_state_manager::RnnStateManager* rnnStateManagerPtr, PeftTable const& peftTable,
         runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,

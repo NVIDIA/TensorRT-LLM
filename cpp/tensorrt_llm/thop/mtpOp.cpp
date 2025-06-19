@@ -109,8 +109,8 @@ std::tuple<th::Tensor, th::Tensor> mtp_sampling_and_accepted_draft_tokens_op(th:
     TLLM_CHECK(draftTokensSizes[0] == (numGenerationRequest * numMTPModules));
 
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
-    auto acceptedTokens = torch::empty(
-        {batchSize, numMTPModules + 1}, at::TensorOptions().dtype(torch::kInt32).device(logits.device()));
+    auto acceptedTokens
+        = torch::ones({batchSize, numMTPModules + 1}, at::TensorOptions().dtype(torch::kInt32).device(logits.device()));
     auto numAcceptedTokens = torch::ones({batchSize}, at::TensorOptions().dtype(torch::kInt32).device(logits.device()));
 
     // Fill params

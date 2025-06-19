@@ -30,7 +30,7 @@ namespace tensorrt_llm::batch_manager
 {
 
 DecoderInputBuffers::DecoderInputBuffers(
-    SizeType32 maxBatchSize, SizeType32 maxDecoderSteps, BufferManager const& manager)
+    SizeType32 maxNumSequences, SizeType32 maxBatchSize, SizeType32 maxDecoderSteps, BufferManager const& manager)
 {
     auto const maxBatchSizeShape = ITensor::makeShape({maxBatchSize});
     auto const nvSizeType = TRTDataType<SizeType32>::value;
@@ -48,6 +48,8 @@ DecoderInputBuffers::DecoderInputBuffers(
     {
         forwardBatchSlots.emplace_back(BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize}), nvSizeType));
     }
+
+    logits.resize(maxNumSequences);
 }
 
 DecoderOutputBuffers::DecoderOutputBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxSeqLen,
@@ -91,11 +93,6 @@ DecoderBuffers::DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWid
     SizeType32 maxTokensPerStep, BufferManager const& manager, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
-    if (worldConfig.isLastPipelineParallelRank())
-    {
-        logits.resize(maxNumSequences);
-    }
-
     cacheIndirectionInput = manager.gpu(
         ITensor::makeShape({maxNumSequences, maxBeamWidth, maxAttentionWindow}), nvinfer1::DataType::kINT32);
     cacheIndirectionOutput = manager.gpu(
@@ -107,23 +104,10 @@ DecoderBuffers::DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWid
     {
         draftBuffers.create(maxNumSequences, maxTokensPerStep, manager, modelConfig);
     }
-
-    if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
-    {
-        explicitDraftTokensBuffers.create(maxNumSequences, manager, modelConfig, worldConfig);
-    }
-    else if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
-    {
-        lookaheadBuffers.emplace(maxNumSequences, maxTokensPerStep, manager);
-    }
-    else if (modelConfig.getSpeculativeDecodingMode().isEagle())
-    {
-        eagleBuffers.create(maxNumSequences, manager, modelConfig, worldConfig);
-    }
 }
 
-void DecoderBuffers::DraftBuffers::create(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep,
-    BufferManager const& manager, ModelConfig const& modelConfig)
+void DraftBuffers::create(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, BufferManager const& manager,
+    ModelConfig const& modelConfig)
 {
     auto const speculativeDecodingMode = modelConfig.getSpeculativeDecodingMode();
 
