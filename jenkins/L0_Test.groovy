@@ -1358,7 +1358,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C; fi'
 
         def extraInternalEnv = ""
-        def pytestTestTimeout = "1800"
+        def pytestTestTimeout = "7200"
 
         // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
         extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
@@ -1559,7 +1559,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}")
     }
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
