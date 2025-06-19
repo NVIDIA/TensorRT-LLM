@@ -47,15 +47,12 @@ def shuffle_weight_for_activation_kernel(
         w3_w1_weight: torch.Tensor) -> torch.Tensor:
     temp_weight = w3_w1_weight.clone()
     last_dim = w3_w1_weight.shape[-1]
-    # Shuffle the weights to match the expected format for the Triton activation kernel
-    if w3_w1_weight.dim() == 3:
-        # The whole shuffle after re-quantization for fp8 qdq
-        w3_w1_weight[:, :, 0::2] = temp_weight[:, :, last_dim // 2:]
-        w3_w1_weight[:, :, 1::2] = temp_weight[:, :, 0:last_dim // 2]
-    elif w3_w1_weight.dim() == 2:
-        # The shard shuffle for unquantized and mxfp4
-        w3_w1_weight[:, 0::2] = temp_weight[:, last_dim // 2:]
-        w3_w1_weight[:, 1::2] = temp_weight[:, 0:last_dim // 2]
+    assert w3_w1_weight.dim() in [1, 2, 3]
+    # n_dims = 1: Single expert bias (like the unquantized case)
+    # n_dims = 2: Single expert weight (like the unquantized case)
+    # n_dims = 3: Multiple experts weight (re-quantization for fp8 qdq)
+    w3_w1_weight[..., 0::2] = temp_weight[..., last_dim // 2:]
+    w3_w1_weight[..., 1::2] = temp_weight[..., 0:last_dim // 2]
     return w3_w1_weight
 
 
@@ -84,8 +81,11 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
             module.intermediate_size_per_partition,
             module.hidden_size,
         )
-        super().create_weights(module, weight_dtype, w3_w1_weight_shape,
-                               w2_weight_shape)
+        super().create_weights(module,
+                               weight_dtype,
+                               w3_w1_weight_shape,
+                               w2_weight_shape,
+                               bias_dtype=torch.float32)
         self.setup_quant_scales(module)
 
     def setup_quant_scales(self, module: torch.nn.Module):
@@ -111,10 +111,13 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
                                             TensorParallelMode.COLUMN)
 
         w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
-        w31_weight_shard = w31_weight_shard.view(dst_w3_w1_weight.dtype)
+        # We use .to here since for Triton the bias is always in float32 and a conversion is needed.
+        w31_weight_shard = w31_weight_shard.to(dst_w3_w1_weight.dtype)
 
-        # Transpose the weights to match the expected format for the Triton gemm kernel
-        w31_weight_shard = w31_weight_shard.transpose(0, 1).contiguous()
+        # This function is shared by weights and biases, we only do transpose for weights
+        if w31_weight_shard.dim() == 2:
+            # Transpose the weights to match the expected format for the Triton gemm kernel
+            w31_weight_shard = w31_weight_shard.transpose(0, 1).contiguous()
 
         if self.shuffle_weight:
             w31_weight_shard = shuffle_weight_for_activation_kernel(
@@ -132,10 +135,13 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         w2_weight_shard = load_weight_shard(w2_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.ROW)
-        w2_weight_shard = w2_weight_shard.view(dst_w2_weight.dtype)
+        # We use .to here since for Triton the bias is always in float32 and a conversion is needed.
+        w2_weight_shard = w2_weight_shard.to(dst_w2_weight.dtype)
 
-        # Transpose the weights to match the expected format for the Triton gemm kernel
-        w2_weight_shard = w2_weight_shard.transpose(0, 1).contiguous()
+        # This function is shared by weights and biases, we only do transpose for weights
+        if w2_weight_shard.dim() == 2:
+            # Transpose the weights to match the expected format for the Triton gemm kernel
+            w2_weight_shard = w2_weight_shard.transpose(0, 1).contiguous()
 
         dst_w2_weight.copy_(w2_weight_shard, non_blocking=True)
 
@@ -167,13 +173,12 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
                               out_dtype=module.dtype)
 
         # Call the Triton kernel, which also does permutation
-        gemm1_output = matmul_ogs(
-            hidden_states,
-            gemm1_weights,
-            None,  # Bias
-            rdata,
-            gather_indx=gather_indx,
-            precision_config=pc1)
+        gemm1_output = matmul_ogs(hidden_states,
+                                  gemm1_weights,
+                                  module.w3_w1_bias if module.bias else None,
+                                  rdata,
+                                  gather_indx=gather_indx,
+                                  precision_config=pc1)
 
         # Step 3: Activation
         # Setup quantization context
@@ -194,14 +199,13 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
                               out_dtype=module.dtype)
 
         # Call the Triton kernel, which also does finalization
-        gemm2_output = matmul_ogs(
-            act_out,
-            gemm2_weights,
-            None,  # Bias
-            rdata,
-            scatter_indx=scatter_indx,
-            precision_config=pc2,
-            gammas=rdata.gate_scal if rdata else None)
+        gemm2_output = matmul_ogs(act_out,
+                                  gemm2_weights,
+                                  module.w2_bias if module.bias else None,
+                                  rdata,
+                                  scatter_indx=scatter_indx,
+                                  precision_config=pc2,
+                                  gammas=rdata.gate_scal if rdata else None)
         return gemm2_output
 
 
@@ -235,8 +239,12 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             module.intermediate_size_per_partition,
             module.hidden_size,
         )
-        FusedMoEMethodBase.create_weights(self, module, weight_dtype,
-                                          w3_w1_weight_shape, w2_weight_shape)
+        FusedMoEMethodBase.create_weights(self,
+                                          module,
+                                          weight_dtype,
+                                          w3_w1_weight_shape,
+                                          w2_weight_shape,
+                                          bias_dtype=torch.float32)
 
         fc31_dequant = nn.Parameter(torch.empty(
             module.expert_size_per_partition, dtype=torch.float32),
@@ -325,6 +333,10 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         # now we can shuffle the weights for the activation kernel
         module.w3_w1_weight.data = shuffle_weight_for_activation_kernel(
             module.w3_w1_weight.data)
+        if module.bias:
+            # Bias should also be shuffled here
+            module.w3_w1_bias.data = shuffle_weight_for_activation_kernel(
+                module.w3_w1_bias.data)
         # Step3: calculate and store final loaded weights
         module.fc31_dequant.data.copy_(tmp_w3_w1_weight_scale)
         module.fc2_dequant.data.copy_(tmp_w2_weight_scale)
@@ -370,13 +382,12 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                               out_dtype=module.dtype)
 
         # Call the Triton kernel, which also does permutation
-        gemm1_output = matmul_ogs(
-            hidden_states,
-            gemm1_weights,
-            None,  # Bias
-            rdata,
-            gather_indx=gather_indx,
-            precision_config=pc1)
+        gemm1_output = matmul_ogs(hidden_states,
+                                  gemm1_weights,
+                                  module.w3_w1_bias if module.bias else None,
+                                  rdata,
+                                  gather_indx=gather_indx,
+                                  precision_config=pc1)
 
         # Step 3: Activation
         # Setup quantization context
@@ -404,14 +415,13 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                               out_dtype=module.dtype)
 
         # Call the Triton kernel, which also does finalization
-        gemm2_output = matmul_ogs(
-            act_out,
-            gemm2_weights,
-            None,  # Bias
-            rdata,
-            scatter_indx=scatter_indx,
-            precision_config=pc2,
-            gammas=rdata.gate_scal if rdata else None)
+        gemm2_output = matmul_ogs(act_out,
+                                  gemm2_weights,
+                                  module.w2_bias if module.bias else None,
+                                  rdata,
+                                  scatter_indx=scatter_indx,
+                                  precision_config=pc2,
+                                  gammas=rdata.gate_scal if rdata else None)
         return gemm2_output
 
 
@@ -509,8 +519,12 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             w2_weight_shape[2],
         )
 
-        FusedMoEMethodBase.create_weights(self, module, weight_dtype,
-                                          w3_w1_weight_shape, w2_weight_shape)
+        FusedMoEMethodBase.create_weights(self,
+                                          module,
+                                          weight_dtype,
+                                          w3_w1_weight_shape,
+                                          w2_weight_shape,
+                                          bias_dtype=torch.float32)
 
         fc31_dequant = nn.Parameter(
             torch.empty(w3_w1_scale_shape, dtype=torch.uint8),  # mxfp8 scale
@@ -689,13 +703,12 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                               out_dtype=module.dtype)
 
         # Call the Triton kernel, which also does permutation
-        gemm1_output = matmul_ogs(
-            hidden_states,
-            gemm1_weights,
-            None,  # Bias
-            rdata,
-            gather_indx=gather_indx,
-            precision_config=pc1)
+        gemm1_output = matmul_ogs(hidden_states,
+                                  gemm1_weights,
+                                  module.w3_w1_bias if module.bias else None,
+                                  rdata,
+                                  gather_indx=gather_indx,
+                                  precision_config=pc1)
 
         # Step 3: Activation
         # Setup quantization context
@@ -736,14 +749,13 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                               out_dtype=module.dtype)
 
         # Call the Triton kernel, which also does finalization
-        gemm2_output = matmul_ogs(
-            act_out,
-            gemm2_weights,
-            None,  # Bias
-            rdata,
-            scatter_indx=scatter_indx,
-            precision_config=pc2,
-            gammas=rdata.gate_scal if rdata else None)
+        gemm2_output = matmul_ogs(act_out,
+                                  gemm2_weights,
+                                  module.w2_bias if module.bias else None,
+                                  rdata,
+                                  scatter_indx=scatter_indx,
+                                  precision_config=pc2,
+                                  gammas=rdata.gate_scal if rdata else None)
         return gemm2_output
 
 
@@ -762,6 +774,7 @@ class TritonFusedMoE(MoE):
         aux_stream: Optional[torch.cuda.Stream] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
+        bias: bool = False,
         layer_idx: Optional[int] = None,
         override_quant_method=None,
     ):
@@ -800,6 +813,8 @@ class TritonFusedMoE(MoE):
             self.slot_start:self.slot_end]
         assert len(
             self.initial_local_expert_ids) == self.expert_size_per_partition
+
+        self.bias = bias
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:

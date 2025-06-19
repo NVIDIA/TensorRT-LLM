@@ -77,7 +77,8 @@ def create_moe(
         assert moe_cls == WideEPMoE, "MoE Load Balance is only supported in WideEPMoE now."
 
     if bias:
-        assert moe_cls == CutlassFusedMoE, "bias is only supported in CutlassFusedMoE."
+        assert moe_cls in [CutlassFusedMoE, TritonFusedMoE
+                           ], f"bias not supported in {moe_cls.__name__}."
 
     if moe_cls == TRTLLMGenFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
@@ -177,6 +178,7 @@ def create_moe(
             model_config=model_config,
             aux_stream=aux_stream,
             weight_loading_mode=weight_loading_mode,
+            bias=bias,
             layer_idx=layer_idx,
         )
     else:
