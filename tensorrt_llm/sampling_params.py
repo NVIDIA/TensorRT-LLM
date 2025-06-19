@@ -2,7 +2,7 @@ import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
-from typing import List, NamedTuple, Optional, Tuple, Union
+from typing import List, NamedTuple, Optional, Tuple, Union,Dict
 
 import torch
 from pydantic import BaseModel
@@ -106,7 +106,37 @@ class BatchedLogitsProcessor(ABC):
             client_ids (List[Optional[int]]): A batch of optional client ids.
         """
         pass  # noqa
+    
+class LogitBiasLogitsProcessor(LogitsProcessor):
+    def __init__(self, logit_bias: Dict[str, float]) -> None:
+        super().__init__()
+        self.logit_bias = logit_bias
+        self.tokens_to_adjust = {}
+        for k, v in logit_bias.items():
+            try:
+                token_id = int(k)
+                self.tokens_to_adjust[token_id] = v
+            except (ValueError, TypeError):
+                continue
 
+    def __call__(self, req_id: int, logits: torch.Tensor,
+                 token_ids: List[List[int]], stream_ptr: Optional[int],
+                 client_id: Optional[int]) -> None:
+
+        if self.tokens_to_adjust:
+            token_ids_list = list(self.tokens_to_adjust.keys())
+            bias_values = torch.tensor(
+                [self.tokens_to_adjust[token] for token in token_ids_list],
+                device=logits.device,
+                dtype=logits.dtype
+            )
+
+            stream = None if stream_ptr is None else torch.cuda.ExternalStream(stream_ptr)
+            with torch.cuda.stream(stream):
+                logits[:, :, token_ids_list] += bias_values
+
+            if stream is not None:
+                stream.synchronize()
 
 @dataclass(slots=True, kw_only=True)
 class AdditionalModelOutput:
