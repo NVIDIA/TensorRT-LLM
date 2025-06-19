@@ -190,6 +190,7 @@ MODEL_MAP = {
     'QWenForCausalLM': QWenForCausalLM,
     'Qwen2ForCausalLM': QWenForCausalLM,
     'Qwen2MoeForCausalLM': QWenForCausalLM,
+    'Qwen3ForCausalLM': QWenForCausalLM,
     'Qwen2ForSequenceClassification': QWenForCausalLM,
     'Qwen2VLForConditionalGeneration': QWenForCausalLM,
     'Qwen2VLModel': QWenForCausalLM,
