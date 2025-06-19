@@ -519,18 +519,19 @@ def create_py_executor_instance(
 
 
 def create_torch_sampler_args(engine: PyTorchModelEngine,
-                              executor_config: ExecutorConfig, *,
-                              mixed_sampler: bool):
+                              executor_config: ExecutorConfig, mapping: Mapping,
+                              *, mixed_sampler: bool):
     pretrained_config = engine.model.model_config.pretrained_config
     vocab_size = pretrained_config.vocab_size
     assert vocab_size is not None
     assert engine.max_seq_len is not None
+    max_num_sequences = executor_config.max_batch_size * mapping.pp_size
     max_draft_tokens = (0 if executor_config.speculative_config is None else
                         executor_config.speculative_config.max_draft_tokens)
     return TorchSampler.Args(
         max_seq_len=engine.max_seq_len,
         max_draft_tokens=max_draft_tokens,
-        max_batch_size=executor_config.max_batch_size,
+        max_num_sequences=max_num_sequences,
         max_beam_width=executor_config.max_beam_width,
         vocab_size=vocab_size,
         mixed_sampler=mixed_sampler,
@@ -549,6 +550,7 @@ def instantiate_sampler(engine: PyTorchModelEngine,
         sampler_args = create_torch_sampler_args(
             engine,
             executor_config,
+            mapping,
             mixed_sampler=pytorch_backend_config.mixed_sampler)
         return get_spec_decoder(sampler_args, engine.spec_config)
     if pytorch_backend_config.enable_trtllm_sampler:
@@ -562,6 +564,7 @@ def instantiate_sampler(engine: PyTorchModelEngine,
     sampler_args = create_torch_sampler_args(
         engine,
         executor_config,
+        mapping,
         mixed_sampler=pytorch_backend_config.mixed_sampler)
     return TorchSampler(sampler_args)
 

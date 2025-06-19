@@ -197,7 +197,7 @@ class TorchSampler(Sampler):
     class Args:
         max_seq_len: int
         max_draft_tokens: int
-        max_batch_size: int
+        max_num_sequences: int
         max_beam_width: int
         vocab_size: int
         mixed_sampler: bool
@@ -208,8 +208,9 @@ class TorchSampler(Sampler):
         self.max_tokens = args.max_draft_tokens + 1
         self.vocab_size = args.vocab_size
         assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
+        self.num_seq_slots = args.max_num_sequences
         new_tokens = torch.zeros(
-            (self.max_tokens, args.max_batch_size, self.MAX_BEAM_WIDTH),
+            (self.max_tokens, self.num_seq_slots, self.MAX_BEAM_WIDTH),
             dtype=torch.int,
             device='cuda')
         self.store = self.Store(new_tokens=new_tokens)
@@ -325,14 +326,14 @@ class TorchSampler(Sampler):
         """Shape: In lockstep with TRTLLMSampler: https://github.com/NVIDIA/TensorRT-LLM/blob/cea5dd1e3883b18bf50901a7f196f50a9544c28c/cpp/include/tensorrt_llm/runtime/decoderState.h#L103"""
         if any(req.py_return_log_probs for req in requests):
             return torch.empty(
-                (self.max_batch_size, self.MAX_BEAM_WIDTH, self.max_tokens),
+                (self.num_seq_slots, self.MAX_BEAM_WIDTH, self.max_tokens),
                 device="cpu",
                 pin_memory=True)
         return None
 
     def gen_logits_host(self, requests: Iterable[LlmRequest]):
         if any(req.py_return_generation_logits for req in requests):
-            return torch.empty((self.max_tokens, self.max_batch_size,
+            return torch.empty((self.max_tokens, self.num_seq_slots,
                                 self.MAX_BEAM_WIDTH, self.vocab_size),
                                device="cpu",
                                pin_memory=True)
