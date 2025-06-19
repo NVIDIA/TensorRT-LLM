@@ -9,6 +9,7 @@ from ...model_config import ModelConfig
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
+from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
@@ -25,6 +26,8 @@ def get_moe_cls(
         return CutlassFusedMoE
     elif moe_backend.upper() == "VANILLA":
         return VanillaMoE
+    elif moe_backend.upper() == "CUTEDSL":
+        return CuteDslFusedMoE
     elif moe_backend.upper() == "TRTLLM":
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()
@@ -53,9 +56,7 @@ def create_moe(
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     apply_router_weight_on_input: bool = False,
     layer_idx: Optional[int] = None,
-    use_optimized_permute_and_finalize_scale: bool = False,
 ) -> MoE:
-    print(f"limin: im in create_moe.py, use_optimized_permute_and_finalize_scale = {use_optimized_permute_and_finalize_scale}")
     moe_cls = get_moe_cls(model_config, override_quant_config)
 
     moe_load_balancer = get_moe_load_balancer()
@@ -89,7 +90,6 @@ def create_moe(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
-            use_optimized_permute_and_finalize_scale=use_optimized_permute_and_finalize_scale,
         )
     elif moe_cls == VanillaMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in VanillaMoE."
@@ -104,6 +104,20 @@ def create_moe(
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+    elif moe_cls == CuteDslFusedMoE:
+        return moe_cls(
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=reduce_results,
+            model_config=model_config,
+            aux_stream=aux_stream,
+            weight_loading_mode=weight_loading_mode,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            layer_idx=layer_idx,
         )
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")
