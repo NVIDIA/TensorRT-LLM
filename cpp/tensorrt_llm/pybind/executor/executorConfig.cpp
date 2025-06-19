@@ -421,15 +421,12 @@ void initConfigBindings(pybind11::module_& m)
     };
 
     py::enum_<tle::CacheTransceiverConfig::CommType>(m, "CacheTransceiverCommType")
-        .value("UNKNOWN", tle::CacheTransceiverConfig::CommType::UNKNOWN)
         .value("MPI", tle::CacheTransceiverConfig::CommType::MPI)
         .value("UCX", tle::CacheTransceiverConfig::CommType::UCX)
         .value("NIXL", tle::CacheTransceiverConfig::CommType::NIXL)
         .def(py::init(
             [](std::string const& str)
             {
-                if (str == "UNKNOWN" || str == "unknown")
-                    return tle::CacheTransceiverConfig::CommType::UNKNOWN;
                 if (str == "MPI" || str == "mpi")
                     return tle::CacheTransceiverConfig::CommType::MPI;
                 if (str == "UCX" || str == "ucx")
@@ -445,11 +442,9 @@ void initConfigBindings(pybind11::module_& m)
         .def(py::init<bool, std::optional<tle::CacheTransceiverConfig::CommType>, std::optional<size_t>>(),
             py::arg("enable_cache_transceiver") = false, py::arg("comm_type") = std::nullopt,
             py::arg("max_num_tokens") = std::nullopt)
-        .def_property("enable_cache_transceiver", &tle::CacheTransceiverConfig::getEnableCacheTransceiver,
-            &tle::CacheTransceiverConfig::setEnableCacheTransceiver)
+        .def_property_readonly("enable_cache_transceiver", &tle::CacheTransceiverConfig::getEnableCacheTransceiver)
         .def_property("comm_type", &tle::CacheTransceiverConfig::getCommType, &tle::CacheTransceiverConfig::setCommType)
-        .def_property("max_num_tokens", &tle::CacheTransceiverConfig::getMaxNumTokens,
-            &tle::CacheTransceiverConfig::setMaxNumTokens)
+        .def_property_readonly("max_num_tokens", &tle::CacheTransceiverConfig::getMaxNumTokens)
         .def(py::pickle(cacheTransceiverConfigGetstate, cacheTransceiverConfigSetstate));
 
     auto executorConfigGetState = [](py::object const& self)
