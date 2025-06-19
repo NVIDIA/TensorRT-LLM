@@ -634,7 +634,7 @@ class TRTLLMSampler(Sampler):
                 'cpu', non_blocking=True)
 
         device = SampleStateTensors(
-            new_tokens=self.algs.decoder_state.all_new_tokens)
+            new_tokens=self.store["decoder_state"].all_new_tokens)
 
         host = SampleStateTensorsHostTRTLLM(new_tokens=new_output_tokens,
                                             finished_sum=finished_sum,
