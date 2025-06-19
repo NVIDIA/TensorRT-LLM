@@ -470,12 +470,6 @@ def globalVars = [
     (ACTION_INFO): null,
 ]
 
-@Field
-def RUN_MULTI_GPU_TEST = "run_multi_gpu_test"
-def subJobReturnVars = [
-    (RUN_MULTI_GPU_TEST): false,
-]
-
 String getShortenedJobName(String path)
 {
     static final nameMapping = [
@@ -2313,17 +2307,15 @@ pipeline {
                         echo "Only run single-GPU tests."
                         singleGpuJobs.failFast = params.enableFailFast
                         parallel singleGpuJobs
-                        stage("Upload Artifacts") {
-                            if (dgxJobs.size() > 0) {
-                                subJobReturnVars[RUN_MULTI_GPU_TEST] = true
-                                echo "Set subJobReturnVars[RUN_MULTI_GPU_TEST] to true."
-                            }
-                            String subJobReturnVarsJson = writeJSON returnText: true, json: subJobReturnVars
-                            writeFile file: "subJobReturnVars.json", text: subJobReturnVarsJson
-                            retry(3) {
-                                archiveArtifacts artifacts: "subJobReturnVars.json", fingerprint: true
-                            }
+                        if (dgxJobs.size() == 0) {
+                            echo "Skip multi-GPU testing. No test to run."
+                            return
                         }
+                        if (globalVars[ACTION_INFO]['parents'].size() == 0) {
+                            error "No parent job to run multi-GPU tests."
+                        }
+                        def parentJob = globalVars[ACTION_INFO]['parents'][-1]
+                        trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "Will run multi-GPU tests:")
                         return
                     }
                     if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {

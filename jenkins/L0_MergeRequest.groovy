@@ -148,12 +148,6 @@ def globalVars = [
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
 ]
 
-@Field
-def RUN_MULTI_GPU_TEST = "run_multi_gpu_test"
-def subJobReturnVars = [
-    (RUN_MULTI_GPU_TEST): false,
-]
-
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
 boolean enableUpdateGitlabStatus =
     !testFilter[ENABLE_SKIP_TEST] &&
@@ -887,32 +881,6 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "", getHandle
     return status
 }
 
-def updateSubJobReturnVars(handle, subJobReturnVars) {
-    try {
-        // Get build information through handle
-        def buildNumber = handle.number
-        def jobName = handle.fullProjectName
-        def buildUrl = handle.absoluteUrl
-
-        // Construct API request using handle's URL
-        def apiUrl = "${buildUrl}api/json?tree=artifacts[fileName,relativePath]"
-
-        def apiResponse = sh(script: "curl -s '${apiUrl}'", returnStdout: true).trim()
-        def buildInfo = readJSON text: apiResponse, returnPojo: true
-
-        if (buildInfo.artifacts != null) {
-            def artifactInfo = buildInfo.artifacts.find { it.fileName == 'subJobReturnVars.json' }
-            if (artifactInfo != null) {
-                def url = "${buildUrl}artifact/${artifactInfo.relativePath}"
-                def myResult = sh(script: "curl -s '${url}'", returnStdout: true).trim()
-                trtllm_utils.updateMapWithJson(this, subJobReturnVars, myResult, "subJobReturnVars")
-            }
-        }
-    } catch (Exception e) {
-        echo "Warning: Failed to update subJobReturnVars: ${e.getMessage()}"
-    }
-}
-
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars, subJobReturnVars)
 {
     stages = [
@@ -991,17 +959,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars, s
 
                         echo "trigger x86_64 test job, params: ${parameters}"
 
-                        def status = ""
-                        handle = triggerJob(
+                        def status = triggerJob(
                             testJobName,
                             parameters,
-                            "",
-                            "",
-                            true,
                         )
-                        status = handle.result
-                        subJobReturnVars = updateSubJobReturnVars(handle, subJobReturnVars)
-                        willRunMultiGpuTest = subJobReturnVars[RUN_MULTI_GPU_TEST]
+                        willRunMultiGpuTest = currentBuild.description?.contains("Will run multi-GPU tests") ?: false
                         echo "willRunMultiGpuTest: ${willRunMultiGpuTest}"
 
                         if (status != "SUCCESS") {
