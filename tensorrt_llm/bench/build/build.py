@@ -31,6 +31,7 @@ def get_benchmark_engine_settings(
     pp_size: int,
     target_input_len: int,
     target_output_len: int,
+    kv_cache_gpu_mem_fraction: float = 0.95,
 ) -> Tuple[int, int]:
     """ Retrieve benchmark settings for a specific model + configuration.
 
@@ -58,6 +59,7 @@ def get_benchmark_engine_settings(
             pp_size,
             target_input_len,
             target_output_len,
+            kv_cache_gpu_mem_fraction,
         )
     else:
         max_batch_size = DEFAULT_MAX_BATCH_SIZE

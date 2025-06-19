@@ -51,7 +51,6 @@ def calc_engine_setting(
         Tuple[int, int]: Tuple containing engine configuration information for
         engine build (max_num_tokens, max_batch_size).
     """
-    kv_cache_gpu_mem_fraction = 0.9
     byte_per_elem = BYTES_PER_ELEM.get(quant_config.quant_algo, 2)
     byte_per_kv_elem = BYTES_PER_ELEM.get(quant_config.kv_cache_quant_algo, 2)
 
