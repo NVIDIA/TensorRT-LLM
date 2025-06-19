@@ -91,8 +91,6 @@ def calc_engine_setting(
         byte_per_mamba_cache = byte_per_state_elem * (
             num_conv_state_elements + num_ssm_state_elements) / (1024**3)
 
-        print(f"byte_per_mamba_cache: {byte_per_mamba_cache}")
-
         # Each mamba cache entry is pretty large (~50MB), so we are more conservative when estimating the max batch size
         kv_cache_gpu_mem_fraction *= kv_cache_gpu_mem_fraction
     else:
