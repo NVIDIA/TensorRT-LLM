@@ -35,7 +35,7 @@ There are two ways of serving LLM inference requests:
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture1.png" width="640" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture1.png" width="640" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. The execution timeline of aggregated LLM serving</em></sub></p>
@@ -44,7 +44,7 @@ In aggregated LLM serving, both the context and generation phases share the same
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture2.png" width="580" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture2.png" width="580" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. The execution timeline of dis-aggregated LLM serving</em></sub></p>
@@ -65,7 +65,7 @@ The first approach to do disaggregated LLM inference with TensorRT-LLM involves 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture3.png" width="800" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture3.png" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. `trtllm-serve` integration with disaggregated service</em></sub></p>
@@ -113,7 +113,7 @@ The second approach involves the use of [Dynamo](https://github.com/ai-dynamo/dy
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture4.png" width="800" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture4.png" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4. Dynamo integration with disaggregated service</em></sub></p>
@@ -130,7 +130,7 @@ The third approach to do disaggregated LLM inference with TensorRT-LLM utilizes 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture5.png" width="800" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture5.png" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5. Triton integration with disaggregated service</em></sub></p>
@@ -143,7 +143,7 @@ In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture6.png" width="890" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture6.png" width="890" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6. KV cache exchange architecture</em></sub></p>
@@ -154,7 +154,7 @@ To optimize the overall performance of disaggregated serving, TensorRT-LLM overl
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture7.png" width="800" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture7.png" width="800" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 7. KV cache exchange timing diagram</em></sub></p>
@@ -165,7 +165,7 @@ To minimize KV cache transmission latency, TensorRT-LLM currently uses direct tr
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture8.png" width="680" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture8.png" width="680" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 8. KV cache layout conversion</em></sub></p>
@@ -200,7 +200,7 @@ We conducted performance testing on DeepSeek R1 based on datasets with different
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture9.png" width="640" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture9.png" width="640" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 9. “Rate-matched” Pareto curve for DeepSeek R1 without MTP</em></sub></p>
@@ -209,7 +209,7 @@ Figure 9 shows the rate-matched Pareto curve for DeepSeek R1 with MTP off. Confi
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture10.png" width="640" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture10.png" width="640" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 10. DeepSeek R1 with MTP Pareto curve</em></sub></p>
@@ -222,19 +222,19 @@ As shown in Figure 10, enabling MTP increases speedups of disaggregation over ag
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture11.png" width="640" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture11.png" width="640" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 11. DeepSeek R1 4-GPU Pareto curve. ctx/gen=4.5 means SOL rate matching between context and generation phase, which is only used for SOL perf result collection purpose. c4dep4_g1dep4 means 4 DEP4 context instances plus 1 DEP4 generation instance form a full LLM serving instance.</em></sub></p>
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture12.png" width="640" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture12.png" width="640" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 12. DeepSeek R1 8-GPU Pareto curve</em></sub></p>
 
-Figures 11 and 12 show the performance curves for the ISL8192-OSL256 dataset on DeepSeek R1 using 4 GPUs per generation instance (GEN4) and 8 GPUs per context instance (GEN8) respectively. With disaggregation, we plot both “rate-matched” results (based on perfect rate matching between context and generation phases) and E2E results (which can be directly reproduced by users in production deployment environments).
+Figures 11 and 12 show the performance curves for the ISL8192-OSL256 dataset on DeepSeek R1 using 4 GPUs per generation instance (GEN4) and 8 GPUs per generation instance (GEN8) respectively. With disaggregation, we plot both “rate-matched” results (based on perfect rate matching between context and generation phases) and E2E results (which can be directly reproduced by users in production deployment environments).
 
 The results show that for this ISL/OSL setting, disaggregated serving outperforms aggregated serving significantly—achieving up to **1.73x** speedup with GEN4 and up to **2x** with GEN8.
 
@@ -244,14 +244,14 @@ By comparing the disaggregated serving E2E results with the “rate-matched” c
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture13.png" width="640" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture13.png" width="640" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 13. DeepSeek R1 E2E Pareto curves with MTP = 1, 2, 3. In this figure, ctx1dep4-gen2dep4-mtp3 means 1 DEP4 context instance plus 2 DEP4 generation instances with MTP = 3.</em></sub></p>
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture14.png" width="640" height="auto">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture14.png" width="640" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 14. DeepSeek R1 E2E Pareto curves without MTP.</em></sub></p>

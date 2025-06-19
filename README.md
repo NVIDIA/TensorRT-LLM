@@ -18,6 +18,9 @@ TensorRT-LLM
 <div align="left">
 
 ## Tech Blogs
+* [06/19] Disaggregated Serving in TensorRT-LLM
+✨ [➡️ link](./docs/source/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.md)
+
 * [06/05] Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
 
