@@ -57,7 +57,8 @@ def calc_engine_setting(
     # Each GPU in TP group has at least 1 kv head
     adjusted_num_kv_heads = max(tp_size, model_config.num_key_value_heads)
 
-    if is_nemotron_hybrid(model_config):
+    is_mamba_attn_hybrid = is_nemotron_hybrid(model_config)
+    if is_mamba_attn_hybrid:
         num_attention_layers = model_config.hybrid_override_pattern.count("*")
     else:
         num_attention_layers = model_config.num_hidden_layers
@@ -80,7 +81,7 @@ def calc_engine_setting(
     # Calculate max requests in KV cache based on target ISL and OSL.
     target_seq_len = target_input_len + target_output_len
 
-    if is_nemotron_hybrid(model_config):
+    if is_mamba_attn_hybrid:
         num_mamba_layers = model_config.hybrid_override_pattern.count("M")
         conv_dim = model_config.mamba_config.d_inner + 2 * model_config.mamba_config.n_groups * model_config.mamba_config.d_state
         num_conv_state_elements = num_mamba_layers * conv_dim * (
@@ -90,6 +91,9 @@ def calc_engine_setting(
         byte_per_mamba_cache = byte_per_state_elem * (
             num_conv_state_elements + num_ssm_state_elements) / (1024**3)
 
+        print(f"byte_per_mamba_cache: {byte_per_mamba_cache}")
+
+        # Each mamba cache entry is pretty large (~50MB), so we are more conservative when estimating the max batch size
         kv_cache_gpu_mem_fraction *= kv_cache_gpu_mem_fraction
     else:
         byte_per_mamba_cache = 0
@@ -100,7 +104,7 @@ def calc_engine_setting(
     mamba_cache_memory = byte_per_mamba_cache * kv_cache_max_requests
     kv_cache_max_tokens = (cache_memory - mamba_cache_memory) / byte_per_token
 
-    if is_nemotron_hybrid(model_config):
+    if is_mamba_attn_hybrid:
         kv_cache_memory = kv_cache_max_tokens * byte_per_token
         logger.info(
             f"Estimated total cache memory: {cache_memory:.2f} GB. KV cache: {kv_cache_memory:.2f} GB, Mamba cache: {mamba_cache_memory:.2f} GB"
