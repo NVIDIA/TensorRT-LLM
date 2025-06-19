@@ -34,13 +34,9 @@ class DebuggerContext:
         self.forward_pre_hook_handles = {}
         self.log_folder = dest_folder
         self.is_pre_forward = True
-        self.is_log_folder_inited: bool = False
         self._init_log_folder()
 
     def _init_log_folder(self):
-        if self.is_log_folder_inited:
-            return
-
         if self.log_folder is None:
             pwd = os.getcwd()
             self.log_folder = os.path.join(pwd, "data_dump")
@@ -50,7 +46,6 @@ class DebuggerContext:
         p = Path(self.log_folder) / f"rank{rank}"
         self.log_folder = p.absolute()
         p.mkdir(parents=True, exist_ok=True)
-        self.is_log_folder_inited = True
 
     def get_log_folder(self):
         return self.log_folder
@@ -326,6 +321,7 @@ class DumpTensorFilter(Filter):
 
 def dump_tensor(module: nn.Module, data_tensor, debug_ctx: DebuggerContext):
     global tensor_counter
+
     input_tensor_names = []
     input_tensor_names = get_forward_arg_names(module)
     if input_tensor_names is not None:
