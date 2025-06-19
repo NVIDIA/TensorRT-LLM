@@ -987,25 +987,80 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.timeout(7200)
+@pytest.mark.skip_less_device_memory(80000)
 class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-R1"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1"
 
-    @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
         [
             #  Use a larger batch_size to speed up the tests
-            (8, 1, 4, 3, False, False, True, True, 32, "CUTLASS"),
-            (8, 1, 4, 3, False, False, True, True, 32, "TRTLLM"),
-            (8, 1, 8, 0, True, True, True, True, 32, "CUTLASS"),
-            (8, 1, 1, 0, True, True, True, True, 32, "CUTLASS"),
+            pytest.param(8,
+                         1,
+                         4,
+                         3,
+                         False,
+                         False,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_device(8)),
+            pytest.param(8,
+                         1,
+                         4,
+                         3,
+                         False,
+                         False,
+                         True,
+                         True,
+                         32,
+                         "TRTLLM",
+                         marks=pytest.mark.skip_less_device(8)),
+            pytest.param(8,
+                         1,
+                         8,
+                         0,
+                         True,
+                         True,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_device(8)),
+            pytest.param(8,
+                         1,
+                         1,
+                         0,
+                         True,
+                         True,
+                         True,
+                         True,
+                         32,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_device(8)),
+            pytest.param(4,
+                         1,
+                         1,
+                         0,
+                         True,
+                         True,
+                         True,
+                         True,
+                         16,
+                         "CUTLASS",
+                         marks=pytest.mark.skip_less_device(4)),
         ],
-        ids=["latency", "latency_trtllmgen", "throughput", "throughput_tp8"])
-    def test_nvfp4_8gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
-                         attention_dp, cuda_graph, overlap_scheduler,
-                         max_batch_size, moe_backend):
+        ids=[
+            "latency", "latency_trtllmgen", "throughput", "throughput_tp8",
+            "throughput_tp4"
+        ])
+    def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
+                              attention_dp, cuda_graph, overlap_scheduler,
+                              max_batch_size, moe_backend):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
@@ -1042,9 +1097,10 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
+            # Commented out because GPQA takes too long to run
+            # task = GPQADiamond(self.MODEL_NAME)
+            # task.evaluate(llm,
+            #               extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
