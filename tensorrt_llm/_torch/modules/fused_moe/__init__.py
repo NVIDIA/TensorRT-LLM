@@ -3,6 +3,7 @@ from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
+from .fused_moe_wide_ep import WideEPMoE
 from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import MoeLoadBalancer
 from .quantization import FusedMoEQuantScalesFP8
@@ -19,19 +20,23 @@ __all__ = [
     "CuteDslFusedMoE",
     "TRTLLMGenFusedMoE",
     "BaseMoeRoutingMethod",
-    "MoeLoadBalancer",
-    "RenormalizeNaiveMoeRoutingMethod",
-    "Llama4RenormalizeMoeRoutingMethod",
-    "SparseMixerMoeRoutingMethod",
-    "LoadBalancedMoeRoutingMethod",
-    "StaticMoeRoutingMethod",
-    "DefaultMoeRoutingMethod",
-    "DeepSeekV3MoeRoutingMethod",
-    "RoutingMethodType",
-    "RenormalizeMoeRoutingMethod",
-    "MoE",
-    "MoEWeightLoadingMode",
-    "get_moe_cls",
     "create_moe",
+    "CutlassFusedMoE",
+    "DeepSeekV3MoeRoutingMethod",
+    "DefaultMoeRoutingMethod",
     "FusedMoEQuantScalesFP8",
+    "get_moe_cls",
+    "Llama4RenormalizeMoeRoutingMethod",
+    "LoadBalancedMoeRoutingMethod",
+    "MoE",
+    "MoeLoadBalancer",
+    "MoEWeightLoadingMode",
+    "RenormalizeMoeRoutingMethod",
+    "RenormalizeNaiveMoeRoutingMethod",
+    "RoutingMethodType",
+    "SparseMixerMoeRoutingMethod",
+    "StaticMoeRoutingMethod",
+    "TRTLLMGenFusedMoE",
+    "VanillaMoE",
+    "WideEPMoE",
 ]
