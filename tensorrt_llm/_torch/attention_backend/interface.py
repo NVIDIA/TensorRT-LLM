@@ -392,8 +392,7 @@ class RopeParams:
                 )
 
         if self.scale_type == RotaryScalingType.yarn:
-            rope_inv_freq = None
-            _, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
                 self.max_positions,
                 self.dim,
                 self.theta,
