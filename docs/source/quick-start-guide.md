@@ -4,7 +4,7 @@
 
 This is the starting point to try out TensorRT-LLM. Specifically, this Quick Start Guide enables you to quickly get setup and send HTTP requests using TensorRT-LLM.
 
-The following examples can most easily be executed using the prebuilt [Docker release container available on NGC](https://registry.ngc.nvidia.com/orgs/nvstaging/teams/tensorrt-llm/containers/release) (see also [release.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docker/release.md) on GitHub). Ensure to run these commands as a user with appropriate permissions, preferably `root`, to streamline the setup process.
+The following examples can most easily be executed using the prebuilt [Docker release container available on NGC](https://registry.ngc.nvidia.com/orgs/nvstaging/teams/tensorrt-llm/containers/release) (see also [release.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docker/release.md) on GitHub).
 
 
 ## LLM API
