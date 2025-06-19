@@ -199,6 +199,10 @@ class MMLU(Evaluator):
             for key in self.SUBJECT_TO_SUBCATEGORIES.keys()
         }
         for output, ref, sub in zip(outputs, references, subjects):
+            # Add logging here
+            logger.info(f"Subject: {sub}")
+            logger.info(f"Model output: {output.outputs[0].text}")
+            logger.info(f"Expected answer: {ref}")
             correction = output.outputs[0].text.strip().startswith(ref)
             subject_corrections[sub].append(correction)
 
