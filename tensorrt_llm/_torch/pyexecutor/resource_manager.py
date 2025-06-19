@@ -585,7 +585,7 @@ class MambaCacheManager(BaseResourceManager):
                                                         device=device,
                                                         dtype=torch.int32)
 
-    def prepare_mamba_cache_blocks(self, request_ids: List[int]):
+    def _prepare_mamba_cache_blocks(self, request_ids: List[int]):
         state_indices = []
         for r in request_ids:
             # cache hit
@@ -602,12 +602,7 @@ class MambaCacheManager(BaseResourceManager):
                                              dtype=torch.int32,
                                              device=self.ssm_states.device)
 
-    def free_mamba_cache_blocks(self, request_id: int):
-        if request_id in self.mamba_cache_index:
-            block = self.mamba_cache_index.pop(request_id)
-            self.mamba_cache_free_blocks.append(block)
-
-    def prepare_mamba_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
             i.py_request_id for i in scheduled_batch.context_requests
         ]
@@ -615,10 +610,13 @@ class MambaCacheManager(BaseResourceManager):
             i.py_request_id for i in scheduled_batch.generation_requests
         ]
         request_ids = context_ids + generation_ids
-        self.prepare_mamba_cache_blocks(request_ids)
+        self._prepare_mamba_cache_blocks(request_ids)
 
-    def free_mamba_resources(self, request: LlmRequest):
-        self.free_mamba_cache_blocks(request.py_request_id)
+    def free_resources(self, request: LlmRequest):
+        request_id = request.py_request_id
+        if request_id in self.mamba_cache_index:
+            block = self.mamba_cache_index.pop(request_id)
+            self.mamba_cache_free_blocks.append(block)
 
     def get_state_indices(self) -> torch.Tensor:
         return self.state_indices
@@ -708,12 +706,12 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        self.prepare_mamba_resources(scheduled_batch)
-        super().prepare_resources(scheduled_batch)
+        MambaCacheManager.prepare_resources(self, scheduled_batch)
+        KVCacheManager.prepare_resources(self, scheduled_batch)
 
     def free_resources(self, request: LlmRequest):
-        self.free_mamba_resources(request)
-        super().free_resources(request)
+        MambaCacheManager.free_resources(self, request)
+        KVCacheManager.free_resources(self, request)
 
     def shutdown(self):
         MambaCacheManager.shutdown(self)
