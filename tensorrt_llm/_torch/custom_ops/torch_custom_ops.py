@@ -573,6 +573,216 @@ def _(
                              dtype=output_dtype)
 
 
+def div_up(x: int, y: int) -> int:
+    return ((x + y - 1) // y)
+
+
+def pad_up(x: int, y: int) -> int:
+    return ((x + y - 1) // y) * y
+
+
+def cute_dsl_fp8_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp4 scale tensor.
+    """
+    m, k = input_shapes[0]
+    scale_shape = pad_up(pad_up(m, 4) * div_up(k, 128) * 4, 128) // 4
+    return scale_shape
+
+
+class DummyHopperBlockwiseGemmKernel:
+
+    def __init__(
+        self,
+        acc_dtype: torch.dtype,
+        tile_shape_mnk: Tuple[int, int, int],
+        cluster_shape_mnk: Tuple[int, int, int],
+    ):
+        self.acc_dtype = acc_dtype
+        self.tile_shape_mnk = tile_shape_mnk
+        self.cluster_shape_mnk = cluster_shape_mnk
+
+    def __call__(self, mA, mB, mC, mSFA, mSFB):
+        # print("[DummyHopperBlockwiseGemmKernel] Run inference")
+        # print(f"[DummyHopperBlockwiseGemmKernel] mA.shape = {mA.shape}")
+        # print(f"[DummyHopperBlockwiseGemmKernel] mB.shape = {mB.shape}")
+        # print(f"[DummyHopperBlockwiseGemmKernel] mC.shape = {mC.shape}")
+        # print(f"[DummyHopperBlockwiseGemmKernel] mSFA.shape = {mSFA.shape}")
+        # print(f"[DummyHopperBlockwiseGemmKernel] mSFB.shape = {mSFB.shape}")
+        # print(f"[DummyHopperBlockwiseGemmKernel] self.acc_dtype = {self.acc_dtype}")
+        # print(f"[DummyHopperBlockwiseGemmKernel] self.tile_shape_mnk = {self.tile_shape_mnk}")
+        # print(f"[DummyHopperBlockwiseGemmKernel] self.cluster_shape_mnk = {self.cluster_shape_mnk}")
+        pass
+
+
+class CuteDSLFp8Linear(TunableRunner):
+    kernel_dict = dict()
+
+    def __init__(self):
+        super().__init__()
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> List[int]:
+        # Each config corresponds to a single generated kernel in this case.
+        return [0]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        acc_dtype: torch.dtype = torch.bfloat16,
+        tile_shape_mnk: Tuple[int, int, int] = (128, 128, 128),
+        cluster_shape_mnk: Tuple[int, int, int] = (1, 1, 1),
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        """Performs linear operation using cute-dsl with autotuning.
+
+        :param a: Input tensor of shape (M, K)
+        :type a: torch.Tensor, type: fp8
+        :param b: Weight tensor of shape (N, K)
+        :type b: torch.Tensor, type: fp8
+        :param a_sf: Input scale tensor of shape (P). P is computed by the following formula:
+            P = (div_up(shape_m_4_align * div_up(shape_k, 128) * sizeof(float), 128) * 128)/sizeof(float)
+        :type a_sf: torch.Tensor, type: fp32
+        :param b_sf: Weight scale tensor of shape (w_n, w_k)
+        :type b_sf: torch.Tensor, type: fp32
+
+        :return: Output tensor of shape (M, N)
+        :rtype: torch.Tensor, type: bf16
+        """
+        a, b, a_sf, b_sf = inputs
+        m, n, k = a.shape[0], b.shape[0], a.shape[1]
+        w_n, w_k = b_sf.shape[0], b_sf.shape[1]
+        c = torch.empty(*(m, n), dtype=torch.bfloat16, device="cuda")
+        # print(f"limin: m = {m}, n = {n}, k = {k}, w_n = {w_n}, w_k = {w_k}")
+        # print("limin: a.dtype = ", a.dtype)
+        # print("limin: b.dtype = ", b.dtype)
+        # print("limin: a_sf.dtype = ", a_sf.dtype)
+        # print("limin: b_sf.dtype = ", b_sf.dtype)
+
+        # torch_tensor -> cute.tensor
+        a.as_strided((m, k, 1), (k, 1, m * k)).view(torch.uint8)
+        b.as_strided((n, k, 1), (k, 1, n * k)).view(torch.uint8)
+        c.as_strided((m, n, 1), (n, 1, m * n))
+
+        b_sf.as_strided((w_n, w_k, 1), (w_k, 1, w_n * w_k))
+
+        # m_padded = pad_up(m, 4)
+        # input_scale_tmp = a_sf[0:m_padded * w_k]
+        # print(f"limin: 0, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+        # input_scale_tmp = input_scale_tmp.reshape(-1, m_padded)
+        # print(f"limin: 1, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+        # input_scale_tmp = input_scale_tmp[:w_k, :m_padded].contiguous().permute(1, 0)
+        # print(f"limin: 2, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+        # input_scale_tmp = input_scale_tmp.as_strided((m_padded, w_k, 1), (1, m_padded, m_padded * w_k))
+        # print(f"limin: 3, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
+
+        # mA = from_dlpack(a_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        # mB = from_dlpack(b_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        # mC = from_dlpack(c_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        # mA.element_type = cutlass.Float8E4M3FN
+        # mB.element_type = cutlass.Float8E4M3FN
+
+        # # TODO: mSFA is column major
+        # mSFA = from_dlpack(input_scale_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=0)
+        # mSFB = from_dlpack(weight_scale_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+
+        # print(f"limin: mA.shape = {mA.shape}, mA.stride = {mA.stride}")
+        # print(f"limin: mB.shape = {mB.shape}, mB.stride = {mB.stride}")
+        # print(f"limin: mC.shape = {mC.shape}, mC.stride = {mC.stride}")
+        # print(f"limin: mSFA.shape = {mSFA.shape}, mSFA.stride = {mSFA.stride}")
+        # print(f"limin: mSFB.shape = {mSFB.shape}, mSFB.stride = {mSFB.stride}")
+
+        gemm = DummyHopperBlockwiseGemmKernel(
+            acc_dtype,  # acc_dtype,
+            tile_shape_mnk=tile_shape_mnk,
+            cluster_shape_mnk=cluster_shape_mnk,
+        )
+
+        # get stream
+        # torch_stream = torch.cuda.current_stream()
+        # stream = cuda.CUstream(torch_stream.cuda_stream)
+
+        cache_key = (tile_shape_mnk, cluster_shape_mnk)
+        if cache_key not in CuteDSLFp8Linear.kernel_dict:
+
+            compiled_gemm = gemm
+            # compiled_gemm = cute.compile(
+            #     gemm,
+            #     mA,
+            #     mB,
+            #     mC,
+            #     mSFA,
+            #     mSFB,
+            #     stream,
+            # )
+            CuteDSLFp8Linear.kernel_dict[cache_key] = compiled_gemm
+        else:
+            compiled_gemm = CuteDSLFp8Linear.kernel_dict[cache_key]
+
+        # launch gemm kernel
+        compiled_gemm(a, b, c, a_sf, b_sf)
+
+        return c
+
+
+### a/b: fp8, scale: fp32 -> bf16
+@torch.library.custom_op("trtllm::cute_dsl_fp8_gemm",
+                         mutates_args=(),
+                         device_types="cuda")
+@autotuner.tuning_config(
+    name="trtllm::cute_dsl_fp8_gemm::gemm",
+    dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_last_power_of_2_num_tokens_buckets,
+        last_positive_power_of_2), ),
+    constraint_specs=(ConstraintSpec(2, 0, cute_dsl_fp8_scale_infer_shape), ),
+    configs={
+        'acc_dtype': [torch.bfloat16],
+        'tile_shape_mnk': [(64, 128, 128), (128, 128, 128)],
+        'cluster_shape_mnk': [(1, 1, 1), (2, 2, 2), (1, 4, 4), (4, 4, 4)]
+    },
+)
+def cute_dsl_fp8_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    tuner = AutoTuner.get()
+
+    # allocate workspace for profiling
+    cute_dsl_fp8_gemm_runner = CuteDSLFp8Linear()
+
+    _, best_tactic, best_config = tuner.choose_one(
+        "trtllm::cute_dsl_fp8_gemm::gemm",
+        [cute_dsl_fp8_gemm_runner],
+        [input, weight, input_scale, weight_scale],
+    )
+
+    return cute_dsl_fp8_gemm_runner(
+        inputs=[input, weight, input_scale, weight_scale],
+        tactic=best_tactic,
+        **best_config)
+
+
+@torch.library.register_fake("trtllm::cute_dsl_fp8_gemm")
+def _(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+):
+    # [m, k]
+    shape = [i for i in mat_a.shape]
+    # [n, k]
+    shape[-1] = mat_b.shape[-2]
+    # TODO: output is fixed as bf16?
+    ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
+    return ret
+
+
 @torch.library.custom_op("trtllm::attention", mutates_args=())
 def attention(
     q: torch.Tensor,
