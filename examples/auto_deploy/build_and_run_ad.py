@@ -7,11 +7,12 @@ from typing import List, Optional, Union
 import torch
 from simple_config import SimpleConfig
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy.models import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.shim import DemoLLM
 from tensorrt_llm._torch.auto_deploy.utils.benchmark import benchmark, store_benchmark_results
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
-from tensorrt_llm.llmapi.llm import LLM, RequestOutput
+from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.llm_args import TorchCompileConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
