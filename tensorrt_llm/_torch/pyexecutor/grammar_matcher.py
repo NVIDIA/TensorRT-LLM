@@ -1,4 +1,5 @@
 import json
+import os
 from abc import ABC, abstractmethod
 
 import llguidance
@@ -158,7 +159,11 @@ class LLGuidanceMatcherFactory(GrammarMatcherFactory):
                 grammar = llguidance.LLMatcher.grammar_from_json_schema(
                     '{"type": "object"}')
             case GuidedDecodingParams.GuideType.JSON_SCHEMA:
-                grammar = llguidance.LLMatcher.grammar_from_json_schema(guide)
+                kwargs = {}
+                if os.environ.get("TRTLLM_XGUIDANCE_LENIENT") == "1":
+                    kwargs = {"defaults": {"lenient": True}}
+                grammar = llguidance.LLMatcher.grammar_from_json_schema(
+                    guide, **kwargs)
             case GuidedDecodingParams.GuideType.REGEX:
                 grammar = llguidance.LLMatcher.grammar_from_regex(guide)
             case GuidedDecodingParams.GuideType.EBNF_GRAMMAR:

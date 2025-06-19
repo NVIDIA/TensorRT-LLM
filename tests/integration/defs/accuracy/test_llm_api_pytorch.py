@@ -280,22 +280,20 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-    def test_guided_decoding(self, backend: str):
+    def test_guided_decoding(self, backend: str, mocker):
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         llm = LLM(self.MODEL_PATH,
                   guided_decoding_backend=backend,
                   disable_overlap_scheduler=True,
                   use_cuda_graph=True)
         with llm:
-            if backend == "llguidance":
-                os.environ["TRTLLM_XGUIDANCE_LENIENT"] = "1"
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
-            if backend == "llguidance":
-                os.environ.pop("TRTLLM_XGUIDANCE_LENIENT")
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-    def test_guided_decoding_4gpus(self, backend: str):
+    def test_guided_decoding_4gpus(self, backend: str, mocker):
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         llm = LLM(self.MODEL_PATH,
                   guided_decoding_backend=backend,
                   disable_overlap_scheduler=True,
@@ -303,12 +301,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                   tensor_parallel_size=2,
                   pipeline_parallel_size=2)
         with llm:
-            if backend == "llguidance":
-                os.environ["TRTLLM_XGUIDANCE_LENIENT"] = "1"
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
-            if backend == "llguidance":
-                os.environ.pop("TRTLLM_XGUIDANCE_LENIENT")
 
 
 class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
