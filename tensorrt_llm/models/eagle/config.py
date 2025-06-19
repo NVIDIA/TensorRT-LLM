@@ -16,15 +16,15 @@
 import json
 from typing import Optional, Union
 
-from transformers import LlamaConfig
+from transformers import AutoConfig as HFModelConfig
 
 from ...mapping import Mapping
 from ..convert_utils import infer_dtype
-from ..llama.config import LLaMAConfig
+from ..qwen.config import QWenConfig as TRTCModelconfig
 from ..modeling_utils import QuantAlgo, QuantConfig
 
 
-class EagleConfig(LLaMAConfig):
+class EagleConfig(TRTCModelconfig):
 
     def __init__(self,
                  *,
@@ -35,7 +35,7 @@ class EagleConfig(LLaMAConfig):
         self.num_eagle_layers = num_eagle_layers
         self.max_non_leaves_per_layer = max_non_leaves_per_layer
         self.max_draft_len = max_draft_len
-        self.eagle_net_config = LLaMAConfig.from_dict(
+        self.eagle_net_config = TRTCModelconfig.from_dict(
             kwargs["eagle_net_config"])
         del kwargs["eagle_net_config"]
         super().__init__(**kwargs)
@@ -73,7 +73,7 @@ class EagleConfig(LLaMAConfig):
         hf_config = None
         hf_config_or_dir if speculative_config_or_dir is None else speculative_config_or_dir
         if hf_config_or_dir is not None:
-            hf_config = LlamaConfig.from_pretrained(hf_config_or_dir)
+            hf_config = HFModelConfig.from_pretrained(hf_config_or_dir)
 
             hf_config.model_type
             n_head = hf_config.num_attention_heads
@@ -91,7 +91,7 @@ class EagleConfig(LLaMAConfig):
             if hasattr(hf_config, 'head_dim'):
                 head_dim = hf_config.head_dim
             else:
-                head_dim = hf_config.n_embd // hf_config.n_head
+                head_dim = n_embd // n_head
             if hasattr(hf_config, 'head_size'):
                 head_size = hf_config.head_size
             else:
@@ -107,7 +107,7 @@ class EagleConfig(LLaMAConfig):
                 rms_norm_eps_eagle = hf_config_eagle['rms_norm_eps']
                 n_positions_eagle = hf_config_eagle['max_position_embeddings']
             else:
-                hf_config_eagle = LlamaConfig.from_pretrained(
+                hf_config_eagle = HFModelConfig.from_pretrained(
                     speculative_config_or_dir)
                 n_head_eagle = hf_config_eagle.num_attention_heads
                 inter_size_eagle = hf_config_eagle.intermediate_size
@@ -125,7 +125,7 @@ class EagleConfig(LLaMAConfig):
             rotary_scaling = rotary_scaling
 
         eagle_net_config = {
-            'architecture': "LlamaForCausalLM",
+            'architecture': "Qwen2ForCausalLM",
             'dtype': dtype,
             'logits_dtype': 'float32',
             'num_hidden_layers': n_layer_eagle,
@@ -152,7 +152,9 @@ class EagleConfig(LLaMAConfig):
             'use_parallel_embedding': kwargs['use_parallel_embedding'],
             'embedding_sharding_dim': kwargs['embedding_sharding_dim'],
             'head_dim': head_dim,
-            'head_size': head_size
+            'head_size': head_size,
+            "qwen_type":"qwen2",
+            "seq_length":8192
         }
 
         config = {
@@ -185,7 +187,9 @@ class EagleConfig(LLaMAConfig):
             'num_eagle_layers': kwargs['speculative_config'].num_eagle_layers,
             'max_non_leaves_per_layer':
             kwargs['speculative_config'].max_non_leaves_per_layer,
-            'eagle_net_config': eagle_net_config
+            'eagle_net_config': eagle_net_config,
+            "qwen_type":"qwen2",
+            "seq_length":8192
         }
         if quant_config:
             config['quantization']['quant_algo'] = quant_config.quant_algo

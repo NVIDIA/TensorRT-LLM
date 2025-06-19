@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 from tqdm import tqdm
-from transformers import LlamaConfig
+from transformers import AutoConfig
 
 import tensorrt_llm
 from tensorrt_llm.mapping import Mapping
@@ -13,7 +13,6 @@ from tensorrt_llm.models.eagle.config import EagleConfig
 from tensorrt_llm.models.eagle.model import EagleForCausalLM
 from tensorrt_llm.models.model_weights_loader import ModelWeightsLoader
 from tensorrt_llm.quantization import QuantAlgo
-
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -280,7 +279,7 @@ if __name__ == '__main__':
     hf_config = None
     eagle_model_dir = args.model_dir if args.eagle_model_dir is None else args.eagle_model_dir
     if args.model_dir is not None:
-        hf_config = LlamaConfig.from_pretrained(args.model_dir)
+        hf_config = AutoConfig.from_pretrained(args.model_dir)
 
         args.model_type = hf_config.model_type
         args.n_head = hf_config.num_attention_heads
@@ -322,7 +321,7 @@ if __name__ == '__main__':
             else:
                 args.head_size_eagle = args.head_dim_eagle
         else:
-            hf_config_eagle = LlamaConfig.from_pretrained(args.eagle_model_dir)
+            hf_config_eagle = AutoConfig.from_pretrained(args.eagle_model_dir)
             args.n_head_eagle = hf_config_eagle.num_attention_heads
             args.inter_size_eagle = hf_config_eagle.intermediate_size
             args.n_layer_eagle = hf_config_eagle.num_hidden_layers
@@ -368,7 +367,7 @@ if __name__ == '__main__':
         args.rotary_scaling = rotary_scaling
 
     eagle_net_config = {
-        'architecture': "LlamaForCausalLM",
+        'architecture': "Qwen2ForCausalLM",
         'dtype': args.dtype,
         'logits_dtype': 'float32',
         'num_hidden_layers': args.n_layer_eagle,
@@ -395,7 +394,9 @@ if __name__ == '__main__':
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'head_dim': args.head_dim_eagle,
-        'head_size': args.head_size_eagle
+        'head_size': args.head_size_eagle,
+        "qwen_type":"qwen2",
+        "seq_length":8192
     }
 
     config = {
@@ -430,7 +431,9 @@ if __name__ == '__main__':
         'max_non_leaves_per_layer': args.max_non_leaves_per_layer,
         'eagle_net_config': eagle_net_config,
         'head_dim': args.head_dim,
-        'head_size': args.head_size
+        'head_size': args.head_size,
+        "qwen_type":"qwen2",
+        "seq_length":8192
     }
 
     assert args.max_draft_len <= 256, "args.max_draft_len > 256 is not supported"

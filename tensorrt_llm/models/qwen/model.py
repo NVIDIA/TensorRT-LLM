@@ -21,7 +21,7 @@ import torch
 from tqdm import tqdm
 
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, recv, send
+from ...functional import Tensor, recv, send,LayerNormType,concat
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, RmsNorm, SharedMoE)
 from ...layers.moe import MOEWeightWrapper
@@ -50,9 +50,16 @@ class QWenDecoderLayer(Module):
         self.tp_group = config.mapping.tp_group
         self.tp_size = config.mapping.tp_size
 
-        self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
+        self.fc_after_embed = getattr(config, 'fc_after_embed', False)  # 默认值设为None
+    
+        # Eagle 权重 无此部分
+        if not self.fc_after_embed:
+            self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                        eps=config.norm_epsilon,
                                        dtype=dtype)
+
+        layernorm_type = LayerNormType.RmsNorm
+        qk_layernorm = True if config.qwen_type == "qwen3" else False
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
         local_layer_idx = layer_idx - layers_range[0]
@@ -78,7 +85,10 @@ class QWenDecoderLayer(Module):
             cp_group=config.mapping.cp_group,
             quant_mode=config.quant_mode,
             use_logn_scaling=config.use_logn_attn,
-            dense_bias=False)
+            dense_bias=False,
+            qk_layernorm=qk_layernorm,
+            layernorm_type=layernorm_type,
+            eps = config.norm_epsilon)
 
         if config.moe.has_moe():
             mlp_kwargs = {'moe_config': config.moe, 'mapping': config.mapping}
@@ -127,7 +137,9 @@ class QWenDecoderLayer(Module):
         mrope_params=None,
     ):
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if not self.fc_after_embed:
+            hidden_states = self.input_layernorm(hidden_states)
+
         attention_output = self.attention(
             hidden_states,
             attention_mask=attention_mask,
@@ -167,11 +179,24 @@ class QWenModel(Module):
                                              dtype=config.dtype)
 
         self.layers = DecoderLayerList(QWenDecoderLayer, config)
+        self.fc_after_embed = getattr(config, 'fc_after_embed', False)  # 默认值设为None
 
-        if self.mapping.is_last_pp_rank():
-            self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
-                                eps=config.norm_epsilon,
-                                dtype=config.dtype)
+        # Eagle 权重 无此部分
+        if self.mapping.is_last_pp_rank(): 
+            if not self.fc_after_embed:
+                self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
+                                    eps=config.norm_epsilon,
+                                    dtype=config.dtype)
+        
+                      
+        if self.fc_after_embed:
+            self.fc = ColumnLinear(2 * config.hidden_size,
+                                   config.hidden_size,
+                                   bias=False,
+                                   dtype=config.dtype,
+                                   tp_group=config.mapping.tp_group,
+                                   tp_size=config.mapping.tp_size,
+                                   gather_output=True)
 
     def forward(self,
                 input_ids: Tensor,
@@ -183,6 +208,7 @@ class QWenModel(Module):
                 attention_params=None,
                 mrope_params=None,
                 hidden_states=None,
+                hidden_states_for_embed=None,
                 prompt_embedding_table: Optional[Tensor] = None,
                 prompt_tasks: Optional[Tensor] = None,
                 prompt_vocab_size: Optional[Tensor] = None,
@@ -197,6 +223,11 @@ class QWenModel(Module):
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
+        if hidden_states_for_embed is not None:
+            hidden_states = concat([hidden_states, hidden_states_for_embed],
+                                   dim=-1)
+            hidden_states = self.fc(hidden_states)
+
         hidden_states = self.layers.forward(
             hidden_states,
             use_cache=use_cache,
@@ -210,8 +241,10 @@ class QWenModel(Module):
         if use_cache:
             hidden_states, presents = hidden_states
 
+        
         if self.mapping.is_last_pp_rank():
-            hidden_states = self.ln_f(hidden_states)
+            if not self.fc_after_embed:
+                hidden_states = self.ln_f(hidden_states)
         else:
             hidden_states = send(hidden_states, self.mapping.next_pp_rank())
 
@@ -336,7 +369,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "mlp.shared_expert_gate": "mlp.shared_expert_gate",
                     "fc": ["up_proj", "gate_proj"],
                 }
-            elif config.qwen_type in {"qwen2", "qwen2_vl"
+            elif config.qwen_type in {"qwen2", "qwen2_vl","qwen3"
                                       } and config.tie_word_embeddings:
                 custom_dict = {"lm_head": "model.embed_tokens"}
             elif config.architecture == "Qwen2ForSequenceClassification":
@@ -353,6 +386,18 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "transformer": "language_model.model",
                     "lm_head": "language_model.lm_head",
                 }
+                
+            if config.tie_word_embeddings:
+                config.share_embedding_table = True
+                config.use_parallel_embedding = True
+
+            # q k layernorm is required in qwen3 dense model
+            if config.qwen_type == "qwen3":
+                custom_dict.update({
+                    "q_layernorm":"q_norm",
+                    "k_layernorm":"k_norm"
+                })
+
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             model = cls(config)
             if config.qwen_type == "qwen" and model.config.mapping.has_tp():
