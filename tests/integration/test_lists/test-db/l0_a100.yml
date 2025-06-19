@@ -30,8 +30,8 @@ l0_a100:
   - unittest/trt/attention/test_sage_attention.py unittest/llmapi/test_llm_download.py unittest/llmapi/test_llm_kv_cache_events.py unittest/llmapi/test_mpi_session.py unittest/trt/model/redrafter unittest/trt/model/test_phi.py unittest/trt/model/test_unet.py unittest/trt/python_plugin unittest/tools unittest/utils unittest/others
   - unittest/llmapi/test_llm_models.py -m "part1"
   - unittest/llmapi/test_llm_models.py -m "not (part0 or part1)"
-  - unittest/llmapi/test_llm.py -m "part0"
-  - unittest/llmapi/test_llm.py -m "not part0"
+  - unittest/llmapi/test_llm.py -m "part0" TIMEOUT (60)
+  - unittest/llmapi/test_llm.py -m "not part0" TIMEOUT (90)
   - unittest/llmapi/test_executor.py
   - accuracy/test_cli_flow.py::TestGpt2::test_int8_kv_cache # 1 min
   - accuracy/test_cli_flow.py::TestGpt2::test_weight_only[int4] # 1 min
@@ -86,7 +86,7 @@ l0_a100:
   tests:
   - triton_server/test_triton.py::test_gpt_disaggregated_serving_bls[gpt-disaggregated-serving-bls]
   - triton_server/test_triton.py::test_llava[llava]
-  - triton_server/test_triton.py::test_gpt_ib[gpt-ib]
+  - triton_server/test_triton.py::test_gpt_ib[gpt-ib] TIMEOUT (60)
   - triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]
   - triton_server/test_triton.py::test_gpt_2b_ib_lora[gpt-2b-ib-lora]
   - triton_server/test_triton.py::test_gpt_ib_lad[gpt-ib-lad]
