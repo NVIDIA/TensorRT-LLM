@@ -216,14 +216,14 @@ class ModelConfig(BaseModel):
     @classmethod
     def from_hf(cls, model_hf_name, hf_model_path):
         model_name_or_path = hf_model_path or model_hf_name
-        hf_config = AutoConfig.from_pretrained(model_name_or_path,
-                                               trust_remote_code=True)
+        hf_config = AutoConfig.from_pretrained(
+            model_name_or_path, trust_remote_code=True).to_dict()
         param_count = cls.get_param_count(model_hf_name, hf_model_path)
 
         mamba_config = MambaConfig(
-            **hf_config.to_dict()) if is_nemotron_hybrid(hf_config) else None
+            **hf_config) if is_nemotron_hybrid(hf_config) else None
 
         return cls(name=model_hf_name,
                    param_count=param_count,
                    mamba_config=mamba_config,
-                   **hf_config.to_dict())
+                   **hf_config)
