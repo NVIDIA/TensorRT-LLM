@@ -432,6 +432,7 @@ class WideEPMoE(MoE):
                 )
 
         x_sf = None
+        sf_swizzle = True
         if self.has_any_quant:
             if self.has_fp8_qdq:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
@@ -444,11 +445,14 @@ class WideEPMoE(MoE):
                         # note: we use uint8 to store 2 fp4 values
                         x_col = x.shape[1] * 2
                     else:
+                        sf_swizzle = not self.use_postquant_alltoall
                         x_row = x.shape[0]
                         x_col = x.shape[1]
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
                             x, self.fc31_input_scale, self.scaling_vector_size,
-                            False)
+                            False, sf_swizzle)
+                        if self.use_postquant_alltoall:
+                            x_sf = x_sf.view((x_row, -1))
 
             elif self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
@@ -516,10 +520,15 @@ class WideEPMoE(MoE):
         if self.use_postquant_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 x, x_sf = self.alltoall_postquant_dispatch(
-                    x, x_sf, x_row, x_col, alltoall_info)
+                    x,
+                    x_sf,
+                    x_row,
+                    x_col,
+                    alltoall_info,
+                    is_sf_swizzle=sf_swizzle)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if x_sf is not None:
-                    if self.has_nvfp4:
+                    if self.has_nvfp4 and sf_swizzle:
                         x_sf = unswizzle_sf(x_sf, x_row, x_col,
                                             self.scaling_vector_size)
                     # Adapter between `x_sf` and DeepEP
@@ -813,15 +822,19 @@ class WideEPMoE(MoE):
 
         return x, token_selected_slots, token_final_scales, gathered_local_statistic_tensor, alltoall_info
 
-    def alltoall_postquant_dispatch(self, x: torch.Tensor, x_sf: torch.Tensor,
-                                    x_row: int, x_col: int,
-                                    alltoall_info: MoEAlltoallInfo):
+    def alltoall_postquant_dispatch(self,
+                                    x: torch.Tensor,
+                                    x_sf: torch.Tensor,
+                                    x_row: int,
+                                    x_col: int,
+                                    alltoall_info: MoEAlltoallInfo,
+                                    is_sf_swizzle: bool = True):
         x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
                                          self.alltoall_workspace, self.ep_rank,
                                          self.ep_size)
 
         if x_sf is not None:
-            if self.has_nvfp4:
+            if self.has_nvfp4 and is_sf_swizzle:
                 x_sf = unswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
