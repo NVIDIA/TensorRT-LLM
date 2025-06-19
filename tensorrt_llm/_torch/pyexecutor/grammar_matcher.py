@@ -96,7 +96,7 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
                 compiled_grammar = self._xgrammar_compiler.compile_structural_tag(
                     structures, triggers)
             case _:
-                raise ValueError(f"Unrecognized guide type: {guide_type}.")
+                raise ValueError(f"Unsupported guide type: {guide_type}.")
 
         matcher = xgrammar.GrammarMatcher(compiled_grammar)
         return XGrammarMatcher(matcher)
@@ -167,7 +167,7 @@ class LLGuidanceMatcherFactory(GrammarMatcherFactory):
                 # provide Lark-formatted grammar instead of standard EBNF.
                 grammar = llguidance.LLMatcher.grammar_from_lark(guide)
             case _:
-                raise ValueError(f"Unrecognized guide type: {guide_type}.")
+                raise ValueError(f"Unsupported guide type: {guide_type}.")
 
         matcher = llguidance.LLMatcher(self._tokenizer, grammar)
         if matcher.is_error():
