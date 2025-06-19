@@ -888,11 +888,29 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "", getHandle
 }
 
 def updateSubJobReturnVars(handle, subJobReturnVars) {
-    def artifacts = handle.getArtifacts()
-    def resultFile = artifacts.find { it.fileName == 'subJobReturnVars.json' }
-    def url = "${handle.absoluteUrl}artifact/${resultFile.relativePath}"
-    def myResult = sh(script: "curl -s '${url}'", returnStdout: true).trim()
-    trtllm_utils.updateMapWithJson(this, subJobReturnVars, myResult, "subJobReturnVars")
+    try {
+        // Get build information through handle
+        def buildNumber = handle.number
+        def jobName = handle.fullProjectName
+        def buildUrl = handle.absoluteUrl
+
+        // Construct API request using handle's URL
+        def apiUrl = "${buildUrl}api/json?tree=artifacts[fileName,relativePath]"
+
+        def apiResponse = sh(script: "curl -s '${apiUrl}'", returnStdout: true).trim()
+        def buildInfo = readJSON text: apiResponse, returnPojo: true
+
+        if (buildInfo.artifacts != null) {
+            def artifactInfo = buildInfo.artifacts.find { it.fileName == 'subJobReturnVars.json' }
+            if (artifactInfo != null) {
+                def url = "${buildUrl}artifact/${artifactInfo.relativePath}"
+                def myResult = sh(script: "curl -s '${url}'", returnStdout: true).trim()
+                trtllm_utils.updateMapWithJson(this, subJobReturnVars, myResult, "subJobReturnVars")
+            }
+        }
+    } catch (Exception e) {
+        echo "Warning: Failed to update subJobReturnVars: ${e.getMessage()}"
+    }
 }
 
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars, subJobReturnVars)
