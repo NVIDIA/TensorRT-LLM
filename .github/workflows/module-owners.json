@@ -9,5 +9,8 @@
     "Performance": ["kaiyux", "jiahanc", "hypdeb"],
     "Lora/P-tuning":["byshiue", "Naveassaf"],
     "Disaggregated Serving":["Shixiaowei02", "joyang-nv", "chuangz0", "schetlur-nv"],
-    "Documentation":["nv-guomingz"]
+    "Documentation":["nv-guomingz"],
+    "Sampling": ["dcampora", "lfr-0531", "Naveassaf", "syuoni", "yweng0828"],
+    "Memory": ["litaotju", "peaceh-nv"],
+    "Installation": ["hchings", "Superjomn", "nv-guomingz", "QiJune"]
 }

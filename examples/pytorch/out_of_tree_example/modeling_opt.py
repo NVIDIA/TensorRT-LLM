@@ -64,24 +64,22 @@ class OPTDecoderLayer(DecoderLayer):
             config.hidden_size,
             elementwise_affine=config.layer_norm_elementwise_affine,
             dtype=config.torch_dtype)
-        self.fc1 = Linear(
-            config.hidden_size,
-            config.ffn_dim,
-            bias=config.enable_bias,
-            dtype=config.torch_dtype,
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            quant_config=model_config.get_quant_config(),
-        )
-        self.fc2 = Linear(
-            config.ffn_dim,
-            config.hidden_size,
-            bias=config.enable_bias,
-            dtype=config.torch_dtype,
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.ROW,
-            quant_config=model_config.get_quant_config(),
-        )
+        self.fc1 = Linear(config.hidden_size,
+                          config.ffn_dim,
+                          bias=config.enable_bias,
+                          dtype=config.torch_dtype,
+                          mapping=model_config.mapping,
+                          tensor_parallel_mode=TensorParallelMode.COLUMN,
+                          quant_config=model_config.get_quant_config(),
+                          allreduce_strategy=model_config.allreduce_strategy)
+        self.fc2 = Linear(config.ffn_dim,
+                          config.hidden_size,
+                          bias=config.enable_bias,
+                          dtype=config.torch_dtype,
+                          mapping=model_config.mapping,
+                          tensor_parallel_mode=TensorParallelMode.ROW,
+                          quant_config=model_config.get_quant_config(),
+                          allreduce_strategy=model_config.allreduce_strategy)
         self.final_layer_norm = LayerNorm(
             config.hidden_size,
             elementwise_affine=config.layer_norm_elementwise_affine,
@@ -89,7 +87,7 @@ class OPTDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         **kwargs,
@@ -191,8 +189,8 @@ class OPTModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.Tensor:

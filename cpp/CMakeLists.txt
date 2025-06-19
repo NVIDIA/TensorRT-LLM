@@ -43,6 +43,14 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
+       "Using open sourced Cutlass low latency gemm kernel" ON)
+option(USING_OSS_CUTLASS_FP4_GEMM "Using open sourced Cutlass fp4 gemm kernel"
+       ON)
+option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
+       ON)
+option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
+       "Using open sourced Cutlass AR gemm kernel" ON)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -376,20 +384,22 @@ print(os.path.dirname(torch.__file__),end='');"
   set(USE_SYSTEM_NVTX ON)
   set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
   find_package(Torch REQUIRED)
-
-  message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
-  add_compile_options(${TORCH_CXX_FLAGS})
   add_compile_definitions(TORCH_CUDA=1)
 
-  if(DEFINED USE_CXX11_ABI)
-    parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
-    if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
-       AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL ${USE_CXX11_ABI})
-      message(
-        WARNING
-          "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
-          "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
-          "setting will be discarded.")
+  if(DEFINED TORCH_CXX_FLAGS)
+    message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
+    add_compile_options(${TORCH_CXX_FLAGS})
+    if(DEFINED USE_CXX11_ABI)
+      parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
+      if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
+         AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL
+             ${USE_CXX11_ABI})
+        message(
+          WARNING
+            "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
+            "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
+            "setting will be discarded.")
+      endif()
     endif()
   endif()
 

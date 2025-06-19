@@ -155,6 +155,15 @@ def test_with_dummy_eagle(hf_model_root,
     print("Build engines...")
     model_name = "eagle"
 
+    # We unset WORLD_SIZE while running tests in specific cluster nodes to
+    # deal with a bug in transformers library. Trainer initialization in
+    # get_dummy_spec_decoding_heads() function fails if WORLD_SIZE is unset.
+    # Preemptively skip tests if WORLD_SIZE is unset.
+    if os.environ.get("WORLD_SIZE") is None:
+        pytest.skip(
+            "[test_with_dummy_eagle] Skipping test due to missing WORLD_SIZE env variable."
+        )
+
     print("Creating dummy Eagle heads...")
     get_dummy_spec_decoding_heads(hf_model_dir=hf_model_root,
                                   save_dir=llm_venv.get_working_directory(),
@@ -305,6 +314,7 @@ def test_mistral_eagle_1gpu(llm_mistral_model_root,
 
 @skip_post_blackwell
 @skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                          ids=['eagle1', 'eagle2'])
 @pytest.mark.parametrize("mistral_nemo_model_root", ['Mistral-Nemo-12b-Base'],

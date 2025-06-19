@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -29,6 +30,7 @@
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <sstream>
 
 #include <optional>
 #include <vector>
@@ -273,6 +275,25 @@ void initRequestBindings(pybind11::module_& m)
         .def_property_readonly("config", &tle::LoraConfig::getConfig)
         .def(py::pickle(loraConfigGetstate, loraConfigSetstate));
 
+    auto multimodalInputGetstate = [](tle::MultimodalInput const& self)
+    { return py::make_tuple(self.getMultimodalHashes(), self.getMultimodalPositions(), self.getMultimodalLengths()); };
+    auto multimodalInputSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 3)
+        {
+            throw std::runtime_error("Invalid MultimodalInput state!");
+        }
+        return tle::MultimodalInput(state[0].cast<std::vector<std::vector<SizeType32>>>(),
+            state[1].cast<std::vector<SizeType32>>(), state[2].cast<std::vector<SizeType32>>());
+    };
+    py::class_<tle::MultimodalInput>(m, "MultimodalInput")
+        .def(py::init<std::vector<std::vector<SizeType32>>, std::vector<SizeType32>, std::vector<SizeType32>>(),
+            py::arg("multimodal_hashes"), py::arg("multimodal_positions"), py::arg("multimodal_lengths"))
+        .def_property_readonly("multimodal_hashes", &tle::MultimodalInput::getMultimodalHashes)
+        .def_property_readonly("multimodal_positions", &tle::MultimodalInput::getMultimodalPositions)
+        .def_property_readonly("multimodal_lengths", &tle::MultimodalInput::getMultimodalLengths)
+        .def(py::pickle(multimodalInputGetstate, multimodalInputSetstate));
+
     auto MropeConfigGetstate = [](tle::MropeConfig const& self)
     { return py::make_tuple(self.getMRopeRotaryCosSin(), self.getMRopePositionDeltas()); };
     auto MropeConfigSetstate = [](py::tuple const& state)
@@ -499,16 +520,17 @@ void initRequestBindings(pybind11::module_& m)
         return py::make_tuple(self.getInputTokenIds(), self.getMaxTokens(), self.getStreaming(),
             self.getSamplingConfig(), self.getOutputConfig(), self.getEndId(), self.getPadId(), self.getPositionIds(),
             self.getBadWords(), self.getStopWords(), self.getEmbeddingBias(), self.getExternalDraftTokensConfig(),
-            self.getPromptTuningConfig(), self.getMultimodalEmbedding(), self.getMropeConfig(), self.getLoraConfig(),
-            self.getLookaheadConfig(), self.getKvCacheRetentionConfig(), self.getLogitsPostProcessorName(),
-            self.getLogitsPostProcessor(), self.getEncoderInputTokenIds(), self.getClientId(),
-            self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(), self.getContextPhaseParams(),
-            self.getEncoderInputFeatures(), self.getEncoderOutputLength(), self.getCrossAttentionMask(),
-            self.getEagleConfig(), self.getSkipCrossAttnBlocks(), self.getGuidedDecodingParams());
+            self.getPromptTuningConfig(), self.getMultimodalInput(), self.getMultimodalEmbedding(),
+            self.getMropeConfig(), self.getLoraConfig(), self.getLookaheadConfig(), self.getKvCacheRetentionConfig(),
+            self.getLogitsPostProcessorName(), self.getLogitsPostProcessor(), self.getEncoderInputTokenIds(),
+            self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
+            self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
+            self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
+            self.getGuidedDecodingParams());
     };
     auto requestSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 32)
+        if (state.size() != 33)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -518,16 +540,17 @@ void initRequestBindings(pybind11::module_& m)
             state[7].cast<std::optional<std::vector<SizeType32>>>(),
             state[8].cast<std::optional<std::list<VecTokens>>>(), state[9].cast<std::optional<std::list<VecTokens>>>(),
             state[10].cast<std::optional<Tensor>>(), state[11].cast<std::optional<tle::ExternalDraftTokensConfig>>(),
-            state[12].cast<std::optional<tle::PromptTuningConfig>>(), state[13].cast<std::optional<Tensor>>(),
-            state[14].cast<std::optional<tle::MropeConfig>>(), state[15].cast<std::optional<tle::LoraConfig>>(),
-            state[16].cast<std::optional<tle::LookaheadDecodingConfig>>(),
-            state[17].cast<std::optional<tle::KvCacheRetentionConfig>>(), state[18].cast<std::optional<std::string>>(),
-            state[19].cast<std::optional<tle::LogitsPostProcessor>>(), state[20].cast<std::optional<VecTokens>>(),
-            state[21].cast<std::optional<IdType>>(), state[22].cast<bool>(), state[23].cast<tle::PriorityType>(),
-            state[24].cast<tle::RequestType>(), state[25].cast<std::optional<tle::ContextPhaseParams>>(),
-            state[26].cast<std::optional<tle::Tensor>>(), state[27].cast<std::optional<SizeType32>>(),
-            state[28].cast<std::optional<tle::Tensor>>(), 1, state[29].cast<std::optional<tle::EagleConfig>>(),
-            state[30].cast<std::optional<tle::Tensor>>(), state[31].cast<std::optional<tle::GuidedDecodingParams>>());
+            state[12].cast<std::optional<tle::PromptTuningConfig>>(),
+            state[13].cast<std::optional<tle::MultimodalInput>>(), state[14].cast<std::optional<Tensor>>(),
+            state[15].cast<std::optional<tle::MropeConfig>>(), state[16].cast<std::optional<tle::LoraConfig>>(),
+            state[17].cast<std::optional<tle::LookaheadDecodingConfig>>(),
+            state[18].cast<std::optional<tle::KvCacheRetentionConfig>>(), state[19].cast<std::optional<std::string>>(),
+            state[20].cast<std::optional<tle::LogitsPostProcessor>>(), state[21].cast<std::optional<VecTokens>>(),
+            state[22].cast<std::optional<IdType>>(), state[23].cast<bool>(), state[24].cast<tle::PriorityType>(),
+            state[25].cast<tle::RequestType>(), state[26].cast<std::optional<tle::ContextPhaseParams>>(),
+            state[27].cast<std::optional<tle::Tensor>>(), state[28].cast<std::optional<SizeType32>>(),
+            state[29].cast<std::optional<tle::Tensor>>(), 1, state[30].cast<std::optional<tle::EagleConfig>>(),
+            state[31].cast<std::optional<tle::Tensor>>(), state[32].cast<std::optional<tle::GuidedDecodingParams>>());
     };
 
     py::class_<tle::Request> request(m, "Request", pybind11::dynamic_attr());
@@ -545,6 +568,7 @@ void initRequestBindings(pybind11::module_& m)
                  std::optional<tle::Tensor>,                    // embeddingBias
                  std::optional<tle::ExternalDraftTokensConfig>, // externalDraftTokensConfig
                  std::optional<tle::PromptTuningConfig>,        // pTuningConfig
+                 std::optional<tle::MultimodalInput>,           // multimodalInput
                  std::optional<tle::Tensor>,                    // multimodalEmbedding
                  std::optional<tle::MropeConfig>,               // mRopeConfig
                  std::optional<tle::LoraConfig>,                // loraConfig
@@ -583,6 +607,7 @@ void initRequestBindings(pybind11::module_& m)
         py::arg("embedding_bias") = py::none(),
         py::arg("external_draft_tokens_config") = py::none(),
         py::arg("prompt_tuning_config") = py::none(),
+        py::arg("multimodal_input") = py::none(),
         py::arg("multimodal_embedding") = py::none(),
         py::arg("mrope_config") = py::none(),
         py::arg("lora_config") = py::none(),
@@ -622,6 +647,7 @@ void initRequestBindings(pybind11::module_& m)
             &tle::Request::setExternalDraftTokensConfig)
         .def_property(
             "prompt_tuning_config", &tle::Request::getPromptTuningConfig, &tle::Request::setPromptTuningConfig)
+        .def_property("multimodal_input", &tle::Request::getMultimodalInput, &tle::Request::setMultimodalInput)
         .def_property(
             "multimodal_embedding", &tle::Request::getMultimodalEmbedding, &tle::Request::setMultimodalEmbedding)
         .def_property("mrope_config", &tle::Request::getMropeConfig, &tle::Request::setMropeConfig)
@@ -750,6 +776,13 @@ void initRequestBindings(pybind11::module_& m)
         .def_readwrite("additional_outputs", &tle::Result::additionalOutputs)
         .def_readwrite("context_phase_params", &tle::Result::contextPhaseParams)
         .def(py::pickle(resultGetstate, resultSetstate));
+
+    m.def("deserialize_result",
+        [](std::string& x)
+        {
+            std::istringstream is(x);
+            return tle::serialize_utils::deserialize<tle::Result>(is);
+        });
 
     auto responseGetstate = [](tle::Response const& self)
     { return py::make_tuple(self.getRequestId(), self.getResult(), self.getClientId()); };

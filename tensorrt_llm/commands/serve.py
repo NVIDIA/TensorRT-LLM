@@ -292,6 +292,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         metadata_server_config_file)
 
     if metadata_server_cfg is not None:
+        assert server_role is not None, "server_role is required when metadata_server_cfg is provided"
         try:
             server_role = ServerRole[server_role.upper()]
         except ValueError:

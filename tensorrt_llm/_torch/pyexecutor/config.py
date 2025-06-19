@@ -60,7 +60,6 @@ class PyTorchConfig:
     """
 
     kv_cache_dtype: str = "auto"
-    use_kv_cache: bool = True
     enable_iter_perf_stats: bool = False
     # If true, enables per request stats per iteration
     # Must also set enable_iter_perf_stats to true to get request stats
@@ -86,6 +85,11 @@ class PyTorchConfig:
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
+    allreduce_strategy: str = "AUTO"
+
+    # The iteration interval to create responses under the streaming mode.
+    # TODO: make this a per-request parameter
+    stream_interval: int = 1
 
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [

@@ -267,8 +267,8 @@ def generate_fmha_cu(project_dir, venv_python):
     build_run("python3 setup.py", env=env)
 
     # Copy generated header file when cu path is active and cubins are deleted.
-    # cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
-    # build_run(f"mv generated/fmha_cubin.h {cubin_dir}")
+    cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
+    build_run(f"mv generated/fmha_cubin.h {cubin_dir}")
 
     for cu_file in (fmha_v2_dir / "generated").glob("*sm*.cu"):
         build_run(f"mv {cu_file} {fmha_v2_cu_dir}")
@@ -440,7 +440,7 @@ def main(*,
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
             build_run(
-                f"\"{venv_conan}\" install --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f"\"{venv_conan}\" install --build=missing --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"

@@ -15,11 +15,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
-#include "tensorrt_llm/batch_manager/cacheFormatter.h"
-#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
-#include "tensorrt_llm/batch_manager/kvCacheUtils.h"
-#include "tensorrt_llm/batch_manager/mlaCacheFormatter.h"
+#include "dataTransceiverImpl.h"
+
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -28,7 +25,7 @@ namespace tensorrt_llm::batch_manager
 {
 
 DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
-    executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<IOFormatter> formatter)
+    executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
     : mManager{manager}
     , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
     , mFormatter(std::move(formatter))
@@ -133,7 +130,7 @@ void DataSenderImpl::release(LlmRequest::RequestIdType requestId)
 }
 
 DataReceiverImpl::DataReceiverImpl(executor::kv_cache::ConnectionManager* manager,
-    executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<IOFormatter> formatter)
+    executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter)
     : mManager{manager}
     , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
     , mFormatter(std::move(formatter))
@@ -156,23 +153,10 @@ void DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
 
     if (!common::getEnvDisableSelectiveCacheTransfer())
     {
-        // TODO: remove IOFormatter and make CacheFormatter new base class
-        auto* cacheFormatter = dynamic_cast<kv_cache_manager::CacheFormatter const*>(mFormatter.get());
-        auto* mlaCacheFormatter = dynamic_cast<kv_cache_manager::MLACacheFormatter const*>(mFormatter.get());
-        if (cacheFormatter != nullptr)
-        {
-            auto* cacheManager = cacheFormatter->getCacheManager();
-            auto blockRange
-                = kv_cache_manager::BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
-            requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
-        }
-        else if (mlaCacheFormatter != nullptr)
-        {
-            auto* cacheManager = mlaCacheFormatter->getCacheManager();
-            auto blockRange
-                = kv_cache_manager::BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
-            requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
-        }
+        auto* cacheManager = mFormatter->getCacheManager();
+        auto blockRange
+            = kv_cache_manager::BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
+        requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
     }
 
     auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -185,18 +169,28 @@ void DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
     }
     auto counterParts = mFormatter->getCounterparts(
         mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx(), destCacheState);
+
+    auto connections = mManager->getConnections(commState);
+    std::vector<executor::kv_cache::Connection const*> counterPartConnections;
     for (auto index : counterParts)
     {
-        auto const* connection = mManager->getConnections(commState).at(index);
+        auto const* connection = connections.at(index);
+        counterPartConnections.emplace_back(connection);
+    }
+    auto pickUpConnections = mFormatter->pickRecvConnections(counterPartConnections, mSelfState.getCacheState().value(),
+        mSelfState.getCommState().value().getSelfIdx(), destCacheState);
+    for (auto connection : counterPartConnections)
+    {
         // if Manager is agentConnectionManager, then send request info to agent
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         if (agentConnectionManager != nullptr)
         {
             // TODO: index -> validConnectionIdx conversion
+            auto valideConnectionIdx
+                = std::find(pickUpConnections.begin(), pickUpConnections.end(), connection) - pickUpConnections.begin();
             auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
             TLLM_CHECK(agentConnection != nullptr);
             TLLM_CHECK(cacheBufferId.has_value());
-            int valideConnectionIdx = std::find(counterParts.begin(), counterParts.end(), index) - counterParts.begin();
             const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
                 ->sendRequestAndBufferInfo(requestInfo, cacheBufferId, valideConnectionIdx);
         }

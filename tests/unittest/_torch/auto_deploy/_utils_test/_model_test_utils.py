@@ -253,9 +253,10 @@ def apply_rotary_pos_emb_complex(
     xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     # Multiply with frequencies. Note that freqs_cis is expected to broadcast with an extra head dim.
-    freqs = freqs_cis.unsqueeze(unsqueeze_dim)
-    xq_out = torch.view_as_real(xq_complex * freqs).flatten(3)
-    xk_out = torch.view_as_real(xk_complex * freqs).flatten(3)
+    freqs_q = freqs_cis.unsqueeze(unsqueeze_dim)
+    freqs_k = freqs_cis.unsqueeze(unsqueeze_dim)
+    xq_out = torch.view_as_real(xq_complex * freqs_q).flatten(3)
+    xk_out = torch.view_as_real(xk_complex * freqs_k).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -393,7 +394,7 @@ def get_small_model_config(model_hub_id: str, **config_kwargs) -> Dict[str, Any]
     config["free_mem_ratio"] = 0.00  # we don't need the cache and it may cause OOM issues
     config["benchmark"] = False  # No benchmark to speed up things
     config["max_tokens"] = 8  # Don't produce too many tokens to speed up things
-    config["page_size"] = 4  # Make sure paging is activated despite small max_tokens
+    config["attn_page_size"] = 4  # Make sure paging is activated despite small max_tokens
     config["max_batch_size"] = 2  # Minimum batching to speed up things
     config["prompt"] = "Hello World"
 

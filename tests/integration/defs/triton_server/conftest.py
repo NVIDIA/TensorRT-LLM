@@ -574,15 +574,16 @@ def setup_cache_data(request, tensorrt_llm_example_root):
 
 
 def cleanup_engine_outputs(output_dir_root):
-    for dirpath, dirnames, _ in os.walk(output_dir_root, topdown=False):
-        for dirname in dirnames:
-            if "engine_dir" in dirname or "model_dir" in dirname or "ckpt_dir" in dirname:
-                folder_path = os.path.join(dirpath, dirname)
-                try:
-                    shutil.rmtree(folder_path)
-                    print_info(f"Deleted folder: {folder_path}")
-                except Exception as e:
-                    print_info(f"Error deleting {folder_path}: {e}")
+    if output_dir_root is not None:
+        for dirpath, dirnames, _ in os.walk(output_dir_root, topdown=False):
+            for dirname in dirnames:
+                if "engine_dir" in dirname or "model_dir" in dirname or "ckpt_dir" in dirname:
+                    folder_path = os.path.join(dirpath, dirname)
+                    try:
+                        shutil.rmtree(folder_path)
+                        print_info(f"Deleted folder: {folder_path}")
+                    except Exception as e:
+                        print_info(f"Error deleting {folder_path}: {e}")
 
 
 # Teardown hook to clean up engine outputs after each group of test cases are finished
