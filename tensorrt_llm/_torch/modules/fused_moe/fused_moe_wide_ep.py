@@ -364,13 +364,15 @@ class WideEPMoE(MoE):
         if self.layer_load_balancer is None:
             token_selected_slots = token_selected_experts
         else:
-            token_selected_slots = self.layer_load_balancer.route(
-                token_selected_experts, self.use_dp)
             if not self.layer_load_balancer.is_static_routing():
                 self.layer_load_balancer.local_statistic(
                     token_selected_experts,
                     is_first_stage=is_first_call,
                     is_last_stage=is_last_call)
+            token_selected_slots = self.layer_load_balancer.route(
+                token_selected_experts, self.use_dp)
+            if not self.layer_load_balancer.is_static_routing():
+                # split into two part to get possible overlap with load balancer routing
                 if is_last_call:
                     loadbalancer_local_statistic_info = self.layer_load_balancer.get_local_statistic_tensor(
                     )
@@ -489,11 +491,8 @@ class WideEPMoE(MoE):
         ) and is_last_call:
             gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
                 (self.mapping.moe_ep_size, self.num_experts))
-            global_statistic_info = torch.sum(
-                gathered_loadbalancer_local_statistic_info,
-                dim=0,
-                dtype=torch.int32)
-            self.layer_load_balancer.update_statistic(global_statistic_info)
+            self.layer_load_balancer.update_statistic(
+                gathered_loadbalancer_local_statistic_info)
 
         if self.smart_router and not cutlass_min_latency_mode:
             ep_size = self.cluster_size

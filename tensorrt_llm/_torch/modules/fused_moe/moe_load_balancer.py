@@ -307,6 +307,9 @@ class SingleLayerMoeLoadBalancer:
         self.cudagraph_stream = None
         self.cudagraph_event = None
 
+        self.statistic_stream = None
+        self.statistic_event = None
+
     def get_layer_idx(self):
         return self.single_layer_load_balancer_impl.get_layer_id()
 
@@ -475,6 +478,12 @@ class SingleLayerMoeLoadBalancer:
             self.statistic_flag_tensor = None
             if is_graph_capturing():
                 assert self.cudagraph_stream is not None, "Doesn't have cudagraph_stream, should not set_cpu_stage."
+                assert self.statistic_event is not None
+                assert self.statistic_stream is not None
+                # wait statistic update done
+                self.statistic_event.wait()
+                self.statistic_event = None
+                self.statistic_stream = None
                 current_stream_event = torch.cuda.Event()
                 current_stream_event.record(torch.cuda.current_stream())
                 with torch.cuda.stream(self.cudagraph_stream):
@@ -530,10 +539,25 @@ class SingleLayerMoeLoadBalancer:
                     (self.expert_count, ),
                     dtype=torch.int32,
                     device=torch.device('cuda'))
-            torch.ops.trtllm.moe_hierarchical_statistic_local_device(
-                local_raw_expert_ids, self.local_statistic_tensor,
-                self.statistic_flag_tensor, self.single_layer_load_balancer_ptr,
-                is_first_stage, is_last_stage)
+            if is_graph_capturing():
+                self.statistic_event = torch.cuda.Event()
+                self.statistic_stream = torch.cuda.Stream()
+                current_stream_event = torch.cuda.Event()
+                current_stream_event.record(torch.cuda.current_stream())
+                with torch.cuda.stream(self.statistic_stream):
+                    current_stream_event.wait()
+                    torch.ops.trtllm.moe_hierarchical_statistic_local_device(
+                        local_raw_expert_ids, self.local_statistic_tensor,
+                        self.statistic_flag_tensor,
+                        self.single_layer_load_balancer_ptr, is_first_stage,
+                        is_last_stage)
+                    self.statistic_event.record(self.statistic_stream)
+            else:
+                torch.ops.trtllm.moe_hierarchical_statistic_local_device(
+                    local_raw_expert_ids, self.local_statistic_tensor,
+                    self.statistic_flag_tensor,
+                    self.single_layer_load_balancer_ptr, is_first_stage,
+                    is_last_stage)
 
     def get_local_statistic_tensor(self):
         """
@@ -543,21 +567,39 @@ class SingleLayerMoeLoadBalancer:
         """
         if self.updates_enabled:
             assert self.local_statistic_tensor is not None
+            if is_graph_capturing():
+                assert self.statistic_event is not None
+                assert self.statistic_stream is not None
+                self.statistic_event.wait()
             return self.local_statistic_tensor
         return None
 
-    def update_statistic(self, global_statistic_tensor: torch.Tensor):
+    def update_statistic(self, gathered_local_statistic_tensor: torch.Tensor):
         """
         Perform update with global statistics.
 
         Args:
-            global_statistic_tensor: global statistics info, should have shape (self.expert_count,)
+            gathered_local_statistic_tensor: gathered local statistics info, should have shape (world_size, self.expert_count)
         """
         if self.updates_enabled:
             assert isinstance(self.statistic_flag_tensor, torch.Tensor)
-            torch.ops.trtllm.moe_hierarchical_statistic_update(
-                global_statistic_tensor, self.statistic_flag_tensor,
-                self.single_layer_load_balancer_ptr)
+
+            def _update_statistic():
+                global_statistic_info = torch.sum(
+                    gathered_local_statistic_tensor, dim=0, dtype=torch.int32)
+                torch.ops.trtllm.moe_hierarchical_statistic_update(
+                    global_statistic_info, self.statistic_flag_tensor,
+                    self.single_layer_load_balancer_ptr)
+
+            if is_graph_capturing():
+                current_stream_event = torch.cuda.Event()
+                current_stream_event.record(torch.cuda.current_stream())
+                with torch.cuda.stream(self.statistic_stream):
+                    current_stream_event.wait()
+                    _update_statistic()
+                    self.statistic_event.record(self.statistic_stream)
+            else:
+                _update_statistic()
             self.local_statistic_tensor = None
 
     def route(self,
