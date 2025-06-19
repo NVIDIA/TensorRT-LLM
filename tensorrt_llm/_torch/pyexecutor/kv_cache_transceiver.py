@@ -31,10 +31,11 @@ def create_kv_cache_transceiver(
         mapping: Mapping, kv_cache_manager: KVCacheManager,
         attention_type: AttentionTypeCpp,
         cache_transceiver_config: CacheTransceiverConfig):
-    if cache_transceiver_config is None:
+    if cache_transceiver_config is None or (
+            not cache_transceiver_config.enable_cache_transceiver):
+        logger.info("cache_transceiver is disabled")
         return None
-    if (cache_transceiver_config.comm_type is None
-            or cache_transceiver_config.comm_type == CommTypeCpp.UNKNOWN):
+    if (cache_transceiver_config.comm_type is None):
 
         comm_type = CommTypeCpp.UCX
         if getenv("TRTLLM_USE_UCX_KVCACHE"):
@@ -45,15 +46,12 @@ def create_kv_cache_transceiver(
             comm_type = CommTypeCpp.MPI
         cache_transceiver_config.comm_type = comm_type
 
-    cache_transceiver = None
-    if (cache_transceiver_config.enable_cache_transceiver):
-        if (cache_transceiver_config.comm_type == CommTypeCpp.MPI):
-            logger.warning(
-                "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended"
-            )
-        cache_transceiver = BindKvCacheTransceiver(mapping, kv_cache_manager,
-                                                   attention_type,
-                                                   cache_transceiver_config)
+    if (cache_transceiver_config.comm_type == CommTypeCpp.MPI):
+        logger.warning(
+            "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
+    cache_transceiver = BindKvCacheTransceiver(mapping, kv_cache_manager,
+                                               attention_type,
+                                               cache_transceiver_config)
 
     return cache_transceiver
 

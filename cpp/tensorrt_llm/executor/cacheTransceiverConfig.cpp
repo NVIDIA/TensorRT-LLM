@@ -49,19 +49,9 @@ std::optional<CacheTransceiverConfig::CommType> CacheTransceiverConfig::getCommT
     return mCommType;
 }
 
-void CacheTransceiverConfig::setEnableCacheTransceiver(bool enableCacheTransceiver)
-{
-    mEnableCacheTransceiver = enableCacheTransceiver;
-}
-
 std::optional<size_t> CacheTransceiverConfig::getMaxNumTokens() const
 {
     return mMaxNumTokens;
-}
-
-void CacheTransceiverConfig::setMaxNumTokens(size_t maxNumTokens)
-{
-    mMaxNumTokens = maxNumTokens;
 }
 
 } // namespace tensorrt_llm::executor

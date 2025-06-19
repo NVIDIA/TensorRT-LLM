@@ -62,12 +62,13 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
     runtime::WorldConfig const& worldConfig, executor::kv_cache::CacheState::AttentionType attentionType,
     std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig)
 {
-    if (!cacheTransceiverConfig.has_value())
+    if (!cacheTransceiverConfig.has_value() || !cacheTransceiverConfig.value().getEnableCacheTransceiver())
     {
-        cacheTransceiverConfig = executor::CacheTransceiverConfig{};
+        TLLM_LOG_INFO("CacheTransceiver is disabled.");
+        return nullptr;
     }
     auto commType = cacheTransceiverConfig.value().getCommType();
-    if (!commType.has_value() || commType.value() == executor::CacheTransceiverConfig::CommType::UNKNOWN)
+    if (!commType.has_value())
     {
         if (common::getEnvUseUCXKvCache())
         {
@@ -92,15 +93,11 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
     }
     cacheTransceiverConfig.value().setCommType(commType);
 
-    if (cacheTransceiverConfig.value().getEnableCacheTransceiver())
-    {
-        executor::kv_cache::CacheState::ModelConfig cacheStateCfg{
-            modelConfig.getNumKvHeadsPerLayer(), modelConfig.getSizePerHead(), modelConfig.getTokensPerBlock()};
+    executor::kv_cache::CacheState::ModelConfig cacheStateCfg{
+        modelConfig.getNumKvHeadsPerLayer(), modelConfig.getSizePerHead(), modelConfig.getTokensPerBlock()};
 
-        return std::make_unique<CacheTransceiver>(cacheManager, cacheStateCfg, worldConfig, modelConfig.getKvDataType(),
-            attentionType, cacheTransceiverConfig);
-    }
-    return nullptr;
+    return std::make_unique<CacheTransceiver>(
+        cacheManager, cacheStateCfg, worldConfig, modelConfig.getKvDataType(), attentionType, cacheTransceiverConfig);
 }
 
 CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,
@@ -151,9 +148,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
     TLLM_CHECK_WITH_INFO(mCacheTransceiverConfig.has_value(), "CacheTransceiverConfig is not set.");
     auto commType = mCacheTransceiverConfig.value().getCommType();
-    TLLM_CHECK_WITH_INFO(
-        commType.has_value() || commType.value() == executor::CacheTransceiverConfig::CommType::UNKNOWN,
-        " CacheTransceiverConfig::CommType is not set.");
+    TLLM_CHECK_WITH_INFO(commType.has_value(), " CacheTransceiverConfig::CommType is not set.");
 
     std::optional<size_t> maxNumTokens = std::nullopt;
     if (mCacheTransceiverConfig.has_value())
