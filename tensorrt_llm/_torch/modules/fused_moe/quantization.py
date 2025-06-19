@@ -72,9 +72,12 @@ class FusedMoEMethodBase(ABC):
             return True
         return False
 
-    def create_weights(self, module: torch.nn.Module, weight_dtype: torch.dtype,
+    def create_weights(self,
+                       module: torch.nn.Module,
+                       weight_dtype: torch.dtype,
                        w3_w1_weight_shape: tuple[int, int, int],
-                       w2_weight_shape: tuple[int, int, int]):
+                       w2_weight_shape: tuple[int, int, int],
+                       bias_dtype: Optional[torch.dtype] = None):
         # Fused gate_up_proj (column parallel)
         w3_w1_weight = nn.Parameter(torch.empty(w3_w1_weight_shape,
                                                 dtype=weight_dtype),
@@ -89,14 +92,17 @@ class FusedMoEMethodBase(ABC):
 
         # bias
         if module.bias:
+            bias_dtype = bias_dtype or module.dtype
             w3_w1_bias = nn.Parameter(torch.empty(
-                (w3_w1_weight_shape[0], w3_w1_weight_shape[1]),
-                dtype=module.dtype),
+                (module.expert_size_per_partition,
+                 module.intermediate_size_per_partition * 2),
+                dtype=bias_dtype),
                                       requires_grad=False)
             module.register_parameter("w3_w1_bias", w3_w1_bias)
 
             w2_bias = nn.Parameter(torch.empty(
-                (w2_weight_shape[0], w2_weight_shape[1]), dtype=module.dtype),
+                (module.expert_size_per_partition, module.hidden_size),
+                dtype=bias_dtype),
                                    requires_grad=False)
             module.register_parameter("w2_bias", w2_bias)
 

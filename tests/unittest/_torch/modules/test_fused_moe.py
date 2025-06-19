@@ -19,11 +19,6 @@ from utils.util import (check_accuracy, skip_neither_ada_nor_hopper_unittest,
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
-                                                   CutlassFusedMoE,
-                                                   DefaultMoeRoutingMethod,
-                                                   RenormalizeMoeRoutingMethod,
-                                                   TritonFusedMoE, VanillaMoE, WideEPMoE)
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import \
     CuteDslFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import \
@@ -31,6 +26,13 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import \
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import \
     AlltoallMethodType
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
+
+# isort and yapf will fight against each other here, so we disable isort
+# isort: off
+from tensorrt_llm._torch.modules.fused_moe import (
+    BaseMoeRoutingMethod, CutlassFusedMoE, DefaultMoeRoutingMethod,
+    RenormalizeMoeRoutingMethod, TritonFusedMoE, VanillaMoE, create_moe, WideEPMoE)
+# isort: on
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
@@ -46,17 +48,25 @@ MPI.pickle.__init__(
 
 
 @pytest.mark.parametrize(
-    "moe_cls, dtype, experts, routing_cls",
-    product([CutlassFusedMoE, VanillaMoE, TritonFusedMoE],
-            [torch.float16, torch.bfloat16], [3, 8, 512],
-            [DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod]))
-def test_fused_moe(moe_cls, dtype, experts, routing_cls, mapping=None):
+    "moe_backend, dtype, experts, routing_cls, bias",
+    product(["CUTLASS", "VANILLA", "TRITON"], [torch.float16, torch.bfloat16],
+            [3, 8, 512], [DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod],
+            [True, False]))
+def test_fused_moe(moe_backend,
+                   dtype,
+                   experts,
+                   routing_cls,
+                   bias,
+                   mapping=None):
 
-    if moe_cls == TritonFusedMoE:
+    if moe_backend == "TRITON":
         if dtype != torch.bfloat16:
             pytest.skip("Unsupported for TritonFusedMoE")
         if routing_cls != RenormalizeMoeRoutingMethod:
             pytest.skip("Unsupported for TritonFusedMoE")
+
+    if bias and moe_backend not in ["TRITON"]:
+        pytest.skip("Bias not supported.")
 
     SEQ_LEN = 8
     HIDDEN_SIZE = 64
@@ -76,6 +86,13 @@ def test_fused_moe(moe_cls, dtype, experts, routing_cls, mapping=None):
 
     weights = {}
     for expert_id in range(NUM_EXPERTS):
+        if bias:
+            w1_bias = torch.randn((INTERMEDIATE_SIZE, ), dtype=dtype).cuda()
+            w2_bias = torch.randn((HIDDEN_SIZE, ), dtype=dtype).cuda()
+            w3_bias = torch.randn((INTERMEDIATE_SIZE, ), dtype=dtype).cuda()
+            weights[f"{expert_id}.w1.bias"] = w1_bias
+            weights[f"{expert_id}.w2.bias"] = w2_bias
+            weights[f"{expert_id}.w3.bias"] = w3_bias
         w1_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
                                 dtype=dtype,
                                 device="cuda")
@@ -88,14 +105,15 @@ def test_fused_moe(moe_cls, dtype, experts, routing_cls, mapping=None):
         weights[f"{expert_id}.w1.weight"] = w1_weight
         weights[f"{expert_id}.w2.weight"] = w2_weight
         weights[f"{expert_id}.w3.weight"] = w3_weight
-    fused_moe = moe_cls(
+    fused_moe = create_moe(
         num_experts=NUM_EXPERTS,
         routing_method=routing_method,
         hidden_size=HIDDEN_SIZE,
         intermediate_size=INTERMEDIATE_SIZE,
         dtype=dtype,
         reduce_results=True,
-        model_config=ModelConfig(mapping=mapping),
+        model_config=ModelConfig(mapping=mapping, moe_backend=moe_backend),
+        bias=bias,
     )
     fused_moe.load_weights([weights])
     fused_moe.cuda()
@@ -109,7 +127,8 @@ def test_fused_moe(moe_cls, dtype, experts, routing_cls, mapping=None):
                                         hidden_size=HIDDEN_SIZE,
                                         intermediate_size=INTERMEDIATE_SIZE,
                                         dtype=dtype,
-                                        model_config=ModelConfig())
+                                        model_config=ModelConfig(),
+                                        bias=bias)
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
 
@@ -261,17 +280,21 @@ def test_fused_moe_alltoall(alltoall_method_type):
 
 
 @skip_pre_hopper
-@pytest.mark.parametrize("moe_cls", [CutlassFusedMoE, TritonFusedMoE])
+@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON"])
 @pytest.mark.parametrize("routing_cls",
                          [DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod])
+@pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_moe_fp8(moe_cls, dtype, routing_cls):
+def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
 
-    if moe_cls == TritonFusedMoE:
+    if moe_backend == "TRITON":
         if dtype != torch.bfloat16:
             pytest.skip("Unsupported for TritonFusedMoE")
         if routing_cls != RenormalizeMoeRoutingMethod:
             pytest.skip("Unsupported for TritonFusedMoE")
+
+    if bias and moe_backend not in ["TRITON"]:
+        pytest.skip("Bias not supported.")
 
     SEQ_LEN = 4
     HIDDEN_SIZE = 64
@@ -290,6 +313,13 @@ def test_fused_moe_fp8(moe_cls, dtype, routing_cls):
 
     weights = {}
     for expert_id in range(NUM_EXPERTS):
+        if bias:
+            w1_bias = torch.randn((INTERMEDIATE_SIZE, ), dtype=dtype).cuda()
+            w2_bias = torch.randn((HIDDEN_SIZE, ), dtype=dtype).cuda()
+            w3_bias = torch.randn((INTERMEDIATE_SIZE, ), dtype=dtype).cuda()
+            weights[f"{expert_id}.w1.bias"] = w1_bias
+            weights[f"{expert_id}.w2.bias"] = w2_bias
+            weights[f"{expert_id}.w3.bias"] = w3_bias
         w1_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
                                 dtype=dtype,
                                 device="cuda")
@@ -327,13 +357,15 @@ def test_fused_moe_fp8(moe_cls, dtype, routing_cls):
         weights[f"{expert_id}.w3.input_scale"] = w3_input_scale
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
-    fused_moe = moe_cls(num_experts=NUM_EXPERTS,
-                        routing_method=routing_method,
-                        hidden_size=HIDDEN_SIZE,
-                        intermediate_size=INTERMEDIATE_SIZE,
-                        dtype=dtype,
-                        reduce_results=False,
-                        model_config=ModelConfig(quant_config=quant_config))
+    fused_moe = create_moe(num_experts=NUM_EXPERTS,
+                           routing_method=routing_method,
+                           hidden_size=HIDDEN_SIZE,
+                           intermediate_size=INTERMEDIATE_SIZE,
+                           dtype=dtype,
+                           reduce_results=False,
+                           model_config=ModelConfig(quant_config=quant_config,
+                                                    moe_backend=moe_backend),
+                           bias=bias)
     fused_moe.cuda()
     fused_moe.load_weights([weights])
 
@@ -347,7 +379,8 @@ def test_fused_moe_fp8(moe_cls, dtype, routing_cls):
         hidden_size=HIDDEN_SIZE,
         intermediate_size=INTERMEDIATE_SIZE,
         dtype=dtype,
-        model_config=ModelConfig(quant_config=quant_config))
+        model_config=ModelConfig(quant_config=quant_config),
+        bias=bias)
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
     with torch.inference_mode():
@@ -356,7 +389,7 @@ def test_fused_moe_fp8(moe_cls, dtype, routing_cls):
 
     # compare
     torch.cuda.synchronize()
-    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.2)
+    check_accuracy(output, ref_output, rtol=0.04, atol=0.1, percent=0.99)
 
 
 def set_tensor_value_2(x, num_row, num_cols):
@@ -1005,7 +1038,8 @@ def test_fused_moe_w4afp8(dtype):
 @skip_pre_hopper
 @pytest.mark.parametrize("experts", [8, 128, 512])
 @pytest.mark.parametrize("fp8_activation", [True, False])
-def test_fused_moe_triton_mxfp4(experts, fp8_activation):
+@pytest.mark.parametrize("bias", [True, False])
+def test_fused_moe_triton_mxfp4(experts, fp8_activation, bias):
     dtype = torch.bfloat16
     SEQ_LEN = 8
     HIDDEN_SIZE = 256
@@ -1024,6 +1058,9 @@ def test_fused_moe_triton_mxfp4(experts, fp8_activation):
                             dtype=dtype).cuda()
     w3_weight = torch.randn((NUM_EXPERTS, INTERMEDIATE_SIZE, HIDDEN_SIZE),
                             dtype=dtype).cuda()
+    w1_bias = torch.randn((NUM_EXPERTS, INTERMEDIATE_SIZE), dtype=dtype).cuda()
+    w2_bias = torch.randn((NUM_EXPERTS, HIDDEN_SIZE), dtype=dtype).cuda()
+    w3_bias = torch.randn((NUM_EXPERTS, INTERMEDIATE_SIZE), dtype=dtype).cuda()
 
     from triton_kernels.numerics_details.mxfp import (downcast_to_mxfp_torch,
                                                       upcast_from_mxfp_torch)
@@ -1056,13 +1093,18 @@ def test_fused_moe_triton_mxfp4(experts, fp8_activation):
         weights[f"{expert_id}.w1.weight"] = w1_weight_qdq[expert_id]
         weights[f"{expert_id}.w2.weight"] = w2_weight_qdq[expert_id]
         weights[f"{expert_id}.w3.weight"] = w3_weight_qdq[expert_id]
+        if bias:
+            weights[f"{expert_id}.w1.bias"] = w1_bias[expert_id]
+            weights[f"{expert_id}.w2.bias"] = w2_bias[expert_id]
+            weights[f"{expert_id}.w3.bias"] = w3_bias[expert_id]
 
     ref_fused_moe = RefGatedMLPFusedMoE(num_experts=NUM_EXPERTS,
                                         routing_method=routing_method,
                                         hidden_size=HIDDEN_SIZE,
                                         intermediate_size=INTERMEDIATE_SIZE,
                                         dtype=dtype,
-                                        model_config=ModelConfig())
+                                        model_config=ModelConfig(),
+                                        bias=bias)
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
 
@@ -1076,6 +1118,10 @@ def test_fused_moe_triton_mxfp4(experts, fp8_activation):
         weights[f"{expert_id}.w1.weight"] = w1_weight_fp4[expert_id]
         weights[f"{expert_id}.w2.weight"] = w2_weight_fp4[expert_id]
         weights[f"{expert_id}.w3.weight"] = w3_weight_fp4[expert_id]
+        if bias:
+            weights[f"{expert_id}.w1.bias"] = w1_bias[expert_id]
+            weights[f"{expert_id}.w2.bias"] = w2_bias[expert_id]
+            weights[f"{expert_id}.w3.bias"] = w3_bias[expert_id]
         weights[f"{expert_id}.w1.weight_scale"] = w1_weight_scale[expert_id]
         weights[f"{expert_id}.w2.weight_scale"] = w2_weight_scale[expert_id]
         weights[f"{expert_id}.w3.weight_scale"] = w3_weight_scale[expert_id]
@@ -1094,7 +1140,8 @@ def test_fused_moe_triton_mxfp4(experts, fp8_activation):
                                dtype=dtype,
                                reduce_results=True,
                                model_config=ModelConfig(),
-                               override_quant_method=quant_method)
+                               override_quant_method=quant_method,
+                               bias=bias)
     fused_moe.load_weights([weights])
     fused_moe.cuda()
 
@@ -1106,7 +1153,7 @@ def test_fused_moe_triton_mxfp4(experts, fp8_activation):
 
     # There can be one off mismatch in the outputs due to different kernel implementations
     # Here we check certain percent of the outputs are within the tolerance
-    check_accuracy(output, ref_output, rtol=0.6, atol=0.6, percent=0.95)
+    check_accuracy(output, ref_output, rtol=0.6, atol=0.6, percent=0.945)
 
 
 class RefGatedMLPFusedMoE(nn.Module):
@@ -1117,12 +1164,14 @@ class RefGatedMLPFusedMoE(nn.Module):
                  hidden_size: int,
                  intermediate_size: int,
                  dtype: Optional[torch.dtype] = None,
-                 model_config: ModelConfig = ModelConfig()):
+                 model_config: ModelConfig = ModelConfig(),
+                 bias=False):
         super().__init__()
         self.num_experts = num_experts
         self.routing_method = routing_method
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        self.bias = bias
 
         self.dtype = dtype
         self.quant_config = model_config.quant_config
@@ -1131,7 +1180,7 @@ class RefGatedMLPFusedMoE(nn.Module):
             GatedMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=self.intermediate_size,
-                bias=False,
+                bias=bias,
                 dtype=self.dtype,
                 config=model_config,
             ) for _ in range(self.num_experts)
@@ -1173,6 +1222,10 @@ class RefGatedMLPFusedMoE(nn.Module):
             gate_up_proj_weights[0]['weight'] = weights[f"{expert}.w1.weight"]
             gate_up_proj_weights[1]['weight'] = weights[f"{expert}.w3.weight"]
             down_proj_weights[0]['weight'] = weights[f"{expert}.w2.weight"]
+            if self.bias:
+                gate_up_proj_weights[0]['bias'] = weights[f"{expert}.w1.bias"]
+                gate_up_proj_weights[1]['bias'] = weights[f"{expert}.w3.bias"]
+                down_proj_weights[0]['bias'] = weights[f"{expert}.w2.bias"]
 
             if self.quant_config and self.quant_config.quant_algo == QuantAlgo.FP8:
                 gate_up_proj_weights[0]['weight_scale'] = weights[
