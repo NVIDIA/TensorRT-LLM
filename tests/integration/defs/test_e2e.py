@@ -1682,10 +1682,12 @@ def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(8)
 @skip_pre_hopper
-@skip_post_blackwell
-@pytest.mark.parametrize("model_path", ['DeepSeek-V3'])
-def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
-        llm_root, llm_venv, model_path):
+@pytest.mark.parametrize("model_path", [
+    pytest.param('DeepSeek-V3', marks=skip_post_blackwell),
+    pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
+])
+def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
+                                                      model_path):
     # "RCCA https://nvbugs/5163844"
     print(f"Testing {model_path}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
@@ -2195,11 +2197,17 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("model_path", [
     pytest.param('llama-3.3-models/Llama-3.3-70B-Instruct',
+                 marks=(skip_pre_hopper, pytest.mark.timeout(5400))),
+    pytest.param('llama4-models/Llama-4-Maverick-17B-128E-Instruct',
                  marks=skip_pre_hopper),
-    pytest.param('Llama-4-Maverick-17B-128E-Instruct', marks=skip_pre_hopper),
 ])
-def test_ptp_quickstart_advanced_llama_2nodes(llm_root, llm_venv, model_path):
+def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
+                                                   model_path):
     print(f"Testing {model_path}.")
+    tp_size, pp_size = 16, 1
+    if "Llama-4" in model_path:
+        tp_size, pp_size = 8, 2
+
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
     run_cmd = [
         "trtllm-llmapi-launch",
@@ -2207,7 +2215,8 @@ def test_ptp_quickstart_advanced_llama_2nodes(llm_root, llm_venv, model_path):
         str(example_root / "quickstart_advanced.py"),
         f"--model_dir={llm_models_root()}/{model_path}",
         "--moe_ep_size=8",
-        "--tp_size=16",
+        f"--tp_size={tp_size}",
+        f"--pp_size={pp_size}",
         "--use_cuda_graph",
         f"--kv_cache_fraction={_MEM_FRACTION_50}",
         "--max_batch_size=32",
