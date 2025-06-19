@@ -134,19 +134,23 @@ class DeepseekV3MTPHead(nn.Module):
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
 
-    def forward(self, hidden_states: torch.Tensor, lm_head: Linear,
-                attn_metadata: AttentionMetadata) -> torch.Tensor:
-        if attn_metadata is not None:
-            last_tokens = torch.cumsum(
-                attn_metadata.seq_lens_cuda,
-                dim=0,
-                dtype=torch.long,
-            ) - 1
-            last_token_hidden_states = hidden_states[last_tokens]
-        else:
-            last_token_hidden_states = hidden_states[-1].unsqueeze(0)
+    def forward(self,
+                hidden_states: torch.Tensor,
+                lm_head: Linear,
+                attn_metadata: AttentionMetadata,
+                return_context_logits: bool = False) -> torch.Tensor:
+        if not return_context_logits:
+            if attn_metadata is not None:
+                last_tokens = torch.cumsum(
+                    attn_metadata.seq_lens_cuda,
+                    dim=0,
+                    dtype=torch.long,
+                ) - 1
+                hidden_states = hidden_states[last_tokens]
+            else:
+                hidden_states = hidden_states[-1].unsqueeze(0)
 
-        logits = lm_head(last_token_hidden_states)
+        logits = lm_head(hidden_states)
         return logits
 
 
@@ -924,10 +928,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         input_ids: torch.IntTensor,
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
-        lm_head: Linear,
         embed_tokens: Embedding,
         attn_metadata: AttentionMetadata,
-        spec_metadata: MTPSpecMetadata,
+        all_rank_num_tokens: Optional[List[int]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -968,7 +971,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         # MoE
         hidden_states = self.mlp(
             hidden_states,
-            all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
+            all_rank_num_tokens=all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),
@@ -987,9 +990,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         else:
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
-        logits = self.shared_head(hidden_states, lm_head, attn_metadata).float()
-
-        return hidden_states, logits
+        return hidden_states
 
 
 class DeepseekV3Model(DecoderModel):
