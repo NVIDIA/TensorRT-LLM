@@ -32,7 +32,7 @@ LLAMA_3_1_8B_CONFIG = {
     "mlp_bias": False,
     "model_type": "llama",
     "num_attention_heads": 32,
-    "num_hidden_layers": 32,
+    "num_hidden_layers": 2,
     "num_key_value_heads": 8,
     "pretraining_tp": 1,
     "rms_norm_eps": 1e-05,
@@ -101,9 +101,6 @@ class TestDebugger(unittest.TestCase):
 
     def test_with_llama(self):
         config_dict = deepcopy(LLAMA_3_1_8B_CONFIG)
-        # 8B * sizeof(float16) plus some extra for activations
-        mem_for_full_model = (2 + 1) * 8 * 2**(30)
-        reduce_llama_config(mem_for_full_model, config_dict)
         if config_dict["num_hidden_layers"] <= 0:
             self.skipTest("Insufficient memory for a single Llama layer")
         llama_config = LlamaConfig.from_dict(config_dict)
@@ -204,7 +201,3 @@ class TestDebugger(unittest.TestCase):
         self.assertEqual(input_ids.shape, logits.shape[:-1])
 
         kv_cache_manager.shutdown()
-
-
-if __name__ == "__main__":
-    unittest.main()

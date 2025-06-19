@@ -21,8 +21,8 @@ class DebuggerContext:
     """
 
     def __init__(self, dest_folder: str = None):
-        self.pre_forward_actions = {}
-        self.after_forward_actions = {}
+        self.pre_forward_actions = []
+        self.after_forward_actions = []
 
         self.layer_names = []
         self.layer_inner_counter = []
@@ -85,13 +85,13 @@ class DebuggerContext:
         self.forward_pre_hook_handles.clear()
 
     def register_pre_forward_action(self, filter, action):
-        self.pre_forward_actions[filter] = action
+        self.pre_forward_actions.append((filter, action))
 
     def get_pre_forward_action(self):
         return self.pre_forward_actions
 
     def register_after_forward_action(self, filter, action):
-        self.after_forward_actions[filter] = action
+        self.after_forward_actions.append((filter, action))
 
     def get_after_forward_action(self):
         return self.after_forward_actions
@@ -107,7 +107,8 @@ class DebuggerContext:
             self.layer_inner_counter) >= 1 else 0
 
     def do_actions(self, module, tensors, actions):
-        for k, a in actions.items():
+        assert isinstance(actions, list), "Actions shall be list."
+        for k, a in actions:
             if k.filter(module, tensors):
                 a(module, tensors, self)
 
@@ -190,7 +191,6 @@ def after_forward(module: nn.Module, args, kwargs, output):
     assert name == old_name, "module mismatch"
 
     debug_ctx.get_module_indices_tree().pop(-1)
-    debug_ctx.tensor_counter = 0
     return None
 
 
@@ -300,10 +300,6 @@ def debug_mode(model: nn.Module,
         disable_debug()
 
 
-input_tensor_names = []
-tensor_counter = 0
-
-
 def get_forward_arg_names(module: nn.Module):
     if hasattr(module, "forward"):
         forward_func = module.forward
@@ -329,17 +325,16 @@ class DumpTensorFilter(Filter):
 
 
 def dump_tensor(module: nn.Module, data_tensor, debug_ctx: DebuggerContext):
-    global input_tensor_names
     global tensor_counter
-
+    input_tensor_names = []
     input_tensor_names = get_forward_arg_names(module)
     if input_tensor_names is not None:
         input_tensor_names = input_tensor_names[1:]
 
     def get_dump_file_path(tensor):
+        global tensor_counter
         assert debug_ctx.get_log_folder(
         ) is not None, "Log folder shall be initialized by DebugContext."
-        global tensor_counter
 
         name_parts = []
         for idx in range(len(debug_ctx.get_current_modules_tree())):
@@ -374,8 +369,6 @@ def dump_tensor(module: nn.Module, data_tensor, debug_ctx: DebuggerContext):
 
     tensor_counter = 0
     dump(data_tensor)
-    tensor_counter = 0
-    input_tensor_names.clear()
 
 
 def register_tensor_dump_hook():
