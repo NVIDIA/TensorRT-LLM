@@ -15,7 +15,6 @@
  */
 
 #include "cutlass_kernels/include/moe_kernels.h"
-// #include "moe_kernels.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
@@ -56,356 +55,6 @@ using namespace tensorrt_llm::common;
 namespace tensorrt_llm::kernels
 {
 
-static constexpr int BLOCK_SIZE = 1024;
-static constexpr int WARP_SIZE = 32;
-static constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;
-
-namespace reduce_topk
-{
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
-#define TLLM_GEN_ENABLE_FAST_REDUX
-#endif
-
-template <typename T_>
-struct TopKRedType
-{
-    using T = T_;
-    static_assert(std::is_same_v<T, float> || std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>,
-        "Top K reduction only implemented for float, float16 and bfloat16");
-
-    using TypeCmp = std::conditional_t<sizeof(T) == 4, uint64_t, uint32_t>;
-    using IdxT = std::conditional_t<sizeof(T) == 4, int32_t, int16_t>;
-    static constexpr int moveBits = (sizeof(T) == 4) ? 32 : 16;
-    static constexpr int maxIdx = 65535;
-    TypeCmp compValIdx;
-
-    static __host__ __device__ inline TypeCmp makeCmpVal(T val, int32_t idx = 0)
-    {
-        auto valueBits = cub::Traits<T>::TwiddleIn(reinterpret_cast<typename cub::Traits<T>::UnsignedBits&>(val));
-        TypeCmp compactTmp = reinterpret_cast<TypeCmp&>(valueBits);
-        compactTmp = (compactTmp << moveBits) | (0xFFFF & (maxIdx - idx));
-        // Use 65535 minus idx to give higher priority to elements with smaller indices.
-        return compactTmp;
-    }
-
-    static __host__ __device__ void unpack(T& value, int32_t& index, TypeCmp cmp)
-    {
-        // Since "65535-idx" is always smaller than 65536 and positive, we can directly use it as the lower 16 bits
-        index = maxIdx - static_cast<int32_t>((cmp & 0xFFFF));
-
-        auto compactTmp = cmp >> moveBits;
-        auto valueBits
-            = cub::Traits<T>::TwiddleOut(reinterpret_cast<typename cub::Traits<T>::UnsignedBits&>(compactTmp));
-        value = reinterpret_cast<T&>(valueBits);
-    }
-
-    __host__ __device__ TopKRedType() = default;
-
-    __host__ __device__ TopKRedType(T val, int32_t idx)
-        : compValIdx(makeCmpVal(val, idx))
-    {
-    }
-
-    __host__ __device__ operator TypeCmp() const noexcept
-    {
-        return compValIdx;
-    }
-
-    __device__ inline TypeCmp reduce(cg::thread_block_tile<WARP_SIZE> const& warp)
-    {
-#if defined(TLLM_GEN_ENABLE_FAST_REDUX)
-        static constexpr bool UseCg = false;
-#else
-        static constexpr bool UseCg = true;
-#endif
-        if constexpr (UseCg || sizeof(TypeCmp) == 8)
-        {
-            return cg::reduce(warp, compValIdx, cg::greater<TypeCmp>{});
-        }
-        else
-        {
-            TypeCmp result;
-            asm("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(result) : "r"(compValIdx));
-            return result;
-        }
-    }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <int K_, bool Enable_>
-struct TopKIdx
-{
-    // by default, empty
-};
-
-template <int K_>
-struct TopKIdx<K_, true>
-{
-    static constexpr int K = K_;
-    int32_t val[K];
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#define TOPK_SWAP(I, J)                                                                                                \
-    {                                                                                                                  \
-        auto pairMin = min(topK[I].compValIdx, topK[J].compValIdx);                                                    \
-        auto pairMax = max(topK[I].compValIdx, topK[J].compValIdx);                                                    \
-        topK[I].compValIdx = pairMax;                                                                                  \
-        topK[J].compValIdx = pairMin;                                                                                  \
-    }
-
-template <int N, typename RedType>
-struct Sort;
-
-template <typename RedType>
-struct Sort<1, RedType>
-{
-    static __device__ void run(RedType* topK) {}
-};
-
-template <typename RedType>
-struct Sort<2, RedType>
-{
-    static __device__ void run(RedType* topK)
-    {
-        TOPK_SWAP(0, 1);
-    }
-};
-
-template <typename RedType>
-struct Sort<3, RedType>
-{
-    static __device__ void run(RedType* topK)
-    {
-        TOPK_SWAP(0, 1);
-        TOPK_SWAP(1, 2);
-        TOPK_SWAP(0, 1);
-    }
-};
-
-template <typename RedType>
-struct Sort<4, RedType>
-{
-    static __device__ void run(RedType* topK)
-    {
-        TOPK_SWAP(0, 2);
-        TOPK_SWAP(1, 3);
-        TOPK_SWAP(0, 1);
-        TOPK_SWAP(2, 3);
-        TOPK_SWAP(1, 2);
-    }
-};
-
-template <int K, typename Type, int N, bool IsSorted = false>
-__device__ void reduceTopK(cg::thread_block_tile<WARP_SIZE> const& warp, Type (&out)[K], int32_t (&outIdx)[K],
-    Type (&value)[N], int32_t (&idx)[N], Type minValue)
-{
-    static_assert(K > 0, "Top K must have K > 0");
-    static_assert(K < WARP_SIZE, "Top K must have K < WARP_SIZE");
-    static_assert(N > 0, "Top K must have N > 0");
-    static_assert(N < 5, "Only support candidates number less than or equal to 128");
-    using RedType = TopKRedType<Type>;
-    RedType topK[N];
-#pragma unroll
-    for (int nn = 0; nn < N; ++nn)
-    {
-        topK[nn] = RedType{value[nn], idx[nn]};
-    }
-
-    if constexpr (!IsSorted)
-    {
-        Sort<N, RedType>::run(topK);
-    }
-    typename RedType::TypeCmp packedMax{};
-#pragma unroll
-    for (int kk = 0; kk < K; ++kk)
-    {
-        bool update = kk > 0 && packedMax == topK[0].compValIdx;
-#pragma unroll
-        for (int nn = 0; nn < N; ++nn)
-        {
-            topK[nn] = update && nn == N - 1 ? RedType{minValue, idx[nn]} : update ? topK[nn + 1] : topK[nn];
-        }
-        // get the next largest value
-        packedMax = topK[0].reduce(warp);
-        RedType::unpack(out[kk], outIdx[kk], packedMax);
-    }
-};
-
-#undef TOPK_SWAP
-
-} // end of namespace reduce_topk
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename T>
-__device__ T calcSoftmax(cg::thread_block_tile<WARP_SIZE> const& warp, T score, int32_t laneIdx, int32_t NumTopExperts)
-{
-    T maxScore = T{-INFINITY};
-    if (laneIdx < NumTopExperts)
-    {
-        maxScore = score >= maxScore ? score : maxScore;
-    }
-    maxScore = cg::reduce(warp, maxScore, cg::greater<T>());
-
-    float sumScore = float{0.f};
-    float newScore;
-    // Get the summation of scores for each token
-    if (laneIdx < NumTopExperts)
-    {
-        newScore = static_cast<float>(score) - static_cast<float>(maxScore);
-        newScore = static_cast<float>(exp(newScore));
-        sumScore += newScore;
-    }
-    sumScore = cg::reduce(warp, sumScore, cg::plus<float>());
-
-    if (laneIdx < NumTopExperts)
-    {
-        score = static_cast<T>(newScore / sumScore);
-    }
-
-    return score;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename InputT, typename OutputT, typename IdxT, int MaxNumExperts, int MaxNumTopExperts>
-__global__ void renormMoeRoutingKernel(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices,
-    int32_t const numTokens, int32_t const numExperts, int32_t const topK)
-{
-
-    uint32_t const blockRank = blockIdx.x;
-    uint32_t const tIdx = BLOCK_SIZE * blockRank + threadIdx.x;
-    uint32_t const warpIdx = tIdx / WARP_SIZE;
-    uint32_t const laneIdx = tIdx % WARP_SIZE;
-    uint32_t const warpNum = gridDim.x * WARPS_PER_BLOCK;
-    auto block = cg::this_thread_block();
-    auto warp = cg::tiled_partition<WARP_SIZE>(block);
-
-    InputT minScore = InputT{-INFINITY};
-    for (uint32_t tokenId = warpIdx; tokenId < numTokens; tokenId += warpNum)
-    {
-        auto scoreOffset = tokenId * numExperts;
-        auto outputOffset = tokenId * topK;
-        InputT inputScore[MaxNumExperts / WARP_SIZE];
-        IdxT inputIndex[MaxNumExperts / WARP_SIZE];
-
-        InputT warpTopKScore[MaxNumTopExperts];
-        IdxT warpTopKExpertIdx[MaxNumTopExperts];
-
-        // Load scores and indices for this warp
-        for (uint32_t i = 0; i < MaxNumExperts / WARP_SIZE; ++i)
-        {
-            auto expertIdx = i * WARP_SIZE + laneIdx;
-            inputScore[i]
-                = expertIdx < numExperts ? static_cast<InputT>(routerLogits[scoreOffset + expertIdx]) : minScore;
-            inputIndex[i] = expertIdx;
-        }
-
-        // Reduce topK scores and indices for this warp
-        reduce_topk::reduceTopK(warp, warpTopKScore, warpTopKExpertIdx, inputScore, inputIndex, minScore);
-
-        // Perform softmax on topK scores
-        auto score = calcSoftmax(warp,
-            laneIdx < topK ? static_cast<float>(warpTopKScore[laneIdx]) : static_cast<float>(minScore), laneIdx, topK);
-        if (laneIdx < topK)
-        {
-            topkValues[outputOffset + laneIdx] = static_cast<OutputT>(score);
-            topkIndices[outputOffset + laneIdx] = warpTopKExpertIdx[laneIdx];
-        }
-    } // end for tokenId
-}
-
-int nextPowerOfTwo(int num)
-{
-    if (num <= 0)
-    {
-        return 1; // Handle invalid input
-    }
-    int power = 1;
-    while (power < num)
-    {
-        // Check for overflow before shifting
-        if (power > INT_MAX / 2)
-        {
-            return power;
-        }
-        power <<= 1;
-    }
-    return power;
-}
-
-#define CASE(MAX_NUM_EXPERTS)                                                                                          \
-    case MAX_NUM_EXPERTS:                                                                                              \
-        switch (maxNumTopExperts)                                                                                      \
-        {                                                                                                              \
-        case 1: kernelInstance = &renormMoeRoutingKernel<InputT, OutputT, IdxT, MAX_NUM_EXPERTS, 1>; break;            \
-        case 2: kernelInstance = &renormMoeRoutingKernel<InputT, OutputT, IdxT, MAX_NUM_EXPERTS, 2>; break;            \
-        case 4: kernelInstance = &renormMoeRoutingKernel<InputT, OutputT, IdxT, MAX_NUM_EXPERTS, 4>; break;            \
-        case 8: kernelInstance = &renormMoeRoutingKernel<InputT, OutputT, IdxT, MAX_NUM_EXPERTS, 8>; break;            \
-        default: kernelInstance = nullptr; break;                                                                      \
-        }                                                                                                              \
-        break;
-
-template <typename InputT, typename OutputT, typename IdxT>
-void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
-    int64_t const numExperts, int64_t const topK, cudaStream_t const stream)
-{
-
-    const uint32_t maxNumBlocks = 1024;
-    const uint32_t numBlocks = std::min(static_cast<uint32_t>((numTokens - 1) / WARPS_PER_BLOCK + 1), maxNumBlocks);
-
-    uint32_t maxNumExperts = nextPowerOfTwo(numExperts) < 32 ? 32 : nextPowerOfTwo(numExperts);
-    uint32_t maxNumTopExperts = nextPowerOfTwo(topK);
-
-    auto* kernelInstance = &renormMoeRoutingKernel<InputT, OutputT, IdxT, 128, 8>;
-
-    switch (maxNumExperts)
-    {
-        CASE(32)
-        CASE(64)
-        CASE(96)
-        CASE(128)
-    default: kernelInstance = nullptr; break;
-    }
-
-    if (kernelInstance == nullptr)
-    {
-        TLLM_CHECK_WITH_INFO(kernelInstance != nullptr, "Can not find corresponding kernel instance.");
-    }
-
-    dim3 renormMoeRoutingGridDim(numBlocks);
-    dim3 renormMoeRoutingBlockDim(BLOCK_SIZE);
-    cudaLaunchConfig_t config;
-    config.gridDim = renormMoeRoutingGridDim;
-    config.blockDim = renormMoeRoutingBlockDim;
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    cudaLaunchKernelEx(&config, kernelInstance, routerLogits, topkValues, topkIndices, static_cast<int32_t>(numTokens),
-        static_cast<int32_t>(numExperts), static_cast<int32_t>(topK));
-    sync_check_cuda_error(stream);
-}
-
-#define INSTANTIATE_RENORM_MOE_ROUTING(InputT, OutputT, IdxT)                                                          \
-    template void invokeRenormMoeRouting<InputT, OutputT, IdxT>(InputT * routerLogits, OutputT * topkValues,           \
-        IdxT * topkIndices, int64_t const numTokens, int64_t const numExperts, int64_t const topK,                     \
-        cudaStream_t const stream);
-
-INSTANTIATE_RENORM_MOE_ROUTING(float, float, int32_t);
-INSTANTIATE_RENORM_MOE_ROUTING(half, float, int32_t);
-#ifdef ENABLE_BF16
-INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, float, int32_t);
-#endif
-
-// limin-todo:
 template <int BLOCK_SIZE, int EXPERTS_PER_TOKEN, int LOG2_NUM_EXPERTS>
 __global__ void fusedBuildExpertMapsSortFirstTokenKernel(int const* const token_selected_experts,
     int* const unpermuted_token_selected_experts, int* const permuted_source_token_ids,
@@ -456,7 +105,6 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(int const* const token_
     // that to elide the binary search
 
     // sort the expert map
-    // TODO: 使用cub的排序算法，将local_token_selected_experts中的专家ID进行排序，并返回每个专家的第一个token的偏移量
     using BlockRadixRank = cub::BlockRadixRank<BLOCK_SIZE, LOG2_NUM_EXPERTS, false>;
     extern __shared__ unsigned char temp_storage[];
     auto& sort_temp = *reinterpret_cast<typename BlockRadixRank::TempStorage*>(temp_storage);
@@ -482,9 +130,7 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(int const* const token_
 #pragma unroll
         for (int i = 0; i < EXPERTS_PER_TOKEN; i++)
         {
-            // 存储处理后的专家ID
             unpermuted_token_selected_experts[token * EXPERTS_PER_TOKEN + i] = local_token_selected_experts[i];
-            // TODO: 存储token的重排序索引, 这个output的shape是多少？
             permuted_source_token_ids[local_token_permuted_indices[i]] = i * num_tokens + token;
         }
     }
@@ -495,33 +141,10 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(int const* const token_
         int out_expert_id = expert_id + token * BlockRadixRank::BINS_TRACKED_PER_THREAD;
         if (out_expert_id < num_experts_per_node + 1)
         {
-            // 存储每个专家的第一个token的偏移量
             expert_first_token_offset[out_expert_id] = local_expert_first_token_offset[expert_id];
         }
     }
 }
-
-// 假设我们有以下设置：
-// num_tokens = 4（4个输入token）
-// EXPERTS_PER_TOKEN = 2（每个token选择2个专家）
-// num_experts_per_node = 4（节点上有4个专家）
-// start_expert = 0, end_expert = 4
-// Token 0 选择的专家: [1, 3]
-// Token 1 选择的专家: [0, 2]
-// Token 2 选择的专家: [2, 3]
-// Token 3 选择的专家: [1, 0]
-// 初始数据在内存中的排列：
-// local_token_selected_experts =
-//     [1, 3, 0, 2, 2, 3, 1, 0] 位置索引：[0, 1, 2, 3, 4, 5, 6, 7]
-// 排序后的专家ID序列：
-// [0,0, 1,1, 2,2, 3,3]
-// 那么local_token_permuted_indices会存储：
-// [2,7, 0,6, 3,4, 1,5]
-// local_expert_first_token_offset存储：
-// [0, 2, 4, 6]
-// => 则第i各专家要处理的token为：
-// a = local_expert_first_token_offset[i] ~ local_expert_first_token_offset[i+1] - 1
-// local_toekn_permuted_indices[a]
 
 template <int BLOCK_SIZE, int EXPERTS_PER_TOKEN, int LOG2_NUM_EXPERTS>
 bool fusedBuildExpertMapsSortFirstTokenDispatch(int const* token_selected_experts,
@@ -673,62 +296,6 @@ bool fusedBuildExpertMapsSortFirstToken(int const* token_selected_experts, int* 
     return false;
 }
 
-// // ========================== CUB Sorting things ====================================
-// cutlass_kernels::CubKeyValueSorter::CubKeyValueSorter()
-//     : num_experts_(0)
-//     , num_bits_(sizeof(int) * 8)
-// {
-// }
-
-// int cutlass_kernels::CubKeyValueSorter::expertsToBits(int num_experts)
-// {
-//     // Max value we represent is V = num_experts + (num_experts - 1) = 2 * num_experts - 1
-//     // The maximum number of bits is therefore floor(log2(V)) + 1
-//     return static_cast<int>(log2(2 * num_experts - 1)) + 1;
-// }
-
-// cutlass_kernels::CubKeyValueSorter::CubKeyValueSorter(int const num_experts)
-//     : num_experts_(num_experts)
-//     , num_bits_(expertsToBits(num_experts))
-// {
-// }
-
-// void cutlass_kernels::CubKeyValueSorter::updateNumExperts(int const num_experts)
-// {
-//     num_experts_ = num_experts;
-//     num_bits_ = expertsToBits(num_experts);
-// }
-
-// size_t cutlass_kernels::CubKeyValueSorter::getWorkspaceSize(size_t const num_key_value_pairs, int const num_experts)
-// {
-//     int num_bits = expertsToBits(num_experts);
-//     size_t required_storage = 0;
-//     int* null_int = nullptr;
-//     cub::DeviceRadixSort::SortPairs(
-//         nullptr, required_storage, null_int, null_int, null_int, null_int, num_key_value_pairs, 0, num_bits);
-
-//     // TODO: fix DeviceRadixSort
-//     //   when num_key_value_pairs, num_experts, num_bits, required_storage = 64, 4, 3, 0
-//     //   The required_storage seems to vary between 0 and 1 for the same inputs
-//     if (required_storage == 0)
-//     {
-//         required_storage = 1;
-//     }
-//     return required_storage;
-// }
-
-// void cutlass_kernels::CubKeyValueSorter::run(void* workspace, size_t const workspace_size, int const* keys_in, int* keys_out,
-//     int const* values_in, int* values_out, size_t const num_key_value_pairs, cudaStream_t stream)
-// {
-//     size_t expected_ws_size = getWorkspaceSize(num_key_value_pairs, num_experts_);
-//     size_t actual_ws_size = workspace_size;
-
-//     TLLM_CHECK_WITH_INFO(expected_ws_size <= workspace_size,
-//         "[CubKeyValueSorter::run] The allocated workspace is too small to run this problem.");
-//     cub::DeviceRadixSort::SortPairs(
-//         workspace, actual_ws_size, keys_in, keys_out, values_in, values_out, num_key_value_pairs, 0, num_bits_, stream);
-// }
-
 // ============================== Infer GEMM sizes =================================
 // TODO Could linear search be better for small # experts
 template <class T>
@@ -860,30 +427,6 @@ __device__ uint32_t quantizePackedFP4Value(ComputeElem& post_act_val, float glob
     return res;
 }
 
-// __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id, int64_t source_token_id, int64_t token_id,
-//     int64_t elem_idx, int64_t num_cols, int64_t max_tokens_per_expert,
-//     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat,
-//     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf)
-// {
-//     static constexpr int CVT_FP4_NUM_THREADS_PER_SF = CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
-
-//     // We need to offset into the scaling factors for just this expert
-//     auto act_sf_expert = act_sf_flat + getOffsetFlatSFArray(expert_id, max_tokens_per_expert, num_cols);
-
-//     // Use `token - num_tokens_before_expert` because we want this to be relative to the start of this expert
-//     auto sf_out
-//         = cvt_quant_to_fp4_get_sf_out_offset<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF, CVT_FP4_NUM_THREADS_PER_SF>(
-//             std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx, std::nullopt /* numRows */,
-//             num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED);
-//     if (sf_out)
-//     {
-//         auto const sf_in = cvt_quant_to_fp4_get_sf_out_offset<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF,
-//             CVT_FP4_NUM_THREADS_PER_SF>(std::nullopt /* batchIdx */, source_token_id, elem_idx,
-//             std::nullopt /* numRows */, num_cols, const_cast<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF*>(input_sf),
-//             FP4QuantizationSFLayout::SWIZZLED);
-//         *sf_out = *sf_in;
-//     }
-// }
 __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id, int64_t source_token_id, int64_t token_id,
     int64_t elem_idx, int64_t num_cols, int64_t max_tokens_per_expert,
     cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat,
@@ -915,16 +458,13 @@ void generateTokenPermutation(int const* unpermuted_token_selected_experts, int 
 {
     int64_t const expanded_num_rows = k * num_rows;
     sorter.updateNumExperts(num_experts_per_node);
-    // limin-todo:
     size_t const sorter_ws_size_bytes
         = cutlass_kernels::pad_to_multiple_of_16(sorter.getWorkspaceSize(expanded_num_rows, num_experts_per_node));
-    // std::cout << "sorter_ws_size_bytes = " << sorter_ws_size_bytes << std::endl;
     sorter.run((void*) sorter_ws, sorter_ws_size_bytes, unpermuted_token_selected_experts,
         permuted_token_selected_experts, unpermuted_source_token_ids, permuted_source_token_ids, expanded_num_rows,
         stream);
 
     sync_check_cuda_error(stream);
-    // std::cout << "after call sorter.run" << std::endl;
 
     // Upper bound on number of expanded rows
     computeExpertFirstTokenOffset(
@@ -1047,7 +587,6 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
 #endif
-    // limin-todo: logic: input[0] -> 3, output[3] -> 1
     int64_t const expanded_source_row = expanded_dest_row_to_expanded_source_row[expanded_dest_row];
     if (threadIdx.x == 0)
     {

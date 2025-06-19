@@ -17,17 +17,12 @@
 #pragma once
 
 #include "tensorrt_llm/common/cudaUtils.h"
-// #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h"
 #include "cutlass_kernels/include/moe_kernels.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 namespace tensorrt_llm::kernels
 {
-template <typename InputT, typename OutputT, typename IdxT>
-void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices, int64_t const numTokens,
-    int64_t const numExperts, int64_t const topK, cudaStream_t const stream);
-
 bool fusedBuildExpertMapsSortFirstToken(int const* token_selected_experts, int* unpermuted_token_selected_experts,
     int* permuted_source_token_ids, int64_t* expert_first_token_offset, int64_t const num_tokens,
     int const num_experts_per_node, int const experts_per_token, int const start_expert, int const end_expert,
