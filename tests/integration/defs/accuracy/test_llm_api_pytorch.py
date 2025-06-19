@@ -581,15 +581,14 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         [False, pytest.param(True, marks=skip_device_contain_gb200)])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
-                           # (True, False, False, False),
-                           # (False, True, False, False),
-                           # (False, False, True, False),
-                           # (False, False, False, True),
-                           # (True, False, True, True), 
-                           # (True, True, True, True)
+                           (True, False, False, False),
+                           (False, True, False, False),
+                           (False, False, True, False),
+                           (False, False, False, True),
+                           (True, False, True, True), 
+                           (True, True, True, True)
                            ])
-    # @parametrize_with_ids("mtp_nextn", [0, 2])
-    @parametrize_with_ids("mtp_nextn", [0])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_fp8_block_scales(self, mtp_nextn, fp8kv, attention_dp, cuda_graph,
                               overlap_scheduler, torch_compile):
         if torch_compile and mtp_nextn > 0:
@@ -639,15 +638,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @skip_no_hopper
     @parametrize_with_ids("torch_compile", [False])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
-                          [(False, False, False, False),
-                           # (True, False, False, False),
-                           # (False, True, False, False),
-                           # (False, False, True, False),
-                           # (False, False, False, True),
-                           # (True, False, True, True), 
-                           # (True, True, True, True)
-                           ])
-    # @parametrize_with_ids("mtp_nextn", [0, 2])
+                          [(False, False, False, False)])
     @parametrize_with_ids("mtp_nextn", [0])
     def test_cute_dsl_fp8_block_scales(self, mtp_nextn, fp8kv, attention_dp, cuda_graph,
                               overlap_scheduler, torch_compile):

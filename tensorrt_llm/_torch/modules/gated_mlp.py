@@ -24,6 +24,7 @@ def swiglu(x):
         gate, x = x.chunk(2, dim=-1)
         return F.silu(gate) * x
 
+
 class GatedMLP(nn.Module):
 
     def __init__(self,

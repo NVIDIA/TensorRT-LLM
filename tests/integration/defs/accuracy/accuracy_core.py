@@ -193,9 +193,7 @@ class AccuracyTask:
             evaluator_kwargs.update(extra_evaluator_kwargs)
         evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
                                        **evaluator_kwargs)
-        print(f"limin: im in accuracy_core.py, before evaluate")
         accuracy = evaluator.evaluate(llm, sampling_params)
-        print(f"limin: accuracy = {accuracy}, threshold = {threshold}")
         if self.HIGHER_IS_BETTER:
             assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}."
         else:
@@ -276,9 +274,7 @@ class MMLU(AccuracyTask):
     ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50
-    # limin-todo:
     NUM_SAMPLES = 4096
-    # NUM_SAMPLES = 1
 
     MAX_BATCH_SIZE = 128
     MAX_INPUT_LEN = 4094
