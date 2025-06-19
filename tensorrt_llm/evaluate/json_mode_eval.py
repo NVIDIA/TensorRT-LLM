@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import os
 from typing import Iterable, List, Optional, Union
 
 import click
@@ -56,8 +57,13 @@ class JsonModeEval(Evaluator):
         for i, sample in enumerate(self.data):
             if i >= self.num_samples:
                 break
+            schema = sample["schema"]
+            if os.environ.get("TRTLLM_XGUIDANCE_LENIENT") == "1":
+                schema = json.loads(schema)
+                schema["x-guidance"] = {"lenient": True}
+                schema = json.dumps(schema)
             sampling_args = {
-                "guided_decoding": GuidedDecodingParams(json=sample["schema"])
+                "guided_decoding": GuidedDecodingParams(json=schema)
             }
             yield sample["prompt"], sampling_args, sample["completion"]
 
