@@ -792,7 +792,7 @@ if __name__ == "__main__":
                                                     == GemmKind.Grouped)
 
     # Fix OOM error in CI. If len(operations) is more than 50, it will be split into multiple sub groups.
-    GROUP_SIZE = 15
+    GROUP_SIZE = 8
     op_groups = dict()
     for op in operations:
         # if should_skip(op):
