@@ -1,6 +1,6 @@
 def is_nemotron_hybrid(config):
     return getattr(config, "hybrid_override_pattern", None) is not None \
-        or config.get("hybrid_override_pattern", None) is not None
+        or (isinstance(config, dict) and config.get("hybrid_override_pattern", None) is not None)
 
 
 def is_mla(config):
