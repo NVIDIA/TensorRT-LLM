@@ -1358,13 +1358,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C; fi'
 
         def extraInternalEnv = ""
-        // Move back to 3600 once TRTLLM-4000 gets resolved
-        def pytestTestTimeout = "7200"
+        def pytestTestTimeout = "1800"
 
         // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
         extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
-        // CPP test execution is timing out easily, so we always override the timeout to 7200
-        extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=7200"
+        // CPP test execution is timing out easily, so we always override its internal timeout to the same value as pytest
+        extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
 
         def testDBList = renderTestDB(testList, llmSrc, stageName)
         testList = "${testList}_${splitId}"
