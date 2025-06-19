@@ -26,8 +26,7 @@ from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
-from .sampler import (EarlyStopSampler, TorchSampler, TorchStarAttentionSampler,
-                      TRTLLMSampler)
+from .sampler import EarlyStopSampler, TorchSampler, TRTLLMSampler
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
@@ -543,7 +542,7 @@ def instantiate_sampler(engine: PyTorchModelEngine,
         mixed_sampler=pytorch_backend_config.mixed_sampler)
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
-        return TorchStarAttentionSampler(max_seq_len=engine.max_seq_len)
+        return TorchSampler(sampler_args)
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         return get_spec_decoder(sampler_args, engine.spec_config)

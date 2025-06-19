@@ -402,44 +402,6 @@ class TorchSampler(Sampler):
             offset += steps
 
 
-class TorchStarAttentionSampler(TorchSampler):
-
-    def update_one_request(self, request: LlmRequest,
-                           new_tokens_list: list[int], logits: torch.Tensor):
-        beam_idx = 0
-
-        output_token_idx = request.output_token_idx
-        new_token = new_tokens_list[output_token_idx]
-        request.add_new_token(new_token, beam_idx)
-
-        current_logits = logits[output_token_idx].unsqueeze(0)
-        if request.py_return_generation_logits:
-            request.py_result.append_generation_logits(current_logits)
-        if request.py_return_log_probs:
-            _, log_probs = greedy_search_sampling_batch(current_logits)
-            request.py_result.append_log_probs([[{
-                new_token:
-                Logprob(logprob=log_probs.item(), rank=1)
-            }]])
-
-        self._handle_stop_criteria(request, new_token, beam=beam_idx)
-        if request.state != LlmRequestState.GENERATION_COMPLETE:
-            request.py_decoding_iter += 1
-
-    def update_requests(self, state: SampleState):
-        if state.sampler_event:
-            state.sampler_event.synchronize()
-        new_tokens_list = state.host.new_tokens.tolist()
-        logits = state.host.logits
-
-        for request in state.scheduled_requests.context_requests:
-            if request.state == LlmRequestState.GENERATION_IN_PROGRESS:
-                self.update_one_request(request, new_tokens_list, logits)
-
-        for request in state.scheduled_requests.generation_requests:
-            self.update_one_request(request, new_tokens_list, logits)
-
-
 class Algorithms:
 
     def defined_algorithms(self):

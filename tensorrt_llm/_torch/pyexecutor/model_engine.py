@@ -1646,7 +1646,6 @@ class PyTorchModelEngine(ModelEngine):
         # for star attention, we need customized block ids
         block_ids_per_seq = []
         num_cached_tokens_per_seq = []
-        output_token_idx = 0
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             prompt_lengths.append(request.py_prompt_len)
@@ -1703,8 +1702,6 @@ class PyTorchModelEngine(ModelEngine):
             sequence_lengths.append(len(input_id))
             block_ids_per_seq.extend([all_cache_indices])
             num_cached_tokens_per_seq.append(past_seen_token_num)
-            request.output_token_idx = output_token_idx
-            output_token_idx += 1
         num_contexts = len(sequence_lengths)
         for request in scheduled_requests.context_requests:
             ctx_iter = request.ctx_iters
@@ -1744,8 +1741,6 @@ class PyTorchModelEngine(ModelEngine):
             sequence_lengths.append(len(input_id))
             block_ids_per_seq.extend([all_cache_indices])
             num_cached_tokens_per_seq.append(past_seen_token_num)
-            request.output_token_idx = output_token_idx
-            output_token_idx += 1
         num_queries = len(sequence_lengths) - num_contexts
 
         # Requests with draft tokens are treated like extend requests.
@@ -1803,8 +1798,6 @@ class PyTorchModelEngine(ModelEngine):
             position_ids.append(last_query_pos_id + request.gen_iters + 1)
             block_ids_per_seq.extend([all_cache_indices])
             num_cached_tokens_per_seq.append(past_seen_token_num)
-            request.output_token_idx = output_token_idx
-            output_token_idx += 1
 
         num_tokens = len(input_ids)
         assert num_tokens <= self.max_num_tokens, (
