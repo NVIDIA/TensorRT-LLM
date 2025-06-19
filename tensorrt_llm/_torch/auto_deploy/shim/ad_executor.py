@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch._prims_common import DeviceLikeType
 
+from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import nvtx_range
 
 from ...._utils import mpi_rank, mpi_world_size
@@ -293,7 +294,13 @@ def create_autodeploy_executor(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
     )
-    resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+    seq_slot_manager = SeqSlotManager(max_num_sequences=max_batch_size * dist_mapping.pp_size)
+    resource_manager = ResourceManager(
+        {
+            ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
+            ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager,
+        }
+    )
     resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # scheduling
@@ -305,7 +312,7 @@ def create_autodeploy_executor(
 
     # search sampler with speculative decoding
     sampler_args = create_torch_sampler_args(
-        engine, executor_config, dist_mapping, mixed_sampler=False
+        executor_config, dist_mapping, mixed_sampler=False, max_seq_len=max_seq_len
     )
     sampler = TorchSampler(sampler_args)
     py_executor = PyExecutor(

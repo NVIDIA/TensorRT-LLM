@@ -199,21 +199,24 @@ class TorchSampler(Sampler):
         max_draft_tokens: int
         max_num_sequences: int
         max_beam_width: int
-        vocab_size: int
         mixed_sampler: bool
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
         self.mixed_sampler = args.mixed_sampler
         self.max_tokens = args.max_draft_tokens + 1
-        self.vocab_size = args.vocab_size
         assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.num_seq_slots = args.max_num_sequences
-        new_tokens = torch.zeros(
-            (self.max_tokens, self.num_seq_slots, self.MAX_BEAM_WIDTH),
-            dtype=torch.int,
-            device='cuda')
-        self.store = self.Store(new_tokens=new_tokens)
+
+        # AutoDeploy build creates the sampler in inference mode,
+        # which would disallow in-place mutating of new_tokens.
+        # So, we temporarily exit inference mode.
+        with torch.inference_mode(False):
+            new_tokens = torch.zeros(
+                (self.max_tokens, self.num_seq_slots, self.MAX_BEAM_WIDTH),
+                dtype=torch.int,
+                device='cuda')
+            self.store = self.Store(new_tokens=new_tokens)
 
     def _meet_max_token_stop_criteria(self, request: LlmRequest,
                                       num_tokens: int):
@@ -331,10 +334,10 @@ class TorchSampler(Sampler):
                 pin_memory=True)
         return None
 
-    def gen_logits_host(self, requests: Iterable[LlmRequest]):
+    def gen_logits_host(self, requests: Iterable[LlmRequest], vocab_size: int):
         if any(req.py_return_generation_logits for req in requests):
             return torch.empty((self.max_tokens, self.num_seq_slots,
-                                self.MAX_BEAM_WIDTH, self.vocab_size),
+                                self.MAX_BEAM_WIDTH, vocab_size),
                                device="cpu",
                                pin_memory=True)
         return None
@@ -343,8 +346,9 @@ class TorchSampler(Sampler):
                      model_outputs: dict[str, torch.Tensor]) -> SampleState:
         requests = scheduled_requests.all_requests()
         new_tokens = self.store.new_tokens
+        vocab_size = model_outputs["logits"].shape[-1]
         log_probs_host = self.log_probs_host(requests)
-        gen_logits_host = self.gen_logits_host(requests)
+        gen_logits_host = self.gen_logits_host(requests, vocab_size)
         self._process_requests(requests,
                                model_outputs,
                                new_tokens,
