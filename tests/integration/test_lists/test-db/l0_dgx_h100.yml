@@ -15,7 +15,7 @@ l0_dgx_h100:
       auto_trigger: others
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch/multi_gpu
+  - unittest/_torch/multi_gpu TIMEOUT (90)
   - unittest/_torch/auto_deploy/unit/multigpu
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4"
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=TRTLLM-torch_compile=False]
@@ -164,5 +164,5 @@ l0_dgx_h100:
   - cpp/test_multi_gpu.py::TestDisagg::test_orchestrator_params[llama-mpi_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_orchestrator_params[llama-ucx_kvcache-90]
   - cpp/test_multi_gpu.py::TestDisagg::test_spawn_orchestrator[llama-ucx_kvcache-90]
-  - cpp/test_multi_gpu.py::TestDisagg::test_orchestrator_params[llama-nixl_kvcache-90]
+  - cpp/test_multi_gpu.py::TestDisagg::test_orchestrator_params[llama-nixl_kvcache-90] TIMEOUT (90)
   - cpp/test_multi_gpu.py::TestDisagg::test_spawn_orchestrator[llama-nixl_kvcache-90]

@@ -1340,7 +1340,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
-        [(1, 1, 1, False, False, True)],
+        [(1, 1, 1, False, True, True)],
         ids=["latency"])
     def test_fp8_block_scales(self, tp_size, pp_size, ep_size, attention_dp,
                               cuda_graph, overlap_scheduler):
@@ -1348,6 +1348,27 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                               use_cuda_graph=cuda_graph)
 
         llm = LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  **pytorch_config,
+                  enable_attention_dp=attention_dp)
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
+        [(1, 1, 1, False, True, True)],
+        ids=["latency"])
+    def test_bf16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
+                  overlap_scheduler):
+        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
+                              use_cuda_graph=cuda_graph)
+
+        llm = LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B",
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
@@ -1412,9 +1433,16 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
-        [(1, 1, 1, True, True, True, "CUTLASS"),
-         (1, 1, 1, False, True, True, "TRTLLM")],
-        ids=["latency_moe_cutlass", "latency_moe_trtllm"],
+        [
+            (1, 1, 1, True, True, True, "CUTLASS"),
+            (1, 1, 1, False, True, True, "TRTLLM"),
+            (4, 1, 4, False, True, True, "CUTLASS"),
+            (4, 1, 4, False, True, True, "TRTLLM"),
+        ],
+        ids=[
+            "latency_moe_cutlass", "latency_moe_trtllm",
+            "4gpu_latency_moe_trtllm", "4gpu_latency_moe_cutlass"
+        ],
     )
     def test_nvfp4(
         self,
@@ -1502,21 +1530,26 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
-        [(8, 1, 8, True, True, True), (8, 1, 8, False, True, True)],
-        ids=["latency", "throughput_latency"])
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
+        [(8, 1, 8, True, True, True, "CUTLASS"),
+         (8, 1, 8, False, True, True, "TRTLLM")],
+        ids=["latency_moe_cutlass", "latency_moe_trtllm"],
+    )
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
-                   overlap_scheduler):
+                   overlap_scheduler, moe_backend):
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
-                              use_cuda_graph=cuda_graph)
+                              use_cuda_graph=cuda_graph,
+                              moe_backend=moe_backend)
 
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         llm = LLM(
             f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
             moe_expert_parallel_size=ep_size,
             **pytorch_config,
-            enable_attention_dp=attention_dp)
+            enable_attention_dp=attention_dp,
+            kv_cache_config=kv_cache_config)
         with llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
