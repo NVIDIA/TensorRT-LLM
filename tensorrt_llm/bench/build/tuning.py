@@ -191,7 +191,6 @@ def finetune_setting(
 
     # Fine-tune the max num tokens.
     # Set min to 2048 to ensure Ctx/Gen overlap efficiency
-    logger.info(f"Estimated max num tokens (before fine-tune): {raw_token}")
     if raw_token < 4096:
         max_token = max(2048, 256 * math.ceil(raw_token / 256))
     elif raw_token < 8192:
