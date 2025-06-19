@@ -614,8 +614,8 @@ class KvCacheAwareRouter(Router):
 
 def create_router(router_config: Optional[RouterConfig],
                   servers: Optional[List[str]],
-                  metadata_server_cfg: Optional[MetadataServerConfig],
-                  metadata_server: Optional[JsonDictionary]) -> Router:
+                  metadata_server_cfg: Optional[MetadataServerConfig] = None,
+                  metadata_server: Optional[JsonDictionary] = None) -> Router:
     """
     Factory function to create different types of router instances.
 

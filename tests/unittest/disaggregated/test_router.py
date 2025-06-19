@@ -21,12 +21,10 @@ class MockMetadataServer:
         self.lock = threading.Lock()
 
     def get(self, key):
-        print("***** get *****", key)
         with self.lock:
             return self.servers.get(key)
 
     def put(self, key, value):
-        print("***** put *****", key, value)
         with self.lock:
             self.servers[key] = value
             return True
@@ -39,7 +37,6 @@ class MockMetadataServer:
             return False
 
     def add_server(self, key, url):
-        print("***** add_server *****", key, url)
         with self.lock:
             self.servers[key] = url
             return True
@@ -363,8 +360,8 @@ async def test_fetch_live_servers_context(mock_metadata_server, router_class):
                           metadata_server=mock_metadata_server)
 
     # Initial check - should be no servers
-    servers = await router.fetch_live_servers()
-    assert len(servers) == 0, "Should have no servers initially"
+    with pytest.raises(ValueError):
+        servers = await router.fetch_live_servers()
 
     # Add a server
     server_key = "trtllm/server1"
