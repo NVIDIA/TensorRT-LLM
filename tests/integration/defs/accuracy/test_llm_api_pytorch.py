@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Literal
+from typing import Type
 
 import pytest
 
@@ -28,8 +28,9 @@ from ..conftest import (llm_models_root, parametrize_with_ids,
                         skip_device_contain_gb200, skip_no_hopper,
                         skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper)
-from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            JsonModeEval, LlmapiAccuracyTestHarness)
+from .accuracy_core import (GSM8K, MMLU, AccuracyTask, CnnDailymail,
+                            GPQADiamond, JsonModeEval,
+                            LlmapiAccuracyTestHarness)
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
@@ -497,6 +498,30 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
+    def _evaluate(self, llm: LLM, task_types: list[Type[AccuracyTask]]) -> None:
+        with llm:
+            for task_type in task_types:
+                task = task_type(self.MODEL_NAME)
+                task.evaluate(llm)
+
+    @staticmethod
+    def _filter_task_types(task_types: list[Type[AccuracyTask]],
+                           fp8kv: bool = False) -> list[Type[AccuracyTask]]:
+        if fp8kv:
+            task_types = [
+                task_type for task_type in task_types if task_type != MMLU
+            ]
+            if not task_types:
+                pytest.skip("No need to run MMLU for fp8kv")
+
+        return task_types
+
+    parametrize_tasks = pytest.mark.parametrize("task_types", [
+        pytest.param([MMLU], marks=pytest.mark.pre_merge),
+        pytest.param([MMLU, GSM8K], marks=pytest.mark.post_merge)
+    ],
+                                                ids=["MMLU", "MMLU+GSM8K"])
+
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids(
         "torch_compile",
@@ -508,8 +533,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     # Only Hopper and Blackwell MLA kernel supports MTP
     @parametrize_with_ids("mtp_nextn",
                           [0, pytest.param(2, marks=skip_pre_hopper)])
+    @parametrize_tasks
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
-                      overlap_scheduler, torch_compile):
+                      overlap_scheduler, torch_compile,
+                      task_types: list[Type[AccuracyTask]]):
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
@@ -531,11 +558,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   **pytorch_config,
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
-        with llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+        self._evaluate(llm, task_types)
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids(
@@ -551,9 +574,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
+    @parametrize_tasks
     def test_bfloat16_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                             attention_dp, cuda_graph, overlap_scheduler,
-                            torch_compile):
+                            torch_compile,
+                            task_types: list[Type[AccuracyTask]]):
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
@@ -580,11 +605,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   **pytorch_config,
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
-        with llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+        self._evaluate(llm, task_types)
 
     @skip_no_hopper
     @parametrize_with_ids(
@@ -598,12 +619,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, False, False, True),
                            (True, False, True, True), (True, True, True, True)])
     @parametrize_with_ids("mtp", ["disable", "eagle", "vanilla"])
+    @parametrize_tasks
     def test_fp8_block_scales(self, mtp, fp8kv, attention_dp, cuda_graph,
-                              overlap_scheduler, torch_compile):
+                              overlap_scheduler, torch_compile,
+                              task_types: list[Type[AccuracyTask]]):
         if torch_compile and mtp != "disable":
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
             pytest.skip("https://nvbugs/5252559")
+        task_types = self._filter_task_types(task_types, fp8kv)
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -639,13 +664,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if fp8kv:
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        with llm:
-            # No need to run MMLU for fp8kv
-            if not fp8kv:
-                task = MMLU(self.MODEL_NAME)
-                task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+        self._evaluate(llm, task_types)
 
     @pytest.mark.skip_device_not_contain(["H100"])
     @parametrize_with_ids("mtp_nextn", [0, 2])
@@ -665,11 +684,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   **pytorch_config,
                   speculative_config=mtp_config)
         assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-        with llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+        self._evaluate(llm, [MMLU, GSM8K])
 
     @pytest.mark.skip_less_device(4)
     @skip_no_hopper
@@ -697,11 +712,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
         assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-        with llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+        self._evaluate(llm, [MMLU, GSM8K])
 
     @pytest.mark.skip_less_device(4)
     @skip_no_hopper
@@ -720,22 +731,18 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
-    @pytest.mark.parametrize("task_name", [
-        pytest.param("MMLU", marks=pytest.mark.pre_merge),
-        pytest.param("MMLU+GSM8K", marks=pytest.mark.post_merge)
-    ])
+    @parametrize_tasks
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     fp8kv, attention_dp, cuda_graph,
                                     overlap_scheduler, torch_compile,
-                                    task_name: Literal["MMLU", "MMLU+GSM8K"]):
+                                    task_types: list[Type[AccuracyTask]]):
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
             pytest.skip("https://nvbugs/5252559")
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
-        if fp8kv and task_name == "MMLU":
-            pytest.skip("No need to run MMLU for fp8kv")
+        task_types = self._filter_task_types(task_types, fp8kv)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
@@ -771,17 +778,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if fp8kv:
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        tasks = task_name.split("+")
-        with llm:
-            for t in tasks:
-                if t == "MMLU" and not fp8kv:
-                    task = MMLU(self.MODEL_NAME)
-                elif t == "GSM8K":
-                    task = GSM8K(self.MODEL_NAME)
-                else:
-                    continue
-
-                task.evaluate(llm)
+        self._evaluate(llm, task_types)
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["H100", "H200"])
@@ -809,11 +806,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   kv_cache_config=kv_cache_config,
                   **pytorch_backend_options,
                   enable_attention_dp=True)
-        with llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+        self._evaluate(llm, [MMLU, GSM8K])
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
@@ -887,12 +880,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (True, False, True, True), (True, True, True, True)])
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM"])
+    @parametrize_tasks
     def test_nvfp4(self, fp8kv, attention_dp, cuda_graph, overlap_scheduler,
-                   torch_compile, mtp_nextn, moe_backend):
+                   torch_compile, mtp_nextn, moe_backend,
+                   task_types: list[Type[AccuracyTask]]):
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
             pytest.skip("https://nvbugs/5252559")
+        task_types = self._filter_task_types(task_types, fp8kv)
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -924,13 +921,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if fp8kv:
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        with llm:
-            # No need to run MMLU for fp8kv
-            if not fp8kv:
-                task = MMLU(self.MODEL_NAME)
-                task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+        self._evaluate(llm, task_types)
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
@@ -949,9 +940,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM"])
+    @parametrize_tasks
     def test_nvfp4_4gpus(self, fp8kv, attention_dp, cuda_graph,
                          overlap_scheduler, tp_size, pp_size, ep_size,
-                         torch_compile, mtp_nextn, moe_backend):
+                         torch_compile, mtp_nextn, moe_backend,
+                         task_types: list[Type[AccuracyTask]]):
         if torch_compile and mtp_nextn > 0:
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
@@ -960,6 +953,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("PP with torch.compile is not supported yet.")
         if not attention_dp and (tp_size > 1 or ep_size > 1):
             pytest.skip("https://nvbugs/5336321")
+        task_types = self._filter_task_types(task_types)
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
@@ -995,13 +990,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if fp8kv:
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        with llm:
-            # No need to run MMLU for fp8kv
-            if not fp8kv:
-                task = MMLU(self.MODEL_NAME)
-                task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+        self._evaluate(llm, task_types)
 
     @parametrize_with_ids(
         "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
@@ -1016,10 +1005,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         pytest.param("fp8", marks=skip_no_hopper),
         pytest.param("nvfp4", marks=skip_pre_blackwell)
     ])
+    @parametrize_tasks
     def test_no_kv_cache_reuse(self, quant_dtype, mtp_nextn, fp8kv,
-                               attention_dp, cuda_graph, overlap_scheduler):
+                               attention_dp, cuda_graph, overlap_scheduler,
+                               task_types: list[Type[AccuracyTask]]):
         if quant_dtype == "nvfp4" and mtp_nextn > 0:
             pytest.skip("MTP is not supported for NVFP4")
+        task_types = self._filter_task_types(task_types)
 
         model_path = self.MODEL_PATH
         if quant_dtype == "fp8":
@@ -1065,13 +1057,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if fp8kv:
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
-        with llm:
-            # No need to run MMLU for fp8kv
-            if not fp8kv:
-                task = MMLU(self.MODEL_NAME)
-                task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+        self._evaluate(llm, task_types)
 
 
 @pytest.mark.timeout(7200)
