@@ -39,6 +39,7 @@ option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
 option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
 option(COMPRESS_FATBIN "Compress everything in fatbin" ON)
+option(TIMING_NVCC "Enable nvcc build timing report" OFF)
 option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
@@ -322,6 +323,10 @@ if(FAST_MATH)
 endif()
 if(COMPRESS_FATBIN)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --fatbin-options -compress-all")
+endif()
+if(NVCC_TIMING)
+  set(CMAKE_CUDA_FLAGS
+      "${CMAKE_CUDA_FLAGS} --time ${CMAKE_CURRENT_BINARY_DIR}/nvcc-timing.csv")
 endif()
 message("CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
 

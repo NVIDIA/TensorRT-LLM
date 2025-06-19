@@ -229,6 +229,8 @@ function(process_target target_name enable_hopper enable_blackwell)
 
 endfunction()
 
+set(ALL_KERNELS_LIB)
+
 set(TARGET_LIB
     fpA_intB_gemm_src;fb_gemm_src;fp8_blockscale_gemm_src;gemm_swiglu_sm90_src)
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
@@ -238,6 +240,8 @@ foreach(target_name ${TARGET_LIB})
   process_target(${target_name} true false) # Name, Hopper, Blackwell
 endforeach()
 
+list(APPEND ALL_KERNELS_LIB ${TARGET_LIB})
+
 set(TARGET_LIB fpA_intB_gemm_src;fb_gemm_src)
 if(USING_OSS_CUTLASS_FP4_GEMM)
   list(APPEND TARGET_LIB fp4_gemm_src)
@@ -245,6 +249,8 @@ endif()
 foreach(target_name ${TARGET_LIB})
   process_target(${target_name} false true) # Name, Hopper, Blackwell
 endforeach()
+
+list(APPEND ALL_KERNELS_LIB ${TARGET_LIB})
 
 set(TARGET_LIB "")
 if(USING_OSS_CUTLASS_MOE_GEMM)
@@ -256,6 +262,10 @@ endif()
 foreach(target_name ${TARGET_LIB})
   process_target(${target_name} true true) # Name, Hopper, Blackwell
 endforeach()
+
+list(APPEND ALL_KERNELS_LIB ${TARGET_LIB})
+
+add_custom_target(cutlass_kernels DEPENDS ${ALL_KERNELS_LIB})
 
 # foreach(target_name moe_gemm_src) process_target(${target_name} true true) #
 # Name, Hopper, Blackwell endforeach()
