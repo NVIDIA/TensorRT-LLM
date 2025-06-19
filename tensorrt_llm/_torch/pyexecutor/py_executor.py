@@ -2062,8 +2062,7 @@ class PyExecutor:
             else:
                 new_active_requests.append(request)
         self.active_requests = new_active_requests
-        if len(new_responses) > 0:
-            self._enqueue_responses(new_responses)
+        self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
         return requests_to_terminate
