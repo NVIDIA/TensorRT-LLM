@@ -631,6 +631,13 @@ class MambaCacheManager(BaseResourceManager):
         layer_offset = self.mamba_layer_offsets[layer_idx]
         return self.ssm_states[layer_offset]
 
+    def shutdown(self):
+        # release tensor memory, keeping python references as tensors
+        self.conv_states = torch.tensor([])
+        self.ssm_states = torch.tensor([])
+        self.state_indices = torch.tensor([])
+        torch.cuda.empty_cache()
+
 
 class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
 
@@ -707,6 +714,10 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
     def free_resources(self, request: LlmRequest):
         self.free_mamba_resources(request)
         super().free_resources(request)
+
+    def shutdown(self):
+        MambaCacheManager.shutdown(self)
+        KVCacheManager.shutdown(self)
 
 
 class BaseDraftTokenManager(BaseResourceManager):
