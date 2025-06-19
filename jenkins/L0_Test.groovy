@@ -2321,7 +2321,7 @@ pipeline {
                             String subJobReturnVarsJson = writeJSON returnText: true, json: subJobReturnVars
                             writeFile file: "subJobReturnVars.json", text: subJobReturnVarsJson
                             retry(3) {
-                                uploadArtifacts artifacts: "subJobReturnVars.json", fingerprint: true
+                                archiveArtifacts artifacts: "subJobReturnVars.json", fingerprint: true
                             }
                         }
                         return
