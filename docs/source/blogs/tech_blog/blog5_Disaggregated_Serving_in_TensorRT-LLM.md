@@ -234,7 +234,7 @@ As shown in Figure 10, enabling MTP increases speedups of disaggregation over ag
 </div>
 <p align="center"><sub><em>Figure 12. DeepSeek R1 8-GPU Pareto curve</em></sub></p>
 
-Figures 11 and 12 show the performance curves for the ISL8192-OSL256 dataset on DeepSeek R1 using 4 GPUs per generation instance (GEN4) and 8 GPUs per context instance (GEN8) respectively. With disaggregation, we plot both “rate-matched” results (based on perfect rate matching between context and generation phases) and E2E results (which can be directly reproduced by users in production deployment environments).
+Figures 11 and 12 show the performance curves for the ISL8192-OSL256 dataset on DeepSeek R1 using 4 GPUs per generation instance (GEN4) and 8 GPUs per generation instance (GEN8) respectively. With disaggregation, we plot both “rate-matched” results (based on perfect rate matching between context and generation phases) and E2E results (which can be directly reproduced by users in production deployment environments).
 
 The results show that for this ISL/OSL setting, disaggregated serving outperforms aggregated serving significantly—achieving up to **1.73x** speedup with GEN4 and up to **2x** with GEN8.
 
