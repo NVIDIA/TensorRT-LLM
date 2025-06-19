@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -29,6 +30,7 @@
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <sstream>
 
 #include <optional>
 #include <vector>
@@ -774,6 +776,13 @@ void initRequestBindings(pybind11::module_& m)
         .def_readwrite("additional_outputs", &tle::Result::additionalOutputs)
         .def_readwrite("context_phase_params", &tle::Result::contextPhaseParams)
         .def(py::pickle(resultGetstate, resultSetstate));
+
+    m.def("deserialize_result",
+        [](std::string& x)
+        {
+            std::istringstream is(x);
+            return tle::serialize_utils::deserialize<tle::Result>(is);
+        });
 
     auto responseGetstate = [](tle::Response const& self)
     { return py::make_tuple(self.getRequestId(), self.getResult(), self.getClientId()); };

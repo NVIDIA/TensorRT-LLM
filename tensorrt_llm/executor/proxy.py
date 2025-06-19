@@ -11,12 +11,13 @@ import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
-from .._utils import mpi_rank, nvtx_range_debug
+from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            print_colored, print_colored_debug)
+                            enable_llm_debug, print_colored,
+                            print_colored_debug)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorkerConfig
@@ -24,7 +25,7 @@ from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
                     create_mpi_comm_session, get_spawn_proxy_process_env,
-                    is_llm_response)
+                    is_llm_response, print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 
 __all__ = [
@@ -44,6 +45,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         worker_cls: type = GenerationExecutorWorker,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None,
     ) -> None:
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
@@ -86,10 +88,14 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.model_world_size = model_world_size
 
+        self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
+
         worker_kwargs = dict(**worker_kwargs,
                              worker_queues=self._setup_queues(),
                              postproc_worker_config=postproc_worker_config,
-                             is_llm_executor=False)
+                             is_llm_executor=False,
+                             garbage_collection_gen0_threshold=self.
+                             garbage_collection_gen0_threshold)
 
         if "log_level" not in worker_kwargs:
             worker_kwargs["log_level"] = logger.level
@@ -152,8 +158,9 @@ class GenerationExecutorProxy(GenerationExecutor):
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
-        if (res := self.result_queue.get()) is None:
-            return False  # shutdown the thread
+        with customized_gc_thresholds(self.garbage_collection_gen0_threshold):
+            if (res := self.result_queue.get()) is None:
+                return False  # shutdown the thread
 
         async_queues = []
         event_loop = None
@@ -383,6 +390,9 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()
+
+        if enable_llm_debug():
+            print_alive_threads()
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """

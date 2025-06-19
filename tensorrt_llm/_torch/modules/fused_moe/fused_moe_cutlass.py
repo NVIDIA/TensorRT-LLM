@@ -899,7 +899,7 @@ class CutlassFusedMoE(MoE):
             #     print(f"limin: finalize_scale_op, output shape = {final_hidden_states.shape}, {final_hidden_states}")
             # print(f"limin: finalize_scale_op, output shape = {final_hidden_states.shape}, {final_hidden_states}")
         else:
-            final_hidden_states = torch.ops.trtllm.fused_moe(
+             final_hidden_states = torch.ops.trtllm.fused_moe(
                 x,
                 token_selected_slots,
                 token_final_scales,
@@ -914,6 +914,7 @@ class CutlassFusedMoE(MoE):
                 ep_rank=ep_rank,
                 cluster_size=cluster_size,
                 cluster_rank=cluster_rank,
+                enable_alltoall=self.enable_alltoall,
                 use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
                 use_w4a8_group_scaling=use_w4a8_group_scaling,
                 min_latency_mode=cutlass_min_latency_mode,

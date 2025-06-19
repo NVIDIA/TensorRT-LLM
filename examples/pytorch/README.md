@@ -81,3 +81,13 @@ python3 examples/pytorch/quickstart_advanced.py \
     --max_matching_ngram_size=2 \
     --spec_decode_nextn=4
 ```
+
+```bash
+# Draft Taret
+python3 examples/pytorch/quickstart_advanced.py \
+    --model_dir meta-llama/Llama-3.1-8B-Instruct \
+    --spec_decode_algo draft_target \
+    --spec_decode_nextn 5 \
+    --draft_model_dir meta-llama/Llama-3.2-1B-Instruct \
+    --disable_overlap_scheduler
+```

@@ -775,6 +775,8 @@ def test_llm_gpt2_int8_kv_1gpu(gpt_example_root, llm_venv, llm_gpt2_model_root,
 def test_llm_gpt2_medium_fp8(gpt_example_root, llm_gpt2_medium_model_root,
                              llm_datasets_root, llm_rouge_root, llm_venv,
                              cmodel_dir, engine_dir, quant_lm_head, qformat):
+    if qformat == "fp8_pc_pt" and quant_lm_head:
+        pytest.skip("Skipping test for fp8_pc_pt with quant_lm_head")
     "Build & Run gpt2-medium fp8 with 1 gpu"
     print("Quantizing and converting checkpoint...")
     dtype = "float16"

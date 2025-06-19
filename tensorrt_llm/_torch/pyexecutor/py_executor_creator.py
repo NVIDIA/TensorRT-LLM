@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 
 import tensorrt_llm
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
@@ -23,7 +24,7 @@ from ._util import (KvCacheCreator, create_py_executor_instance,
                     instantiate_sampler, is_mla)
 from .config import PyTorchConfig
 from .config_utils import is_mla
-from .model_engine import DRAFT_KV_CACHE_MANAGER_KEY, PyTorchModelEngine
+from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 
 
@@ -176,10 +177,12 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
     return mapping
 
 
-def create_py_executor(executor_config: ExecutorConfig,
-                       checkpoint_dir: str = None,
-                       engine_dir: str = None,
-                       lora_config: Optional[LoraConfig] = None) -> PyExecutor:
+def create_py_executor(
+        executor_config: ExecutorConfig,
+        checkpoint_dir: str = None,
+        engine_dir: str = None,
+        lora_config: Optional[LoraConfig] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
     _mangle_executor_config(executor_config)
     pytorch_backend_config = executor_config.pytorch_backend_config
 
@@ -240,7 +243,7 @@ def create_py_executor(executor_config: ExecutorConfig,
                 spec_config=draft_spec_config,
                 is_draft_model=True,
             )
-            draft_model_engine.kv_cache_manager_key = DRAFT_KV_CACHE_MANAGER_KEY
+            draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
             draft_model_engine.load_weights_from_target_model(
                 model_engine.model)
     else:
@@ -326,7 +329,8 @@ def create_py_executor(executor_config: ExecutorConfig,
         spec_resource_manager = get_spec_resource_manager(
             spec_config, model_engine, draft_model_engine)
         if spec_resource_manager is not None:
-            resources["spec_resource_manager"] = spec_resource_manager
+            resources[ResourceManagerType.
+                      SPEC_RESOURCE_MANAGER] = spec_resource_manager
 
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES
@@ -334,7 +338,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         py_executor = create_py_executor_instance(
             dist, resources, mapping, pytorch_backend_config, executor_config,
             ctx_chunk_config, model_engine, draft_model_engine, False, sampler,
-            lora_config)
+            lora_config, garbage_collection_gen0_threshold)
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
@@ -365,7 +369,8 @@ def create_py_executor(executor_config: ExecutorConfig,
             py_executor = create_py_executor_instance(
                 dist, resources, mapping, pytorch_backend_config,
                 executor_config, ctx_chunk_config, model_engine,
-                draft_model_engine, False, sampler, lora_config)
+                draft_model_engine, False, sampler, lora_config,
+                garbage_collection_gen0_threshold)
 
     py_executor.start_worker()
     return py_executor

@@ -93,6 +93,7 @@ def test_llm_hf_gemma_quantization_1gpu_vswa(batch_size, data_type,
                                              gemma_example_root,
                                              llm_datasets_root, llm_rouge_root,
                                              qformat):
+    skip_fp8_pre_ada(use_fp8=qformat == "fp8")
     max_attention_window = VSWA_ATTENTION[Path(gemma_model_root).stem]
     hf_gemma_quantization_1gpu(batch_size, data_type, gemma_model_root,
                                llm_venv, cmodel_dir, engine_dir,
