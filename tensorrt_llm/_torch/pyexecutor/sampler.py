@@ -27,7 +27,7 @@ from .llm_request import LlmRequest, LlmRequestState
 from .scheduler import ScheduledRequests
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class SampleStateTensors:
     new_tokens: torch.Tensor
     logits: torch.Tensor | None = None
@@ -445,7 +445,7 @@ class Algorithms:
         return f"Algs({', '.join(algs)})"
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(kw_only=True)
 class SampleStateTensorsHostTRTLLM(SampleStateTensors):
     finished_sum: torch.Tensor
     finish_reasons: torch.Tensor
