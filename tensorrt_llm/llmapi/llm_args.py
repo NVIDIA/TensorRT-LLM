@@ -1593,9 +1593,6 @@ class TrtLlmArgs(BaseLlmArgs):
 
 LlmArgs = TrtLlmArgs
 
-LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(LlmArgs,
-                                                            indent=' ' * 4)
-
 
 class LoadFormat(Enum):
     AUTO = 0
@@ -1607,18 +1604,18 @@ class TorchCompileConfig(BaseModel):
     """
     Configuration for torch.compile.
     """
-    torch_compile_fullgraph: bool = Field(
+    enable_fullgraph: bool = Field(
         default=True,
         description="Enable full graph compilation in torch.compile.")
 
-    torch_compile_inductor_enabled: bool = Field(
+    enable_inductor: bool = Field(
         default=False, description="Enable inductor backend in torch.compile.")
 
-    torch_compile_piecewise_cuda_graph: bool = Field(
+    enable_piecewise_cuda_graph: bool = Field(
         default=False,
         description="Enable piecewise CUDA graph in torch.compile.")
 
-    torch_compile_enable_userbuffers: bool = Field(
+    enable_userbuffers: bool = Field(
         default=True,
         description=
         "When torch compile is enabled, userbuffers is enabled by default.")
@@ -1812,17 +1809,15 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_iter_req_stats=self.enable_iter_req_stats,
             print_iter_log=self.print_iter_log,
             torch_compile_enabled=bool(self.torch_compile_config is not None),
-            torch_compile_fullgraph=self.torch_compile_config.
-            torch_compile_fullgraph
+            torch_compile_fullgraph=self.torch_compile_config.enable_fullgraph
             if self.torch_compile_config is not None else True,
             torch_compile_inductor_enabled=self.torch_compile_config.
-            torch_compile_inductor_enabled
-            if self.torch_compile_config is not None else False,
+            enable_inductor if self.torch_compile_config is not None else False,
             torch_compile_piecewise_cuda_graph=self.torch_compile_config.
-            torch_compile_piecewise_cuda_graph
+            enable_piecewise_cuda_graph
             if self.torch_compile_config is not None else False,
             torch_compile_enable_userbuffers=self.torch_compile_config.
-            torch_compile_enable_userbuffers
+            enable_userbuffers
             if self.torch_compile_config is not None else True,
             autotuner_enabled=self.autotuner_enabled,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
@@ -2084,3 +2079,10 @@ def get_model_format(model_dir: str) -> _ModelFormatKind:
         )
     else:
         return model_format
+
+
+TRT_LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(TrtLlmArgs,
+                                                                indent=' ' * 4)
+TORCH_LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(TorchLlmArgs,
+                                                                  indent=' ' *
+                                                                  4)

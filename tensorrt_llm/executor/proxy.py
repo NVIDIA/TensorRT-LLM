@@ -16,7 +16,8 @@ from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            print_colored, print_colored_debug)
+                            enable_llm_debug, print_colored,
+                            print_colored_debug)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorkerConfig
@@ -24,7 +25,7 @@ from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
                     create_mpi_comm_session, get_spawn_proxy_process_env,
-                    is_llm_response)
+                    is_llm_response, print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 
 __all__ = [
@@ -389,6 +390,9 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()
+
+        if enable_llm_debug():
+            print_alive_threads()
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """

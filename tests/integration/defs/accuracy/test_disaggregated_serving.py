@@ -58,7 +58,7 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
 
         for future in self.futures:
             future.cancel()
-        self.shutdown(wait=False, cancel_futures=True)
+        self.shutdown(wait=True, cancel_futures=True)
         return False
 
 
@@ -163,15 +163,16 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
             thread_pool.futures.append(future)
             return future
 
-        yield DuckLLM(args, generate_async)
+        try:
+            yield DuckLLM(args, generate_async)
+        finally:
+            ctx_server.terminate()
+            gen_server.terminate()
+            disaggregated_server.terminate()
 
-        ctx_server.terminate()
-        gen_server.terminate()
-        disaggregated_server.terminate()
-
-        ctx_server.wait()
-        gen_server.wait()
-        disaggregated_server.wait()
+            ctx_server.wait()
+            gen_server.wait()
+            disaggregated_server.wait()
 
 
 @pytest.mark.timeout(3600)
@@ -252,16 +253,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("mtp_nextn",
                           [0, pytest.param(2, marks=skip_pre_hopper)])
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
-        ctx_server_config = {
-            "pytorch_backend_config": {
-                "disable_overlap_scheduler": True
-            }
-        }
-        gen_server_config = {
-            "pytorch_backend_config": {
-                "disable_overlap_scheduler": not overlap_scheduler
-            }
-        }
+        ctx_server_config = {"disable_overlap_scheduler": True}
+        gen_server_config = {"disable_overlap_scheduler": not overlap_scheduler}
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
