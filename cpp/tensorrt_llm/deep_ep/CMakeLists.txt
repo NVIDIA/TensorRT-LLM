@@ -1,4 +1,31 @@
-set(DEEP_EP_SOURCE_DIR ${PROJECT_SOURCE_DIR}/../3rdparty/DeepEP)
+set(DEEP_EP_COMMIT 205817d98b692ed32a1d104775251292091cfab7)
+
+# Download DeepEP
+include(FetchContent)
+if(DEFINED $ENV{GITHUB_MIRROR})
+  set(GITHUB_URL "$ENV{GITHUB_MIRROR}")
+else()
+  set(GITHUB_URL "https://github.com")
+endif()
+FetchContent_Declare(
+  deep_ep_download
+  URL ${GITHUB_URL}/deepseek-ai/DeepEP/archive/${DEEP_EP_COMMIT}.tar.gz)
+FetchContent_MakeAvailable(deep_ep_download)
+set(DEEP_EP_SOURCE_DIR ${deep_ep_download_SOURCE_DIR})
+
+# Delete stale nvshmem
+set(NVSHMEM_STAMP_FILE ${CMAKE_CURRENT_BINARY_DIR}/nvshmem_stamp.txt)
+file(SHA256 "${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch"
+     NVSHMEM_PATCH_HASH)
+set(NVSHMEM_STAMP_CONTENT "3.2.5-1 ${NVSHMEM_PATCH_HASH}")
+set(OLD_NVSHMEM_STAMP_CONTENT "")
+if(EXISTS ${NVSHMEM_STAMP_FILE})
+  file(READ ${NVSHMEM_STAMP_FILE} OLD_NVSHMEM_STAMP_CONTENT)
+endif()
+if(NOT "${OLD_NVSHMEM_STAMP_CONTENT}" STREQUAL "${NVSHMEM_STAMP_CONTENT}")
+  file(REMOVE_RECURSE ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-src)
+  file(WRITE ${NVSHMEM_STAMP_FILE} "${NVSHMEM_STAMP_CONTENT}")
+endif()
 
 # Find libmlx5.so.1
 execute_process(
@@ -17,8 +44,8 @@ include(ExternalProject)
 ExternalProject_Add(
   nvshmem_project
   URL https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz
-  URL_HASH
-    SHA256=eb2c8fb3b7084c2db86bd9fd905387909f1dfd483e7b45f7b3c3d5fcf5374b5a
+  SOURCE_DIR ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-src
+  BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build
   PATCH_COMMAND patch -p1 -i ${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch
   COMMAND sed "s/TRANSPORT_VERSION_MAJOR 3/TRANSPORT_VERSION_MAJOR 103/" -i
           src/CMakeLists.txt
@@ -38,7 +65,6 @@ ExternalProject_Add(
              -DNVSHMEM_BUILD_EXAMPLES=0
              -DNVSHMEM_BUILD_TESTS=0
   INSTALL_COMMAND ""
-  BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build
   EXCLUDE_FROM_ALL TRUE)
 add_library(nvshmem_project::nvshmem STATIC IMPORTED)
 add_dependencies(nvshmem_project::nvshmem nvshmem_project)
