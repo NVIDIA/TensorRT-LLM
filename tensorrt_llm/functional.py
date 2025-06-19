@@ -26,6 +26,8 @@ import torch
 import tensorrt as trt
 # isort: on
 
+from tensorrt_llm.logger import logger
+
 from . import graph_rewriting as gw
 from ._common import default_net, default_trtnet, precision
 from ._utils import (QuantModeWrapper, bf16_array, bool_array,
@@ -4080,6 +4082,18 @@ def allreduce(
     Returns:
         The tensor produced by that layer.
     '''
+    logger.info('[functional.py][allreduce] ---Beginning of allreduce---')
+
+    logger.info(
+        f'[functional.py][allreduce] Input tensor output shape: {tensor.shape}')
+    logger.info(
+        f'[functional.py][allreduce] Input tensor output dtype: {tensor.dtype}')
+    logger.info(
+        f'[functional.py][allreduce] Input tensor output content: {tensor}')
+    input_tensor_name = f"{tensor.name.replace('/', '_')}_debug_all_reduce_INPUT_tensor"
+    logger.info(
+        f'[functional.py][allreduce] Input tensor name: {input_tensor_name}')
+    tensor.mark_output(input_tensor_name)
 
     global allreduce_ub_counter
     allreduce_ub_counter += 1
@@ -4126,15 +4140,71 @@ def allreduce(
                 if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                     scale_factor.mark_output("allreduce_ub_2_" +
                                              str(allreduce_ub_counter))
+                    logger.info(
+                        '[functional.py][allreduce] ---Returning from allreduce WITH NVFP4 FUSION---'
+                    )
+                    final_output.mark_output(
+                        f"{final_output.name.replace('/', '_')}_debug_final_output_WITH_FUSION"
+                    )
                     return (final_output, scale_factor), inter_output
             else:
                 assert all_reduce_params.fusion_op == AllReduceFusionOp.LAST_PROCESS_FOR_UB
                 inter_output.mark_output("allreduce_ub_1_" +
                                          str(allreduce_ub_counter))
+        if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+            logger.info(
+                f'[functional.py][allreduce] NVFP4 scale factor shape: {scale_factor.shape}'
+            )
+            logger.info(
+                f'[functional.py][allreduce] NVFP4 scale factor dtype: {scale_factor.dtype}'
+            )
+            logger.info(
+                f'[functional.py][allreduce] NVFP4 scale factor content: {scale_factor}'
+            )
+        logger.info(
+            f'[functional.py][allreduce] Final output shape: {final_output.shape}'
+        )
+        logger.info(
+            f'[functional.py][allreduce] Final output dtype: {final_output.dtype}'
+        )
+        final_output_name = f"{final_output.name.replace('/', '_')}_debug_final_output_WITH_FUSION"
+        logger.info(
+            f'[functional.py][allreduce] Final output name: {final_output_name}'
+        )
+
+        logger.info(
+            f'[functional.py][allreduce] Inter output shape: {inter_output.shape}'
+        )
+        logger.info(
+            f'[functional.py][allreduce] Inter output dtype: {inter_output.dtype}'
+        )
+        logger.info(
+            f'[functional.py][allreduce] Inter output content: {inter_output}')
+
+        logger.info(
+            '[functional.py][allreduce] ---Returning from allreduce WITH FUSION---'
+        )
+        final_output.mark_output(final_output_name)
         return final_output, inter_output
     else:
         final_output = _create_tensor(layer.get_output(0),
                                       layer).cast(tensor.dtype)
+        logger.info(
+            f'[functional.py][allreduce] Final output shape: {final_output.shape}'
+        )
+        logger.info(
+            f'[functional.py][allreduce] Final output dtype: {final_output.dtype}'
+        )
+        logger.info(
+            f'[functional.py][allreduce] Final output content: {final_output}')
+        final_output_name = f"{final_output.name.replace('/', '_')}_debug_final_output_WITH_FUSION"
+        logger.info(
+            f'[functional.py][allreduce] Final output name: {final_output_name}'
+        )
+        logger.info(
+            '[functional.py][allreduce] ---Returning from allreduce WITHOUT FUSION---'
+        )
+        final_output.mark_output(final_output_name)
         return final_output
 
 
