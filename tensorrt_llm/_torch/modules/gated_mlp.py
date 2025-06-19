@@ -23,6 +23,13 @@ def swiglu(x):
     else:
         gate, x = x.chunk(2, dim=-1)
         return F.silu(gate) * x
+    gate, x = x.chunk(2, dim=-1)
+    return F.silu(gate) * x
+
+def swiglu_fused_moe(x):
+    # print(f"limin: swiglu, input shape = {x.shape}, {x}")
+    x, gate = x.chunk(2, dim=-1)
+    return F.silu(gate) * x
 
 
 class GatedMLP(nn.Module):

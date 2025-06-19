@@ -277,8 +277,8 @@ class MMLU(AccuracyTask):
     BETA = 0.2
     SIGMA = 50
     # limin-todo:
-    # NUM_SAMPLES = 4096
-    NUM_SAMPLES = 1
+    NUM_SAMPLES = 4096
+    # NUM_SAMPLES = 1
 
     MAX_BATCH_SIZE = 128
     MAX_INPUT_LEN = 4094

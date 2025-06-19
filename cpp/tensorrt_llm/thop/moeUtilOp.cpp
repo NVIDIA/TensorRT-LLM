@@ -712,8 +712,9 @@ moe_permute_op(torch::Tensor const& input, torch::Tensor const& token_selected_e
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
     // // limin-todo: what's the output?
-    size_t num_moe_inputs
-        = use_fp8_block_scaling ? (experts_per_token * num_rows + 3) / 4 * 4 : experts_per_token * num_rows;
+    // size_t num_moe_inputs
+    //     = use_fp8_block_scaling ? (experts_per_token * num_rows + 3) / 4 * 4 : experts_per_token * num_rows;
+    size_t num_moe_inputs = experts_per_token * num_rows;
     // num_moe_inputs = min_latency_mode ? num_experts_per_node * num_rows : num_moe_inputs;
     // size_t const permuted_elems = num_moe_inputs * hidden_size;
     // std::cout << "limin: moe_permute_op, num_rows, experts_per_token, num_moe_inputs: " << num_rows << ", " <<

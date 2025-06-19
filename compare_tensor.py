@@ -2,10 +2,10 @@ import torch
 import os
 import numpy as np
 
-def compare_tensors_meta_info(dir1_name, dir2_name, filename):
+def compare_tensors_meta_info(dir1_name, dir2_name, filename, filename_opt):
     # Read original tensor
     orig_path = os.path.join(dir1_name, filename)
-    opt_path = os.path.join(dir2_name, filename)
+    opt_path = os.path.join(dir2_name, filename_opt)
     
     # Check if files exist
     if not os.path.exists(orig_path) or not os.path.exists(opt_path):
@@ -43,10 +43,11 @@ def compare_tensors_meta_info(dir1_name, dir2_name, filename):
     print(f"Max difference: {abs(orig_max - opt_max)}")
     print("\n")
 
-def compare_tensors_data(dir1_name, dir2_name, filename):
+def compare_tensors_data(dir1_name, dir2_name, filename, filename_opt):
+    print(f"\n\nComparing tensors: {filename} and {filename_opt}")
     # Read original tensor
     orig_path = os.path.join(dir1_name, filename)
-    opt_path = os.path.join(dir2_name, filename)
+    opt_path = os.path.join(dir2_name, filename_opt)
     
     # Check if files exist
     if not os.path.exists(orig_path) or not os.path.exists(opt_path):
@@ -93,7 +94,44 @@ def compare_tensors_data(dir1_name, dir2_name, filename):
     #         print(f"  优化值: {opt_data[idx]}")
     #         print(f"  相对误差: {rel_diff[idx]:.4f}")
     #         print(f"  绝对误差: {abs_diff[idx]:.4f}")
+
+def compare_tensors_data(dir1_name, dir2_name, filename, filename_opt):
+    print(f"\n\nComparing tensors: {filename} and {filename_opt}")
+    # Read original tensor
+    orig_path = os.path.join(dir1_name, filename)
+    opt_path = os.path.join(dir2_name, filename_opt)
     
+    # Check if files exist
+    if not os.path.exists(orig_path) or not os.path.exists(opt_path):
+        print(f"Files do not exist: {orig_path} or {opt_path}")
+        return
+        
+    def read_tensor_data(file_path):
+        data = []
+        with open(file_path, 'r') as f:
+            for line in f:
+                # 将每行按空格分割，并转换为float类型
+                row = [float(x) for x in line.strip().split()]
+                data.append(row)
+        
+        # 转换为numpy数组
+        return np.array(data)
+
+    # 使用示例
+    data = read_tensor_data(orig_path).reshape(-1)
+    # print(data)
+
+    data_opt = np.load(opt_path).reshape(-1)
+    # print(data_opt)
+
+    diff = np.abs(data - data_opt)
+    # print(diff)
+
+    rel_diff = np.abs(data - data_opt) / (np.abs(data) + 1e-7)
+    # print(rel_diff)
+    print(f"max rel_diff: {np.max(rel_diff)}")
+    print(f"max diff: {np.max(diff)}")
+
 # Usage example
 if __name__ == "__main__":
     # compare_tensors_meta_info("tensor_inputs", "tensor_inputs_opt", "inputs_embeds4.txt")
@@ -136,30 +174,85 @@ if __name__ == "__main__":
     # compare_tensors_meta_info("moe_hidden_states", "moe_hidden_states_opt", "moe_hidden_states4_1.txt")
     # compare_tensors_data("moe_hidden_states", "moe_hidden_states_opt", "moe_hidden_states4_1.npy")
 
-    print("\n\n")
-    print("   forward-chunk-output, layer-1: --------------------------------")
-    compare_tensors_meta_info("forward_chunk_output", "forward_chunk_output_opt", "forward_chunk_output4_1.txt")
-    compare_tensors_data("forward_chunk_output", "forward_chunk_output_opt", "forward_chunk_output4_1.npy")
+    # print("\n\n")
+    # print("   forward-chunk-output, layer-1: --------------------------------")
+    # compare_tensors_meta_info("forward_chunk_output", "forward_chunk_output_opt", "forward_chunk_output4_1.txt")
+    # compare_tensors_data("forward_chunk_output", "forward_chunk_output_opt", "forward_chunk_output4_1.npy")
 
-    print("\n\n")
-    print("   forward-chunk-moe-input, layer-1: --------------------------------")
-    compare_tensors_meta_info("forward_chunk_moe_input", "forward_chunk_moe_input_opt", "forward_chunk_moe_input4_1.txt")
-    compare_tensors_data("forward_chunk_moe_input", "forward_chunk_moe_input_opt", "forward_chunk_moe_input4_1.npy")
-    print("   forward-chunk-moe-selected-slots, layer-1: --------------------------------")
-    compare_tensors_meta_info("forward_chunk_moe_selected_slots", "forward_chunk_moe_selected_slots_opt", "forward_chunk_moe_selected_slots4_1.txt")
-    compare_tensors_data("forward_chunk_moe_selected_slots", "forward_chunk_moe_selected_slots_opt", "forward_chunk_moe_selected_slots4_1.npy")
-    print("   forward-chunk-moe-final-scales, layer-1: --------------------------------")
-    compare_tensors_meta_info("forward_chunk_moe_final_scales", "forward_chunk_moe_final_scales_opt", "forward_chunk_moe_final_scales4_1.txt")
-    compare_tensors_data("forward_chunk_moe_final_scales", "forward_chunk_moe_final_scales_opt", "forward_chunk_moe_final_scales4_1.npy")
-    print("   forward-chunk-moe-w3-w1-weight, layer-1: --------------------------------")
-    compare_tensors_meta_info("forward_chunk_moe_w3_w1_weight", "forward_chunk_moe_w3_w1_weight_opt", "forward_chunk_moe_w3_w1_weight4_1.txt")
-    compare_tensors_data("forward_chunk_moe_w3_w1_weight", "forward_chunk_moe_w3_w1_weight_opt", "forward_chunk_moe_w3_w1_weight4_1.npy")
-    print("   forward-chunk-moe-w2-weight, layer-1: --------------------------------")
-    compare_tensors_meta_info("forward_chunk_moe_w2_weight", "forward_chunk_moe_w2_weight_opt", "forward_chunk_moe_w2_weight4_1.txt")
-    compare_tensors_data("forward_chunk_moe_w2_weight", "forward_chunk_moe_w2_weight_opt", "forward_chunk_moe_w2_weight4_1.npy")
-    print("   forward-chunk-moe-quant-scales-0, layer-1: --------------------------------")
-    compare_tensors_meta_info("forward_chunk_moe_quant_scales_0", "forward_chunk_moe_quant_scales_0_opt", "forward_chunk_moe_quant_scales_04_1.txt")
-    compare_tensors_data("forward_chunk_moe_quant_scales_0", "forward_chunk_moe_quant_scales_0_opt", "forward_chunk_moe_quant_scales_04_1.npy")
-    print("   forward-chunk-moe-quant-scales-1, layer-1: --------------------------------")
-    compare_tensors_meta_info("forward_chunk_moe_quant_scales_1", "forward_chunk_moe_quant_scales_1_opt", "forward_chunk_moe_quant_scales_14_1.txt")
-    compare_tensors_data("forward_chunk_moe_quant_scales_1", "forward_chunk_moe_quant_scales_1_opt", "forward_chunk_moe_quant_scales_14_1.npy")
+    # print("\n\n")
+    # print("   forward-chunk-moe-input, layer-1: --------------------------------")
+    # compare_tensors_meta_info("forward_chunk_moe_input", "forward_chunk_moe_input_opt", "forward_chunk_moe_input4_1.txt")
+    # compare_tensors_data("forward_chunk_moe_input", "forward_chunk_moe_input_opt", "forward_chunk_moe_input4_1.npy")
+    # print("   forward-chunk-moe-selected-slots, layer-1: --------------------------------")
+    # compare_tensors_meta_info("forward_chunk_moe_selected_slots", "forward_chunk_moe_selected_slots_opt", "forward_chunk_moe_selected_slots4_1.txt")
+    # compare_tensors_data("forward_chunk_moe_selected_slots", "forward_chunk_moe_selected_slots_opt", "forward_chunk_moe_selected_slots4_1.npy")
+    # print("   forward-chunk-moe-final-scales, layer-1: --------------------------------")
+    # compare_tensors_meta_info("forward_chunk_moe_final_scales", "forward_chunk_moe_final_scales_opt", "forward_chunk_moe_final_scales4_1.txt")
+    # compare_tensors_data("forward_chunk_moe_final_scales", "forward_chunk_moe_final_scales_opt", "forward_chunk_moe_final_scales4_1.npy")
+    # print("   forward-chunk-moe-w3-w1-weight, layer-1: --------------------------------")
+    # compare_tensors_meta_info("forward_chunk_moe_w3_w1_weight", "forward_chunk_moe_w3_w1_weight_opt", "forward_chunk_moe_w3_w1_weight4_1.txt")
+    # compare_tensors_data("forward_chunk_moe_w3_w1_weight", "forward_chunk_moe_w3_w1_weight_opt", "forward_chunk_moe_w3_w1_weight4_1.npy")
+    # print("   forward-chunk-moe-w2-weight, layer-1: --------------------------------")
+    # compare_tensors_meta_info("forward_chunk_moe_w2_weight", "forward_chunk_moe_w2_weight_opt", "forward_chunk_moe_w2_weight4_1.txt")
+    # compare_tensors_data("forward_chunk_moe_w2_weight", "forward_chunk_moe_w2_weight_opt", "forward_chunk_moe_w2_weight4_1.npy")
+    # print("   forward-chunk-moe-quant-scales-0, layer-1: --------------------------------")
+    # compare_tensors_meta_info("forward_chunk_moe_quant_scales_0", "forward_chunk_moe_quant_scales_0_opt", "forward_chunk_moe_quant_scales_04_1.txt")
+    # compare_tensors_data("forward_chunk_moe_quant_scales_0", "forward_chunk_moe_quant_scales_0_opt", "forward_chunk_moe_quant_scales_04_1.npy")
+    # print("   forward-chunk-moe-quant-scales-1, layer-1: --------------------------------")
+    # compare_tensors_meta_info("forward_chunk_moe_quant_scales_1", "forward_chunk_moe_quant_scales_1_opt", "forward_chunk_moe_quant_scales_14_1.txt")
+    # compare_tensors_data("forward_chunk_moe_quant_scales_1", "forward_chunk_moe_quant_scales_1_opt", "forward_chunk_moe_quant_scales_14_1.npy")
+
+
+
+    ###################for test_fused_moe.py compare tensor###################
+    print("forward_chunk_moe_input: --------------------------------")
+    compare_tensors_meta_info("./", "forward_chunk_moe_input_opt", "input_activations_void.txt", "forward_chunk_moe_input.txt")
+    compare_tensors_data("./", "forward_chunk_moe_input_opt", "input_activations_void.npy", "forward_chunk_moe_input.npy")
+    compare_tensors_meta_info("./", "forward_chunk_moe_selected_slots_opt", "token_selected_experts.txt", "forward_chunk_moe_selected_slots.txt")
+    compare_tensors_data("./", "forward_chunk_moe_selected_slots_opt", "token_selected_experts.npy", "forward_chunk_moe_selected_slots.npy")
+    compare_tensors_meta_info("./", "forward_chunk_moe_final_scales_opt", "token_final_scales.txt", "forward_chunk_moe_final_scales.txt")
+    compare_tensors_data("./", "forward_chunk_moe_final_scales_opt", "token_final_scales.npy", "forward_chunk_moe_final_scales.npy")
+
+    print("\n\nforward_chunk_moe_permuted_data_tensor: --------------------------------")
+    compare_tensors_meta_info("./", "forward_chunk_moe_permuted_data_tensor_opt", "permuted_data_.txt", "forward_chunk_moe_permuted_data_tensor.txt", )
+    compare_tensors_data("./", "forward_chunk_moe_permuted_data_tensor_opt", "permuted_data_.npy", "forward_chunk_moe_permuted_data_tensor.npy")
+
+    # print("\n\nforward_chunk_moe_unpermuted_token_selected_experts_tensor: --------------------------------")
+    # compare_tensors_meta_info("./", "forward_chunk_moe_unpermuted_token_selected_experts_tensor_opt", "unpermuted_token_selected_experts_.txt", "forward_chunk_moe_unpermuted_token_selected_experts_tensor.txt")
+    # compare_tensors_data("./", "forward_chunk_moe_unpermuted_token_selected_experts_tensor_opt", "unpermuted_token_selected_experts_.npy", "forward_chunk_moe_unpermuted_token_selected_experts_tensor.npy")
+
+    # print("\n\nforward_chunk_moe_unpermuted_source_token_ids_tensor: --------------------------------")
+    # compare_tensors_meta_info("./", "forward_chunk_moe_unpermuted_source_token_ids_tensor_opt", "unpermuted_source_token_ids_.txt", "forward_chunk_moe_unpermuted_source_token_ids_tensor.txt")
+    # compare_tensors_data("./", "forward_chunk_moe_unpermuted_source_token_ids_tensor_opt", "unpermuted_source_token_ids_.npy", "forward_chunk_moe_unpermuted_source_token_ids_tensor.npy")
+
+    # print("\n\nforward_chunk_moe_permuted_source_token_ids_tensor: --------------------------------")
+    # compare_tensors_meta_info("./", "forward_chunk_moe_permuted_source_token_ids_tensor_opt", "permuted_source_token_ids_.txt", "forward_chunk_moe_permuted_source_token_ids_tensor.txt")
+    # compare_tensors_data("./", "forward_chunk_moe_permuted_source_token_ids_tensor_opt", "permuted_source_token_ids_.npy", "forward_chunk_moe_permuted_source_token_ids_tensor.npy")
+
+    # print("\n\nforward_chunk_moe_permuted_token_selected_experts_tensor: --------------------------------")
+    # compare_tensors_meta_info("./", "forward_chunk_moe_permuted_token_selected_experts_tensor_opt", "permuted_token_selected_experts_.txt", "forward_chunk_moe_permuted_token_selected_experts_tensor.txt")
+    # compare_tensors_data("./", "forward_chunk_moe_permuted_token_selected_experts_tensor_opt", "permuted_token_selected_experts_.npy", "forward_chunk_moe_permuted_token_selected_experts_tensor.npy")
+
+    # print("\n\nforward_chunk_moe_expert_first_token_offset_tensor: --------------------------------")
+    # compare_tensors_meta_info("./", "forward_chunk_moe_expert_first_token_offset_tensor_opt", "expert_first_token_offset_.txt", "forward_chunk_moe_expert_first_token_offset_tensor.txt")
+    # compare_tensors_data("./", "forward_chunk_moe_expert_first_token_offset_tensor_opt", "expert_first_token_offset_.npy", "forward_chunk_moe_expert_first_token_offset_tensor.npy")
+
+    # print("\n\nforward_chunk_moe_src_to_dest_map_tensor: --------------------------------")
+    # compare_tensors_meta_info("./", "forward_chunk_moe_src_to_dest_map_tensor_opt", "expanded_source_row_to_expanded_dest_row.txt", "forward_chunk_moe_src_to_dest_map_tensor.txt")
+    # compare_tensors_data("./", "forward_chunk_moe_src_to_dest_map_tensor_opt", "expanded_source_row_to_expanded_dest_row.npy", "forward_chunk_moe_src_to_dest_map_tensor.npy")
+    
+    print("\n\nforward_chunk_moe_grouped_gemm1_result_tensor: --------------------------------")
+    compare_tensors_meta_info("./", "forward_chunk_moe_group_gemm_1_opt", "grouped_gemm1_result_.txt", "forward_chunk_moe_group_gemm_1.txt")
+    compare_tensors_data("./", "forward_chunk_moe_group_gemm_1_opt", "grouped_gemm1_result_.npy", "forward_chunk_moe_group_gemm_1.npy")
+
+    print("\n\nforward_chunk_moe_fc1_result_tensor: --------------------------------")
+    compare_tensors_meta_info("./", "forward_chunk_moe_swiglu_output_opt", "fc1_result_.txt", "forward_chunk_moe_swiglu_output.txt")
+    compare_tensors_data("./", "forward_chunk_moe_swiglu_output_opt", "fc1_result_.npy", "forward_chunk_moe_swiglu_output.npy")
+
+    print("\n\nforward_chunk_moe_grouped_gemm2_result_tensor: --------------------------------")
+    compare_tensors_meta_info("./", "forward_chunk_moe_group_gemm_2_output_opt", "grouped_gemm2_result_.txt", "forward_chunk_moe_group_gemm_2_output.txt")
+    compare_tensors_data("./", "forward_chunk_moe_group_gemm_2_output_opt", "grouped_gemm2_result_.npy", "forward_chunk_moe_group_gemm_2_output.npy")
+
+    print("\n\nforward_chunk_moe_fc2_result_tensor: --------------------------------")
+    compare_tensors_meta_info("./", "forward_chunk_moe_final_hidden_states_opt", "final_output_.txt", "forward_chunk_moe_final_hidden_states.txt")
+    compare_tensors_data("./", "forward_chunk_moe_final_hidden_states_opt", "final_output_.npy", "forward_chunk_moe_final_hidden_states.npy")

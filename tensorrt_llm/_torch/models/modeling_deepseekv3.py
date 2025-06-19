@@ -67,16 +67,16 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
 
-USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE = os.environ.get("USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE", "0") == "1"
-PRINT_TENSOR = os.environ.get("PRINT_TENSOR", "0") == "1"
-print(f"limin: USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE = {USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE}, PRINT_TENSOR = {PRINT_TENSOR}")
+# USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE = os.environ.get("USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE", "0") == "1"
+# PRINT_TENSOR = os.environ.get("PRINT_TENSOR", "0") == "1"
+# print(f"limin: USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE = {USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE}, PRINT_TENSOR = {PRINT_TENSOR}")
 
-if USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE:
-    output_dir = "_opt"
-else:
-    output_dir = ""
+# if USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE:
+#     output_dir = "_opt"
+# else:
+#     output_dir = ""
 
-output_id = 0
+# output_id = 0
 
 
 def save_tensor_to_file(tensor, dir_name, filename):
@@ -445,10 +445,11 @@ class Deepseekv3MoE(nn.Module):
                  model_config: ModelConfig = ModelConfig(),
                  override_quant_config: Optional[QuantConfig] = None,
                  layer_idx: Optional[int] = None,
-                 output_id: Optional[int] = None):
+                 # output_id: Optional[int] = None
+                 ):
         from ..distributed import AllReduce
         
-        self.output_id = output_id
+        # self.output_id = output_id
 
         super().__init__()
         config = model_config.pretrained_config
@@ -477,7 +478,8 @@ class Deepseekv3MoE(nn.Module):
             override_quant_config=override_quant_config,
             aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
             layer_idx=layer_idx,
-            use_optimized_permute_and_finalize_scale=USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE)
+            use_optimized_permute_and_finalize_scale=True)
+            # use_optimized_permute_and_finalize_scale=USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE)
 
         self.mapping = model_config.mapping
 
@@ -566,10 +568,10 @@ class Deepseekv3MoE(nn.Module):
 
         router_logits = self.gate(hidden_states)
         
-        global output_id
-        if output_id == 4 and PRINT_TENSOR:
-            save_tensor_to_file(router_logits, "moe_router_logits" + output_dir, "moe_router_logits" + str(output_id) + "_" + str(self.layer_idx))
-            save_tensor_to_file(hidden_states, "moe_hidden_states" + output_dir, "moe_hidden_states" + str(output_id) + "_" + str(self.layer_idx))
+        # global output_id
+        # if output_id == 4 and PRINT_TENSOR:
+        #     save_tensor_to_file(router_logits, "moe_router_logits" + output_dir, "moe_router_logits" + str(output_id) + "_" + str(self.layer_idx))
+        #     save_tensor_to_file(hidden_states, "moe_hidden_states" + output_dir, "moe_hidden_states" + str(output_id) + "_" + str(self.layer_idx))
 
         routed_output = self.experts(
             hidden_states_fp4 or hidden_states,
@@ -578,7 +580,7 @@ class Deepseekv3MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
-            output_id=output_id,
+            # output_id=output_id,
         )
 
         return routed_output
@@ -613,10 +615,10 @@ class Deepseekv3MoE(nn.Module):
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared], self.aux_stream)
         
-        global output_id
-        if output_id == 4 and PRINT_TENSOR:
-            save_tensor_to_file(routed_output, "moe_routed_output" + output_dir, "moe_routed_output" + str(output_id) + "_" + str(self.layer_idx))
-            save_tensor_to_file(shared_output, "moe_shared_output" + output_dir, "moe_shared_output" + str(output_id) + "_" + str(self.layer_idx))
+        # global output_id
+        # if output_id == 4 and PRINT_TENSOR:
+        #     save_tensor_to_file(routed_output, "moe_routed_output" + output_dir, "moe_routed_output" + str(output_id) + "_" + str(self.layer_idx))
+        #     save_tensor_to_file(shared_output, "moe_shared_output" + output_dir, "moe_shared_output" + str(output_id) + "_" + str(self.layer_idx))
 
         if not do_finalize:
             return [shared_output, *routed_output]
@@ -801,7 +803,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         
-        global output_id
+        # global output_id
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -812,8 +814,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
-        if output_id == 4 and PRINT_TENSOR:
-            save_tensor_to_file(hidden_states, "ffn_input" + output_dir, "ffn_input" + str(output_id) + "_" + str(self.layer_idx))
+        # if output_id == 4 and PRINT_TENSOR:
+        #     save_tensor_to_file(hidden_states, "ffn_input" + output_dir, "ffn_input" + str(output_id) + "_" + str(self.layer_idx))
 
 
         if isinstance(self.mlp, Deepseekv3MoE):
@@ -917,14 +919,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                and self.model_config.moe_backend == 'TRTLLM'
                                and self.mlp.experts.has_nvfp4)
             
-            if output_id == 4 and PRINT_TENSOR:
-                save_tensor_to_file(hidden_states, "moe_input" + output_dir, "moe_input" + str(output_id) + "_" + str(self.layer_idx))
+            # if output_id == 4 and PRINT_TENSOR:
+            #     save_tensor_to_file(hidden_states, "moe_input" + output_dir, "moe_input" + str(output_id) + "_" + str(self.layer_idx))
 
             hidden_states = _run_MoE(hidden_states,
                                      hidden_states_fp4=None,
                                      do_finalize=do_finalize)
-            if output_id == 4 and PRINT_TENSOR:
-                save_tensor_to_file(hidden_states, "moe_output" + output_dir, "moe_output" + str(output_id) + "_" + str(self.layer_idx))
+            # if output_id == 4 and PRINT_TENSOR:
+            #     save_tensor_to_file(hidden_states, "moe_output" + output_dir, "moe_output" + str(output_id) + "_" + str(self.layer_idx))
 
             if self.fusion_config.POST_MOE_FUSION:
                 if do_finalize:
@@ -1163,15 +1165,15 @@ class DeepseekV3Model(DecoderModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         
-        global output_id
-        if output_id == 4 and PRINT_TENSOR:
-            save_tensor_to_file(inputs_embeds, "tensor_inputs" + output_dir, "inputs_embeds" + str(output_id))
-        print(f"limin: in DeepseekV3Model.forward, inputs_embeds.shape = {inputs_embeds.shape}")
+        # global output_id
+        # if output_id == 4 and PRINT_TENSOR:
+        #     save_tensor_to_file(inputs_embeds, "tensor_inputs" + output_dir, "inputs_embeds" + str(output_id))
+        # print(f"limin: in DeepseekV3Model.forward, inputs_embeds.shape = {inputs_embeds.shape}")
 
         hidden_states = inputs_embeds
         residual = None
 
-        layer_id = 0
+        # layer_id = 0
         for decoder_layer in self.layers[:self.num_hidden_layers]:
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
@@ -1179,14 +1181,14 @@ class DeepseekV3Model(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
             )
-            if output_id == 4 and PRINT_TENSOR:
-                save_tensor_to_file(hidden_states, "tensor_outputs" + output_dir, "hidden_states_output" + str(output_id) + "_" + str(layer_id))
-            layer_id += 1
-            print(f"   limin: im in DeepseekV3Model.forward, layer_id = {layer_id}")
+            # if output_id == 4 and PRINT_TENSOR:
+            #     save_tensor_to_file(hidden_states, "tensor_outputs" + output_dir, "hidden_states_output" + str(output_id) + "_" + str(layer_id))
+            # layer_id += 1
+            # # print(f"   limin: im in DeepseekV3Model.forward, layer_id = {layer_id}")
             # if layer_id == 2:
             #     break
 
-        output_id += 1
+        # output_id += 1
         return hidden_states
 
 

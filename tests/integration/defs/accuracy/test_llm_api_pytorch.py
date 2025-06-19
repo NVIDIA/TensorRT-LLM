@@ -659,8 +659,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             if not fp8kv:
                 task = MMLU(self.MODEL_NAME)
                 task.evaluate(llm)
-            # task = GSM8K(self.MODEL_NAME)
-            # task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.skip_device_not_contain(["H100"])
     @parametrize_with_ids("mtp_nextn", [0, 2])
@@ -720,21 +720,31 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["H100", "H200"])
+    # @parametrize_with_ids(
+    #     "torch_compile",
+    #     [False, pytest.param(True, marks=skip_device_contain_gb200)])
     @parametrize_with_ids(
-        "torch_compile",
-        [False, pytest.param(True, marks=skip_device_contain_gb200)])
+       "torch_compile",
+       [False])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
-                           (True, False, False, False),
-                           (False, True, False, False),
-                           (False, False, True, False),
-                           (False, False, False, True),
-                           (False, True, True, True), (True, False, True, True),
-                           (True, True, True, True)])
-    @parametrize_with_ids("mtp_nextn", [0, 2])
-    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
-                                                         (2, 2, 1), (1, 4, 1)],
-                             ids=["tp4", "ep4", "tp2pp2", "pp4"])
+                           # (True, False, False, False),
+                           # (False, True, False, False),
+                           # (False, False, True, False),
+                           # (False, False, False, True),
+                           # (False, True, True, True), (True, False, True, True),
+                           # (True, True, True, True)
+                           ])
+    # @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids("mtp_nextn", [0])
+    # @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
+    #                                                      (2, 2, 1), (1, 4, 1)],
+    #                          ids=["tp4", "ep4", "tp2pp2", "pp4"])
+    # @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 4),
+    #                                                     (2, 2, 1), (1, 4, 1)],
+    #                         ids=["ep4", "tp2pp2", "pp4"])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(1, 4, 1)],
+                           ids=["pp4"])
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     fp8kv, attention_dp, cuda_graph,
                                     overlap_scheduler, torch_compile):

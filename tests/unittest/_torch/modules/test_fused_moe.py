@@ -477,7 +477,7 @@ def test_fused_moe_fp8_blockwise_fused_moe_opt(moe_cls, dtype, num_experts, seq_
                          # reduce_results=False,
                          reduce_results=True,
                          model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
-                         # use_optimized_permute_and_finalize_scale=False,
+                         use_optimized_permute_and_finalize_scale=False,
                          )
     fused_moe_origin.cuda()
     fused_moe_origin.load_weights([weights])
@@ -499,8 +499,8 @@ def test_fused_moe_fp8_blockwise_fused_moe_opt(moe_cls, dtype, num_experts, seq_
     # print(f"limin: after ref_fused_moe load weights")
 
     with torch.inference_mode():
-        # # print(f"limin: begin fused_moe forward")
-        # output = fused_moe.forward(x, router_logits)
+        # print(f"limin: begin fused_moe forward")
+        output = fused_moe.forward(x, router_logits)
         # # print(f"limin: after fused_moe forward")
         output_origin = fused_moe_origin.forward(x, router_logits)
         # print(f"limin: begin ref_fused_moe forward")
@@ -509,12 +509,12 @@ def test_fused_moe_fp8_blockwise_fused_moe_opt(moe_cls, dtype, num_experts, seq_
 
     # compare
     torch.cuda.synchronize()
-    # print(f"limin: output = {output}")
+    print(f"limin: output = {output}")
     print(f"limin: output_origin = {output_origin}")
     print(f"limin: ref_output = {ref_output}")
-    # torch.testing.assert_close(output_origin, output, rtol=1e-2, atol=0.1)
+    torch.testing.assert_close(output_origin, output, rtol=1e-2, atol=0.1)
     torch.testing.assert_close(output_origin, ref_output, rtol=1e-2, atol=0.1)
-    # torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
     return True
 
 def load_tensor_from_file(dir, filename, dtype):
@@ -694,8 +694,10 @@ def test_fused_moe_fp8_blockwise_input_from_file(moe_cls, dtype, num_experts, se
     with torch.inference_mode():
         # print(f"limin: begin fused_moe forward")
         output = fused_moe.forward(x, router_logits)
+        # torch.cuda.synchronize()
         # # print(f"limin: after fused_moe forward")
         output_origin = fused_moe_origin.forward(x, router_logits)
+        # torch.cuda.synchronize()
         # print(f"limin: begin ref_fused_moe forward")
         ref_output = ref_fused_moe.forward(x, router_logits)
         # print(f"limin: after ref_fused_moe forward")
@@ -705,8 +707,8 @@ def test_fused_moe_fp8_blockwise_input_from_file(moe_cls, dtype, num_experts, se
     print(f"limin: output = {output}")
     print(f"limin: output_origin = {output_origin}")
     print(f"limin: ref_output = {ref_output}")
-    # torch.testing.assert_close(output_origin, output, rtol=1e-2, atol=0.1)
-    torch.testing.assert_close(output_origin, ref_output, rtol=1e-2, atol=0.1)
+    torch.testing.assert_close(output_origin, output, rtol=1e-2, atol=0.1)
+    # torch.testing.assert_close(output_origin, ref_output, rtol=1e-2, atol=0.1)
     # torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
     return True
 

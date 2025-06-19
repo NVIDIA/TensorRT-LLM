@@ -22,51 +22,53 @@ from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            UnquantizedFusedMoEMethod, WInt4AFP8FusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
-from ..gated_mlp import swiglu
+from ..gated_mlp import swiglu_fused_moe
 # from tensorrt_llm._torch.custom_ops.cute_dsl_ops import cute_dsl_fp8_group_blockwise_gemm_ref
 
 import math
 
 
-USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE = os.environ.get("USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE", "0") == "1"
-PRINT_TENSOR = os.environ.get("PRINT_TENSOR", "0") == "1"
-print(f"limin: fused_moe_cutlass.py: USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE = {USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE}, PRINT_TENSOR = {PRINT_TENSOR}")
+# USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE = os.environ.get("USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE", "0") == "1"
+# PRINT_TENSOR = os.environ.get("PRINT_TENSOR", "0") == "1"
+# print(f"limin: fused_moe_cutlass.py: USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE = {USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE}, PRINT_TENSOR = {PRINT_TENSOR}")
 
-if USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE:
-    output_dir = "_opt"
-else:
-    output_dir = ""
+# if USE_OPTIMIZED_PERMUTE_AND_FINALIZE_SCALE:
+#     output_dir = "_opt"
+# else:
+#     output_dir = ""
 
-def save_tensor_to_file(tensor, dir_name, filename, dtype="float"):
-    # 确保tensor在CPU上并转换为numpy数组
-    if tensor.is_cuda:
-        tensor_cpu = tensor.cpu()
-    else:
-        tensor_cpu = tensor
-    if dtype == "float":
-        numpy_array = tensor_cpu.detach().float().numpy()
-    elif dtype == "int":
-        numpy_array = tensor_cpu.detach().numpy()
-    else:
-        raise ValueError(f"Invalid dtype: {dtype}")
+# FUSED_MOE_PRINT_TENSOR=False
 
-    # 创建目录(如果不存在)
-    import os
-    os.makedirs(dir_name, exist_ok=True)
+# def save_tensor_to_file(tensor, dir_name, filename, dtype="float"):
+#     # 确保tensor在CPU上并转换为numpy数组
+#     if tensor.is_cuda:
+#         tensor_cpu = tensor.cpu()
+#     else:
+#         tensor_cpu = tensor
+#     if dtype == "float":
+#         numpy_array = tensor_cpu.detach().float().numpy()
+#     elif dtype == "int":
+#         numpy_array = tensor_cpu.detach().numpy()
+#     else:
+#         raise ValueError(f"Invalid dtype: {dtype}")
+
+#     # 创建目录(如果不存在)
+#     import os
+#     os.makedirs(dir_name, exist_ok=True)
     
-    # 保存为npy格式
-    import numpy as np
-    np.save(f"{dir_name}/{filename}.npy", numpy_array)
+#     # 保存为npy格式
+#     import numpy as np
+#     np.save(f"{dir_name}/{filename}.npy", numpy_array)
     
-    # 同时保存一些基本信息到文本文件
-    with open(f"{dir_name}/{filename}.txt", "w") as f:
-        f.write(f"Tensor shape: {tensor.shape}\n")
-        f.write(f"Tensor dtype: {tensor.dtype}\n")
-        f.write(f"Tensor device: {tensor.device}\n")
-        f.write(f"Tensor mean: {tensor.float().mean().item()}\n")
-        f.write(f"Tensor std: {tensor.float().std().item()}\n")
-        f.write(f"Tensor min: {tensor.float().min().item()}\n") 
-        f.write(f"Tensor max: {tensor.float().max().item()}\n")
+#     # 同时保存一些基本信息到文本文件
+#     with open(f"{dir_name}/{filename}.txt", "w") as f:
+#         f.write(f"Tensor shape: {tensor.shape}\n")
+#         f.write(f"Tensor dtype: {tensor.dtype}\n")
+#         f.write(f"Tensor device: {tensor.device}\n")
+#         f.write(f"Tensor mean: {tensor.float().mean().item()}\n")
+#         f.write(f"Tensor std: {tensor.float().std().item()}\n")
+#         f.write(f"Tensor min: {tensor.float().min().item()}\n") 
+#         f.write(f"Tensor max: {tensor.float().max().item()}\n")
 
 
 def cute_dsl_fp8_group_blockwise_gemm_ref(a: torch.Tensor, b: torch.Tensor, a_sf: torch.Tensor, b_sf: torch.Tensor, group_m_list: torch.Tensor, use_offset_array: bool = False) -> torch.Tensor:
@@ -163,106 +165,6 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(a: torch.Tensor, b: torch.Tensor, a_sf
     # print(f"limin: ref.shape = {ref.shape}, ref.stride = {ref.stride()}, ref = {ref}")
     return ref
 
-
-def cute_dsl_fp8_group_blockwise_gemm_ref_new(a: torch.Tensor, b: torch.Tensor, a_sf: torch.Tensor, b_sf: torch.Tensor, group_m_list: torch.Tensor, use_offset_array: bool = False) -> torch.Tensor:
-    m, k = a.shape[0], a.shape[1]
-    l, n, k = b.shape[0], b.shape[1], b.shape[2]
-    num_group, w_n, w_k = b_sf.shape[0], b_sf.shape[1], b_sf.shape[2]
-    print(f"limin: m = {m}, k = {k}, l = {l}, n = {n}, num_group = {num_group}, w_n = {w_n}, w_k = {w_k}")
-    print(f"limin: a.shape = {a.shape}")
-    print(f"limin: a_sf.shape = {a_sf.shape}")
-    print(f"limin: b.shape = {b.shape}")
-    print(f"limin: b_sf.shape = {b_sf.shape}")
-    print(f"limin: group_m_list.shape = {group_m_list.shape}")
-    print(f"limin: use_offset_array = {use_offset_array}")
-    # c = torch.empty(*(m, n), dtype=torch.bfloat16, device="cuda")
-
-    # TODO: view(int8) will cause error.
-    # a_tmp = a.as_strided((m, k, 1), (k, 1, m * k))
-    # b_tmp = b.permute(1, 2, 0)
-    # c_tmp = c.as_strided((m, n, 1), (n, 1, m * n))
-    # print(f"limin: a_tmp.shape = {a_tmp.shape}, a_tmp.stride = {a_tmp.stride()}")
-    # print(f"limin: b_tmp.shape = {b_tmp.shape}, b_tmp.stride = {b_tmp.stride()}")
-    # print(f"limin: c_tmp.shape = {c_tmp.shape}, c_tmp.stride = {c_tmp.stride()}")
-
-    m_padded = (m + 3) // 4 * 4
-    input_scale_tmp = a_sf[0:m_padded * w_k]
-    # print(f"limin: 0, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
-    input_scale_tmp = input_scale_tmp.reshape(-1, m_padded)
-    # print(f"limin: 1, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
-    input_scale_tmp = input_scale_tmp[:w_k, :m].contiguous().permute(1, 0)
-    print(f"limin: 2, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
-    # input_scale_tmp = input_scale_tmp.as_strided((m, w_k, 1), (1, m, m * w_k))
-    # print(f"limin: input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
-
-    # TOOD: contiguous
-    # weight_scale_tmp = b_sf.permute(1, 2, 0)
-    # print(f"limin: weight_scale_tmp.shape = {weight_scale_tmp.shape}, weight_scale_tmp.stride = {weight_scale_tmp.stride()}")
-
-    # print("limin: input = ", a_tmp)
-    # print("limin: weight = ", b_tmp)
-    # print("limin: input_scale = ", input_scale_tmp)
-    # print("limin: weight_scale = ", weight_scale_tmp)
-
-    # print("limin: input negative_numbers = ",  torch.sum(a_tmp < 0).item())
-    # print("limin: weight negative_numbers = ",  torch.sum(b_tmp < 0).item())
-    # print("limin: input_scale negative_numbers = ",  torch.sum(input_scale_tmp < 0).item())
-    # print("limin: weight_scale negative_numbers = ",  torch.sum(weight_scale_tmp < 0).item())
-    # update
-    def pad_and_multiply(scale, tensor):
-        if scale.ndim == 2:
-            cm, ck = scale.shape
-            m, k = tensor.shape
-        else:
-            _, cm, ck = scale.shape
-            _, m, k = tensor.shape
-
-        IsGroupWise = False
-        IsBlockWise = False
-        if ck == math.ceil(k / 128):
-            IsGroupWise = True
-        if cm == math.ceil(m / 128):
-            IsBlockWise = True
-        if not IsBlockWise and not IsGroupWise:
-            raise ValueError("Only support granularity = 128")
-
-        k_idx = torch.arange(k, device=scale.device)
-        if IsGroupWise:
-            k_idx = k_idx // 128
-        m_idx = torch.arange(m, device=scale.device)
-        if IsBlockWise:
-            m_idx = m_idx // 128
-        print(f"   limin: m_idx.shape = {m_idx.shape}, m_idx = {m_idx}")
-        print(f"   limin: k_idx.shape = {k_idx.shape}, k_idx = {k_idx}")
-        expanded_scale = scale[m_idx[:, None], k_idx]
-        print(f"   limin: tensor.shape = {tensor.shape}, tensor = {tensor}")
-        print(f"   limin: expanded_scale.shape = {expanded_scale.shape}, expanded_scale = {expanded_scale}")
-
-        result = expanded_scale * tensor
-
-        return result
-
-    updated_a = pad_and_multiply(input_scale_tmp, a.to(torch.float32))
-    updated_b = pad_and_multiply(b_sf, b.to(torch.float32))
-
-    # print(f"limin: updated_a = {updated_a}")
-    # print(f"limin: updated_b = {updated_b}")
-
-    ref = torch.zeros((m, n), device="cuda", dtype=torch.float32)
-    # # print(f"limin: group_m_list = {group_m_list}")
-    # # [0, 2, 5, 6]
-    # len_group_m_list = group_m_list.shape[0]
-    # for i in range(len_group_m_list - 1):
-    #     start = group_m_list[i]
-    #     end = group_m_list[i+1]
-    #     # assert start <= end, f"Invalid group boundaries: start={start} > end={end}"
-    #     ref[start:end, :] = torch.einsum(
-    #         "mk,nk->mn", updated_a[start:end, :], updated_b[i, :, :]
-    #     )
-
-    ref = ref.to(torch.bfloat16)
-    # print(f"limin: ref.shape = {ref.shape}, ref.stride = {ref.stride()}, ref = {ref}")
-    return ref
 
 # The type of alltoall method
 class AlltoallMethodType(IntEnum):
@@ -592,7 +494,7 @@ class CutlassFusedMoE(MoE):
             all_rank_num_tokens: Optional[List[int]] = None,
             use_dp_padding: Optional[bool] = None,
             repeating_info: Tuple = (True, True),
-            output_id: Optional[int] = None,
+            # : Optional[int] = None,
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -822,14 +724,14 @@ class CutlassFusedMoE(MoE):
                         dtype=token_final_scales.dtype,
                         device=token_final_scales.device)
         
-        if output_id == 4 and PRINT_TENSOR:
-            save_tensor_to_file(x, "forward_chunk_moe_input" + output_dir, "forward_chunk_moe_input" + str(output_id) + "_" + str(self.layer_idx))
-            save_tensor_to_file(token_selected_slots, "forward_chunk_moe_selected_slots" + output_dir, "forward_chunk_moe_selected_slots" + str(output_id) + "_" + str(self.layer_idx), dtype="int")
-            save_tensor_to_file(token_final_scales, "forward_chunk_moe_final_scales" + output_dir, "forward_chunk_moe_final_scales" + str(output_id) + "_" + str(self.layer_idx))
-            save_tensor_to_file(w3_w1_weight, "forward_chunk_moe_w3_w1_weight" + output_dir, "forward_chunk_moe_w3_w1_weight" + str(output_id) + "_" + str(self.layer_idx))
-            save_tensor_to_file(w2_weight, "forward_chunk_moe_w2_weight" + output_dir, "forward_chunk_moe_w2_weight" + str(output_id) + "_" + str(self.layer_idx))
-            save_tensor_to_file(quant_scales[0], "forward_chunk_moe_quant_scales_0" + output_dir, "forward_chunk_moe_quant_scales_0" + str(output_id) + "_" + str(self.layer_idx))
-            save_tensor_to_file(quant_scales[1], "forward_chunk_moe_quant_scales_1" + output_dir, "forward_chunk_moe_quant_scales_1" + str(output_id) + "_" + str(self.layer_idx))
+        # if output_id == 4 and PRINT_TENSOR:
+        #     save_tensor_to_file(x, "forward_chunk_moe_input" + output_dir, "forward_chunk_moe_input" + str(output_id) + "_" + str(self.layer_idx))
+        #     save_tensor_to_file(token_selected_slots, "forward_chunk_moe_selected_slots" + output_dir, "forward_chunk_moe_selected_slots" + str(output_id) + "_" + str(self.layer_idx), dtype="int")
+        #     save_tensor_to_file(token_final_scales, "forward_chunk_moe_final_scales" + output_dir, "forward_chunk_moe_final_scales" + str(output_id) + "_" + str(self.layer_idx))
+        #     save_tensor_to_file(w3_w1_weight, "forward_chunk_moe_w3_w1_weight" + output_dir, "forward_chunk_moe_w3_w1_weight" + str(output_id) + "_" + str(self.layer_idx))
+        #     save_tensor_to_file(w2_weight, "forward_chunk_moe_w2_weight" + output_dir, "forward_chunk_moe_w2_weight" + str(output_id) + "_" + str(self.layer_idx))
+        #     save_tensor_to_file(quant_scales[0], "forward_chunk_moe_quant_scales_0" + output_dir, "forward_chunk_moe_quant_scales_0" + str(output_id) + "_" + str(self.layer_idx))
+        #     save_tensor_to_file(quant_scales[1], "forward_chunk_moe_quant_scales_1" + output_dir, "forward_chunk_moe_quant_scales_1" + str(output_id) + "_" + str(self.layer_idx))
 
         if self.use_optimized_permute_and_finalize_scale:
             # print(f"limin: token_selected_slots = {token_selected_slots}")
@@ -840,6 +742,10 @@ class CutlassFusedMoE(MoE):
             # print(f"CUDA memory allocated: {torch.cuda.memory_allocated()}")
             # print(f"CUDA memory cached: {torch.cuda.memory_reserved()}")
             # torch.cuda.synchronize()
+            # if FUSED_MOE_PRINT_TENSOR:
+            #     save_tensor_to_file(x, "forward_chunk_moe_input_opt", "forward_chunk_moe_input")
+            #     save_tensor_to_file(token_selected_slots, "forward_chunk_moe_selected_slots_opt", "forward_chunk_moe_selected_slots")
+            #     save_tensor_to_file(token_final_scales, "forward_chunk_moe_final_scales_opt", "forward_chunk_moe_final_scales")
             (
                 unpermuted_token_selected_experts_tensor, 
                 unpermuted_source_token_ids_tensor, 
@@ -867,8 +773,24 @@ class CutlassFusedMoE(MoE):
                 min_latency_mode=cutlass_min_latency_mode, 
                 use_fp8_block_scaling=use_deepseek_fp8_block_scale
             )
-            # print(f"limin: unpermuted_token_selected_experts_tensor = {unpermuted_token_selected_experts_tensor.shape}")
-            # print(f"limin: x.shape = {x.shape}")
+            # if FUSED_MOE_PRINT_TENSOR:
+            #     save_tensor_to_file(unpermuted_token_selected_experts_tensor, "forward_chunk_moe_unpermuted_token_selected_experts_tensor_opt", "forward_chunk_moe_unpermuted_token_selected_experts_tensor")
+            #     save_tensor_to_file(unpermuted_source_token_ids_tensor, "forward_chunk_moe_unpermuted_source_token_ids_tensor_opt", "forward_chunk_moe_unpermuted_source_token_ids_tensor")
+            #     save_tensor_to_file(permuted_source_token_ids_tensor, "forward_chunk_moe_permuted_source_token_ids_tensor_opt", "forward_chunk_moe_permuted_source_token_ids_tensor")
+            #     save_tensor_to_file(permuted_token_selected_experts_tensor, "forward_chunk_moe_permuted_token_selected_experts_tensor_opt", "forward_chunk_moe_permuted_token_selected_experts_tensor")
+            #     save_tensor_to_file(permuted_data_tensor, "forward_chunk_moe_permuted_data_tensor_opt", "forward_chunk_moe_permuted_data_tensor")
+            #     save_tensor_to_file(expert_first_token_offset_tensor, "forward_chunk_moe_expert_first_token_offset_tensor_opt", "forward_chunk_moe_expert_first_token_offset_tensor")
+            #     save_tensor_to_file(src_to_dest_map_tensor, "forward_chunk_moe_src_to_dest_map_tensor_opt", "forward_chunk_moe_src_to_dest_map_tensor")
+            #     print(f"limin: unpermuted_token_selected_experts_tensor = {unpermuted_token_selected_experts_tensor.shape}, {unpermuted_token_selected_experts_tensor}")
+            #     print(f"limin: unpermuted_source_token_ids_tensor = {unpermuted_source_token_ids_tensor.shape}, {unpermuted_source_token_ids_tensor}")
+            #     print(f"limin: permuted_source_token_ids_tensor = {permuted_source_token_ids_tensor.shape}, {permuted_source_token_ids_tensor}")
+            #     print(f"limin: permuted_token_selected_experts_tensor = {permuted_token_selected_experts_tensor.shape}, {permuted_token_selected_experts_tensor}")
+            #     print(f"limin: permuted_data_tensor = {permuted_data_tensor.shape}, {permuted_data_tensor}")
+            #     print(f"limin: expert_first_token_offset_tensor = {expert_first_token_offset_tensor.shape}, {expert_first_token_offset_tensor}")
+            #     print(f"limin: src_to_dest_map_tensor = {src_to_dest_map_tensor.shape}, {src_to_dest_map_tensor}")
+            #     # print(f"limin: unpermuted_token_selected_experts_tensor = {unpermuted_token_selected_experts_tensor.shape}")
+            #     print(f"limin: x.shape = {x.shape}, token_selected_slots.shape = {token_selected_slots.shape}, token_final_scales.shape = {token_final_scales.shape}")
+            #     print(f"limin: permuted_data_tensor.shape = {permuted_data_tensor.shape}")
             # print(f"limin: token_final_scales.shape = {token_final_scales.shape}")
             # print(f"limin: permuted_source_token_ids_tensor = {permuted_source_token_ids_tensor.shape}")
             # print(f"limin: expert_first_token_offset_tensor = {expert_first_token_offset_tensor.shape}")
@@ -915,8 +837,23 @@ class CutlassFusedMoE(MoE):
                 group_m_list=expert_first_token_offset_tensor,
                 use_offset_array=True,
             )
+            # input: torch.Tensor, weight: torch.Tensor, input_scale: torch.Tensor, weight_scale: torch.Tensor, group_m: torch.Tensor
+            # h1 = torch.ops.trtllm.cute_dsl_fp8_group_blockwise_gemm(
+            #     act_input_fp8,
+            #     w3_w1_weight.view(weight_dtype),
+            #     act_input_sf,
+            #     quant_scales[0],
+            #     expert_first_token_offset_tensor,
+            #     # use_offset_array=True,
+            # )
+            # if FUSED_MOE_PRINT_TENSOR:
+            #     save_tensor_to_file(h1, "forward_chunk_moe_group_gemm_1_opt", "forward_chunk_moe_group_gemm_1")
+            #     print(f"limin: group_gemm_1, output shape = {h1.shape}, {h1}")
             # print(f"limin: group_gemm_1, output shape = {h1.shape}, {h1}")
-            h2 = swiglu(h1)
+            h2 = swiglu_fused_moe(h1)
+            # if FUSED_MOE_PRINT_TENSOR:
+            #     save_tensor_to_file(h2, "forward_chunk_moe_swiglu_output_opt", "forward_chunk_moe_swiglu_output")
+            #     print(f"limin: swiglu, output shape = {h2.shape}, {h2}")
             # print(f"limin: swiglu, output shape = {h2.shape}, {h2}")
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(h2)
             # print(f"limin: w2_weight = {w2_weight.shape}, {w2_weight}")
@@ -929,6 +866,17 @@ class CutlassFusedMoE(MoE):
                 group_m_list=expert_first_token_offset_tensor,
                 use_offset_array=True,
             )
+            # h3 = torch.ops.trtllm.cute_dsl_fp8_group_blockwise_gemm(
+            #     act_input_fp8,
+            #     w2_weight.view(weight_dtype),
+            #     act_input_sf,
+            #     quant_scales[1],
+            #     expert_first_token_offset_tensor,
+            #     # use_offset_array=True,
+            # )
+            # if FUSED_MOE_PRINT_TENSOR:
+            #     save_tensor_to_file(h3, "forward_chunk_moe_group_gemm_2_output_opt", "forward_chunk_moe_group_gemm_2_output")
+            #     print(f"limin: group_gemm_2, output shape = {h3.shape}, {h3}")
             # print(f"limin: group_gemm_2, output shape = {h3.shape}, {h3}")
             final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
                 h3,
@@ -946,6 +894,9 @@ class CutlassFusedMoE(MoE):
                 ep_size,
                 ep_rank,
             )
+            # if FUSED_MOE_PRINT_TENSOR:
+            #     save_tensor_to_file(final_hidden_states, "forward_chunk_moe_final_hidden_states_opt", "forward_chunk_moe_final_hidden_states")
+            #     print(f"limin: finalize_scale_op, output shape = {final_hidden_states.shape}, {final_hidden_states}")
             # print(f"limin: finalize_scale_op, output shape = {final_hidden_states.shape}, {final_hidden_states}")
         else:
             final_hidden_states = torch.ops.trtllm.fused_moe(
@@ -982,8 +933,8 @@ class CutlassFusedMoE(MoE):
                 # Otherwise, the output should be unpacked as a single tensor.
                 final_hidden_states = final_hidden_states[0]
         
-        if output_id == 4 and PRINT_TENSOR:
-            save_tensor_to_file(final_hidden_states, "forward_chunk_output" + output_dir, "forward_chunk_output" + str(output_id) + "_" + str(self.layer_idx))
+        # if output_id == 4 and PRINT_TENSOR:
+        #     save_tensor_to_file(final_hidden_states, "forward_chunk_output" + output_dir, "forward_chunk_output" + str(output_id) + "_" + str(self.layer_idx))
 
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
@@ -1020,7 +971,7 @@ class CutlassFusedMoE(MoE):
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
-        output_id: Optional[int] = None,
+        # output_id: Optional[int] = None,
     ) -> torch.Tensor:
         if self.use_dp:
             assert all_rank_num_tokens is not None
@@ -1053,7 +1004,8 @@ class CutlassFusedMoE(MoE):
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding,
-                output_id=output_id)
+                # output_id=output_id
+                )
             outputs = self.reducescatter_or_allreduce(
                 outputs,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
@@ -1108,7 +1060,8 @@ class CutlassFusedMoE(MoE):
                                     idx_chunk] if self.use_dp else None,
                                 use_dp_padding=use_dp_padding,
                                 repeating_info=(is_first_call, is_last_call),
-                                output_id=output_id)
+                                # output_id=output_id
+                                )
                         if idx_chunk > 0:
                             outputs_list[-1] = self.reducescatter_or_allreduce(
                                 outputs_list[-1],
@@ -1123,7 +1076,8 @@ class CutlassFusedMoE(MoE):
                                 idx_chunk] if self.use_dp else None,
                             use_dp_padding=use_dp_padding,
                             repeating_info=(is_first_call, is_last_call),
-                            output_id=output_id)
+                            # output_id
+                            )
                         with torch.cuda.stream(self.aux_stream):
                             outputs_list[-1] = self.reducescatter_or_allreduce(
                                 outputs_list[-1],
@@ -1137,7 +1091,8 @@ class CutlassFusedMoE(MoE):
                         all_rank_num_tokens=all_rank_num_tokens_list[idx_chunk]
                         if self.use_dp else None,
                         repeating_info=(is_first_call, is_last_call),
-                        output_id=output_id)
+                        # output_id=output_id
+                        )
 
                 outputs_list.append(outputs)
             if not self.enable_alltoall:

@@ -2160,6 +2160,155 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>:
     return blockscale_gemm_runner_.get();
 }
 
+#define FUSED_MOE_PRINT_TENSOR 0
+
+template <typename T>
+void printTensorInfo(const T* ptr, int rows, int cols, char const* tensor_name, cudaStream_t stream)
+{
+    if (!FUSED_MOE_PRINT_TENSOR)
+        return;
+
+    int num_elements = rows * cols;
+    T* host_data = new T[num_elements];
+    cudaMemcpyAsync(host_data, ptr, num_elements * sizeof(T), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    // 计算基本统计信息
+    float sum = 0.0f;
+    float min_val = std::numeric_limits<float>::max();
+    float max_val = std::numeric_limits<float>::lowest();
+    float std_sum = 0.0f;
+    for (int i = 0; i < num_elements; i++)
+    {
+        float val = static_cast<float>(host_data[i]);
+        sum += val;
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+    float mean = sum / num_elements;
+
+    // 计算标准差
+    for (int i = 0; i < num_elements; i++)
+    {
+        float val = static_cast<float>(host_data[i]);
+        float diff = val - mean;
+        std_sum += diff * diff;
+    }
+    float std_dev = std::sqrt(std_sum / num_elements);
+
+    // 保存tensor信息到文件
+    std::string info_filename = std::string(tensor_name) + ".txt";
+    FILE* f = fopen(info_filename.c_str(), "w");
+    fprintf(f, "Tensor shape: [%d, %d]\n", rows, cols);
+    fprintf(f, "Tensor dtype: %s\n", typeid(T).name());
+    fprintf(f, "Tensor device: cuda\n");
+    fprintf(f, "Tensor mean: %.6f\n", mean);
+    fprintf(f, "Tensor std: %.6f\n", std_dev);
+    fprintf(f, "Tensor min: %.6f\n", min_val);
+    fprintf(f, "Tensor max: %.6f\n", max_val);
+    fclose(f);
+
+    // 保存tensor数据到npy文件
+    std::string npy_filename = std::string(tensor_name) + ".npy";
+    FILE* npy_file = fopen(npy_filename.c_str(), "wb");
+    if (npy_file)
+    {
+        // // Write npy header
+        // char const magic[] = "\x93NUMPY";
+        // fwrite(magic, 1, 6, npy_file);
+
+        // // Write version
+        // const uint8_t version[] = {0x01, 0x00};  // Version 1.0
+        // fwrite(version, 1, 2, npy_file);
+
+        // // Prepare header dict
+        // std::string header_dict;
+        // if constexpr (std::is_same<T, __nv_bfloat16>::value)
+        // {
+        //     header_dict = "{'descr': '<f4', 'fortran_order': False, 'shape': (" +
+        //                          std::to_string(rows) + ", " + std::to_string(cols) + "), }";
+        // }
+        // else if constexpr (std::is_same<T, float>::value)
+        // {
+        //     header_dict = "{'descr': '<f4', 'fortran_order': False, 'shape': (" +
+        //                          std::to_string(rows) + ", " + std::to_string(cols) + "), }";
+        // }
+        // else if constexpr (std::is_same<T, int>::value)
+        // {
+        //     header_dict = "{'descr': '<i4', 'fortran_order': False, 'shape': (" +
+        //                          std::to_string(rows) + ", " + std::to_string(cols) + "), }";
+        // }
+        // else if constexpr (std::is_same<T, int64_t>::value)
+        // {
+        //     header_dict = "{'descr': '<i8', 'fortran_order': False, 'shape': (" +
+        //                          std::to_string(rows) + ", " + std::to_string(cols) + "), }";
+        // }
+        // else
+        // {
+        //     header_dict = "{'descr': '<f4', 'fortran_order': False, 'shape': (" + std::to_string(rows) + ", "
+        //         + std::to_string(cols) + "), }";
+        // }
+
+        // // Calculate header length (including padding to make total length % 64 == 0)
+        // uint16_t header_len = header_dict.length() + 1;  // +1 for newline
+        // uint16_t padding = (64 - ((header_len + 10) % 64)) % 64;  // 10 is the length of magic + version + header_len
+        // header_len += padding;
+
+        // // Write header length
+        // fwrite(&header_len, 2, 1, npy_file);
+
+        // // Write header dict with padding
+        // fwrite(header_dict.c_str(), 1, header_dict.length(), npy_file);
+        // for (int i = 0; i < padding + 1; i++) {  // +1 for newline
+        //     fputc(' ', npy_file);
+        // }
+        // fputc('\n', npy_file);
+
+        // // Write tensor data
+        // T* float_data = new T[num_elements];
+        // for (int i = 0; i < num_elements; i++) {
+        //     float_data[i] = static_cast<T>(host_data[i]);
+        // }
+        // fwrite(float_data, sizeof(T), num_elements, npy_file);
+        // delete[] float_data;
+        // fclose(npy_file);
+        // 将tensor数据写入txt文件
+
+        // 直接写入数据
+        for (int i = 0; i < rows; i++)
+        {
+            for (int j = 0; j < cols; j++)
+            {
+                fprintf(npy_file, "%f ", static_cast<float>(host_data[i * cols + j]));
+            }
+            fprintf(npy_file, "\n");
+        }
+
+        fclose(npy_file);
+
+        std::cout << tensor_name << ": " << std::endl;
+        for (int i = 0; i < rows; i++)
+        {
+            if (cols == 1)
+            {
+                std::cout << static_cast<float>(host_data[i]) << ", ";
+            }
+            else
+            {
+                for (int j = 0; j < cols; j++)
+                {
+                    std::cout << static_cast<float>(host_data[i * cols + j]) << ", ";
+                }
+                std::cout << std::endl;
+            }
+        }
+        std::cout << std::endl;
+    }
+
+    delete[] host_data;
+}
+
+
 template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
 void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>::BlockScaleFC1(
     BlockScaleGemmRunner& gemm_runner, T const* const input, T* const output, void* const gemm_output,
@@ -2178,6 +2327,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
         shape_n, shape_k, stream, nullptr, quant_params.fp8_block_scaling.fc1_scales_ptrs);
 
     sync_check_cuda_error(stream);
+    // printTensorInfo<T>(static_cast<T*>(gemm_output), expanded_num_rows, shape_n, "grouped_gemm1_result_", stream);
+
     constexpr bool bias_is_broadcast = true;
     doActivation<T, UnfusedGemmOutputType>(output, static_cast<UnfusedGemmOutputType const*>(gemm_output),
         fc2_fp8_quant, fc1_expert_biases, bias_is_broadcast, expert_first_token_offset, num_experts_per_node,
@@ -2205,10 +2356,13 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
 
     sync_check_cuda_error(stream);
 
+    // printTensorInfo<OutputType>(static_cast<OutputType*>(gemm_output), expanded_num_rows, shape_n, "grouped_gemm2_result_", stream);
+
     finalizeMoeRoutingKernelLauncher<OutputType, UnfusedGemmOutputType>(
         static_cast<UnfusedGemmOutputType const*>(gemm_output), final_output, fc2_expert_biases,
         unpermuted_final_scales, expanded_source_row_to_expanded_dest_row, expert_for_source_row, num_rows, hidden_size,
         k, num_valid_tokens_ptr, parallelism_config, stream);
+    
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType, class Enable>
@@ -2739,8 +2893,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 }
 
 
-
-
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
 void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::runMoe(
     void const* input_activations_void, void const* input_sf_void, int const* token_selected_experts,
@@ -2867,8 +3019,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
     bool const needs_num_valid = parallelism_config.ep_size > 1;
     int64_t const* num_valid_tokens_ptr = needs_num_valid ? expert_first_token_offset_ + num_experts_per_node : nullptr;
-
+    
     auto expanded_num_rows = num_rows * experts_per_token;
+    // std::cout << "num_rows: " << num_rows << std::endl;
+    // std::cout << "experts_per_token: " << experts_per_token << std::endl;
+    // std::cout << "expanded_num_rows: " << expanded_num_rows << std::endl;
 
     if (min_latency_mode)
     {
@@ -2912,6 +3067,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     }
     else
     {
+        // printTensorInfo<T>(static_cast<T const*>(input_activations_void), num_rows, hidden_size, "input_activations_void", stream);
+        // printTensorInfo<int>(static_cast<int const*>(token_selected_experts), num_rows, experts_per_token, "token_selected_experts", stream);
+        // printTensorInfo<float>(static_cast<float const*>(token_final_scales), num_rows, experts_per_token, "token_final_scales", stream);
+
         bool fused_prologue_result = false;
         if (!use_w4afp8)
         {
@@ -2951,6 +3110,17 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             TLLM_CUDA_CHECK(cudaEventRecord(*(lora_params.memcpy_event_ptr), stream));
         }
 
+        // printTensorInfo<int64_t>(static_cast<int64_t*>(expert_first_token_offset_), 1, num_experts_per_node + 1,
+        //     "expert_first_token_offset_", stream);
+        // printTensorInfo<int>(static_cast<int*>(unpermuted_source_token_ids_), 1, expanded_num_rows,
+        //     "unpermuted_source_token_ids_", stream);
+        // printTensorInfo<int>(static_cast<int*>(unpermuted_token_selected_experts_), 1, expanded_num_rows,
+        //     "unpermuted_token_selected_experts_", stream);
+        // printTensorInfo<int>(
+        //     static_cast<int*>(permuted_source_token_ids_), 1, expanded_num_rows, "permuted_source_token_ids_", stream);
+        // printTensorInfo<int>(static_cast<int*>(permuted_token_selected_experts_), 1, expanded_num_rows,
+        //     "permuted_token_selected_experts_", stream);
+
         using ExpandedActivationsType = std::conditional_t<use_w4afp8, BackBoneType, T>;
         expandInputRowsKernelLauncher(input_activations, reinterpret_cast<ExpandedActivationsType*>(permuted_data_),
             token_topk_unpermuted_scales, permuted_token_final_scales_, permuted_source_token_ids_,
@@ -2959,6 +3129,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             input_sf, stream);
 
         sync_check_cuda_error(stream);
+        // 调用函数打印permuted_data_
+        // printTensorInfo<T>(permuted_data_, expanded_num_rows, hidden_size, "permuted_data_", stream);
+        // printTensorInfo<int>(expanded_source_row_to_expanded_dest_row, 1, expanded_num_rows,
+        //     "expanded_source_row_to_expanded_dest_row", stream);
 
         auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(num_rows, expanded_num_rows,
             fc1_activation_type, hidden_size, inter_size, num_experts_per_node, input_activations_void, input_sf,
@@ -2992,6 +3166,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             num_rows, expanded_num_rows, hidden_size, inter_size, num_experts_per_node, fc1_activation_type,
             alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_, false, nullptr, nullptr, 0);
         sync_check_cuda_error(stream);
+        // printTensorInfo<T>(static_cast<T*>(fc1_result_), expanded_num_rows, inter_size, "fc1_result_", stream);
 
         if (use_lora)
         {
@@ -3011,6 +3186,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             inter_size, num_experts_per_node, experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_,
             stream, parallelism_config, *gemm2_config_, false, nullptr, nullptr, 0);
         sync_check_cuda_error(stream);
+        // printTensorInfo<OutputType>(
+        //     static_cast<OutputType*>(final_output), num_rows, hidden_size, "final_output_", stream);
     }
 }
 
