@@ -2314,7 +2314,7 @@ pipeline {
                         if (globalVars[ACTION_INFO]['parents'].size() == 0) {
                             error "No parent job to run multi-GPU tests."
                         }
-                        def parentJob = globalVars[ACTION_INFO]['parents'][-1]
+                        def parentJob = globalVars[ACTION_INFO]['parents'][-2]
                         trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "Will run multi-GPU tests:")
                         return
                     }
