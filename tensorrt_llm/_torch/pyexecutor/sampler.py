@@ -37,7 +37,7 @@ class SampleStateTensors:
         return vars(self).values()
 
 
-@dataclass(kw_only=True, frozen=True)
+@dataclass(kw_only=True)
 class SampleState:
     scheduled_requests: ScheduledRequests
 
@@ -325,14 +325,14 @@ class TorchSampler(Sampler):
         """Shape: In lockstep with TRTLLMSampler: https://github.com/NVIDIA/TensorRT-LLM/blob/cea5dd1e3883b18bf50901a7f196f50a9544c28c/cpp/include/tensorrt_llm/runtime/decoderState.h#L103"""
         if any(req.py_return_log_probs for req in requests):
             return torch.empty(
-                (len(requests), self.MAX_BEAM_WIDTH, self.max_tokens),
+                (self.max_batch_size, self.MAX_BEAM_WIDTH, self.max_tokens),
                 device="cpu",
                 pin_memory=True)
         return None
 
     def gen_logits_host(self, requests: Iterable[LlmRequest]):
         if any(req.py_return_generation_logits for req in requests):
-            return torch.empty((self.max_tokens, len(requests),
+            return torch.empty((self.max_tokens, self.max_batch_size,
                                 self.MAX_BEAM_WIDTH, self.vocab_size),
                                device="cpu",
                                pin_memory=True)
@@ -453,7 +453,7 @@ class SampleStateTensorsHostTRTLLM(SampleStateTensors):
     cum_log_probs: torch.Tensor | None = None
 
 
-@dataclass(kw_only=True, frozen=True)
+@dataclass(kw_only=True)
 class SampleStateTRTLLM(SampleState):
     host: SampleStateTensorsHostTRTLLM
 

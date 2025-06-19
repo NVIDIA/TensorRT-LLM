@@ -785,7 +785,6 @@ class PyExecutor:
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
                         (
                             logits,
-                            sample_state.log_probs,
                             sample_state.host,
                         ) = self.dist.recv_object(
                             src=self.dist.prev_pp_rank,
@@ -805,16 +804,16 @@ class PyExecutor:
                     if not self.dist.is_second_last_pp_rank:
                         if self.send_handles[prev_microbatch_id] is not None:
                             self.send_handles[prev_microbatch_id].Wait()
+                        needs_logits = (
+                            self._need_return_logits(scheduled_batch)
+                            or (self._need_return_log_probs(scheduled_batch)
+                                and sample_state.host.log_probs is not None))
+                        serialized_logits = sample_state.host.logits.numpy(
+                        ) if needs_logits else None
                         self.send_handles[
                             prev_microbatch_id] = self.dist.isend_object(
                                 (
-                                    sample_state.host.logits.numpy() if
-                                    self._need_return_logits(scheduled_batch) or
-                                    (self._need_return_log_probs(
-                                        scheduled_batch) and
-                                     sample_state.host.log_probs is not None)
-                                    else None,
-                                    sample_state.host.log_probs,
+                                    serialized_logits,
                                     sample_state.host,
                                 ),
                                 dest=self.dist.next_pp_rank,
