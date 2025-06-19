@@ -595,10 +595,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, False, True, False),
                            (False, False, False, True),
                            (True, False, True, True), (True, True, True, True)])
-    @parametrize_with_ids("mtp_nextn", [0, 2])
-    def test_fp8_block_scales(self, mtp_nextn, fp8kv, attention_dp, cuda_graph,
+    @parametrize_with_ids("mtp", ["disable", "eagle", "vanilla"])
+    def test_fp8_block_scales(self, mtp, fp8kv, attention_dp, cuda_graph,
                               overlap_scheduler, torch_compile):
-        if torch_compile and mtp_nextn > 0:
+        if torch_compile and mtp != "disable":
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
             pytest.skip("https://nvbugs/5252559")
@@ -619,8 +619,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytorch_config["kv_cache_dtype"] = "fp8"
 
         mtp_config = None
-        if mtp_nextn > 0:
+        mtp_nextn = 2
+        if mtp == "eagle":
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        elif mtp == "vanilla":
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn,
+                                           use_mtp_vanilla=True)
 
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
                   kv_cache_config=kv_cache_config,
