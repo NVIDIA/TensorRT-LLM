@@ -78,7 +78,7 @@ BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
 BUILD_MEMORY_REQUEST = "48Gi"
 BUILD_MEMORY_LIMIT = "64Gi"
-BUILD_JOBS = "4"
+BUILD_JOBS = "8"
 
 SLURM_CORES_REQUEST = "1"
 SLURM_CORES_LIMIT = "1"
@@ -1358,13 +1358,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C; fi'
 
         def extraInternalEnv = ""
-        // Move back to 3600 once TRTLLM-4000 gets resolved
-        def pytestTestTimeout = "7200"
+        def pytestTestTimeout = "1800"
 
         // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
         extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
-        // CPP test execution is timing out easily, so we always override the timeout to 7200
-        extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=7200"
+        // CPP test execution is timing out easily, so we always override its internal timeout to the same value as pytest
+        extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
 
         def testDBList = renderTestDB(testList, llmSrc, stageName)
         testList = "${testList}_${splitId}"
@@ -1699,7 +1698,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 {
     def dockerArgs = "-v /mnt/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
     x86TestConfigs = [
-        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
+        "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 1],
@@ -1713,18 +1713,22 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A30-Triton-1": ["a30", "l0_a30", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
-        "A30-CPP-1": ["a30", "l0_a30", 1, 2],
-        "A30-CPP-2": ["a30", "l0_a30", 2, 2],
+        "A30-CPP-1": ["a30", "l0_a30", 1, 3],
+        "A30-CPP-2": ["a30", "l0_a30", 2, 3],
+        "A30-CPP-3": ["a30", "l0_a30", 3, 3],
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
-        "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 1],
+        "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
+        "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2],
         "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 3],
         "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 3],
         "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 3],
-        "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 2],
+        "H100_PCIe-CPP-2": ["h100-cr", "l0_h100", 2, 2],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 2],
         "H100_PCIe-TensorRT-2": ["h100-cr", "l0_h100", 2, 2],
-        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 2],
-        "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 2],
+        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 3],
+        "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 3],
+        "B200_PCIe-PyTorch-3": ["b100-ts2", "l0_b200", 3, 3],
         "B200_PCIe-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
         "B200_PCIe-TensorRT-2": ["b100-ts2", "l0_b200", 2, 2],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
