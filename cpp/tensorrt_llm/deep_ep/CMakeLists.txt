@@ -13,6 +13,26 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(deep_ep_download)
 set(DEEP_EP_SOURCE_DIR ${deep_ep_download_SOURCE_DIR})
 
+# Copy files
+set(DEEP_EP_PYTHON_DEST ${PROJECT_SOURCE_DIR}/../tensorrt_llm/deep_ep)
+file(REMOVE_RECURSE ${DEEP_EP_PYTHON_DEST})
+file(MAKE_DIRECTORY ${DEEP_EP_PYTHON_DEST})
+file(COPY ${DEEP_EP_SOURCE_DIR}/LICENSE DESTINATION ${DEEP_EP_PYTHON_DEST})
+set(_files __init__.py buffer.py utils.py)
+foreach(_f IN LISTS _files)
+  set(_src "${DEEP_EP_SOURCE_DIR}/deep_ep/${_f}")
+  set(_dst "${DEEP_EP_PYTHON_DEST}/${_f}")
+  file(READ "${_src}" _content)
+  string(REPLACE "deep_ep_cpp" "tensorrt_llm.deep_ep_cpp_tllm" _content
+                 "${_content}")
+  string(
+    PREPEND
+    _content
+    "# Adapted from https://github.com/deepseek-ai/DeepEP/blob/${DEEP_EP_COMMIT}/deep_ep/${_f}\n"
+  )
+  file(WRITE "${_dst}" "${_content}")
+endforeach()
+
 # Delete stale nvshmem
 set(NVSHMEM_STAMP_FILE ${CMAKE_CURRENT_BINARY_DIR}/nvshmem_stamp.txt)
 file(SHA256 "${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch"
