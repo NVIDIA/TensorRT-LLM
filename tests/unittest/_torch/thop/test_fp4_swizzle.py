@@ -42,8 +42,7 @@ def unswizzle_sf_ref(sf: torch.Tensor,
     sf_reshaped = sf.view(num_m_tiles, num_k_tiles, 32, 4, 4)
     sf_unswizzle = sf_reshaped.transpose(1, 3)
     sf_unswizzle = sf_unswizzle.reshape(num_m_tiles * 32 * 4, num_k_tiles * 4)
-    sf_unswizzle_sliced = sf_unswizzle[:row, :(col // scaling_vector_size)]
-    return sf_unswizzle_sliced.contiguous()
+    return sf_unswizzle.contiguous()
 
 
 def reswizzle_sf_ref(sf: torch.Tensor,
@@ -93,9 +92,10 @@ def test_swizzle_sf(rows, cols):
     sf_cols = ceil_div(cols, scaling_vector_size)
 
     # Create scaling factor data using fp4_sf_dtype
-    sf_data = torch.arange(rows * sf_cols,
-                           dtype=fp4_utils.float4_sf_dtype,
-                           device="cuda").view(rows, sf_cols)
+    sf_data = torch.randint(0,
+                            256, (rows * sf_cols, ),
+                            dtype=fp4_utils.float4_sf_dtype,
+                            device="cuda").view(rows, sf_cols)
 
     # Apply reference implementation
     ref_result = swizzle_sf_ref(sf_data, rows, cols, scaling_vector_size)
@@ -118,9 +118,10 @@ def test_unswizzle_sf(rows, cols):
     sf_cols = ceil_div(cols, scaling_vector_size)
 
     # Create scaling factor data by first swizzling with reference implementation
-    original_sf_data = torch.arange(rows * sf_cols,
-                                    dtype=fp4_utils.float4_sf_dtype,
-                                    device="cuda").view(rows, sf_cols)
+    original_sf_data = torch.randint(0,
+                                     256, (rows * sf_cols, ),
+                                     dtype=fp4_utils.float4_sf_dtype,
+                                     device="cuda").view(rows, sf_cols)
     swizzled_sf_data = swizzle_sf_ref(original_sf_data, rows, cols,
                                       scaling_vector_size)
 
@@ -128,6 +129,7 @@ def test_unswizzle_sf(rows, cols):
     ref_result = unswizzle_sf_ref(swizzled_sf_data, rows, cols,
                                   scaling_vector_size)
 
+    # Note that unlike swizzle_sf, unswizzle_sf does not return a 1D tensor
     result = unswizzle_sf(swizzled_sf_data, rows, cols, scaling_vector_size)
 
     # Verify C++ result matches reference result
@@ -152,7 +154,7 @@ def test_swizzle_round_trip(rows, cols):
 
     # Create scaling factor data
     original_sf_data = torch.randint(0,
-                                     256, (rows, sf_cols),
+                                     256, (rows * sf_cols, ),
                                      dtype=fp4_utils.float4_sf_dtype,
                                      device="cuda")
 
@@ -161,7 +163,8 @@ def test_swizzle_round_trip(rows, cols):
     unswizzled_sf = unswizzle_sf(swizzled_sf, rows, cols, scaling_vector_size)
 
     # Verify round-trip preserves original scaling factor data
-    torch.testing.assert_close(original_sf_data, unswizzled_sf)
+    torch.testing.assert_close(original_sf_data.view(rows, sf_cols),
+                               unswizzled_sf)
 
 
 @skip_pre_blackwell
@@ -177,10 +180,10 @@ def test_reswizzle_sf(rows, cols, num_partitions):
     # Create scaling factor data: multiple partitions of swizzled data
     partition_sf_data = []
     for i in range(num_partitions):
-        sf_data = torch.arange(i * 100,
-                               i * 100 + rows * sf_cols,
-                               dtype=fp4_utils.float4_sf_dtype,
-                               device="cuda").view(rows, sf_cols)
+        sf_data = torch.randint(0,
+                                256, (rows * sf_cols, ),
+                                dtype=fp4_utils.float4_sf_dtype,
+                                device="cuda").view(rows, sf_cols)
         swizzled_sf = swizzle_sf_ref(sf_data, rows, cols, scaling_vector_size)
         partition_sf_data.append(swizzled_sf)
 

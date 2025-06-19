@@ -113,33 +113,47 @@ def compute_swizzled_sf_shape(row: int, col: int):
 
 
 def swizzle_sf(sf: torch.Tensor,
-               row: int,
-               col: int,
+               rows: int,
+               cols: int,
                scaling_vector_size: int = 16):
-    """Swizzle FP4 scaling factors using C++ torch op implementation"""
-    if row is not None and col is not None:
-        sf_cols = ceil_div(col, scaling_vector_size)
-        sf = sf.view(-1, row, sf_cols)
+    """Swizzle FP4 scaling factors using C++ torch op implementation
+    Args:
+        sf: [b, rows, cols_sf] or [rows, cols_sf]. The original unswizzled scaling factors.
+        rows: rows of the original unquantized tensor
+        cols_sf: ceil_div(cols, scaling_vector_size) where cols is the number of columns of the original unquantized tensor
+        scaling_vector_size: the size of the scaling vector
+    Returns:
+        [b * pad_up(rows, 128) * pad_up(cols_sf, 4), ] 1D swizzled scaling factors, possibly with rows and cols padded.
+    """
+    sf_cols = ceil_div(cols, scaling_vector_size)
+    sf = sf.view(-1, rows, sf_cols)
     return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(sf)
 
 
 def unswizzle_sf(sf: torch.Tensor,
-                 row: int,
-                 col: int,
+                 rows: int,
+                 cols: int,
                  scaling_vector_size: int = 16):
-    """Unswizzle scaling factors using C++ torch op implementation"""
-    sf_cols = (col + scaling_vector_size - 1) // scaling_vector_size
-    # Reshape to expected input shape for C++ op
-    sf = sf.view(row, sf_cols)
-
-    return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(sf)
+    """Swizzle FP4 scaling factors using C++ torch op implementation
+    Args:
+        sf: The (padded then) swizzled scaling factors.
+        rows: rows of the original unquantized tensor
+        cols: cols of the original unquantized tensor
+        scaling_vector_size: the size of the scaling vector
+    Returns:
+        2D unswizzled scaling factors
+    """
+    sf_cols = ceil_div(cols, scaling_vector_size)
+    sf = sf.view(-1, rows, sf_cols)
+    return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(sf).view(
+        -1, sf_cols)
 
 
 def reswizzle_sf(sf: torch.Tensor,
                  row: int,
                  col: int,
                  scaling_vector_size: int = 16):
-    """Reswizzle scaling factors for multiple partitions using C++ ops"""
+    """Reswizzle scaling factors using C++ ops"""
     factor = scaling_vector_size * 4
     num_m_tiles = ceil_div(row, 128)
     num_k_tiles = ceil_div(col, factor)

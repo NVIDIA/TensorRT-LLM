@@ -77,5 +77,8 @@ void invokeBatchedFP4Quantization(int b, int m, int n, T const* input, float con
 void invokeNVFP4BlockScaleInterleave(
     int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream = 0);
 
+void invokeNVFP4BlockScaleInterleaveReverse(
+    int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream = 0);
+
 } // namespace kernels
 } // namespace tensorrt_llm
