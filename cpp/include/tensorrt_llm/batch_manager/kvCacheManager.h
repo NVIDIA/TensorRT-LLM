@@ -419,14 +419,9 @@ public:
         }
     }
 
-    [[nodiscard]] executor::RetentionPriority getDecodeRetentionPriority() const
+    [[nodiscard]] executor::KvCacheRetentionConfig const& getKvCacheRetentionConfig() const
     {
-        return mKvCacheRetentionConfig.getDecodeRetentionPriority();
-    }
-
-    [[nodiscard]] std::optional<std::chrono::milliseconds> getDecodeDurationMs() const
-    {
-        return mKvCacheRetentionConfig.getDecodeDurationMs();
+        return mKvCacheRetentionConfig;
     }
 
     // @brief Check whether the sequence uses cyclic KV cache.
@@ -686,7 +681,7 @@ public:
 
     //! \brief Bring block from primary to secondary memory.
     //! \details Does nothing if block is already in secondary memory.
-    void offloadBlock(BlockPtr const& block);
+    void offloadBlock(BlockPtr const& block, executor::KvCacheRetentionConfig const& config);
 
     //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vectors.
     //! \details Only full blocks are considered.
@@ -752,13 +747,13 @@ private:
         std::optional<std::chrono::milliseconds> durationMs);
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
-    [[nodiscard]] BlockPtr getFreeBlock(
-        executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
+    [[nodiscard]] BlockPtr getFreeBlock(executor::KvCacheRetentionConfig const& config,
+        executor::RetentionPriority priority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt);
 
     //! \brief Free block from previous block and claim it from free blocks list.
-    void claimLeafBlock(BlockPtr const& block, std::optional<executor::RetentionPriority> priority = std::nullopt,
-        std::optional<std::chrono::milliseconds> durationMs = std::nullopt);
+    void claimLeafBlock(BlockPtr const& block, std::optional<executor::RetentionPriority> priority,
+        std::optional<std::chrono::milliseconds> durationMs);
 
     //! \brief For FP4 quantization. Creates pool objects for FP4 block scalars.
     void createBlockScalePools(SizeType32 blockSize);
@@ -896,7 +891,7 @@ public:
 
     //! \brief Bring block from primary to secondary memory for window size.
     //! \details Does nothing if block is already in secondary memory.
-    void offloadBlock(BlockPtr const& block, SizeType32 windowSize);
+    void offloadBlock(BlockPtr const& block, executor::KvCacheRetentionConfig const& config, SizeType32 windowSize);
 
     void storeBlocks(std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
         SizeType32 windowSize)
