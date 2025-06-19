@@ -53,7 +53,7 @@ from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (CutlassFusedMoE, DeepSeekV3MoeRoutingMethod,
-                                 create_moe)
+                                 WideEPMoE, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -511,7 +511,7 @@ class Deepseekv3MoE(nn.Module):
                                           self.mapping,
                                           dim=0,
                                           sizes=all_rank_num_tokens)
-            elif not isinstance(self.experts, CutlassFusedMoE) or (
+            elif not isinstance(self.experts, (CutlassFusedMoE, WideEPMoE)) or (
                     not self.experts.has_fp8_qdq and self.experts.has_nvfp4):
                 # Use padding when not using the cutlass path or when x_sf in self.experts is not None
                 use_dp_padding = True
@@ -721,12 +721,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             ) if tp > self.mapping.gpus_per_node else tp  # Avoid costly inter-node TP
         return mlp_tp_size
 
-    def _enable_min_latency_mode(self, num_tokens: int):
-        return (num_tokens <= 128 and self.fusion_config.POST_MOE_FUSION
-                and self.is_nvfp4 and self.model_config.moe_backend == 'CUTLASS'
-                and not self.mapping.is_multi_node()
-                and self.allreduce.mnnvl_allreduce is None)
-
     def forward(
         self,
         position_ids: torch.IntTensor,
@@ -779,115 +773,69 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 do_finalize=do_finalize,
             )
 
-        cutlass_min_latency_mode = self._enable_min_latency_mode(
-            hidden_states.shape[0])
-
-        if cutlass_min_latency_mode:
-            assert self.fusion_config.PRE_MOE_FUSION and self.fusion_config.POST_MOE_FUSION
-            assert self.model_config.moe_backend == 'CUTLASS'
-
-            hidden_states, hidden_states_act, hidden_states_sf, residual = self.allreduce(
+        if self.fusion_config.PRE_MOE_FUSION:
+            # moe_backend can be either CUTLASS or TRTLLM here
+            # TODO: unify the two min-latency MoE backends by enabling quant fusion
+            hidden_states, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.
-                    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                     residual=residual,
                     norm_weight=self.post_attention_layernorm.weight,
-                    scale=self.mlp.experts.fc31_input_scale,
                     eps=self.post_attention_layernorm.variance_epsilon,
+                    trigger_completion_at_end=False,
                 ))
-            hidden_states_fp4 = Fp4QuantizedTensor(hidden_states_act,
-                                                   hidden_states_sf)
-
-            hidden_states = _run_MoE(hidden_states,
-                                     hidden_states_fp4,
-                                     do_finalize=False)
-
-            shared_output = hidden_states[0]
-            hidden_states_activated_experts = hidden_states[1]
-            num_activated_experts_per_node = hidden_states[2]
-            experts_to_token_score = hidden_states[3]
-
-            moe_all_reduce_params = MoEAllReduceParams(
-                residual=residual,
-                norm_weight=self.next_layer_layernorm.weight,
-                device_num_experts=num_activated_experts_per_node,
-                expert_scale_factor=experts_to_token_score,
-                shared_expert_output=shared_output,
-                eps=self.next_layer_layernorm.variance_epsilon,
-                is_cutlass_min_latency=True,
-            )
-
-            # MoE_finalize is fused into allreduce
-            hidden_states, residual = self.moe_allreduce(
-                hidden_states_activated_experts,
-                all_reduce_params=moe_all_reduce_params,
-            )
         else:
-            if self.fusion_config.PRE_MOE_FUSION:
-                # moe_backend can be either CUTLASS or TRTLLM here
-                # TODO: unify the two min-latency MoE backends by enabling quant fusion
+            # No fusion
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+
+        # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
+        do_finalize = not (hidden_states.shape[0]
+                           <= self.moe_allreduce.max_token
+                           and self.fusion_config.POST_MOE_FUSION
+                           and self.model_config.moe_backend == 'TRTLLM'
+                           and self.mlp.experts.has_nvfp4)
+
+        hidden_states = _run_MoE(hidden_states,
+                                 hidden_states_fp4=None,
+                                 do_finalize=do_finalize)
+
+        if self.fusion_config.POST_MOE_FUSION:
+            if do_finalize:
                 hidden_states, residual = self.allreduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
                         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                         residual=residual,
-                        norm_weight=self.post_attention_layernorm.weight,
-                        eps=self.post_attention_layernorm.variance_epsilon,
+                        norm_weight=self.next_layer_layernorm.weight,
+                        eps=self.next_layer_layernorm.variance_epsilon,
                         trigger_completion_at_end=False,
                     ))
             else:
-                # No fusion
-                hidden_states, residual = self.post_attention_layernorm(
+                assert len(
+                    hidden_states) == 4, "hidden_states must have 4 elements"
+
+                shared_output = hidden_states[0]
+                fc2_output = hidden_states[1]
+                expert_scale_factor = hidden_states[2]
+                expanded_idx_to_permuted_idx = hidden_states[3]
+
+                moe_all_reduce_params = MoEAllReduceParams(
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    expert_scale_factor=expert_scale_factor,
+                    shared_expert_output=shared_output,
+                    residual=residual,
+                    norm_weight=self.next_layer_layernorm.weight,
+                    eps=self.next_layer_layernorm.variance_epsilon,
+                    is_cutlass_min_latency=False,
+                )
+                hidden_states, residual = self.moe_allreduce(
+                    fc2_output, all_reduce_params=moe_all_reduce_params)
+        else:
+            if self.next_layer_layernorm is not None:
+                hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
-
-            # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
-            do_finalize = not (hidden_states.shape[0]
-                               <= self.moe_allreduce.max_token
-                               and self.fusion_config.POST_MOE_FUSION
-                               and self.model_config.moe_backend == 'TRTLLM'
-                               and self.mlp.experts.has_nvfp4)
-
-            hidden_states = _run_MoE(hidden_states,
-                                     hidden_states_fp4=None,
-                                     do_finalize=do_finalize)
-
-            if self.fusion_config.POST_MOE_FUSION:
-                if do_finalize:
-                    hidden_states, residual = self.allreduce(
-                        hidden_states,
-                        all_reduce_params=AllReduceParams(
-                            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                            residual=residual,
-                            norm_weight=self.next_layer_layernorm.weight,
-                            eps=self.next_layer_layernorm.variance_epsilon,
-                            trigger_completion_at_end=False,
-                        ))
-                else:
-                    assert len(hidden_states
-                               ) == 4, "hidden_states must have 4 elements"
-
-                    shared_output = hidden_states[0]
-                    fc2_output = hidden_states[1]
-                    expert_scale_factor = hidden_states[2]
-                    expanded_idx_to_permuted_idx = hidden_states[3]
-
-                    moe_all_reduce_params = MoEAllReduceParams(
-                        expanded_idx_to_permuted_idx=
-                        expanded_idx_to_permuted_idx,
-                        expert_scale_factor=expert_scale_factor,
-                        shared_expert_output=shared_output,
-                        residual=residual,
-                        norm_weight=self.next_layer_layernorm.weight,
-                        eps=self.next_layer_layernorm.variance_epsilon,
-                        is_cutlass_min_latency=False,
-                    )
-                    hidden_states, residual = self.moe_allreduce(
-                        fc2_output, all_reduce_params=moe_all_reduce_params)
-            else:
-                if self.next_layer_layernorm is not None:
-                    hidden_states, residual = self.next_layer_layernorm(
-                        hidden_states, residual)
 
         return hidden_states, residual
 
