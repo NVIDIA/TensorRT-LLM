@@ -953,7 +953,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("PP with torch.compile is not supported yet.")
         if not attention_dp and (tp_size > 1 or ep_size > 1):
             pytest.skip("https://nvbugs/5336321")
-        task_types = self._filter_task_types(task_types)
+        task_types = self._filter_task_types(task_types, fp8kv)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         torch_compile_config = TorchCompileConfig(
@@ -1011,7 +1011,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                task_types: list[Type[AccuracyTask]]):
         if quant_dtype == "nvfp4" and mtp_nextn > 0:
             pytest.skip("MTP is not supported for NVFP4")
-        task_types = self._filter_task_types(task_types)
+        task_types = self._filter_task_types(task_types, fp8kv)
 
         model_path = self.MODEL_PATH
         if quant_dtype == "fp8":
