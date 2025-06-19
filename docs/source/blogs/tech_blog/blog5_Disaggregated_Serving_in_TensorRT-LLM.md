@@ -16,7 +16,7 @@ By NVIDIA TensorRT-LLM Team
     - [Measurement Methodology](#Measurement-Methodology)
     - [DeepSeek R1](#DeepSeek-R1)
       - [ISL 4400 - OSL 1200 (Machine Translation Dataset)](#ISL-4400---OSL-1200-Machine-Translation-Dataset)
-      - [ISL 8192 - OS L256 (Synthetic Dataset)](#ISL-8192---OS-L256-Synthetic-Dataset)
+      - [ISL 8192 - OSL 256 (Synthetic Dataset)](#ISL-8192---OSL-256-Synthetic-Dataset)
       - [ISL 4096 - OSL 1024 (Machine Translation Dataset)](#ISL-4096---OSL-1024-Machine-Translation-Dataset)
     - [Reproducing Steps](#Reproducing-Steps)
   - [Future Work](#Future-Work)
@@ -218,7 +218,7 @@ For some data points on the performance curve, the context/generation instance n
 
 As shown in Figure 10, enabling MTP increases speedups of disaggregation over aggregation further, reaching 1.6x to 2.5x, averaging 20 – 30 % higher than MTP-off.
 
-#### ISL 8192 - OS L256 (Synthetic Dataset)
+#### ISL 8192 - OSL 256 (Synthetic Dataset)
 
 <div align="center">
 <figure>
@@ -251,7 +251,7 @@ By comparing the disaggregated serving E2E results with the “rate-matched” c
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog5_Picture13.png" width="640" height="auto">
+  <img src="../media/tech_blog5_Picture14.png" width="640" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 14. DeepSeek R1 E2E Pareto curves without MTP.</em></sub></p>
