@@ -297,7 +297,7 @@ class FP8QDQLinearMethod(LinearMethodBase):
               bias: Optional[torch.Tensor]):
         cur_input_scale = module.input_scale
         if input.dtype != torch.float8_e4m3fn:
-            if module.input_scale is not None:
+            if module.input_scale is not None and not module.quant_config.force_dynamic_quantization:
                 # Static quantization
                 qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     input, module.input_scale)
