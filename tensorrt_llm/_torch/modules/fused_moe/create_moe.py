@@ -6,10 +6,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...model_config import ModelConfig
+from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
-from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_wide_ep import WideEPMoE
 from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import get_moe_load_balancer
@@ -17,10 +17,11 @@ from .routing import BaseMoeRoutingMethod
 
 
 def get_moe_cls(
-        model_config: ModelConfig,
-        routing_method: BaseMoeRoutingMethod,
-        dtype: Optional[torch.dtype] = None,
-        override_quant_config: Optional[QuantConfig] = None) -> Type[MoE]:
+    model_config: ModelConfig,
+    routing_method: BaseMoeRoutingMethod,
+    dtype: Optional[torch.dtype] = None,
+    override_quant_config: Optional[QuantConfig] = None,
+) -> Type[MoE]:
     moe_backend = model_config.moe_backend
     quant_config = model_config.quant_config
     if override_quant_config is not None:
@@ -67,10 +68,13 @@ def create_moe(
 
     moe_load_balancer = get_moe_load_balancer()
     if moe_load_balancer is not None:
-        assert moe_cls == CutlassFusedMoE, "MoE Load Balance is only supported in CutlassFusedMoE now."
+        assert (moe_cls == CutlassFusedMoE
+                ), "MoE Load Balance is only supported in CutlassFusedMoE now."
 
     if moe_cls == TRTLLMGenFusedMoE:
-        assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
+        assert (
+            not apply_router_weight_on_input
+        ), "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
 
         return moe_cls(
             routing_method=routing_method,
@@ -112,7 +116,9 @@ def create_moe(
             layer_idx=layer_idx,
         )
     elif moe_cls == VanillaMoE:
-        assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in VanillaMoE."
+        assert (
+            not apply_router_weight_on_input
+        ), "apply_router_weight_on_input is not supported in VanillaMoE."
 
         return moe_cls(
             routing_method=routing_method,

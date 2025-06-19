@@ -1,43 +1,20 @@
-import os
-from enum import IntEnum
-from typing import Dict, List, Optional, Tuple, Union
 import math
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
-from tensorrt_llm._utils import logger
-from tensorrt_llm.mapping import Mapping
-
-from ...distributed import allgather, reducescatter
+from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import (
-    EventType,
-    Fp4QuantizedTensor,
-    disable_fp4_allgather,
-    reswizzle_sf,
-    swizzle_sf,
-    unswizzle_sf,
-)
-from .deep_ep_utils import buffer_pool, deep_ep_installed
-from .interface import MoE
-from .moe_load_balancer import get_moe_load_balancer
-from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod,
-    FP8QDQFusedMoEMethod,
-    MoEWeightLoadingMode,
-    NVFP4CutlassFusedMoEMethod,
-    UnquantizedFusedMoEMethod,
-    WInt4AFP8FusedMoEMethod,
-)
-from .routing import BaseMoeRoutingMethod
+from ...utils import (Fp4QuantizedTensor, disable_fp4_allgather, reswizzle_sf,
+                      swizzle_sf, unswizzle_sf)
 from .fused_moe_cutlass import AlltoallMethodType, CutlassFusedMoE
+from .quantization import MoEWeightLoadingMode
+from .routing import BaseMoeRoutingMethod
 
 
 def swiglu_fused_moe(x):
-    # print(f"limin: swiglu, input shape = {x.shape}, {x}")
     x, gate = x.chunk(2, dim=-1)
     return F.silu(gate) * x
 
@@ -58,7 +35,7 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
     b_tmp = b.permute(1, 2, 0)
 
     m_padded = (m + 3) // 4 * 4
-    input_scale_tmp = a_sf[0 : m_padded * w_k]
+    input_scale_tmp = a_sf[0:m_padded * w_k]
     input_scale_tmp = input_scale_tmp.reshape(-1, m_padded)
     input_scale_tmp = input_scale_tmp[:w_k, :m].contiguous().permute(1, 0)
     input_scale_tmp = input_scale_tmp.as_strided((m, w_k, 1), (1, m, m * w_k))
@@ -99,9 +76,9 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
         start = offset_array[i]
         end = offset_array[i + 1]
         # assert start <= end, f"Invalid group boundaries: start={start} > end={end}"
-        ref[start:end, :] = torch.einsum(
-            "mk,nk->mn", updated_a[start:end, :, 0], updated_b[:, :, i]
-        )
+        ref[start:end, :] = torch.einsum("mk,nk->mn", updated_a[start:end, :,
+                                                                0],
+                                         updated_b[:, :, i])
     ref = ref.to(torch.bfloat16)
     return ref
 
@@ -164,7 +141,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
         aux_stream: Optional[torch.cuda.Stream] = None,
-        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
+        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
+        VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
     ):
@@ -184,14 +162,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
 
     def forward_chunk(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        cutlass_min_latency_mode: bool = False,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        repeating_info: Tuple = (True, True),
+            self,
+            x: Union[torch.Tensor, Fp4QuantizedTensor],
+            router_logits: torch.Tensor,
+            cutlass_min_latency_mode: bool = False,
+            output_dtype: Optional[torch.dtype] = None,
+            all_rank_num_tokens: Optional[List[int]] = None,
+            use_dp_padding: Optional[bool] = None,
+            repeating_info: Tuple = (True, True),
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -201,31 +179,27 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
         is_first_call, is_last_call = repeating_info
 
-        if (
-            self.layer_load_balancer
-            and not self.layer_load_balancer.is_static_routing()
-            and is_first_call
-        ):
+        if (self.layer_load_balancer
+                and not self.layer_load_balancer.is_static_routing()
+                and is_first_call):
             self.layer_load_balancer.wait_for_gpu_stage()
 
         use_deepseek_fp8_block_scale = False
-        use_w4a8_group_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits
-        )
+            router_logits)
 
-        assert token_selected_experts.shape[1] == self.routing_method.experts_per_token
+        assert token_selected_experts.shape[
+            1] == self.routing_method.experts_per_token
         assert token_selected_experts.shape == token_final_scales.shape
         assert token_selected_experts.shape[0] == router_logits.shape[0]
         assert token_final_scales.dtype == torch.float32
         assert token_selected_experts.dtype == torch.int32
 
         if self.apply_router_weight_on_input:
-            assert (
-                self.routing_method.top_k == 1
-            ), "Current workaround only supports top-1 routing"
+            assert (self.routing_method.top_k == 1
+                    ), "Current workaround only supports top-1 routing"
             assert (
                 x.dtype != torch.float8_e4m3fn
             ), "Current workaround for apply_router_weight_on_input does not support fp8 input"
@@ -233,11 +207,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
 
-        if (
-            self.layer_load_balancer
-            and not self.layer_load_balancer.is_static_routing()
-            and is_first_call
-        ):
+        if (self.layer_load_balancer
+                and not self.layer_load_balancer.is_static_routing()
+                and is_first_call):
             self.layer_load_balancer.maybe_cudagraph_done_wait()
 
         need_statistic = False
@@ -245,8 +217,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             token_selected_slots = token_selected_experts
         else:
             token_selected_slots = self.layer_load_balancer.route(
-                token_selected_experts, self.use_dp
-            )
+                token_selected_experts, self.use_dp)
             if not self.layer_load_balancer.is_static_routing():
                 need_statistic = True
 
@@ -255,9 +226,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         ExpertStatistic.set_layer(self.layer_idx)
         ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
 
-        token_selected_experts_for_statistic = (
-            token_selected_experts if need_statistic else None
-        )
+        token_selected_experts_for_statistic = (token_selected_experts
+                                                if need_statistic else None)
 
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
@@ -300,16 +270,16 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                             deep_ep_topk_idx,
                             self.deep_ep_max_num_tokens,
                             self.num_slots,
-                        )
-                    )
+                        ))
                     # x shape: [#local experts, #max recv tokens, hidden_size]
                     # recv_expert_count shape: [#local experts]
 
                     # Adapter between `torch.ops.trtllm.fused_moe` and DeepEP
                     # TODO: remove the adapter by changing `torch.ops.trtllm.fused_moe` API
                     mask = torch.arange(
-                        x.shape[1], dtype=torch.int32, device=x.device
-                    ).expand(x.shape[0], x.shape[1]) < recv_expert_count.unsqueeze(1)
+                        x.shape[1], dtype=torch.int32, device=x.device).expand(
+                            x.shape[0],
+                            x.shape[1]) < recv_expert_count.unsqueeze(1)
                     token_selected_slots = torch.full(
                         (x.shape[0], x.shape[1], self.routing_method.top_k),
                         self.num_slots,
@@ -328,11 +298,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     )
                     x = x.view(x.shape[0] * x.shape[1], x.shape[2])
                     token_selected_slots = token_selected_slots.view(
-                        x.shape[0], self.routing_method.top_k
-                    )
+                        x.shape[0], self.routing_method.top_k)
                     token_final_scales = torch.ones_like(
-                        token_selected_slots, dtype=token_final_scales.dtype
-                    )
+                        token_selected_slots, dtype=token_final_scales.dtype)
             else:
                 raise NotImplementedError(
                     f"Not available alltoall method type: {alltoall_method_type!r}"
@@ -342,8 +310,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         if self.has_any_quant:
             if self.has_fp8_qdq:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                    x, self.fc31_input_dequant
-                )
+                    x, self.fc31_input_dequant)
             elif self.has_nvfp4:
                 if not disable_fp4_allgather() or self.use_postquant_alltoall:
                     if isinstance(x, Fp4QuantizedTensor):
@@ -355,25 +322,20 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                         x_row = x.shape[0]
                         x_col = x.shape[1]
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
-                            x, self.fc31_input_scale, self.scaling_vector_size, False
-                        )
+                            x, self.fc31_input_scale, self.scaling_vector_size,
+                            False)
 
             elif self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
             elif self.has_w4afp8:
-                use_w4a8_group_scaling = True
                 weight_dtype = torch.quint4x2
             else:
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
 
-        if (
-            self.use_dp
-            and self.parallel_size > 1
-            and not disable_fp4_allgather()
-            and not self.enable_alltoall
-        ):
+        if (self.use_dp and self.parallel_size > 1
+                and not disable_fp4_allgather() and not self.enable_alltoall):
             (
                 x,
                 x_sf,
@@ -394,29 +356,25 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             )
             # Fp4 gemm has extra scaling factor
             if x_sf is not None:
-                x_sf = reswizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
+                x_sf = reswizzle_sf(x_sf, x_row, x_col,
+                                    self.scaling_vector_size)
 
-        if (
-            self.layer_load_balancer
-            and not self.layer_load_balancer.is_static_routing()
-        ):
+        if (self.layer_load_balancer
+                and not self.layer_load_balancer.is_static_routing()):
             self.layer_load_balancer.statistic(
-                token_selected_experts_for_statistic, is_first_call, is_last_call
-            )
+                token_selected_experts_for_statistic, is_first_call,
+                is_last_call)
 
         if self.smart_router and not cutlass_min_latency_mode:
             ep_size = self.cluster_size
             ep_rank = self.cluster_rank
             expert_start = ep_rank * self.num_experts // ep_size
-            expert_end = min(
-                self.num_experts, (ep_rank + 1) * self.num_experts // ep_size
-            )
-            w3_w1_weight = self.w3_w1_weight.narrow(
-                0, expert_start, expert_end - expert_start
-            )
-            w2_weight = self.w2_weight.narrow(
-                0, expert_start, expert_end - expert_start
-            )
+            expert_end = min(self.num_experts,
+                             (ep_rank + 1) * self.num_experts // ep_size)
+            w3_w1_weight = self.w3_w1_weight.narrow(0, expert_start,
+                                                    expert_end - expert_start)
+            w2_weight = self.w2_weight.narrow(0, expert_start,
+                                              expert_end - expert_start)
             cluster_size = self.ep_size
             cluster_rank = self.ep_rank
             quant_scales = self.get_quant_scales(expert_start, expert_end)
@@ -432,14 +390,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         if self.use_postquant_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 x, x_sf = self.alltoall_postquant_dispatch(
-                    x, x_sf, x_row, x_col, alltoall_info
-                )
+                    x, x_sf, x_row, x_col, alltoall_info)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if x_sf is not None:
                     if self.has_nvfp4:
-                        x_sf = unswizzle_sf(
-                            x_sf, x_row, x_col, self.scaling_vector_size
-                        )
+                        x_sf = unswizzle_sf(x_sf, x_row, x_col,
+                                            self.scaling_vector_size)
                     # Adapter between `x_sf` and DeepEP
                     # TODO: remove the adapter by adding dtype support to DeepEP
                     x_sf_dtype = x_sf.dtype
@@ -459,9 +415,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 if x_sf is not None:
                     x_sf = x_sf.view(x_sf_dtype)
                     if self.has_nvfp4:
-                        x_sf = swizzle_sf(
-                            x_sf, x.shape[0], x.shape[1] * 2, self.scaling_vector_size
-                        )
+                        x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
+                                          self.scaling_vector_size)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 raise NotImplementedError(
                     "Not implemented postquant for DeepEPLowLatency, please set TRTLLM_MOE_POST_QUANT_ALLTOALLV=0"
@@ -477,13 +432,14 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             if self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 token_selected_slots = recv_topk_idx.to(torch.int32)
                 mask = token_selected_slots == -1
-                token_selected_slots += (
-                    self.expert_size_per_partition * self.mapping.moe_ep_rank
-                )
+                token_selected_slots += (self.expert_size_per_partition *
+                                         self.mapping.moe_ep_rank)
                 token_selected_slots[mask] = self.num_slots
                 num_recv_token_is_zero = x.shape[0] == 0
                 if x.shape[0] == 0:
-                    x = torch.zeros((1, x.shape[1]), dtype=x.dtype, device=x.device)
+                    x = torch.zeros((1, x.shape[1]),
+                                    dtype=x.dtype,
+                                    device=x.device)
                     token_selected_slots = torch.full(
                         (1, token_selected_slots.shape[1]),
                         self.num_slots,
@@ -525,8 +481,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
 
         act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-            permuted_data_tensor
-        )
+            permuted_data_tensor)
         h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
             a=act_input_fp8,
             b=w3_w1_weight.view(weight_dtype),
@@ -563,14 +518,12 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 final_hidden_states = self.alltoall_combine(
-                    final_hidden_states, alltoall_info, token_count
-                )
+                    final_hidden_states, alltoall_info, token_count)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if num_recv_token_is_zero:
                     final_hidden_states = final_hidden_states[:0]
                 final_hidden_states = self.deep_ep_buffer.combine(
-                    final_hidden_states, deep_ep_handle
-                )
+                    final_hidden_states, deep_ep_handle)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 final_hidden_states = self.deep_ep_buffer.low_latency_combine(
                     final_hidden_states.view(
@@ -587,11 +540,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
-        if (
-            self.layer_load_balancer
-            and not self.layer_load_balancer.is_static_routing()
-            and is_last_call
-        ):
+        if (self.layer_load_balancer
+                and not self.layer_load_balancer.is_static_routing()
+                and is_last_call):
             self.layer_load_balancer.maybe_cudagraph_done_set_cpu_stage()
 
         return final_hidden_states

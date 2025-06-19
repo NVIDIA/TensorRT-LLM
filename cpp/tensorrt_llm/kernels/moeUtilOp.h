@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "cutlass_kernels/include/moe_kernels.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -34,8 +34,8 @@ void buildExpertMaps(int const* token_selected_experts, int* unpermuted_token_se
 
 void generateTokenPermutation(int const* unpermuted_token_selected_experts, int const* unpermuted_source_token_ids,
     int* permuted_token_selected_experts, int* permuted_source_token_ids, int64_t* expert_first_token_offset,
-    int64_t num_rows, int64_t num_experts_per_node, int64_t k, cutlass_kernels::CubKeyValueSorter& sorter, void* sorter_ws,
-    cudaStream_t stream);
+    int64_t num_rows, int64_t num_experts_per_node, int64_t k, cutlass_kernels::CubKeyValueSorter& sorter,
+    void* sorter_ws, cudaStream_t stream);
 
 template <class InputActivationsType, class ExpandedActivationsType>
 void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
