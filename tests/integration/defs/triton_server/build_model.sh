@@ -603,7 +603,6 @@ if [ "$MODEL" = "mllama" ]; then
 
     echo "mllama builder"
     trtllm-build --checkpoint_dir ./c-model/Llama-3.2-11B-Vision-Instruct/bf16 \
-                --gemm_plugin auto \
                 --max_batch_size 8 \
                 --max_input_len 2048 \
                 --max_seq_len 2560 \
