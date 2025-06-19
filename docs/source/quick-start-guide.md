@@ -4,6 +4,9 @@
 
 This is the starting point to try out TensorRT-LLM. Specifically, this Quick Start Guide enables you to quickly get setup and send HTTP requests using TensorRT-LLM.
 
+The following examples can most easily be executed using the prebuilt [Docker release container available on NGC](https://registry.ngc.nvidia.com/orgs/nvstaging/teams/tensorrt-llm/containers/release) (see also [release.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docker/release.md) on GitHub). Ensure to run these commands as a user with appropriate permissions, preferably `root`, to streamline the setup process.
+
+
 ## LLM API
 The LLM API is a Python API designed to facilitate setup and inference with TensorRT-LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing checkpoint conversion, engine building, engine loading, and model inference, all through a single Python object.
 
@@ -28,7 +31,7 @@ trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ```
 
 After the server starts, you can access familiar OpenAI endpoints such as `v1/chat/completions`.
-You can run inference such as the following example:
+You can run inference such as the following example from another terminal:
 
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
@@ -72,8 +75,15 @@ _Example Output_
 }
 ```
 
-For examples and command syntax, refer to the [trtllm-serve](commands/trtllm-serve.rst) section.
+For detailed examples and command syntax, refer to the [trtllm-serve](commands/trtllm-serve.rst) section. If you are running `trtllm-server` inside a Docker container, you have two options for sending API requests:
 
+1. Expose port `8000` to access the server from outside the container.
+
+2. Open a new terminal and use the following command to directly attach to the running container:
+
+```bash:docs/source/quick-start-guide.md
+docker exec -it <container_id> bash
+```
 
 ## Model Definition API
 
