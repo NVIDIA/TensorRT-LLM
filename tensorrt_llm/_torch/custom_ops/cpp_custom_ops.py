@@ -24,6 +24,7 @@ def _register_fake():
         trigger_completion_at_end,
     ):
         from tensorrt_llm.functional import AllReduceFusionOp
+
         if op == int(AllReduceFusionOp.NONE):
             return [torch.empty_like(input)]
         elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM):
@@ -55,7 +56,7 @@ def _register_fake():
         else:
             return [torch.empty_like(input)]
 
-    #MNNVL Allreduce
+    # MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_twoshot_allreduce")
     def _(input, buffer, buffer_flags, wait_for_results):
         output = input.new_empty(input.shape)
@@ -68,9 +69,18 @@ def _register_fake():
         return [output, residual_out]
 
     @torch.library.register_fake("trtllm::moe_allreduce")
-    def _(residual, norm_weight, device_num_experts, scale_input,
-          active_experts_token_input, token_input, workspace, rank, nranks,
-          eps):
+    def _(
+        residual,
+        norm_weight,
+        device_num_experts,
+        scale_input,
+        active_experts_token_input,
+        token_input,
+        workspace,
+        rank,
+        nranks,
+        eps,
+    ):
         norm_out = torch.empty_like(token_input)
         residual_out = torch.empty_like(residual)
         return [norm_out, residual_out]
@@ -175,8 +185,10 @@ def _register_fake():
         output_shape, scale_shape = fp4_utils.get_fp4_shape(
             input.shape, sf_vec_size)
 
-        return (input.new_empty(output_shape, dtype=torch.uint8),
-                global_scale.new_empty(scale_shape, dtype=torch.uint8))
+        return (
+            input.new_empty(output_shape, dtype=torch.uint8),
+            global_scale.new_empty(scale_shape, dtype=torch.uint8),
+        )
 
     @torch.library.register_fake("trtllm::moe_comm_prepare_indices")
     def _(
@@ -210,9 +222,14 @@ def _register_fake():
         backward_recv_rank_local_indices = gathered_target_rank_ids.new_empty(
             backward_recv_rank_local_indices_shape, dtype=torch.int32)
 
-        return (local_gather_indices, send_rank_count_cum_sum,
-                send_rank_local_indices, recv_rank_count_cum_sum,
-                recv_rank_local_indices, backward_recv_rank_local_indices)
+        return (
+            local_gather_indices,
+            send_rank_count_cum_sum,
+            send_rank_local_indices,
+            recv_rank_count_cum_sum,
+            recv_rank_local_indices,
+            backward_recv_rank_local_indices,
+        )
 
     @torch.library.register_fake("trtllm::moe_local_gather")
     def _(
@@ -263,14 +280,21 @@ def _register_fake():
         pass
 
     @torch.library.register_fake("trtllm::moe_load_balance_statistic")
-    def _(single_layer_load_balancer_ptr: int,
-          gathered_raw_expert_ids: torch.Tensor, enabled: torch.Tensor,
-          is_first_stage: bool, is_last_stage: bool):
+    def _(
+        single_layer_load_balancer_ptr: int,
+        gathered_raw_expert_ids: torch.Tensor,
+        enabled: torch.Tensor,
+        is_first_stage: bool,
+        is_last_stage: bool,
+    ):
         pass
 
     @torch.library.register_fake("trtllm::moe_load_balance_routing")
-    def _(single_layer_load_balancer_ptr: int,
-          token_selected_experts: torch.Tensor, offset_by_ep_rank: bool):
+    def _(
+        single_layer_load_balancer_ptr: int,
+        token_selected_experts: torch.Tensor,
+        offset_by_ep_rank: bool,
+    ):
         return torch.empty_like(token_selected_experts)
 
     @torch.library.custom_op("trtllm::group_rms_norm_base",
@@ -339,9 +363,15 @@ def _register_fake():
 
     @torch.library.register_fake(
         "trtllm::mtp_sampling_and_accepted_draft_tokens_op")
-    def _(logits: torch.Tensor, draft_tokens: torch.Tensor,
-          target_tokens: torch.Tensor, num_mtp_modules: int, batch_size: int,
-          num_context_request: int, vocab_size: int):
+    def _(
+        logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        num_mtp_modules: int,
+        batch_size: int,
+        num_context_request: int,
+        vocab_size: int,
+    ):
         return logits.new_empty((batch_size, num_mtp_modules + 1),
                                 dtype=torch.int32), logits.new_empty(
                                     (batch_size, ), dtype=torch.int32)
@@ -384,42 +414,82 @@ def _register_fake():
         pad_slot_id: int,
     ) -> None:
         pass
-    
+
     @torch.library.register_fake("trtllm::moe_permute_op")
-    def _(input: torch.Tensor, token_selected_experts: torch.Tensor, token_final_scales: torch.Tensor, 
-          fc1_expert_weights: torch.Tensor, fc2_expert_weights: torch.Tensor, quant_scales: List[torch.Tensor], 
-          input_sf: Optional[torch.Tensor],
-          num_experts_per_node: int, tp_size: int, tp_rank: int, ep_size: int, ep_rank: int,
-          cluster_size: int, cluster_rank: int, min_latency_mode: bool, use_fp8_block_scaling: bool):
-        
-        experts_per_token = token_selected_experts.shape[1];
-        num_rows = input.shape[0];
-        hidden_size = input.shape[1];
+    def _(
+        input: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        fc1_expert_weights: torch.Tensor,
+        fc2_expert_weights: torch.Tensor,
+        quant_scales: List[torch.Tensor],
+        input_sf: Optional[torch.Tensor],
+        num_experts_per_node: int,
+        tp_size: int,
+        tp_rank: int,
+        ep_size: int,
+        ep_rank: int,
+        cluster_size: int,
+        cluster_rank: int,
+        min_latency_mode: bool,
+        use_fp8_block_scaling: bool,
+    ):
 
-        num_moe_inputs = experts_per_token * num_rows;
+        experts_per_token = token_selected_experts.shape[1]
+        num_rows = input.shape[0]
+        hidden_size = input.shape[1]
 
-        unpermuted_token_selected_experts_tensor = token_selected_experts.new_empty((num_moe_inputs, ), dtype=torch.int32)
-        unpermuted_source_token_ids_tensor = token_selected_experts.new_empty((num_moe_inputs, ), dtype=torch.int32)
-        permuted_source_token_ids_tensor = token_selected_experts.new_empty((num_moe_inputs, ), dtype=torch.int32)
-        permuted_token_selected_experts_tensor = token_selected_experts.new_empty((num_moe_inputs, ), dtype=torch.int32)
-        permuted_data_tensor = input.new_empty((num_moe_inputs, hidden_size), dtype=torch.float32)
-        expert_first_token_offset_tensor = token_selected_experts.new_empty((num_experts_per_node + 1, ), dtype=torch.int64)
-        permuted_token_final_scales_tensor = token_selected_experts.new_empty((num_moe_inputs, ), dtype=torch.float32)
-        src_to_dest_map_tensor = token_selected_experts.new_empty((num_moe_inputs, ), dtype=torch.int32)
+        num_moe_inputs = experts_per_token * num_rows
 
-        return (unpermuted_token_selected_experts_tensor, unpermuted_source_token_ids_tensor,
-        permuted_source_token_ids_tensor, permuted_token_selected_experts_tensor, permuted_data_tensor,
-        expert_first_token_offset_tensor, permuted_token_final_scales_tensor, src_to_dest_map_tensor)
+        unpermuted_token_selected_experts_tensor = token_selected_experts.new_empty(
+            (num_moe_inputs, ), dtype=torch.int32)
+        unpermuted_source_token_ids_tensor = token_selected_experts.new_empty(
+            (num_moe_inputs, ), dtype=torch.int32)
+        permuted_source_token_ids_tensor = token_selected_experts.new_empty(
+            (num_moe_inputs, ), dtype=torch.int32)
+        permuted_token_selected_experts_tensor = token_selected_experts.new_empty(
+            (num_moe_inputs, ), dtype=torch.int32)
+        permuted_data_tensor = input.new_empty((num_moe_inputs, hidden_size),
+                                               dtype=torch.float32)
+        expert_first_token_offset_tensor = token_selected_experts.new_empty(
+            (num_experts_per_node + 1, ), dtype=torch.int64)
+        permuted_token_final_scales_tensor = token_selected_experts.new_empty(
+            (num_moe_inputs, ), dtype=torch.float32)
+        src_to_dest_map_tensor = token_selected_experts.new_empty(
+            (num_moe_inputs, ), dtype=torch.int32)
+
+        return (
+            unpermuted_token_selected_experts_tensor,
+            unpermuted_source_token_ids_tensor,
+            permuted_source_token_ids_tensor,
+            permuted_token_selected_experts_tensor,
+            permuted_data_tensor,
+            expert_first_token_offset_tensor,
+            permuted_token_final_scales_tensor,
+            src_to_dest_map_tensor,
+        )
 
     @torch.library.register_fake("trtllm::moe_finalize_scale_op")
-    def _(gemm2_output: torch.Tensor, fc2_expert_biases: torch.Tensor,
-          unpermuted_final_scales: torch.Tensor, expanded_source_row_to_expanded_dest_row: torch.Tensor,
-          expert_for_source_row: torch.Tensor,
-          expert_first_token_offset_tensor: torch.Tensor, num_rows: int, hidden_size: int, experts_per_token: int,
-          num_experts_per_node: int, tp_size: int, tp_rank: int, ep_size: int, ep_rank: int):
+    def _(
+        gemm2_output: torch.Tensor,
+        fc2_expert_biases: torch.Tensor,
+        unpermuted_final_scales: torch.Tensor,
+        expanded_source_row_to_expanded_dest_row: torch.Tensor,
+        expert_for_source_row: torch.Tensor,
+        expert_first_token_offset_tensor: torch.Tensor,
+        num_rows: int,
+        hidden_size: int,
+        experts_per_token: int,
+        num_experts_per_node: int,
+        tp_size: int,
+        tp_rank: int,
+        ep_size: int,
+        ep_rank: int,
+    ):
 
-        return gemm2_output.new_empty((num_rows, hidden_size), dtype=gemm2_output.dtype)
+        return gemm2_output.new_empty((num_rows, hidden_size),
+                                      dtype=gemm2_output.dtype)
 
-   
+
 def fp8_quantize_1x128(input: torch.Tensor):
     return torch.ops.trtllm.fp8_quantize_1x128(input)
