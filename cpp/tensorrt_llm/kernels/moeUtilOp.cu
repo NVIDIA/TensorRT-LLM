@@ -379,7 +379,8 @@ __host__ __device__ constexpr int64_t getOffsetFlatSFArray(int64_t expert_id, in
     auto min_alignment = cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentFP4;
     int64_t rounded_gemm_n = cute::ceil_div(gemm_n, min_alignment) * min_alignment;
     assert(gemm_k % cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize == 0);
-    return expert_id * rounded_gemm_n * gemm_k / cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
+    return expert_id * rounded_gemm_n * gemm_k
+        / cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
 }
 
 __host__ __device__ constexpr int64_t getOffsetActivationSF(int64_t expert_id, int64_t token_offset, int64_t gemm_k)
@@ -414,7 +415,8 @@ __device__ uint32_t quantizePackedFP4Value(ComputeElem& post_act_val, float glob
 
     // Use `token - num_tokens_before_expert` because we want this to be relative to the start of this expert
     // auto sf_out
-    //     = cvt_quant_to_fp4_get_sf_out_offset<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF, CVT_FP4_NUM_THREADS_PER_SF>(
+    //     = cvt_quant_to_fp4_get_sf_out_offset<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF,
+    //     CVT_FP4_NUM_THREADS_PER_SF>(
     //         std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx, std::nullopt /* numRows */,
     //         num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED);
     auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF,
@@ -443,18 +445,20 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id, int
         elem_idx, std::nullopt /* numRows */, num_cols, act_sf_expert, FP4QuantizationSFLayout::SWIZZLED);
     if (sf_out)
     {
-        auto const sf_in = cvt_quant_to_fp4_get_sf_out_offset<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF,
-            CVT_FP4_NUM_THREADS_PER_SF, NVFP4_VEC_SIZE>(std::nullopt /* batchIdx */, source_token_id, elem_idx,
-            std::nullopt /* numRows */, num_cols, const_cast<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF*>(input_sf),
-            FP4QuantizationSFLayout::SWIZZLED);
+        auto const sf_in
+            = cvt_quant_to_fp4_get_sf_out_offset<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF,
+                CVT_FP4_NUM_THREADS_PER_SF, NVFP4_VEC_SIZE>(std::nullopt /* batchIdx */, source_token_id, elem_idx,
+                std::nullopt /* numRows */, num_cols,
+                const_cast<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF*>(input_sf),
+                FP4QuantizationSFLayout::SWIZZLED);
         *sf_out = *sf_in;
     }
 }
 
 void generateTokenPermutation(int const* unpermuted_token_selected_experts, int const* unpermuted_source_token_ids,
     int* permuted_token_selected_experts, int* permuted_source_token_ids, int64_t* expert_first_token_offset,
-    int64_t num_rows, int64_t num_experts_per_node, int64_t k, cutlass_kernels::CubKeyValueSorter& sorter, void* sorter_ws,
-    cudaStream_t stream)
+    int64_t num_rows, int64_t num_experts_per_node, int64_t k, cutlass_kernels::CubKeyValueSorter& sorter,
+    void* sorter_ws, cudaStream_t stream)
 {
     int64_t const expanded_num_rows = k * num_rows;
     sorter.updateNumExperts(num_experts_per_node);
@@ -707,7 +711,8 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
         float const* unpermuted_scales, float* permuted_scales, int const* expanded_dest_row_to_expanded_source_row,   \
         int* expanded_source_row_to_expanded_dest_row, int64_t const num_rows, int64_t const* num_valid_tokens_ptr,    \
         int64_t const cols, int const k, int const num_experts_per_node, float const* fc1_act_global_scale,            \
-        int64_t* expert_first_token_offset, cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,            \
+        int64_t* expert_first_token_offset,                                                                            \
+        cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,                               \
         cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, cudaStream_t stream);
 
 INSTANTIATE_EXPAND_INPUT_ROWS(half, half);
