@@ -154,8 +154,10 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             batch.generation_requests = []
 
             pages_before = kv_cache_manager.get_num_free_blocks()
+            resource_manager = ResourceManager(
+                {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
             with model_engine._maybe_pad_batch(
-                    batch, kv_cache_manager) as padded_batch:
+                    batch, resource_manager) as padded_batch:
                 # No padding for prefill
                 self.assertIs(batch, padded_batch)
             self.assertEqual(kv_cache_manager.get_num_free_blocks(),
@@ -165,9 +167,13 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             batch.context_requests = []
             batch.generation_requests = requests
             pages_before = kv_cache_manager.get_num_free_blocks()
-            new_dummy_block = 1 if model_engine.cuda_graph_dummy_request is None else 0
+            tokens_per_block = kv_cache_manager.tokens_per_block
+            # 2 is the number of tokens for the dummy request, in which one is the prompt and the other is the generation input.
+            new_dummy_block = (
+                2 + tokens_per_block - 1
+            ) // tokens_per_block if model_engine.cuda_graph_dummy_request is None else 0
             with model_engine._maybe_pad_batch(
-                    batch, kv_cache_manager) as padded_batch:
+                    batch, resource_manager) as padded_batch:
                 if batch_size < 8 and max_seq_len < 25:
                     self.assertEqual(
                         len(padded_batch.generation_requests) % 8, 0)
