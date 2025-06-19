@@ -56,6 +56,7 @@ enum class AllReduceStrategyType : int8_t
     ONESHOT = 4,
     TWOSHOT = 5,
     LOWPRECISION = 6,
+    MNNVL = 7
 };
 
 enum class AllReduceStrategyConfig : int8_t

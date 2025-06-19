@@ -32,6 +32,11 @@ else() # Windows
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
 endif()
 
+find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS nvml)
+
 add_library(common_src OBJECT ${SRCS} ${CU_SRCS})
 set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET common_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+set(CUDA_NVML_LIB CUDA::nvml)
+target_link_libraries(common_src ${CUDA_NVML_LIB})

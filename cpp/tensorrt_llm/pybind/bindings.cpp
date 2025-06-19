@@ -25,6 +25,7 @@
 
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
+#include "tensorrt_llm/common/linkSupportUtil.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
 #include "tensorrt_llm/pybind/batch_manager/bindings.h"
@@ -581,4 +582,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate, py::return_value_policy::reference);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
+
+    auto mUtil = m.def_submodule("allreduceUtil", "Internal submodule of TRTLLM runtime");
+    mUtil.def("check_nvlink_p2p_supported", tensorrt_llm::common::initGroupTopology, "Lamport initialize all buffers");
 }
