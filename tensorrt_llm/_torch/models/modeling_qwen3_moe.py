@@ -263,7 +263,6 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
             do_finalize=do_finalize,
         )
 
-        # print(f"self.layer_idx: {self.layer_idx}, do_finalize: {do_finalize}, spec_metadata is not None: {spec_metadata is not None}")
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
                 if spec_metadata:
