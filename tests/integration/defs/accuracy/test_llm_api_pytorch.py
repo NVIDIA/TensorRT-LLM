@@ -575,18 +575,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-<<<<<<< HEAD
-    @pytest.mark.skip_device_not_contain(["H100", "H200"])
-    # @parametrize_with_ids(
-    #     "torch_compile",
-    #     [False, pytest.param(True, marks=skip_device_contain_gb200)])
-    @parametrize_with_ids("torch_compile", [False])
-=======
     @skip_no_hopper
     @parametrize_with_ids(
         "torch_compile",
         [False, pytest.param(True, marks=skip_device_contain_gb200)])
->>>>>>> origin/main
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
                            # (True, False, False, False),
