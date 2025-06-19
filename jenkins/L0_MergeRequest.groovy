@@ -989,8 +989,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         }
                     }
                 }
-                if (!willRunMultiGpuTest && JOB_NAME ==~ /.*PostMerge.*/) {
-                    echo "Not postMerge job and will not run multi-GPU tests"
+                if (!willRunMultiGpuTest && !(env.JOB_NAME ==~ /.*PostMerge.*/)) {
+                    echo "Not postMerge job and willRunMultiGpuTest: ${willRunMultiGpuTest}"
                     return
                 }
                 testStageName = "[Test-x86_64-Multi-GPU] Run"
