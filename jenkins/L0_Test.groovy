@@ -2326,7 +2326,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                 trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
                     sh "env | sort"
                     def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
-                    runLLMBuildFromPackage(pipeline, cpuArch, false, "imageTest/")
+                    runLLMBuild(pipeline, cpuArch, false, "imageTest/")
                 })
             }
         }
