@@ -484,7 +484,7 @@ class WideEPMoE(MoE):
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
             # use separate allgather since doesn't have sizes, can be optimized but in allgather path it is OK
-            if is_last_call:
+            if is_last_call and loadbalancer_local_statistic_info is not None:
                 gathered_loadbalancer_local_statistic_info = allgather(
                     loadbalancer_local_statistic_info, self.mapping, dim=0)
             # Fp4 gemm has extra scaling factor
