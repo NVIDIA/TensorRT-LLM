@@ -15,6 +15,7 @@
  */
 
 #include <cstddef>
+#include <cstdlib>
 #include <cuda_runtime_api.h>
 
 #include "gdrwrap.h"
@@ -27,9 +28,35 @@
 namespace tensorrt_llm::runtime
 {
 
+bool HostAccessibleDeviceAllocator::mAllowManagedFallback = false;
+
+bool HostAccessibleDeviceAllocator::isSupported()
+{
+    if (TopologyDetector::getInstance().getCurrentGpuMemoryNumaId() >= 0)
+    {
+        // we are on systems that GPU memory is also a NUMA node.
+        return true;
+    }
+    if (!tensorrt_llm::runtime::gdrcopy::isInitialized() && !tensorrt_llm::runtime::gdrcopy::initialize())
+    {
+        // system don't support GDRCopy.
+        return mAllowManagedFallback;
+    }
+    return true;
+}
+
 void HostAccessibleDeviceAllocator::init()
 {
     TLLM_CHECK(mIsInited == false);
+
+    if (getenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK") != nullptr)
+    {
+        if (std::string(getenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK")) == "1")
+        {
+            mAllowManagedFallback = true;
+        }
+    }
+
     TLLM_CUDA_CHECK(cudaGetDevice(&mDevId));
     mGpuMemNumaId = TopologyDetector::getInstance().getCurrentGpuMemoryNumaId();
     if (mGpuMemNumaId < 0)
@@ -148,9 +175,17 @@ void* HostAccessibleDeviceAllocator::allocate(size_t memorySize)
         devPtr = TopologyDetector::getInstance().allocateCurrentGpuNumaMemory(memorySize);
         hostPtr = devPtr;
     }
-    else
+    else if (mGdrHandle)
     {
         gdrcopy::gdrCudaMalloc(&hostPtr, &devPtr, memorySize, &memDesc, mGdrHandle);
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(
+            mAllowManagedFallback, "HostAccessibleDeviceAllocator is not supported on the current system.");
+        TLLM_CUDA_CHECK(cudaMallocManaged(&devPtr, memorySize));
+        TLLM_CUDA_CHECK(cudaMemAdvise(devPtr, memorySize, cudaMemAdviseSetPreferredLocation, currentDevId));
+        hostPtr = devPtr;
     }
     recordAllocation(devPtr, memorySize, hostPtr, memDesc);
     return devPtr;
@@ -167,9 +202,15 @@ void HostAccessibleDeviceAllocator::free(void* ptr)
         {
             gdrcopy::gdrCudaFree(allocInfo.memDesc, mGdrHandle);
         }
-        else
+        else if (mGpuMemNumaId >= 0)
         {
             TopologyDetector::getInstance().freeCurrentGpuNumaMemory(it->first, allocInfo.size);
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(
+                mAllowManagedFallback, "HostAccessibleDeviceAllocator is not supported on the current system.");
+            TLLM_CUDA_CHECK(cudaFree(ptr));
         }
         mAllocations.erase(it);
     }

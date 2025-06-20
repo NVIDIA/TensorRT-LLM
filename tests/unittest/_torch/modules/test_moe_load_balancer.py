@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,9 @@ class TestMoeLoadBalancer(unittest.TestCase):
     """
     Test cases for the MoeLoadBalancer class.
     """
+
+    def setUp(self):
+        os.environ["TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK"] = "1"
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_moe_load_balancer_init(self, mock_load_balancer_impl):
