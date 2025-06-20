@@ -25,13 +25,6 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-enum class CacheType
-{
-    kSELF = 0,
-    kCROSS = 1,
-    kSELFKONLY = 2,
-};
-
 //! @brief Encapsulates parameters to configure paged KV cache.
 class KvCacheConfig
 {

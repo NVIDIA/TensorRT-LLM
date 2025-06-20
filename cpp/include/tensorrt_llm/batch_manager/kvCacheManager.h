@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
+#include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
