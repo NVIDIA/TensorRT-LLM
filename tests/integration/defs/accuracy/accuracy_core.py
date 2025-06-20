@@ -15,7 +15,9 @@
 import json
 import math
 import os
+import shutil
 import tempfile
+from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 import pytest
@@ -366,6 +368,58 @@ class PassKeyRetrieval128k(AccuracyTask):
     MAX_OUTPUT_LEN = 50
 
 
+class TempDirLRUCache:
+    """
+    Cache temporary directories for reuse.
+    """
+
+    def __init__(self, max_size: int | None = None) -> None:
+        # dicts are ordered by insertion order
+        self._cache: dict[str, str] = {}
+
+        # assumes directories don't change size after entering the cache
+        self._sizes: dict[str, int] = {}
+        self._size: int = 0
+        self._max_size = max_size or float("inf")
+
+    def get(self, key: str) -> str | None:
+        if key in self._cache:
+            # update lru
+            tdir = self._cache.pop(key)
+            self._cache[key] = tdir
+            return tdir
+
+    def put(self, key: str, tdir: str) -> None:
+        if self.get(key) is not None:
+            raise ValueError(f"{key} is already in the cache")
+
+        size = sum(f.stat().st_size for f in Path(tdir).glob('**/*')
+                   if f.is_file())
+
+        if size > self._max_size:
+            raise ValueError(f"{tdir} exceeds the allowed cache size")
+
+        # pop first
+        while self._size + size > self._max_size:
+            evicted_key = next(iter(self._cache.keys()))
+            evicted = self._cache.pop(evicted_key)
+            evicted_size = self._sizes.pop(evicted_key)
+            self._size -= evicted_size
+            shutil.rmtree(evicted)
+
+        self._cache[key] = tdir
+        self._sizes[key] = size
+        self._size += size
+
+    def clear(self) -> None:
+        while self._cache:
+            _, tdir = self._cache.popitem()
+            shutil.rmtree(tdir)
+
+        self._sizes.clear()
+        self._size = 0
+
+
 class CliFlowAccuracyTestHarness:
     # Model
     MODEL_NAME = None
@@ -378,15 +432,22 @@ class CliFlowAccuracyTestHarness:
     def setup_class(cls, request):
         cls.llm_venv = request.getfixturevalue("llm_venv")
         cls.llm_root = request.getfixturevalue("llm_root")
+        cls.convert_cache = TempDirLRUCache()
+        cls.build_cache = TempDirLRUCache()
+        cls.workspaces: list[str] = []
+        yield
+        cls.convert_cache.clear()
+        cls.build_cache.clear()
+        for workspace in cls.workspaces:
+            shutil.rmtree(workspace)
 
     @pytest.fixture(autouse=True, scope="function")
     def setup_method(self):
-        with tempfile.TemporaryDirectory(
-                prefix=self.MODEL_NAME.replace("/", "-"),
-                dir=self.llm_venv.get_working_directory()) as workspace:
-            self.ckpt_dir = f"{workspace}/cmodels"
-            self.engine_dir = f"{workspace}/engines"
-            yield
+        workspace = tempfile.mkdtemp(prefix=self.MODEL_NAME.replace("/", "-"),
+                                     dir=self.llm_venv.get_working_directory())
+        self.workspaces.append(workspace)
+        self.ckpt_dir = f"{workspace}/cmodels"
+        self.engine_dir = f"{workspace}/engines"
 
     def install_requirements(self):
         requirements = f"{self.llm_root}/examples/{self.EXAMPLE_FOLDER}/requirements.txt"
@@ -450,7 +511,6 @@ class CliFlowAccuracyTestHarness:
 
         convert_cmd = [
             script,
-            f"--output_dir={self.ckpt_dir}",
             f"--dtype={self.dtype}",
         ]
 
@@ -525,7 +585,15 @@ class CliFlowAccuracyTestHarness:
         if self.extra_convert_args:
             convert_cmd.extend(self.extra_convert_args)
 
-        venv_check_call(self.llm_venv, convert_cmd)
+        key = " ".join(convert_cmd)
+        if (cached_ckpt := self.convert_cache.get(key)) is not None:
+            logger.info(
+                f"Reusing previously cached checkpoint at {cached_ckpt}...")
+            self.ckpt_dir = cached_ckpt
+        else:
+            convert_cmd.append(f"--output_dir={self.ckpt_dir}")
+            venv_check_call(self.llm_venv, convert_cmd)
+            self.convert_cache.put(key, self.ckpt_dir)
 
     def build(self):
         logger.info("Building engines...")
@@ -536,7 +604,6 @@ class CliFlowAccuracyTestHarness:
         build_cmd = [
             "trtllm-build",
             f"--checkpoint_dir={self.ckpt_dir}",
-            f"--output_dir={self.engine_dir}",
             f"--max_batch_size={max_batch_size}",
             f"--max_input_len={max_input_len}",
             f"--max_seq_len={max_seq_len}",
@@ -544,7 +611,20 @@ class CliFlowAccuracyTestHarness:
         ]
         if self.extra_build_args:
             build_cmd.extend(self.extra_build_args)
-        check_call(" ".join(build_cmd), shell=True, env=self.llm_venv._new_env)
+
+        key = " ".join(build_cmd)
+        if (cached_engine := self.build_cache.get(key)) is not None:
+            logger.info(
+                f"Reusing previously cached engine at {cached_engine}...")
+            self.engine_dir = cached_engine
+        else:
+            build_cmd.extend([
+                f"--output_dir={self.engine_dir}",
+            ])
+            check_call(" ".join(build_cmd),
+                       shell=True,
+                       env=self.llm_venv._new_env)
+            self.build_cache.put(key, self.engine_dir)
 
     def summarize(self, task: AccuracyTask):
         logger.info("Running summarize...")
