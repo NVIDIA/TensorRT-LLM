@@ -991,6 +991,8 @@ private:
 class KvCacheConfig
 {
 public:
+    static constexpr auto kDefaultGpuMemFraction = 0.9F;
+
     explicit KvCacheConfig(bool enableBlockReuse = true, std::optional<SizeType32> const& maxTokens = std::nullopt,
         std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> const& sinkTokenLength = std::nullopt,

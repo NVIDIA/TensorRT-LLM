@@ -2057,32 +2057,33 @@ std::map<SizeType32, std::vector<SizeType32>> BaseKVCacheManager::groupLayersByW
 }
 
 std::tuple<uint64_t, uint64_t> BaseKVCacheManager::calculateFreeMemBytes(
-    runtime::BufferManager const& bufferManager, KvCacheConfig const& config)
+    runtime::BufferManager const& bufferManager, executor::KvCacheConfig const& config)
 {
-    auto const freeMemFraction = config.freeGpuMemoryFraction.value_or(KvCacheConfig::kDefaultGpuMemFraction);
+    auto const freeMemFraction
+        = config.getFreeGpuMemoryFraction().value_or(executor::KvCacheConfig::kDefaultGpuMemFraction);
     TLLM_CHECK_WITH_INFO(freeMemFraction < 1.0F,
         "Invalid freeMemFraction, freeMemFraction (%f) must be smaller than 1.0f", freeMemFraction);
-    if (config.maxTokens.has_value())
+    if (config.getMaxTokens().has_value())
     {
-        if (config.freeGpuMemoryFraction.has_value())
+        if (config.getFreeGpuMemoryFraction().has_value())
         {
             TLLM_LOG_WARNING(
                 "Both freeGpuMemoryFraction (aka kv_cache_free_gpu_mem_fraction) "
                 "and maxTokens (aka max_tokens_in_paged_kv_cache) "
                 "are set (to %f and %ld, respectively). The smaller value will be used.",
-                freeMemFraction, (int64_t) config.maxTokens.value());
+                freeMemFraction, (int64_t) config.getMaxTokens().value());
         }
     }
 
     TLLM_CUDA_CHECK(::cudaDeviceSynchronize());
-    auto const [freeMem, totalMem] = tc::getDeviceMemoryInfo(config.useUvm);
+    auto const [freeMem, totalMem] = tc::getDeviceMemoryInfo(config.getUseUvm());
     auto const finalFreeMem = freeMem + bufferManager.memoryPoolFree();
     TLLM_LOG_INFO("Memory usage when calculating max tokens in paged kv cache: total: %0.2f GiB, available: %0.2f GiB",
         totalMem / static_cast<double>(1 << 30), finalFreeMem / static_cast<double>(1 << 30));
     TLLM_CHECK_WITH_INFO(finalFreeMem <= totalMem, "Free memory cannot exceed total memory");
 
     auto const freePrimaryMemBytes = static_cast<uint64_t>(finalFreeMem * freeMemFraction);
-    auto const freeSecondaryMemBytes = config.hostCacheSize.value_or(0);
+    auto const freeSecondaryMemBytes = config.getHostCacheSize().value_or(0);
 
     TLLM_LOG_DEBUG("Calculated free memory: {.freePrimaryMemBytes=%" PRIu64 ", .freeSecondaryMemBytes=%" PRIu64 "}",
         freePrimaryMemBytes, freeSecondaryMemBytes);
@@ -2120,7 +2121,7 @@ bool isSortedVectorIdenticalAcrossAllRanks(WorldConfig const& worldConfig, std::
 }
 } // namespace
 
-BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& config, bool isCrossAttention,
+BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfig const& config, bool isCrossAttention,
     nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
     uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor)
@@ -2130,7 +2131,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         isCrossAttention ? "Cross KvCacheManager" : "Self KvCacheManager", allottedPrimaryMemBytes,
         allottedSecondaryMemBytes);
 
-    if (config.maxTokens.has_value() && windowSizeToLayers.size() > 1)
+    if (config.getMaxTokens().has_value() && windowSizeToLayers.size() > 1)
     {
         TLLM_LOG_WARNING(
             "Setting maxTokens when using Variable Sliding Window Attention is a strange concept, as it limits "
@@ -2162,9 +2163,9 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         TLLM_LOG_DEBUG("windowSizeShare: %f, cacheSizeBytesPerToken: %d", windowSizeShare, cacheSizeBytesPerToken);
         auto maxTokens = static_cast<uint64_t>(
             allottedPrimaryMemBytes * windowSizeShare / static_cast<double>(cacheSizeBytesPerToken));
-        if (config.maxTokens.has_value())
+        if (config.getMaxTokens().has_value())
         {
-            auto const maxTokensFromConfig = static_cast<uint64_t>(config.maxTokens.value());
+            auto const maxTokensFromConfig = static_cast<uint64_t>(config.getMaxTokens().value());
             TLLM_LOG_DEBUG("Maximum kv-cache token overridden by configuration as '%ld'.", maxTokensFromConfig);
             maxTokens = std::min(maxTokensFromConfig, maxTokens);
         }
@@ -2184,7 +2185,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(KvCacheConfig const& c
         TLLM_LOG_DEBUG(
             "Number of blocks in KV cache secondary pool for windowSize %d: %d, onboard blocks to primary memory "
             "before reuse: %s",
-            windowSize, blocksInSecondaryPool, config.onboardBlocks ? "true" : "false");
+            windowSize, blocksInSecondaryPool, config.getOnboardBlocks() ? "true" : "false");
         return blocksInSecondaryPool;
     };
 
