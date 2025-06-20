@@ -9,8 +9,7 @@ from defs.conftest import skip_no_hopper
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
-from tensorrt_llm import DisaggregatedParams, SamplingParams
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._utils import set_mpi_comm
 from tensorrt_llm.llmapi import KvCacheConfig, MpiCommSession
 

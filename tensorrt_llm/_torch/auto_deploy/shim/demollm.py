@@ -10,11 +10,12 @@ import torch
 import torch.multiprocessing as mp
 from transformers import PreTrainedTokenizerBase
 
+from ...._tensorrt_engine import LLM
 from ....executor import GenerationExecutor
 from ....executor.request import GenerationRequest
 from ....executor.result import CompletionOutput, GenerationResult
 from ....inputs.registry import create_input_processor
-from ....llmapi.llm import LLM, RequestOutput
+from ....llmapi.llm import RequestOutput
 from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ....llmapi.tokenizer import TokenizerBase
 from ....sampling_params import SamplingParams

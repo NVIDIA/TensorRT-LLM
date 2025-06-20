@@ -1,5 +1,6 @@
 ### Distributed LLM Generation
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM
 
 
 def main():

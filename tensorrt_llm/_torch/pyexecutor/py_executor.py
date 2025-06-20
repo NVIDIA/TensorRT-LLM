@@ -205,6 +205,7 @@ class PyExecutor:
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
         self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
+        self.stream_interval = model_engine.pytorch_backend_config.stream_interval
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
@@ -1608,7 +1609,7 @@ class PyExecutor:
                       new_tensors_device: Optional[SampleStateTensors] = None):
 
         @nvtx_range(
-            f"[Executor] _forward_step: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
+            f"[Executor] _forward_step {self.model_engine.iter_counter}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits):
@@ -1982,7 +1983,7 @@ class PyExecutor:
 
         logger.debug(
             f'before gather, rank = {self.dist.rank}, responses = {responses}')
-        if self.enable_attention_dp:
+        if self.enable_attention_dp and self.dist.world_size != 1:
             if not self.gather_all_responses:
                 responses_list = self.dist.tp_gather(responses)
             else:
@@ -2045,11 +2046,14 @@ class PyExecutor:
 
             request.draft_tokens = request.py_draft_tokens
             request.decoding_iter = request.py_decoding_iter
-            response = request.create_response(False, self.dist.rank)
+
             request_done = False
-            if response:
-                request_done = response.result.is_final
-                new_responses.update({req_id: response})
+            if self.model_engine.iter_counter % self.stream_interval == 0 or request.is_finished:
+                response = request.create_response(False, self.dist.rank)
+                if response:
+                    request_done = response.result.is_final
+                    new_responses.update({req_id: response})
+
             if request_done:
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)

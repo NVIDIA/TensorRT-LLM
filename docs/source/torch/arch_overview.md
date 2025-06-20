@@ -5,10 +5,10 @@ Besides TensorRT, PyTorch can also serve as the backend for TensorRT-LLM. This d
 
 ## Top Level API
 
-The interface for PyTorch backend is `tensorrt._torch.LLM`.
+The interface for PyTorch backend is `tensorrt_llm.LLM`.
 
 ```python
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM
 llm = LLM(model=<path_to_llama_from_hf>)
 ```
 

@@ -14,7 +14,8 @@
 # limitations under the License.
 import pytest
 
-from tensorrt_llm.llmapi import LLM, EagleDecodingConfig, KvCacheConfig
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.llmapi import EagleDecodingConfig, KvCacheConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 

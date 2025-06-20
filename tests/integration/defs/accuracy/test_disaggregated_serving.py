@@ -83,7 +83,6 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
         yaml.dump(gen_server_config, f)
 
     args = LlmArgs.from_kwargs(model=model_name,
-                               backend="pytorch",
                                tensor_parallel_size=tensor_parallel_size)
 
     trtllm_serve_path = "trtllm-serve"

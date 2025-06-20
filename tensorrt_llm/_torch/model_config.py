@@ -282,6 +282,7 @@ class ModelConfig(Generic[TConfig]):
 
         num_heads = self.pretrained_config.num_attention_heads // (
             self.mapping.tp_size * self.mapping.cp_size)
+        hidden_size = self.pretrained_config.hidden_size // self.mapping.tp_size
 
         model_config_cpp = ModelConfigCpp(
             vocab_size=self.pretrained_config.vocab_size,
@@ -289,7 +290,7 @@ class ModelConfig(Generic[TConfig]):
             num_attention_layers=self.pretrained_config.num_hidden_layers,
             num_rnn_layers=0,
             num_heads=num_heads,
-            hidden_size=self.pretrained_config.hidden_size,
+            hidden_size=hidden_size,
             data_type=torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
 
@@ -317,7 +318,7 @@ class ModelConfig(Generic[TConfig]):
         if "head_size" in self.pretrained_config:
             head_size = self.pretrained_config.head_size
         else:
-            head_size = self.pretrained_config.hidden_size // num_heads
+            head_size = hidden_size // num_heads
 
         model_config_cpp.mlp_hidden_size = mlp_hidden_size
         model_config_cpp.size_per_head = head_size

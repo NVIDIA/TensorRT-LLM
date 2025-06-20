@@ -5,8 +5,8 @@ import pytest
 import yaml
 
 import tensorrt_llm.bindings.executor as tle
-from tensorrt_llm._torch.llm import LLM as TorchLLM
-from tensorrt_llm.llmapi.llm import LLM
+from tensorrt_llm import LLM as TorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi.llm_args import *
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
 
@@ -54,10 +54,10 @@ speculative_config:
         f.seek(0)
         dict_content = yaml.safe_load(f)
 
-    llm_args = LlmArgs(model=llama_model_path)
+    llm_args = TrtLlmArgs(model=llama_model_path)
     llm_args_dict = update_llm_args_with_extra_dict(llm_args.to_dict(),
                                                     dict_content)
-    llm_args = LlmArgs(**llm_args_dict)
+    llm_args = TrtLlmArgs(**llm_args_dict)
     assert llm_args.speculative_config.max_window_size == 4
     assert llm_args.speculative_config.max_ngram_size == 3
     assert llm_args.speculative_config.max_verification_set_size == 4
@@ -226,10 +226,10 @@ class TestTrtLlmArgs:
 
     def test_dynamic_setattr(self):
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
-            args = LlmArgs(model=llama_model_path, invalid_arg=1)
+            args = TrtLlmArgs(model=llama_model_path, invalid_arg=1)
 
         with pytest.raises(ValueError):
-            args = LlmArgs(model=llama_model_path)
+            args = TrtLlmArgs(model=llama_model_path)
             args.invalid_arg = 1
 
 

@@ -4,8 +4,8 @@ from typing import Callable
 import openai
 from transformers import AutoTokenizer
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import GenerationExecutor
-from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.sampling_params import SamplingParams
 

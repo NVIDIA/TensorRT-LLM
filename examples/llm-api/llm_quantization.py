@@ -3,7 +3,8 @@ import logging
 
 import torch
 
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi import CalibConfig, QuantAlgo, QuantConfig
 
 major, minor = torch.cuda.get_device_capability()

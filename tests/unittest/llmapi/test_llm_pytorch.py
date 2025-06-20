@@ -1,5 +1,6 @@
 import pytest
 
+from tensorrt_llm import LLM
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -71,9 +72,7 @@ def test_llm_get_stats_async(return_context_logits, use_overlap,
         SamplingParams()  # pytorch only supports n=1
     ])
 def test_llm_abort_request(sampling_params):
-    from tensorrt_llm._torch import LLM as LLM_torch
-    llm = LLM_torch(model=llama_model_path,
-                    kv_cache_config=global_kvcache_config)
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
 
 
@@ -82,10 +81,9 @@ def test_llm_reward_model():
     tokenizer = TransformersTokenizer.from_pretrained(rm_model_path)
     tokenized_input = tokenizer(prompts, return_tensors="pt")["input_ids"]
 
-    from tensorrt_llm._torch import LLM as LLM_torch
-    llm = LLM_torch(model=rm_model_path,
-                    attn_backend="VANILLA",
-                    disable_overlap_scheduler=True)
+    llm = LLM(model=rm_model_path,
+              attn_backend="VANILLA",
+              disable_overlap_scheduler=True)
 
     sampling_params = SamplingParams(return_context_logits=True)
 
@@ -106,8 +104,6 @@ def test_llm_with_postprocess_parallel_and_result_handler(streaming):
 
 
 def llama_v2_13b_lora_test_harness(**llm_kwargs) -> None:
-    from tensorrt_llm._torch.llm import LLM
-
     lora_config = LoraConfig(lora_dir=[
         f"{llm_models_root()}/llama-models-v2/chinese-llama-2-lora-13b"
     ],
@@ -134,8 +130,6 @@ def llama_v2_13b_lora_test_harness(**llm_kwargs) -> None:
 
 
 def llama_7b_multi_lora_test_harness(**llm_kwargs) -> None:
-    from tensorrt_llm._torch.llm import LLM
-
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
     hf_lora_dir1 = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
     hf_lora_dir2 = f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
@@ -181,8 +175,6 @@ def test_llama_v2_13b_lora():
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora_default_modules() -> None:
-    from tensorrt_llm._torch.llm import LLM
-
     lora_config = LoraConfig(max_lora_rank=64)
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
@@ -214,8 +206,6 @@ def test_llama_7b_multi_lora():
 # https://jirasw.nvidia.com/browse/TRTLLM-5045
 @skip_gpu_memory_less_than_138gb
 def test_nemotron_nas_lora() -> None:
-    from tensorrt_llm._torch.llm import LLM
-
     lora_config = LoraConfig(lora_dir=[
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
     ],
@@ -248,8 +238,6 @@ def test_nemotron_nas_lora() -> None:
 
 @skip_gpu_memory_less_than_80gb
 def test_codellama_fp8_with_bf16_lora() -> None:
-    from tensorrt_llm._torch.llm import LLM
-
     model_dir = f"{llm_models_root()}/codellama/CodeLlama-7b-Instruct-hf/"
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
                                kv_cache_quant_algo=QuantAlgo.FP8)
@@ -308,8 +296,6 @@ def test_codellama_fp8_with_bf16_lora() -> None:
 
 @skip_gpu_memory_less_than_80gb
 def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
-    from tensorrt_llm._torch.llm import LLM
-
     model_dir = f"{llm_models_root()}/Bielik-11B-v2.2-Instruct"
 
     target_modules = ['attn_q', 'attn_k', 'attn_v']

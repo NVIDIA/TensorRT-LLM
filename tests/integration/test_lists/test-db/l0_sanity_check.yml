@@ -14,6 +14,8 @@ l0_sanity_check:
           - '*a10*'
           - '*gb202*'
           - '*gb203*'
+          - '*5080*'
+          - '*5090*'
         linux_distribution_name: ubuntu*
     tests:
       - llmapi/test_llm_examples.py::test_llmapi_quickstart

@@ -2,7 +2,7 @@ import torch
 from utils.llm_data import llm_models_root
 from utils.util import skip_gpu_memory_less_than
 
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.sampling_params import SamplingParams
