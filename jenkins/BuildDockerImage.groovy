@@ -527,8 +527,6 @@ pipeline {
                         def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
                         def requiredFiles = [
                             "TensorRT-LLM-GH200.tar.gz",
-                            "tensorrt-llm-release-src-",
-                            "tensorrt-llm-sbsa-release-src-",
                             "TensorRT-LLM.tar.gz"
                         ]
                         def maxWaitMinutes = 180
