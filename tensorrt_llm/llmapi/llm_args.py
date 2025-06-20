@@ -658,6 +658,8 @@ class KvCacheConfig(BaseModel, PybindMirror):
         description=
         "Whether partially matched blocks that are in use can be reused after copying them."
     )
+    use_uvm: bool = Field(default=False,
+                          description="Whether to use UVM for the KV cache.")
 
     def _to_pybind(self):
         return _KvCacheConfig(
@@ -672,7 +674,8 @@ class KvCacheConfig(BaseModel, PybindMirror):
             secondary_offload_min_priority=self.secondary_offload_min_priority,
             event_buffer_max_size=self.event_buffer_max_size,
             enable_partial_reuse=self.enable_partial_reuse,
-            copy_on_partial_reuse=self.copy_on_partial_reuse)
+            copy_on_partial_reuse=self.copy_on_partial_reuse,
+            use_uvm=self.use_uvm)
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)

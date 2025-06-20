@@ -1150,6 +1150,8 @@ void Serialization::serialize(ExecutorConfig const& executorConfig, std::ostream
 KvCacheConfig Serialization::deserializeKvCacheConfig(std::istream& is)
 {
     auto enableBlockReuse = su::deserialize<bool>(is);
+    auto enablePartialReuse = su::deserialize<bool>(is);
+    auto copyOnPartialReuse = su::deserialize<bool>(is);
     auto maxTokens = su::deserialize<std::optional<SizeType32>>(is);
     auto maxAttentionWindowVec = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
     auto sinkTokenLength = su::deserialize<std::optional<SizeType32>>(is);
@@ -1159,14 +1161,18 @@ KvCacheConfig Serialization::deserializeKvCacheConfig(std::istream& is)
     auto crossKvCacheFraction = su::deserialize<std::optional<FloatType>>(is);
     auto secondaryOffloadMinPriority = su::deserialize<std::optional<executor::RetentionPriority>>(is);
     auto eventBufferMaxSize = su::deserialize<size_t>(is);
+    auto useUvm = su::deserialize<bool>(is);
 
     return KvCacheConfig{enableBlockReuse, maxTokens, maxAttentionWindowVec, sinkTokenLength, freeGpuMemoryFraction,
-        hostCacheSize, onboardBlocks, crossKvCacheFraction, secondaryOffloadMinPriority, eventBufferMaxSize};
+        hostCacheSize, onboardBlocks, crossKvCacheFraction, secondaryOffloadMinPriority, eventBufferMaxSize,
+        enablePartialReuse, copyOnPartialReuse, useUvm};
 }
 
 void Serialization::serialize(KvCacheConfig const& kvCacheConfig, std::ostream& os)
 {
     su::serialize(kvCacheConfig.getEnableBlockReuse(), os);
+    su::serialize(kvCacheConfig.getEnablePartialReuse(), os);
+    su::serialize(kvCacheConfig.getCopyOnPartialReuse(), os);
     su::serialize(kvCacheConfig.getMaxTokens(), os);
     su::serialize(kvCacheConfig.getMaxAttentionWindowVec(), os);
     su::serialize(kvCacheConfig.getSinkTokenLength(), os);
@@ -1176,6 +1182,7 @@ void Serialization::serialize(KvCacheConfig const& kvCacheConfig, std::ostream& 
     su::serialize(kvCacheConfig.getCrossKvCacheFraction(), os);
     su::serialize(kvCacheConfig.getSecondaryOffloadMinPriority(), os);
     su::serialize(kvCacheConfig.getEventBufferMaxSize(), os);
+    su::serialize(kvCacheConfig.getUseUvm(), os);
 }
 
 size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
@@ -1183,6 +1190,8 @@ size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
 
     size_t totalSize = 0;
     totalSize += su::serializedSize(kvCacheConfig.getEnableBlockReuse());
+    totalSize += su::serializedSize(kvCacheConfig.getEnablePartialReuse());
+    totalSize += su::serializedSize(kvCacheConfig.getCopyOnPartialReuse());
     totalSize += su::serializedSize(kvCacheConfig.getMaxTokens());
     totalSize += su::serializedSize(kvCacheConfig.getMaxAttentionWindowVec());
     totalSize += su::serializedSize(kvCacheConfig.getSinkTokenLength());
@@ -1192,6 +1201,7 @@ size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
     totalSize += su::serializedSize(kvCacheConfig.getCrossKvCacheFraction());
     totalSize += su::serializedSize(kvCacheConfig.getSecondaryOffloadMinPriority());
     totalSize += su::serializedSize(kvCacheConfig.getEventBufferMaxSize());
+    totalSize += su::serializedSize(kvCacheConfig.getUseUvm());
     return totalSize;
 }
 

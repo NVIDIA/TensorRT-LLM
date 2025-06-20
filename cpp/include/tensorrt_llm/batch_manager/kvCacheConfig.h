@@ -65,7 +65,7 @@ public:
     explicit KvCacheConfig(executor::KvCacheConfig const& kvCacheConfig)
         : KvCacheConfig(kvCacheConfig.getMaxTokens(), kvCacheConfig.getMaxAttentionWindowVec(),
             kvCacheConfig.getSinkTokenLength(), kvCacheConfig.getFreeGpuMemoryFraction(),
-            kvCacheConfig.getEnableBlockReuse(), false, kvCacheConfig.getHostCacheSize(),
+            kvCacheConfig.getEnableBlockReuse(), kvCacheConfig.getUseUvm(), kvCacheConfig.getHostCacheSize(),
             kvCacheConfig.getOnboardBlocks(), kvCacheConfig.getCrossKvCacheFraction(),
             kvCacheConfig.getSecondaryOffloadMinPriority(), kvCacheConfig.getEventBufferMaxSize(),
             kvCacheConfig.getEnablePartialReuse(), kvCacheConfig.getCopyOnPartialReuse())
