@@ -440,6 +440,8 @@ class WideEPMoE(MoE):
         x_row = x.shape[0]
         x_col = x.shape[1]
         sf_swizzle = True
+        x_row = x.shape[0]
+        x_col = x.shape[1]
         if self.has_any_quant:
             if self.has_fp8_qdq:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
@@ -895,7 +897,7 @@ class WideEPMoE(MoE):
         ), f'weight {weight_name} should be a is_contiguous, shape={weight_tensor.shape}, strides={weight_tensor.is_contiguous()}'
         assert weight_tensor.numel() * weight_tensor.element_size() == weight_tensor.untyped_storage().size(),\
             f'weight {weight_name} shape={weight_tensor.shape} storage_size = {weight_tensor.untyped_storage().size()}, numel={weight_tensor.numel()}, eltsize={weight_tensor.element_size()}, dtype={weight_tensor.dtype}'
-        self.layer_load_balancer.fix_tensor(weight_tensor)
+        self.layer_load_balancer.make_tensor_host_accessible(weight_tensor)
         param.data = weight_tensor
 
     def register_all_parameter_slot_and_to_fix_weight_fns(
@@ -912,7 +914,7 @@ class WideEPMoE(MoE):
                     self.register_parameter_weight_slot_fn,
                     (weight_name, local_slot_id))
         for weight_name in weight_and_tensor_dict:
-            self.layer_load_balancer.add_to_fix_weight_fn(
+            self.layer_load_balancer.add_to_migrate_weight_fn(
                 self.register_to_fix_weight_fn, (weight_name, ))
 
         local_shared_load_expert_ids = self.layer_load_balancer.get_load_expert_ids(
