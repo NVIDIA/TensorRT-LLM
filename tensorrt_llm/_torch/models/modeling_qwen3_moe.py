@@ -15,7 +15,7 @@ from ..modules.embedding import Embedding
 from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE, MoE,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
-                                 RoutingMethodType, create_moe)
+                                 RoutingMethodType, WideEPMoE, create_moe)
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
@@ -138,7 +138,7 @@ class Qwen3MoE(nn.Module):
                                           self.mapping,
                                           dim=0,
                                           sizes=all_rank_num_tokens)
-            elif not isinstance(self.experts, CutlassFusedMoE) or (
+            elif not isinstance(self.experts, (CutlassFusedMoE, WideEPMoE)) or (
                     not self.experts.has_fp8_qdq and self.experts.has_nvfp4):
                 # Use padding when not using the cutlass path or when x_sf in self.experts is not None
                 use_dp_padding = True

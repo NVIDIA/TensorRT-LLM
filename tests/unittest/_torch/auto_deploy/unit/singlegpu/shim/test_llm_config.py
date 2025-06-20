@@ -2,9 +2,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy.shim.demollm import DemoLLM
 from tensorrt_llm._torch.auto_deploy.transformations.transform import InferenceOptimizer
-from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.llmapi.llm_args import TorchCompileConfig, _AutoDeployLlmArgs
 
 # ================================
@@ -128,7 +128,8 @@ def test_config_flow(
 
     # Create instance with appropriate mocking
     with patch.object(api_class, "_try_load_tokenizer", return_value=MagicMock()):
-        instance = api_class(**config_params)
+        with patch.object(api_class, "_build_model", return_value=MagicMock()):
+            instance = api_class(**config_params)
 
     # Verify args were created correctly
     assert hasattr(instance, "args")
