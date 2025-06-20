@@ -394,7 +394,7 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
 
                 if self._streaming:
                     beam_output._last_text_len = 0
-                    beam_output.text = (beam_output.token_ids_diff)
+                    beam_output.text = str(beam_output.token_ids_diff)
                 else:
                     beam_output.text = str(beam_output.token_ids)
 
