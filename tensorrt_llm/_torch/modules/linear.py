@@ -536,7 +536,8 @@ class NVFP4LinearMethod(LinearMethodBase):
             output = output + bias
         return output
 
-    def load_weight_scales(weights: List[Dict],
+    def load_weight_scales(self,
+                           weights: List[Dict],
                            tp_size: int = 1,
                            tp_rank: int = 0,
                            tp_mode: Optional[TensorParallelMode] = None):
