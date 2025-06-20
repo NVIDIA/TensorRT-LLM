@@ -543,11 +543,12 @@ void SingleLayerMoeLoadBalancer::copyPlacementInfoToGpu()
 
 void SingleLayerMoeLoadBalancer::copyPlacementInfoToGpuByCpu()
 {
-    memcpy(mGpuPlacementHostAccess.expertReplicaCount, mCpuPlacementInfo.placementInfoForGPU.expertReplicaCount,
-        sizeof(int) * mMetaInfo.expertCount);
-    memcpy(mGpuPlacementHostAccess.expertReplicaStartOffset,
+    HostAccessibleDeviceAllocator::getInstance().memcpyToDevice(mGpuPlacementHostAccess.expertReplicaCount,
+        mCpuPlacementInfo.placementInfoForGPU.expertReplicaCount, sizeof(int) * mMetaInfo.expertCount);
+    HostAccessibleDeviceAllocator::getInstance().memcpyToDevice(mGpuPlacementHostAccess.expertReplicaStartOffset,
         mCpuPlacementInfo.placementInfoForGPU.expertReplicaStartOffset, sizeof(int) * mMetaInfo.expertCount);
-    memcpy(mGpuPlacementHostAccess.globalSlotIds, mCpuPlacementInfo.placementInfoForGPU.globalSlotIds,
+    HostAccessibleDeviceAllocator::getInstance().memcpyToDevice(mGpuPlacementHostAccess.globalSlotIds,
+        mCpuPlacementInfo.placementInfoForGPU.globalSlotIds,
         sizeof(int) * mMetaInfo.epSize * mMetaInfo.slotCountPerRank);
     mCpuPlacementInfo.rankExpertIds.swap(mCpuPlacementInfo.oldRankExpertIds);
     for (int i = 0; i < mMetaInfo.epSize; ++i)
@@ -763,14 +764,16 @@ void HostMemoryMoeWeightUpdater::copyWeightsCpu(MoeWeight const& src, MoeWeight 
     size_t threadCopyCount = fullCopyCount / size;
     for (size_t i = rank * threadCopyCount; i < (rank + 1) * threadCopyCount; i++)
     {
-        memcpy(dstPtr + i * dstPitch, srcPtr + i * srcPitch, singleCopySize);
+        HostAccessibleDeviceAllocator::getInstance().memcpyToDevice(
+            dstPtr + i * dstPitch, srcPtr + i * srcPitch, singleCopySize);
     }
     size_t threadStartOffset = rank * singleCopySize / size;
     size_t threadEndOffset = (rank + 1) * singleCopySize / size;
     size_t threadCopySize = threadEndOffset - threadStartOffset;
     for (size_t i = fullCopyCount; i < copyCount && threadCopySize > 0; i++)
     {
-        memcpy(dstPtr + i * dstPitch + threadStartOffset, srcPtr + i * srcPitch + threadStartOffset, threadCopySize);
+        HostAccessibleDeviceAllocator::getInstance().memcpyToDevice(
+            dstPtr + i * dstPitch + threadStartOffset, srcPtr + i * srcPitch + threadStartOffset, threadCopySize);
     }
 }
 

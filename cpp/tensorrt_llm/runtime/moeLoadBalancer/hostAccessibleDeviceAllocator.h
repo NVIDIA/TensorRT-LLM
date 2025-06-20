@@ -18,6 +18,7 @@
 
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <utility>
 
 #include "gdrwrap.h"
@@ -77,11 +78,21 @@ public:
      */
     void* getHostPtr(void* devPtr);
 
+    /**
+     * @brief memcpyToDevice, use memcpy or GDRCopy
+     *
+     * @param dst : the dst pointer, should be host accessible
+     * @param src : the src pointer, should be on host
+     * @param size : copy size
+     */
+    void memcpyToDevice(void* dst, void const* src, size_t size);
+
 private:
     struct AllocationInfo
     {
         size_t size;
         void* hostPtr;
+        void* devPtr;
         gdrcopy::GdrMemDesc* memDesc;
     };
 
@@ -132,6 +143,20 @@ private:
      */
     void recordAllocation(void* devPtr, size_t memorySize, void* hostPtr, gdrcopy::GdrMemDesc* memDesc = nullptr);
 
+    /**
+     * @brief Get Allocation information from host pointer
+     *
+     * @param The host accessible pointer
+     */
+    AllocationInfo getAllocationInfoFromHostPtr(void const* hostPtr);
+
+    /**
+     * @brief Get Allocation information from device pointer
+     *
+     * @param The device accessible pointer
+     */
+    AllocationInfo getAllocationInfoFromDevPtr(void const* devPtr);
+
     // if GPU memory has NUMA id, then CPU can direct access that. We should use this.
     int mGpuMemNumaId = -1;
     // if Not, we should use GDRCopy
@@ -143,8 +168,9 @@ private:
     std::mutex mRefMutex;
     int mLoadBalancerCount = 0;
 
-    std::mutex mAllocationsMutex;
-    std::map<void*, AllocationInfo> mAllocations;
+    std::shared_mutex mAllocationsMutex;
+    std::map<void const*, AllocationInfo> mDeviceAllocations;
+    std::map<void const*, AllocationInfo> mHostAllocations;
 
     static bool mAllowManagedFallback;
 };

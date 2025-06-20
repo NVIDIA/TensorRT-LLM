@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <string.h>
+
 #include <cstddef>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
@@ -122,28 +124,55 @@ void HostAccessibleDeviceAllocator::DecRefCount()
 void HostAccessibleDeviceAllocator::recordAllocation(
     void* devPtr, size_t memorySize, void* hostPtr, gdrcopy::GdrMemDesc* memDesc)
 {
-    std::lock_guard<std::mutex> lock(mAllocationsMutex);
-    mAllocations[devPtr] = {memorySize, hostPtr, memDesc};
+    std::unique_lock<std::shared_mutex> lock(mAllocationsMutex);
+    mDeviceAllocations[devPtr] = {memorySize, hostPtr, devPtr, memDesc};
+    mHostAllocations[hostPtr] = {memorySize, hostPtr, devPtr, memDesc};
+}
+
+HostAccessibleDeviceAllocator::AllocationInfo HostAccessibleDeviceAllocator::getAllocationInfoFromHostPtr(
+    void const* hostPtr)
+{
+    std::shared_lock<std::shared_mutex> lock(mAllocationsMutex);
+    if (mHostAllocations.empty())
+    {
+        return HostAccessibleDeviceAllocator::AllocationInfo{0, nullptr, nullptr, nullptr};
+    }
+    auto it = mHostAllocations.upper_bound(hostPtr);
+    if (it == mHostAllocations.begin())
+    {
+        return HostAccessibleDeviceAllocator::AllocationInfo{0, nullptr, nullptr, nullptr};
+        ;
+    }
+    --it;
+    return it->second;
+}
+
+HostAccessibleDeviceAllocator::AllocationInfo HostAccessibleDeviceAllocator::getAllocationInfoFromDevPtr(
+    void const* devPtr)
+{
+    std::shared_lock<std::shared_mutex> lock(mAllocationsMutex);
+    if (mDeviceAllocations.empty())
+    {
+        return HostAccessibleDeviceAllocator::AllocationInfo{0, nullptr, nullptr, nullptr};
+    }
+    auto it = mDeviceAllocations.upper_bound(devPtr);
+    if (it == mDeviceAllocations.begin())
+    {
+        return HostAccessibleDeviceAllocator::AllocationInfo{0, nullptr, nullptr, nullptr};
+        ;
+    }
+    --it;
+    return it->second;
 }
 
 void* HostAccessibleDeviceAllocator::getHostPtr(void* devPtr)
 {
-    std::lock_guard<std::mutex> lock(mAllocationsMutex);
-    if (mAllocations.empty())
+    auto allocationInfo = getAllocationInfoFromDevPtr(devPtr);
+    if (allocationInfo.devPtr == nullptr)
     {
         return nullptr;
     }
-
-    auto it = mAllocations.upper_bound(devPtr);
-    if (it == mAllocations.begin())
-    {
-        return nullptr;
-    }
-
-    --it;
-
-    void* recordedDevPtr = it->first;
-    auto const& allocationInfo = it->second;
+    void* recordedDevPtr = allocationInfo.devPtr;
     size_t recordedSize = allocationInfo.size;
     void* recordedHostPtr = allocationInfo.hostPtr;
 
@@ -157,6 +186,21 @@ void* HostAccessibleDeviceAllocator::getHostPtr(void* devPtr)
     }
 
     return nullptr;
+}
+
+void HostAccessibleDeviceAllocator::memcpyToDevice(void* dst, void const* src, size_t size)
+{
+    if (mGdrHandle != nullptr)
+    {
+        auto allocationInfo = getAllocationInfoFromHostPtr(dst);
+        TLLM_CHECK(allocationInfo.hostPtr != nullptr);
+        TLLM_CHECK(allocationInfo.memDesc != nullptr);
+        tensorrt_llm::runtime::gdrcopy::copy_to_mapping(allocationInfo.memDesc->gdrMh, dst, src, size);
+    }
+    else
+    {
+        memcpy(dst, src, size);
+    }
 }
 
 void* HostAccessibleDeviceAllocator::allocate(size_t memorySize)
@@ -193,9 +237,9 @@ void* HostAccessibleDeviceAllocator::allocate(size_t memorySize)
 
 void HostAccessibleDeviceAllocator::free(void* ptr)
 {
-    std::lock_guard<std::mutex> lock(mAllocationsMutex);
-    auto it = mAllocations.find(ptr);
-    if (it != mAllocations.end())
+    std::unique_lock<std::shared_mutex> lock(mAllocationsMutex);
+    auto it = mDeviceAllocations.find(ptr);
+    if (it != mDeviceAllocations.end())
     {
         auto const& allocInfo = it->second;
         if (allocInfo.memDesc)
@@ -204,7 +248,7 @@ void HostAccessibleDeviceAllocator::free(void* ptr)
         }
         else if (mGpuMemNumaId >= 0)
         {
-            TopologyDetector::getInstance().freeCurrentGpuNumaMemory(it->first, allocInfo.size);
+            TopologyDetector::getInstance().freeCurrentGpuNumaMemory(const_cast<void*>(it->first), allocInfo.size);
         }
         else
         {
@@ -212,7 +256,10 @@ void HostAccessibleDeviceAllocator::free(void* ptr)
                 mAllowManagedFallback, "HostAccessibleDeviceAllocator is not supported on the current system.");
             TLLM_CUDA_CHECK(cudaFree(ptr));
         }
-        mAllocations.erase(it);
+        void* hostPtr = it->second.hostPtr;
+        TLLM_CHECK_WITH_INFO(mHostAllocations.count(hostPtr) == 1, "host pointer not recorded.");
+        mDeviceAllocations.erase(it);
+        mHostAllocations.erase(hostPtr);
     }
     else
     {
