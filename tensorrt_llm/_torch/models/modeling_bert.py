@@ -192,7 +192,6 @@ class BertModel(nn.Module):
         self.model_config = model_config
 
         config = self.model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.add_pooling_layer = add_pooling_layer
 
         self.embedding = BertEmbeddings(config=config)
