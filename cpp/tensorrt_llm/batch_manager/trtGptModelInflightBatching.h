@@ -18,10 +18,9 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
+#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
-#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -37,6 +36,18 @@ class GptDecoderBatched;
 class AllReduceBuffers;
 class NcclCommunicator;
 class SpeculativeDecodingMode;
+
+namespace decoder
+{
+class DecoderState;
+} // namespace decoder
+
+namespace decoder_batch
+{
+class Input;
+class Output;
+} // namespace decoder_batch
+
 } // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::mpi
@@ -57,6 +68,7 @@ namespace rnn_state_manager
 {
 class RnnStateManager;
 } // namespace rnn_state_manager
+
 class SequenceSlotManager;
 class DecoderStepAsyncSend;
 class DecoderSlotAsyncSend;
@@ -133,7 +145,7 @@ public:
 
     TrtGptModelInflightBatching(std::shared_ptr<nvinfer1::ILogger> logger, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, runtime::RawEngine const& rawEngine, bool ctxGenFusion,
-        TrtGptModelOptionalParams const& optionalParams = TrtGptModelOptionalParams());
+        executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode);
 
     ~TrtGptModelInflightBatching() override;
 
@@ -191,10 +203,10 @@ public:
         return mIterCounter;
     }
 
-    [[nodiscard]] static bool optionalParamsAreValid(
-        runtime::ModelConfig const& modelConfig, TrtGptModelOptionalParams const& optionalParams);
-    [[nodiscard]] static TrtGptModelOptionalParams fixOptionalParams(
-        runtime::ModelConfig const& modelConfig, TrtGptModelOptionalParams const& optionalParams);
+    [[nodiscard]] static bool executorConfigIsValid(
+        runtime::ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig);
+    [[nodiscard]] static executor::ExecutorConfig fixExecutorConfig(
+        runtime::ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig);
 
     void prepareDisaggGenInitRequests(RequestList const& activeRequests, RequestVector& newGenReques);
     void checkDisaggGenTransferStatus(RequestList const& activeRequests);
