@@ -849,7 +849,7 @@ def getCommonParameters()
     ]
 }
 
-def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "", getHandle = false)
+def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
 {
     if (jenkinsUrl == "" && env.localJobCredentials) {
         jenkinsUrl = env.JENKINS_URL
@@ -874,9 +874,6 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "", getHandle
         )
         echo "Triggered job: ${handle.absoluteUrl}"
         status = handle.result
-        if (getHandle) {
-            return handle
-        }
     }
     return status
 }
