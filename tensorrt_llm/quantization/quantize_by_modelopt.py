@@ -23,6 +23,7 @@ import random
 import sys
 import time
 from importlib.metadata import version
+from typing import Optional
 
 import numpy as np
 import torch
@@ -647,36 +648,39 @@ def combine_medusa_weight(tp_size, pp_size, base_model_output_dir,
     logger.info("Combine medusa heads' weight, done.")
 
 
-def quantize_and_export(*,
-                        model_dir,
-                        device,
-                        calib_dataset,
-                        dtype,
-                        qformat,
-                        kv_cache_dtype,
-                        calib_size,
-                        batch_size,
-                        calib_max_seq_length,
-                        awq_block_size,
-                        output_dir,
-                        tp_size,
-                        pp_size,
-                        cp_size,
-                        seed,
-                        tokenizer_max_seq_length,
-                        num_medusa_heads=None,
-                        num_medusa_layers=None,
-                        max_draft_len=None,
-                        medusa_hidden_act=None,
-                        medusa_model_dir=None,
-                        quant_medusa_head=None,
-                        auto_quantize_bits=None,
-                        device_map="auto",
-                        quantize_lm_head=False):
-    '''
-        Load model from the model_dir, call Modelopt to quantize the model, and then export
-        the quantized model as TRT-LLM checkpoint
-    '''
+def quantize_and_export(
+    *,
+    model_dir: str,
+    device: str,
+    calib_dataset: str,
+    dtype: str,
+    qformat: str,
+    kv_cache_dtype: Optional[str],
+    calib_size: int,
+    batch_size: int,
+    calib_max_seq_length: int,
+    awq_block_size: int,
+    output_dir: str,
+    tp_size: int,
+    pp_size: int,
+    cp_size: int,
+    seed: int,
+    tokenizer_max_seq_length: int,
+    num_medusa_heads: Optional[int] = None,
+    num_medusa_layers: Optional[int] = None,
+    max_draft_len: Optional[int] = None,
+    medusa_hidden_act: Optional[str] = None,
+    medusa_model_dir: Optional[str] = None,
+    quant_medusa_head: Optional[bool] = None,
+    auto_quantize_bits: Optional[bool] = None,
+    device_map: str = "auto",
+    quantize_lm_head: bool = False,
+    export_format: str = "tensorrt_llm",
+):
+    """
+    Load model from the model_dir, call Modelopt to quantize the model, and then export
+    the quantized model as TRT-LLM checkpoint
+    """
     try:
         import modelopt  # noqa
     except ImportError as e:
@@ -686,7 +690,8 @@ def quantize_and_export(*,
         raise e
 
     import modelopt.torch.quantization as mtq
-    from modelopt.torch.export import export_tensorrt_llm_checkpoint
+    from modelopt.torch.export import (export_hf_checkpoint,
+                                       export_tensorrt_llm_checkpoint)
 
     from tensorrt_llm.models.convert_utils import infer_dtype
 
@@ -814,14 +819,25 @@ def quantize_and_export(*,
         if model_type == 'mllama':
             model = model.language_model
 
-        export_tensorrt_llm_checkpoint(
-            model.hf_model if is_enc_dec else model,
-            model_type,
-            getattr(torch, dtype),
-            export_dir=export_path,
-            inference_tensor_parallel=tp_size,
-            inference_pipeline_parallel=pp_size,
-        )
+        match export_format:
+            case "tensorrt_llm":
+                export_tensorrt_llm_checkpoint(
+                    model.hf_model if is_enc_dec else model,
+                    model_type,
+                    getattr(torch, dtype),
+                    export_dir=export_path,
+                    inference_tensor_parallel=tp_size,
+                    inference_pipeline_parallel=pp_size,
+                )
+            case "hf":
+                export_hf_checkpoint(
+                    model=model,
+                    dtype=getattr(torch, dtype),
+                    export_dir=export_path,
+                )
+                return
+            case _:
+                raise ValueError(f"Unsupported export format: {export_format}")
 
         export_paths = []
         tensorrt_llm_configs = []
