@@ -426,7 +426,7 @@ class CliFlowAccuracyTestHarness:
         self.env = env
 
     def convert(self):
-        print("Converting model to TensorRT-LLM checkpoint...")
+        logger.info("Converting model to TensorRT-LLM checkpoint...")
 
         is_prequantized = False
         for quant_config_file in [
@@ -528,7 +528,7 @@ class CliFlowAccuracyTestHarness:
         venv_check_call(self.llm_venv, convert_cmd)
 
     def build(self):
-        print("Building engines...")
+        logger.info("Building engines...")
         max_batch_size = max(task.MAX_BATCH_SIZE for task in self.tasks)
         max_input_len = max(task.MAX_INPUT_LEN for task in self.tasks)
         max_seq_len = max(task.MAX_INPUT_LEN + task.MAX_OUTPUT_LEN
@@ -547,7 +547,7 @@ class CliFlowAccuracyTestHarness:
         check_call(" ".join(build_cmd), shell=True, env=self.llm_venv._new_env)
 
     def summarize(self, task: AccuracyTask):
-        print("Running summarize...")
+        logger.info("Running summarize...")
         summarize_cmd = [
             f"{self.llm_root}/examples/summarize.py",
             f"--engine_dir={self.engine_dir}",
@@ -611,7 +611,7 @@ class CliFlowAccuracyTestHarness:
                  str(world_size), "--allow-run-as-root"], summarize_cmd)
 
     def mmlu(self, task: AccuracyTask):
-        print("Running mmlu...")
+        logger.info("Running mmlu...")
         num_samples, threshold = task.get_num_samples_and_threshold(
             dtype=self.dtype,
             quant_algo=self.quant_algo,
@@ -638,14 +638,14 @@ class CliFlowAccuracyTestHarness:
         check_call(" ".join(mmlu_cmd), shell=True, env=self.llm_venv._new_env)
 
     def eval_long_context(self, task: AccuracyTask):
-        print("Running construct_synthetic_dataset...")
+        logger.info("Running construct_synthetic_dataset...")
         data_gen_cmd = [
             f"{self.llm_root}/examples/infinitebench/construct_synthetic_dataset.py",
             "--test_case=build_passkey", f"--test_level={task.LEVEL}"
         ]
         venv_check_call(self.llm_venv, data_gen_cmd)
 
-        print("Running eval_long_context...")
+        logger.info("Running eval_long_context...")
         eval_cmd = [
             f"{self.llm_root}/examples/eval_long_context.py", "--task=passkey",
             f"--engine_dir={self.engine_dir}",
