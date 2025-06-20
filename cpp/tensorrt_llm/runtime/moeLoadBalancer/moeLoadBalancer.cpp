@@ -843,7 +843,7 @@ MoeLoadBalancer::MoeLoadBalancer(int epRank, int epSize, int layerUpdatesPerIter
     int numaCpuCount = topologyDetector.getCurrentGpuNumaCpuCount();
     int numaGpuCount = topologyDetector.getGpuCountUnderNuma(currentGpuNumaId);
     HostAccessibleDeviceAllocator::getInstance().IncRefCount();
-    TLLM_CHECK_WITH_INFO(HostAccessibleDeviceAllocator::getInstance().isSupported(),
+    TLLM_CHECK_WITH_INFO(layerUpdatesPerIter == 0 || HostAccessibleDeviceAllocator::getInstance().isSupported(),
         "HostAccessibleDeviceAllocator is not supported on current platform, please install gdrcopy(gdrdrv).");
     TLLM_CHECK_WITH_INFO(
         numaCpuCount > 0 && numaGpuCount > 0, "numaCpuCount=%d, numaGpuCount=%d", numaCpuCount, numaGpuCount);
