@@ -294,6 +294,10 @@ th::Tensor NVFP4BlockScaleInterleave(th::Tensor const& blockScale)
     auto cols = blockScaleShape.size() == 3 ? blockScaleShape[2] : blockScaleShape[1];
 
     auto expert_out_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(rows, cols);
+    auto rows_padded = PadUpFn(rows, 128);
+    auto cols_padded = PadUpFn(cols, 4);
+    TORCH_CHECK(
+        expert_out_size == rows_padded * cols_padded, "expert_out_size should be equal to rows_padded * cols_padded.");
     th::Tensor interleavedBlockScale = th::empty(
         {expert_out_size * num_experts}, th::dtype(SF_DTYPE).device(blockScale.device()).requires_grad(false));
 
@@ -301,24 +305,29 @@ th::Tensor NVFP4BlockScaleInterleave(th::Tensor const& blockScale)
     {
         const thread_local int smCount = tensorrt_llm::common::getMultiProcessorCount();
         auto stream = at::cuda::getCurrentCUDAStream(blockScale.get_device());
-        tensorrt_llm::kernels::invokeNVFP4BlockScaleInterleave(num_experts, rows, cols, blockScale.data_ptr<uint8_t>(),
-            static_cast<uint8_t*>(interleavedBlockScale.data_ptr()), smCount, stream);
+        tensorrt_llm::kernels::invokeNVFP4BlockScaleInterleave(num_experts, rows, rows_padded, cols, cols_padded,
+            blockScale.data_ptr<uint8_t>(), static_cast<uint8_t*>(interleavedBlockScale.data_ptr()), smCount, stream);
     }
     else
     {
-        for (size_t eIdx = 0; eIdx < static_cast<size_t>(num_experts); eIdx++)
+        for (int eIdx = 0; eIdx < static_cast<int>(num_experts); eIdx++)
         {
             uint8_t* interleavedBlockScalePtr
                 = static_cast<uint8_t*>(interleavedBlockScale.data_ptr()) + eIdx * expert_out_size;
-            for (size_t rIdx = 0; rIdx < static_cast<size_t>(rows); ++rIdx)
+            for (int rIdx = 0; rIdx < static_cast<int>(rows_padded); ++rIdx)
             {
                 auto globalRowIdx = eIdx * rows + rIdx;
                 uint8_t* blockScalePtr = blockScale.data_ptr<uint8_t>() + globalRowIdx * cols;
-                for (int cIdx = 0; cIdx < cols; ++cIdx)
+                for (int cIdx = 0; cIdx < static_cast<int>(cols_padded); ++cIdx)
                 {
+                    uint8_t sf_ori = 0;
+                    if (rIdx < static_cast<int>(rows) && cIdx < static_cast<int>(cols))
+                    {
+                        sf_ori = blockScalePtr[cIdx];
+                    }
                     int sf_index
                         = computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED);
-                    interleavedBlockScalePtr[sf_index] = blockScalePtr[cIdx];
+                    interleavedBlockScalePtr[sf_index] = sf_ori;
                 }
             }
         }
