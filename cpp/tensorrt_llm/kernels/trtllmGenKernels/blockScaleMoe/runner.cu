@@ -154,7 +154,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     else if (routingMethodType == RoutingMethodType::Renormalize /* default */
         || routingMethodType == RoutingMethodType::RenormalizeNaive /* Softmax -> TopK */)
     {
-        moe::dev::routingQwen3::Data routingData;
+        moe::dev::routingRenormalize::Data routingData;
 
         //
         // Config
@@ -196,7 +196,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mLocalExpertsStrideLog2 = 0;
         routingData.mNumLocalExperts = localNumExperts;
 
-        moe::dev::routingQwen3::run(routingData, stream);
+        moe::dev::routingRenormalize::run(routingData, stream);
     }
     else
     {
