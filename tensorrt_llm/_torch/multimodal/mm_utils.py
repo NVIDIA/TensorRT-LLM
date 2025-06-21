@@ -4,9 +4,11 @@ from typing import Any, Callable, Dict, Tuple
 
 import torch
 from torch.multiprocessing import get_sharing_strategy, set_sharing_strategy
-from torch.multiprocessing.reductions import (
-    rebuild_cuda_tensor, rebuild_meta_tensor, rebuild_storage_filename,
-    rebuild_tensor, rebuild_typed_storage, reduce_storage, reduce_tensor)
+from torch.multiprocessing.reductions import (rebuild_cuda_tensor,
+                                              rebuild_storage_filename,
+                                              rebuild_tensor,
+                                              rebuild_typed_storage,
+                                              reduce_storage, reduce_tensor)
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +25,6 @@ class _SharedTensorRebuildMethodRegistry:
     # Fixed keys for common rebuild methods
     REBUILD_CUDA = 1
     REBUILD_CPU = 2
-    REBUILD_META = 3
 
     _registry: Dict[int, Callable] = {}
 
@@ -33,7 +34,6 @@ class _SharedTensorRebuildMethodRegistry:
         # Register common methods with fixed keys
         cls._registry[cls.REBUILD_CUDA] = rebuild_cuda_tensor
         cls._registry[cls.REBUILD_CPU] = rebuild_tensor
-        cls._registry[cls.REBUILD_META] = rebuild_meta_tensor
 
     @classmethod
     def register(cls, method: Callable) -> int:
@@ -49,9 +49,6 @@ class _SharedTensorRebuildMethodRegistry:
             return cls.REBUILD_CUDA
         if method == rebuild_tensor:
             return cls.REBUILD_CPU
-        if method == rebuild_meta_tensor:
-            # TODO: add support for meta tensor if needed
-            return cls.REBUILD_META
         raise NotImplementedError("Other rebuild methods are not supported yet")
 
     @classmethod
