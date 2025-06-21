@@ -1793,6 +1793,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     x86SlurmTestConfigs = [
         "RTXPro6000-PyTorch-[Post-Merge]-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
         "DGX_B200-4_GPUs-PyTorch-[Post-Merge]-1": ["b200-4-gpus", "l0_dgx_b200", 1, 1, 4],
+        "DGX_B200-8_GPUs-PyTorch-[Post-Merge]-1": ["b200-8-gpus", "l0_dgx_b200", 1, 1, 8],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 

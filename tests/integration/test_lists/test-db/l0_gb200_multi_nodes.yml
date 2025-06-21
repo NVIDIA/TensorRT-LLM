@@ -14,3 +14,5 @@ l0_gb200_multi_nodes:
       backend: pytorch
   tests:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[latency]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[throughput_tp8]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[throughput_latency]
