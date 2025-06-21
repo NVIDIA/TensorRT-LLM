@@ -1,8 +1,10 @@
-import unittest
 import multiprocessing as mp
+import unittest
+
 import torch
 
-from tensorrt_llm._torch.multimodal.mm_utils import SharedTensorContainer, _SharedTensorRebuildMethodRegistry
+from tensorrt_llm._torch.multimodal.mm_utils import (
+    SharedTensorContainer, _SharedTensorRebuildMethodRegistry)
 
 
 class TestShareTensor(unittest.TestCase):
@@ -41,7 +43,8 @@ class TestShareTensor(unittest.TestCase):
         queue = mp.Queue()
 
         # Producer process
-        producer = mp.Process(target=self._producer, args=(queue, self.ref_tensor, "cuda"))
+        producer = mp.Process(target=self._producer,
+                              args=(queue, self.ref_tensor, "cuda"))
         producer.start()
         status, data = queue.get(timeout=100)
         # Verify
@@ -57,7 +60,8 @@ class TestShareTensor(unittest.TestCase):
         queue = mp.Queue()
 
         # Producer process
-        producer = mp.Process(target=self._producer, args=(queue, self.ref_tensor, "cpu"))
+        producer = mp.Process(target=self._producer,
+                              args=(queue, self.ref_tensor, "cpu"))
         producer.start()
         status, data = queue.get(timeout=100)
         # Verify
@@ -71,32 +75,37 @@ class TestShareTensor(unittest.TestCase):
         mp.set_start_method('spawn', force=True)
         queue = mp.Queue()
         test_shapes = [
-            (1,),           
-            (2, 3),         
-            (1, 2, 3, 4),   
-            (10,),          
+            (1, ),
+            (2, 3),
+            (1, 2, 3, 4),
+            (10, ),
         ]
 
         for shape in test_shapes:
             with self.subTest(shape=shape):
                 test_tensor = torch.randn(shape)
-                producer = mp.Process(target=self._producer, args=(queue, test_tensor, "cpu"))
+                producer = mp.Process(target=self._producer,
+                                      args=(queue, test_tensor, "cpu"))
                 producer.start()
                 status, data = queue.get(timeout=100)
-                
+
                 self.assertEqual(status, 'success')
-                reconstructed = SharedTensorContainer.from_dict(data).get_local_view()
+                reconstructed = SharedTensorContainer.from_dict(
+                    data).get_local_view()
                 self.assertTrue(torch.allclose(reconstructed, test_tensor))
                 producer.join()
-            
+
             with self.subTest(shape=shape):
                 test_tensor = torch.randn(shape)
-                producer = mp.Process(target=self._producer, args=(queue, test_tensor, "cuda"))
+                producer = mp.Process(target=self._producer,
+                                      args=(queue, test_tensor, "cuda"))
                 producer.start()
                 status, data = queue.get(timeout=100)
                 self.assertEqual(status, 'success')
-                reconstructed = SharedTensorContainer.from_dict(data).get_local_view()
-                self.assertTrue(torch.allclose(reconstructed, test_tensor.cuda()))
+                reconstructed = SharedTensorContainer.from_dict(
+                    data).get_local_view()
+                self.assertTrue(
+                    torch.allclose(reconstructed, test_tensor.cuda()))
                 del reconstructed
                 producer.join()
 
@@ -116,30 +125,34 @@ class TestShareTensor(unittest.TestCase):
         for dtype in test_dtypes:
             with self.subTest(dtype=dtype):
                 test_tensor = torch.randn(2, 3).to(dtype)
-                producer = mp.Process(target=self._producer, args=(queue, test_tensor, "cpu"))
+                producer = mp.Process(target=self._producer,
+                                      args=(queue, test_tensor, "cpu"))
                 producer.start()
                 status, data = queue.get(timeout=100)
-                
+
                 self.assertEqual(status, 'success')
-                reconstructed = SharedTensorContainer.from_dict(data).get_local_view()
+                reconstructed = SharedTensorContainer.from_dict(
+                    data).get_local_view()
                 self.assertTrue(torch.allclose(reconstructed, test_tensor))
                 self.assertEqual(reconstructed.dtype, test_tensor.dtype)
                 producer.join()
-            
+
             with self.subTest(dtype=dtype):
                 test_tensor = torch.randn(2, 3).to(dtype)
-                producer = mp.Process(target=self._producer, args=(queue, test_tensor, "cuda"))
+                producer = mp.Process(target=self._producer,
+                                      args=(queue, test_tensor, "cuda"))
                 producer.start()
                 status, data = queue.get(timeout=100)
                 self.assertEqual(status, 'success')
-                reconstructed = SharedTensorContainer.from_dict(data).get_local_view()
-                self.assertTrue(torch.allclose(reconstructed, test_tensor.cuda()))
+                reconstructed = SharedTensorContainer.from_dict(
+                    data).get_local_view()
+                self.assertTrue(
+                    torch.allclose(reconstructed, test_tensor.cuda()))
                 self.assertEqual(reconstructed.dtype, test_tensor.dtype)
                 del reconstructed
                 producer.join()
 
-        
 
 if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
-    unittest.main() 
+    unittest.main()
