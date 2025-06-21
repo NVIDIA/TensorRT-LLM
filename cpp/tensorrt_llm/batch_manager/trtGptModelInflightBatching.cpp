@@ -40,6 +40,7 @@
 #include "tensorrt_llm/batch_manager/promptTuningBuffers.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
+#include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/batch_manager/transformerBuffers.h"
 #include "tensorrt_llm/batch_manager/updateDecoderBuffers.h"
 #include "tensorrt_llm/batch_manager/utils/debugUtils.h"
@@ -79,74 +80,79 @@
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 namespace tk = tensorrt_llm::kernels;
-namespace texe = tensorrt_llm::executor;
 
 namespace tensorrt_llm::batch_manager
 {
 
-bool TrtGptModelInflightBatching::optionalParamsAreValid(
-    ModelConfig const& modelConfig, TrtGptModelOptionalParams const& optionalParams)
+bool TrtGptModelInflightBatching::executorConfigIsValid(
+    ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig)
 {
-    // Make sure logic in this function matches fixOptionalParams
-    if (optionalParams.kvCacheConfig.enableBlockReuse)
+    // Make sure logic in this function matches fixExecutorConfig
+    if (executorConfig.getKvCacheConfig().getEnableBlockReuse())
     {
         if (!modelConfig.getPagedContextFMHA())
         {
             return false;
         }
-    }
-    // Context logits cannot be returned for reused tokens, so disable reuse
-    if (modelConfig.computeContextLogits())
-    {
-        return false;
+        // Context logits cannot be returned for reused tokens, so disable reuse
+        if (modelConfig.computeContextLogits())
+        {
+            return false;
+        }
     }
     return true;
 }
 
-TrtGptModelOptionalParams TrtGptModelInflightBatching::fixOptionalParams(
-    ModelConfig const& modelConfig, TrtGptModelOptionalParams const& optionalParams)
+executor::ExecutorConfig TrtGptModelInflightBatching::fixExecutorConfig(
+    ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig)
 {
-    // Make sure logic in this function matches optionalParamsAreValid
-    auto fixedOptionalParams = TrtGptModelOptionalParams(optionalParams);
-    if (fixedOptionalParams.kvCacheConfig.enableBlockReuse)
+    // Make sure logic in this function matches executorConfigIsValid
+    if (executorConfig.getKvCacheConfig().getEnableBlockReuse())
     {
+        auto kvCacheConfig = executorConfig.getKvCacheConfig();
+
         if (!modelConfig.getPagedContextFMHA())
         {
             TLLM_LOG_WARNING(
-                "Fix optionalParams : KV cache reuse disabled because model was not built with paged context FMHA "
+                "Fixing executorConfig: KV cache reuse disabled because model was not built with paged context FMHA "
                 "support");
-            fixedOptionalParams.kvCacheConfig.enableBlockReuse = false;
+            kvCacheConfig.setEnableBlockReuse(false);
         }
+        if (modelConfig.computeContextLogits())
+        {
+            TLLM_LOG_WARNING(
+                "Fixing executorConfig: KV cache reuse disabled because model was built to return context logits");
+            kvCacheConfig.setEnableBlockReuse(false);
+        }
+
+        auto fixedExecutorConfig = executor::ExecutorConfig(executorConfig);
+        fixedExecutorConfig.setKvCacheConfig(kvCacheConfig);
+        return fixedExecutorConfig;
     }
-    if (modelConfig.computeContextLogits())
-    {
-        TLLM_LOG_WARNING(
-            "Fix optionalParams : KV cache reuse disabled because model was built to return context logits");
-        fixedOptionalParams.kvCacheConfig.enableBlockReuse = false;
-    }
-    return fixedOptionalParams;
+    return executorConfig;
 }
 
 TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer1::ILogger> logger,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig, RawEngine const& rawEngine, bool ctxGenFusion,
-    TrtGptModelOptionalParams const& optionalParams)
-    : TrtGptModel(modelConfig, worldConfig, optionalParams)
+    executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode)
+    : TrtGptModel(modelConfig, worldConfig, executorConfig)
     , mModelConfig(modelConfig)
     , mWorldConfig(worldConfig)
     , mDevice{runtime::utils::initDevice(worldConfig)}
-    , mDecodingConfig{optionalParams.decodingConfig}
-    , mExtendedRuntimePerfKnobConfig{optionalParams.extendedRuntimePerfKnobConfig}
-    , mDebugConfig{optionalParams.debugConfig}
-    , mAdditionalModelOutputs{worldConfig.isLastPipelineParallelRank() ? optionalParams.additionalModelOutputs
+    , mDecodingConfig{executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{})}
+    , mExtendedRuntimePerfKnobConfig{executorConfig.getExtendedRuntimePerfKnobConfig()}
+    , mDebugConfig{executorConfig.getDebugConfig()}
+    , mAdditionalModelOutputs{worldConfig.isLastPipelineParallelRank() ? executorConfig.getAdditionalModelOutputs()
                                                                        : std::nullopt}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
-    , mRuntime{std::make_unique<TllmRuntime>(rawEngine, mLogger.get(), optionalParams.useGpuDirectStorage,
-          optionalParams.gpuWeightsPercent, modelConfig.useShapeInference())}
+    , mRuntime{std::make_unique<TllmRuntime>(rawEngine, mLogger.get(), executorConfig.getUseGpuDirectStorage(),
+          executorConfig.getGpuWeightsPercent(), modelConfig.useShapeInference())}
     , mCopyBufferManager{std::make_shared<CudaStream>()}
     , mCtxGenFusion(ctxGenFusion)
     , mOperatingBeamWidth{getMaxBeamWidth()}
-    , mGatherGenerationLogits{optionalParams.gatherGenerationLogits}
-    , mPromptTableOffloading{optionalParams.promptTableOffloading}
+    , mGatherGenerationLogits{executorConfig.getGatherGenerationLogits()}
+    , mPromptTableOffloading{executorConfig.getPromptTableOffloading()}
+    , mIsLeaderInOrchMode{isLeaderInOrchMode}
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -175,7 +181,9 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     mNumBuffers = (mCtxGenFusion ? 1 : 2) * mNumMicroBatches;
 
-    if (!optionalParams.kvCacheConfig.onboardBlocks)
+    auto const kvCacheConfig = KvCacheConfig(executorConfig.getKvCacheConfig());
+
+    if (!kvCacheConfig.onboardBlocks)
     {
         TLLM_CHECK_WITH_INFO(
             !mModelConfig.getPagedContextFMHA(), "KV cache blocks need to be onboarded if context FMHA.");
@@ -183,7 +191,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     if (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
     {
-        TLLM_CHECK_WITH_INFO(optionalParams.kvCacheConfig.enableBlockReuse,
+        TLLM_CHECK_WITH_INFO(kvCacheConfig.enableBlockReuse,
             "KV cache block reuse must be enabled for speculative decoding target model");
     }
 
@@ -203,9 +211,9 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     setupSpeculativeDecodingModule(mDecodingConfig);
 
-    if (mWorldConfig.isLastPipelineParallelRank() && optionalParams.guidedDecodingConfig)
+    if (mWorldConfig.isLastPipelineParallelRank() && executorConfig.getGuidedDecodingConfig())
     {
-        mGuidedDecoder = std::make_unique<GuidedDecoder>(optionalParams.guidedDecodingConfig.value(),
+        mGuidedDecoder = std::make_unique<GuidedDecoder>(executorConfig.getGuidedDecodingConfig().value(),
             getMaxNumSequences(), mModelConfig.getVocabSizePadded(mWorldConfig.getSize()),
             mModelConfig.getLogitsDtype(), mRuntime->getBufferManager());
     }
@@ -241,8 +249,10 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     if (mModelConfig.useLoraPlugin())
     {
+        auto const peftCacheManagerConfig
+            = PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig()));
         mPeftCacheManager = std::make_shared<PeftCacheManager>(
-            optionalParams.peftCacheManagerConfig, mModelConfig, mWorldConfig, mRuntime->getBufferManager());
+            peftCacheManagerConfig, mModelConfig, mWorldConfig, mRuntime->getBufferManager());
     }
     else
     {
@@ -256,38 +266,38 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     if (mModelConfig.isTransformerBased() && modelConfig.isKVCacheEnabled())
     {
         auto cacheTransceiverConfig
-            = optionalParams.cacheTransceiverConfig.value_or(executor::CacheTransceiverConfig());
+            = executorConfig.getCacheTransceiverConfig().value_or(executor::CacheTransceiverConfig());
         auto cacheTransPreAllocaSize
             = kv_cache_manager::CacheTransBufferManager::preAllocBufferSize(cacheTransceiverConfig.getMaxNumTokens());
 
         auto const [freePrimaryMemBytes, freeSecondaryMemBytes]
-            = BaseKVCacheManager::calculateFreeMemBytes(mRuntime->getBufferManager(), optionalParams.kvCacheConfig);
+            = BaseKVCacheManager::calculateFreeMemBytes(mRuntime->getBufferManager(), kvCacheConfig);
 
         if (mModelConfig.useCrossAttention())
         {
-            TLLM_CHECK_WITH_INFO(optionalParams.kvCacheConfig.crossKvCacheFraction.has_value(),
+            TLLM_CHECK_WITH_INFO(kvCacheConfig.crossKvCacheFraction.has_value(),
                 "Must set crossKvCacheFraction for encoder-decoder model");
-            auto const crossKvCacheFraction = optionalParams.kvCacheConfig.crossKvCacheFraction.value();
-            mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kSELF,
+            auto const crossKvCacheFraction = kvCacheConfig.crossKvCacheFraction.value();
+            mKvCacheManager = createKvCacheManager(kvCacheConfig, KvCacheType::kSELF,
                 freePrimaryMemBytes * (1.0f - crossKvCacheFraction),
                 freeSecondaryMemBytes * (1.0f - crossKvCacheFraction), cacheTransPreAllocaSize);
-            mCrossKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kCROSS,
-                freePrimaryMemBytes * crossKvCacheFraction, freeSecondaryMemBytes * crossKvCacheFraction,
-                cacheTransPreAllocaSize);
+            mCrossKvCacheManager
+                = createKvCacheManager(kvCacheConfig, KvCacheType::kCROSS, freePrimaryMemBytes * crossKvCacheFraction,
+                    freeSecondaryMemBytes * crossKvCacheFraction, cacheTransPreAllocaSize);
             TLLM_LOG_INFO("This is an Encoder-Decoder model, set %0.1f cross KV cache fraction based on the config.",
                 crossKvCacheFraction);
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(!optionalParams.kvCacheConfig.crossKvCacheFraction.has_value(),
+            TLLM_CHECK_WITH_INFO(!kvCacheConfig.crossKvCacheFraction.has_value(),
                 "Do not set crossKvCacheFraction for decoder-only model");
-            mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig, KvCacheType::kSELF,
-                freePrimaryMemBytes, freeSecondaryMemBytes, cacheTransPreAllocaSize);
+            mKvCacheManager = createKvCacheManager(
+                kvCacheConfig, KvCacheType::kSELF, freePrimaryMemBytes, freeSecondaryMemBytes, cacheTransPreAllocaSize);
         }
 
         mCacheTransceiver
             = CacheTransceiverFactory::createCacheTransceiver(mKvCacheManager.get(), mModelConfig, mWorldConfig,
-                executor::kv_cache::CacheState::AttentionType::kDEFAULT, optionalParams.cacheTransceiverConfig);
+                executor::kv_cache::CacheState::AttentionType::kDEFAULT, executorConfig.getCacheTransceiverConfig());
     }
 
     if (mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind())
@@ -339,7 +349,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     }
 
     mSeqSlotManager
-        = std::make_shared<SequenceSlotManager>(getMaxNumSequences(), optionalParams.maxSeqIdleMicroseconds);
+        = std::make_shared<SequenceSlotManager>(getMaxNumSequences(), executorConfig.getMaxSeqIdleMicroseconds());
 
     mMicroBatchScheduledRequests.resize(mNumMicroBatches);
     mDecoderFinishedEvents.resize(mNumMicroBatches);
@@ -349,13 +359,13 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     {
         TLLM_CHECK_WITH_INFO(modelConfig.getMaxBeamWidth() == 1, "RNN based model doesn't support beam search now.");
         TLLM_CHECK_WITH_INFO(
-            !optionalParams.enableChunkedContext, "RNN based model doesn't support Chunked Context now.");
+            !executorConfig.getEnableChunkedContext(), "RNN based model doesn't support Chunked Context now.");
         TLLM_CHECK_WITH_INFO(
             modelConfig.getSpeculativeDecodingMode().isNone(), "RNN based model doesn't support speculative decoding.");
     }
 
     std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig;
-    if (optionalParams.enableChunkedContext)
+    if (executorConfig.getEnableChunkedContext())
     {
         TLLM_CHECK_WITH_INFO(modelConfig.isKVCacheEnabled() && mModelConfig.getPagedContextFMHA(),
             "Chunked context requires context FMHA, paged kv_cache and paged context FMHA all enabled at the same "
@@ -368,10 +378,10 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             chunkUnitSize = std::max(/* maxKvStepSizeInFmha */ 256, chunkUnitSize);
             TLLM_LOG_INFO("ChunkUnitSize is set to %d as sliding window attention is used.", chunkUnitSize);
         }
-        ctxChunkConfig
-            = batch_scheduler::ContextChunkingConfig{optionalParams.schedulerConfig.getContextChunkingPolicy().value_or(
-                                                         texe::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED),
-                chunkUnitSize};
+        ctxChunkConfig = batch_scheduler::ContextChunkingConfig{
+            executorConfig.getSchedulerConfig().getContextChunkingPolicy().value_or(
+                executor::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED),
+            chunkUnitSize};
     }
 
     auto maxNumTokens = getMaxNumTokens();
@@ -379,7 +389,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     // Max context size is limited by `max_num_tokens` for chunked-context or context-FMHA,
     // or by `max_input_len` of the model.
-    auto const maxContextLength = (optionalParams.enableChunkedContext || mModelConfig.getContextFMHA())
+    auto const maxContextLength = (executorConfig.getEnableChunkedContext() || mModelConfig.getContextFMHA())
         ? maxNumTokens
         : std::make_optional<SizeType32>(mModelConfig.getMaxInputLen());
 
@@ -398,7 +408,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     }
 
     mCapacityScheduler = std::make_unique<CapacityScheduler>(getMaxNumSequences(),
-        optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), mKvCacheManager != nullptr,
+        executorConfig.getSchedulerConfig().getCapacitySchedulerPolicy(), mKvCacheManager != nullptr,
         mWorldConfig.isPipelineParallel());
 
     mMicroBatchScheduler = std::make_unique<MicroBatchScheduler>(ctxChunkConfig, maxContextLength);
@@ -438,9 +448,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         mCudaGraphExecutorCaches.resize(mNumBuffers, utils::CudaGraphExecutorCache(cudaGraphCacheSize));
     }
 
-    mSpeculativeDecodingFastLogits = optionalParams.speculativeDecodingConfig.has_value()
-        && optionalParams.speculativeDecodingConfig.value().fastLogits;
-    mIsLeaderInOrchMode = optionalParams.isLeaderInOrchMode;
+    mSpeculativeDecodingFastLogits
+        = executorConfig.getSpecDecConfig().has_value() && executorConfig.getSpecDecConfig()->fastLogits;
     if (mSpeculativeDecodingFastLogits && modelConfig.getSpeculativeDecodingMode().isNone() && mIsLeaderInOrchMode)
     {
         mDraftModelSendLogitsThread = std::make_unique<std::thread>(&utils::draftModelSendLogitsThread, mDevice,

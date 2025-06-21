@@ -302,9 +302,13 @@ class SingleLayerMoeLoadBalancer:
         self.load_expert_ids = list(range(load_expert_start, load_expert_end))
 
         self.statistic_flag_tensor = None
+        self.local_statistic_tensor = None
 
         self.cudagraph_stream = None
         self.cudagraph_event = None
+
+        self.statistic_stream = None
+        self.statistic_event = None
 
     def get_layer_idx(self):
         return self.single_layer_load_balancer_impl.get_layer_id()
@@ -474,6 +478,12 @@ class SingleLayerMoeLoadBalancer:
             self.statistic_flag_tensor = None
             if is_graph_capturing():
                 assert self.cudagraph_stream is not None, "Doesn't have cudagraph_stream, should not set_cpu_stage."
+                assert self.statistic_event is not None
+                assert self.statistic_stream is not None
+                # wait statistic update done
+                self.statistic_event.wait()
+                self.statistic_event = None
+                self.statistic_stream = None
                 current_stream_event = torch.cuda.Event()
                 current_stream_event.record(torch.cuda.current_stream())
                 with torch.cuda.stream(self.cudagraph_stream):
@@ -510,6 +520,87 @@ class SingleLayerMoeLoadBalancer:
                 gathered_raw_expert_ids, self.statistic_flag_tensor,
                 self.single_layer_load_balancer_ptr, is_first_stage,
                 is_last_stage)
+
+    def local_statistic(self, local_raw_expert_ids: torch.Tensor,
+                        is_first_stage: bool, is_last_stage: bool):
+        """
+        Perform local statistics on the expert IDs.
+
+        Args:
+            local_raw_expert_ids: The gathered raw expert IDs from all ranks
+            is_first_stage: Whether this is the first stage
+            is_last_stage: Whether this is the last stage
+        """
+        if self.updates_enabled:
+            assert isinstance(self.statistic_flag_tensor, torch.Tensor)
+            if is_first_stage:
+                assert self.local_statistic_tensor is None
+                self.local_statistic_tensor = torch.empty(
+                    (self.expert_count, ),
+                    dtype=torch.int32,
+                    device=torch.device('cuda'))
+            if is_graph_capturing():
+                self.statistic_event = torch.cuda.Event()
+                self.statistic_stream = torch.cuda.Stream()
+                current_stream_event = torch.cuda.Event()
+                current_stream_event.record(torch.cuda.current_stream())
+                with torch.cuda.stream(self.statistic_stream):
+                    current_stream_event.wait()
+                    torch.ops.trtllm.moe_hierarchical_statistic_local_device(
+                        local_raw_expert_ids, self.local_statistic_tensor,
+                        self.statistic_flag_tensor,
+                        self.single_layer_load_balancer_ptr, is_first_stage,
+                        is_last_stage)
+                    self.statistic_event.record(self.statistic_stream)
+            else:
+                torch.ops.trtllm.moe_hierarchical_statistic_local_device(
+                    local_raw_expert_ids, self.local_statistic_tensor,
+                    self.statistic_flag_tensor,
+                    self.single_layer_load_balancer_ptr, is_first_stage,
+                    is_last_stage)
+
+    def get_local_statistic_tensor(self):
+        """
+        Get the local statistic tensor. Should perform allreduce on it and then call update_statistic
+        Returns:
+            The local statistic tensor if using statistic else None
+        """
+        if self.updates_enabled:
+            assert self.local_statistic_tensor is not None
+            if is_graph_capturing():
+                assert self.statistic_event is not None
+                assert self.statistic_stream is not None
+                self.statistic_event.wait()
+            return self.local_statistic_tensor
+        return None
+
+    def update_statistic(self, gathered_local_statistic_tensor: torch.Tensor):
+        """
+        Perform update with global statistics.
+
+        Args:
+            gathered_local_statistic_tensor: gathered local statistics info, should have shape (world_size, self.expert_count)
+        """
+        if self.updates_enabled:
+            assert isinstance(self.statistic_flag_tensor, torch.Tensor)
+
+            def _update_statistic():
+                global_statistic_info = torch.sum(
+                    gathered_local_statistic_tensor, dim=0, dtype=torch.int32)
+                torch.ops.trtllm.moe_hierarchical_statistic_update(
+                    global_statistic_info, self.statistic_flag_tensor,
+                    self.single_layer_load_balancer_ptr)
+
+            if is_graph_capturing():
+                current_stream_event = torch.cuda.Event()
+                current_stream_event.record(torch.cuda.current_stream())
+                with torch.cuda.stream(self.statistic_stream):
+                    current_stream_event.wait()
+                    _update_statistic()
+                    self.statistic_event.record(self.statistic_stream)
+            else:
+                _update_statistic()
+            self.local_statistic_tensor = None
 
     def route(self,
               token_selected_experts: torch.Tensor,

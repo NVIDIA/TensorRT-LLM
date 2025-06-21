@@ -85,6 +85,60 @@ void moeLoadBalanceStatistic(torch::Tensor gatheredRawExpertIds, torch::Tensor e
         static_cast<bool>(isFirstStage), static_cast<bool>(isLastStage), gatheredRawExpertIds.data_ptr<int>(), stream);
 }
 
+void moeHierarchicalStatisticLocalDevice(torch::Tensor localRawExpertIds, torch::Tensor localExpertTokenCount,
+    torch::Tensor enabled, int64_t singleLayerLoadBalancerPtr, int64_t isFirstStage, int64_t isLastStage)
+{
+    CHECK_INPUT(localRawExpertIds, torch::kInt32);
+    CHECK_INPUT(localExpertTokenCount, torch::kInt32);
+    CHECK_INPUT(enabled, torch::kInt32);
+    TORCH_CHECK(localRawExpertIds.dim() == 2, "localRawExpertIds must be a 2D tensor");
+    TORCH_CHECK(localExpertTokenCount.dim() == 1, "localExpertTokenCount must be a 1D tensor");
+    int topK = localRawExpertIds.size(1);
+    TORCH_CHECK(enabled.dim() == 1, "enabled must be a 1D tensor");
+    TORCH_CHECK(enabled.size(0) == 1, "enabled must have 1 element");
+    TORCH_CHECK(isFirstStage == 0 || isFirstStage == 1, "isFirstStage must be 0 or 1");
+    TORCH_CHECK(isLastStage == 0 || isLastStage == 1, "isLastStage must be 0 or 1");
+    TORCH_CHECK(singleLayerLoadBalancerPtr != 0, "singleLayerLoadBalancerPtr must be non-null");
+
+    auto* loadBalancer
+        = reinterpret_cast<tensorrt_llm::runtime::SingleLayerMoeLoadBalancer*>(singleLayerLoadBalancerPtr);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo = loadBalancer->getMetaInfo();
+
+    TORCH_CHECK(localExpertTokenCount.size(0) == metaInfo.expertCount, "localExpertTokenCount should have shape (%d,)",
+        metaInfo.expertCount);
+    TORCH_CHECK(topK == metaInfo.topK, "topK must be equal to metaInfo.topK");
+
+    int numTotalTokens = localRawExpertIds.size(0);
+
+    tensorrt_llm::kernels::moeHierarchicalStatisticLocalDevice(metaInfo, numTotalTokens,
+        localExpertTokenCount.data_ptr<int>(), enabled.data_ptr<int>(), static_cast<bool>(isFirstStage),
+        static_cast<bool>(isLastStage), localRawExpertIds.data_ptr<int>(), stream);
+}
+
+void moeHierarchicalStatisticUpdate(
+    torch::Tensor globalExpertTokenCount, torch::Tensor enabled, int64_t singleLayerLoadBalancerPtr)
+{
+    CHECK_INPUT(globalExpertTokenCount, torch::kInt32);
+    CHECK_INPUT(enabled, torch::kInt32);
+    TORCH_CHECK(globalExpertTokenCount.dim() == 1, "globalExpertTokenCount must be a 1D tensor");
+    TORCH_CHECK(enabled.dim() == 1, "enabled must be a 1D tensor");
+    TORCH_CHECK(enabled.size(0) == 1, "enabled must have 1 element");
+    TORCH_CHECK(singleLayerLoadBalancerPtr != 0, "singleLayerLoadBalancerPtr must be non-null");
+    auto* loadBalancer
+        = reinterpret_cast<tensorrt_llm::runtime::SingleLayerMoeLoadBalancer*>(singleLayerLoadBalancerPtr);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo = loadBalancer->getMetaInfo();
+    auto statisticInfo = loadBalancer->getStatisticInfo();
+
+    TORCH_CHECK(globalExpertTokenCount.size(0) == metaInfo.expertCount,
+        "globalExpertTokenCount should have shape (%d,)", metaInfo.expertCount);
+    tensorrt_llm::kernels::moeHierarchicalStatisticUpdate(
+        metaInfo, *statisticInfo, globalExpertTokenCount.data_ptr<int>(), enabled.data_ptr<int>(), stream);
+}
+
 torch::Tensor moeLoadBalanceRouting(
     torch::Tensor tokenSelectedExperts, bool offsetByEpRank, int64_t singleLayerLoadBalancerPtr)
 {
@@ -180,6 +234,31 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("moe_load_balance_statistic", &torch_ext::moeLoadBalanceStatistic);
+}
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def(
+        "moe_hierarchical_statistic_local_device(Tensor local_raw_expert_ids, Tensor local_expert_token_count, Tensor "
+        "enabled, int "
+        "single_layer_load_balancer_ptr, int is_first_stage, int is_last_stage) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("moe_hierarchical_statistic_local_device", &torch_ext::moeHierarchicalStatisticLocalDevice);
+}
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def(
+        "moe_hierarchical_statistic_update(Tensor global_expert_token_count, Tensor enabled, int "
+        "single_layer_load_balancer_ptr) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("moe_hierarchical_statistic_update", &torch_ext::moeHierarchicalStatisticUpdate);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

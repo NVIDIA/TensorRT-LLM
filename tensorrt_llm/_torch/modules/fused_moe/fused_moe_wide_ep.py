@@ -359,32 +359,39 @@ class WideEPMoE(MoE):
         ) and is_first_call:
             self.layer_load_balancer.maybe_cudagraph_done_wait()
 
-        need_statistic = False
+        loadbalancer_local_statistic_info = None
+        gathered_loadbalancer_local_statistic_info = None
         if self.layer_load_balancer is None:
             token_selected_slots = token_selected_experts
         else:
+            if not self.layer_load_balancer.is_static_routing():
+                self.layer_load_balancer.local_statistic(
+                    token_selected_experts,
+                    is_first_stage=is_first_call,
+                    is_last_stage=is_last_call)
             token_selected_slots = self.layer_load_balancer.route(
                 token_selected_experts, self.use_dp)
             if not self.layer_load_balancer.is_static_routing():
-                need_statistic = True
+                # split into two part to get possible overlap with load balancer routing
+                if is_last_call:
+                    loadbalancer_local_statistic_info = self.layer_load_balancer.get_local_statistic_tensor(
+                    )
 
         # If load balancer is disabled, the statistics are collected from expert IDs.
         # If load balancer is enabled, the statistics are collected from expert slot IDs.
         ExpertStatistic.set_layer(self.layer_idx)
         ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
 
-        token_selected_experts_for_statistic = token_selected_experts if need_statistic else None
-
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 token_count = x.shape[0]
                 alltoall_info = None
-                x, token_selected_slots, token_final_scales, token_selected_experts_for_statistic, alltoall_info = \
+                x, token_selected_slots, token_final_scales, gathered_loadbalancer_local_statistic_info, alltoall_info = \
                     self.alltoall_prepare_maybe_dispatch(all_rank_num_tokens,
                                                          x,
                                                          token_selected_slots,
                                                          token_final_scales,
-                                                         token_selected_experts_for_statistic)
+                                                         loadbalancer_local_statistic_info)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if not self.use_postquant_alltoall:
                     x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
@@ -427,6 +434,7 @@ class WideEPMoE(MoE):
                 )
 
         x_sf = None
+        sf_swizzle = True
         if self.has_any_quant:
             if self.has_fp8_qdq:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
@@ -439,11 +447,14 @@ class WideEPMoE(MoE):
                         # note: we use uint8 to store 2 fp4 values
                         x_col = x.shape[1] * 2
                     else:
+                        sf_swizzle = not self.use_postquant_alltoall
                         x_row = x.shape[0]
                         x_col = x.shape[1]
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
                             x, self.fc31_input_scale, self.scaling_vector_size,
-                            False)
+                            False, sf_swizzle)
+                        if self.use_postquant_alltoall:
+                            x_sf = x_sf.view((x_row, -1))
 
             elif self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
@@ -457,24 +468,31 @@ class WideEPMoE(MoE):
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
-            x, x_sf, token_selected_slots, token_final_scales, token_selected_experts_for_statistic = allgather(
+            x, x_sf, token_selected_slots, token_final_scales = allgather(
                 [
-                    x, x_sf, token_selected_slots, token_final_scales,
-                    token_selected_experts_for_statistic
+                    x,
+                    x_sf,
+                    token_selected_slots,
+                    token_final_scales,
                 ],
                 self.mapping,
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
+            # use separate allgather since doesn't have sizes, can be optimized but in allgather path it is OK
+            if is_last_call:
+                gathered_loadbalancer_local_statistic_info = allgather(
+                    loadbalancer_local_statistic_info, self.mapping, dim=0)
             # Fp4 gemm has extra scaling factor
             if x_sf is not None:
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-        ):
-            self.layer_load_balancer.statistic(
-                token_selected_experts_for_statistic, is_first_call,
-                is_last_call)
+        ) and is_last_call:
+            gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
+                (self.mapping.moe_ep_size, self.num_experts))
+            self.layer_load_balancer.update_statistic(
+                gathered_loadbalancer_local_statistic_info)
 
         if self.smart_router and not cutlass_min_latency_mode:
             ep_size = self.cluster_size
@@ -501,10 +519,15 @@ class WideEPMoE(MoE):
         if self.use_postquant_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 x, x_sf = self.alltoall_postquant_dispatch(
-                    x, x_sf, x_row, x_col, alltoall_info)
+                    x,
+                    x_sf,
+                    x_row,
+                    x_col,
+                    alltoall_info,
+                    is_sf_swizzle=sf_swizzle)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if x_sf is not None:
-                    if self.has_nvfp4:
+                    if self.has_nvfp4 and sf_swizzle:
                         x_sf = unswizzle_sf(x_sf, x_row, x_col,
                                             self.scaling_vector_size)
                     # Adapter between `x_sf` and DeepEP
@@ -760,35 +783,23 @@ class WideEPMoE(MoE):
             self, all_rank_num_tokens: list, x: torch.Tensor,
             token_selected_slots: torch.Tensor,
             token_final_scales: torch.Tensor,
-            token_selected_experts_for_statistic: Optional[torch.Tensor]):
+            local_statistic_tensor: Optional[torch.Tensor]):
         top_k = self.routing_method.experts_per_token
         # gather router info
         max_num_token = max(all_rank_num_tokens)
-        token_selected_slots = torch.nn.functional.pad(
-            token_selected_slots,
-            (0, 0, 0, max_num_token - token_selected_slots.shape[0]),
-            'constant', self.num_slots)
-        token_selected_experts_for_statistic = torch.nn.functional.pad(
-            token_selected_experts_for_statistic,
-            (0, 0, 0,
-             max_num_token - token_selected_experts_for_statistic.shape[0]),
-            'constant', self.num_experts
-        ) if token_selected_experts_for_statistic is not None else None
-        token_final_scales = torch.nn.functional.pad(
-            token_final_scales,
-            (0, 0, 0, max_num_token - token_final_scales.shape[0]))
-        gathered_token_selected_slots, gathered_token_final_scales, gathered_token_selected_experts_for_statistic = allgather(
-            [
-                token_selected_slots, token_final_scales,
-                token_selected_experts_for_statistic
-            ],
+        if max_num_token > token_selected_slots.shape[0]:
+            token_selected_slots = torch.nn.functional.pad(
+                token_selected_slots,
+                (0, 0, 0, max_num_token - token_selected_slots.shape[0]),
+                'constant', self.num_slots)
+        if max_num_token > token_final_scales.shape[0]:
+            token_final_scales = torch.nn.functional.pad(
+                token_final_scales,
+                (0, 0, 0, max_num_token - token_final_scales.shape[0]))
+        gathered_token_selected_slots, gathered_token_final_scales, gathered_local_statistic_tensor = allgather(
+            [token_selected_slots, token_final_scales, local_statistic_tensor],
             self.mapping,
             dim=0)
-        if gathered_token_selected_experts_for_statistic is not None:
-            gathered_token_selected_experts_for_statistic = torch.flatten(
-                gathered_token_selected_experts_for_statistic.contiguous(),
-                start_dim=0,
-                end_dim=-2)
         gathered_token_selected_slots = torch.flatten(
             gathered_token_selected_slots.contiguous(), start_dim=0, end_dim=-2)
         gathered_token_final_scales = torch.flatten(
@@ -808,17 +819,21 @@ class WideEPMoE(MoE):
                                              self.alltoall_workspace,
                                              self.ep_rank, self.ep_size)
 
-        return x, token_selected_slots, token_final_scales, gathered_token_selected_experts_for_statistic, alltoall_info
+        return x, token_selected_slots, token_final_scales, gathered_local_statistic_tensor, alltoall_info
 
-    def alltoall_postquant_dispatch(self, x: torch.Tensor, x_sf: torch.Tensor,
-                                    x_row: int, x_col: int,
-                                    alltoall_info: MoEAlltoallInfo):
+    def alltoall_postquant_dispatch(self,
+                                    x: torch.Tensor,
+                                    x_sf: torch.Tensor,
+                                    x_row: int,
+                                    x_col: int,
+                                    alltoall_info: MoEAlltoallInfo,
+                                    is_sf_swizzle: bool = True):
         x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
                                          self.alltoall_workspace, self.ep_rank,
                                          self.ep_size)
 
         if x_sf is not None:
-            if self.has_nvfp4:
+            if self.has_nvfp4 and is_sf_swizzle:
                 x_sf = unswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
