@@ -5,7 +5,8 @@ import click
 import colorama
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
-from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig, SamplingParams
 
 
 class LlmConsole(code.InteractiveConsole):
