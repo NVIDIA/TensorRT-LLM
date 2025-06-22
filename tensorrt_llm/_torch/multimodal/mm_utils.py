@@ -12,6 +12,25 @@ from torch.multiprocessing.reductions import (rebuild_cuda_tensor,
 
 logger = logging.getLogger(__name__)
 
+DTYPE_MAPPING = {
+    'torch.float32': torch.float32,
+    'torch.float64': torch.float64,
+    'torch.int32': torch.int32,
+    'torch.int64': torch.int64,
+    'torch.bool': torch.bool,
+    'torch.uint8': torch.uint8,
+    'torch.int8': torch.int8,
+    'torch.int16': torch.int16,
+    'torch.float16': torch.float16,
+    'torch.bfloat16': torch.bfloat16,
+}
+
+def str_to_torch_dtype(dtype_str: str) -> torch.dtype:
+    """Convert dtype string to torch dtype
+    """
+    if dtype_str not in DTYPE_MAPPING:
+        raise ValueError(f"Unsupported dtype: {dtype_str}. Supported dtypes are: {list(DTYPE_MAPPING.keys())}")
+    return DTYPE_MAPPING[dtype_str]
 
 class _SharedTensorRebuildMethodRegistry:
     """Registry for tensor rebuild methods with fixed keys for common methods.
@@ -227,7 +246,7 @@ class SharedTensorContainer:
                              tuple(tensor_info['tensor_stride']),
                              tensor_info['tensor_offset'],
                              torch.storage.TypedStorage,
-                             eval(tensor_info['dtype']),
+                             str_to_torch_dtype(tensor_info['dtype']),
                              tensor_info['storage_device'], storage_handle,
                              tensor_info['storage_size_bytes'],
                              tensor_info['storage_offset_bytes'],
@@ -263,11 +282,11 @@ class SharedTensorContainer:
             storage_handle = base64.b64decode(tensor_info['storage_handle'])
             storage_metadata = (torch.storage.TypedStorage, manager_handle,
                                 storage_handle, tensor_info['storage_size'],
-                                eval(tensor_info['storage_dtype']))
+                                str_to_torch_dtype(tensor_info['storage_dtype']))
             storage = rebuild_storage_filename(*storage_metadata)
             if not isinstance(storage, torch.storage.TypedStorage):
                 storage = rebuild_typed_storage(
-                    storage, eval(tensor_info['storage_dtype']))
+                    storage, str_to_torch_dtype(tensor_info['storage_dtype']))
 
             meta_data = (tensor_info['tensor_storage_offset'],
                          tuple(tensor_info['tensor_size']),
