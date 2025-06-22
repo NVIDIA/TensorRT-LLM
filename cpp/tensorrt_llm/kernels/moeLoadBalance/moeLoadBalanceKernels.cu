@@ -129,6 +129,19 @@ void moeSetSignalForCpuStageForTest(MoeLoadBalanceSingleLayerSignal* signal)
 }
 
 template <typename TYPE>
+__global__ void zeroExpertTokenCountKernel(MoeLoadBalanceMetaInfo metaInfo, int* const enabled, int* expertTokenCount)
+{
+    if (*enabled == 0)
+    {
+        return;
+    }
+    TYPE oldExpertTokenCount = {0};
+    int* expertTokenCountPtr = expertTokenCount + metaInfo.expertCount * blockIdx.x;
+    TYPE* typedExpertTokenCountPtr = reinterpret_cast<TYPE*>(expertTokenCountPtr);
+    typedExpertTokenCountPtr[threadIdx.x] = oldExpertTokenCount;
+}
+
+template <typename TYPE>
 __global__ void shiftWindowKernel(MoeLoadBalanceMetaInfo metaInfo, int* const enabled, int* expertTokenCount)
 {
     if (*enabled == 0)
@@ -151,8 +164,8 @@ __global__ void shiftWindowKernel(MoeLoadBalanceMetaInfo metaInfo, int* const en
     typedExpertTokenCountPtr[threadIdx.x] = oldExpertTokenCount;
 }
 
-__global__ void statisticKernel(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo,
-    int totalEltCount, int* const enabled, int* const gatheredRawExpertIds)
+__global__ void statisticKernel(MoeLoadBalanceMetaInfo metaInfo, int* expertTokenCount, int totalEltCount,
+    int* const enabled, int* const gatheredRawExpertIds)
 {
     extern __shared__ int sharedExpertCount[];
     if (*enabled == 0)
@@ -175,19 +188,19 @@ __global__ void statisticKernel(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceS
     __syncthreads();
     for (int i = threadIdx.x; i < metaInfo.expertCount; i += blockDim.x)
     {
-        atomicAdd_system(&statisticInfo.expertTokenCount[i], sharedExpertCount[i]);
+        atomicAdd_system(&expertTokenCount[i], sharedExpertCount[i]);
     }
 }
 
-__global__ void updateLoadFactorKernel(
-    MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo, int* const enabled)
+__global__ void updateLoadFactorKernel(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo,
+    int* expertTokenCountPtr, int* const enabled)
 {
     if (*enabled == 0)
     {
         return;
     }
     int expertIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    int expertTokenCount = statisticInfo.expertTokenCount[expertIdx];
+    int expertTokenCount = expertTokenCountPtr[expertIdx];
     float* loadFactor = statisticInfo.expertLoadFactor;
     loadFactor[expertIdx] = loadFactor[expertIdx] * statisticInfo.decayFactor + expertTokenCount;
 }
@@ -233,7 +246,7 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
         }
         int sharedMemorySize = metaInfo.expertCount * sizeof(int);
         statisticKernel<<<blockCount, threadCount, sharedMemorySize, stream>>>(
-            metaInfo, statisticInfo, totalEltCount, enabled, gatheredRawExpertIds);
+            metaInfo, statisticInfo.expertTokenCount, totalEltCount, enabled, gatheredRawExpertIds);
     }
 
     if (isLastStage)
@@ -241,8 +254,63 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
         // only last stage need update load factor.
         int threadCount = 128;
         int blockCount = (metaInfo.expertCount + threadCount - 1) / threadCount;
-        updateLoadFactorKernel<<<blockCount, threadCount, 0, stream>>>(metaInfo, statisticInfo, enabled);
+        updateLoadFactorKernel<<<blockCount, threadCount, 0, stream>>>(
+            metaInfo, statisticInfo, statisticInfo.expertTokenCount, enabled);
     }
+}
+
+void moeHierarchicalStatisticLocalDevice(MoeLoadBalanceMetaInfo metaInfo, int numTotalTokens,
+    int* localExpertTokenCount, int* const enabled, bool isFirstStage, bool isLastStage, int* const localRawExpertIds,
+    cudaStream_t stream)
+{
+    static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    if (isFirstStage)
+    {
+        // shift window and zero expertTokenCount
+        // only first stage need shift window.
+        int threadCount = metaInfo.expertCount;
+        auto* kernelFunc = zeroExpertTokenCountKernel<int>;
+        if (threadCount % 4 == 0)
+        {
+            threadCount /= 4;
+            kernelFunc = zeroExpertTokenCountKernel<int4>;
+        }
+        else if (threadCount % 2 == 0)
+        {
+            threadCount /= 2;
+            kernelFunc = zeroExpertTokenCountKernel<int2>;
+        }
+        dim3 gridDim(1);
+        dim3 blockDim(threadCount);
+        void* args[]
+            = {&metaInfo, static_cast<void*>(const_cast<int**>(&enabled)), static_cast<void*>(&localExpertTokenCount)};
+        TLLM_CHECK_WITH_INFO(
+            threadCount <= 1024, "expertCount=%d is too large and not supported now.", metaInfo.expertCount);
+        TLLM_CUDA_CHECK(cudaLaunchKernel(kernelFunc, gridDim, blockDim, &args[0], 0, stream));
+    }
+
+    {
+        // do the statistic into expertTokenCount and maybe also expertLoadFactor;
+        int threadCount = 1024;
+        int totalEltCount = numTotalTokens * metaInfo.topK;
+        int blockCount = (totalEltCount + threadCount - 1) / threadCount;
+        if (blockCount > smCount)
+        {
+            blockCount = smCount;
+        }
+        int sharedMemorySize = metaInfo.expertCount * sizeof(int);
+        statisticKernel<<<blockCount, threadCount, sharedMemorySize, stream>>>(
+            metaInfo, localExpertTokenCount, totalEltCount, enabled, localRawExpertIds);
+    }
+}
+
+void moeHierarchicalStatisticUpdate(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatisticInfo statisticInfo,
+    int* globalExpertTokenCount, int* const enabled, cudaStream_t stream)
+{
+    int threadCount = 128;
+    int blockCount = (metaInfo.expertCount + threadCount - 1) / threadCount;
+    updateLoadFactorKernel<<<blockCount, threadCount, 0, stream>>>(
+        metaInfo, statisticInfo, globalExpertTokenCount, enabled);
 }
 
 template <int MAX_EXPERT_COUNT = 1024, int THREAD_COUNT = 256, int ITEM_PER_THREAD = 4>

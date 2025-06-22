@@ -18,10 +18,11 @@ import click
 
 import tensorrt_llm.profiler as profiler
 
-from .._torch.llm import LLM as PyTorchLLM
+from .. import LLM as PyTorchLLM
+from .._tensorrt_engine import LLM
 from ..evaluate import (GSM8K, MMLU, CnnDailymail, GPQADiamond, GPQAExtended,
                         GPQAMain, JsonModeEval)
-from ..llmapi import LLM, BuildConfig, KvCacheConfig
+from ..llmapi import BuildConfig, KvCacheConfig
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
 

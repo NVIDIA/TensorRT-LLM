@@ -4,8 +4,7 @@ from pathlib import Path
 import pytest
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
 
 
