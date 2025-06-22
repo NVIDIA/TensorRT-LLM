@@ -25,12 +25,16 @@ DTYPE_MAPPING = {
     'torch.bfloat16': torch.bfloat16,
 }
 
+
 def str_to_torch_dtype(dtype_str: str) -> torch.dtype:
     """Convert dtype string to torch dtype
     """
     if dtype_str not in DTYPE_MAPPING:
-        raise ValueError(f"Unsupported dtype: {dtype_str}. Supported dtypes are: {list(DTYPE_MAPPING.keys())}")
+        raise ValueError(
+            f"Unsupported dtype: {dtype_str}. Supported dtypes are: {list(DTYPE_MAPPING.keys())}"
+        )
     return DTYPE_MAPPING[dtype_str]
+
 
 class _SharedTensorRebuildMethodRegistry:
     """Registry for tensor rebuild methods with fixed keys for common methods.
@@ -282,7 +286,8 @@ class SharedTensorContainer:
             storage_handle = base64.b64decode(tensor_info['storage_handle'])
             storage_metadata = (torch.storage.TypedStorage, manager_handle,
                                 storage_handle, tensor_info['storage_size'],
-                                str_to_torch_dtype(tensor_info['storage_dtype']))
+                                str_to_torch_dtype(
+                                    tensor_info['storage_dtype']))
             storage = rebuild_storage_filename(*storage_metadata)
             if not isinstance(storage, torch.storage.TypedStorage):
                 storage = rebuild_typed_storage(
