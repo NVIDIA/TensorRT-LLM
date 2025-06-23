@@ -119,20 +119,10 @@ pipeline {
                               case "Reset":
                                 sh "rm -rf ${CCACHE_DIR}"
                                 sh "mkdir -p ${CCACHE_DIR}"
-                                sh """printf "max_size=500G
-                                temporary_dir=/tmp/ccache
-                                compression=true
-                                base_dir=/home/jenkins/agent/workspace/LLM
-                                sloppiness=file_macro,time_macros,pch_defines
-                                " > ${CCACHE_DIR}/ccache.conf"""
+                                sh "printf 'max_size=500G\ntemporary_dir=/tmp/ccache\ncompression=true\nbase_dir=/home/jenkins/agent/workspace/LLM\nsloppiness=file_macro,time_macros,pch_defines\n' > ${CCACHE_DIR}/ccache.conf"
                                 break
                               case "Config":
-                                sh """printf "max_size=500G
-                                temporary_dir=/tmp/ccache
-                                compression=true
-                                base_dir=/home/jenkins/agent/workspace/LLM
-                                sloppiness=file_macro,time_macros,pch_defines
-                                " > ${CCACHE_DIR}/ccache.conf"""
+                                sh "printf 'max_size=500G\ntemporary_dir=/tmp/ccache\ncompression=true\nbase_dir=/home/jenkins/agent/workspace/LLM\nsloppiness=file_macro,time_macros,pch_defines\n' > ${CCACHE_DIR}/ccache.conf"
                                 break
                               case "Stats":
                                 sh "ccache -sv"
