@@ -1924,16 +1924,16 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     def _handle_errors(self, error_msg: Optional[str] = None):
-        error_responses = {}
+        error_responses = []
         error_msg = error_msg or "error"
         for request in self.active_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
             self._terminate_request(request)
-            error_responses[req_id] = LlmResponse(
-                request_id=req_id,
-                error_msg=error_msg,
-                client_id=request.py_client_id)
+            error_responses.append(
+                LlmResponse(request_id=req_id,
+                            error_msg=error_msg,
+                            client_id=request.py_client_id))
         self.active_requests.clear()
         self._enqueue_responses(error_responses)
 
@@ -1950,7 +1950,7 @@ class PyExecutor:
         if len(self.canceled_req_ids) == 0:
             return
 
-        cancelled_responses = {}
+        cancelled_responses = []
         left_requests = []
         # Tracks canceled requests for proper handling in overlap mode during `sampler.update_requests`.
         self.canceled_requests = []
@@ -1960,8 +1960,8 @@ class PyExecutor:
                 self._terminate_request(request)
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
-                cancelled_responses[req_id] = request.create_response(
-                    False, self.dist.rank)
+                cancelled_responses.append(
+                    request.create_response(False, self.dist.rank))
                 self.canceled_requests.append(request)
                 self.canceled_req_ids.erase(req_id)
             else:
@@ -1977,7 +1977,7 @@ class PyExecutor:
         self._enqueue_responses(cancelled_responses)
 
     @nvtx_range("_enqueue_responses")
-    def _enqueue_responses(self, responses: Dict[int, LlmResponse]):
+    def _enqueue_responses(self, responses: List[LlmResponse]):
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
             return
 
@@ -1989,17 +1989,18 @@ class PyExecutor:
             else:
                 responses_list = self.dist.allgather(responses)
             if self.dist.rank == 0 or self.gather_all_responses:
-                gather_responses = {}
+                gather_responses = []
                 if responses_list is not None:
-                    for resp in responses_list:
-                        gather_responses.update(resp)
+                    for resp_list in responses_list:
+                        gather_responses.extend(resp_list)
                     responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
 
         if self.dist.rank == 0 or self.gather_all_responses:
             with self.response_cv:
-                for req_id, resp in responses.items():
+                for resp in responses:
+                    req_id = resp.request_id
                     if req_id in self.responses.keys():
                         self.responses[req_id].append(resp)
                     else:
@@ -2008,20 +2009,20 @@ class PyExecutor:
 
     @nvtx_range("_handle_first_token_response")
     def _handle_first_token_response(self, scheduled_batch):
-        new_responses = {}
+        new_responses = []
         for req in scheduled_batch.generation_requests:
             if req.py_decoding_iter == 1:
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )
                 response = req.create_response(False, self.dist.rank)
-                new_responses.update({req.py_request_id: response})
+                new_responses.append(response)
 
         self._enqueue_responses(new_responses)
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
-        new_responses = {}
+        new_responses = []
         requests_to_terminate = []
         new_active_requests = []
         logger.debug(
@@ -2052,7 +2053,7 @@ class PyExecutor:
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = response.result.is_final
-                    new_responses.update({req_id: response})
+                    new_responses.append(response)
 
             if request_done:
                 if request.is_disagg_context_transmission_state:
