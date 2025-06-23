@@ -1760,6 +1760,7 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "The iteration interval to create responses under the streaming mode. "
         "Set this to a larger value when the batch size is large, which helps reduce the streaming overhead.",
+    )
 
     force_dynamic_quantization: bool = Field(
         default=False,
