@@ -190,19 +190,19 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 }
 
 
-def prepareWheelFromBuildStage(makefileStage, arch) {
+def prepareWheelFromBuildStage(dockerfileStage, arch) {
     if (TRIGGER_TYPE == "manual") {
         echo "Trigger type is manual, skip preparing wheel from build stage"
         return ""
     }
 
-    if (!makefileStage || !arch) {
-        echo "Error: makefileStage and arch are required parameters"
+    if (!dockerfileStage || !arch) {
+        echo "Error: dockerfileStage and arch are required parameters"
         return ""
     }
 
-    if (makefileStage != "release") {
-        echo "prepareWheelFromBuildStage: ${makefileStage} is not release"
+    if (dockerfileStage != "release") {
+        echo "prepareWheelFromBuildStage: ${dockerfileStage} is not release"
         return ""
     }
 
@@ -300,7 +300,7 @@ def buildImage(config, imageKeyToTag)
             }
         }
 
-        args += prepareWheelFromBuildStage(makefileStage, arch)
+        args += prepareWheelFromBuildStage(dockerfileStage, arch)
         // Avoid the frequency of OOM issue when building the wheel
         if (target == "trtllm") {
             if (arch == "x86_64") {
