@@ -439,7 +439,7 @@ def getCommonParameters()
     return [
         'gitlabSourceRepoHttpUrl': LLM_REPO,
         'gitlabCommit': env.gitlabCommit,
-        'artifactPath': ARTIFACT_PATH,
+        'artifactPath': env.artifactPath,
         'uploadPath': UPLOAD_PATH,
     ]
 }
