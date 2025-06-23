@@ -315,7 +315,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             py::arg("lora_task_id"), py::arg("unique_tokens"))
         .def_readonly("uses_extra_ids", &tbk::BlockKey::usesExtraIds)
         .def_readonly("lora_task_id", &tbk::BlockKey::loraTaskId)
-        .def_readonly("unique_tokens", &tbk::BlockKey::uniqueTokens);
+        .def_readonly("unique_tokens", &tbk::BlockKey::uniqueTokens)
+        .def_readonly("extra_keys", &tbk::BlockKey::extraKeys);
 
     py::class_<tbk::BlockKeyHasher>(m, "BlockKeyHasher")
         .def_static("hash", &tbk::BlockKeyHasher::hash, py::arg("block_key"), py::arg("parent_hash") = 0);

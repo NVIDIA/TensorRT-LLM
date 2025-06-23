@@ -80,10 +80,24 @@ std::vector<BlockKey> buildBlockKeys(
     std::list<VecUniqueTokens>& blockedUniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
 {
     std::vector<BlockKey> blockKeys;
+    
+    SizeType32 currentTokenIdx = 0;
     for (auto& uniqueTokens : blockedUniqueTokens)
     {
+        // Generate extra keys for this block
+        auto extraKeys = generateBlockHashExtraKeys(llmRequest, currentTokenIdx, currentTokenIdx + uniqueTokens.size());
+        
         blockKeys.emplace_back(
-            llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(), std::move(uniqueTokens));
+            llmRequest.getInputTokensExtraIds().has_value(), 
+            llmRequest.getLoraTaskId(), 
+            std::move(uniqueTokens),
+            std::move(extraKeys));
+            
+        currentTokenIdx += uniqueTokens.size();
+    }
+    return blockKeys;
+}
+
     }
     return blockKeys;
 }
@@ -92,6 +106,74 @@ std::vector<BlockKey> buildBlockKeys(
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+
+std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
+    LlmRequest const& llmRequest, 
+    SizeType32 startTokenIdx, 
+    SizeType32 endTokenIdx)
+{
+    auto const multimodalHashes = llmRequest.getMultimodalHashes();
+    auto const multimodalPositions = llmRequest.getMultimodalPositions();
+    auto const multimodalLengths = llmRequest.getMultimodalLengths();
+    
+    if (!multimodalHashes || !multimodalPositions || !multimodalLengths || 
+        multimodalHashes->empty() || multimodalPositions->empty() || multimodalLengths->empty())
+    {
+        return std::nullopt;
+    }
+    
+    if (multimodalHashes->size() != multimodalPositions->size() || 
+        multimodalPositions->size() != multimodalLengths->size())
+    {
+        TLLM_LOG_WARNING("Multimodal data arrays have mismatched sizes");
+        return std::nullopt;
+    }
+    
+    std::vector<MmKey> extraKeys;  // MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>
+    
+    for (size_t i = 0; i < multimodalPositions->size(); ++i)
+    {
+        auto const& startPos = (*multimodalPositions)[i];
+        auto const& length = (*multimodalLengths)[i];
+        auto const& mmHashVector = (*multimodalHashes)[i];  // This is vector<int32> - your current format
+        
+        std::array<uint8_t, 32> mmHashArray;
+        if (mmHashVector.size() == 8)  // 256-bit hash = 8 * 32-bit integers
+        {
+            // Assuming mmHashVector[j] comes from Python's int(hex_chunk, 16)
+            // where hex_chunk like "00010203" means 0x00 is MSB and 0x03 is LSB.
+            // And assuming the overall Blake3 output wants these bytes in order: 0x00, 0x01, 0x02, 0x03...
+            for (size_t j = 0; j < 8; ++j)
+            {
+                auto const& hashPart = mmHashVector[j]; // e.g., 0x00010203
+                // Extract bytes in Big-Endian order from hashPart and place them sequentially
+                // into mmHashArray to reconstruct the original Blake3 byte sequence.
+                mmHashArray[j * 4 + 0] = static_cast<uint8_t>((hashPart >> 24) & 0xFF); // Extract 0x00 (MSB of the int)
+                mmHashArray[j * 4 + 1] = static_cast<uint8_t>((hashPart >> 16) & 0xFF); // Extract 0x01
+                mmHashArray[j * 4 + 2] = static_cast<uint8_t>((hashPart >> 8) & 0xFF);  // Extract 0x02
+                mmHashArray[j * 4 + 3] = static_cast<uint8_t>(hashPart & 0xFF);         // Extract 0x03 (LSB of the int)
+            }
+        }
+        else
+        {
+            // TODO: maybe we should raise an error here
+            TLLM_LOG_WARNING("Multimodal hash vector has unexpected size: %zu (expected 8)", mmHashVector.size());
+            continue;  // Skip this multimodal item
+        }
+        
+        // Check if this multimodal content overlaps with the current block
+        if (endTokenIdx > startPos && startTokenIdx < startPos + length)
+        {
+            // Calculate the start offset of this multimodal content within the block
+            SizeType32 mmStartInBlock = (startPos >= startTokenIdx) ? 0 : startTokenIdx - startPos;
+            
+            // Add the multimodal hash array and its start offset in the block
+            extraKeys.emplace_back(mmHashArray, mmStartInBlock);
+        }
+    }
+    
+    return extraKeys.empty() ? std::nullopt : std::make_optional(std::move(extraKeys));
+}
 
 size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) noexcept
 {
@@ -122,7 +204,37 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
         c = c ^ (c >> 31);
         seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
     }
-    // TODO: support external hashes for multimodal
+
+    // Add extra keys for multimodal data (similar to VLLM's approach)
+    if (blockKey.extraKeys)
+    {
+        for (auto const& [mmHash, startOffset] : *blockKey.extraKeys)
+        {
+            // Hash the multimodal hash array in 32-bit chunks (more efficient)
+            for (size_t i = 0; i < 32; i += 4)
+            {
+                // Combine 4 bytes into a 32-bit word (construct as little endian order)
+                uint32_t word = static_cast<uint32_t>(mmHash[i]) |
+                                (static_cast<uint32_t>(mmHash[i+1]) << 8) |
+                                (static_cast<uint32_t>(mmHash[i+2]) << 16) |
+                                (static_cast<uint32_t>(mmHash[i+3]) << 24);
+                
+                // Mix the word into the seed
+                word = ((word >> 16) ^ word) * 0x45d9f3b;
+                word = ((word >> 16) ^ word) * 0x45d9f3b;
+                word = (word >> 16) ^ word;
+                seed ^= word + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            }
+            
+            // Hash the start offset
+            uint64_t e = static_cast<uint64_t>(startOffset);
+            e = (e ^ (e >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+            e = (e ^ (e >> 27)) * UINT64_C(0x94d049bb133111eb);
+            e = e ^ (e >> 31);
+            seed ^= e + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        }
+    }
+
     return seed;
 }
 
