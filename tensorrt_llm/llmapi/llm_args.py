@@ -1572,6 +1572,9 @@ class TrtLlmArgs(BaseLlmArgs):
     _convert_checkpoint_options: Dict[str,
                                       Any] = PrivateAttr(default_factory=dict)
 
+    # Unused in TRT backend
+    force_dynamic_quantization: bool = False
+
     @property
     def auto_parallel_config(self) -> AutoParallelConfig:
         return self._auto_parallel_config
