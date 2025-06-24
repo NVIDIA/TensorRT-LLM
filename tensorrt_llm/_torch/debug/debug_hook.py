@@ -363,7 +363,6 @@ def dump_tensor(module: nn.Module, data_tensor, debug_ctx: DebuggerContext):
             for _t in t:
                 dump(_t)
 
-    tensor_counter = 0
     dump(data_tensor)
 
 
