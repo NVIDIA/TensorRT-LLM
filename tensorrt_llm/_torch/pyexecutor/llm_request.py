@@ -229,19 +229,15 @@ class LlmResult:
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs'))
 
-    def __init__(self,
-                 result: Union[bytes, tensorrt_llm.bindings.executor.Result],
-                 py_result: PyResult,
-                 is_final: bool = False):
+    def __init__(self, result: Union[bytes,
+                                     tensorrt_llm.bindings.executor.Result],
+                 py_result: PyResult):
         self._result = result
         self._py_result = py_result
-        self.is_final = is_final
 
     def __getattr__(self, item):
         if item in self.py_result_properties:
             return getattr(self._py_result, item)
-        if item == 'is_final':
-            return object.__getattribute__(self, 'is_final')
         result = object.__getattribute__(self, '_result')
         return getattr(result, item)
 
@@ -316,6 +312,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_return_logits_device_memory = return_logits_device_memory
         self.py_is_draft = is_draft
         self.py_seq_slot = None
+        self.py_exclude_last_generation_logits = exclude_last_generation_logits
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
@@ -327,19 +324,78 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   return_generation_logits,
                                   exclude_last_generation_logits)
 
-    def is_generation_only_request(self):
-        return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+    def create_child_request(self, request_id: int):
+        # Create a child request by C++'s API to track the states each other.
+        child_request = super().create_child_request(request_id)
+
+        # Copy Python-specific attributes from parent to child
+        child_request.py_client_id = self.py_client_id
+        child_request.py_parent_request_id = self.py_request_id
+        child_request.py_request_id = child_request.request_id
+        child_request.py_llm_request_type = child_request.llm_request_type
+        child_request.py_end_id = child_request.end_id
+        child_request.py_prompt_len = child_request.prompt_len
+        child_request.py_orig_prompt_len = child_request.orig_prompt_len
+        child_request.py_max_new_tokens = child_request.max_new_tokens
+
+        # input_toknes are already cloned in create_child_request.
+        child_request.py_tokens = child_request.get_tokens()
+
+        # Copy Python-specific configuration from parent
+        child_request.py_return_log_probs = self.py_return_log_probs
+        child_request.py_return_context_logits = self.py_return_context_logits
+        child_request.py_return_generation_logits = self.py_return_generation_logits
+        child_request.py_return_logits_device_memory = self.py_return_logits_device_memory
+        child_request.py_exclude_last_generation_logits = self.py_exclude_last_generation_logits
+        child_request.py_stop_words_list = self.py_stop_words_list
+        child_request.py_logits_post_processors = self.py_logits_post_processors
+        child_request.py_rewind_len = self.py_rewind_len
+        child_request.py_decoding_iter = self.py_decoding_iter
+        child_request.py_draft_tokens = self.py_draft_tokens.copy(
+        ) if self.py_draft_tokens else []
+        child_request.py_last_draft_tokens = self.py_last_draft_tokens.copy(
+        ) if self.py_last_draft_tokens else None
+        child_request.py_num_accepted_draft_tokens = self.py_num_accepted_draft_tokens
+        child_request.py_lora_task_layer_module_configs = self.py_lora_task_layer_module_configs
+
+        # Initialize Python-specific runtime state
+        child_request.py_batch_idx = None
+        child_request.is_attention_dp_dummy = self.is_attention_dp_dummy
+        child_request.is_cuda_graph_dummy = self.is_cuda_graph_dummy
+
+        # Create PyResult for child
+        child_request.py_result = PyResult(
+            prompt_len=child_request.py_prompt_len,
+            max_new_tokens=child_request.py_max_new_tokens,
+            use_device_memory=self.py_return_logits_device_memory,
+            streaming=child_request.streaming,
+            return_log_probs=self.py_return_log_probs,
+            return_context_logits=self.py_return_context_logits,
+            return_generation_logits=self.py_return_generation_logits,
+            exclude_last_generation_logits=self.
+            py_exclude_last_generation_logits)
+
+        # Note: This mimics the behavior of the original LlmRequest.
+        # We need to ensure the child request behaves like the parent
+        # LlmRequest by copying any additional Python-specific attributes that
+        # might be needed for proper request handling and response generation.
+        child_request.is_dummy = self.is_dummy
+
+        return child_request
 
     def create_response(
             self,
             use_fast_logits=False,
             mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
-        result, is_final = super().create_serialized_result(
-            use_fast_logits, mpi_world_rank)
-        return LlmResponse(
-            request_id=self.py_request_id,
-            result=LlmResult(result, self.py_result, is_final),
-            client_id=self.py_client_id) if len(result) > 0 else None
+
+        result = super().create_result(use_fast_logits, mpi_world_rank)
+
+        if result is None:
+            return None
+        else:
+            return LlmResponse(request_id=self.py_request_id,
+                               result=LlmResult(result, self.py_result),
+                               client_id=self.py_client_id)
 
     @property
     def is_dummy(self):
