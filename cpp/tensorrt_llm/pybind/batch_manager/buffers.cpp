@@ -52,9 +52,6 @@ void Buffers::initBindings(pybind11::module_& m)
             py::arg("buffer_manager"))
         .def("get_buffers", &tb::TransformerBuffers::getBuffers, py::arg("input_buffers"), py::arg("output_buffers"),
             py::arg("model_config"))
-        .def("reset_cache_indirection", &tb::TransformerBuffers::resetCacheIndirection, py::arg("context_requests"),
-            py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("decoder_cache_indirection_input"),
-            py::arg("decoder_cache_indirection_output"), py::arg("runtime"))
         .def("copy_position_ids", &tb::TransformerBuffers::copyPositionIds, py::arg("runtime"),
             py::arg("position_ids_host"), py::arg("is_chat_glm"), py::arg("decoder_position_ids"))
         .def("copy_kv_block_offsets", &tb::TransformerBuffers::copyKvBlockOffsets, py::arg("context_requests"),

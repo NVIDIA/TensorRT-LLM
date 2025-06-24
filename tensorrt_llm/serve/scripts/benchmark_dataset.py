@@ -1,5 +1,6 @@
 # Adopted from
 # https://github.com/vllm-project/vllm/blob/200bbf92e8861e2458a6f90bca73f40cc3b1ad1f/benchmarks/benchmark_dataset.py
+# https://github.com/sgl-project/sglang/blob/8321f8e45e07a8539935145d1c76373e457ddc89/python/sglang/bench_serving.py
 # SPDX-License-Identifier: Apache-2.0
 """
 This module defines a framework for sampling benchmark requests from various
@@ -172,12 +173,30 @@ class RandomDataset(BenchmarkDataset):
     DEFAULT_RANGE_RATIO = 0.0
     DEFAULT_INPUT_LEN = 1024
     DEFAULT_OUTPUT_LEN = 128
+    SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
     def __init__(
         self,
+        return_text: bool = True,
+        sample_from_sharegpt: bool = True,
+        download_path: Optional[str] = None,
+        download_timeout: int = 180,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
+        self.sample_from_sharegpt = sample_from_sharegpt
+        if self.sample_from_sharegpt:
+            self.load_data(download_path, download_timeout)
+        self.return_text = return_text
+
+    def load_data(self, download_path: str, download_timeout: int):
+        if self.dataset_path is None:
+            logger.warning(
+                "Dataset is not provided, downloading sharegpt dataset")
+            assert download_path is not None, "Please provide a download path to sample from the ShareGPT dataset for more consistent ISL by specifying it with the `--download-path` option. Alternatively, you can use the `--random-ids` option to skip the sampling, which may introduce some unexpected ISL variation even the range ratio is set to 0."
+            self.dataset_path = download_and_cache_file(
+                RandomDataset.SHAREGPT_URL, download_path,
+                RandomDataset.SHAREGPT_URL.split("/")[-1], download_timeout)
 
     def sample(
         self,
@@ -218,18 +237,84 @@ class RandomDataset(BenchmarkDataset):
         offsets = np.random.randint(0, vocab_size, size=num_requests)
 
         requests = []
-        for i in range(num_requests):
-            inner_seq = ((offsets[i] + i + np.arange(input_lens[i])) %
-                         vocab_size).tolist()
-            token_sequence = prefix_token_ids + inner_seq
-            prompt = tokenizer.decode(token_sequence)
-            total_input_len = prefix_len + int(input_lens[i])
-            requests.append(
-                SampleRequest(
-                    prompt=prompt,
-                    prompt_len=total_input_len,
-                    expected_output_len=int(output_lens[i]),
-                ))
+        if self.sample_from_sharegpt:
+            with open(self.dataset_path) as f:
+                dataset = json.load(f)
+            # Filter out the conversations with less than 2 turns.
+            dataset = [
+                data for data in dataset
+                if len(data.get("conversations", data.get("conversation", [])))
+                >= 2
+            ]
+            # Only keep the first turn of each conversation.
+            dataset = [
+                data.get("conversations", data.get("conversation",
+                                                   []))[0]["value"].strip()
+                for data in dataset
+            ]
+            # Shuffle the dataset.
+            random.shuffle(dataset)
+
+            # Filter out sequences that are too long or too short
+            requests = []
+            for prompt in dataset:
+                i = len(requests)
+                if i == num_requests:
+                    break
+
+                # Tokenize the prompts and completions.
+                prompt_token_ids = tokenizer.encode(prompt)
+                prompt_len = len(prompt_token_ids)
+
+                # Skip empty prompt
+                if prompt_len == 0:
+                    continue
+
+                if prompt_len > input_lens[i]:
+                    input_ids = prompt_token_ids[:input_lens[i]]
+                else:
+                    # Re-calculate the prompt length to exclude special tokens.
+                    prompt_len = len(
+                        tokenizer.encode(prompt, add_special_tokens=False))
+                    if prompt_len == 0:
+                        continue
+                    ratio = (input_lens[i] + prompt_len) // prompt_len
+                    prompt = " ".join([prompt] * ratio)
+                    prompt_token_ids = tokenizer.encode(prompt)
+                    while len(prompt_token_ids) < input_lens[i]:
+                        prompt += " " + prompt
+                        prompt_token_ids = tokenizer.encode(prompt)
+                    input_ids = prompt_token_ids[:input_lens[i]]
+
+                prompt = prefix_token_ids + input_ids
+
+                if self.return_text:
+                    prompt = tokenizer.decode(prompt)
+
+                total_input_len = prefix_len + int(input_lens[i])
+                requests.append(
+                    SampleRequest(
+                        prompt=prompt,
+                        prompt_len=total_input_len,
+                        expected_output_len=int(output_lens[i]),
+                    ))
+            assert len(requests) == num_requests, (
+                f"Only {len(requests)} requests sampled from sharegpt dataset, {num_requests} requests are needed"
+            )
+        else:
+            for i in range(num_requests):
+                inner_seq = ((offsets[i] + i + np.arange(input_lens[i])) %
+                             vocab_size).tolist()
+                prompt = prefix_token_ids + inner_seq
+                if self.return_text:
+                    prompt = tokenizer.decode(prompt)
+                total_input_len = prefix_len + int(input_lens[i])
+                requests.append(
+                    SampleRequest(
+                        prompt=prompt,
+                        prompt_len=total_input_len,
+                        expected_output_len=int(output_lens[i]),
+                    ))
         return requests
 
 

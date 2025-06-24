@@ -141,18 +141,15 @@ def calculate_metrics(
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
-            output_len = len(
-                tokenizer(outputs[i].generated_text,
-                          add_special_tokens=False).input_ids)
-            # if not output_len:
-            #     # We use the tokenizer to count the number of output tokens
-            #     # for some serving backends instead of looking at
-            #     # len(outputs[i].itl) since multiple output tokens may be
-            #     # bundled together
-            #     # Note : this may inflate the output token count slightly
-            #     output_len = len(
-            #         tokenizer(outputs[i].generated_text,
-            #                   add_special_tokens=False).input_ids)
+            if not output_len:
+                # We use the tokenizer to count the number of output tokens
+                # for some serving backends instead of looking at
+                # len(outputs[i].itl) since multiple output tokens may be
+                # bundled together
+                # Note : this may inflate the output token count slightly
+                output_len = len(
+                    tokenizer(outputs[i].generated_text,
+                              add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
             total_input += input_requests[i].prompt_len
             tpot = 0
@@ -251,6 +248,7 @@ async def benchmark(
     max_concurrency: Optional[int],
     lora_modules: Optional[Iterable[str]],
     extra_body: Optional[dict],
+    streaming: bool,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -274,7 +272,8 @@ async def benchmark(
         extra_body=extra_body,
     )
 
-    test_output = await request_func(request_func_input=test_input)
+    test_output = await request_func(request_func_input=test_input,
+                                     streaming=streaming)
     if not test_output.success:
         raise ValueError(
             "Initial test run failed - Please make sure benchmark arguments "
@@ -299,7 +298,8 @@ async def benchmark(
                                          logprobs=logprobs,
                                          ignore_eos=ignore_eos,
                                          extra_body=extra_body)
-        profile_output = await request_func(request_func_input=profile_input)
+        profile_output = await request_func(request_func_input=profile_input,
+                                            streaming=streaming)
         if profile_output.success:
             print("Profiler started")
 
@@ -321,12 +321,14 @@ async def benchmark(
     semaphore = (asyncio.Semaphore(max_concurrency)
                  if max_concurrency else None)
 
-    async def limited_request_func(request_func_input, pbar):
+    async def limited_request_func(request_func_input, streaming, pbar):
         if semaphore is None:
             return await request_func(request_func_input=request_func_input,
+                                      streaming=streaming,
                                       pbar=pbar)
         async with semaphore:
             return await request_func(request_func_input=request_func_input,
+                                      streaming=streaming,
                                       pbar=pbar)
 
     benchmark_start_time = time.perf_counter()
@@ -352,6 +354,7 @@ async def benchmark(
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
+                                     streaming=streaming,
                                      pbar=pbar)))
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
@@ -365,7 +368,8 @@ async def benchmark(
             output_len=test_output_len,
             logprobs=logprobs,
         )
-        profile_output = await request_func(request_func_input=profile_input)
+        profile_output = await request_func(request_func_input=profile_input,
+                                            streaming=streaming)
         if profile_output.success:
             print("Profiler stopped")
 
@@ -625,14 +629,19 @@ def main(args: argparse.Namespace):
                                     dataset_path=args.dataset_path).
             sample(tokenizer=tokenizer, num_requests=args.num_prompts),
             "random":
-            lambda: RandomDataset(dataset_path=args.dataset_path).sample(
-                tokenizer=tokenizer,
-                num_requests=args.num_prompts,
-                prefix_len=args.random_prefix_len,
-                input_len=args.random_input_len,
-                output_len=args.random_output_len,
-                range_ratio=args.random_range_ratio,
-            )
+            lambda: RandomDataset(sample_from_sharegpt=not args.random_ids,
+                                  return_text=not args.tokenize_on_client,
+                                  dataset_path=args.dataset_path,
+                                  download_path=args.download_path,
+                                  download_timeout=args.download_timeout
+                                  ).sample(
+                                      tokenizer=tokenizer,
+                                      num_requests=args.num_prompts,
+                                      prefix_len=args.random_prefix_len,
+                                      input_len=args.random_input_len,
+                                      output_len=args.random_output_len,
+                                      range_ratio=args.random_range_ratio,
+                                  )
         }
 
         try:
@@ -688,6 +697,7 @@ def main(args: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
             extra_body=sampling_params,
+            streaming=not args.non_streaming,
         ))
 
     # Save config and results to json
@@ -853,6 +863,11 @@ if __name__ == "__main__":
         "bursty requests. A higher burstiness value (burstiness > 1) "
         "results in a more uniform arrival of requests.",
     )
+    parser.add_argument(
+        "--non-streaming",
+        action="store_true",
+        help="Disable streaming mode",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--trust-remote-code",
@@ -1004,6 +1019,17 @@ if __name__ == "__main__":
               "a random "
               "context length sampled from [input_len * (1 - range_ratio), "
               "input_len * (1 + range_ratio)]."),
+    )
+    random_group.add_argument(
+        "--random-ids",
+        action="store_true",
+        help="Generate random ids instead of sample from ShareGPT dataset.",
+    )
+    random_group.add_argument(
+        "--tokenize-on-client",
+        action="store_true",
+        help=
+        "Tokenize on client instead of server. This option only takes effect with random dataset to let the server run exactly the same ISL specified by cli.",
     )
 
     hf_group = parser.add_argument_group("hf dataset options")
