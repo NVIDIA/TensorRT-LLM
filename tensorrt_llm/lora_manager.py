@@ -554,7 +554,7 @@ class LoraManager(object):
             new_model_files.append(model_file)
 
         if len(new_uids) == 0:
-            return
+            return new_uids
 
         self.lora_target_modules = model_config.lora_target_modules
 
@@ -706,7 +706,7 @@ class LoraManager(object):
             new_model_dirs.append(model_dir)
 
         if len(new_uids) == 0:
-            return
+            return new_uids
 
         lora_hf_configs = []
         for model_dir in new_model_dirs:
