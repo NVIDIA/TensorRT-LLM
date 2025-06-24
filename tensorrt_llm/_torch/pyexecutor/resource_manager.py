@@ -518,7 +518,7 @@ class MambaCacheManager(BaseResourceManager):
         d_model: int,
         d_state: int,
         d_conv: int,
-        num_heads: int,
+        nheads: int,
         n_groups: int,
         head_dim: int,
         num_layers: int,
@@ -532,9 +532,8 @@ class MambaCacheManager(BaseResourceManager):
         tp_size = mapping.tp_size
 
         # derive mamba parameters for conv and ssm states
-        d_inner = head_dim * num_heads
+        d_inner = head_dim * nheads
         conv_dim = d_inner + 2 * n_groups * d_state
-        nheads = d_inner // head_dim
 
         # check that can be partitioned
         assert nheads % tp_size == 0, "nheads must be divisible by tp_size"
