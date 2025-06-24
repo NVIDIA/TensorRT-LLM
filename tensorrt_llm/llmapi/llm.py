@@ -806,7 +806,7 @@ class _TrtLLM(BaseLLM):
                 backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.
                 XGRAMMAR,
                 **_xgrammar_tokenizer_info(self.tokenizer))
-        else:
+        elif self.args.guided_decoding_backend is not None:
             raise ValueError(
                 f"Unsupported guided decoding backend {self.args.guided_decoding_backend}"
             )
