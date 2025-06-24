@@ -252,7 +252,7 @@ moe_permute_op(torch::Tensor const& input, torch::Tensor const& token_selected_e
         break;
     default:
         throw std::invalid_argument(
-            "Invalid dtype, only supports intput tensor with float32, float16 and bfloat16 dtype");
+            "Invalid dtype, only supports input tensor with float32, float16 and bfloat16 dtype");
         break;
     }
     return std::make_tuple(unpermuted_token_selected_experts_tensor, unpermuted_source_token_ids_tensor,
@@ -323,7 +323,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> run_moe_expand_op(torch:
         break;
     default:
         throw std::invalid_argument(
-            "Invalid dtype, only supports intput tensor with float32, float16 and bfloat16 dtype");
+            "Invalid dtype, only supports input tensor with float32, float16 and bfloat16 dtype");
         break;
     }
     return std::make_tuple(
@@ -410,7 +410,7 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
         break;
     default:
         throw std::invalid_argument(
-            "Invalid dtype, only supports intput tensor with float32, float16 and bfloat16 dtype");
+            "Invalid dtype, only supports input tensor with float32, float16 and bfloat16 dtype");
         break;
     }
     return final_output;
