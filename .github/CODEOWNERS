@@ -16,6 +16,7 @@
 
 ## TensorRT-LLM trtllm-bench Reviewers
 /tensorrt_llm/bench @NVIDIA/trtllm-bench-reviewers
+/tensorrt_llm/commands/bench.py @NVIDIA/trtllm-bench-reviewers
 docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 
 
