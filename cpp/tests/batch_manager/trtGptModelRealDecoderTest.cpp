@@ -1051,7 +1051,7 @@ INSTANTIATE_TEST_SUITE_P(GptTests, ParamTest,
             ),
         testing::Values(std::nullopt, 1280),       // maxTokensInPagedKvCache
         testing::Values(std::nullopt, 0.4),        // freeGpuMemoryFraction
-        testing::Values(false, true),              // enableTrtOverlap
+        testing::Values(true),                     // enableTrtOverlap
         testing::Values(false),                    // enableChunkedContext
         testing::Values(false),                    // enableStreamingMode
         testing::Values(false),                    // enableCudaGraphMode
@@ -1077,7 +1077,7 @@ INSTANTIATE_TEST_SUITE_P(GptRandomEndIdTests, ParamTest,
             ),
         testing::Values(std::nullopt, 1280),       // maxTokensInPagedKvCache
         testing::Values(std::nullopt, 0.4),        // freeGpuMemoryFraction
-        testing::Values(false, true),              // enableTrtOverlap
+        testing::Values(true),                     // enableTrtOverlap
         testing::Values(false),                    // enableChunkedContext
         testing::Values(false),                    // enableStreamingMode
         testing::Values(false),                    // enableCudaGraphMode
@@ -1101,7 +1101,7 @@ INSTANTIATE_TEST_SUITE_P(GptKVOffloadingTest, ParamTest,
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(256),               // maxTokensInPagedKvCache
         testing::Values(std::nullopt, 0.4), // freeGpuMemoryFraction
-        testing::Values(false, true),       // enableTrtOverlap
+        testing::Values(true),              // enableTrtOverlap
         testing::Values(false),             // enableChunkedContext
         testing::Values(false),             // enableStreamingMode
         testing::Values(false),             // enableCudaGraphMode
@@ -1134,7 +1134,7 @@ INSTANTIATE_TEST_SUITE_P(GptCudaGraphTests, ParamTest,
         testing::Values(std::nullopt),             // maxTokensInPagedKvCache
         testing::Values(0.4),                      // freeGpuMemoryFraction
         testing::Values(false),                    // enableTrtOverlap
-        testing::Values(false, true),              // enableChunkedContext
+        testing::Values(true),                     // enableChunkedContext
         testing::Values(false),                    // enableStreamingMode
         testing::Values(true),                     // enableCudaGraphMode
         testing::Values(std::nullopt),             // hostCacheSize
@@ -1184,8 +1184,8 @@ INSTANTIATE_TEST_SUITE_P(GptNProfilesTests, ParamTest,
             ),
         testing::Values(std::nullopt, 1280),       // maxTokensInPagedKvCache
         testing::Values(std::nullopt, 0.4),        // freeGpuMemoryFraction
-        testing::Values(false, true),              // enableTrtOverlap
-        testing::Values(false, true),              // enableChunkedContext
+        testing::Values(true),                     // enableTrtOverlap
+        testing::Values(true),                     // enableChunkedContext
         testing::Values(false),                    // enableStreamingMode
         testing::Values(false),                    // enableCudaGraphMode
         testing::Values(std::nullopt),             // hostCacheSize
@@ -1570,7 +1570,7 @@ INSTANTIATE_TEST_SUITE_P(MedusaTests, ParamTest,
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
         testing::Values(0.4),          // freeGpuMemoryFraction
         testing::Values(false),        // enableTrtOverlap
-        testing::Values(false, true),  // enableChunkedContext
+        testing::Values(true),         // enableChunkedContext
         testing::Values(false),        // enableStreamingMode
         testing::Values(true, false),  // enableCudaGraphMode
         testing::Values(std::nullopt), // hostCacheSize
@@ -1594,7 +1594,7 @@ INSTANTIATE_TEST_SUITE_P(EagleTests, ParamTest,
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
         testing::Values(0.4),          // freeGpuMemoryFraction
         testing::Values(false),        // enableTrtOverlap
-        testing::Values(false, true),  // enableChunkedContext
+        testing::Values(true),         // enableChunkedContext
         testing::Values(false),        // enableStreamingMode
         testing::Values(true, false),  // enableCudaGraphMode
         testing::Values(std::nullopt), // hostCacheSize
@@ -1644,7 +1644,7 @@ INSTANTIATE_TEST_SUITE_P(ExplicitDraftTokensDecodingTests, ParamTest,
         testing::Values(std::nullopt),       // maxTokensInPagedKvCache
         testing::Values(0.4),                // freeGpuMemoryFraction
         testing::Values(false),              // enableTrtOverlap
-        testing::Values(false, true),        // enableChunkedContext
+        testing::Values(true),               // enableChunkedContext
         testing::Values(false),              // enableStreamingMode
         testing::Values(false),              // enableCudaGraphMode
         testing::Values(std::nullopt),       // hostCacheSize
