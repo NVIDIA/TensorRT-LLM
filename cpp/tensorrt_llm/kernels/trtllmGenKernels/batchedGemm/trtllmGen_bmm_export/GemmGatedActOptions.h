@@ -81,6 +81,7 @@ enum class ActType
     }
 
 TLLM_ACT_TYPE_FUNCTION(SwiGlu)
+TLLM_ACT_TYPE_FUNCTION(Swish)
 
 #undef TLLM_ACT_TYPE_FUNCTION
 
@@ -91,6 +92,7 @@ inline std::string getActTypeName(ActType type)
     switch (type)
     {
     case ActType::SwiGlu: return "SwiGlu";
+    case ActType::Swish: return "Swish";
     default: return "Unknown type";
     }
 }

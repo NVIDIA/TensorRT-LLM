@@ -243,11 +243,11 @@ struct BatchedGemmData
         // Shape is [B].
         float const* mPtrScaleGate{nullptr};
 
-        // The alpha and beta for SwiGlu.
+        // The alpha and beta for SwiGlu and Swish.
         // gatedActivation <- (x0 + beta) * sigmoid(alpha * x1)
         // Shape is [B]
-        float const* mPtrSwiGluAlpha{nullptr};
-        float const* mPtrSwiGluBeta{nullptr};
+        float const* mPtrAlpha{nullptr};
+        float const* mPtrBeta{nullptr};
 
         // Param is used when the kernel is configured with -routeAct true.
         // The inputs are not padded, but the outputs are padded to divUpMul(M[bi], tileM) for batchM or
@@ -642,7 +642,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
         batchedGemmData.mInputBuffers.mPtrPerTokenSfA, batchedGemmData.mInputBuffers.mPtrPerTokenSfB,
         batchedGemmData.mInputBuffers.mPtrBias, batchedGemmData.mOutputBuffers.mPtrSfC,
         batchedGemmData.mInputBuffers.mPtrScaleC, batchedGemmData.mInputBuffers.mPtrScaleGate,
-        batchedGemmData.mInputBuffers.mPtrSwiGluAlpha, batchedGemmData.mInputBuffers.mPtrSwiGluBeta,
+        batchedGemmData.mInputBuffers.mPtrAlpha, batchedGemmData.mInputBuffers.mPtrBeta,
         batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax, dPtrRowMaxBars,
         batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas, batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
         batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit,
