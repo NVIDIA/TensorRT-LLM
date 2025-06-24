@@ -350,7 +350,7 @@ class GenerationExecutorWorker(GenerationExecutor):
             self._runtime_model_config is not None else self._lora_model_config,
             runtime_mapping=None,
             uids=[adapter_id])
-        return newly_loaded_uids and newly_loaded_uids[0] == adapter_id
+        return adapter_id in newly_loaded_uids
 
     def _load_prompt_adapter(self,
                              prompt_adapter_request: PromptAdapterRequest):
