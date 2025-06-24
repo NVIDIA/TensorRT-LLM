@@ -56,6 +56,9 @@ class Sampler(ABC):
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
         pass
 
+    def get_cache_indirection(self) -> torch.Tensor | None:
+        return None
+
     @abstractmethod
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleState:
@@ -599,17 +602,16 @@ class TRTLLMSampler(Sampler):
             return req.sampling_config.beam_width
         return 0
 
-
-    def get_cache_indirection(self):
-        return self.store["decoder_buffers"].cache_indirection_output
+    def get_cache_indirection(self) -> torch.Tensor | None:
+        return self.store["decoder_state"].cache_indirection_output
 
     def _update_cache_indirection_buffer(self,
                                          scheduled_requests: ScheduledRequests):
         # Copy cache indirection output to input
         for request in scheduled_requests.generation_requests:
-            self.store["decoder_buffers"].cache_indirection_input[
+            self.store["decoder_state"].cache_indirection_input[
                 request.seq_slot].copy_(
-                    self.store["decoder_buffers"].cache_indirection_output[
+                    self.store["decoder_state"].cache_indirection_output[
                         request.seq_slot],
                     non_blocking=True)
 
@@ -617,10 +619,11 @@ class TRTLLMSampler(Sampler):
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateTRTLLM:
         batch_size = scheduled_requests.batch_size
-        beam_width = self.beam_width(scheduled_requests.all_requests)
+        all_requests = scheduled_requests.all_requests()
+        beam_width = self.beam_width(all_requests)
         if (batch_size > 1 and beam_width > 1
                 and any(request.py_return_log_probs
-                        for request in scheduled_requests.all_requests)):
+                        for request in all_requests)):
             raise ValueError(
                 "Beam search is not supported for multiple prompts and logprobs"
             )
@@ -712,10 +715,7 @@ class TRTLLMSampler(Sampler):
 
         
 
-        finalize_events = []
-        
-
-        for request in scheduled_requests.all_requests:
+        for request in requests:
             if request.is_context_init_state:
                 continue
 
@@ -786,8 +786,7 @@ class TRTLLMSampler(Sampler):
                 finalize_events.append(self._finalize_request(request, True))
         # post process all requests if necessary
         if beam_width > 1:
-            for request_position, request in enumerate(
-                    scheduled_requests.all_requests):
+            for request_position, request in enumerate(requests):
                 if request.is_context_init_state:
                     continue
                 if request.state == LlmRequestState.GENERATION_COMPLETE or request.streaming:

@@ -338,6 +338,8 @@ void initBindings(pybind11::module_& m)
             py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
         .def_property_readonly("joint_decoding_input", &tr::decoder::DecoderState::getJointDecodingInput)
         .def_property_readonly("joint_decoding_output", &tr::decoder::DecoderState::getJointDecodingOutput)
+        .def_property_readonly("cache_indirection_input", &tr::decoder::DecoderState::getCacheIndirectionInput)
+        .def_property_readonly("cache_indirection_output", &tr::decoder::DecoderState::getCacheIndirectionOutput)
         .def_property_readonly(
             "sequence_lengths", py::overload_cast<>(&tr::decoder::DecoderState::getSequenceLengths, py::const_))
         .def("get_sequence_lengths",
