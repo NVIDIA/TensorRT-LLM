@@ -1155,30 +1155,6 @@ class BaseLlmArgs(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def init_build_config(self):
-        """
-        Creating a default BuildConfig if none is provided
-        """
-        if self.build_config is None:
-            kwargs = {}
-            if self.max_batch_size:
-                kwargs["max_batch_size"] = self.max_batch_size
-            if self.max_num_tokens:
-                kwargs["max_num_tokens"] = self.max_num_tokens
-            if self.max_seq_len:
-                kwargs["max_seq_len"] = self.max_seq_len
-            if self.max_beam_width:
-                kwargs["max_beam_width"] = self.max_beam_width
-            if self.max_input_len:
-                kwargs["max_input_len"] = self.max_input_len
-            self.build_config = BuildConfig(**kwargs)
-
-        assert isinstance(
-            self.build_config, BuildConfig
-        ), f"build_config is not initialized: {self.build_config}"
-        return self
-
-    @model_validator(mode="after")
     def set_runtime_knobs_from_build_config(self):
         # TODO: remove this after PyT become default to adapt PyT with build_config as input
         assert self.build_config is not None, "build_config is not initialized"
@@ -1541,6 +1517,30 @@ class TrtLlmArgs(BaseLlmArgs):
         if v is None:
             return CalibConfig()
         return v
+
+    @model_validator(mode="after")
+    def init_build_config(self):
+        """
+        Creating a default BuildConfig if none is provided
+        """
+        if self.build_config is None:
+            kwargs = {}
+            if self.max_batch_size:
+                kwargs["max_batch_size"] = self.max_batch_size
+            if self.max_num_tokens:
+                kwargs["max_num_tokens"] = self.max_num_tokens
+            if self.max_seq_len:
+                kwargs["max_seq_len"] = self.max_seq_len
+            if self.max_beam_width:
+                kwargs["max_beam_width"] = self.max_beam_width
+            if self.max_input_len:
+                kwargs["max_input_len"] = self.max_input_len
+            self.build_config = BuildConfig(**kwargs)
+
+        assert isinstance(
+            self.build_config, BuildConfig
+        ), f"build_config is not initialized: {self.build_config}"
+        return self
 
     @model_validator(mode="after")
     def setup_embedding_parallel_mode(self):
