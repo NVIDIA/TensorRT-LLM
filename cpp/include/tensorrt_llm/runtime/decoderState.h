@@ -57,7 +57,8 @@ public:
 
     //! @brief Setup buffers for the cache indirection.
     //! @details This is used for beam search on pipeline parallel ranks without a decoder.
-    void setupCacheIndirection(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow);
+    void setupCacheIndirection(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+        BufferManager const& bufferManager);
 
     //! @brief Setup buffers for speculative decoding.
     void setupSpeculativeDecoding(SpeculativeDecodingMode const& speculativeDecodingMode,
@@ -192,6 +193,10 @@ private:
     void reshapeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
         SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig, BufferManager const& bufferManager);
+
+    void setupCacheIndirectionBuffers(BufferManager const& bufferManager);
+    void reshapeCacheIndirectionBuffers(
+        SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow);
 
     void setupSpeculativeDecodingBuffers(
         SpeculativeDecodingMode speculativeDecodingMode, nvinfer1::DataType dtype, BufferManager const& bufferManager);

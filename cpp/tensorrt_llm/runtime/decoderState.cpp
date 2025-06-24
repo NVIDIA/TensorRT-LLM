@@ -111,8 +111,7 @@ void DecoderState::setupBuffers(nvinfer1::DataType dtype, BufferManager const& b
 
     mBeamSearchBuffers = std::make_unique<BeamSearchBuffers>(bufferManager);
 
-    dInput->cacheIndirection = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
-    dOutput->cacheIndirection = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
+    setupCacheIndirectionBuffers(bufferManager);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -279,7 +278,7 @@ void DecoderState::reshapeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWid
         dOutput.beamHypotheses.reshape(mMaxBatchSize, mMaxBeamWidth, mMaxSequenceLength);
         mBeamSearchBuffers->reshape(mMaxBeamWidth, mMaxSequenceLength);
 
-        setupCacheIndirection(mMaxBatchSize, mMaxBeamWidth, maxAttentionWindow);
+        reshapeCacheIndirectionBuffers(mMaxBatchSize, mMaxBeamWidth, maxAttentionWindow);
 
         dOutput.gatheredIds->reshape(maxTotalTokensShape);
     }
@@ -301,6 +300,22 @@ void DecoderState::reshapeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWid
 }
 
 void DecoderState::setupCacheIndirection(
+    SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, BufferManager const& bufferManager)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    setupCacheIndirectionBuffers(bufferManager);
+    reshapeCacheIndirectionBuffers(maxBatchSize, maxBeamWidth, maxAttentionWindow);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void DecoderState::setupCacheIndirectionBuffers(BufferManager const& bufferManager)
+{
+    auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
+    mJointDecodingInput->cacheIndirection = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
+    mJointDecodingOutput->cacheIndirection = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
+}
+
+void DecoderState::reshapeCacheIndirectionBuffers(
     SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow)
 {
     mJointDecodingInput->cacheIndirection->reshape(
