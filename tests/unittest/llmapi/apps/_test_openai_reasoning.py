@@ -27,7 +27,8 @@ def server(model_name: str, backend: str) -> RemoteOpenAIServer:
     args = []
     if backend == "pytorch":
         args.extend(["--backend", f"{backend}"])
-    args.extend(["--max_beam_width", "2"])
+    max_beam_width = 1 if backend == "pytorch" else 2
+    args.extend(["--max_beam_width", str(max_beam_width)])
     args.extend(["--max_batch_size", "2", "--max_seq_len", "1024"])
     args.extend(["--reasoning_parser", "deepseek-r1"])
     with RemoteOpenAIServer(model_path, args) as remote_server:
