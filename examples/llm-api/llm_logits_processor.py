@@ -3,9 +3,8 @@ from typing import List, Optional
 
 import torch
 
-from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
-                                          LogitsProcessor, SamplingParams)
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.sampling_params import BatchedLogitsProcessor, LogitsProcessor
 
 
 # The recommended way to create a customized logits processor:
