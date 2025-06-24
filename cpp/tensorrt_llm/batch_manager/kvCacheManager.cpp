@@ -76,39 +76,8 @@ std::list<std::vector<T>> chopVectorIntoBlocks(
     return blockedVectors;
 }
 
-std::vector<BlockKey> buildBlockKeys(
-    std::list<VecUniqueTokens>& blockedUniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
-{
-    std::vector<BlockKey> blockKeys;
-    
-    SizeType32 currentTokenIdx = 0;
-    for (auto& uniqueTokens : blockedUniqueTokens)
-    {
-        // Generate extra keys for this block
-        auto extraKeys = generateBlockHashExtraKeys(llmRequest, currentTokenIdx, currentTokenIdx + uniqueTokens.size());
-        
-        blockKeys.emplace_back(
-            llmRequest.getInputTokensExtraIds().has_value(), 
-            llmRequest.getLoraTaskId(), 
-            std::move(uniqueTokens),
-            std::move(extraKeys));
-            
-        currentTokenIdx += uniqueTokens.size();
-    }
-    return blockKeys;
-}
-
-    }
-    return blockKeys;
-}
-
-} // namespace
-
-namespace tensorrt_llm::batch_manager::kv_cache_manager
-{
-
 std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
-    LlmRequest const& llmRequest, 
+    tensorrt_llm::batch_manager::LlmRequest const& llmRequest,
     SizeType32 startTokenIdx, 
     SizeType32 endTokenIdx)
 {
@@ -117,13 +86,15 @@ std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
     auto const multimodalLengths = llmRequest.getMultimodalLengths();
     
     if (!multimodalHashes || !multimodalPositions || !multimodalLengths || 
-        multimodalHashes->empty() || multimodalPositions->empty() || multimodalLengths->empty())
+        !(*multimodalHashes) || (*multimodalHashes)->empty() || 
+        !(*multimodalPositions) || (*multimodalPositions)->empty() || 
+        !(*multimodalLengths) || (*multimodalLengths)->empty())
     {
         return std::nullopt;
     }
     
-    if (multimodalHashes->size() != multimodalPositions->size() || 
-        multimodalPositions->size() != multimodalLengths->size())
+    if ((*multimodalHashes)->size() != (*multimodalPositions)->size() || 
+        (*multimodalPositions)->size() != (*multimodalLengths)->size())
     {
         TLLM_LOG_WARNING("Multimodal data arrays have mismatched sizes");
         return std::nullopt;
@@ -131,11 +102,11 @@ std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
     
     std::vector<MmKey> extraKeys;  // MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>
     
-    for (size_t i = 0; i < multimodalPositions->size(); ++i)
+    for (size_t i = 0; i < (*multimodalPositions)->size(); ++i)
     {
-        auto const& startPos = (*multimodalPositions)[i];
-        auto const& length = (*multimodalLengths)[i];
-        auto const& mmHashVector = (*multimodalHashes)[i];  // This is vector<int32> - your current format
+        auto const& startPos = (*(*multimodalPositions))[i];
+        auto const& length = (*(*multimodalLengths))[i];
+        auto const& mmHashVector = (*(*multimodalHashes))[i];  // This is vector<int32> - your current format
         
         std::array<uint8_t, 32> mmHashArray;
         if (mmHashVector.size() == 8)  // 256-bit hash = 8 * 32-bit integers
@@ -175,6 +146,30 @@ std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
     return extraKeys.empty() ? std::nullopt : std::make_optional(std::move(extraKeys));
 }
 
+std::vector<BlockKey> buildBlockKeys(
+    std::list<VecUniqueTokens>& blockedUniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
+{
+    std::vector<BlockKey> blockKeys;
+    
+    SizeType32 currentTokenIdx = 0;
+    for (auto& uniqueTokens : blockedUniqueTokens)
+    {
+        auto extraKeys = generateBlockHashExtraKeys(llmRequest, currentTokenIdx, currentTokenIdx + uniqueTokens.size());
+        currentTokenIdx += uniqueTokens.size();
+
+        blockKeys.emplace_back(
+            llmRequest.getInputTokensExtraIds().has_value(), 
+            llmRequest.getLoraTaskId(), 
+            std::move(uniqueTokens),
+            std::move(extraKeys));
+    }
+    return blockKeys;
+}
+
+} // namespace
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
 size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) noexcept
 {
     size_t seed = blockKey.uniqueTokens.size() ^ parentHash * UINT64_C(0xbf58476d1ce4e5b9);
