@@ -170,14 +170,22 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
     else
     {
         int blockNum = 0;
-        std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
+
+        size_t allCacheBlockSize = 0;
+
+        std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocks;
         for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
             blockRange.updatePoolIdx(poolIdx);
+            SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(poolIdx);
+            TLLM_CHECK_WITH_INFO(inputKvCacheBlocks.find(window) == inputKvCacheBlocks.end(),
+                "window size already exists, which is not supported");
+            inputKvCacheBlocks.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
             for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
             {
                 blockNum++;
-                inputKvCacheBlocks.push_back(it);
+                inputKvCacheBlocks.at(window).push_back(it);
+                allCacheBlockSize += it->getSize();
             }
         }
         TLLM_CHECK(!inputKvCacheBlocks.empty());
@@ -198,9 +206,12 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
             for (auto const& connection : connections)
             {
-                for (auto const& block : inputKvCacheBlocks)
+                for (auto const& [window, blocks] : inputKvCacheBlocks)
                 {
-                    TransferHelper::sendBuffer(*connection, *block, llmRequest.mRequestId);
+                    for (auto const& block : blocks)
+                    {
+                        TransferHelper::sendBuffer(*connection, *block, llmRequest.mRequestId);
+                    }
                 }
             }
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
@@ -209,13 +220,10 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
             return;
         }
 
-        auto cacheBlockSize = inputKvCacheBlocks.front()->getSize();
-
         auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto targetNum = connections.size();
-        TLLM_CHECK((cacheBlockSize * blockNum) % targetNum == 0);
-        auto const targetBufferSize = (cacheBlockSize * blockNum) / targetNum * peerDuplicateHeadFactor;
+        auto const targetBufferSize = allCacheBlockSize / targetNum * peerDuplicateHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
         TLLM_LOG_DEBUG(" formatOutput bufferTargetNum: %d, targetNum: %d, peerDuplicateHeadFactor: %d dupliacete:%d ",
             bufferTargetNum, targetNum, peerDuplicateHeadFactor, targetInfo.mDupHeadFactor);
@@ -240,7 +248,7 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
         auto preAllocSendBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId);
         if (preAllocSendBuffer != nullptr)
         {
-            TLLM_CHECK(preAllocSendBuffer->getDataType() == inputKvCacheBlocks.front()->getDataType());
+            TLLM_CHECK(preAllocSendBuffer->getDataType() == inputKvCacheBlocks.begin()->second.front()->getDataType());
         }
         auto sendBufferFun = [&](int deviceId, size_t processIdx)
         {
@@ -365,20 +373,27 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
 
     TLLM_LOG_DEBUG("pickUpConnections size: %d connections size: %d", pickUpConnections.size(), connections.size());
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
-    std::vector<runtime::ITensor::SharedPtr> outputBuffers;
+    std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> outputBuffersPerWindow;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
     size_t blockNum = 0;
+    size_t cacheBlockSizeSum = 0;
     for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
     {
         blockRange.updatePoolIdx(poolIdx);
+        SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(poolIdx);
+        TLLM_CHECK_WITH_INFO(outputBuffersPerWindow.find(window) == outputBuffersPerWindow.end(),
+            "window size already exists, which is not supported");
+        outputBuffersPerWindow.emplace(window, std::vector<runtime::ITensor::SharedPtr>());
         for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
         {
             blockNum++;
-            outputBuffers.push_back(it);
+            outputBuffersPerWindow.at(window).push_back(it);
+            cacheBlockSizeSum += it->getSize();
         }
     }
-    TLLM_CHECK(!outputBuffers.empty());
+    TLLM_CHECK(!outputBuffersPerWindow.empty());
+
     {
         NVTX3_SCOPED_RANGE(formatInputRecvBuffer);
 
@@ -438,8 +453,9 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
             {
                 NVTX3_SCOPED_RANGE(formatInputConcatenate);
                 executor::kv_cache::concatKVCacheDispatch(recvBufferTmps.data(), recvBufferTmps.size(),
-                    getCounterparts(selfConfig, selfIdx, destConfig), destConfig, outputBuffers.data(),
-                    outputBuffers.size(), selfIdx, selfConfig, bufferManager);
+                    getCounterparts(selfConfig, selfIdx, destConfig), destConfig,
+                    outputBuffersPerWindow.begin()->second.data(), outputBuffersPerWindow.begin()->second.size(),
+                    selfIdx, selfConfig, bufferManager);
                 bufferManager.getStream().synchronize();
             }
         }
@@ -458,10 +474,13 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                 TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
                 for (auto const& connection : pickUpConnections)
                 {
-                    for (auto const& block : outputBuffers)
+                    for (auto const& [window, blocks] : outputBuffersPerWindow)
                     {
-                        llmRequest.updateKvCacheSize((*block).getSizeInBytes());
-                        TransferHelper::recvBuffer(*connection, *block, reqId);
+                        for (auto const& block : blocks)
+                        {
+                            llmRequest.updateKvCacheSize((*block).getSizeInBytes());
+                            TransferHelper::recvBuffer(*connection, *block, reqId);
+                        }
                     }
                 }
                 TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
@@ -480,12 +499,10 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
             runtime::ITensor::SharedPtr recvBufferTemp;
             std::vector<runtime::ITensor::SharedPtr> recvSplitCaches;
 
-            auto cacheBlockSize = outputBuffers.front()->getSize();
-
-            auto dataType = outputBuffers.front()->getDataType();
+            auto dataType = outputBuffersPerWindow.begin()->second.front()->getDataType();
             auto targetNum = pickUpConnections.size();
-            TLLM_CHECK((cacheBlockSize * blockNum) % targetNum == 0);
-            auto targetBufferSize = (cacheBlockSize * blockNum) / targetNum;
+            TLLM_CHECK(cacheBlockSizeSum % targetNum == 0);
+            auto targetBufferSize = cacheBlockSizeSum / targetNum;
 
             size_t remainNoCoverTargetNum = 0;
             size_t bufferCoverTargetNum = 0;
@@ -494,7 +511,6 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                 NVTX3_SCOPED_RANGE(formatInputAllocBuffer);
 
                 TLLM_CHECK(blockNum > 0);
-                TLLM_CHECK(outputBuffers.size() == blockNum);
                 if (legacyPath)
                 {
 
@@ -662,14 +678,16 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
 
                 if (legacyPath)
                 {
+                    TLLM_CHECK(outputBuffersPerWindow.size() == 1);
                     executor::kv_cache::concatKVCacheDispatch(recvSplitCaches.data(), recvSplitCaches.size(),
-                        getCounterparts(selfConfig, selfIdx, destConfig), destConfig, outputBuffers.data(),
-                        outputBuffers.size(), selfIdx, selfConfig, bufferManager);
+                        getCounterparts(selfConfig, selfIdx, destConfig), destConfig,
+                        outputBuffersPerWindow.begin()->second.data(), outputBuffersPerWindow.begin()->second.size(),
+                        selfIdx, selfConfig, bufferManager);
                 }
                 else
                 {
                     executor::kv_cache::concatKvCacheV2Dispatch(
-                        recvSplitCaches, outputBuffers, destConfig, selfConfig, selfIdx, bufferManager);
+                        recvSplitCaches, outputBuffersPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
                 }
                 bufferManager.getStream().synchronize();
                 if (cacheBufferId.has_value())
@@ -692,6 +710,8 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
         TLLM_LOG_WARNING("CacheFormatter::inquireSupport: selfConfig.getDataType() != destConfig.getDataType()");
         return false;
     }
+
+    // TODO: getEnvDisableSelectiveCacheTransfer
 
     std::unordered_set<SizeType32> setVecSelf{
         selfConfig.getModelConfig().mNbKvHeadsPerLayer.begin(), selfConfig.getModelConfig().mNbKvHeadsPerLayer.end()};
