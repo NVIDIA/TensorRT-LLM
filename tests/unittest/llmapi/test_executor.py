@@ -10,6 +10,7 @@ import pytest
 import torch
 import zmq
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
@@ -17,7 +18,7 @@ from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationResult, GenerationResultBase,
                                    PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
-from tensorrt_llm.llmapi import LLM, BuildConfig
+from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import AsyncQueue
 from tensorrt_llm.sampling_params import SamplingParams

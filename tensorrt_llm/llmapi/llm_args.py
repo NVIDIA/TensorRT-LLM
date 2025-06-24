@@ -298,6 +298,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
     use_relaxed_acceptance_for_thinking: Optional[bool] = False
     relaxed_topk: Optional[int] = 1
     relaxed_delta: Optional[float] = 0.
+    use_mtp_vanilla: Optional[bool] = False
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1351,7 +1352,8 @@ class BaseLlmArgs(BaseModel):
                     use_relaxed_acceptance_for_thinking=self.speculative_config.
                     use_relaxed_acceptance_for_thinking,
                     relaxed_topk=self.speculative_config.relaxed_topk,
-                    relaxed_delta=self.speculative_config.relaxed_delta)
+                    relaxed_delta=self.speculative_config.relaxed_delta,
+                    use_mtp_vanilla=self.speculative_config.use_mtp_vanilla)
             else:
                 raise ValueError(
                     f"Speculative config type not recognized: {self.speculative_config}"
@@ -1591,9 +1593,6 @@ class TrtLlmArgs(BaseLlmArgs):
         return self
 
 
-LlmArgs = TrtLlmArgs
-
-
 class LoadFormat(Enum):
     AUTO = 0
     # Initialize all weights randomly.
@@ -1663,7 +1662,10 @@ class TorchLlmArgs(BaseLlmArgs):
     moe_load_balancer: Optional[Union[object, str]] = Field(
         default=None,
         description="Configuration for MoE load balancing.",
-        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+        json_schema_extra={
+            "type":
+            "Union[tensorrt_llm._torch.model_config.MoeLoadBalancerConfig, str, None]"
+        })
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.")
@@ -2080,6 +2082,8 @@ def get_model_format(model_dir: str) -> _ModelFormatKind:
     else:
         return model_format
 
+
+LlmArgs = TorchLlmArgs
 
 TRT_LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(TrtLlmArgs,
                                                                 indent=' ' * 4)

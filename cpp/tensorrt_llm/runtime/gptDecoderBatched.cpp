@@ -147,8 +147,8 @@ void setEagleInputs(DecodingInput& dInput, decoder_batch::Input const& input)
 
 //! @brief Prepare Input and Output for decoder step.
 // TODO: produce new input and output objects
-void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, decoder_batch::Output& output,
-    decoder_batch::Input const& input, BufferManager const& bufferManager)
+void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, decoder_batch::Input const& input,
+    BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -160,8 +160,6 @@ void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, 
 
     if (maxBeamWidth > 1)
     {
-        dInput.cacheIndirection = input.cacheIndirection;
-        dOutput.cacheIndirection = output.cacheIndirection;
         dInput.generationSteps = input.generationSteps; // For Variable-Beam-Width-Search
     }
 
@@ -217,15 +215,14 @@ void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, 
 
 } // namespace
 
-void GptDecoderBatched::forwardDispatch(
-    decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input)
+void GptDecoderBatched::forwardDispatch(decoder::DecoderState const& decoderState, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     for (SizeType32 step = 0; step < input.maxDecoderSteps; ++step)
     {
         BufferManager manager{mDecoderStream};
-        prepareForward(decoderState, step, output, input, manager);
+        prepareForward(decoderState, step, input, manager);
 
         if (decoderState.getJointDecodingInput().batchSize > 0)
         {
@@ -236,8 +233,7 @@ void GptDecoderBatched::forwardDispatch(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-CudaEvent GptDecoderBatched::forwardAsync(
-    decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input)
+CudaEvent GptDecoderBatched::forwardAsync(decoder::DecoderState const& decoderState, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -245,7 +241,7 @@ CudaEvent GptDecoderBatched::forwardAsync(
     mRuntimeStream->record(eventStart);
     mDecoderStream->wait(eventStart.get());
 
-    forwardDispatch(decoderState, output, input);
+    forwardDispatch(decoderState, input);
 
     CudaEvent event{};
     mDecoderStream->record(event);
@@ -257,11 +253,10 @@ CudaEvent GptDecoderBatched::forwardAsync(
     return eventStop;
 }
 
-void GptDecoderBatched::forward(
-    decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input)
+void GptDecoderBatched::forward(decoder::DecoderState const& decoderState, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto decoderFinishEvent = forwardAsync(decoderState, output, input);
+    auto decoderFinishEvent = forwardAsync(decoderState, input);
     decoderFinishEvent.synchronize();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

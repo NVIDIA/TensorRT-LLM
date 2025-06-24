@@ -41,10 +41,10 @@ from helpers import (get_input_tensor_by_name, get_output_config_from_request,
 from mpi4py.futures import MPICommExecutor
 from mpi4py.MPI import COMM_WORLD
 
+from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch.llm import LLM as PyTorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import global_mpi_rank, global_mpi_size
-from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 
 
