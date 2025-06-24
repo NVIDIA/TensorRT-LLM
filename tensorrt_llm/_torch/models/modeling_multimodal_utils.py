@@ -78,8 +78,16 @@ def fuse_input_embeds(
 
     input_embeds[text_token_indices, :] = text_embed.to(
         dtype=input_embeds.dtype, device=input_embeds.device)
-    input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype,
-                                                    device=input_embeds.device)
+
+    # When KV cache reuse enabled, mm_token_indices may only contain partial multimodal tokens or empty
+    if mm_token_indices.numel() > 0:
+        # We need to extract only the embeddings that correspond to uncached multimodal tokens
+        if mm_token_indices.numel() < mm_embed.shape[0]:
+            # Extract the last mm_token_indices.numel() embeddings from mm_embed
+            start_idx = mm_embed.shape[0] - mm_token_indices.numel()
+            input_embeds[mm_token_indices, :] = mm_embed[start_idx:, :].to(dtype=input_embeds.dtype, device=input_embeds.device)
+        else:
+            input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype, device=input_embeds.device)
 
     return None, input_embeds
 
