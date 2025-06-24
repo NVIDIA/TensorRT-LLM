@@ -320,15 +320,15 @@ class DumpTensorFilter(Filter):
 
 
 def dump_tensor(module: nn.Module, data_tensor, debug_ctx: DebuggerContext):
-    global tensor_counter
+    tensor_counter = 0
 
-    input_tensor_names = []
     input_tensor_names = get_forward_arg_names(module)
     if input_tensor_names is not None:
         input_tensor_names = input_tensor_names[1:]
 
     def get_dump_file_path(tensor):
-        global tensor_counter
+        nonlocal tensor_counter
+        nonlocal input_tensor_names
         assert debug_ctx.get_log_folder(
         ) is not None, "Log folder shall be initialized by DebugContext."
 
