@@ -2288,11 +2288,11 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
         ],
     ]
     if (!ENABLE_NGC_DEVEL_IMAGE_TEST) {
-        testConfigs -= ["NGC Devel Image amd64", "NGC Devel Image arm64"]
+        testConfigs.removeAll(["NGC Devel Image amd64", "NGC Devel Image arm64"])
         echo "NGC Devel Image test is disabled."
     }
     if (!ENABLE_NGC_RELEASE_IMAGE_TEST) {
-        testConfigs -= ["NGC Release Image amd64", "NGC Release Image arm64"]
+        testConfigs.removeAll(["NGC Release Image amd64", "NGC Release Image arm64"])
         echo "NGC Release Image test is disabled."
     }
     // Update testConfigs image field using the map from globalVars
