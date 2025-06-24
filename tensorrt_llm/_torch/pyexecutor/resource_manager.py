@@ -377,6 +377,9 @@ class KVCacheManager(BaseResourceManager):
                 if request.py_rewind_len > 0:
                     self.rewind_kv_cache(request, request.py_rewind_len)
 
+        for request in scheduled_batch.context_requests:
+            self.impl.add_sequence_for_block_reuse(request.py_request_id, request)
+
     def free_resources(self, request: LlmRequest):
         self.impl.remove_sequence(request.py_request_id, request)
 

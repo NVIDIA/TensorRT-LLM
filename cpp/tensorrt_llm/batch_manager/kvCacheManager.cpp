@@ -287,6 +287,7 @@ void KVCacheBlock::setPrevBlockInSeq(BlockPtr prevBlock)
 
 void KVCacheBlock::addNextBlock(BlockKey const& blockKey, BlockPtr block)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     if (mNextBlocks.find(blockKey) == mNextBlocks.end())
     {
         mNextBlocks[blockKey] = std::move(block);
@@ -589,6 +590,7 @@ bool WindowBlockManager::verifyQueueIntegrity()
 
 void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     constexpr int beamIdx = 0; // no need to consider more than one beam for input tokens
     for (auto const& [windowSize, _] : mWindowBlockManagers)
     {
@@ -1388,8 +1390,26 @@ std::deque<tle::KVCacheEvent> BlockManager::getLatestEvents(std::optional<std::c
     return mEventManager ? mEventManager->getEvents(timeout) : std::deque<tle::KVCacheEvent>{};
 }
 
+void BlockManager::storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
+{
+    // Store blocks for potential reuse for a sequence.
+    // This function is called when we want to store blocks that can be reused
+    // for future requests with similar token patterns and we don't want to release the blocks.
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.isCyclic()
+        && !llmRequest->isDummyRequest();
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        if (storeBlocksForReuse)
+        {
+            manager.storeBlocksForReuse(sequence, llmRequest);
+        }
+    }
+}
+
 void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     // When releasing the blocks for a sequence, we store those blocks for potential reuse only if:
     // - Block reuse is enabled.
     // - A request was provided to this function call to identify which tokens these blocks cover
@@ -1413,6 +1433,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
 
 void WindowBlockManager::storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto constexpr beamIdx = 0;
     auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
     auto const& cacheBlockIds = sequence.getCacheBlockIds(mWindowSize);
@@ -1957,6 +1978,24 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
     if (mEnableBlockReuse && !sequence.isCyclic() && !llmRequest.isDummyRequest())
     {
         mBlockManager.storeContextBlocks(sequence, llmRequest);
+    }
+}
+
+void KVCacheManager::addSequenceForBlockReuse(RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto sequence = [this, requestId] {
+        std::scoped_lock lock(mSequencesMtx);
+        auto it = mSequences.find(requestId);
+        return it != mSequences.end() ? &(it->second) : nullptr;
+    }();
+
+    if (sequence != nullptr)
+    {
+        if (mEnableBlockReuse)
+        {
+            mBlockManager.storeBlocksForReuse(*sequence, llmRequest);
+        }
     }
 }
 

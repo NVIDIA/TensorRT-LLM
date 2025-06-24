@@ -877,6 +877,8 @@ public:
 
     void releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt);
 
+    void storeBlocksForReuse(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt);
+
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
@@ -1222,6 +1224,8 @@ public:
         OptionalRef<LlmRequest> llmRequest = std::nullopt)
         = 0;
 
+    virtual void addSequenceForBlockReuse(LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest = std::nullopt) = 0;
+
     virtual void removeSequence(
         LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest = std::nullopt)
         = 0;
@@ -1508,6 +1512,8 @@ public:
     /// inputLength - 1 tokens and populate prepopulatedPromptLen.
     void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         OptionalRef<LlmRequest> llmRequest = std::nullopt) override;
+
+    void addSequenceForBlockReuse(LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest = std::nullopt) override;
 
     void removeSequence(
         LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest = std::nullopt) override;
