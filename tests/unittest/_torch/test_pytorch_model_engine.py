@@ -1,7 +1,6 @@
 import unittest
 from dataclasses import dataclass
 
-import pytest
 import torch
 
 import tensorrt_llm
@@ -42,6 +41,9 @@ class DummyModel(torch.nn.Module):
         self.model_config = ModelConfig(pretrained_config=Config(
             torch_dtype=dtype))
         self.recorded_position_ids = None
+
+    def infer_max_seq_len(self):
+        return 2048
 
     @property
     def config(self):
@@ -133,7 +135,6 @@ def create_model_engine_and_kvcache(config: PyTorchConfig = None):
     return model_engine, kv_cache_manager
 
 
-@pytest.mark.skip(reason="https://nvbugs/5324248")
 class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_pad_generation_requests(self) -> None:
