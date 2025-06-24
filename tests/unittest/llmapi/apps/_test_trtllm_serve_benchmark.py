@@ -5,8 +5,6 @@ import sys
 import pytest
 from utils.util import skip_gpu_memory_less_than_80gb
 
-from .openai_server import RemoteOpenAIServer
-
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from test_llm import get_model_path
 
@@ -22,10 +20,8 @@ def model_path(model_name: str):
 
 
 @pytest.fixture(scope="module")
-def server(model_path: str):
-    # fix port to facilitate concise trtllm-serve examples
-    with RemoteOpenAIServer(model_path, port=8000) as remote_server:
-        yield remote_server
+def port():
+    return 8000
 
 
 @pytest.fixture(scope="module")
@@ -43,8 +39,8 @@ def dataset_path(dataset_name: str):
 
 
 @skip_gpu_memory_less_than_80gb
-def test_trtllm_serve_benchmark(server: RemoteOpenAIServer, benchmark_root: str,
-                                model_path: str):
+def test_trtllm_serve_benchmark(server: "RemoteOpenAIServer",
+                                benchmark_root: str, model_path: str):
     client_script = os.path.join(benchmark_root, "benchmark_serving.py")
     dataset = dataset_path("sharegpt")
     benchmark_cmd = [

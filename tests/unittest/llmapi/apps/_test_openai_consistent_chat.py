@@ -74,16 +74,6 @@ def server(model_name: str, build_engine: str):
     os.environ.pop("FORCE_DETERMINISTIC")
 
 
-@pytest.fixture(scope="module")
-def client(server: RemoteOpenAIServer):
-    return server.get_client()
-
-
-@pytest.fixture(scope="module")
-def async_client(server: RemoteOpenAIServer):
-    return server.get_async_client()
-
-
 @pytest.mark.parametrize("model_name", [
     "llama-3.1-model/Meta-Llama-3.1-70B-Instruct", "Mixtral-8x7B-Instruct-v0.1"
 ],

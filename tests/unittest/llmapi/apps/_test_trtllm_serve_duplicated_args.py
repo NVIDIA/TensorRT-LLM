@@ -1,10 +1,8 @@
 import os
 import subprocess
 import sys
-import tempfile
 
 import pytest
-import yaml
 
 from .openai_server import RemoteOpenAIServer
 
@@ -18,22 +16,31 @@ def model_name():
 
 
 @pytest.fixture(scope="module")
-def temp_extra_llm_api_options_file():
-    temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
-    try:
-        extra_llm_api_options_dict = {
-            "tensor_parallel_size": 1,
-            "max_num_tokens": 16384,
-        }
+def extra_llm_api_options_dict():
+    return {
+        "tensor_parallel_size": 1,
+        "max_num_tokens": 16384,
+    }
 
-        with open(temp_file_path, 'w') as f:
-            yaml.dump(extra_llm_api_options_dict, f)
 
-        yield temp_file_path
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+@pytest.fixture(scope="module")
+def backend():
+    return 'pytorch'
+
+
+@pytest.fixture(scope="module")
+def tp_size():
+    return 99
+
+
+@pytest.fixture(scope="module")
+def extra_llm_api_options():
+    return True
+
+
+@pytest.fixture(scope="module")
+def port():
+    return 8000
 
 
 @pytest.fixture(scope="module")
@@ -57,7 +64,7 @@ def server(model_name: str, temp_extra_llm_api_options_file: str):
 @pytest.mark.parametrize("exe, script",
                          [("python3", "openai_completion_client.py")])
 def test_trtllm_serve_duplicated_args(exe: str, script: str,
-                                      server: RemoteOpenAIServer,
+                                      server: "RemoteOpenAIServer",
                                       example_root: str):
 
     client_script = os.path.join(example_root, script)

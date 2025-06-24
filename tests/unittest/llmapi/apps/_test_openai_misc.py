@@ -6,18 +6,10 @@ import requests
 
 from tensorrt_llm.version import __version__ as VERSION
 
-from ..test_llm import get_model_path
-from .openai_server import RemoteOpenAIServer
-
 
 @pytest.fixture(scope="module")
 def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
-
-
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
-def backend(request):
-    return request.param
 
 
 @pytest.fixture(scope="module", params=['8'])
@@ -30,30 +22,7 @@ def max_seq_len(request):
     return request.param
 
 
-@pytest.fixture(scope="module")
-def server(model_name: str, backend: str, max_batch_size: str,
-           max_seq_len: str):
-    model_path = get_model_path(model_name)
-    args = ["--max_beam_width", "4"]
-    if backend is not None:
-        args.append("--backend")
-        args.append(backend)
-    if max_batch_size is not None:
-        args.append("--max_batch_size")
-        args.append(max_batch_size)
-    if max_seq_len is not None:
-        args.append("--max_seq_len")
-        args.append(max_seq_len)
-    with RemoteOpenAIServer(model_path, args) as remote_server:
-        yield remote_server
-
-
-@pytest.fixture(scope="module")
-def client(server: RemoteOpenAIServer):
-    return server.get_client()
-
-
-def test_version(server: RemoteOpenAIServer):
+def test_version(server: "RemoteOpenAIServer"):
     version_url = server.url_for("version")
     response = requests.get(version_url)
     assert response.status_code == 200

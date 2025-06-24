@@ -1,14 +1,9 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_chat.py
-import os
-import tempfile
-
 import openai
 import pytest
-import yaml
 
-from ..test_llm import get_model_path, similar
-from .openai_server import RemoteOpenAIServer
+from ..test_llm import similar
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
@@ -19,43 +14,21 @@ def model_name():
 
 
 @pytest.fixture(scope="module")
-def temp_extra_llm_api_options_file(request):
-    temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
-    try:
-        extra_llm_api_options_dict = {
-            "guided_decoding_backend": "xgrammar",
-            "disable_overlap_scheduler": True,
-        }
-
-        with open(temp_file_path, 'w') as f:
-            yaml.dump(extra_llm_api_options_dict, f)
-
-        yield temp_file_path
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+def extra_llm_api_options_dict():
+    return {
+        "guided_decoding_backend": "xgrammar",
+        "disable_overlap_scheduler": True,
+    }
 
 
 @pytest.fixture(scope="module")
-def server(model_name: str, temp_extra_llm_api_options_file: str):
-    model_path = get_model_path(model_name)
-    args = [
-        "--backend", "pytorch", "--extra_llm_api_options",
-        temp_extra_llm_api_options_file
-    ]
-    with RemoteOpenAIServer(model_path, args) as remote_server:
-        yield remote_server
+def backend():
+    return 'pytorch'
 
 
 @pytest.fixture(scope="module")
-def client(server: RemoteOpenAIServer):
-    return server.get_client()
-
-
-@pytest.fixture(scope="module")
-def async_client(server: RemoteOpenAIServer):
-    return server.get_async_client()
+def extra_llm_api_options():
+    return True
 
 
 @pytest.fixture(scope="module")

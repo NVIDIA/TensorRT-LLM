@@ -15,7 +15,6 @@ from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi.llm_utils import CalibConfig, QuantAlgo, QuantConfig
 
 from ..test_llm import get_model_path
-from .openai_server import RemoteOpenAIServer
 
 try:
     from .test_llm import cnn_dailymail_path
@@ -62,23 +61,7 @@ def engine_from_fp8_quantization(model_name):
     llm.shutdown()
 
 
-@pytest.fixture(scope="module")
-def server(model_name: str, engine_from_fp8_quantization: str):
-    model_path = get_model_path(model_name)
-    args = ["--tp_size", "2", "--tokenizer", model_path]
-    with RemoteOpenAIServer(engine_from_fp8_quantization,
-                            args) as remote_server:
-        yield remote_server
-
-
-@pytest.fixture(scope="module")
-def client(server: RemoteOpenAIServer):
-    return server.get_client()
-
-
-@pytest.fixture(scope="module")
-def async_client(server: RemoteOpenAIServer):
-    return server.get_async_client()
+server = server_from_engine
 
 
 def generate_payload(size):
