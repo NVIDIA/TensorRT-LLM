@@ -29,7 +29,7 @@ def get_moe_cls(
         return CutlassFusedMoE
     elif moe_backend.upper() == "VANILLA":
         return VanillaMoE
-    elif moe_backend.upper() == "CUTE_DSL":
+    elif moe_backend.upper() == "CUTEDSL":
         return CuteDslFusedMoE
     elif moe_backend.upper() == "TRTLLM":
         if quant_config is not None and (
