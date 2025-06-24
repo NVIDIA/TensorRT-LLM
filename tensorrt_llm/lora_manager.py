@@ -503,6 +503,11 @@ class LoraManager(object):
         uids: Optional[List[str]] = None,
         ckpt_source: str = "hf",
     ) -> List[str]:
+        """Returns the adapter UIDs that were loaded by this call.
+
+        Note that when an adapter was already loaded before this call, it would not be
+        included in the returned list of UIDs.
+        """
         if ckpt_source == "hf":
             return self.load_from_hf(
                 model_dirs=model_dirs_or_files,
@@ -527,6 +532,11 @@ class LoraManager(object):
         runtime_mapping: Optional[Mapping] = None,
         uids: Optional[List[str]] = None,
     ) -> List[str]:
+        """Returns the adapter UIDs that were loaded by this call.
+
+        Note that when an adapter was already loaded before this call, it would not be
+        included in the returned list of UIDs.
+        """
         if runtime_mapping is None:
             runtime_mapping = Mapping()
         tp_size = runtime_mapping.tp_size
@@ -626,7 +636,12 @@ class LoraManager(object):
         uids: Optional[List[str]] = None,
         component: Optional[str] = None,
     ) -> List[str]:
-        """Lora config of https://huggingface.co/hfl/chinese-alpaca-2-lora-7b.
+        """Returns the adapter UIDs that were loaded by this call.
+
+        Note that when an adapter was already loaded before this call, it would not be
+        included in the returned list of UIDs.
+
+        Lora config of https://huggingface.co/hfl/chinese-alpaca-2-lora-7b.
 
         {
             "base_model_name_or_path": "/Llama-2-7b-hf",
