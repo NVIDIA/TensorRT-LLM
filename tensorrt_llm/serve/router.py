@@ -1,9 +1,9 @@
 import asyncio
-import heapq
 from abc import ABC, abstractmethod
 from typing import Dict, Iterable, List, Optional, Union
 
 import aiohttp
+import numpy as np
 from transformers import AutoTokenizer
 
 from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
@@ -456,71 +456,34 @@ class LoadBalancingRouter(Router):
                  use_tokens: bool = False,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server)
-        # Load map between servers and their number of tokens processed
-        self._server_state = {}
-        self._server_load_heap = []
+        # Load map between servers and their number of index
+        self._server_index = {}
+        # server -> request_num
+        self._server_state = np.zeros((len(servers, )))
+        for i, server in enumerate(servers):
+            self._server_index[server] = i
 
         # Routing table to map requests to servers
         self._req_routing_table = {}
 
-        self._use_tokens = use_tokens
-        self._init_heap()
-
     def _on_servers_updated(self, old_servers, new_servers):
         """Rebuild the heap when the server list changes."""
-        # Keep the state for servers that still exist
-        current_state = {}
-        for server in new_servers:
-            if server in self._server_state:
-                # Keep existing state
-                current_state[server] = self._server_state[server]
-            else:
-                # Initialize new server state
-                current_state[server] = ServerState(server, self._use_tokens)
-
-        # Update state and rebuild heap
-        self._server_state = current_state
-        self._server_load_heap = []
-        for server in new_servers:
-            heapq.heappush(self._server_load_heap,
-                           (self._get_server_load(server), server))
-
-    def _init_heap(self):
-        for server in self._servers:
-            self._server_state[server] = ServerState(server, self._use_tokens)
-            heapq.heappush(self._server_load_heap,
-                           (self._get_server_load(server), server))
 
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
-        if not self._servers:
-            if self._metadata_server:
-                raise ValueError(
-                    f"No {self._server_role} servers available in metadata service"
-                )
-            else:
-                raise ValueError(f"No {self._server_role} servers available")
-
-        async with self._lock:
-            server = heapq.heappop(self._server_load_heap)[1]
-            await self._server_state[server].increment_load(request)
-            heapq.heappush(self._server_load_heap,
-                           (self._get_server_load(server), server))
-
-            self._req_routing_table[id(request)] = server
-
-        return server, {}
-
-    def _get_server_load(self, server):
-        return self._server_state[server]._num_active_tokens if self._use_tokens \
-            else self._server_state[server]._num_active_requests
+        min_indices = np.argmin(self._server_state)
+        min_index = np.random.choice(min_indices)
+        self._server_state[min_index] += 1
+        server = self._servers[min_index]
+        self._req_routing_table[id(request)] = server
+        return server
 
     async def finish_request(self, request: OpenAIRequest):
-        async with self._lock:
-            server = self._req_routing_table[id(request)]
-            await self._server_state[server].decrement_load(request)
-            heapq.heappush(self._server_load_heap,
-                           (self._get_server_load(server), server))
-            del self._req_routing_table[id(request)]
+        if id(request) not in self._req_routing_table:
+            return
+        server = self._req_routing_table[id(request)]
+        index = self._server_index[server]
+        self._server_state[index] -= 1
+        del self._req_routing_table[id(request)]
 
 
 def block_key_hasher(token_ids: list[int],
