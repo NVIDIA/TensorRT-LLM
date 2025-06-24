@@ -1919,9 +1919,6 @@ void runTest(Executor& executor, fs::path const& inputPath, ModelIds const& mode
 {
     auto const beamWidth = beamResult.beamWidth;
 
-    std::unordered_map<IdType, SizeType32> reqIdToBatchId;
-    std::unordered_map<SizeType32, std::vector<BeamTokens>> tokens;
-
     auto manager = tr::BufferManager(std::make_shared<tr::CudaStream>());
     auto const& givenInput = tr::utils::loadNpy(manager, inputPath.string(), tr::MemoryType::kCPU);
     auto [givenInputLengths, nbGivenInputs, maxInputLength] = getGivenInputLengths(*givenInput, modelIds.padId);
@@ -1971,19 +1968,16 @@ void runTest(Executor& executor, fs::path const& inputPath, ModelIds const& mode
     auto const numSequences = beamWidth > 1 ? 1 : numReturnSequences;
     auto const numReturnBeams = std::min(beamWidth, numReturnSequences);
 
-    std::vector<IdType> reqIds;
     if (worldRank == 0)
     {
-        reqIds = executor.enqueueRequests(std::move(requests));
+        auto const reqIds = executor.enqueueRequests(requests);
+
+        std::unordered_map<SizeType32, std::vector<BeamTokens>> tokens;
+        std::unordered_map<IdType, SizeType32> reqIdToBatchId;
 
         for (SizeType32 req = 0; req < reqIds.size(); ++req)
         {
-            std::vector<BeamTokens> resultTokens;
-            resultTokens.reserve(numSequences);
-            for (SizeType32 seqIdx = 0; seqIdx < numSequences; ++seqIdx)
-            {
-                resultTokens.emplace_back(numReturnBeams);
-            }
+            std::vector<BeamTokens> resultTokens(numSequences, BeamTokens(numReturnBeams));
             tokens[req] = std::move(resultTokens);
             reqIdToBatchId[reqIds.at(req)] = req;
         }
@@ -1991,32 +1985,41 @@ void runTest(Executor& executor, fs::path const& inputPath, ModelIds const& mode
         // Get the new tokens for each requests
         int32_t numFinished = 0;
         int iter = 0;
-        SizeType32 numResponses = 0;
+        std::unordered_map<IdType, SizeType32> numResponses;
         while (numFinished < maxRequests && iter < maxWaitMs)
         {
             std::chrono::milliseconds waitTime(1);
             auto responses = executor.awaitResponses(waitTime);
             for (auto& response : responses)
             {
-                numResponses++;
+                auto batchId = reqIdToBatchId.at(response.getRequestId());
+                numResponses[batchId]++;
                 if (!response.hasError())
                 {
                     auto result = response.getResult();
                     numFinished += result.isFinal;
-                    auto batchId = reqIdToBatchId.at(response.getRequestId());
                     auto seqIdx = result.sequenceIndex;
 
-                    auto& contextLogits = result.contextLogits;
-                    auto& genLogits = result.generationLogits;
-                    auto& outputTokenIds = result.outputTokenIds;
+                    auto const& contextLogits = result.contextLogits;
+                    auto const& genLogits = result.generationLogits;
+                    auto const& outputTokenIds = result.outputTokenIds;
 
                     EXPECT_EQ(result.finishReasons.size(), numReturnBeams);
                     for (SizeType32 beam = 0; beam < numReturnBeams; ++beam)
                     {
-                        auto& newTokens = outputTokenIds.at(beam);
+                        auto const& newTokens = outputTokenIds.at(beam);
                         auto& reqTokens = tokens.at(batchId).at(seqIdx).at(beam);
 
-                        reqTokens.insert(reqTokens.end(), newTokens.begin(), newTokens.end());
+                        if (!returnAllGeneratedTokens)
+                        {
+                            reqTokens.insert(reqTokens.end(), newTokens.begin(), newTokens.end());
+                        }
+                        else
+                        {
+                            EXPECT_EQ(newTokens.size(),
+                                (numResponses.at(batchId) + numReturnSequences - 1) / numReturnSequences);
+                            reqTokens = newTokens;
+                        }
                         // FinishReason is only supported for bw=1 and inflight batching.
                         if (beamWidth == 1)
                         {
@@ -2025,9 +2028,9 @@ void runTest(Executor& executor, fs::path const& inputPath, ModelIds const& mode
                         }
                     }
 
-                    auto& cumLogProbs = result.cumLogProbs;
-                    auto& logProbs = result.logProbs;
-                    auto& beamTokens = tokens.at(batchId).at(seqIdx);
+                    auto const& cumLogProbs = result.cumLogProbs;
+                    auto const& logProbs = result.logProbs;
+                    auto const& beamTokens = tokens.at(batchId).at(seqIdx);
                     EXPECT_EQ(beamTokens.size(), numReturnBeams);
 
                     if (!isNonGreedySampling)
@@ -2066,9 +2069,8 @@ void runTest(Executor& executor, fs::path const& inputPath, ModelIds const& mode
             ++iter;
         }
         EXPECT_LT(iter, maxWaitMs);
-        testData.verifyOutput(tokens, givenInputLengths, nbGivenInputs, streaming, outConfig.excludeInputFromOutput,
-            flakyTestInfo, isSpeculativeDecoding, returnAllGeneratedTokens, beamWidth, numSequences,
-            isNonGreedySampling);
+        testData.verifyOutput(tokens, givenInputLengths, streaming, outConfig.excludeInputFromOutput, flakyTestInfo,
+            isSpeculativeDecoding, beamWidth, numSequences, isNonGreedySampling);
     }
 }
 

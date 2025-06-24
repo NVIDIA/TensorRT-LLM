@@ -408,9 +408,9 @@ TestData TestData::loadTestData(BeamResult const& beamResults, ITensor const& gi
 }
 
 void TestData::verifyOutput(std::unordered_map<SizeType32, std::vector<executor::BeamTokens>> const& resultTokens,
-    std::vector<SizeType32> const& givenInputLengths, SizeType32 nbGivenInputs, bool streaming,
-    bool excludeInputFromOutput, FlakyTestInfo flakyTestInfo, bool isSpeculativeDecoding, bool returnAllGeneratedTokens,
-    SizeType32 reqBeamWidth, SizeType32 numReturnSequences, bool isNonGreedySampling)
+    std::vector<SizeType32> const& givenInputLengths, bool streaming, bool excludeInputFromOutput,
+    FlakyTestInfo flakyTestInfo, bool isSpeculativeDecoding, SizeType32 reqBeamWidth, SizeType32 numReturnSequences,
+    bool isNonGreedySampling)
 {
     for (auto const& [batchId, beamTokens] : resultTokens)
     {
@@ -436,12 +436,6 @@ void TestData::verifyOutput(std::unordered_map<SizeType32, std::vector<executor:
                     = expectedOutputLengths[batchId * reqBeamWidth + beam]; // Ground truth output length
                 auto expectedOutputLength
                     = expectInputOutputLength - inputLength;                // Number of new generated output tokens
-                if (returnAllGeneratedTokens)
-                {
-                    // If returnAllGeneratedTokens, then the tokens of each iteration will contain all the previously
-                    // generated tokens. Such as: [(a), (a, b), (a, b, c), (a, b, c, d), ...]
-                    expectedOutputLength = (1 + expectedOutputLength) * expectedOutputLength / 2;
-                }
 
                 bool inputNotIncluded = (streaming || excludeInputFromOutput);
                 bool anyMismatch = false;
@@ -458,12 +452,6 @@ void TestData::verifyOutput(std::unordered_map<SizeType32, std::vector<executor:
                         << "b: " << batchId << " seq: " << seqIdx << " beam: " << beam;
                 }
 
-                if (returnAllGeneratedTokens)
-                {
-                    // If returnAllGeneratedTokens, the output of the last iteration will contain all the output tokens
-                    predictedTokens.erase(
-                        predictedTokens.begin(), predictedTokens.end() - (expectInputOutputLength - inputLength));
-                }
                 auto numPredTokens = static_cast<SizeType32>(predictedTokens.size());
 
                 if (isSpeculativeDecoding)
@@ -631,7 +619,7 @@ void TestData::validateGenerationLogits(bool getGenLogits, bool isFinal, bool st
             SizeType32 numGeneratedToken = genLogits.value().getShape()[0];
             if (returnAllGeneratedTokens)
             {
-                EXPECT_EQ((numGeneratedToken + 1) * numGeneratedToken / 2, numPredTokens);
+                EXPECT_EQ(numGeneratedToken, numPredTokens);
             }
             else
             {
