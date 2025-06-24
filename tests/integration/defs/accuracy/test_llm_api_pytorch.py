@@ -516,11 +516,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
         return task_types
 
-    parametrize_tasks = pytest.mark.parametrize("task_types", [
-        pytest.param([MMLU], marks=pytest.mark.pre_merge),
-        pytest.param([MMLU, GSM8K], marks=pytest.mark.post_merge)
-    ],
-                                                ids=["MMLU", "MMLU+GSM8K"])
+    parametrize_tasks = pytest.mark.parametrize(
+        "task_types", [
+            pytest.param([MMLU], marks=pytest.mark.pre_merge),
+            pytest.param([GSM8K], marks=pytest.mark.pre_merge),
+            pytest.param([MMLU, GSM8K], marks=pytest.mark.post_merge)
+        ],
+        ids=["MMLU", "GSM8K", "MMLU+GSM8K"])
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids(
