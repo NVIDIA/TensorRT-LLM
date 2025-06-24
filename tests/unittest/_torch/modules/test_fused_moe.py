@@ -4,14 +4,17 @@ from itertools import product
 from typing import Dict, List, Optional
 from unittest import mock
 
+import _torch.helpers
 import cloudpickle
 import pytest
 import torch
 import torch.nn as nn
+from _torch.helpers import per_block_cast_to_fp8
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from utils.util import (skip_neither_ada_nor_hopper_unittest,
-                        skip_pre_blackwell, skip_pre_hopper)
+                        skip_non_hopper_unittest, skip_pre_blackwell,
+                        skip_pre_hopper)
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -20,6 +23,8 @@ from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
                                                    DefaultMoeRoutingMethod,
                                                    RenormalizeMoeRoutingMethod,
                                                    VanillaMoE, WideEPMoE)
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import \
+    CuteDslFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import \
     AlltoallMethodType
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
@@ -28,6 +33,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
+cloudpickle.register_pickle_by_value(_torch.helpers)
 MPI.pickle.__init__(
     cloudpickle.dumps,
     cloudpickle.loads,
@@ -357,7 +363,7 @@ def set_tensor_value_4(x, num_row, num_cols):
     x.copy_(repeated)
 
 
-@skip_pre_hopper
+@skip_non_hopper_unittest
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls",
     product(
@@ -476,6 +482,7 @@ def test_fused_moe_fp8_blockwise(dtype,
     return True
 
 
+@skip_non_hopper_unittest
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
@@ -838,6 +845,14 @@ class RefGatedMLPFusedMoE(nn.Module):
                     f"{expert}.w3.weight_scale_2"]
                 down_proj_weights[0]['weight_scale_2'] = weights[
                     f"{expert}.w2.weight_scale_2"]
+            elif (self.quant_config and self.quant_config.quant_algo
+                  == QuantAlgo.FP8_BLOCK_SCALES):
+                gate_up_proj_weights[0]["weight_scale"] = weights[
+                    f"{expert}.w1.weight_scale"]
+                gate_up_proj_weights[1]["weight_scale"] = weights[
+                    f"{expert}.w3.weight_scale"]
+                down_proj_weights[0]["weight_scale"] = weights[
+                    f"{expert}.w2.weight_scale"]
 
             self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
             self.experts[expert].down_proj.load_weights(down_proj_weights)
