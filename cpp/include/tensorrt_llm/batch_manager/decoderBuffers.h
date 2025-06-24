@@ -107,32 +107,31 @@ public:
     using SizeType32 = runtime::SizeType32;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    TensorPtr cacheIndirectionInput;
-    TensorPtr cacheIndirectionOutput;
-
     DraftBuffers draftBuffers;
 
-    DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
-        SizeType32 maxTokensPerStep, runtime::BufferManager const& manager, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig);
+    DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, runtime::BufferManager const& manager,
+        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 };
 
 class DecoderStepAsyncSend
 {
 public:
     using SizeType32 = runtime::SizeType32;
-    using BufferPtr = runtime::IBuffer::SharedPtr;
+    using TensorPtr = runtime::ITensor::SharedPtr;
 
-    DecoderStepAsyncSend(DecoderOutputBuffers const& decoderOutputBuffers, DecoderBuffers const& decoderBuffers,
-        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, mpi::MpiComm const& commSession, int peer);
+    DecoderStepAsyncSend(DecoderOutputBuffers const& decoderOutputBuffers, DraftBuffers const& draftBuffers,
+        TensorPtr const& cacheIndirectionOutput, bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa,
+        mpi::MpiComm const& commSession, int peer);
 
     ~DecoderStepAsyncSend();
 
-    static void recv(DecoderOutputBuffers const& decoderOutputBuffers, DecoderBuffers const& decoderBuffers,
-        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, mpi::MpiComm const& commSession, int peer);
+    static void recv(DecoderOutputBuffers const& decoderOutputBuffers, DraftBuffers const& draftBuffers,
+        TensorPtr const& cacheIndirectionOutput, bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa,
+        mpi::MpiComm const& commSession, int peer);
 
-    static void bcast(DecoderOutputBuffers const& decoderOutputBuffers, DecoderBuffers const& decoderBuffers,
-        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, mpi::MpiComm const& commSession, int root);
+    static void bcast(DecoderOutputBuffers const& decoderOutputBuffers, DraftBuffers const& draftBuffers,
+        TensorPtr const& cacheIndirectionOutput, bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa,
+        mpi::MpiComm const& commSession, int root);
 
 private:
     std::unique_ptr<mpi::MpiRequest> mRequest1;

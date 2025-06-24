@@ -245,9 +245,7 @@ class ADEngine(ModelEngine):
         return {"logits": logits_flat}
 
 
-def create_autodeploy_executor(
-    executor_config: ExecutorConfig, checkpoint_dir: str = None, engine_dir: str = None
-):
+def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: str = None):
     """Create an AutoDeploy executor from the given configuration and checkpoint directory.
 
     This is the entrypoint API to the _autodeploy backend.

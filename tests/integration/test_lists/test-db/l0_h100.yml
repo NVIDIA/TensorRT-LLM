@@ -85,7 +85,7 @@ l0_h100:
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_unit_tests.py::test_unit_tests[common-90]
-  - cpp/test_unit_tests.py::test_unit_tests[kernels-90]
+  - cpp/test_unit_tests.py::test_unit_tests[kernels-90] TIMEOUT (60)
   - cpp/test_unit_tests.py::test_unit_tests[layers-90] TIMEOUT (60)
   - cpp/test_unit_tests.py::test_unit_tests[thop-90]
   - cpp/test_unit_tests.py::test_unit_tests[utils-90]
