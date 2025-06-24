@@ -71,7 +71,8 @@ class MnnvlMemory:
 
     def __del__(self):
         if not sys.is_finalizing():
-            MnnvlMemory.close_mnnvl_memory(self.ptr)
+            if hasattr(self, "ptr"):
+                MnnvlMemory.close_mnnvl_memory(self.ptr)
 
     def as_torch_strided_tensor(self, dtype):
         num_segments = MnnvlMemory.comm.Get_size()

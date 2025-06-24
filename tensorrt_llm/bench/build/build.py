@@ -9,7 +9,7 @@ from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.utils.data import create_dataset_from_stream, initialize_tokenizer
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi import LLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo

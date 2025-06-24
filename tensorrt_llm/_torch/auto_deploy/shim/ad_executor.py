@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch._prims_common import DeviceLikeType
 
+from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import nvtx_range
 
 from ...._utils import mpi_rank, mpi_world_size
@@ -12,10 +13,11 @@ from ....bindings.internal.batch_manager import CacheType
 from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ....mapping import Mapping
 from ...distributed import MPIDist
+from ...pyexecutor._util import create_torch_sampler_args
 from ...pyexecutor.config import PyTorchConfig
 from ...pyexecutor.model_engine import ModelEngine
 from ...pyexecutor.py_executor import PyExecutor
-from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager
+from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager, ResourceManagerType
 from ...pyexecutor.sampler import TorchSampler
 from ...pyexecutor.scheduler import (
     BindCapacityScheduler,
@@ -151,7 +153,9 @@ class ADEngine(ModelEngine):
     ) -> bool:
         """Prepare inputs for AD Model from scheduled requests."""
         # cache manager
-        kv_cache_manager = resource_manager.get_resource_manager("kv_cache_manager")
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
 
         # requests in order of context, extend (generate with draft), generate
         context_requests = scheduled_requests.context_requests
@@ -290,8 +294,14 @@ def create_autodeploy_executor(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
     )
-    resource_manager = ResourceManager({"kv_cache_manager": kv_cache_manager})
-    resource_manager.resource_managers.move_to_end("kv_cache_manager", last=True)
+    seq_slot_manager = SeqSlotManager(max_num_sequences=max_batch_size * dist_mapping.pp_size)
+    resource_manager = ResourceManager(
+        {
+            ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
+            ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager,
+        }
+    )
+    resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # scheduling
     capacitor_scheduler = BindCapacityScheduler(max_batch_size, kv_cache_manager.impl)
@@ -301,15 +311,17 @@ def create_autodeploy_executor(
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
     # search sampler with speculative decoding
-    sampler = TorchSampler(max_seq_len=max_seq_len)
-
-    # creating the executor object
+    sampler_args = create_torch_sampler_args(
+        executor_config, dist_mapping, mixed_sampler=False, max_seq_len=max_seq_len
+    )
+    sampler = TorchSampler(sampler_args)
     py_executor = PyExecutor(
         resource_manager,
         scheduler,
         model_engine=engine,
         sampler=sampler,
         dist=mpi_dist,
+        max_num_sequences=ad_config.max_batch_size * dist_mapping.pp_size,
         disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         max_input_len=ad_config.max_input_len,
         max_batch_size=ad_config.max_batch_size,
