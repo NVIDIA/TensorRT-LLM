@@ -342,13 +342,15 @@ class GenerationExecutorWorker(GenerationExecutor):
             self.start_thread(self.dispatch_stats_thread)
 
     def _load_lora_adapter(self, lora_request: LoRARequest) -> bool:
-        uids = [str(lora_request.adapter_id)]
-        return uids == self._lora_manager.load_from_ckpt(
+        """Returns True if the adapter was loaded by this call, False if it was already loaded"""
+        adapter_id = str(lora_request.adapter_id)
+        newly_loaded_uids = self._lora_manager.load_from_ckpt(
             [lora_request.path],
             model_config=self._runtime_model_config if
             self._runtime_model_config is not None else self._lora_model_config,
             runtime_mapping=None,
-            uids=uids)
+            uids=[adapter_id])
+        return newly_loaded_uids and newly_loaded_uids[0] == adapter_id
 
     def _load_prompt_adapter(self,
                              prompt_adapter_request: PromptAdapterRequest):
