@@ -2128,10 +2128,6 @@ TEST_P(AllParamsTest, TokenComparison)
     {
         GTEST_SKIP() << "Test does not support returnAllGeneratedTokens without streaming";
     }
-    if (returnAllGeneratedTokens && outConfig.returnLogProbs)
-    {
-        GTEST_SKIP() << "Skip returnAllGeneratedTokens with outConfig.returnLogProbs to reduce number of tests";
-    }
 
     std::optional<std::vector<SizeType32>> participantIds = std::nullopt;
 
@@ -4499,10 +4495,10 @@ INSTANTIATE_TEST_SUITE_P(GptExecutorTest, AllParamsTest,
     testing::Combine(                 //
         testing::Values(false, true), // streaming
         testing::Values(1, 2),        // beamWidth
-        testing::Values(false, true), // computeLogProbs
+        testing::Values(true),        // computeLogProbs
         testing::Values(false, true), // excludeInputInOutput
-        testing::Values(false, true), // returnContextLogits
-        testing::Values(false, true), // returnGenerationLogits
+        testing::Values(true),        // returnContextLogits
+        testing::Values(true),        // returnGenerationLogits
         testing::Values("gpt"),       // modelName
         testing::Values(false, true), // useOrchestratorMode
         testing::Values(false, true), // returnAllGeneratedTokens
@@ -4514,10 +4510,10 @@ INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, AllParamsTest,
     testing::Combine(                                                                   //
         testing::Values(false, true),                                                   // streaming
         testing::Values(1, 2),                                                          // beamWidth
-        testing::Values(false, true),                                                   // computeLogProbs
+        testing::Values(true),                                                          // computeLogProbs
         testing::Values(false, true),                                                   // excludeInputInOutput
-        testing::Values(false, true),                                                   // returnContextLogits
-        testing::Values(false, true),                                                   // returnGenerationLogits
+        testing::Values(true),                                                          // returnContextLogits
+        testing::Values(true),                                                          // returnGenerationLogits
         testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp2_pp2_cp1"), // modelName
         testing::Values(false, true),                                                   // useOrchestratorMode
         testing::Values(false),                                                         // returnAllGeneratedTokens
