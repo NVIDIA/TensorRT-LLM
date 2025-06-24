@@ -928,7 +928,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         [(4, 1, 1), (4, 1, 4), (2, 2, 1), (1, 4, 1)],
         ids=["tp4", "ep4", "tp2pp2", "pp4"],
     )
-    def test_cuda_dsl_fp8_block_scales_4gpus(
+    def test_cute_dsl_fp8_block_scales_4gpus(
         self,
         tp_size,
         pp_size,
