@@ -518,7 +518,7 @@ class MambaCacheManager(BaseResourceManager):
         d_model: int,
         d_state: int,
         d_conv: int,
-        expand: int,
+        num_heads: int,
         n_groups: int,
         head_dim: int,
         num_layers: int,
@@ -532,7 +532,7 @@ class MambaCacheManager(BaseResourceManager):
         tp_size = mapping.tp_size
 
         # derive mamba parameters for conv and ssm states
-        d_inner = d_model * expand
+        d_inner = head_dim * num_heads
         conv_dim = d_inner + 2 * n_groups * d_state
         nheads = d_inner // head_dim
 
@@ -649,7 +649,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         mamba_d_model: int,
         mamba_d_state: int,
         mamba_d_conv: int,
-        mamba_expand: int,
+        mamba_num_heads: int,
         mamba_n_groups: int,
         mamba_head_dim: int,
         mamba_num_layers: int,
@@ -682,7 +682,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             mamba_d_model,
             mamba_d_state,
             mamba_d_conv,
-            mamba_expand,
+            mamba_num_heads,
             mamba_n_groups,
             mamba_head_dim,
             mamba_num_layers,

@@ -137,7 +137,7 @@ class NemotronHLayer(DecoderLayer):
             self.mixer = Mamba2Mixer(d_model=config.hidden_size,
                                      d_state=config.ssm_state_size,
                                      d_conv=config.conv_kernel,
-                                     expand=config.expand,
+                                     num_heads=config.mamba_num_heads,
                                      n_groups=config.n_groups,
                                      head_dim=config.mamba_head_dim,
                                      chunk_size=config.chunk_size,
@@ -247,6 +247,8 @@ class NemotronHForCausalLM(DecoderModelForCausalLM[NemotronHModel,
                 for k in model_config.quant_config.exclude_modules
             ]
 
+        model_config.pretrained_config.head_dim = model_config.pretrained_config.attention_head_dim
+
         super().__init__(
             NemotronHModel(model_config),
             config=model_config,
@@ -258,7 +260,7 @@ class NemotronHForCausalLM(DecoderModelForCausalLM[NemotronHModel,
         config = self.model_config.pretrained_config
         tp_size = self.model_config.mapping.tp_size
         tp_rank = self.model_config.mapping.tp_rank
-        d_inner = config.hidden_size * config.expand
+        d_inner = config.mamba_head_dim * config.mamba_num_heads
         n_groups = config.n_groups
         d_state = config.ssm_state_size
         nheads = d_inner // config.mamba_head_dim
