@@ -1069,12 +1069,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     bool constexpr isStreaming{false};
 
     // Create multimodal hash data (256-bit hash = 8 int32 values)
-    auto multimodalHashes = std::make_shared<std::vector<std::vector<SizeType32>>>(
-        std::vector<std::vector<SizeType32>>{
-            {0x12345678, -0x6F543211, 0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666}  // Hash 1
-        });
-    auto multimodalPositions = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{2});  // Start at token 2
-    auto multimodalLengths = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{4});    // Length 4 tokens
+    auto multimodalHashes = std::make_shared<std::vector<std::vector<SizeType32>>>(std::vector<std::vector<SizeType32>>{
+        {0x12345678, -0x6F543211, 0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666} // Hash 1
+    });
+    auto multimodalPositions
+        = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{2});                    // Start at token 2
+    auto multimodalLengths = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{4}); // Length 4 tokens
     // assume prompt id starts from 100
     auto inputTokens = std::make_shared<VecTokens>(VecTokens{100, 101, 102, 103, 104, 105, 0, 1, 2});
     auto const inputLength = static_cast<SizeType32>(inputTokens->size());
@@ -1082,9 +1082,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     auto llmRequest0 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         multimodalHashes, multimodalPositions, multimodalLengths, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt, 
-        false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
-        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences);
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt,
+        std::nullopt, false, std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt,
+        std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences);
 
     GenerationRequest seq0{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
@@ -1108,7 +1108,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     // Multimodal: starts at token 2, length 4 → [102, 103, 104, 105]
 
     // Block 0: [100, 101, 102, 103] ← Contains multimodal (102, 103)
-    // Block 1: [104, 105, 0, 1]     ← Contains multimodal (104, 105)  
+    // Block 1: [104, 105, 0, 1]     ← Contains multimodal (104, 105)
     // Block 2: [2, 3, 4]            ← No multimodal
     blockManager.releaseBlocks(seq0, llmRequest0);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1120,9 +1120,9 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     auto llmRequest1 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         multimodalHashes, multimodalPositions, multimodalLengths, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt, 
-        false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
-        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences);
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt,
+        std::nullopt, false, std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt,
+        std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences);
     GenerationRequest seq1{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
     // should reuse blocks 0, 1 and get new block 3
@@ -1141,20 +1141,21 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     ///////////////////////////////////////////////////////////////////////////
-    // Test Case 2: Different multimodal hash 
+    // Test Case 2: Different multimodal hash
     requestId = 2;
-    auto multimodalHashes2 = std::make_shared<std::vector<std::vector<SizeType32>>>(
-        std::vector<std::vector<SizeType32>>{
+    auto multimodalHashes2
+        = std::make_shared<std::vector<std::vector<SizeType32>>>(std::vector<std::vector<SizeType32>>{
             {0x45678123, 0x23456789, 0x34567890, 0x12121212, 0x56565656, 0x78787878, 0x54545454, 0x67676767} // Hash 2
         });
-    auto multimodalPositions2 = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{2});  // Start at token 2
-    auto multimodalLengths2 = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{4});    // Length 4 tokens
+    auto multimodalPositions2
+        = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{2});                     // Start at token 2
+    auto multimodalLengths2 = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{4}); // Length 4 tokens
     auto llmRequest2 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         multimodalHashes2, multimodalPositions2, multimodalLengths2, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt, 
-        false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
-        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences);
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt,
+        std::nullopt, false, std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt,
+        std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences);
 
     GenerationRequest seq2{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     // no reuse, get new blocks 4, 5, 6
@@ -1172,26 +1173,29 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     ///////////////////////////////////////////////////////////////////////////
     // Test Case 3: Multiple multimodal hashes and partial reuse
     requestId = 3;
-    auto multimodalHashes3 = std::make_shared<std::vector<std::vector<SizeType32>>>(
-        std::vector<std::vector<SizeType32>>{
-            {0x12345678, -0x6F543211, 0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666},  // Hash 1
-            {0x45678123, 0x23456789, 0x34567890, 0x12121212, 0x56565656, 0x78787878, 0x54545454, 0x67676767} // Hash 2
+    auto multimodalHashes3
+        = std::make_shared<std::vector<std::vector<SizeType32>>>(std::vector<std::vector<SizeType32>>{
+            {0x12345678, -0x6F543211, 0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666}, // Hash 1
+            {0x45678123, 0x23456789, 0x34567890, 0x12121212, 0x56565656, 0x78787878, 0x54545454, 0x67676767}   // Hash 2
         });
-    auto multimodalPositions3 = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{2, 4});  // Start at token 2 and 4
-    auto multimodalLengths3 = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{2, 2});    // Length 2 tokens
-    
+    auto multimodalPositions3
+        = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{2, 4}); // Start at token 2 and 4
+    auto multimodalLengths3
+        = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{2, 2}); // Length 2 tokens
+
     auto llmRequest3 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         multimodalHashes3, multimodalPositions3, multimodalLengths3, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt, 
-        false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
-        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences);
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt,
+        std::nullopt, false, std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt,
+        std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences);
     GenerationRequest seq3{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     // reuse block 0, get new blocks 7, 8
     auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
     auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
     blockManager.addSequence(seq3, promptLen3, numContextBlocks3, *llmRequest3, maxAttentionWindow);
-    EXPECT_EQ(llmRequest3->getContextCurrentPosition(), tokensPerBlock); // only reuse block 0 [100, 101, 102, 103] with same hash/offset
+    EXPECT_EQ(llmRequest3->getContextCurrentPosition(),
+        tokensPerBlock); // only reuse block 0 [100, 101, 102, 103] with same hash/offset
     EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 7, 8}));
     llmRequest3->addNewToken(11, beamIdx);
     numTokens = llmRequest3->getNumTokens(beamIdx);
@@ -1204,7 +1208,6 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     blockManager.releaseBlocks(seq3, llmRequest3);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
-
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
@@ -2634,6 +2637,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerRewindTokensTest)
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
     }
 }
+
 TEST_P(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowTest)
 {
     using DType = half;
@@ -4697,5 +4701,3 @@ auto const paramValues = ::testing::Values(
     });
 
 INSTANTIATE_TEST_SUITE_P(FillKvCacheAndCompleteRequestsTest, FillKvCacheAndCompleteRequestsTest, paramValues);
-
-
