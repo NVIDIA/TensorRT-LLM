@@ -9,7 +9,7 @@ from tensorrt_llm._utils import local_mpi_size, mpi_comm
 from tensorrt_llm.mapping import Mapping
 
 try:
-    from deep_ep import Buffer
+    from tensorrt_llm.deep_ep import Buffer
     deep_ep_installed = True
 except ModuleNotFoundError:
     deep_ep_installed = False
