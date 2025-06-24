@@ -1155,6 +1155,30 @@ class BaseLlmArgs(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def init_build_config(self):
+        """
+        Creating a default BuildConfig if none is provided
+        """
+        if self.build_config is None:
+            kwargs = {}
+            if self.max_batch_size:
+                kwargs["max_batch_size"] = self.max_batch_size
+            if self.max_num_tokens:
+                kwargs["max_num_tokens"] = self.max_num_tokens
+            if self.max_seq_len:
+                kwargs["max_seq_len"] = self.max_seq_len
+            if self.max_beam_width:
+                kwargs["max_beam_width"] = self.max_beam_width
+            if self.max_input_len:
+                kwargs["max_input_len"] = self.max_input_len
+            self.build_config = BuildConfig(**kwargs)
+
+        assert isinstance(
+            self.build_config, BuildConfig
+        ), f"build_config is not initialized: {self.build_config}"
+        return self
+
+    @model_validator(mode="after")
     def set_runtime_knobs_from_build_config(self):
         # TODO: remove this after PyT become default to adapt PyT with build_config as input
         assert self.build_config is not None, "build_config is not initialized"
@@ -1519,30 +1543,6 @@ class TrtLlmArgs(BaseLlmArgs):
         return v
 
     @model_validator(mode="after")
-    def init_build_config(self):
-        """
-        Creating a default BuildConfig if none is provided
-        """
-        if self.build_config is None:
-            kwargs = {}
-            if self.max_batch_size:
-                kwargs["max_batch_size"] = self.max_batch_size
-            if self.max_num_tokens:
-                kwargs["max_num_tokens"] = self.max_num_tokens
-            if self.max_seq_len:
-                kwargs["max_seq_len"] = self.max_seq_len
-            if self.max_beam_width:
-                kwargs["max_beam_width"] = self.max_beam_width
-            if self.max_input_len:
-                kwargs["max_input_len"] = self.max_input_len
-            self.build_config = BuildConfig(**kwargs)
-
-        assert isinstance(
-            self.build_config, BuildConfig
-        ), f"build_config is not initialized: {self.build_config}"
-        return self
-
-    @model_validator(mode="after")
     def setup_embedding_parallel_mode(self):
         if self.embedding_parallel_mode == 'NONE':
             self._convert_checkpoint_options['use_parallel_embedding'] = False
@@ -1615,6 +1615,14 @@ class TorchCompileConfig(BaseModel):
 
 
 class TorchLlmArgs(BaseLlmArgs):
+    # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
+    build_config: Optional[object] = Field(
+        default=None,
+        description="Build config.",
+        exclude_from_json=True,
+        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
+
+    # PyTorch backend specific configurations
 
     garbage_collection_gen0_threshold: int = Field(
         default=20000,
