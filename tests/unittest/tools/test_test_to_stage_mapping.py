@@ -34,7 +34,12 @@ def sample_test_cases(stage_query):
     random.seed(0)  # Ensure deterministic test results
     all_tests = list(stage_query.test_map.keys())
     if not all_tests:
-        return []
+        raise RuntimeError(
+            "No tests found in test mapping. This indicates a configuration "
+            "issue - either the test database YAML files are missing/empty "
+            "or the StageQuery is not parsing them correctly. Please check "
+            "that the test database directory exists and contains valid YAML "
+            "files with test definitions.")
 
     # Return up to MAX_SAMPLES tests randomly selected
     if len(all_tests) <= MAX_SAMPLES:
@@ -49,7 +54,12 @@ def sample_stages(stage_query):
     random.seed(0)  # Ensure deterministic test results
     all_stages = list(stage_query.stage_to_yaml.keys())
     if not all_stages:
-        return []
+        raise RuntimeError(
+            "No stages found in stage mapping. This indicates a configuration "
+            "issue - either the Jenkins L0_Test.groovy file is not being "
+            "parsed correctly or the regex pattern for stage matching needs "
+            "to be updated. Please check that the groovy file exists and "
+            "contains stage definitions in the expected format.")
 
     # Return up to MAX_SAMPLES stages randomly selected
     if len(all_stages) <= MAX_SAMPLES:
@@ -222,7 +232,6 @@ def test_backend_filtering_consistency(stage_query):
                 stage_upper = stage.upper()
                 for other_backend in other_backends:
                     other_upper = other_backend.upper()
-                    # Skip if stage handles multiple backends
                     if (other_upper in stage_upper
                             and backend.upper() not in stage_upper):
                         assert False, \
