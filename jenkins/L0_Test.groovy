@@ -91,8 +91,8 @@ TESTER_MEMORY = "96Gi"
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 
-ENABLE_NGC_DEVEL_IMAGE_TEST = env.enableNgcDevelImageTest ? env.enableNgcDevelImageTest : false
-ENABLE_NGC_RELEASE_IMAGE_TEST = env.enableNgcReleaseImageTest ? env.enableNgcReleaseImageTest : false
+ENABLE_NGC_DEVEL_IMAGE_TEST = env.enableNgcDevelImageTest ? env.enableNgcDevelImageTest.toBoolean() : false
+ENABLE_NGC_RELEASE_IMAGE_TEST = env.enableNgcReleaseImageTest ? env.enableNgcReleaseImageTest.toBoolean() : false
 
 def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
