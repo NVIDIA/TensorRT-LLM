@@ -502,16 +502,16 @@ class LoraManager(object):
         runtime_mapping: Optional[Mapping] = None,
         uids: Optional[List[str]] = None,
         ckpt_source: str = "hf",
-    ):
+    ) -> List[str]:
         if ckpt_source == "hf":
-            self.load_from_hf(
+            return self.load_from_hf(
                 model_dirs=model_dirs_or_files,
                 model_config=model_config,
                 runtime_mapping=runtime_mapping,
                 uids=uids,
             )
         elif ckpt_source == "nemo":
-            self.load_from_nemo(
+            return self.load_from_nemo(
                 model_files=model_dirs_or_files,
                 model_config=model_config,
                 runtime_mapping=runtime_mapping,
@@ -526,7 +526,7 @@ class LoraManager(object):
         model_config: Union["ModelConfig", LoraModelConfig],
         runtime_mapping: Optional[Mapping] = None,
         uids: Optional[List[str]] = None,
-    ):
+    ) -> List[str]:
         if runtime_mapping is None:
             runtime_mapping = Mapping()
         tp_size = runtime_mapping.tp_size
@@ -616,6 +616,8 @@ class LoraManager(object):
             load_from_model_file(uid, model_file)
             release_gc()
 
+        return new_uids
+
     def load_from_hf(
         self,
         model_dirs: List[str],
@@ -623,7 +625,7 @@ class LoraManager(object):
         runtime_mapping: Optional[Mapping] = None,
         uids: Optional[List[str]] = None,
         component: Optional[str] = None,
-    ):
+    ) -> List[str]:
         """Lora config of https://huggingface.co/hfl/chinese-alpaca-2-lora-7b.
 
         {
@@ -864,6 +866,8 @@ class LoraManager(object):
         for uid, model_dir, hf_config in zip(new_uids, new_model_dirs, lora_hf_configs):
             load_from_model_dir(uid, model_dir, hf_config)
             release_gc()
+
+        return new_uids
 
     @property
     def lora_weights(self):
