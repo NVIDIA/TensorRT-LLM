@@ -16,7 +16,9 @@
 
 #include "mlaChunkedPrefill.cuh"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/mathUtils.h"
+#include <cuda_fp8.h>
 #include <cutlass/array.h>
 #include <cutlass/half.h>
 
@@ -88,6 +90,70 @@ struct setChunkedKVKernelTraits
     static constexpr int kCpTokenPerBlock = 16;
     static constexpr int kBlockSize = kThreadPerHead * kCpTokenPerBlock;
 };
+
+template <typename SrcType, int NUM>
+inline __device__ void quantCopy(
+    __nv_fp8_e4m3* dst_global_ptr, SrcType const* src_fragment_ptr, float const scale_val = 1.f)
+{
+    using DstVecType = typename std::conditional<sizeof(SrcType) == 2, float2, float>::type;
+    using SrcType2 = typename std::conditional<sizeof(SrcType) == 2,
+        typename tensorrt_llm::common::TypeConverter<SrcType>::Type, float2>::type;
+    static constexpr int COPY_SIZE = sizeof(DstVecType);
+    static constexpr int TOTAL_COPY_SIZE = NUM * sizeof(__nv_fp8_e4m3);
+    static constexpr int LOOP_NUM = TOTAL_COPY_SIZE / COPY_SIZE;
+    static_assert(TOTAL_COPY_SIZE % COPY_SIZE == 0);
+    static constexpr int CVT_NUM = COPY_SIZE / sizeof(__nv_fp8_e4m3) / 2;
+    static_assert(COPY_SIZE % (sizeof(__nv_fp8_e4m3) * 2) == 0);
+    DstVecType fragment;
+    int offset = 0;
+#pragma unroll
+    for (int i = 0; i < LOOP_NUM; ++i)
+    {
+#pragma unroll
+        for (int j = 0; j < CVT_NUM; ++j)
+        {
+            float2 val2 = tensorrt_llm::common::cuda_cast<float2>(
+                reinterpret_cast<SrcType2 const*>(src_fragment_ptr)[j + offset]);
+            val2.x *= scale_val;
+            val2.y *= scale_val;
+            reinterpret_cast<__nv_fp8x2_e4m3*>(&fragment)[j] = __nv_fp8x2_e4m3(val2);
+        }
+        reinterpret_cast<DstVecType*>(dst_global_ptr)[i] = fragment;
+        offset += CVT_NUM;
+    }
+}
+
+template <typename DstType, int NUM>
+inline __device__ void dequantCopy(
+    DstType* dst_global_ptr, __nv_fp8_e4m3 const* src_fragment_ptr, float const scale_val = 1.f)
+{
+    using DstVecType = uint4;
+    using DstType2 = typename std::conditional<sizeof(DstType) == 2,
+        typename tensorrt_llm::common::TypeConverter<DstType>::Type, float2>::type;
+    static constexpr int COPY_SIZE = sizeof(DstVecType);
+    static constexpr int TOTAL_COPY_SIZE = NUM * sizeof(DstType);
+    static constexpr int LOOP_NUM = TOTAL_COPY_SIZE / COPY_SIZE;
+    static_assert(TOTAL_COPY_SIZE % COPY_SIZE == 0);
+    static constexpr int CVT_NUM = COPY_SIZE / sizeof(DstType) / 2;
+    static_assert(COPY_SIZE % (sizeof(DstType) * 2) == 0);
+    DstVecType fragment;
+    int offset = 0;
+#pragma unroll
+    for (int i = 0; i < LOOP_NUM; ++i)
+    {
+#pragma unroll
+        for (int j = 0; j < CVT_NUM; ++j)
+        {
+            float2 val2 = tensorrt_llm::common::cuda_cast<float2>(
+                reinterpret_cast<__nv_fp8x2_e4m3 const*>(src_fragment_ptr)[j + offset]);
+            val2.x *= scale_val;
+            val2.y *= scale_val;
+            reinterpret_cast<DstType2*>(&fragment)[j] = tensorrt_llm::common::cuda_cast<DstType2>(val2);
+        }
+        reinterpret_cast<DstVecType*>(dst_global_ptr)[i] = fragment;
+        offset += CVT_NUM;
+    }
+}
 
 // merged_attn [q_total_len, H=128, D=128] (T)
 // merged_softmax_sum [q_total_len, H, 2] (float, max/sum)
@@ -179,12 +245,13 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softma
 
 // kv_output {total_chunk_token=b*chunk_size, h=1, d_lora}
 // k_pe_output {total_chunk_token, h=1, d_rope}
-template <typename T>
+template <typename T, typename TCache>
 __global__ void loadChunkedKVCacheForMLAKernel(T* output_kv_ptr, T* output_k_pe_ptr,
     tensorrt_llm::kernels::KVBlockArray const kv_cache, int64_t const* cu_ctx_chunked_len, int chunked_size,
-    int chunked_idx)
+    int chunked_idx, float const* kv_scale_quant_orig_ptr)
 {
     using KT = loadChunkedKVKernelTraits<T>;
+    float const kv_scale_quant_orig = kv_scale_quant_orig_ptr ? kv_scale_quant_orig_ptr[0] : 1.0f;
     int const batch_idx = static_cast<int>(blockIdx.y);
     [[maybe_unused]] int const head_idx = static_cast<int>(blockIdx.z); // default 0
 
@@ -215,14 +282,31 @@ __global__ void loadChunkedKVCacheForMLAKernel(T* output_kv_ptr, T* output_k_pe_
                 // kv_output {total_chunk_token, h=1, d}
                 int const global_st_idx
                     = global_st_offset * KT::kLoraSize + local_token_idx * KT::kLoraSize + head_dim_idx;
-                *reinterpret_cast<typename KT::VecT*>(output_kv_ptr + global_st_idx) = ld_data;
+                if constexpr (std::is_same_v<TCache, T>)
+                {
+                    *reinterpret_cast<typename KT::VecT*>(output_kv_ptr + global_st_idx) = ld_data;
+                }
+                else if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
+                {
+                    dequantCopy<T, KT::kElemPerLoad>(output_kv_ptr + global_st_idx,
+                        reinterpret_cast<__nv_fp8_e4m3 const*>(&ld_data), kv_scale_quant_orig);
+                }
             }
             else
             {
                 // k_pe_output {total_chunk_token, h=1, d_rope}
                 int const global_st_idx = global_st_offset * KT::kRopeSize + local_token_idx * KT::kRopeSize
                     + (head_dim_idx - KT::kLoraSize);
-                *reinterpret_cast<typename KT::VecT*>(output_k_pe_ptr + global_st_idx) = ld_data;
+
+                if constexpr (std::is_same_v<TCache, T>)
+                {
+                    *reinterpret_cast<typename KT::VecT*>(output_k_pe_ptr + global_st_idx) = ld_data;
+                }
+                else if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
+                {
+                    dequantCopy<T, KT::kElemPerLoad>(output_k_pe_ptr + global_st_idx,
+                        reinterpret_cast<__nv_fp8_e4m3 const*>(&ld_data), kv_scale_quant_orig);
+                }
             }
         }
     }
@@ -329,10 +413,10 @@ void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T c
 }
 
 // load single chunk kv from kv_cache for each request
-template <typename T>
+template <typename T, typename TCache>
 void invokeMLALoadChunkedKV(T* output_kv_ptr, T* output_k_pe_ptr, KVBlockArray const& kv_cache, int const num_contexts,
     int64_t const* cu_ctx_chunked_len, int lora_size, int rope_size, int chunked_size, int chunked_idx,
-    cudaStream_t stream)
+    float const* kv_scale_quant_orig_ptr, cudaStream_t stream)
 {
     using KT = loadChunkedKVKernelTraits<T>;
     TLLM_CHECK_WITH_INFO(lora_size + rope_size == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
@@ -340,8 +424,8 @@ void invokeMLALoadChunkedKV(T* output_kv_ptr, T* output_k_pe_ptr, KVBlockArray c
     TLLM_CHECK_WITH_INFO(rope_size == KT::kRopeSize, "rope dim should be equal to %d", KT::kRopeSize);
     // {chunked_unit_size / token_per_block, batch_size, head_num}
     dim3 grid(static_cast<int>(tensorrt_llm::common::divUp(chunked_size, KT::kTokenPerBlock)), num_contexts, 1);
-    loadChunkedKVCacheForMLAKernel<T><<<grid, KT::kBlockSize, 0, stream>>>(
-        output_kv_ptr, output_k_pe_ptr, kv_cache, cu_ctx_chunked_len, chunked_size, chunked_idx);
+    loadChunkedKVCacheForMLAKernel<T, TCache><<<grid, KT::kBlockSize, 0, stream>>>(output_kv_ptr, output_k_pe_ptr,
+        kv_cache, cu_ctx_chunked_len, chunked_size, chunked_idx, kv_scale_quant_orig_ptr);
 }
 
 // output_kv {B, 2, ceil(chunked_size / kv_cache_tokens_per_block), h, kv_cache_tokens_per_block, d}, padding with
@@ -369,9 +453,12 @@ void invokeMLASetChunkedKV(T* output_kv, T const* kv, T const* k_pe, int const b
         float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, int const batch_size,     \
         int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads,                  \
         int const head_size, cudaStream_t stream);                                                                     \
-    template void invokeMLALoadChunkedKV<T>(T * output_kv_ptr, T * output_k_pe_ptr, KVBlockArray const& kv_cache,      \
+    template void invokeMLALoadChunkedKV<T, T>(T * output_kv_ptr, T * output_k_pe_ptr, KVBlockArray const& kv_cache,   \
         int const num_contexts, int64_t const* cu_ctx_chunked_len, int lora_size, int rope_size, int chunked_size,     \
-        int chunked_idx, cudaStream_t stream);                                                                         \
+        int chunked_idx, float const* kv_scale_quant_orig_ptr, cudaStream_t stream);                                   \
+    template void invokeMLALoadChunkedKV<T, __nv_fp8_e4m3>(T * output_kv_ptr, T * output_k_pe_ptr,                     \
+        KVBlockArray const& kv_cache, int const num_contexts, int64_t const* cu_ctx_chunked_len, int lora_size,        \
+        int rope_size, int chunked_size, int chunked_idx, float const* kv_scale_quant_orig_ptr, cudaStream_t stream);  \
     template void invokeMLASetChunkedKV<T>(T * output_kv, T const* kv, T const* k_pe, int const batch_size,            \
         int const max_seq_len, int const num_heads, int uncompressed_head_size, int rope_size,                         \
         int64_t const* cu_seq_lens, int const kv_cache_tokens_per_block, cudaStream_t stream);

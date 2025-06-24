@@ -873,7 +873,7 @@ protected:
             this->h_cu_chunk_lens->getSizeInBytes(), cudaMemcpyHostToDevice);
         tensorrt_llm::kernels::invokeMLALoadChunkedKV<DataType>(compressed_kv_output_ptr, k_pe_output_ptr, kv_cache,
             this->mBatchSize, d_cu_chunk_lens_ptr, this->mLoraSize, this->mRopeSize, this->mChunkSize, chunk_idx,
-            mStream->get());
+            nullptr, mStream->get());
         cudaStreamSynchronize(this->mStream->get());
         // copy result back to host
         cudaMemcpy(this->h_compressed_kv_output->data(), compressed_kv_output_ptr,
