@@ -299,8 +299,9 @@ class GenerationResultBase:
                     handler(response.error_msg)
 
             response_result = response.result
-            if hasattr(response_result, "_result"):
-                response_result.deserialize()
+            # TODO(jaedeokk): Need to check. Why do we need to deserialize the result? Is it for disaggregated serving?
+            # if hasattr(response_result, "_result"):
+            #     response_result.deserialize()
 
             self._done = response_result.is_final
             context_phase_params = response_result.context_phase_params

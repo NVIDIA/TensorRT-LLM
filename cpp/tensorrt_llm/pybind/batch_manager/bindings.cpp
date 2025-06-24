@@ -113,6 +113,8 @@ void initBindings(pybind11::module_& m)
         .def("set_generated_tokens", &GenLlmReq::setGeneratedTokens, py::arg("generated_beam_tokens"))
         .def("pause", &GenLlmReq::pause, py::arg("max_input_len"))
         .def_property("max_sent_token_len", &GenLlmReq::getMaxSentTokenLen, &GenLlmReq::setMaxSentTokenLen)
+        .def_property(
+            "exclude_input_from_output", &GenLlmReq::getExcludeInputFromOutput, &GenLlmReq::setExcludeInputFromOutput)
         .def_property_readonly("prompt_embedding_table", &GenLlmReq::getPromptEmbeddingTable)
         .def_property_readonly("multimodal_embedding", &GenLlmReq::getMultimodalEmbedding)
         .def_property_readonly("mrope_rotary_cos_sin", &GenLlmReq::getMropeRotaryCosSin)
@@ -377,6 +379,7 @@ void initBindings(pybind11::module_& m)
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"))
+        .def("create_child_request", &tb::LlmRequest::createChildRequest, py::arg("request_id"))
         .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
         .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, py::arg("iter_counter"));
 
