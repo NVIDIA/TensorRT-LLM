@@ -1992,11 +1992,25 @@ class _AutoDeployLlmArgs(TorchLlmArgs):
         return self
 
 
+def _recursive_update(config: Any, extra_options: Dict[str, Any]) -> None:
+    """Recursively update the config object (dataclass/pydantic object) with extra options."""
+    for key, value in extra_options.items():
+        if not hasattr(config, key):
+            raise ValueError(
+                f"Key '{key}' not found in {config.__class__.__name__}.")
+        val = getattr(config, key)
+        if isinstance(value, dict):
+            _recursive_update(val, value)
+        else:
+            setattr(config, key, value)
+
+
 def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,
         extra_llm_api_options: Optional[str] = None) -> Dict:
 
+    llm_args_dict = copy.deepcopy(llm_args_dict)
     field_mapping = {
         "quant_config": QuantConfig,
         "calib_config": CalibConfig,
@@ -2012,7 +2026,15 @@ def update_llm_args_with_extra_dict(
         "cache_transceiver_config": CacheTransceiverConfig,
         "lora_config": LoraConfig,
     }
-    for field_name, field_type in field_mapping.items():
+    # update overlapping fields recursively
+    overlapping_fields = set(llm_args_dict.keys() & llm_args.keys())
+    for key in overlapping_fields:
+        _recursive_update(llm_args[key], llm_args_dict[key])
+        llm_args_dict.pop(key)
+    # update fields that are not in llm_args
+    diff_fields = set(field_mapping.keys()) - overlapping_fields
+    for field_name in diff_fields:
+        field_type = field_mapping[field_name]
         if field_name in llm_args_dict:
             if field_name == "speculative_config":
                 llm_args_dict[field_name] = field_type.from_dict(
