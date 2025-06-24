@@ -1,8 +1,11 @@
 import asyncio
 import datetime
-import gc
 import json
 import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
+from gc_utils import assert_resource_freed
 
 # Required for test_generate_with_seed to pass.
 # See the discussion in https://github.com/NVIDIA/TensorRT-LLM/pull/4264#issuecomment-2943269891
@@ -116,19 +119,15 @@ def llm_test_harness(model_dir: str,
     tokenizer = llm_kwargs.pop('tokenizer', None)
     if tokenizer is None:
         tokenizer = model_dir
+    from tensorrt_llm._torch import LLM as LLM_torch
 
-    if backend == "pytorch":
-        from tensorrt_llm._torch import LLM as LLM_torch
-        llm = LLM_torch(model_dir, tokenizer=tokenizer, **llm_kwargs)
-    else:
-        llm = LLM(model_dir, tokenizer=tokenizer, **llm_kwargs)
-    outputs = llm.generate(inputs, sampling_params=sampling_params)
-    print(outputs)
-    check_output(outputs, references, similar_threshold=similar_threshold)
+    llm_cls = LLM_torch if backend == "pytorch" else LLM
 
-    assert gc.is_tracked(llm)
-    assert len(
-        gc.get_referrers(llm)) == 0, f"the references: {gc.get_referrers(llm)}"
+    with assert_resource_freed(llm_cls, model_dir, tokenizer,
+                               **llm_kwargs) as llm:
+        outputs = llm.generate(inputs, sampling_params=sampling_params)
+        print(outputs)
+        check_output(outputs, references, similar_threshold=similar_threshold)
 
 
 def llm_check_output(llm: LLM,
@@ -235,7 +234,6 @@ def test_llm_loading_from_hf():
                      kv_cache_config=global_kvcache_config)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5266240")
 @force_ampere
 @pytest.mark.part0
 def test_llm_loading_from_ckpt():
