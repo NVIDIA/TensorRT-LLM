@@ -95,37 +95,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
 
-    MoE torch custom op:
-        In min-latency mode:
-        Quant:
-            fp8 block scales (SM90 Hopper only):
-                FusedMoE Op: dynamic quant + gemm1 + swiglu + gemm2 (return tensor list).
-            fp8 qdq, nvfp4:
-                FusedMoE Op: gemm1 + swiglu + gemm2 (return tensor list).
-
-        In max-throughput mode:
-        Quant:
-            fp8 block scales (SM90 Hopper only):
-                FusedMoE Op: dynamic quant + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute (return one tensor)
-            p8 qdq, nvfp4:
-                FusedMoE Op: scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute (return one tensor)
-
-    FusedMoE module:
-        min-latency mode:
-            routing(topK, etc.) + FusedMoE Op
-            equals to: routing(topK, etc.) [+ dynamic quant fp8 qdq | optional dynamic quant nvfp4] + gemm1 + swiglu + gemm2
-
-        max-throughput mode:
-            routing(topK, etc.) [+ dynamic quant for fp8 qdq and nvfp4 ] [+ fp4_allgather] + FusedMoe Op[no allreduce] + reducescatter, with AttentionDP on
-            equals to: dynamic quant + routing(topK, etc.) [+ fp4_allgather] + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute [no allreduce] + reducescatter
-
-    In min-latency mode, setting `reduce_results=False` disables the AllReduce in the FusedMoE module, so any necessary AllReduce operations must be added explicitly in the model definition.
-    AttentionDP should be turned off for min-latency mode.
-
-    Large-scale EP:
-    When we have redundant expert, we have more weight slots than `num_experts`, in that case, we separate the concepts of expert and slot.
-    Expert is the concept from model's perspective while slot is the concept from model engine's perspective.
-    There should be at least `num_experts` slots in the model engine. More than that is OK, in that case, some experts may have multiple replicas.
+    This backend is composed of multiple custom ops:
+    1. moe_permute_op: permute the input tensor and the expert selected tensor.
+    2. cute_dsl_fp8_group_blockwise_gemm_ref: a reference implementation of the cute_dsl_fp8_group_blockwise_gemm.
+    3. moe_finalize_scale_op: finalize the scale of the output tensor.
     """
 
     def __init__(
