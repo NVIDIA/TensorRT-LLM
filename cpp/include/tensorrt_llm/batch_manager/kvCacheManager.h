@@ -30,6 +30,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <NvInferRuntime.h>
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <list>
@@ -38,7 +39,6 @@
 #include <set>
 #include <unordered_map>
 #include <vector>
-#include <array>
 
 namespace tensorrt_llm::batch_manager::eviction_policy
 {
@@ -109,7 +109,7 @@ struct BlockKey
     bool usesExtraIds = false;
     std::optional<LoraTaskIdType> loraTaskId = std::nullopt;
     VecUniqueTokens uniqueTokens;
-    
+
     // Extra keys for multimodal data (similar to VLLM's approach)
     // Each extra key is a pair of (mm_hash, start_offset_in_block)
     std::optional<std::vector<MmKey>> extraKeys = std::nullopt;
@@ -137,8 +137,8 @@ struct BlockKey
 
     bool operator==(BlockKey const& other) const noexcept
     {
-        return (
-            usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens && extraKeys == other.extraKeys);
+        return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId
+            && uniqueTokens == other.uniqueTokens && extraKeys == other.extraKeys);
     }
 
     int partialMatch(BlockKey const& other) const noexcept

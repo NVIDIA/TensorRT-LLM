@@ -77,39 +77,36 @@ std::list<std::vector<T>> chopVectorIntoBlocks(
 }
 
 std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
-    tensorrt_llm::batch_manager::LlmRequest const& llmRequest,
-    SizeType32 startTokenIdx, 
-    SizeType32 endTokenIdx)
+    tensorrt_llm::batch_manager::LlmRequest const& llmRequest, SizeType32 startTokenIdx, SizeType32 endTokenIdx)
 {
     auto const multimodalHashes = llmRequest.getMultimodalHashes();
     auto const multimodalPositions = llmRequest.getMultimodalPositions();
     auto const multimodalLengths = llmRequest.getMultimodalLengths();
-    
-    if (!multimodalHashes || !multimodalPositions || !multimodalLengths || 
-        !(*multimodalHashes) || (*multimodalHashes)->empty() || 
-        !(*multimodalPositions) || (*multimodalPositions)->empty() || 
-        !(*multimodalLengths) || (*multimodalLengths)->empty())
+
+    if (!multimodalHashes || !multimodalPositions || !multimodalLengths || !(*multimodalHashes)
+        || (*multimodalHashes)->empty() || !(*multimodalPositions) || (*multimodalPositions)->empty()
+        || !(*multimodalLengths) || (*multimodalLengths)->empty())
     {
         return std::nullopt;
     }
-    
-    if ((*multimodalHashes)->size() != (*multimodalPositions)->size() || 
-        (*multimodalPositions)->size() != (*multimodalLengths)->size())
+
+    if ((*multimodalHashes)->size() != (*multimodalPositions)->size()
+        || (*multimodalPositions)->size() != (*multimodalLengths)->size())
     {
         TLLM_LOG_WARNING("Multimodal data arrays have mismatched sizes");
         return std::nullopt;
     }
-    
-    std::vector<MmKey> extraKeys;  // MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>
-    
+
+    std::vector<MmKey> extraKeys; // MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>
+
     for (size_t i = 0; i < (*multimodalPositions)->size(); ++i)
     {
         auto const& startPos = (*(*multimodalPositions))[i];
         auto const& length = (*(*multimodalLengths))[i];
-        auto const& mmHashVector = (*(*multimodalHashes))[i];  // This is vector<int32> - your current format
-        
+        auto const& mmHashVector = (*(*multimodalHashes))[i]; // This is vector<int32> - your current format
+
         std::array<uint8_t, 32> mmHashArray;
-        if (mmHashVector.size() == 8)  // 256-bit hash = 8 * 32-bit integers
+        if (mmHashVector.size() == 8) // 256-bit hash = 8 * 32-bit integers
         {
             // Assuming mmHashVector[j] comes from Python's int(hex_chunk, 16)
             // where hex_chunk like "00010203" means 0x00 is MSB and 0x03 is LSB.
@@ -129,20 +126,20 @@ std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
         {
             // TODO: maybe we should raise an error here
             TLLM_LOG_WARNING("Multimodal hash vector has unexpected size: %zu (expected 8)", mmHashVector.size());
-            continue;  // Skip this multimodal item
+            continue; // Skip this multimodal item
         }
-        
+
         // Check if this multimodal content overlaps with the current block
         if (endTokenIdx > startPos && startTokenIdx < startPos + length)
         {
             // Calculate the start offset of this multimodal content within the block
             SizeType32 mmStartInBlock = (startPos >= startTokenIdx) ? 0 : startTokenIdx - startPos;
-            
+
             // Add the multimodal hash array and its start offset in the block
             extraKeys.emplace_back(mmHashArray, mmStartInBlock);
         }
     }
-    
+
     return extraKeys.empty() ? std::nullopt : std::make_optional(std::move(extraKeys));
 }
 
@@ -150,18 +147,15 @@ std::vector<BlockKey> buildBlockKeys(
     std::list<VecUniqueTokens>& blockedUniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
 {
     std::vector<BlockKey> blockKeys;
-    
+
     SizeType32 currentTokenIdx = 0;
     for (auto& uniqueTokens : blockedUniqueTokens)
     {
         auto extraKeys = generateBlockHashExtraKeys(llmRequest, currentTokenIdx, currentTokenIdx + uniqueTokens.size());
         currentTokenIdx += uniqueTokens.size();
 
-        blockKeys.emplace_back(
-            llmRequest.getInputTokensExtraIds().has_value(), 
-            llmRequest.getLoraTaskId(), 
-            std::move(uniqueTokens),
-            std::move(extraKeys));
+        blockKeys.emplace_back(llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(),
+            std::move(uniqueTokens), std::move(extraKeys));
     }
     return blockKeys;
 }
@@ -209,18 +203,16 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
             for (size_t i = 0; i < 32; i += 4)
             {
                 // Combine 4 bytes into a 32-bit word (construct as little endian order)
-                uint32_t word = static_cast<uint32_t>(mmHash[i]) |
-                                (static_cast<uint32_t>(mmHash[i+1]) << 8) |
-                                (static_cast<uint32_t>(mmHash[i+2]) << 16) |
-                                (static_cast<uint32_t>(mmHash[i+3]) << 24);
-                
+                uint32_t word = static_cast<uint32_t>(mmHash[i]) | (static_cast<uint32_t>(mmHash[i + 1]) << 8)
+                    | (static_cast<uint32_t>(mmHash[i + 2]) << 16) | (static_cast<uint32_t>(mmHash[i + 3]) << 24);
+
                 // Mix the word into the seed
                 word = ((word >> 16) ^ word) * 0x45d9f3b;
                 word = ((word >> 16) ^ word) * 0x45d9f3b;
                 word = (word >> 16) ^ word;
                 seed ^= word + 0x9e3779b9 + (seed << 6) + (seed >> 2);
             }
-            
+
             // Hash the start offset
             uint64_t e = static_cast<uint64_t>(startOffset);
             e = (e ^ (e >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
