@@ -472,7 +472,6 @@ protected:
         using tensorrt_llm::runtime::bufferCast;
 
         auto dtype = nvinfer1::DataType::kHALF;
-        auto cacheType = dtype;
         if constexpr (std::is_same_v<DataType, float>)
         {
             dtype = nvinfer1::DataType::kFLOAT;
@@ -489,6 +488,7 @@ protected:
         {
             return false;
         }
+        auto cacheType = dtype;
         if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
         {
             cacheType = nvinfer1::DataType::kFP8;
@@ -906,9 +906,9 @@ protected:
         // copy cu chunk lens to device
         cudaMemcpy(this->d_cu_chunk_lens->data(), this->h_cu_chunk_lens->data(),
             this->h_cu_chunk_lens->getSizeInBytes(), cudaMemcpyHostToDevice);
-        tensorrt_llm::kernels::invokeMLALoadChunkedKV<DataType>(compressed_kv_output_ptr, k_pe_output_ptr, kv_cache,
-            this->mBatchSize, d_cu_chunk_lens_ptr, this->mLoraSize, this->mRopeSize, this->mChunkSize, chunk_idx,
-            kv_scale_quant_orig_ptr, mStream->get());
+        tensorrt_llm::kernels::invokeMLALoadChunkedKV<DataType, TCache>(compressed_kv_output_ptr, k_pe_output_ptr,
+            kv_cache, this->mBatchSize, d_cu_chunk_lens_ptr, this->mLoraSize, this->mRopeSize, this->mChunkSize,
+            chunk_idx, kv_scale_quant_orig_ptr, mStream->get());
         cudaStreamSynchronize(this->mStream->get());
         // copy result back to host
         cudaMemcpy(this->h_compressed_kv_output->data(), compressed_kv_output_ptr,

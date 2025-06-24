@@ -250,7 +250,7 @@ __global__ void loadChunkedKVCacheForMLAKernel(T* output_kv_ptr, T* output_k_pe_
     tensorrt_llm::kernels::KVBlockArray const kv_cache, int64_t const* cu_ctx_chunked_len, int chunked_size,
     int chunked_idx, float const* kv_scale_quant_orig_ptr)
 {
-    using KT = loadChunkedKVKernelTraits<T>;
+    using KT = loadChunkedKVKernelTraits<TCache>;
     float const kv_scale_quant_orig = kv_scale_quant_orig_ptr ? kv_scale_quant_orig_ptr[0] : 1.0f;
     int const batch_idx = static_cast<int>(blockIdx.y);
     [[maybe_unused]] int const head_idx = static_cast<int>(blockIdx.z); // default 0
