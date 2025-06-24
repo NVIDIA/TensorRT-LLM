@@ -75,6 +75,7 @@ full:B200_PCIe/examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3-small
 full:B200_PCIe/examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3.5-mini-instruct-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1] SKIP (Disable for Blackwell)
 full:B200_PCIe/unittest/trt/functional SKIP (Disable for Blackwell)
 full:B200_PCIe/unittest/trt/quantization SKIP (Disable for Blackwell)
+full:B200_PCIe/unittest/_torch/thop/test_moe.py::test_moe_fp8[autotune-512-512-expert_info3-16] SKIP (https://nvbugs/5356427)
 full:B200_PCIe/accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=False] SKIP (Disable for Blackwell)
 full:B200_PCIe/accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph=True] SKIP (Disable for Blackwell)
 full:B200_PCIe/accuracy/test_cli_flow.py::TestVicuna7B::test_lookahead SKIP (Disable for Blackwell)
