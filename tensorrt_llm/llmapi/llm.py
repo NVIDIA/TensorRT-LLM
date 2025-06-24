@@ -15,7 +15,6 @@ from transformers import PreTrainedTokenizerBase
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 
-from .. import bindings as tllm
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..builder import EngineConfig
@@ -951,7 +950,6 @@ class _TorchLLM(BaseLLM):
             mapping=self.args.parallel_config.to_mapping(),
             speculative_config=self.args.speculative_config,
             hf_model_dir=self._hf_model_dir,
-            trt_engine_dir=self._engine_dir,
             max_input_len=self.args.max_input_len,
             max_seq_len=max_seq_len)
 
