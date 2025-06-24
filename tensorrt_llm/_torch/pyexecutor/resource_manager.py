@@ -261,7 +261,7 @@ class KVCacheManager(BaseResourceManager):
             'tokens_per_block': tokens_per_block,
             'blocks_per_window': blocks_per_window,
             'max_num_sequences': max_batch_size,
-            'max_beam_width': self.max_beam_width,  # TODO: more than 1 beam?
+            'max_beam_width': self.max_beam_width,
             'max_attention_window_vec': self.max_attention_window_vec,
             'temp_attention_window_inputs': temp_attention_window_inputs,
             'dtype': dtype,

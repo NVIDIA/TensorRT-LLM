@@ -813,16 +813,14 @@ class TRTLLMSampler(Sampler):
         finalize_event.synchronize()
 
         # Get these values again, as they might have changed during the finalize step
-        output_ids_host = self.store["decoder_state"].gathered_ids.to(
-            'cpu', non_blocking=False)
+        output_ids_host = self.store["decoder_state"].gathered_ids.to('cpu')
         sequence_lengths_host = self.store["decoder_state"].sequence_lengths.to(
-            'cpu', non_blocking=False)
+            'cpu')
 
         if request.py_return_log_probs:
-            log_probs_host = self.store["decoder_state"].log_probs.to(
-                'cpu', non_blocking=False)
+            log_probs_host = self.store["decoder_state"].log_probs.to('cpu')
             cum_log_probs_host = self.store["decoder_state"].cum_log_probs.to(
-                'cpu', non_blocking=False)
+                'cpu')
 
         generated_tokens = [[0]] * beam_width
         log_probs = [[] for _ in range(beam_width)]

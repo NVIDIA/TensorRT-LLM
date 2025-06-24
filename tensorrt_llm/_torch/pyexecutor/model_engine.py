@@ -1460,7 +1460,7 @@ class PyTorchModelEngine(ModelEngine):
                 cache_indirection_buffer)
             #Copy cache indirection to local buffer with offsets changing:  seq_slots[i] -> i
             cache_indirection_attention[:num_generation_requests].copy_(
-                cache_indirection_buffer[seq_slots], non_blocking=False)
+                cache_indirection_buffer[seq_slots])
             attn_metadata.cache_indirection = cache_indirection_attention
             attn_metadata.beam_width = self.max_beam_width
         else:
