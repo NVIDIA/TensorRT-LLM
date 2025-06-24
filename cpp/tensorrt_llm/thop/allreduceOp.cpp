@@ -163,6 +163,8 @@ public:
     {
         size_t size = input.numel();
         size_t seq_len = input.size(0);
+        size_t bytes_per_element = input.element_size();
+        TLLM_LOG_DEBUG("All reduce message size is %zu", size * bytes_per_element);
 
         if (std::getenv("TLLM_USE_NCCL_UB") && mStrategy == AllReduceStrategyType::UB)
         {
