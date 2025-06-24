@@ -511,17 +511,14 @@ def main(*,
     install_tree = copytree
     if skip_building_wheel and linking_install_binary:
 
-        def symlink_remove_dst(src, dst, *, follow_symlinks=True):
+        def symlink_remove_dst(src, dst):
             src = os.path.abspath(src)
             dst = os.path.abspath(dst)
             if os.path.isdir(dst):
                 dst = os.path.join(dst, os.path.basename(src))
             if os.path.exists(dst):
                 os.remove(dst)
-            if follow_symlinks:
-                os.symlink(src, dst)
-            else:
-                copy(src, dst, follow_symlinks=follow_symlinks)
+            os.symlink(src, dst)
 
         install_file = symlink_remove_dst
 
@@ -646,22 +643,12 @@ def main(*,
                 lib_dir / "nvshmem")
             install_file(
                 build_dir /
-                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_bootstrap_uid.so.3.0.0",
-                lib_dir / "nvshmem")
-            install_file(
-                build_dir /
                 "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_bootstrap_uid.so.3",
-                lib_dir / "nvshmem",
-                follow_symlinks=False)
-            install_file(
-                build_dir /
-                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103.0.0",
                 lib_dir / "nvshmem")
             install_file(
                 build_dir /
                 "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103",
-                lib_dir / "nvshmem",
-                follow_symlinks=False)
+                lib_dir / "nvshmem")
         if not skip_stubs:
             with working_directory(project_dir):
                 build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
