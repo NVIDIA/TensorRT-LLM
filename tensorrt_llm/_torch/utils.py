@@ -136,7 +136,7 @@ def unswizzle_sf(sf: torch.Tensor,
                  scaling_vector_size: int = 16):
     """Swizzle FP4 scaling factors using C++ torch op implementation
     Args:
-        sf: The (padded then) swizzled scaling factors.
+        sf: The (padded and) swizzled scaling factors.
         rows: rows of the original unquantized tensor
         cols: cols of the original unquantized tensor
         scaling_vector_size: the size of the scaling vector
@@ -150,28 +150,42 @@ def unswizzle_sf(sf: torch.Tensor,
 
 
 def reswizzle_sf(sf: torch.Tensor,
-                 row: int,
-                 col: int,
+                 rows: int,
+                 cols: int,
                  scaling_vector_size: int = 16):
-    """Reswizzle scaling factors using C++ ops"""
-    factor = scaling_vector_size * 4
-    num_m_tiles = ceil_div(row, 128)
-    num_k_tiles = ceil_div(col, factor)
-    partition_size = num_m_tiles * num_k_tiles * 32 * 4 * 4
-    num_partitions = sf.numel() // partition_size
+    """Reswizzle FP4 scaling factors using C++ torch op implementation.
+       It unswizzles the scaling factors in each partition first, then concatenates them together, and finally swizzles them back.
+    Args:
+        sf: The (padded and) swizzled scaling factors.
+        rows: rows of the original unquantized tensor
+        cols: cols of the original unquantized tensor
+        scaling_vector_size: the size of the scaling vector
+    Returns:
+        1D reswizzled scaling factors
+    """
+    sf_cols = ceil_div(cols, scaling_vector_size)
+    padded_rows, padded_sf_cols = compute_swizzled_sf_shape(rows, sf_cols)
+    padded_cols = padded_sf_cols * scaling_vector_size
+
+    assert sf.numel() % (padded_rows * padded_sf_cols) == 0
+    num_partitions = sf.numel() // (padded_rows * padded_sf_cols)
+
+    sf_reshaped = sf.view(num_partitions, padded_rows, padded_sf_cols)
 
     # Unswizzle each partition
-    sf_reshaped = sf.view(num_partitions, num_m_tiles, num_k_tiles, 32, 4, 4)
-    sf_unswizzle = sf_reshaped.transpose(2, 4)
-    sf_unswizzle = sf_unswizzle.reshape(num_partitions, num_m_tiles * 32 * 4,
-                                        num_k_tiles * 4)
+    sf_unswizzled = unswizzle_sf(sf_reshaped, padded_rows, padded_cols,
+                                 scaling_vector_size)
 
-    # Concatenate partitions and re-swizzle for the new dimensions
-    total_rows = num_partitions * row
-    sf_cols = ceil_div(col, scaling_vector_size)
-    sf_concatenated = sf_unswizzle[:, :row].reshape(total_rows, sf_cols)
+    # Brings the unswizzled scaling factors in each partition together
+    total_rows = num_partitions * rows
+    sf_unswizzled = sf_unswizzled.view(num_partitions, padded_rows,
+                                       padded_sf_cols)
+    sf_concatenated = sf_unswizzled[:, :rows, :sf_cols].contiguous(
+    )  # TODO: This will incur a elementwise kernel
+    sf_concatenated = sf_concatenated.view(total_rows, sf_cols)
 
-    return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(sf_concatenated)
+    # Finally swizzle the concatenated scaling factors
+    return swizzle_sf(sf_concatenated, total_rows, cols, scaling_vector_size)
 
 
 def next_positive_power_of_2(x: int) -> int:
