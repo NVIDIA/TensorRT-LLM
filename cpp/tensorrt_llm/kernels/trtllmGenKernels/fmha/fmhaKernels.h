@@ -334,9 +334,11 @@ private:
             int const maxNumCtasPerSeqKv = (maxAttentionWindow + kernelMeta.mStepKv - 1) / kernelMeta.mStepKv;
             // Compute numCtasPerSeqKv.
             numCtasPerSeqKv = std::min(maxNumCtasPerSeqKv,
-                std::max(1, int32_t(params.mMultiProcessorCount / (numCtasPerSeqQ * numCtasY * numCtasZ))));
+                std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
+            // Update the numCtasX.
+            numCtasX *= numCtasPerSeqQ;
             // The current total number of CTAs.
-            int totalNumCtas = numCtasPerSeqQ * numCtasPerSeqKv * numCtasZ * numCtasY;
+            int totalNumCtas = numCtasX * numCtasZ * numCtasY;
             // Disable the multiCtasKvMode if there is only one CtaKv.
             if (numCtasPerSeqKv <= 1)
             {
@@ -385,8 +387,6 @@ private:
             clusterDimX *= numCtasPerSeqKv;
         }
 
-        // Update numCtasX.
-        numCtasX *= numCtasPerSeqKv;
         // Compute the current number of CTAs in total.
         int totalNumCtas = numCtasX * numCtasZ * numCtasY;
 
