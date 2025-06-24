@@ -954,12 +954,6 @@ class BaseLlmArgs(BaseModel):
         default=None,
         description="The parser to separate reasoning content from output.")
 
-    garbage_collection_gen0_threshold: int = Field(
-        default=20000,
-        description=
-        "Threshold for Python garbage collection of generation 0 objects."
-        "Lower values trigger more frequent garbage collection.")
-
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
         default=None,
@@ -1622,14 +1616,11 @@ class TorchCompileConfig(BaseModel):
 
 class TorchLlmArgs(BaseLlmArgs):
 
-    # Just a dummy BuildConfig to allow code reuse with the TrtLlmArgs
-    build_config: Optional[object] = Field(
-        default=None,
-        description="Build config.",
-        exclude_from_json=True,
-        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
-
-    # PyTorch backend specific configurations
+    garbage_collection_gen0_threshold: int = Field(
+        default=20000,
+        description=
+        "Threshold for Python garbage collection of generation 0 objects."
+        "Lower values trigger more frequent garbage collection.")
 
     use_cuda_graph: bool = Field(
         default=False,
