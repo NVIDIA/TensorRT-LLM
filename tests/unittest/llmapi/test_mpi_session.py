@@ -54,6 +54,7 @@ def run_client(server_addr, values_to_process):
         return f"Error in client: {str(e)}"
 
 
+@pytest.mark.skip(reason="https://nvbugs/5351244")
 @pytest.mark.parametrize("task_type", ["submit", "submit_sync"])
 def test_remote_mpi_session(task_type: Literal["submit", "submit_sync"]):
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""

@@ -122,10 +122,6 @@ public:
     void copyPositionIds(runtime::TllmRuntime const& runtime, std::vector<SizeType32> const& positionIdsHost,
         bool isChatGlm, TensorPtr const& decoderPositionIds);
 
-    void resetCacheIndirection(RequestVector const& contextRequests, SizeType32 maxBeamWidth,
-        SizeType32 maxAttentionWindow, TensorPtr const& decoderCacheIndirectionInput,
-        TensorPtr const& decoderCacheIndirectionOutput, runtime::BufferManager const& manager);
-
     void copyKvBlockOffsets(RequestVector const& contextRequests, RequestVector const& genRequests,
         kv_cache_manager::BaseKVCacheManager const* kvCacheManager,
         kv_cache_manager::BaseKVCacheManager const* crossKvCacheManager, runtime::BufferManager const& manager);
