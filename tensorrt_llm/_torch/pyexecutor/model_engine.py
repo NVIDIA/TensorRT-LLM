@@ -165,8 +165,7 @@ def prefetch_files(file_names: List[str]):
 
 def load_weights(checkpoint_dir: str):
     weights = {}
-    weight_files = glob.glob(f"{checkpoint_dir}/**/*.safetensors",
-                             recursive=True)
+    weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
     if weight_files:
         # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
         # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
