@@ -300,8 +300,8 @@ class FP8QDQLinearMethod(LinearMethodBase):
             qinput = input
 
         # This op does not support bias now.
-        if qinput.shape[0] < 8 and module.enable_cuda_core:
-            # use cuda core for small batch size
+        if qinput.shape[0] <= 8 and module.enable_cuda_core:
+            # use cuda core for small m dimension
             output = torch.ops.trtllm.cuda_scaled_mm(
                 qinput,
                 module.weight.t(),
