@@ -414,8 +414,11 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
         act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(input)
 
-        output = torch.ops.trtllm.fp8_block_scaling_gemm(
-            act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+        # output = torch.ops.trtllm.fp8_block_scaling_gemm(
+        #     act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+        output = torch.ops.trtllm.cute_dsl_fp8_gemm(act_input_fp8,
+                                                    module.weight, act_input_sf,
+                                                    module.weight_scale)
         if bias is not None:
             output = output + bias
         return output

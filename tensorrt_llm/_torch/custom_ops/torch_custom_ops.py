@@ -1,7 +1,12 @@
+import sys
 from functools import lru_cache
 from typing import List, Optional, Tuple
 
+import cutlass
+import cutlass.cute as cute
 import torch
+from cuda import cuda
+from cutlass.cute.runtime import from_dlpack
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
@@ -12,6 +17,10 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
 from ..utils import (compute_swizzled_sf_shape, fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
+
+sys.path.append(
+    '/home/lmin/scratch/trt-dkg/cutlass_ir/compiler/python/examples/hopper')
+from blockwise_gemm import HopperBlockwiseGemmKernel
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -632,7 +641,7 @@ class CuteDSLFp8Linear(TunableRunner):
     def forward(
         self,
         inputs: List[torch.Tensor],
-        acc_dtype: torch.dtype = torch.bfloat16,
+        # acc_dtype: torch.dtype = torch.bfloat16,
         tile_shape_mnk: Tuple[int, int, int] = (128, 128, 128),
         cluster_shape_mnk: Tuple[int, int, int] = (1, 1, 1),
         tactic: int = -1,
@@ -661,33 +670,44 @@ class CuteDSLFp8Linear(TunableRunner):
         # print("limin: b.dtype = ", b.dtype)
         # print("limin: a_sf.dtype = ", a_sf.dtype)
         # print("limin: b_sf.dtype = ", b_sf.dtype)
+        # print(f"limin: a.shape = {a.shape}, a.stride = {a.stride()}")
+        # print(f"limin: b.shape = {b.shape}, b.stride = {b.stride()}")
+        # print(f"limin: a_sf.shape = {a_sf.shape}, a_sf.stride = {a_sf.stride()}")
+        # print(f"limin: b_sf.shape = {b_sf.shape}, b_sf.stride = {b_sf.stride()}")
 
         # torch_tensor -> cute.tensor
-        a.as_strided((m, k, 1), (k, 1, m * k)).view(torch.uint8)
-        b.as_strided((n, k, 1), (k, 1, n * k)).view(torch.uint8)
-        c.as_strided((m, n, 1), (n, 1, m * n))
+        a_tmp = a.as_strided((m, k, 1), (k, 1, m * k)).view(torch.uint8)
+        b_tmp = b.as_strided((n, k, 1), (k, 1, n * k)).view(torch.uint8)
+        c_tmp = c.as_strided((m, n, 1), (n, 1, m * n))
 
-        b_sf.as_strided((w_n, w_k, 1), (w_k, 1, w_n * w_k))
+        weight_scale_tmp = b_sf.as_strided((w_n, w_k, 1), (w_k, 1, w_n * w_k))
 
-        # m_padded = pad_up(m, 4)
-        # input_scale_tmp = a_sf[0:m_padded * w_k]
+        m_padded = pad_up(m, 4)
+        input_scale_tmp = a_sf[0:m_padded * w_k]
         # print(f"limin: 0, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
-        # input_scale_tmp = input_scale_tmp.reshape(-1, m_padded)
+        input_scale_tmp = input_scale_tmp.reshape(-1, m_padded)
         # print(f"limin: 1, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
-        # input_scale_tmp = input_scale_tmp[:w_k, :m_padded].contiguous().permute(1, 0)
+        input_scale_tmp = input_scale_tmp[:w_k, :m_padded].contiguous().permute(
+            1, 0)
         # print(f"limin: 2, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
-        # input_scale_tmp = input_scale_tmp.as_strided((m_padded, w_k, 1), (1, m_padded, m_padded * w_k))
+        input_scale_tmp = input_scale_tmp.as_strided(
+            (m_padded, w_k, 1), (1, m_padded, m_padded * w_k))
         # print(f"limin: 3, input_scale_tmp.shape = {input_scale_tmp.shape}, input_scale_tmp.stride = {input_scale_tmp.stride()}")
 
-        # mA = from_dlpack(a_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        # mB = from_dlpack(b_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        # mC = from_dlpack(c_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        # mA.element_type = cutlass.Float8E4M3FN
-        # mB.element_type = cutlass.Float8E4M3FN
+        mA = from_dlpack(a_tmp,
+                         assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mB = from_dlpack(b_tmp,
+                         assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mC = from_dlpack(c_tmp,
+                         assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mA.element_type = cutlass.Float8E4M3FN
+        mB.element_type = cutlass.Float8E4M3FN
 
-        # # TODO: mSFA is column major
-        # mSFA = from_dlpack(input_scale_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-        # mSFB = from_dlpack(weight_scale_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        # TODO: mSFA is column major
+        mSFA = from_dlpack(input_scale_tmp,
+                           assumed_align=16).mark_layout_dynamic(leading_dim=0)
+        mSFB = from_dlpack(weight_scale_tmp,
+                           assumed_align=16).mark_layout_dynamic(leading_dim=1)
 
         # print(f"limin: mA.shape = {mA.shape}, mA.stride = {mA.stride}")
         # print(f"limin: mB.shape = {mB.shape}, mB.stride = {mB.stride}")
@@ -695,35 +715,41 @@ class CuteDSLFp8Linear(TunableRunner):
         # print(f"limin: mSFA.shape = {mSFA.shape}, mSFA.stride = {mSFA.stride}")
         # print(f"limin: mSFB.shape = {mSFB.shape}, mSFB.stride = {mSFB.stride}")
 
-        gemm = DummyHopperBlockwiseGemmKernel(
-            acc_dtype,  # acc_dtype,
-            tile_shape_mnk=tile_shape_mnk,
-            cluster_shape_mnk=cluster_shape_mnk,
-        )
+        # gemm = HopperBlockwiseGemmKernel(
+        #     # acc_dtype,  # acc_dtype,
+        #     cutlass.Float32,
+        #     tile_shape_mnk=tile_shape_mnk,
+        #     cluster_shape_mnk=cluster_shape_mnk,
+        # )
 
         # get stream
-        # torch_stream = torch.cuda.current_stream()
-        # stream = cuda.CUstream(torch_stream.cuda_stream)
+        torch_stream = torch.cuda.current_stream()
+        stream = cuda.CUstream(torch_stream.cuda_stream)
 
         cache_key = (tile_shape_mnk, cluster_shape_mnk)
         if cache_key not in CuteDSLFp8Linear.kernel_dict:
-
-            compiled_gemm = gemm
-            # compiled_gemm = cute.compile(
-            #     gemm,
-            #     mA,
-            #     mB,
-            #     mC,
-            #     mSFA,
-            #     mSFB,
-            #     stream,
-            # )
+            gemm = HopperBlockwiseGemmKernel(
+                # acc_dtype,  # acc_dtype,
+                cutlass.Float32,
+                tile_shape_mnk=tile_shape_mnk,
+                cluster_shape_mnk=cluster_shape_mnk,
+            )
+            # compiled_gemm = gemm
+            compiled_gemm = cute.compile(
+                gemm,
+                mA,
+                mB,
+                mC,
+                mSFA,
+                mSFB,
+                stream,
+            )
             CuteDSLFp8Linear.kernel_dict[cache_key] = compiled_gemm
         else:
             compiled_gemm = CuteDSLFp8Linear.kernel_dict[cache_key]
 
         # launch gemm kernel
-        compiled_gemm(a, b, c, a_sf, b_sf)
+        compiled_gemm(mA, mB, mC, mSFA, mSFB, stream)
 
         return c
 
@@ -739,9 +765,9 @@ class CuteDSLFp8Linear(TunableRunner):
         last_positive_power_of_2), ),
     constraint_specs=(ConstraintSpec(2, 0, cute_dsl_fp8_scale_infer_shape), ),
     configs={
-        'acc_dtype': [torch.bfloat16],
+        # 'acc_dtype': [torch.float],
         'tile_shape_mnk': [(64, 128, 128), (128, 128, 128)],
-        'cluster_shape_mnk': [(1, 1, 1), (2, 2, 2), (1, 4, 4), (4, 4, 4)]
+        'cluster_shape_mnk': [(1, 1, 1), (2, 2, 1), (1, 4, 1), (4, 4, 1)]
     },
 )
 def cute_dsl_fp8_gemm(

@@ -103,7 +103,7 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
     with autotune():
         our_out = torch.ops.trtllm.cute_dsl_fp8_gemm(act_a_fp8, act_b_fp8,
                                                      act_a_sf, act_b_sf)
-
+    print("after autotune")
     from tensorrt_llm._torch.autotuner import AutoTuner
     for k, v in AutoTuner.get().profiling_cache.items():
         print(f"Autotuner profiling cache: {k} = {v}")
@@ -111,10 +111,10 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
     our_out = torch.ops.trtllm.cute_dsl_fp8_gemm(act_a_fp8, act_b_fp8, act_a_sf,
                                                  act_b_sf)
 
-    # diff = calc_diff(our_out, output_expected)
-    # print("limin: our_out, output_expected, diff = ", diff)
-    # assert diff < 1e-3
-    # torch.testing.assert_close(our_out, output_expected, atol=1e-3, rtol=1e-3)
+    diff = calc_diff(our_out, output_expected)
+    print("limin: our_out, output_expected, diff = ", diff)
+    assert diff < 1e-3
+    torch.testing.assert_close(our_out, output_expected, atol=1e-3, rtol=1e-3)
 
     # our_ref = cute_dsl_fp8_linear_ref(act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
     # diff = calc_diff(our_ref, output_expected)
