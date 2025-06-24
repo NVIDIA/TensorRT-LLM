@@ -68,8 +68,7 @@ def create_moe(
 
     moe_load_balancer = get_moe_load_balancer()
     if moe_load_balancer is not None:
-        assert (moe_cls == CutlassFusedMoE
-                ), "MoE Load Balance is only supported in CutlassFusedMoE now."
+        assert moe_cls == WideEPMoE, "MoE Load Balance is only supported in WideEPMoE now."
 
     if moe_cls == TRTLLMGenFusedMoE:
         assert (

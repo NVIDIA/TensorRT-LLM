@@ -9,7 +9,8 @@ from typing import List, Optional, Set, Tuple
 from zmq import PUSH
 from zmq.asyncio import Context
 
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
 from tensorrt_llm.executor.postproc_worker import PostprocParams

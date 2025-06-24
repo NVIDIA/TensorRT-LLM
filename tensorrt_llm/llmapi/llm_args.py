@@ -298,6 +298,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
     use_relaxed_acceptance_for_thinking: Optional[bool] = False
     relaxed_topk: Optional[int] = 1
     relaxed_delta: Optional[float] = 0.
+    use_mtp_vanilla: Optional[bool] = False
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1351,7 +1352,8 @@ class BaseLlmArgs(BaseModel):
                     use_relaxed_acceptance_for_thinking=self.speculative_config.
                     use_relaxed_acceptance_for_thinking,
                     relaxed_topk=self.speculative_config.relaxed_topk,
-                    relaxed_delta=self.speculative_config.relaxed_delta)
+                    relaxed_delta=self.speculative_config.relaxed_delta,
+                    use_mtp_vanilla=self.speculative_config.use_mtp_vanilla)
             else:
                 raise ValueError(
                     f"Speculative config type not recognized: {self.speculative_config}"
@@ -1591,9 +1593,6 @@ class TrtLlmArgs(BaseLlmArgs):
         return self
 
 
-LlmArgs = TrtLlmArgs
-
-
 class LoadFormat(Enum):
     AUTO = 0
     # Initialize all weights randomly.
@@ -1663,7 +1662,10 @@ class TorchLlmArgs(BaseLlmArgs):
     moe_load_balancer: Optional[Union[object, str]] = Field(
         default=None,
         description="Configuration for MoE load balancing.",
-        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+        json_schema_extra={
+            "type":
+            "Union[tensorrt_llm._torch.model_config.MoeLoadBalancerConfig, str, None]"
+        })
 
     attn_backend: str = Field(default='TRTLLM',
                               description="Attention backend to use.")
@@ -1720,6 +1722,14 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, enable min-latency mode. Currently only used for Llama4.",
     )
 
+    # TODO: make this a per-request parameter
+    stream_interval: int = Field(
+        default=1,
+        description=
+        "The iteration interval to create responses under the streaming mode. "
+        "Set this to a larger value when the batch size is large, which helps reduce the streaming overhead.",
+    )
+
     # TODO: remove backend later
     @field_validator('backend', mode='before')
     def init_backend(cls, v):
@@ -1772,6 +1782,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 ) from e
         return self
 
+    @model_validator(mode="after")
+    def validate_stream_interval(self):
+        if self.stream_interval <= 0:
+            raise ValueError(
+                f"stream_interval must be positive, got {self.stream_interval}")
+        return self
+
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -1807,7 +1824,8 @@ class TorchLlmArgs(BaseLlmArgs):
             autotuner_enabled=self.autotuner_enabled,
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
-            enable_min_latency=self.enable_min_latency)
+            enable_min_latency=self.enable_min_latency,
+            stream_interval=self.stream_interval)
 
     @field_validator('cuda_graph_max_batch_size')
     @classmethod
@@ -2064,6 +2082,8 @@ def get_model_format(model_dir: str) -> _ModelFormatKind:
     else:
         return model_format
 
+
+LlmArgs = TorchLlmArgs
 
 TRT_LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(TrtLlmArgs,
                                                                 indent=' ' * 4)

@@ -1,6 +1,6 @@
 import modeling_opt  # noqa
 
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM
 
 
 def main():

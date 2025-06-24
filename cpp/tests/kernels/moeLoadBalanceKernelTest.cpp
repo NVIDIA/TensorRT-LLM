@@ -110,7 +110,6 @@ struct MoeLoadBalanceTestParam
     bool isFirstStage;
     bool isLastStage;
     float decayFactor;
-    int rawDataWindowSize;
 };
 
 class MoeLoadBalanceStatisticKernelTest : public ::testing::TestWithParam<MoeLoadBalanceTestParam>
@@ -126,14 +125,13 @@ protected:
         mMetaInfo.epSize = param.epSize;
         mMetaInfo.slotCountPerRank = param.slotCountPerRank;
 
-        mStatisticInfo.rawDataWindowSize = param.rawDataWindowSize;
         mStatisticInfo.decayFactor = param.decayFactor;
 
         ASSERT_EQ(cudaStreamCreate(&mStream), cudaSuccess);
 
         // allocate device memory
         size_t expertLoadFactorSize = param.expertCount * sizeof(float);
-        size_t expertTokenCountSize = param.expertCount * param.rawDataWindowSize * sizeof(int);
+        size_t expertTokenCountSize = param.expertCount * mStatisticInfo.rawDataWindowSize * sizeof(int);
         size_t gatheredIdsSize = param.maxTokenCountPerRank * param.epSize * param.topK * sizeof(int);
 
         ASSERT_EQ(cudaMalloc(&mDeviceEnabled, sizeof(int)), cudaSuccess);
@@ -147,9 +145,9 @@ protected:
 
         // allocate host memory for verification
         mExpectedLoadFactor.resize(param.expertCount, 0.0f);
-        mExpectedExpertTokenCount.resize(param.expertCount * param.rawDataWindowSize);
+        mExpectedExpertTokenCount.resize(param.expertCount * mStatisticInfo.rawDataWindowSize);
         mHostExpertLoadFactor.resize(param.expertCount);
-        mHostExpertTokenCount.resize(param.expertCount * param.rawDataWindowSize);
+        mHostExpertTokenCount.resize(param.expertCount * mStatisticInfo.rawDataWindowSize);
         mHostGatheredIds.resize(param.maxTokenCountPerRank * param.epSize * param.topK);
 
         // initialize the random number generator
@@ -188,7 +186,7 @@ protected:
         mExpectedExpertTokenCount = mHostExpertTokenCount;
         if (param.isFirstStage)
         {
-            for (int windowIdx = param.rawDataWindowSize - 1; windowIdx >= 0; --windowIdx)
+            for (int windowIdx = mStatisticInfo.rawDataWindowSize - 1; windowIdx >= 0; --windowIdx)
             {
                 if (windowIdx > 0)
                 {
@@ -305,7 +303,7 @@ TEST_P(MoeLoadBalanceStatisticKernelTest, TestStatistics)
         EXPECT_NEAR(mHostExpertLoadFactor[i], mExpectedLoadFactor[i], 1e-6)
             << "Expert " << i << " load factor mismatch";
     }
-    for (int i = 0; i < param.expertCount * param.rawDataWindowSize; ++i)
+    for (int i = 0; i < param.expertCount * mStatisticInfo.rawDataWindowSize; ++i)
     {
         EXPECT_EQ(mHostExpertTokenCount[i], mExpectedExpertTokenCount[i]) << "Expert " << i << " token count mismatch";
     }
@@ -323,8 +321,7 @@ INSTANTIATE_TEST_SUITE_P(MoeLoadBalanceStatisticKernelTests, MoeLoadBalanceStati
             /* maxTokenCountPerRank */ 128,
             /* isFirstStage */ true,
             /* isLastStage */ true,
-            /* decayFactor */ 0.9f,
-            /* rawDataWindowSize */ 3},
+            /* decayFactor */ 0.9f},
         // large scale test scenarios
         MoeLoadBalanceTestParam{/* expertCount */ 64,
             /* topK */ 4,
@@ -334,8 +331,7 @@ INSTANTIATE_TEST_SUITE_P(MoeLoadBalanceStatisticKernelTests, MoeLoadBalanceStati
             /* maxTokenCountPerRank */ 512,
             /* isFirstStage */ false,
             /* isLastStage */ true,
-            /* decayFactor */ 0.95f,
-            /* rawDataWindowSize */ 5} // can add more test scenarios
+            /* decayFactor */ 0.95f} // can add more test scenarios
         ));
 
 class MoeLoadBalanceRouteKernelTest : public ::testing::TestWithParam<MoeLoadBalanceTestParam>
@@ -601,8 +597,7 @@ INSTANTIATE_TEST_SUITE_P(MoeLoadBalanceRouteKernelTests, MoeLoadBalanceRouteKern
             /* maxTokenCountPerRank */ 128,
             /* isFirstStage */ true,
             /* isLastStage */ true,
-            /* decayFactor */ 0.9f,
-            /* rawDataWindowSize */ 3},
+            /* decayFactor */ 0.9f},
         // large scale test scenarios
         MoeLoadBalanceTestParam{/* expertCount */ 256,
             /* topK */ 8,
@@ -612,8 +607,7 @@ INSTANTIATE_TEST_SUITE_P(MoeLoadBalanceRouteKernelTests, MoeLoadBalanceRouteKern
             /* maxTokenCountPerRank */ 5000,
             /* isFirstStage */ false,
             /* isLastStage */ true,
-            /* decayFactor */ 0.95f,
-            /* rawDataWindowSize */ 5},
+            /* decayFactor */ 0.95f},
         // edge case: single rank
         MoeLoadBalanceTestParam{/* expertCount */ 16,
             /* topK */ 2,
@@ -623,5 +617,4 @@ INSTANTIATE_TEST_SUITE_P(MoeLoadBalanceRouteKernelTests, MoeLoadBalanceRouteKern
             /* maxTokenCountPerRank */ 64,
             /* isFirstStage */ true,
             /* isLastStage */ true,
-            /* decayFactor */ 0.9f,
-            /* rawDataWindowSize */ 1}));
+            /* decayFactor */ 0.9f}));

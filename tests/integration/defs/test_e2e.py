@@ -2107,8 +2107,7 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-    from tensorrt_llm import SamplingParams
-    from tensorrt_llm._torch import LLM
+    from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm.sampling_params import SamplingParams
     prompts = [
         "Hello, my name is",

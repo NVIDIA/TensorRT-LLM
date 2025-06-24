@@ -14,7 +14,7 @@
 # limitations under the License.
 import pytest
 
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM
 from tensorrt_llm._torch.pyexecutor.config import MoeLoadBalancerConfig
 from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
@@ -52,6 +52,15 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @skip_pre_blackwell
+    def test_nvfp4_streaming(self):
+        model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
+        with LLM(model_path, stream_interval=4) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm, streaming=True)
 
 
 class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
@@ -640,29 +649,17 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids(
         "torch_compile",
         [False, pytest.param(True, marks=skip_device_contain_gb200)])
-    @parametrize_with_ids(
-        "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
-        [
-            (False, False, False, False),
-            (True, False, False, False),
-            (False, True, False, False),
-            (False, False, True, False),
-            (False, False, False, True),
-            (True, False, True, True),
-            (True, True, True, True),
-        ],
-    )
-    @parametrize_with_ids("mtp_nextn", [0, 2])
-    def test_fp8_block_scales(
-        self,
-        mtp_nextn,
-        fp8kv,
-        attention_dp,
-        cuda_graph,
-        overlap_scheduler,
-        torch_compile,
-    ):
-        if torch_compile and mtp_nextn > 0:
+    @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
+                          [(False, False, False, False),
+                           (True, False, False, False),
+                           (False, True, False, False),
+                           (False, False, True, False),
+                           (False, False, False, True),
+                           (True, False, True, True), (True, True, True, True)])
+    @parametrize_with_ids("mtp", ["disable", "eagle", "vanilla"])
+    def test_fp8_block_scales(self, mtp, fp8kv, attention_dp, cuda_graph,
+                              overlap_scheduler, torch_compile):
+        if torch_compile and mtp != "disable":
             pytest.skip("https://nvbugs/5252313")
         if torch_compile and attention_dp:
             pytest.skip("https://nvbugs/5252559")
@@ -684,8 +681,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytorch_config["kv_cache_dtype"] = "fp8"
 
         mtp_config = None
-        if mtp_nextn > 0:
+        mtp_nextn = 2
+        if mtp == "eagle":
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        elif mtp == "vanilla":
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn,
+                                           use_mtp_vanilla=True)
 
         llm = LLM(
             f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",

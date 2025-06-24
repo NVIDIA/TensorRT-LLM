@@ -3,7 +3,8 @@ import os
 
 import click
 
-from tensorrt_llm.llmapi import LLM, BuildConfig, SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.llmapi import BuildConfig, SamplingParams
 
 
 @click.command()

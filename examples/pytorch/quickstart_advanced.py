@@ -1,7 +1,6 @@
 import argparse
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (DraftTargetDecodingConfig, EagleDecodingConfig,
                                  KvCacheConfig, MTPDecodingConfig,
                                  NGramDecodingConfig, TorchCompileConfig)

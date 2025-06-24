@@ -186,7 +186,7 @@ __all__ = [
 Alternatively, you can register the new model as an out-of-tree model, so that you can use the new model without touching the TensorRT-LLM codebase. To do so, place `modeling_mymodel.py` (and potentially `configuration_mymodel.py`) in your working directory, and import the modeling code in your script:
 
 ```python
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM
 import modeling_mymodel
 
 def main():
