@@ -108,7 +108,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
     std::vector<KVCacheBlockPool> const& pools, bool isOffload, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::optional<std::string> directory)
 {
-    TLLM_LOG_ERROR("copyBlock entered: srcId=%d, dstId=%d, isOffload=%s, mode=%d", src->getBlockId(), dst->getBlockId(),
+    TLLM_LOG_DEBUG("copyBlock entered: srcId=%d, dstId=%d, isOffload=%s, mode=%d", src->getBlockId(), dst->getBlockId(),
         (isOffload ? "true" : "false"), static_cast<int>(mode));
 
     if (mode == executor::KvCacheTransferMode::DRAM)
