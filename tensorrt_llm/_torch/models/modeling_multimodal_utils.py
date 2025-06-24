@@ -85,9 +85,11 @@ def fuse_input_embeds(
         if mm_token_indices.numel() < mm_embed.shape[0]:
             # Extract the last mm_token_indices.numel() embeddings from mm_embed
             start_idx = mm_embed.shape[0] - mm_token_indices.numel()
-            input_embeds[mm_token_indices, :] = mm_embed[start_idx:, :].to(dtype=input_embeds.dtype, device=input_embeds.device)
+            input_embeds[mm_token_indices, :] = mm_embed[start_idx:, :].to(
+                dtype=input_embeds.dtype, device=input_embeds.device)
         else:
-            input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype, device=input_embeds.device)
+            input_embeds[mm_token_indices, :] = mm_embed.to(
+                dtype=input_embeds.dtype, device=input_embeds.device)
 
     return None, input_embeds
 
