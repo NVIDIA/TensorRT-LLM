@@ -36,11 +36,24 @@ def add_multimodal_arguments(parser):
                         type=str,
                         default=None,
                         choices=[
-                            'blip2', 'llava', 'llava_next', 'llava_onevision',
-                            'llava_onevision_lmms', 'vila', 'nougat', 'cogvlm',
-                            'fuyu', 'pix2struct', 'neva', 'kosmos-2',
-                            'video-neva', 'phi-3-vision', 'phi-4-multimodal',
-                            'mllama', 'internvl', 'qwen2_vl',
+                            'blip2',
+                            'llava',
+                            'llava_next',
+                            'llava_onevision',
+                            'llava_onevision_lmms',
+                            'vila',
+                            'nougat',
+                            'cogvlm',
+                            'fuyu',
+                            'pix2struct',
+                            'neva',
+                            'kosmos-2',
+                            'video-neva',
+                            'phi-3-vision',
+                            'phi-4-multimodal',
+                            'mllama',
+                            'internvl',
+                            'qwen2_vl',
                             'llama_nemotron_nano_vl',
                         ],
                         help="Model type")
@@ -1741,11 +1754,13 @@ def build_pixtral_engine(args):
         engine_name=f"model.engine",
         dtype=torch.bfloat16)
 
+
 def build_llama_nemotron_nano_vl_engine(args):
     from llama_3_1_nemotron_nano_vl_8b_v1.modeling import Llama_Nemotron_Nano_VL
     model = Llama_Nemotron_Nano_VL.from_pretrained(args.model_path)
 
     class RadioWithNeck(torch.nn.Module):
+
         def __init__(self, model):
             super().__init__()
             self.downsample_ratio = model.downsample_ratio
@@ -1763,8 +1778,9 @@ def build_llama_nemotron_nano_vl_engine(args):
             x = x.view(n, int(h * scale_factor), int(w * scale_factor),
                        int(c / (scale_factor * scale_factor)))
             if self.ps_version == 'v1':
-                logger.warning("in ps_version 'v1', the height and width have not been swapped back, "
-                               'which results in a transposed image.')
+                logger.warning(
+                    "in ps_version 'v1', the height and width have not been swapped back, "
+                    'which results in a transposed image.')
             else:
                 x = x.permute(0, 2, 1, 3).contiguous()
             return x
@@ -1772,10 +1788,12 @@ def build_llama_nemotron_nano_vl_engine(args):
         def extract_feature(self, pixel_values):
             vit_embeds = self.vision_model(pixel_values).features
             vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
-            h = w = int(vit_embeds.shape[1] ** 0.5)
+            h = w = int(vit_embeds.shape[1]**0.5)
             vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
-            vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
-            vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
+            vit_embeds = self.pixel_shuffle(vit_embeds,
+                                            scale_factor=self.downsample_ratio)
+            vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1,
+                                            vit_embeds.shape[-1])
             vit_embeds = self.mlp1(vit_embeds)
             return vit_embeds
 
