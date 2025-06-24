@@ -111,6 +111,9 @@ methods:
       enable_min_latency:
         annotation: bool
         default: False
+      force_dynamic_quantization:
+        annotation: bool
+        default: False
     return_annotation: None
   generate:
     parameters:
