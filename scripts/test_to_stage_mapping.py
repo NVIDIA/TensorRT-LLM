@@ -46,8 +46,20 @@ def _load_tests_file(path: str) -> List[str]:
     return tests
 
 
+# Regex to parse Jenkins stage configurations from Groovy files
+# Matches patterns like: "Stage-Name": ["platform", "yaml_file", split_id, split_count, gpu_count]
+#
+# Pattern breakdown:
+#   "(?P<stage>[^"]+)"     - Captures stage name in quotes (group 'stage')
+#   \s*:\s*               - Matches colon with optional whitespace
+#   \[                    - Matches opening bracket
+#   "[^"]+"              - Matches platform string in quotes (ignored)
+#   ,\s*                 - Matches comma with optional whitespace
+#   "(?P<yml>[^"]+)"     - Captures yaml filename in quotes (group 'yml')
+#   (?:,\s*\d+)*         - Matches zero or more comma-separated numbers (split_id, split_count, gpu_count)
+#   \s*\]                - Matches closing bracket with optional whitespace
 _STAGE_RE = re.compile(
-    r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"')
+    r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"(?:,\s*\d+)*\s*\]')
 
 
 def _extract_terms(entry):
@@ -215,8 +227,8 @@ def main():
         help='One or more test name patterns to resolve to Jenkins stages')
     group.add_argument(
         '--test-list',
-        help=
-        'File with test name patterns, either newline separated or a YAML list')
+        help=('File with test name patterns, either newline separated '
+              'or a YAML list'))
     group.add_argument('--stages',
                        nargs='+',
                        help='List of stage names to look up')
