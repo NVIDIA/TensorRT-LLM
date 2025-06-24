@@ -18,7 +18,6 @@
 #include "mlaCacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 
-#include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -170,8 +169,11 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
 
     // The size of outputSplitCaches should be equal to pPDomainSize
 
+    SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(0);
+    std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocksPerWindow;
+    inputKvCacheBlocksPerWindow.emplace(window, inputKvCacheBlocks);
     tensorrt_llm::executor::kv_cache::splitKVCacheDispatch(
-        inputKvCacheBlocks, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
+        inputKvCacheBlocksPerWindow, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
 
     bufferManager.getStream().synchronize();
 
@@ -446,11 +448,14 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
         }
 
         {
+            std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> outputCachesPerWindow;
+            SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(0);
+            outputCachesPerWindow.emplace(window, outputBuffers);
             NVTX3_SCOPED_RANGE(formatInputConcatenate);
 
             // recvSplitCaches size == ppdomainsize
             executor::kv_cache::concatKvCacheV2Dispatch(
-                recvSplitCaches, outputBuffers, destConfig, selfConfig, selfIdx, bufferManager);
+                recvSplitCaches, outputCachesPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
         }
         bufferManager.getStream().synchronize();
     }
