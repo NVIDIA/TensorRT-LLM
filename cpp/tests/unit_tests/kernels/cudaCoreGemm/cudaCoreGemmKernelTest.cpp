@@ -316,15 +316,15 @@ float run_cublas_kernel(Params& params, int warmup, int iter)
 template <typename InputType, typename OutputType>
 bool benchmark_and_verify(int m, int n, int k, int warmup, int iter, bool debug = false, bool run_cublas = false)
 {
-    constexpr nvinfer1::DataType kInputDatatype = std::is_same<InputType, float>::value ? nvinfer1::DataType::kFLOAT
-        : std::is_same<InputType, half>::value                                          ? nvinfer1::DataType::kHALF
-        : std::is_same<InputType, __nv_bfloat16>::value                                 ? nvinfer1::DataType::kBF16
-                                                                                        : nvinfer1::DataType::kFP8;
+    constexpr cudaDataType_t kInputDatatype = std::is_same<InputType, float>::value ? CUDA_R_32F
+        : std::is_same<InputType, half>::value                                      ? CUDA_R_16F
+        : std::is_same<InputType, __nv_bfloat16>::value                             ? CUDA_R_16BF
+                                                                                    : CUDA_R_8F_E4M3;
 
-    constexpr nvinfer1::DataType kOutputDatatype = std::is_same<OutputType, float>::value ? nvinfer1::DataType::kFLOAT
-        : std::is_same<OutputType, half>::value                                           ? nvinfer1::DataType::kHALF
-        : std::is_same<OutputType, __nv_bfloat16>::value                                  ? nvinfer1::DataType::kBF16
-                                                                                          : nvinfer1::DataType::kFP8;
+    constexpr cudaDataType_t kOutputDatatype = std::is_same<OutputType, float>::value ? CUDA_R_32F
+        : std::is_same<OutputType, half>::value                                       ? CUDA_R_16F
+        : std::is_same<OutputType, __nv_bfloat16>::value                              ? CUDA_R_16BF
+                                                                                      : CUDA_R_8F_E4M3;
 
     std::srand(20240123);
     simple_assert(m <= 4);

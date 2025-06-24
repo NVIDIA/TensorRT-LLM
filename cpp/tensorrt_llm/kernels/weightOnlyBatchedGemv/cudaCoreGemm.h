@@ -49,30 +49,26 @@ struct Params
     void const* weight;
     void* output;
     SizeType32 m, n, k;
+    cudaDataType_t inputType;
+    cudaDataType_t outputType;
     // gemmPlugin
     float alpha;
-    nvinfer1::DataType inputType;
-    nvinfer1::DataType outputType;
     // torch flow
-    bool use_torch_flow;
     float const* scale_a;
     float const* scale_b;
-    cudaDataType_t torchInputType;
-    cudaDataType_t torchOutputType;
 
     // used by gemmPlugin
     Params(void const* _act, void const* _weight, float _alpha, void* _output, SizeType32 _m, SizeType32 _n,
-        SizeType32 _k, nvinfer1::DataType _inputType, nvinfer1::DataType _outputType)
+        SizeType32 _k, cudaDataType_t _inputType, cudaDataType_t _outputType)
         : act(_act)
         , weight(_weight)
         , output(_output)
         , m(_m)
         , n(_n)
         , k(_k)
-        , alpha(_alpha)
         , inputType(_inputType)
         , outputType(_outputType)
-        , use_torch_flow(false)
+        , alpha(_alpha)
         , scale_a(nullptr)
         , scale_b(nullptr)
     {
@@ -80,21 +76,18 @@ struct Params
 
     // used by torch flow
     Params(void const* _act, void const* _weight, void* _output, SizeType32 _m, SizeType32 _n, SizeType32 _k,
-        float const* _scale_a, float const* _scale_b, cudaDataType_t _torchInputType, cudaDataType_t _torchOutputType)
+        float const* _scale_a, float const* _scale_b, cudaDataType_t _inputType, cudaDataType_t _outputType)
         : act(_act)
         , weight(_weight)
         , output(_output)
         , m(_m)
         , n(_n)
         , k(_k)
+        , inputType(_inputType)
+        , outputType(_outputType)
         , alpha(1.f)
-        , inputType(nvinfer1::DataType::kFLOAT)
-        , outputType(nvinfer1::DataType::kFLOAT)
-        , use_torch_flow(true)
         , scale_a(_scale_a)
         , scale_b(_scale_b)
-        , torchInputType(_torchInputType)
-        , torchOutputType(_torchOutputType)
     {
     }
 };

@@ -395,15 +395,15 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     {
         tensorrt_llm::kernels::cuda_core_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
             reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K,
-            nvinfer1::DataType::kFP8, mOutputType);
+            CUDA_R_8F_E4M3, trtToCublasDtype(mOutputType));
         cudaKernelFinished = tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher(params, stream);
     }
     else if (!isArch90or100 && ((mArch < 90 && M <= 6) || (isArch90or100 && M <= 2)) && N <= 128000 && !mUseFp8
         && noPadDim && cudaKernelSupportType)
     {
         tensorrt_llm::kernels::cuda_core_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
-            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K, mType,
-            mOutputType);
+            reinterpret_cast<void const*>(inputs[1]), mAlpha, reinterpret_cast<void*>(outputs[0]), M, N, K,
+            trtToCublasDtype(mType), trtToCublasDtype(mOutputType));
         cudaKernelFinished = tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher(params, stream);
     }
 

@@ -231,40 +231,22 @@ bool cudaCoreGemmDispatcher(Params const& params, cudaStream_t stream)
     {
         dispatched = false;
     }
-    else if (params.use_torch_flow)
-    {
-        if (params.torchInputType == CUDA_R_8F_E4M3)
-        {
-            if (params.torchOutputType == CUDA_R_32F)
-            {
-                dispatched = cudaCoreGemmLauncher<__nv_fp8_e4m3, float>(params, stream);
-            }
-            else if (params.torchOutputType == CUDA_R_16F)
-            {
-                dispatched = cudaCoreGemmLauncher<__nv_fp8_e4m3, half>(params, stream);
-            }
-            else if (params.torchOutputType == CUDA_R_16BF)
-            {
-                dispatched = cudaCoreGemmLauncher<__nv_fp8_e4m3, __nv_bfloat16>(params, stream);
-            }
-        }
-    }
-    else if (params.inputType == nvinfer1::DataType::kFP8)
+    else if (params.inputType == CUDA_R_8F_E4M3)
     {
         if (params.k % 16 != 0)
         {
             // Expect k % 16 == 0 for 128 bits alignment
             dispatched = false;
         }
-        else if (params.outputType == nvinfer1::DataType::kHALF)
+        else if (params.outputType == CUDA_R_16F)
         {
             dispatched = cudaCoreGemmLauncher<__nv_fp8_e4m3, half>(params, stream);
         }
-        else if (params.outputType == nvinfer1::DataType::kBF16)
+        else if (params.outputType == CUDA_R_16BF)
         {
             dispatched = cudaCoreGemmLauncher<__nv_fp8_e4m3, __nv_bfloat16>(params, stream);
         }
-        else if (params.outputType == nvinfer1::DataType::kFLOAT)
+        else if (params.outputType == CUDA_R_32F)
         {
             dispatched = cudaCoreGemmLauncher<__nv_fp8_e4m3, float>(params, stream);
         }
@@ -273,18 +255,18 @@ bool cudaCoreGemmDispatcher(Params const& params, cudaStream_t stream)
             dispatched = false;
         }
     }
-    else if (params.inputType == nvinfer1::DataType::kHALF)
+    else if (params.inputType == CUDA_R_16F)
     {
         if (params.k % 8 != 0)
         {
             // Expect k % 8 == 0 for 128 bits alignment
             dispatched = false;
         }
-        else if (params.outputType == nvinfer1::DataType::kHALF)
+        else if (params.outputType == CUDA_R_16F)
         {
             dispatched = cudaCoreGemmLauncher<half, half>(params, stream);
         }
-        else if (params.outputType == nvinfer1::DataType::kFLOAT)
+        else if (params.outputType == CUDA_R_32F)
         {
             dispatched = cudaCoreGemmLauncher<half, float>(params, stream);
         }
@@ -293,18 +275,18 @@ bool cudaCoreGemmDispatcher(Params const& params, cudaStream_t stream)
             dispatched = false;
         }
     }
-    else if (params.inputType == nvinfer1::DataType::kBF16)
+    else if (params.inputType == CUDA_R_16BF)
     {
         if (params.k % 8 != 0)
         {
             // Expect k % 8 == 0 for 128 bits alignment
             dispatched = false;
         }
-        else if (params.outputType == nvinfer1::DataType::kBF16)
+        else if (params.outputType == CUDA_R_16BF)
         {
             dispatched = cudaCoreGemmLauncher<__nv_bfloat16, __nv_bfloat16>(params, stream);
         }
-        else if (params.outputType == nvinfer1::DataType::kFLOAT)
+        else if (params.outputType == CUDA_R_32F)
         {
             dispatched = cudaCoreGemmLauncher<__nv_bfloat16, float>(params, stream);
         }
@@ -313,14 +295,14 @@ bool cudaCoreGemmDispatcher(Params const& params, cudaStream_t stream)
             dispatched = false;
         }
     }
-    else if (params.inputType == nvinfer1::DataType::kFLOAT)
+    else if (params.inputType == CUDA_R_32F)
     {
         if (params.k % 4 != 0)
         {
             // Expect k % 4 == 0 for 128 bits alignment
             dispatched = false;
         }
-        else if (params.outputType == nvinfer1::DataType::kFLOAT)
+        else if (params.outputType == CUDA_R_32F)
         {
             dispatched = cudaCoreGemmLauncher<float, float>(params, stream);
         }
