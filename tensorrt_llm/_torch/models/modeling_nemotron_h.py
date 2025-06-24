@@ -247,6 +247,9 @@ class NemotronHForCausalLM(DecoderModelForCausalLM[NemotronHModel,
                 for k in model_config.quant_config.exclude_modules
             ]
 
+        # Nemotron-H config.json uses attention_head_dim instead of head_dim which makes the
+        # attention module use the wrong head_dim, based on hidden_size and num_attention_heads.
+        # for this model, we need to override the head_dim to attention_head_dim.
         model_config.pretrained_config.head_dim = model_config.pretrained_config.attention_head_dim
 
         super().__init__(
