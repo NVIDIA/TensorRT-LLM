@@ -27,7 +27,6 @@ global_kvcache_config = KvCacheConfig(max_tokens=10000)
 @pytest.mark.parametrize("return_log_probs", [True, False])
 @pytest.mark.parametrize("gather_generation_logits", [True, False])
 @pytest.mark.parametrize("gather_context_logits", [True, False])
-@pytest.mark.parametrize("enable_trtllm_sampler", [True])
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
 @pytest.mark.parametrize("max_beam_width", [2])
 @pytest.mark.parametrize("max_tokens", [8])
@@ -38,9 +37,6 @@ def test_beam_search_output_shapes(disable_overlap_scheduler: bool,
                                    gather_generation_logits: bool,
                                    return_log_probs: bool, max_beam_width: int,
                                    max_tokens: int, num_prompts: int):
-    if not enable_trtllm_sampler:
-        pytest.skip(
-            "Beam search currently is only supported with TRTLLMSampler")
     if return_log_probs and num_prompts > 1:
         pytest.skip(
             "Beam search currently does not support return_log_probs with multiple prompts"
@@ -59,8 +55,6 @@ def test_beam_search_output_shapes(disable_overlap_scheduler: bool,
     )
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
-        top_k=None,
-        top_p=None,
         n=max_beam_width,
         use_beam_search=max_beam_width > 1,
         return_context_logits=gather_context_logits,
