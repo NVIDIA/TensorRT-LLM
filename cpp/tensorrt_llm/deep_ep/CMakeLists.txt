@@ -13,8 +13,8 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(deep_ep_download)
 set(DEEP_EP_SOURCE_DIR ${deep_ep_download_SOURCE_DIR})
 
-# Copy files
-set(DEEP_EP_PYTHON_DEST ${PROJECT_SOURCE_DIR}/../tensorrt_llm/deep_ep)
+# Copy and update files
+set(DEEP_EP_PYTHON_DEST ${CMAKE_CURRENT_BINARY_DIR}/python/deep_ep)
 file(REMOVE_RECURSE ${DEEP_EP_PYTHON_DEST})
 file(MAKE_DIRECTORY ${DEEP_EP_PYTHON_DEST})
 file(COPY ${DEEP_EP_SOURCE_DIR}/LICENSE DESTINATION ${DEEP_EP_PYTHON_DEST})
@@ -112,8 +112,13 @@ pybind11_add_module(
   ${DEEP_EP_SOURCE_DIR}/csrc/kernels/runtime.cu)
 set_target_properties(
   deep_ep_cpp_tllm
-  PROPERTIES CXX_STANDARD_REQUIRED ON CUDA_STANDARD_REQUIRED ON CXX_STANDARD 17
-             CUDA_STANDARD 17 CUDA_SEPARABLE_COMPILATION ON)
+  PROPERTIES CXX_STANDARD_REQUIRED ON
+             CUDA_STANDARD_REQUIRED ON
+             CXX_STANDARD 17
+             CUDA_STANDARD 17
+             CUDA_SEPARABLE_COMPILATION ON
+             INSTALL_RPATH "$ORIGIN/libs/nvshmem"
+             BUILD_WITH_INSTALL_RPATH TRUE)
 target_compile_options(
   deep_ep_cpp_tllm
   PRIVATE ${TORCH_CXX_FLAGS} -O3
@@ -127,3 +132,7 @@ target_link_options(
   deep_ep_cpp_tllm PRIVATE
   -Wl,--version-script,${CMAKE_CURRENT_SOURCE_DIR}/deep_ep_cpp_tllm.version
   -Wl,--no-undefined-version)
+
+# Add deep_ep
+add_custom_target(deep_ep)
+add_dependencies(deep_ep deep_ep_cpp_tllm nvshmem_project)
