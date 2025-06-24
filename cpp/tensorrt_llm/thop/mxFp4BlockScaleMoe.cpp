@@ -29,13 +29,16 @@ using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodTy
 torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_logits,
     torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
     std::optional<torch::Tensor> const& hidden_states_scale, torch::Tensor const& gemm1_weights,
-    torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm1_bias, torch::Tensor const& gemm1_swiGluAlpha,
-    torch::Tensor const& gemm1_swiGluBeta, torch::Tensor const& gemm2_weights, torch::Tensor const& gemm2_weights_scale,
-    torch::Tensor const& gemm2_bias, int64_t const num_experts, int64_t const top_k,
+    torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm1_bias,
+    std::optional<torch::Tensor> const& gemm1_alpha, std::optional<torch::Tensor> const& gemm1_beta,
+    torch::Tensor const& gemm2_weights, torch::Tensor const& gemm2_weights_scale, torch::Tensor const& gemm2_bias,
+    std::optional<torch::Tensor> const& output1_scale_scalar,
+    std::optional<torch::Tensor> const& output1_scale_gate_scalar,
+    std::optional<torch::Tensor> const& output2_scale_scalar, int64_t const num_experts, int64_t const top_k,
     std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
     int64_t const local_expert_offset, int64_t const local_num_experts,
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
-    btg::Dtype const dtype)
+    btg::Dtype const dtype, int64_t const act_type)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 100, "Only SM100 is supported by FP4 block scale MOE");
@@ -89,9 +92,15 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
     args.gemm2_weights = gemm2_weights.data_ptr();
     args.gemm2_weights_scale = gemm2_weights_scale.data_ptr();
     args.gemm1_bias = gemm1_bias.data_ptr<float>();
-    args.gemm1_swiGluAlpha = gemm1_swiGluAlpha.data_ptr<float>();
-    args.gemm1_swiGluBeta = gemm1_swiGluBeta.data_ptr<float>();
+    args.gemm1_alpha = gemm1_alpha.has_value() ? gemm1_alpha.value().data_ptr<float>() : nullptr;
+    args.gemm1_beta = gemm1_beta.has_value() ? gemm1_beta.value().data_ptr<float>() : nullptr;
     args.gemm2_bias = gemm2_bias.data_ptr<float>();
+    args.output1_scales_scalar
+        = output1_scale_scalar.has_value() ? output1_scale_scalar.value().data_ptr<float>() : nullptr;
+    args.output1_scales_gate_scalar
+        = output1_scale_gate_scalar.has_value() ? output1_scale_gate_scalar.value().data_ptr<float>() : nullptr;
+    args.output2_scales_scalar
+        = output2_scale_scalar.has_value() ? output2_scale_scalar.value().data_ptr<float>() : nullptr;
     args.num_tokens = hidden_states.sizes()[0];
     args.num_experts = num_experts;
     args.hidden_size = hidden_states.sizes()[1];
@@ -102,6 +111,8 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
     args.local_num_experts = local_num_experts;
     args.routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args.intermediate_size = intermediate_size;
+
+    tensorrt_llm::kernels::ActType actType = static_cast<tensorrt_llm::kernels::ActType>(act_type);
 
     // allocate workspace for routing kernel
     at::Tensor num_tokens_per_expert
@@ -229,15 +240,21 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
     TORCH_CHECK(gemm1_bias.sizes()[0] == local_num_experts, "gemm1_bias has incorrect dim 0.");
     TORCH_CHECK(gemm1_bias.sizes()[1] == 2 * intermediate_size, "gemm1_bias has incorrect dim 1.");
 
-    TORCH_CHECK(gemm1_swiGluAlpha.scalar_type() == at::ScalarType::Float, "gemm1_swiGluAlpha must be float, got %s.",
-        c10::toString(gemm1_swiGluAlpha.scalar_type()));
-    TORCH_CHECK(gemm1_swiGluAlpha.dim() == 1, "gemm1_swiGluAlpha must be 1D.");
-    TORCH_CHECK(gemm1_swiGluAlpha.sizes()[0] == local_num_experts, "gemm1_swiGluAlpha has incorrect dim 0.");
+    if (actType != tensorrt_llm::kernels::ActType::Silu)
+    {
+        TORCH_CHECK(gemm1_alpha.has_value(), "gemm1_alpha must be provided for non-Silu activation.");
+        TORCH_CHECK(gemm1_beta.has_value(), "gemm1_beta must be provided for non-Silu activation.");
 
-    TORCH_CHECK(gemm1_swiGluBeta.scalar_type() == at::ScalarType::Float, "gemm1_swiGluBeta must be float, got %s.",
-        c10::toString(gemm1_swiGluBeta.scalar_type()));
-    TORCH_CHECK(gemm1_swiGluBeta.dim() == 1, "gemm1_swiGluBeta must be 1D.");
-    TORCH_CHECK(gemm1_swiGluBeta.sizes()[0] == local_num_experts, "gemm1_swiGluBeta has incorrect dim 0.");
+        TORCH_CHECK(gemm1_alpha->scalar_type() == at::ScalarType::Float, "gemm1_alpha must be float, got %s.",
+            c10::toString(gemm1_alpha->scalar_type()));
+        TORCH_CHECK(gemm1_alpha->dim() == 1, "gemm1_alpha must be 1D.");
+        TORCH_CHECK(gemm1_alpha->sizes()[0] == local_num_experts, "gemm1_alpha has incorrect dim 0.");
+
+        TORCH_CHECK(gemm1_beta->scalar_type() == at::ScalarType::Float, "gemm1_beta must be float, got %s.",
+            c10::toString(gemm1_beta->scalar_type()));
+        TORCH_CHECK(gemm1_beta->dim() == 1, "gemm1_beta must be 1D.");
+        TORCH_CHECK(gemm1_beta->sizes()[0] == local_num_experts, "gemm1_beta has incorrect dim 0.");
+    }
 
     TORCH_CHECK(gemm2_weights.scalar_type() == FLOAT4_E2M1X2, "gemm2_weights must be byte, got %s.",
         c10::toString(gemm2_weights.scalar_type()));
@@ -261,6 +278,31 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
     TORCH_CHECK(gemm2_bias.dim() == 2, "gemm2_bias must be 2D.");
     TORCH_CHECK(gemm2_bias.sizes()[0] == local_num_experts, "gemm2_bias has incorrect dim 0.");
     TORCH_CHECK(gemm2_bias.sizes()[1] == args.hidden_size, "gemm2_bias has incorrect dim 1.");
+
+    if (dtype == btg::Dtype::MxE4m3)
+    {
+        TORCH_CHECK(output1_scale_scalar.has_value(), "output1_scale_scalar must be provided for MxE4m3.");
+        TORCH_CHECK(output1_scale_gate_scalar.has_value(), "output1_scale_gate_scalar must be provided for MxE4m3.");
+        TORCH_CHECK(output2_scale_scalar.has_value(), "output2_scale_scalar must be provided for MxE4m3.");
+
+        TORCH_CHECK(
+            output1_scale_scalar->scalar_type() == at::ScalarType::Float, "output1_scales_scalar must be float.");
+        TORCH_CHECK(output1_scale_scalar->dim() == 1, "output1_scales_scalar must be 1D.");
+        TORCH_CHECK(
+            output1_scale_scalar->sizes()[0] == local_num_experts, "output1_scales_scalar has incorrect dim 0.");
+
+        TORCH_CHECK(output1_scale_gate_scalar->scalar_type() == at::ScalarType::Float,
+            "output1_scales_gate_scalar must be float.");
+        TORCH_CHECK(output1_scale_gate_scalar->dim() == 1, "output1_scales_gate_scalar must be 1D.");
+        TORCH_CHECK(output1_scale_gate_scalar->sizes()[0] == local_num_experts,
+            "output1_scales_gate_scalar has incorrect dim 0.");
+
+        TORCH_CHECK(
+            output2_scale_scalar->scalar_type() == at::ScalarType::Float, "output2_scales_scalar must be float.");
+        TORCH_CHECK(output2_scale_scalar->dim() == 1, "output2_scales_scalar must be 1D.");
+        TORCH_CHECK(
+            output2_scale_scalar->sizes()[0] == local_num_experts, "output2_scales_scalar has incorrect dim 0.");
+    }
 
     // allocate output
     at::Tensor output = at::detail::empty_cuda(
@@ -294,7 +336,7 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
     args.output_scale = nullptr;
 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(
-        dtype, btg::Dtype::MxE2m1, args.mUseDeepSeekFp8, tile_tokens_dim);
+        dtype, btg::Dtype::MxE2m1, args.mUseDeepSeekFp8, tile_tokens_dim, actType);
     auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args);
     at::Tensor workspace_fc1 = at::detail::empty_cuda(
         {std::get<0>(workspace_sizes)}, at::ScalarType::Char, hidden_states.device(), std::nullopt);
@@ -310,33 +352,38 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
 torch::Tensor mxe4m3_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_logits,
     torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
     torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
-    torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm1_bias, torch::Tensor const& gemm1_swiGluAlpha,
-    torch::Tensor const& gemm1_swiGluBeta, torch::Tensor const& gemm2_weights, torch::Tensor const& gemm2_weights_scale,
-    torch::Tensor const& gemm2_bias, int64_t const num_experts, int64_t const top_k,
+    torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm1_bias,
+    std::optional<torch::Tensor> const& gemm1_alpha, std::optional<torch::Tensor> const& gemm1_beta,
+    torch::Tensor const& gemm2_weights, torch::Tensor const& gemm2_weights_scale, torch::Tensor const& gemm2_bias,
+    torch::Tensor const& output1_scale_scalar, torch::Tensor const& output1_scale_gate_scalar,
+    torch::Tensor const& output2_scale_scalar, int64_t const num_experts, int64_t const top_k,
     std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
     int64_t const local_expert_offset, int64_t const local_num_experts,
-    std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type)
+    std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
+    int64_t const act_type)
 {
     return dtype_mxe2m1_block_scale_moe_runner(routing_logits, routing_bias, hidden_states, hidden_states_scale,
-        gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_swiGluAlpha, gemm1_swiGluBeta, gemm2_weights,
-        gemm2_weights_scale, gemm2_bias, num_experts, top_k, n_group, topk_group, intermediate_size,
-        local_expert_offset, local_num_experts, routed_scaling_factor, tile_tokens_dim, routing_method_type,
-        btg::Dtype::MxE4m3);
+        gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm2_weights, gemm2_weights_scale,
+        gemm2_bias, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar, num_experts, top_k, n_group,
+        topk_group, intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, tile_tokens_dim,
+        routing_method_type, btg::Dtype::MxE4m3, act_type);
 }
 
 torch::Tensor bf16_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_logits,
     torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
     torch::Tensor const& gemm1_weights, torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm1_bias,
-    torch::Tensor const& gemm1_swiGluAlpha, torch::Tensor const& gemm1_swiGluBeta, torch::Tensor const& gemm2_weights,
-    torch::Tensor const& gemm2_weights_scale, torch::Tensor const& gemm2_bias, int64_t const num_experts,
-    int64_t const top_k, std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group,
-    int64_t const intermediate_size, int64_t const local_expert_offset, int64_t const local_num_experts,
-    std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type)
+    std::optional<torch::Tensor> const& gemm1_alpha, std::optional<torch::Tensor> const& gemm1_beta,
+    torch::Tensor const& gemm2_weights, torch::Tensor const& gemm2_weights_scale, torch::Tensor const& gemm2_bias,
+    int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
+    std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
+    int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
+    int64_t const routing_method_type, int64_t const act_type)
 {
     return dtype_mxe2m1_block_scale_moe_runner(routing_logits, routing_bias, hidden_states, std::nullopt, gemm1_weights,
-        gemm1_weights_scale, gemm1_bias, gemm1_swiGluAlpha, gemm1_swiGluBeta, gemm2_weights, gemm2_weights_scale,
-        gemm2_bias, num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
-        routed_scaling_factor, tile_tokens_dim, routing_method_type, btg::Dtype::Bfloat16);
+        gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm2_weights, gemm2_weights_scale, gemm2_bias,
+        std::nullopt, std::nullopt, std::nullopt, num_experts, top_k, n_group, topk_group, intermediate_size,
+        local_expert_offset, local_num_experts, routed_scaling_factor, tile_tokens_dim, routing_method_type,
+        btg::Dtype::Bfloat16, act_type);
 }
 } // namespace torch_ext
 
@@ -351,11 +398,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor gemm1_weights,"
         "Tensor gemm1_weights_scale,"
         "Tensor gemm1_bias,"
-        "Tensor gemm1_swiGluAlpha,"
-        "Tensor gemm1_swiGluBeta,"
+        "Tensor? gemm1_alpha,"
+        "Tensor? gemm1_beta,"
         "Tensor gemm2_weights,"
         "Tensor gemm2_weights_scale,"
         "Tensor gemm2_bias,"
+        "Tensor output1_scale_scalar,"
+        "Tensor output1_scale_gate_scalar,"
+        "Tensor output2_scale_scalar,"
         "int num_experts,"
         "int top_k,"
         "int? n_group,"
@@ -365,7 +415,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int local_num_experts,"
         "float? routed_scaling_factor,"
         "int tile_tokens_dim,"
-        "int routing_method_type) -> Tensor");
+        "int routing_method_type,"
+        "int act_type) -> Tensor");
     m.def(
         "bf16_mxe2m1_block_scale_moe_runner("
         "Tensor routing_logits,"
@@ -374,8 +425,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor gemm1_weights,"
         "Tensor gemm1_weights_scale,"
         "Tensor gemm1_bias,"
-        "Tensor gemm1_swiGluAlpha,"
-        "Tensor gemm1_swiGluBeta,"
+        "Tensor? gemm1_alpha,"
+        "Tensor? gemm1_beta,"
         "Tensor gemm2_weights,"
         "Tensor gemm2_weights_scale,"
         "Tensor gemm2_bias,"
@@ -388,7 +439,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int local_num_experts,"
         "float? routed_scaling_factor,"
         "int tile_tokens_dim,"
-        "int routing_method_type) -> Tensor");
+        "int routing_method_type,"
+        "int act_type) -> Tensor");
 }
 
 // Accepts CUDA tensor only

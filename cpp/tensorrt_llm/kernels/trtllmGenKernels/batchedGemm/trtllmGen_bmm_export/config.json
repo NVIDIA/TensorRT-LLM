@@ -168,7 +168,7 @@
             "numExperts": 128,
             "useCudaGraph": true,
             "biasType": "m",
-            "act": "swiglu"
+            "act": "swish"
         },
         "BatchedGemmMxE2m1Bf16LowLatency": {
             "dtypeA": "mxe2m1",
@@ -207,7 +207,7 @@
             "numExperts": 128,
             "useCudaGraph": true,
             "biasType": "m",
-            "act": "swiglu",
+            "act": "swish",
             "patchF2fp": true
         }
     },
@@ -595,12 +595,14 @@
             "useRoutingScalesOnInput": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "mxe4m3",
+            "tileK": [512, 256],
             "numTokens": 2,
             "numExperts": 2,
             "numStagesMma": 2,
             "numStages": 3,
             "tileN": 8,
-            "tileScheduler": "persistent"
+            "tileScheduler": "persistent",
+            "act": ["swish", "silu"]
         },
         {
             "_comment": "MxFp4xMxFp8_FC1_static_tileN8",
@@ -611,11 +613,13 @@
             "useRoutingScalesOnInput": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "mxe4m3",
+            "tileK": [512, 256],
             "numTokens": 2,
             "numExperts": 2,
             "numStages": 3,
             "tileN": 8,
-            "tileScheduler": "static"
+            "tileScheduler": "static",
+            "act": ["swish", "silu"]
         },
         {
             "_comment": "MxFp4xMxFp8_FC2_persistent_tileN8",
@@ -625,6 +629,7 @@
             "useRoutingScalesOnInput": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
+            "tileK": [512, 256],
             "numTokens": 2,
             "numExperts": 2,
             "numStagesMma": 2,
@@ -640,6 +645,7 @@
             "useRoutingScalesOnInput": false,
             "useUnrollLoop2xForMma": [true, false],
             "dtypeC": "bf16",
+            "tileK": [512, 256],
             "numTokens": 2,
             "numExperts": 2,
             "numStagesMma": 1,
@@ -664,7 +670,8 @@
             "tileN": 16,
             "mmaN": 16,
             "epilogueTileN": 16,
-            "tileScheduler": "persistent"
+            "tileScheduler": "persistent",
+            "act": ["swish", "silu"]
         },
         {
             "_comment": "MxFp4xMxFp8_FC1_static_tileN16",
@@ -682,7 +689,8 @@
             "tileN": 16,
             "mmaN": 16,
             "epilogueTileN": 16,
-            "tileScheduler": "static"
+            "tileScheduler": "static",
+            "act": ["swish", "silu"]
         },
         {
             "_comment": "MxFp4xMxFp8_FC2_persistent_tileN16",
@@ -737,7 +745,8 @@
             "tileN": 32,
             "mmaN": 32,
             "epilogueTileN": 32,
-            "tileScheduler": "persistent"
+            "tileScheduler": "persistent",
+            "act": ["swish", "silu"]
         },
         {
             "_comment": "MxFp4xMxFp8_FC1_static_tileN32",
@@ -755,7 +764,8 @@
             "tileN": 32,
             "mmaN": 32,
             "epilogueTileN": 32,
-            "tileScheduler": "static"
+            "tileScheduler": "static",
+            "act": ["swish", "silu"]
         },
         {
             "_comment": "MxFp4xMxFp8_FC2_persistent_tileN32",
@@ -807,7 +817,8 @@
             "numStagesMma": 2,
             "numStages": 3,
             "tileN": 8,
-            "tileScheduler": "persistent"
+            "tileScheduler": "persistent",
+            "act": ["swish", "silu"]
         },
         {
             "_comment": "MxFp4xBf16_FC1_static_tileN8",
@@ -822,7 +833,8 @@
             "numExperts": 2,
             "numStages": 3,
             "tileN": 8,
-            "tileScheduler": "static"
+            "tileScheduler": "static",
+            "act": ["swish", "silu"]
         },
         {
             "_comment": "MxFp4xBf16_FC2_persistent_tileN8",
@@ -870,7 +882,8 @@
             "tileN": 16,
             "mmaN": 16,
             "epilogueTileN": 16,
-            "tileScheduler": "persistent"
+            "tileScheduler": "persistent",
+            "act": ["swish", "silu"]
         },
         {
             "_comment": "MxFp4xBf16_FC1_static_tileN16",
@@ -887,7 +900,8 @@
             "tileN": 16,
             "mmaN": 16,
             "epilogueTileN": 16,
-            "tileScheduler": "static"
+            "tileScheduler": "static",
+            "act": ["swish", "silu"]
         },
         {
             "_comment": "MxFp4xBf16_FC2_persistent_tileN16",
@@ -939,7 +953,8 @@
             "tileN": 32,
             "mmaN": 32,
             "epilogueTileN": 32,
-            "tileScheduler": "persistent"
+            "tileScheduler": "persistent",
+            "act": ["swish", "silu"]
         },
         {
             "_comment": "MxFp4xBf16_FC1_static_tileN32",
@@ -956,7 +971,8 @@
             "tileN": 32,
             "mmaN": 32,
             "epilogueTileN": 32,
-            "tileScheduler": "static"
+            "tileScheduler": "static",
+            "act": ["swish", "silu"]
         },
         {
             "_comment": "MxFp4xBf16_FC2_persistent_tileN32",

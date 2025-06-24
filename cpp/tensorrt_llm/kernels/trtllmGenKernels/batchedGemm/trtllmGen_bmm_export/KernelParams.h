@@ -223,10 +223,10 @@ struct KernelParams
     // Shape is [B]. One scaling factor per tensor in batch.
     float const* ptrScaleGate;
 
-    // The alpha and beta for SwiGlu.
+    // The alpha and beta for SwiGlu and Swish.
     // Shape is [B]. One alpha and one beta per tensor in batch.
-    float const* ptrSwiGluAlpha;
-    float const* ptrSwiGluBeta;
+    float const* ptrAlpha;
+    float const* ptrBeta;
 
     // The K dimension. It is the hidden dimension of the input matrices.
     int32_t k;
@@ -713,10 +713,10 @@ struct KernelParams
     static KernelParams setKernelParams(GemmOptions_ const& options, bool const batchM, void const* ptrA,
         void const* ptrB, void* ptrC, void const* dSfA, void const* dSfB, void const* ptrPerTokenSfA,
         void const* ptrPerTokenSfB, void const* ptrBias, void* dSfC, float const* ptrScaleC, float const* ptrScaleGate,
-        float const* ptrSwiGluAlpha, float const* ptrSwiGluBeta, int32_t const* routeMap, float* rowMax,
-        uint32_t* rowMaxBars, int32_t const* ptrNumNonExitingCtas = nullptr,
-        int32_t const* ptrTotalNumPaddedTokens = nullptr, int32_t const* ptrCtaIdxXyToBatchIdx = nullptr,
-        int32_t const* ptrCtaIdxXyToMnLimit = nullptr, int32_t const maxNumCtas = MaxNumCtas)
+        float const* ptrAlpha, float const* ptrBeta, int32_t const* routeMap, float* rowMax, uint32_t* rowMaxBars,
+        int32_t const* ptrNumNonExitingCtas = nullptr, int32_t const* ptrTotalNumPaddedTokens = nullptr,
+        int32_t const* ptrCtaIdxXyToBatchIdx = nullptr, int32_t const* ptrCtaIdxXyToMnLimit = nullptr,
+        int32_t const maxNumCtas = MaxNumCtas)
     {
 
         static_assert(sizeof(KernelParams) <= 32 * 1024, "sizeof(KernelParams) has to be less or equal than 32KB");
@@ -730,8 +730,8 @@ struct KernelParams
         params.ptrScaleC = ptrScaleC;
         params.ptrScaleGate = ptrScaleGate;
 
-        params.ptrSwiGluAlpha = ptrSwiGluAlpha;
-        params.ptrSwiGluBeta = ptrSwiGluBeta;
+        params.ptrAlpha = ptrAlpha;
+        params.ptrBeta = ptrBeta;
 
         int32_t ctaOffset = 0;
 

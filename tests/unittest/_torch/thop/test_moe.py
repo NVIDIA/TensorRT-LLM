@@ -22,6 +22,8 @@ import torch
 import torch.nn.functional as F
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from enum import Enum
+
 from utils.util import getSMVersion
 
 from tensorrt_llm._torch.autotuner import autotune
@@ -29,6 +31,13 @@ from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
 from tensorrt_llm._torch.utils import next_positive_power_of_2
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
+
+
+# Keep this in sync with the ActType in cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
+class ActType(Enum):
+    Silu = 0
+    Swiglu = 1
+    Swish = 2
 
 
 class moe_args:
@@ -53,9 +62,10 @@ class moe_args:
                  permute_info,
                  use_routing_scales_on_input,
                  gemm1_bias=None,
-                 gemm1_swiglu_alpha=None,
-                 gemm1_swiglu_beta=None,
-                 gemm2_bias=None):
+                 gemm1_alpha=None,
+                 gemm1_beta=None,
+                 gemm2_bias=None,
+                 act_type=ActType.Silu):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
         self.hidden_size = hidden_size
@@ -75,9 +85,10 @@ class moe_args:
         self.permute_info = permute_info
         self.use_routing_scales_on_input = use_routing_scales_on_input
         self.gemm1_bias = gemm1_bias
-        self.gemm1_swiglu_alpha = gemm1_swiglu_alpha
-        self.gemm1_swiglu_beta = gemm1_swiglu_beta
+        self.gemm1_alpha = gemm1_alpha
+        self.gemm1_beta = gemm1_beta
         self.gemm2_bias = gemm2_bias
+        self.act_type = act_type
 
 
 class moe_args_dequant:
@@ -96,9 +107,10 @@ class moe_args_dequant:
                  permute_info,
                  use_routing_scales_on_input,
                  gemm1_bias=None,
-                 gemm1_swiglu_alpha=None,
-                 gemm1_swiglu_beta=None,
-                 gemm2_bias=None):
+                 gemm1_alpha=None,
+                 gemm1_beta=None,
+                 gemm2_bias=None,
+                 act_type=ActType.Silu):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
         self.hidden_size = hidden_size
@@ -112,9 +124,10 @@ class moe_args_dequant:
         self.permute_info = permute_info
         self.use_routing_scales_on_input = use_routing_scales_on_input
         self.gemm1_bias = gemm1_bias
-        self.gemm1_swiglu_alpha = gemm1_swiglu_alpha
-        self.gemm1_swiglu_beta = gemm1_swiglu_beta
+        self.gemm1_alpha = gemm1_alpha
+        self.gemm1_beta = gemm1_beta
         self.gemm2_bias = gemm2_bias
+        self.act_type = act_type
 
 
 def routing_reference(expertLogits, topK, padding):
@@ -378,12 +391,18 @@ def run_moe_dequant(args,
             my_a += args.gemm1_bias[expert_idx]
         my_x1 = my_a[:, :args.intermediate_size]
         my_x2 = my_a[:, args.intermediate_size:]
-        if args.gemm1_swiglu_alpha is not None and args.gemm1_swiglu_beta is not None:
-            activation_output[i:i + my_num_tokens] = F.sigmoid(
-                my_x2 * args.gemm1_swiglu_alpha[expert_idx]) * (
-                    args.gemm1_swiglu_beta[expert_idx] + my_x1)
-        else:
+        if args.act_type == ActType.Swiglu:
+            assert args.gemm1_alpha is not None and args.gemm1_beta is not None
+            act = F.sigmoid(my_x2 * args.gemm1_alpha[expert_idx])
+            activation_output[i:i + my_num_tokens] = act * (
+                args.gemm1_beta[expert_idx] + my_x1)
+        elif args.act_type == ActType.Silu:
             activation_output[i:i + my_num_tokens] = F.silu(my_x2) * my_x1
+        elif args.act_type == ActType.Swish:
+            assert args.gemm1_alpha is not None and args.gemm1_beta is not None
+            act = my_x2 * F.sigmoid(my_x2 * args.gemm1_alpha[expert_idx])
+            activation_output[i:i + my_num_tokens] = act * (
+                args.gemm1_beta[expert_idx] + my_x1)
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
 
@@ -595,7 +614,7 @@ def run_moe_reference_mxe4m3_mxe2m1(args):
         args.intermediate_size, args.top_k, args.padding, hidden_states_dequant,
         args.expert_logits, gemm1_weights_dequant, gemm2_weights_dequant,
         args.permute_info, args.use_routing_scales_on_input, args.gemm1_bias,
-        args.gemm1_swiglu_alpha, args.gemm1_swiglu_beta, args.gemm2_bias)
+        args.gemm1_alpha, args.gemm1_beta, args.gemm2_bias, args.act_type)
 
     return run_moe_dequant(args_dequant, "mxe4m3"), args_dequant
 
@@ -612,7 +631,7 @@ def run_moe_reference_bf16_mxe2m1(args):
         args.intermediate_size, args.top_k, args.padding, args.hidden_states,
         args.expert_logits, gemm1_weights_dequant, gemm2_weights_dequant,
         args.permute_info, args.use_routing_scales_on_input, args.gemm1_bias,
-        args.gemm1_swiglu_alpha, args.gemm1_swiglu_beta, args.gemm2_bias)
+        args.gemm1_alpha, args.gemm1_beta, args.gemm2_bias, args.act_type)
 
     return run_moe_dequant(args_dequant, "bf16"), args_dequant
 
@@ -1417,8 +1436,9 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     ],
 )
 @pytest.mark.parametrize("dtype_activation", ["mxfp8", "bf16"])
+@pytest.mark.parametrize("act_type", [ActType.Silu, ActType.Swish])
 def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
-                            routing_info, dtype_activation):
+                            routing_info, dtype_activation, act_type):
     torch.random.manual_seed(0)
 
     #
@@ -1471,12 +1491,8 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
 
     gemm1_bias = 50 * torch.randn(
         num_experts, 2 * intermediate_size, device='cuda', dtype=torch.float)
-    gemm1_swiglu_alpha = torch.randn(num_experts,
-                                     device='cuda',
-                                     dtype=torch.float)
-    gemm1_swiglu_beta = torch.ones(num_experts,
-                                   device='cuda',
-                                   dtype=torch.float)
+    gemm1_alpha = torch.randn(num_experts, device='cuda', dtype=torch.float)
+    gemm1_beta = torch.ones(num_experts, device='cuda', dtype=torch.float)
     gemm2_bias = 50 * torch.randn(
         num_experts, hidden_size, device='cuda', dtype=torch.float)
 
@@ -1536,8 +1552,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                     None, scores, gemm1_weights_mxe2m1_bytes,
                     gemm1_scales_mxe2m1_bytes, None, gemm2_weights_mxe2m1_bytes,
                     gemm2_scales_mxe2m1_bytes, None, permute_info, False,
-                    gemm1_bias, gemm1_swiglu_alpha, gemm1_swiglu_beta,
-                    gemm2_bias)
+                    gemm1_bias, gemm1_alpha, gemm1_beta, gemm2_bias, act_type)
 
     if is_mx_fp8:
         output_dequant_reference, args_dequant = run_moe_reference_mxe4m3_mxe2m1(
@@ -1627,6 +1642,17 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     gemm2_bias_shuffled = torch.stack(gemm2_bias_shuffled).reshape(
         num_experts, -1)
 
+    # FIXME: the global scaling factors for Fp8 emulation with MxFp8. Initialize them to the real values.
+    output1_scales_scalar = torch.ones(num_experts,
+                                       device='cuda',
+                                       dtype=torch.float)
+    output1_scales_gate_scalar = torch.ones(num_experts,
+                                            device='cuda',
+                                            dtype=torch.float)
+    output2_scales_scalar = torch.ones(num_experts,
+                                       device='cuda',
+                                       dtype=torch.float)
+
     #
     # Run the TRT-LLM kernel
     #
@@ -1637,22 +1663,27 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
             hidden_states_scale_linear_mxe4m3.cuda(),
             gemm1_weights_mxe2m1_shuffled.cuda(),
             gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
-            gemm1_swiglu_alpha.cuda(), gemm1_swiglu_beta.cuda(),
+            gemm1_alpha.cuda() if act_type is not ActType.Silu else None,
+            gemm1_beta.cuda() if act_type is not ActType.Silu else None,
             gemm2_weights_mxe2m1_shuffled.cuda(),
             gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
-            num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
-            num_experts, routed_scaling, tile_tokens_dim, routing_method_type)
+            output1_scales_scalar.cuda(), output1_scales_gate_scalar.cuda(),
+            output2_scales_scalar.cuda(), num_experts, top_k, n_groups,
+            top_k_groups, intermediate_size, 0, num_experts, routed_scaling,
+            tile_tokens_dim, routing_method_type, act_type.value)
     else:
         output = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
             expert_logits, routing_bias,
             hidden_states.cuda().to(torch.bfloat16),
             gemm1_weights_mxe2m1_shuffled.cuda(),
             gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
-            gemm1_swiglu_alpha.cuda(), gemm1_swiglu_beta.cuda(),
+            gemm1_alpha.cuda() if act_type is not ActType.Silu else None,
+            gemm1_beta.cuda() if act_type is not ActType.Silu else None,
             gemm2_weights_mxe2m1_shuffled.cuda(),
             gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
             num_experts, top_k, n_groups, top_k_groups, intermediate_size, 0,
-            num_experts, routed_scaling, tile_tokens_dim, routing_method_type)
+            num_experts, routed_scaling, tile_tokens_dim, routing_method_type,
+            act_type.value)
 
     output_dequant_actual = output.to(torch.float)
     percent = 0.8 if is_mx_fp8 else 0.85

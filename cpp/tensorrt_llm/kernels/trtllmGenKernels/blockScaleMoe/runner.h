@@ -121,7 +121,7 @@ class Runner
 {
 public:
     explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
-        bool useDeepSeekFp8, int tileTokensDim);
+        bool useDeepSeekFp8, int tileTokensDim, ActType actType);
 
     size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
         int32_t numTokens, int32_t configIndex) const;
@@ -205,8 +205,8 @@ struct MoERunnerArgs
     void* gemm2_weights_scale = nullptr;
 
     float* gemm1_bias = nullptr;
-    float* gemm1_swiGluAlpha = nullptr;
-    float* gemm1_swiGluBeta = nullptr;
+    float* gemm1_alpha = nullptr;
+    float* gemm1_beta = nullptr;
     float* gemm2_bias = nullptr;
 
     int32_t num_tokens{0};
@@ -300,7 +300,7 @@ class Runner
 public:
     // FIXME: tileTokensDim is hardcoded for now
     Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
-        int tileTokensDim = 8);
+        int tileTokensDim = 8, ActType actType = ActType::Silu);
     Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8);
 
     void run(
