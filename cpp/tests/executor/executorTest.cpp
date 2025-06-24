@@ -567,13 +567,22 @@ TEST_F(GptExecutorTest, GenerationChangeEndId)
     }
 }
 
+// stream, excludeInputFromOutput, beamWidth
 using ParamType = std::tuple<bool, bool, int>;
+// streaming, useOrchestratorMode, beamWidth, numReturnSequences, modelName
 using ParamCancelReqType = std::tuple<bool, bool, int, int, std::string>;
+// streaming, modelName
 using LeaderApiUsageType = std::tuple<bool, std::string>;
+// iterStatsMaxIterations, useOrchestratorMode
 using ParamStatsType = std::tuple<int, bool>;
+// streaming, beamWidth, computeLogProbs, excludeInputInOutput, returnContextLogits, returnGenerationLogits, modelName,
+// useOrchestratorMode, returnAllGeneratedTokens, numReturnSequences
 using AllParamsType = std::tuple<bool, int, bool, bool, bool, bool, std::string, bool, bool, int>;
+// modelName, batched, replicated
 using LogitsProcParamsType = std::tuple<std::string, bool, bool>;
+// modelName
 using GuidedDecodingParamsType = std::tuple<std::string>;
+// modelName, useOrchestratorMode, beamWidth
 using TimeoutTestParamsType = std ::tuple<std::string, bool, int>;
 
 std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
@@ -4447,28 +4456,43 @@ TEST_P(TimeoutTest, TimeoutNonstreamingTest)
 }
 
 INSTANTIATE_TEST_SUITE_P(GptExecutorTest, ParamTest,
-    testing::Combine(testing::Values(false, true), // streaming
-        testing::Values(false, true),              // excludeInputFromOutput
-        testing::Values(1, 2)                      // beamWidth
+    testing::Combine(                 //
+        testing::Values(false, true), // streaming
+        testing::Values(false, true), // excludeInputFromOutput
+        testing::Values(1, 2)         // beamWidth
         ),
     generateTestName);
 
 INSTANTIATE_TEST_SUITE_P(GptExecutorTest, ParamStatsTest,
-    testing::Combine(testing::Values(0, 1000), testing::Values(false, true)), generateTestNameStats);
+    testing::Combine(                //
+        testing::Values(0, 1000),    // iterStatsMaxIterations
+        testing::Values(false, true) // useOrchestratorMode
+        ),
+    generateTestNameStats);
 
 INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, ParamCancelReqTest,
-    testing::Combine(testing::Values(false, true), testing::Values(false, true), testing::Values(1, 2),
-        testing::Values(1, 2), testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp2_pp2_cp1")),
+    testing::Combine(                                                                  //
+        testing::Values(false, true),                                                  // streaming
+        testing::Values(false, true),                                                  // useOrchestratorMode
+        testing::Values(1, 2),                                                         // beamWidth
+        testing::Values(1, 2),                                                         // numReturnSequences
+        testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp2_pp2_cp1") // modelName
+        ),
     generateTestNameCancelReq);
 
 INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, TimeoutTest,
-    testing::Combine(testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp1_pp1_cp1"),
-        testing::Values(false, true), testing::Values(2)),
+    testing::Combine(                                                                   //
+        testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp1_pp1_cp1"), // modelName
+        testing::Values(false, true),                                                   // useOrchestratorMode
+        testing::Values(2)                                                              // beamWidth
+        ),
     generateTestNameTimeoutTest);
 
 INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, LeaderApiUsageTest,
-    testing::Combine(
-        testing::Values(false, true), testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp2_pp2_cp1")),
+    testing::Combine(                                                                  //
+        testing::Values(false, true),                                                  // streaming
+        testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp2_pp2_cp1") // modelName
+        ),
     generateTestNameLeaderApiUsage);
 
 INSTANTIATE_TEST_SUITE_P(GptExecutorTest, AllParamsTest,
@@ -4594,9 +4618,12 @@ INSTANTIATE_TEST_SUITE_P(ChatGlm3ExecutorTest, AllParamsTest,
     generateTestNameAllParams);
 
 INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, LogitsProcParamsTest,
-    testing::Combine(
-        testing::Values("llama_tp1_pp1_cp1", "llama_tp4_pp1_cp1", "llama_tp2_pp2_cp1", "llama_tp1_pp4_cp1"),
-        testing::Values(false, true), testing::Values(false, true)),
+    testing::Combine(                                                                            //
+        testing::Values(
+            "llama_tp1_pp1_cp1", "llama_tp4_pp1_cp1", "llama_tp2_pp2_cp1", "llama_tp1_pp4_cp1"), // modelName
+        testing::Values(false, true),                                                            // batched
+        testing::Values(false, true)                                                             // replicated
+        ),
     generateTestNameLogitsProc);
 
 INSTANTIATE_TEST_SUITE_P(GptExecutorGuidedDecodingTest, GuidedDecodingParamsTest,
