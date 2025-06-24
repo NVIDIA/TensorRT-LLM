@@ -103,39 +103,29 @@ std::optional<std::vector<MmKey>> generateBlockHashExtraKeys(
     {
         auto const& startPos = (*(*multimodalPositions))[i];
         auto const& length = (*(*multimodalLengths))[i];
-        auto const& mmHashVector = (*(*multimodalHashes))[i]; // This is vector<int32> - your current format
+        auto const& mmHashVector = (*(*multimodalHashes))[i];
 
         std::array<uint8_t, 32> mmHashArray;
-        if (mmHashVector.size() == 8) // 256-bit hash = 8 * 32-bit integers
+        TLLM_CHECK_WITH_INFO(mmHashVector.size() == 8, "Multimodal hash vector has unexpected size: %zu (expected 8)", mmHashVector.size());
+        
+        // mmHashVector[j] comes from Python's int(hex_chunk, 16)
+        // where hex_chunk like "00010203" means 0x00 is MSB and 0x03 is LSB (big endian)
+        // The overall Blake3 output wants these bytes in order: 0x00, 0x01, 0x02, 0x03...
+        for (size_t j = 0; j < 8; ++j)
         {
-            // Assuming mmHashVector[j] comes from Python's int(hex_chunk, 16)
-            // where hex_chunk like "00010203" means 0x00 is MSB and 0x03 is LSB.
-            // And assuming the overall Blake3 output wants these bytes in order: 0x00, 0x01, 0x02, 0x03...
-            for (size_t j = 0; j < 8; ++j)
-            {
-                auto const& hashPart = mmHashVector[j]; // e.g., 0x00010203
-                // Extract bytes in Big-Endian order from hashPart and place them sequentially
-                // into mmHashArray to reconstruct the original Blake3 byte sequence.
-                mmHashArray[j * 4 + 0] = static_cast<uint8_t>((hashPart >> 24) & 0xFF); // Extract 0x00 (MSB of the int)
-                mmHashArray[j * 4 + 1] = static_cast<uint8_t>((hashPart >> 16) & 0xFF); // Extract 0x01
-                mmHashArray[j * 4 + 2] = static_cast<uint8_t>((hashPart >> 8) & 0xFF);  // Extract 0x02
-                mmHashArray[j * 4 + 3] = static_cast<uint8_t>(hashPart & 0xFF);         // Extract 0x03 (LSB of the int)
-            }
+            auto const& hashPart = mmHashVector[j]; // e.g., 0x00010203
+            // Extract bytes in Big-Endian order from hashPart and place them sequentially into mmHashArray
+            mmHashArray[j * 4 + 0] = static_cast<uint8_t>((hashPart >> 24) & 0xFF); // Extract 0x00 (MSB of the int)
+            mmHashArray[j * 4 + 1] = static_cast<uint8_t>((hashPart >> 16) & 0xFF); // Extract 0x01
+            mmHashArray[j * 4 + 2] = static_cast<uint8_t>((hashPart >> 8) & 0xFF);  // Extract 0x02
+            mmHashArray[j * 4 + 3] = static_cast<uint8_t>(hashPart & 0xFF);         // Extract 0x03 (LSB of the int)
         }
-        else
-        {
-            // TODO: maybe we should raise an error here
-            TLLM_LOG_WARNING("Multimodal hash vector has unexpected size: %zu (expected 8)", mmHashVector.size());
-            continue; // Skip this multimodal item
-        }
+       
 
         // Check if this multimodal content overlaps with the current block
         if (endTokenIdx > startPos && startTokenIdx < startPos + length)
         {
-            // Calculate the start offset of this multimodal content within the block
             SizeType32 mmStartInBlock = (startPos >= startTokenIdx) ? 0 : startTokenIdx - startPos;
-
-            // Add the multimodal hash array and its start offset in the block
             extraKeys.emplace_back(mmHashArray, mmStartInBlock);
         }
     }
@@ -194,7 +184,7 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
         seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
     }
 
-    // Add extra keys for multimodal data (similar to VLLM's approach)
+    // Add extra keys for multimodal data mixing in external mulitmodal item hash and token offset within this sequence block
     if (blockKey.extraKeys)
     {
         for (auto const& [mmHash, startOffset] : *blockKey.extraKeys)
