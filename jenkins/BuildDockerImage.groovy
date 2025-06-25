@@ -602,7 +602,7 @@ pipeline {
                         parameters: trtllm_utils.toBuildParameters(parameters),
                         propagate: false,
                     )
-                    status = handle.getBuildResult().toString()
+                    status = handle.result
 
                     if (status != "SUCCESS") {
                         error "Downstream job did not succeed"
