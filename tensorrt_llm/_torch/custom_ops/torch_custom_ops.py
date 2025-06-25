@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm._utils import get_sm_version
 
 from ..attention_backend.interface import AttentionInputType
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -604,6 +605,7 @@ def _(
 
 class W4A16GemmRunner(TunableRunner):
     _runner_dict = dict()
+    MAX_SUPPORTED_SM_VERSION = 90
 
     def __init__(self, activation_dtype: torch.dtype, quant_mode: int):
         instance_key = (activation_dtype, quant_mode)
@@ -625,6 +627,12 @@ class W4A16GemmRunner(TunableRunner):
                 tactic: int = -1,
                 do_preparation: bool = False,
                 **kwargs) -> torch.Tensor:
+
+        if get_sm_version() > self.MAX_SUPPORTED_SM_VERSION:
+            raise ValueError(
+                f"SM version {get_sm_version()} is not supported for W4A16 GEMM"
+            )
+
         activation, weights_packed, scales = inputs
 
         return self._w4a16_gemm_runner.run_gemm(

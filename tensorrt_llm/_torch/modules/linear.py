@@ -13,7 +13,6 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
 from tensorrt_llm.mapping import Mapping
@@ -788,9 +787,6 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
-
-        if get_sm_version() > 90:
-            raise ValueError("W4A16_AWQ is not supported on SM > 90")
 
         if module.pre_quant_scale is not None:
             pre_quant_scale = module.pre_quant_scale.repeat(input.shape[0], 1)
