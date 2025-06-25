@@ -335,9 +335,9 @@ def convert_weights(llm_venv,
         redrafter_draft_len_per_beam = kwargs.pop(
             "redrafter_draft_len_per_beam")
         convert_cmd = [
-            f"{example_root}/{script}", "--model_dir", model_path[0],
-            "--drafter_model_dir", model_path[1], "--output_dir", model_dir,
-            f"--dtype={data_type}", f"--tp_size={tp_size}",
+            f"{example_root}/{script}", "--base_model_checkpoint_dir",
+            model_path[0], "--drafter_model_dir", model_path[1], "--output_dir",
+            model_dir, f"--dtype={data_type}", f"--tp_size={tp_size}",
             f"--redrafter_num_beams={redrafter_num_beams}",
             f"--redrafter_draft_len_per_beam={redrafter_draft_len_per_beam}"
         ]
