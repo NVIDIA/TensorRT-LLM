@@ -96,6 +96,16 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
+        #Llama models with attention_dp enabled
+        {
+            'patterns': [
+                'llama_v3.1_8b_instruct_fp8', 'llama_v3.1_70b_instruct_fp8',
+                'llama_v3.3_70b_instruct_fp8'
+            ],
+            'config': {
+                'enable_attention_dp': True,
+            }
+        },
         # Llama Nemotron models with attention_dp disabled to prevent hangs
         {
             'patterns': [
