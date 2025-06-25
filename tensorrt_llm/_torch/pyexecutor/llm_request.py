@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import partial
 from typing import List, Optional, Union
 
 import torch
@@ -257,6 +258,23 @@ class LlmResponse:
         return self.error_msg is not None
 
 
+def create_response(
+        request: Union['LlmRequest',
+                       tensorrt_llm.bindings.internal.batch_manager.LlmRequest],
+        use_fast_logits=False,
+        mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
+    """ Create a response for a given request. """
+
+    result = request.create_result(use_fast_logits, mpi_world_rank)
+
+    if result is None:
+        return None
+    else:
+        return LlmResponse(request_id=request.py_request_id,
+                           result=LlmResult(result, request.py_result),
+                           client_id=request.py_client_id)
+
+
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     """LlmRequest wraps `bindings.internal.batch_manager.LlmRequest`
     but detour some features to Python implementation"""
@@ -375,11 +393,15 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             exclude_last_generation_logits=self.
             py_exclude_last_generation_logits)
 
-        # Note: This mimics the behavior of the original LlmRequest.
+        # Note: The below mimics the behavior of the original LlmRequest.
+
         # We need to ensure the child request behaves like the parent
         # LlmRequest by copying any additional Python-specific attributes that
         # might be needed for proper request handling and response generation.
         child_request.is_dummy = self.is_dummy
+
+        # Override create_response to return the child request
+        child_request.create_response = partial(create_response, child_request)
 
         return child_request
 
@@ -387,15 +409,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self,
             use_fast_logits=False,
             mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
-
-        result = super().create_result(use_fast_logits, mpi_world_rank)
-
-        if result is None:
-            return None
-        else:
-            return LlmResponse(request_id=self.py_request_id,
-                               result=LlmResult(result, self.py_result),
-                               client_id=self.py_client_id)
+        return create_response(self, use_fast_logits, mpi_world_rank)
 
     @property
     def is_dummy(self):
