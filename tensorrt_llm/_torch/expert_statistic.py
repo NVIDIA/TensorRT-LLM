@@ -92,4 +92,7 @@ class ExpertStatistic:
         counts = torch.bincount(token_selected_experts.flatten(),
                                 minlength=expert_count)
         key = f"{self.current_iter_id}_{self.current_layer}"
-        self._records[key] = counts.cpu()
+        if key not in self._records:
+            self._records[key] = counts.cpu()
+        else:
+            self._records[key] += counts.cpu()

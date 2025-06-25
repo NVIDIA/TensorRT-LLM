@@ -315,5 +315,6 @@ deepseek-ai/DeepSeek-R1:
 Qwen3/Qwen3-8B:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 30
+  - accuracy: 30
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 34.003

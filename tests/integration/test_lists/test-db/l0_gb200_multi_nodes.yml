@@ -1,0 +1,16 @@
+version: 0.0.1
+l0_gb200_multi_nodes:
+- condition:
+    ranges:
+      # 2 nodes with each node has 4 GPUs
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*gb200*'
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[latency]

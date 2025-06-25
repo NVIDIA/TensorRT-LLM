@@ -3,10 +3,8 @@ from typing import List
 import torch
 import torch.nn.functional as F
 
-from ...modules.fused_moe import MoE  # noqa: F401
 
-
-@torch.library.custom_op("moe::torch_moe", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_moe", mutates_args=())
 def torch_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -80,7 +78,7 @@ def torch_moe(
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("moe::torch_fused_moe", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_moe_fused", mutates_args=())
 def torch_fused_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -90,7 +88,6 @@ def torch_fused_moe(
 ) -> torch.Tensor:
     """
     A reference implementation of a fused MoE layer computation.
-
     Parameters:
         x (torch.Tensor): Input tensor of shape (B, H) or (B, S, H), where B is the batch size,
             S is the sequence length, and H is the hidden size.
@@ -102,7 +99,6 @@ def torch_fused_moe(
             containing the fused weights for w3 and w1 for each expert.
         w2_stacked_weight (torch.Tensor): A tensor of shape (NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
             containing the weights for w2 for each expert.
-
     Returns:
         torch.Tensor: Output tensor with the same shape as the input x.
     """
@@ -138,48 +134,6 @@ def torch_fused_moe(
 
 @torch_fused_moe.register_fake
 def torch_fused_moe(
-    x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
-    w3_w1_stacked_weight: torch.Tensor,
-    w2_stacked_weight: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-@torch.library.custom_op("moe::trtllm_fused_moe", mutates_args=())
-def trtllm_fused_moe(
-    x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
-    w3_w1_stacked_weight: torch.Tensor,
-    w2_stacked_weight: torch.Tensor,
-) -> torch.Tensor:
-    x_shape = x.shape
-    x = x.view(-1, x_shape[-1])
-
-    routing_weights = routing_weights.to(torch.float32)
-    selected_experts = selected_experts.to(torch.int32)
-    quant_scales = []
-
-    return torch.ops.trtllm.fused_moe(
-        x,
-        selected_experts,
-        routing_weights,
-        w3_w1_stacked_weight,
-        w2_stacked_weight,
-        x.dtype,
-        quant_scales,
-        tp_size=1,
-        tp_rank=0,
-        ep_size=1,
-        ep_rank=0,
-        enable_alltoall=False,
-    )[0].view(x_shape)
-
-
-@trtllm_fused_moe.register_fake
-def trtllm_fused_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
