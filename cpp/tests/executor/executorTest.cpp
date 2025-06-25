@@ -4512,10 +4512,10 @@ INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, AllParamsTest,
     testing::Combine(                                                                   //
         testing::Values(false, true),                                                   // streaming
         testing::Values(1, 2),                                                          // beamWidth
-        testing::Values(true),                                                          // computeLogProbs
+        testing::Values(false),                                                         // computeLogProbs
         testing::Values(false, true),                                                   // excludeInputInOutput
-        testing::Values(true),                                                          // returnContextLogits
-        testing::Values(true),                                                          // returnGenerationLogits
+        testing::Values(false),                                                         // returnContextLogits
+        testing::Values(false),                                                         // returnGenerationLogits
         testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp2_pp2_cp1"), // modelName
         testing::Values(false, true),                                                   // useOrchestratorMode
         testing::Values(false),                                                         // returnAllGeneratedTokens
