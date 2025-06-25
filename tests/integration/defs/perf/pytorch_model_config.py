@@ -89,6 +89,13 @@ def get_model_yaml_config(model_label: str,
                 'cuda_graph_batch_sizes': [1, 512, 1024, 2048]
             }
         },
+        # Deepseek default cases
+        {
+            'patterns': 'deepseek_r1',
+            'config': {
+                'enable_attention_dp': True,
+            }
+        },
         # Llama Nemotron models with attention_dp disabled to prevent hangs
         {
             'patterns': [
