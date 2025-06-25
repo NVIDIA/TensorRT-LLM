@@ -182,10 +182,11 @@ class HostMoeTensorSharer:
         offset = 0
         for name in self.names:
             for expert_id in range(self.expert_start, self.expert_end):
-                t = self.shared_tensors[(expert_id, name)]
+                t = self.shared_tensors[(expert_id, name)].contiguous().cpu()
                 data_size = t.numel() * t.element_size()
                 aligned_size = self.align_size(data_size)
-                shm.buf[offset:offset + data_size] = t.numpy().tobytes()
+                shm.buf[offset:offset + data_size] = t.flatten().view(
+                    torch.int8).numpy().tobytes()
                 dtype = t.dtype
                 tensor_shape = t.shape
                 elt_count = t.numel()
@@ -270,7 +271,8 @@ class SingleLayerMoeLoadBalancer:
             single_layer_load_balancer_impl: _tbr.SingleLayerMoeLoadBalancer,
             shared_mpi_comm: MPI.Comm,
             expert_count: int,
-            updates_enabled: bool = True):
+            updates_enabled: bool = True,
+            repeated_count=1):
         """
         Initialize a SingleLayerMoeLoadBalancer instance.
 
@@ -279,6 +281,7 @@ class SingleLayerMoeLoadBalancer:
             shared_mpi_comm: The MPI communicator for shared memory
             expert_count: total number of experts
             updates_enabled: whether to enable weight updates
+            repeated_count: the repeated count of current layer, used when forward is repeated more than once like MTP.
         """
         self.single_layer_load_balancer_impl = single_layer_load_balancer_impl
         self.single_layer_load_balancer_ptr = single_layer_load_balancer_impl.get_pointer(
@@ -306,6 +309,7 @@ class SingleLayerMoeLoadBalancer:
 
         self.cudagraph_stream = None
         self.cudagraph_event = None
+        self.repeated_count = repeated_count
 
         self.statistic_stream = None
         self.statistic_event = None
@@ -316,6 +320,9 @@ class SingleLayerMoeLoadBalancer:
     def get_load_expert_ids(self):
         assert self.updates_enabled, "should not call get_load_expert_ids when using statistic routing"
         return self.load_expert_ids
+
+    def get_repeat_count(self):
+        return self.repeated_count
 
     def is_static_routing(self):
         return not self.updates_enabled
@@ -675,6 +682,8 @@ class MoeLoadBalancer:
         self.enable_statistic = False
         self.enable_update_weights = False
 
+        self.next_layer_repeated_count = None
+
     def __del__(self):
         if not self.is_shutdown:
             self.shutdown()
@@ -696,6 +705,16 @@ class MoeLoadBalancer:
     def set_use_gpu_memcpy(self, use_gpu_memcpy: bool):
         self.load_balancer_impl.set_use_gpu_memcpy(use_gpu_memcpy)
 
+    def set_repeated_for_next_layer(self, repeated_count: int):
+        """
+        Set repeat count for next layer.
+
+        Args:
+            repeated_count: The repeat count for next layer
+        """
+        assert repeated_count > 0, "repeat count must be greater than 0"
+        self.next_layer_repeated_count = repeated_count
+
     def add_layer(self, expert_count: int, top_k: int,
                   slot_count_per_rank: int) -> SingleLayerMoeLoadBalancer:
         """
@@ -712,11 +731,16 @@ class MoeLoadBalancer:
         single_layer_load_balancer_impl = self.load_balancer_impl.add_layer(
             expert_count, top_k, slot_count_per_rank)
         updates_enabled = not self.is_static_routing()
+        repeat_count = 1
+        if self.next_layer_repeated_count is not None:
+            repeat_count = self.next_layer_repeated_count
+            self.next_layer_repeated_count = None
         single_layer_load_balancer = SingleLayerMoeLoadBalancer(
             single_layer_load_balancer_impl,
             self.shared_mpi_comm,
             expert_count,
-            updates_enabled=updates_enabled)
+            updates_enabled=updates_enabled,
+            repeated_count=repeat_count)
         single_layer_load_balancer.set_shared_memory_base_name(
             self.shared_memory_base_name)
         self.single_layer_load_balancers.append(single_layer_load_balancer)
@@ -932,6 +956,18 @@ def get_moe_load_balancer() -> Optional[MoeLoadBalancer]:
         return getattr(_current_moe_load_balancer, 'instance', None)
     except AttributeError:
         return None
+
+
+def moe_load_balancer_set_repeated_for_next_layer(repeat_count: int):
+    """
+    Set repeated count for next Single Layer created.
+
+    Args:
+        repeat_count: repeated count
+    """
+    load_balancer = get_moe_load_balancer()
+    if load_balancer is not None:
+        load_balancer.set_repeated_for_next_layer(repeat_count)
 
 
 def moe_load_balancer_add_single_layer(

@@ -4,7 +4,7 @@ import triton
 from .triton_kernels.rope import rope_fwd_flattened_kernel, rope_fwd_kernel
 
 
-@torch.library.custom_op("rope::apply_rope_with_input_pos", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_rope_with_input_pos", mutates_args=())
 def apply_rope_with_input_pos(
     x: torch.Tensor, freqs_cis: torch.Tensor, input_pos: torch.Tensor, layout: str
 ) -> torch.Tensor:
@@ -77,7 +77,7 @@ def apply_rope_with_input_pos_fake(x, freqs_cis, input_pos, layout):
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("rope::apply_rope_on_flattened_inputs", mutates_args=())
+@torch.library.custom_op("auto_deploy::triton_rope_on_flattened_inputs", mutates_args=())
 def apply_rope_on_flattened_inputs(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
