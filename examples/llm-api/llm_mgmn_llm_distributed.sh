@@ -8,7 +8,7 @@
 #SBATCH -e logs/llmapi-distributed.err
 #SBATCH -J llmapi-distributed-task
 
-### :session Slurm
+### :section Slurm
 ### :title Run LLM-API with pytorch backend on Slurm
 ### :order 0
 

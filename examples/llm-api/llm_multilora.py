@@ -1,4 +1,4 @@
-### :session Customization
+### :section Customization
 ### :title Generate text with multiple LoRA adapters
 ### :order 5
 from huggingface_hub import snapshot_download

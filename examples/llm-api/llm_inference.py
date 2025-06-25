@@ -1,6 +1,6 @@
-### :SESSION: Basics
-### :TITLE: Generate text
-### :ORDER: 0
+### :title Generate text
+### :order 0
+### :section Basics
 from tensorrt_llm import LLM, SamplingParams
 
 
