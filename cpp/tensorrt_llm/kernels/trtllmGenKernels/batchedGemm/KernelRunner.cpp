@@ -329,8 +329,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
     void const* a, void const* sfA, void const* b, void const* sfB, float const* ptrBias, float const* ptrAlpha,
-    float const* ptrBeta, void* c, void* outSfC, void* workspace, CUstream stream, int device,
-    std::optional<int32_t> configIndex)
+    float const* ptrBeta, void* c, void* outSfC, void* workspace, CUstream stream, int device, int32_t configIndex)
 {
     // Dispatch with block scaling factors and with static batching.
     run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, a, sfA, b, sfB,

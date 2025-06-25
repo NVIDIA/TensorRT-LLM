@@ -30,14 +30,13 @@ namespace btg = batchedGemm::trtllm::gen;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 
-at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, at::Tensor const& routing_bias,
+at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, std::optional<at::Tensor> const& routing_bias,
     at::Tensor const& hidden_states, at::Tensor const& hidden_states_scale, at::Tensor const& gemm1_weights,
     at::Tensor const& gemm1_weights_scale, at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale,
-    int64_t const num_experts, int64_t const top_k,
-    std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
-    int64_t const local_expert_offset, int64_t const local_num_experts,
-    std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
-    MoeRunnerType& moe_runner, int64_t moeConfigIndex)
+    int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const n_group,
+    std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
+    int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
+    int64_t const routing_method_type, MoeRunnerType& moe_runner, int64_t moeConfigIndex)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 100, "Only SM100 is supported by FP8 block scale MOE");
@@ -257,12 +256,13 @@ public:
         return mRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
     }
 
-    [[nodiscard]] at::Tensor run(at::Tensor const& routing_logits, at::Tensor const& routing_bias,
+    [[nodiscard]] at::Tensor run(at::Tensor const& routing_logits, std::optional<at::Tensor> const& routing_bias,
         at::Tensor const& hidden_states, at::Tensor const& hidden_states_scale, at::Tensor const& gemm1_weights,
         at::Tensor const& gemm1_weights_scale, at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale,
-        int64_t num_experts, int64_t top_k, int64_t n_group, int64_t topk_group, int64_t intermediate_size,
-        int64_t local_expert_offset, int64_t local_num_experts, double routed_scaling_factor,
-        int64_t routing_method_type, int64_t moeConfigIndex)
+        int64_t num_experts, int64_t top_k, std::optional<int64_t> const n_group,
+        std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
+        int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t routing_method_type,
+        int64_t moeConfigIndex)
     {
 
         // Autotuner has requested a default or 'fallback' config index
@@ -295,29 +295,8 @@ private:
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def(
-        "fp8_block_scale_moe_runner("
-        "Tensor routing_logits,"
-        "Tensor routing_bias,"
-        "Tensor hidden_states,"
-        "Tensor hidden_states_scale,"
-        "Tensor gemm1_weights,"
-        "Tensor gemm1_weights_scale,"
-        "Tensor gemm2_weights,"
-        "Tensor gemm2_weights_scale,"
-        "int num_experts,"
-        "int top_k,"
-        "int n_group,"
-        "int topk_group,"
-        "int intermediate_size,"
-        "int local_expert_offset,"
-        "int local_num_experts,"
-        "float routed_scaling_factor,"
-        "int tile_tokens_dim,"
-        "int routing_method_type) -> Tensor");
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
-{
-    m.impl("fp8_block_scale_moe_runner", &torch_ext::fp8_block_scale_moe_runner);
+    m.class_<torch_ext::FP8BlockScaleMoeRunner>("FP8BlockScaleMoERunner")
+        .def(torch::init<int64_t>())
+        .def("get_valid_configs", &torch_ext::FP8BlockScaleMoeRunner::getValidConfigs)
+        .def("run_moe", &torch_ext::FP8BlockScaleMoeRunner::run);
 }

@@ -89,7 +89,6 @@ public:
         void const* b, void const* sfB, void* c, void* outSfC, void* workspace, CUstream stream, int device,
         int32_t configIndex);
 
-
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
         void const* b, void const* sfB, float const* bias, float const* swiGluAlpha, float const* swiGluBeta, void* c,
         void* outSfC, void* workspace, CUstream stream, int device, int32_t configIndex);

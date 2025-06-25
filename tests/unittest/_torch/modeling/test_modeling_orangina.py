@@ -4,8 +4,7 @@ import shutil
 
 import pytest
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig
 
 configs = """
@@ -25,7 +24,7 @@ configs = """
     "num_attention_heads": 64,
     "num_key_value_heads": 8,
     "sliding_window": 128,
-    "initial_context_length": 131072,
+    "initial_context_length": 4096,
     "rope_theta": 150000,
     "rope_scaling_factor": 32.0,
     "rope_ntk_alpha": 1,
