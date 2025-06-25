@@ -30,6 +30,8 @@
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/stl/map.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/trampoline.h>
 #include <torch/extension.h>
 

@@ -28,6 +28,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/stl/tuple.h>
 #include <sstream>
 
 #include <optional>
@@ -73,13 +74,13 @@ void initRequestBindings(nanobind::module_& m)
             self.getFrequencyPenalty(), self.getLengthPenalty(), self.getEarlyStopping(), self.getNoRepeatNgramSize(),
             self.getNumReturnSequences(), self.getMinP(), self.getBeamWidthArray());
     };
-    auto samplingConfigSetstate = [](nb::tuple const& state)
+    auto samplingConfigSetstate = [](tle::SamplingConfig& samplingConfig, nb::tuple const& state)
     {
         if (state.size() != 19)
         {
             throw std::runtime_error("Invalid SamplingConfig state!");
         }
-        return tle::SamplingConfig(nb::cast<SizeType32>(state[0]),      // BeamWidth
+        new (&samplingConfig) tle::SamplingConfig(nb::cast<SizeType32>(state[0]),      // BeamWidth
             nb::cast<std::optional<SizeType32>>(state[1]),              // TopK
             nb::cast<std::optional<FloatType>>(state[2]),               // TopP
             nb::cast<std::optional<FloatType>>(state[3]),               // TopPMin
@@ -173,13 +174,13 @@ void initRequestBindings(nanobind::module_& m)
 
     auto additionalModelOutputGetstate
         = [](tle::AdditionalModelOutput const& self) { return nb::make_tuple(self.name, self.gatherContext); };
-    auto additionalModelOutputSetstate = [](nb::tuple const& state)
+    auto additionalModelOutputSetstate = [](tle::AdditionalModelOutput& additionalModelOutput, nb::tuple const& state)
     {
         if (state.size() != 2)
         {
             throw std::runtime_error("Invalid AdditionalModelOutput state!");
         }
-        return tle::AdditionalModelOutput(nb::cast<std::string>(state[0]), nb::cast<bool>(state[1]));
+        new (&additionalModelOutput) tle::AdditionalModelOutput(nb::cast<std::string>(state[0]), nb::cast<bool>(state[1]));
     };
     nb::class_<tle::AdditionalModelOutput>(m, "AdditionalModelOutput")
         .def(nb::init<std::string, bool>(), nb::arg("name"), nb::arg("gather_context") = false)
@@ -193,13 +194,13 @@ void initRequestBindings(nanobind::module_& m)
         return nb::make_tuple(self.returnLogProbs, self.returnContextLogits, self.returnGenerationLogits,
             self.excludeInputFromOutput, self.returnEncoderOutput, self.returnPerfMetrics, self.additionalModelOutputs);
     };
-    auto outputConfigSetstate = [](nb::tuple const& state)
+    auto outputConfigSetstate = [](tle::OutputConfig& outputConfig, nb::tuple const& state)
     {
         if (state.size() != 7)
         {
             throw std::runtime_error("Invalid OutputConfig state!");
         }
-        return tle::OutputConfig(nb::cast<bool>(state[0]), nb::cast<bool>(state[1]), nb::cast<bool>(state[2]),
+        new (&outputConfig) tle::OutputConfig(nb::cast<bool>(state[0]), nb::cast<bool>(state[1]), nb::cast<bool>(state[2]),
             nb::cast<bool>(state[3]), nb::cast<bool>(state[4]), nb::cast<bool>(state[5]),
             nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(state[6]));
     };
@@ -221,13 +222,13 @@ void initRequestBindings(nanobind::module_& m)
 
     auto externalDraftTokensConfigGetstate = [](tle::ExternalDraftTokensConfig const& self)
     { return nb::make_tuple(self.getTokens(), self.getLogits(), self.getAcceptanceThreshold()); };
-    auto externalDraftTokensConfigSetstate = [](nb::tuple const& state)
+    auto externalDraftTokensConfigSetstate = [](tle::ExternalDraftTokensConfig& externalDraftTokensConfig, nb::tuple const& state)
     {
         if (state.size() != 3)
         {
             throw std::runtime_error("Invalid ExternalDraftTokensConfig state!");
         }
-        return tle::ExternalDraftTokensConfig(nb::cast<VecTokens>(state[0]), nb::cast<std::optional<Tensor>>(state[1]),
+        new (&externalDraftTokensConfig) tle::ExternalDraftTokensConfig(nb::cast<VecTokens>(state[0]), nb::cast<std::optional<Tensor>>(state[1]),
             nb::cast<std::optional<FloatType>>(state[2]));
     };
     nb::class_<tle::ExternalDraftTokensConfig>(m, "ExternalDraftTokensConfig")
@@ -243,13 +244,13 @@ void initRequestBindings(nanobind::module_& m)
 
     auto promptTuningConfigGetstate = [](tle::PromptTuningConfig const& self)
     { return nb::make_tuple(self.getEmbeddingTable(), self.getInputTokenExtraIds()); };
-    auto promptTuningConfigSetstate = [](nb::tuple const& state)
+    auto promptTuningConfigSetstate = [](tle::PromptTuningConfig& promptTuningConfig, nb::tuple const& state)
     {
         if (state.size() != 2)
         {
             throw std::runtime_error("Invalid PromptTuningConfig state!");
         }
-        return tle::PromptTuningConfig(nb::cast<Tensor>(state[0]), nb::cast<std::optional<VecTokenExtraIds>>(state[1]));
+        new (&promptTuningConfig) tle::PromptTuningConfig(nb::cast<Tensor>(state[0]), nb::cast<std::optional<VecTokenExtraIds>>(state[1]));
     };
     nb::class_<tle::PromptTuningConfig>(m, "PromptTuningConfig")
         .def(nb::init<Tensor, std::optional<VecTokenExtraIds>>(), nb::arg("embedding_table"),
@@ -261,13 +262,13 @@ void initRequestBindings(nanobind::module_& m)
 
     auto loraConfigGetstate = [](tle::LoraConfig const& self)
     { return nb::make_tuple(self.getTaskId(), self.getWeights(), self.getConfig()); };
-    auto loraConfigSetstate = [](nb::tuple const& state)
+    auto loraConfigSetstate = [](tle::LoraConfig& loraConfig, nb::tuple const& state)
     {
         if (state.size() != 3)
         {
             throw std::runtime_error("Invalid LoraConfig state!");
         }
-        return tle::LoraConfig(nb::cast<IdType>(state[0]), nb::cast<std::optional<Tensor>>(state[1]),
+        new (&loraConfig) tle::LoraConfig(nb::cast<IdType>(state[0]), nb::cast<std::optional<Tensor>>(state[1]),
             nb::cast<std::optional<Tensor>>(state[2]));
     };
     nb::class_<tle::LoraConfig>(m, "LoraConfig")
@@ -281,13 +282,13 @@ void initRequestBindings(nanobind::module_& m)
 
     auto multimodalInputGetstate = [](tle::MultimodalInput const& self)
     { return nb::make_tuple(self.getMultimodalHashes(), self.getMultimodalPositions(), self.getMultimodalLengths()); };
-    auto multimodalInputSetstate = [](nb::tuple const& state)
+    auto multimodalInputSetstate = [](tle::MultimodalInput& multimodalInput, nb::tuple const& state)
     {
         if (state.size() != 3)
         {
             throw std::runtime_error("Invalid MultimodalInput state!");
         }
-        return tle::MultimodalInput(nb::cast<std::vector<std::vector<SizeType32>>>(state[0]),
+        new (&multimodalInput) tle::MultimodalInput(nb::cast<std::vector<std::vector<SizeType32>>>(state[0]),
             nb::cast<std::vector<SizeType32>>(state[1]), nb::cast<std::vector<SizeType32>>(state[2]));
     };
     nb::class_<tle::MultimodalInput>(m, "MultimodalInput")
@@ -301,13 +302,13 @@ void initRequestBindings(nanobind::module_& m)
 
     auto MropeConfigGetstate = [](tle::MropeConfig const& self)
     { return nb::make_tuple(self.getMRopeRotaryCosSin(), self.getMRopePositionDeltas()); };
-    auto MropeConfigSetstate = [](nb::tuple const& state)
+    auto MropeConfigSetstate = [](tle::MropeConfig& mropeConfig, nb::tuple const& state)
     {
         if (state.size() != 2)
         {
             throw std::runtime_error("Invalid MropeConfig state!");
         }
-        return tle::MropeConfig(nb::cast<tle::Tensor>(state[0]), nb::cast<SizeType32>(state[1]));
+        new (&mropeConfig) tle::MropeConfig(nb::cast<tle::Tensor>(state[0]), nb::cast<SizeType32>(state[1]));
     };
     nb::class_<tle::MropeConfig>(m, "MropeConfig")
         .def(nb::init<Tensor, SizeType32>(), nb::arg("mrope_rotary_cos_sin"), nb::arg("mrope_position_deltas"))
@@ -318,13 +319,13 @@ void initRequestBindings(nanobind::module_& m)
 
     auto lookaheadDecodingConfigGetstate = [](tle::LookaheadDecodingConfig const& self)
     { return nb::make_tuple(self.getWindowSize(), self.getNgramSize(), self.getVerificationSetSize()); };
-    auto lookaheadDecodingConfigSetstate = [](nb::tuple const& state)
+    auto lookaheadDecodingConfigSetstate = [](tle::LookaheadDecodingConfig& lookaheadDecodingConfig, nb::tuple const& state)
     {
         if (state.size() != 3)
         {
             throw std::runtime_error("Invalid LookaheadDecodingConfig state!");
         }
-        return tle::LookaheadDecodingConfig(
+        new (&lookaheadDecodingConfig) tle::LookaheadDecodingConfig(
             nb::cast<SizeType32>(state[0]), nb::cast<SizeType32>(state[1]), nb::cast<SizeType32>(state[2]));
     };
     nb::class_<tle::LookaheadDecodingConfig>(m, "LookaheadDecodingConfig")
@@ -347,13 +348,13 @@ void initRequestBindings(nanobind::module_& m)
 
     auto TokenRangeRetentionConfigGetstate = [](tle::KvCacheRetentionConfig::TokenRangeRetentionConfig const& self)
     { return nb::make_tuple(self.tokenStart, self.tokenEnd, self.priority, self.durationMs); };
-    auto TokenRangeRetentionConfigSetstate = [](nb::tuple const& state)
+    auto TokenRangeRetentionConfigSetstate = [](tle::KvCacheRetentionConfig::TokenRangeRetentionConfig& tokenRangeRetentionConfig, nb::tuple const& state)
     {
         if (state.size() != 4)
         {
             throw std::runtime_error("Invalid state!");
         }
-        return tle::KvCacheRetentionConfig::TokenRangeRetentionConfig(nb::cast<SizeType32>(state[0]),
+        new (&tokenRangeRetentionConfig) tle::KvCacheRetentionConfig::TokenRangeRetentionConfig(nb::cast<SizeType32>(state[0]),
             nb::cast<std::optional<SizeType32>>(state[1]), nb::cast<tle::RetentionPriority>(state[2]),
             nb::cast<std::optional<std::chrono::milliseconds>>(state[3]));
     };
@@ -362,13 +363,13 @@ void initRequestBindings(nanobind::module_& m)
         return nb::make_tuple(self.getTokenRangeRetentionConfigs(), self.getDecodeRetentionPriority(),
             self.getDecodeDurationMs(), self.getTransferMode(), self.getDirectory());
     };
-    auto kvCacheRetentionConfigSetstate = [](nb::tuple const& state)
+    auto kvCacheRetentionConfigSetstate = [](tle::KvCacheRetentionConfig& kvCacheRetentionConfig, nb::tuple const& state)
     {
         if (state.size() != 5)
         {
             throw std::runtime_error("Invalid state!");
         }
-        return tle::KvCacheRetentionConfig(
+        new (&kvCacheRetentionConfig) tle::KvCacheRetentionConfig(
             nb::cast<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>>(state[0]),
             nb::cast<tle::RetentionPriority>(state[1]), nb::cast<std::optional<std::chrono::milliseconds>>(state[2]),
             nb::cast<tle::KvCacheTransferMode>(state[3]), nb::cast<std::optional<std::string>>(state[4]));
@@ -419,7 +420,7 @@ void initRequestBindings(nanobind::module_& m)
         return nb::make_tuple(self.getFirstGenTokens(), self.getReqId(), nb::none(), self.getDraftTokens());
     };
 
-    auto ContextPhaseParamsSetState = [](nb::tuple const& state)
+    auto ContextPhaseParamsSetState = [](tle::ContextPhaseParams& contextPhaseParams, nb::tuple const& state)
     {
         if (state.size() != 4)
         {
@@ -429,12 +430,12 @@ void initRequestBindings(nanobind::module_& m)
         {
             auto opaque_state = nb::cast<nb::bytes>(state[2]);
             auto opaque_state_str_view = std::string_view(opaque_state.c_str(), opaque_state.size());
-            return std::make_unique<tle::ContextPhaseParams>(nb::cast<VecTokens>(state[0]),
+            new (&contextPhaseParams) tle::ContextPhaseParams(nb::cast<VecTokens>(state[0]),
                 nb::cast<tle::ContextPhaseParams::RequestIdType>(state[1]),
                 std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()),
                 nb::cast<std::optional<VecTokens>>(state[3]));
         }
-        return std::make_unique<tle::ContextPhaseParams>(nb::cast<VecTokens>(state[0]),
+        new (&contextPhaseParams) tle::ContextPhaseParams(nb::cast<VecTokens>(state[0]),
             nb::cast<tle::ContextPhaseParams::RequestIdType>(state[1]), nb::cast<std::optional<VecTokens>>(state[3]));
     };
 
@@ -483,13 +484,13 @@ void initRequestBindings(nanobind::module_& m)
         return nb::make_tuple(self.getEagleChoices(), self.isGreedySampling(), self.getPosteriorThreshold(),
             self.useDynamicTree(), self.getDynamicTreeMaxTopK());
     };
-    auto EagleDecodingConfigSetstate = [](nb::tuple const& state)
+    auto EagleDecodingConfigSetstate = [](tle::EagleConfig& eagleConfig, nb::tuple const& state)
     {
         if (state.size() != 5)
         {
             throw std::runtime_error("Invalid EagleConfig state!");
         }
-        return tle::EagleConfig(nb::cast<std::optional<tle::EagleChoices>>(state[0]), nb::cast<bool>(state[1]),
+        new (&eagleConfig) tle::EagleConfig(nb::cast<std::optional<tle::EagleChoices>>(state[0]), nb::cast<bool>(state[1]),
             nb::cast<std::optional<float>>(state[2]), nb::cast<bool>(state[3]),
             nb::cast<std::optional<SizeType32>>(state[4]));
     };
@@ -519,13 +520,13 @@ void initRequestBindings(nanobind::module_& m)
     auto guidedDecodingParamsGetstate
         = [](tle::GuidedDecodingParams const& self) { return nb::make_tuple(self.getGuideType(), self.getGuide()); };
 
-    auto guidedDecodingParamsSetstate = [](nb::tuple state)
+    auto guidedDecodingParamsSetstate = [](tle::GuidedDecodingParams& guidedDecodingParams, nb::tuple const& state)
     {
         if (state.size() != 2)
         {
             throw std::runtime_error("Invalid GuidedDecodingParams state!");
         }
-        return tle::GuidedDecodingParams(
+        new (&guidedDecodingParams) tle::GuidedDecodingParams(
             nb::cast<tle::GuidedDecodingParams::GuideType>(state[0]), nb::cast<std::optional<std::string>>(state[1]));
     };
 
@@ -550,13 +551,13 @@ void initRequestBindings(nanobind::module_& m)
             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
             self.getGuidedDecodingParams());
     };
-    auto requestSetstate = [](nb::tuple const& state)
+    auto requestSetstate = [](tle::Request& request, nb::tuple const& state)
     {
         if (state.size() != 33)
         {
             throw std::runtime_error("Invalid Request state!");
         }
-        return std::make_unique<tle::Request>(nb::cast<VecTokens>(state[0]), nb::cast<SizeType32>(state[1]),
+        new (&request) tle::Request(nb::cast<VecTokens>(state[0]), nb::cast<SizeType32>(state[1]),
             nb::cast<bool>(state[2]), nb::cast<tle::SamplingConfig>(state[3]), nb::cast<tle::OutputConfig>(state[4]),
             nb::cast<std::optional<SizeType32>>(state[5]), nb::cast<std::optional<SizeType32>>(state[6]),
             nb::cast<std::optional<std::vector<SizeType32>>>(state[7]),
@@ -820,13 +821,13 @@ void initRequestBindings(nanobind::module_& m)
         .def_rw("name", &tle::AdditionalOutput::name)
         .def_rw("output", &tle::AdditionalOutput::output);
 
-    auto resultSetstate = [](nb::tuple const& state)
+    auto resultSetstate = [](tle::Result& result, nb::tuple const& state)
     {
         if (state.size() != 13)
         {
             throw std::runtime_error("Invalid Request state!");
         }
-        tle::Result result;
+        new (&result) tle::Result();
         result.isFinal = nb::cast<bool>(state[0]);
         result.outputTokenIds = nb::cast<std::vector<VecTokens>>(state[1]);
         result.cumLogProbs = nb::cast<std::optional<std::vector<float>>>(state[2]);
@@ -881,13 +882,13 @@ void initRequestBindings(nanobind::module_& m)
     auto responseGetstate = [](tle::Response const& self)
     { return nb::make_tuple(self.getRequestId(), self.getResult(), self.getClientId()); };
 
-    auto responseSetstate = [](nb::tuple const& state)
+    auto responseSetstate = [](tle::Response& response, nb::tuple const& state)
     {
         if (state.size() != 3)
         {
             throw std::runtime_error("Invalid Request state!");
         }
-        return std::make_unique<tle::Response>(
+        new (&response) tle::Response(
             nb::cast<SizeType32>(state[0]), nb::cast<tle::Result>(state[1]), nb::cast<SizeType32>(state[2]));
     };
 
