@@ -215,11 +215,12 @@ class DemoEngine(ADEngine):
     def _sample(
         cls, logits: torch.Tensor, sampling_params: SamplingParams
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        probs = cls._logits_to_probs(
-            logits, sampling_params.temperature, sampling_params.top_k
-        )  # [*logits.shape]
-        # idx_next shape is [*logits.shape[:-1]]
-        idx_next = cls._multinomial_sample_one_no_sync(probs)
+        from tensorrt_llm._torch.pyexecutor.sampler import top_k_sampling_batch
+
+        logits_shape = logits.shape
+        logits = logits.view(-1, logits_shape[-1])  # top_k_sampling_batch expects 2D logits
+        idx_next, probs = top_k_sampling_batch(logits, sampling_params.top_k)
+        idx_next = idx_next.view(logits_shape[:-1])
         return idx_next, probs
 
     def _decode_tokens(
