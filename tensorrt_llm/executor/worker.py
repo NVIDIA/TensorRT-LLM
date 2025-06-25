@@ -60,7 +60,6 @@ class GenerationExecutorWorker(GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
         hf_model_dir: Optional[Path] = None,
         llm_args: Optional[TorchLlmArgs] = None,
     ) -> None:
@@ -167,7 +166,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 create_executor = create_py_executor
                 args["lora_config"] = lora_config
                 args[
-                    "garbage_collection_gen0_threshold"] = garbage_collection_gen0_threshold
+                    "garbage_collection_gen0_threshold"] = llm_args.garbage_collection_gen0_threshold
             elif executor_config.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor

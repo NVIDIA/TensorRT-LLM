@@ -21,6 +21,7 @@ from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..disaggregated_params import DisaggregatedParams
+from ..llmapi import TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
@@ -350,7 +351,8 @@ class GenerationExecutor(ABC):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
+        hf_model_dir: Optional[Path] = None,
+        llm_args: Optional[TorchLlmArgs] = None,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import GenerationExecutorProxy
@@ -377,6 +379,8 @@ class GenerationExecutor(ABC):
             "engine": engine,
             "executor_config": executor_config,
             "batched_logits_processor": batched_logits_processor,
+            "hf_model_dir": hf_model_dir,
+            "llm_args": llm_args,
         }
 
         if lora_config:
@@ -394,9 +398,7 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-                is_llm_executor=is_llm_executor,
-                garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold)
+                is_llm_executor=is_llm_executor)
 
         # WAR: For the performance of gathering logits, we use single process worker
         # for TP1 to avoid the large overhead of IPC.
@@ -407,9 +409,7 @@ class GenerationExecutor(ABC):
                 "Using single process worker for TP1, this may hurt streaming generation performance."
             )
             return GenerationExecutorWorker(**worker_kwargs,
-                                            is_llm_executor=is_llm_executor,
-                                            garbage_collection_gen0_threshold=
-                                            garbage_collection_gen0_threshold)
+                                            is_llm_executor=is_llm_executor)
 
         # For single-gpu case:
         # Partition the workload to multiple process for streaming performance.
