@@ -76,6 +76,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
 
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
     TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
+    TORCH_CHECK(num_experts <= 256, "num_experts must be less than or equal to 256");
 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoERunnerArgs args;
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
@@ -123,7 +124,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
         {args.num_tokens, args.top_k}, routing_bias_dtype, routing_logits.device(), std::nullopt);
     at::Tensor expert_indexes = at::detail::empty_cuda(
         {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
-    at::Tensor expert_count_histogram = at::detail::empty_cuda({((num_experts * 2 + 255) / 256) * 256},
+    at::Tensor expert_count_histogram = at::detail::empty_cuda({2 * 256},
         at::ScalarType::Int, // 256 is the max number of threads per block and max number of experts
         routing_logits.device(), std::nullopt);
 
