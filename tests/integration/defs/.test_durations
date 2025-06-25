@@ -12,7 +12,6 @@
    "test_unittests.py::test_unittests_v2[unittest/trt/model/test_gpt.py -k \"other\"]": 125.12117889150977,
    "test_unittests.py::test_unittests_v2[unittest/trt/model/test_gpt.py -k \"partition1\"]": 265.11671224981546,
    "examples/test_llm_api_with_mpi.py::test_llm_api_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]": 64.8964971601963,
-   "test_e2e.py::test_llmapi_example_customize": 72.42234786972404,
    "test_e2e.py::test_llmapi_example_guided_decoding": 73.23708964884281,
    "test_e2e.py::test_llmapi_example_inference": 66.82718145102262,
    "test_e2e.py::test_llmapi_example_inference_async": 65.93082024902105,
