@@ -377,7 +377,7 @@ if(BUILD_PYT)
 print(os.path.dirname(torch.__file__),end='');"
     RESULT_VARIABLE _PYTHON_SUCCESS
     OUTPUT_VARIABLE TORCH_DIR)
-  if(NOT _PYTHON_SUCCESS MATCHES 0)
+  if(NOT _PYTHON_SUCCESS EQUAL 0)
     message(FATAL_ERROR "Torch config Error.")
   endif()
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
