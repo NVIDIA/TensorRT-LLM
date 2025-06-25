@@ -1,9 +1,7 @@
 import pytest
 
 # isort: off
-from .test_llm import (global_kvcache_config,
-                       tinyllama_guided_decoding_test_harness,
-                       tinyllama_logits_processor_test_harness)
+from .test_llm import tinyllama_logits_processor_test_harness
 from tensorrt_llm.llmapi import KvCacheConfig
 from .test_llm_pytorch import (llama_v2_13b_lora_test_harness,
                                llama_7b_multi_lora_test_harness)
@@ -11,16 +9,6 @@ from .test_llm_pytorch import (llama_v2_13b_lora_test_harness,
 # isort: on
 
 global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
-
-
-@pytest.mark.gpu4
-def test_tinyllama_guided_decoding_tp2pp2():
-    pytest.skip(reason="https://nvbugs/5244006")
-    tinyllama_guided_decoding_test_harness(
-        tensor_parallel_size=2,
-        pipeline_parallel_size=2,
-        kv_cache_config=global_kvcache_config,
-        backend='pytorch')
 
 
 @pytest.mark.gpu4

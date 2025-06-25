@@ -235,7 +235,7 @@ Here is an example of how you can build an LLM object with AutoDeploy integratio
 <summary>Click to expand the example</summary>
 
 ```
-from tensorrt_llm import LLM
+from tensorrt_llm import LLM, TorchCompileConfig
 
 
 # Construct the LLM high-level interface object with autodeploy as backend
@@ -244,7 +244,7 @@ llm = LLM(
     backend="_autodeploy",
     tensor_parallel_size=<NUM_WORLD_RANK>,
     use_cuda_graph=True, # set True if using "torch-opt" as compile backend
-    torch_compile_enabled=True, # set True if using "torch-opt" as compile backend
+    torch_compile_config=TorchCompileConfig(), # set this if using "torch-opt" as compile backend
     model_kwargs={"use_cache": False}, # AutoDeploy uses its own cache implementation
     attn_backend="TritonWithFlattenedInputs", # choose between "TritonWithFlattenedInputs" and "FlashInfer"
     attn_page_size=64, # page size for attention (tokens_per_block, should be == max_seq_len for triton)

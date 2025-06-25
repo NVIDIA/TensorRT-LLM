@@ -21,13 +21,12 @@ from ..speculative import get_spec_decoder
 from .config_utils import is_mla, is_nemotron_hybrid
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
-from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
-                           PyTorchModelEngine)
+from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
-                               PeftCacheManager, ResourceManager)
-from .sampler import (EarlyStopSampler, TorchSampler, TorchStarAttentionSampler,
-                      TRTLLMSampler)
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
+from .sampler import EarlyStopSampler, TorchSampler, TRTLLMSampler
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
@@ -152,7 +151,13 @@ class KvCacheCreator:
         # estimate_max_kv_cache_tokens submits self._dummy_reqs
         num_cache_blocks = 0
         num_extra_tokens_per_seq = 1  # account for generated tokens
+        pytorch_backend_config = executor_config.pytorch_backend_config
         spec_cfg = executor_config.speculative_config
+        if not pytorch_backend_config.disable_overlap_scheduler:
+            num_extra_tokens_per_seq = num_extra_tokens_per_seq + 1
+            if spec_cfg is not None:
+                num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
+
         if spec_cfg is not None:
             num_extra_tokens_per_seq += spec_cfg.max_draft_tokens
             num_extra_tokens_per_seq += spec_cfg.num_extra_kv_tokens
@@ -245,7 +250,7 @@ class KvCacheCreator:
             f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
         )
         kv_stats = py_executor.resource_manager.resource_managers.get(
-            "kv_cache_manager").get_kv_cache_stats()
+            ResourceManagerType.KV_CACHE_MANAGER).get_kv_cache_stats()
 
         kv_cache_max_tokens = self._cal_max_tokens(
             peak_memory, total_gpu_memory, fraction,
@@ -262,7 +267,7 @@ class KvCacheCreator:
             self, model_engine: PyTorchModelEngine) -> KVCacheManager:
         executor_config = self._executor_config
         mapping = self._mapping
-        assert executor_config.pytorch_backend_config.use_kv_cache, "Only construct KV cache when it is needed."
+        assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
 
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
@@ -349,7 +354,7 @@ class KvCacheCreator:
                 spec_config=spec_config,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
-        if model_engine.kv_cache_manager_key == KV_CACHE_MANAGER_KEY:
+        if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
             executor_config.max_seq_len = kv_cache_manager.max_seq_len
 
         return kv_cache_manager
@@ -360,17 +365,19 @@ class KvCacheCreator:
         draft_kv_cache_manager = self._create_kv_cache_manager(
             self._draft_model_engine
         ) if self._draft_model_engine is not None else None
-        resources[KV_CACHE_MANAGER_KEY] = kv_cache_manager
-        resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
+        resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
+        resources[
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
 
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model and draft model (if applicable)."""
-        resources[KV_CACHE_MANAGER_KEY].shutdown()
-        del resources[KV_CACHE_MANAGER_KEY]
-        draft_kv_cache_manager = resources[DRAFT_KV_CACHE_MANAGER_KEY]
+        resources[ResourceManagerType.KV_CACHE_MANAGER].shutdown()
+        del resources[ResourceManagerType.KV_CACHE_MANAGER]
+        draft_kv_cache_manager = resources[
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
         if draft_kv_cache_manager:
             draft_kv_cache_manager.shutdown()
-        del resources[DRAFT_KV_CACHE_MANAGER_KEY]
+        del resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
 
 
 def create_py_executor_instance(
@@ -384,8 +391,9 @@ def create_py_executor_instance(
         draft_model_engine,
         start_worker,
         sampler,
-        lora_config: Optional[LoraConfig] = None) -> PyExecutor:
-    kv_cache_manager = resources.get(KV_CACHE_MANAGER_KEY, None)
+        lora_config: Optional[LoraConfig] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
+    kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
     spec_config = model_engine.spec_config
     if mapping.is_last_pp_rank(
@@ -398,7 +406,7 @@ def create_py_executor_instance(
                 "Guided decoding is not supported with overlap scheduler.")
 
     logger.info(
-        f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"
+        f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}, max_batch_size={executor_config.max_batch_size}"
     )
 
     for key, value in pytorch_backend_config.extra_resource_managers.items():
@@ -462,29 +470,29 @@ def create_py_executor_instance(
             model_config=model_binding_config,
             world_config=world_config,
         )
-        resources["peft_cache_manager"] = peft_cache_manager
+        resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules)
 
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
 
-    resources["seq_slot_manager"] = SeqSlotManager(max_num_sequences)
+    resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
+        max_num_sequences)
 
     resource_manager = ResourceManager(resources)
 
     # Make sure the kv cache manager is always invoked last as it could
     # depend on the results of other resource managers.
     if kv_cache_manager is not None:
-        resource_manager.resource_managers.move_to_end("kv_cache_manager",
-                                                       last=True)
+        resource_manager.resource_managers.move_to_end(
+            ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     capacity_scheduler = BindCapacityScheduler(
         max_num_sequences,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,
-        two_step_lookahead=mapping.has_pp()
-        or not pytorch_backend_config.disable_overlap_scheduler)
+        two_step_lookahead=mapping.has_pp())
     mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
                                            executor_config.max_num_tokens,
                                            ctx_chunk_config)
@@ -497,46 +505,62 @@ def create_py_executor_instance(
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, kv_cache_manager, attention_type, cache_transceiver_config)
 
-    return PyExecutor(resource_manager,
-                      scheduler,
-                      model_engine=model_engine,
-                      sampler=sampler,
-                      dist=dist,
-                      disable_overlap_scheduler=pytorch_backend_config.
-                      disable_overlap_scheduler,
-                      max_batch_size=executor_config.max_batch_size,
-                      max_draft_tokens=spec_config.max_draft_tokens
-                      if spec_config is not None else 0,
-                      kv_cache_transceiver=kv_cache_transceiver,
-                      draft_model_engine=draft_model_engine,
-                      start_worker=start_worker)
+    return PyExecutor(
+        resource_manager,
+        scheduler,
+        model_engine=model_engine,
+        sampler=sampler,
+        dist=dist,
+        max_num_sequences=max_num_sequences,
+        disable_overlap_scheduler=pytorch_backend_config.
+        disable_overlap_scheduler,
+        max_batch_size=executor_config.max_batch_size,
+        max_draft_tokens=spec_config.max_draft_tokens
+        if spec_config is not None else 0,
+        kv_cache_transceiver=kv_cache_transceiver,
+        draft_model_engine=draft_model_engine,
+        start_worker=start_worker,
+        garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
 
 
-def instantiate_sampler(model_engine: PyTorchModelEngine,
+def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
+                              *, max_seq_len: int, mixed_sampler: bool):
+    max_num_sequences = executor_config.max_batch_size * mapping.pp_size
+    max_draft_tokens = (0 if executor_config.speculative_config is None else
+                        executor_config.speculative_config.max_draft_tokens)
+    return TorchSampler.Args(
+        max_seq_len=max_seq_len,
+        max_draft_tokens=max_draft_tokens,
+        max_num_sequences=max_num_sequences,
+        max_beam_width=executor_config.max_beam_width,
+        mixed_sampler=mixed_sampler,
+    )
+
+
+def instantiate_sampler(engine: PyTorchModelEngine,
                         executor_config: ExecutorConfig,
                         pytorch_backend_config: PyTorchConfig,
                         mapping: Mapping):
+    sampler_args = create_torch_sampler_args(
+        executor_config,
+        mapping,
+        max_seq_len=engine.max_seq_len,
+        mixed_sampler=pytorch_backend_config.mixed_sampler)
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
-        sampler = TorchStarAttentionSampler(
-            max_seq_len=model_engine.max_seq_len)
-    elif model_engine.spec_config is not None and model_engine.spec_config.spec_dec_mode.has_spec_decoder(
+        return TorchSampler(sampler_args)
+    if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
-        sampler = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
-                                   spec_config=model_engine.spec_config)
-    elif pytorch_backend_config.enable_trtllm_sampler:
+        return get_spec_decoder(sampler_args, engine.spec_config)
+    if pytorch_backend_config.enable_trtllm_sampler:
         decoding_mode = get_decoding_mode(executor_config)
-        sampler = TRTLLMSampler(
-            executor_config, model_engine.model, model_engine.dtype, mapping,
-            decoding_mode, pytorch_backend_config.disable_overlap_scheduler)
-    elif not model_engine.model.model_config.is_generation:
+        return TRTLLMSampler(executor_config, engine.model, engine.dtype,
+                             mapping, decoding_mode,
+                             pytorch_backend_config.disable_overlap_scheduler)
+    if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
-        sampler = EarlyStopSampler()
-    else:
-        sampler = TorchSampler(
-            max_seq_len=model_engine.max_seq_len,
-            mixed_sampler=pytorch_backend_config.mixed_sampler)
-    return sampler
+        return EarlyStopSampler()
+    return TorchSampler(sampler_args)
 
 
 def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:

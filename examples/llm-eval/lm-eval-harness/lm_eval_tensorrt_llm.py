@@ -32,12 +32,12 @@ from packaging.version import parse
 from tqdm import tqdm
 
 import tensorrt_llm
-from tensorrt_llm._torch import LLM as TORCH_LLM
+from tensorrt_llm import LLM as TORCH_LLM
+from tensorrt_llm._tensorrt_engine import LLM as TRT_LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.bindings.executor import DecodingConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
 from tensorrt_llm.llmapi import RequestOutput, SamplingParams
-from tensorrt_llm.llmapi.llm import LLM as TRT_LLM
 
 logger = logging.getLogger(__name__)
 

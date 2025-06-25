@@ -40,6 +40,7 @@
 #include "tensorrt_llm/batch_manager/promptTuningBuffers.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
+#include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/batch_manager/transformerBuffers.h"
 #include "tensorrt_llm/batch_manager/updateDecoderBuffers.h"
 #include "tensorrt_llm/batch_manager/utils/debugUtils.h"
@@ -79,74 +80,79 @@
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 namespace tk = tensorrt_llm::kernels;
-namespace texe = tensorrt_llm::executor;
 
 namespace tensorrt_llm::batch_manager
 {
 
-bool TrtGptModelInflightBatching::optionalParamsAreValid(
-    ModelConfig const& modelConfig, TrtGptModelOptionalParams const& optionalParams)
+bool TrtGptModelInflightBatching::executorConfigIsValid(
+    ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig)
 {
-    // Make sure logic in this function matches fixOptionalParams
-    if (optionalParams.kvCacheConfig.enableBlockReuse)
+    // Make sure logic in this function matches fixExecutorConfig
+    if (executorConfig.getKvCacheConfig().getEnableBlockReuse())
     {
         if (!modelConfig.getPagedContextFMHA())
         {
             return false;
         }
-    }
-    // Context logits cannot be returned for reused tokens, so disable reuse
-    if (modelConfig.computeContextLogits())
-    {
-        return false;
+        // Context logits cannot be returned for reused tokens, so disable reuse
+        if (modelConfig.computeContextLogits())
+        {
+            return false;
+        }
     }
     return true;
 }
 
-TrtGptModelOptionalParams TrtGptModelInflightBatching::fixOptionalParams(
-    ModelConfig const& modelConfig, TrtGptModelOptionalParams const& optionalParams)
+executor::ExecutorConfig TrtGptModelInflightBatching::fixExecutorConfig(
+    ModelConfig const& modelConfig, executor::ExecutorConfig const& executorConfig)
 {
-    // Make sure logic in this function matches optionalParamsAreValid
-    auto fixedOptionalParams = TrtGptModelOptionalParams(optionalParams);
-    if (fixedOptionalParams.kvCacheConfig.enableBlockReuse)
+    // Make sure logic in this function matches executorConfigIsValid
+    if (executorConfig.getKvCacheConfig().getEnableBlockReuse())
     {
+        auto kvCacheConfig = executorConfig.getKvCacheConfig();
+
         if (!modelConfig.getPagedContextFMHA())
         {
             TLLM_LOG_WARNING(
-                "Fix optionalParams : KV cache reuse disabled because model was not built with paged context FMHA "
+                "Fixing executorConfig: KV cache reuse disabled because model was not built with paged context FMHA "
                 "support");
-            fixedOptionalParams.kvCacheConfig.enableBlockReuse = false;
+            kvCacheConfig.setEnableBlockReuse(false);
         }
+        if (modelConfig.computeContextLogits())
+        {
+            TLLM_LOG_WARNING(
+                "Fixing executorConfig: KV cache reuse disabled because model was built to return context logits");
+            kvCacheConfig.setEnableBlockReuse(false);
+        }
+
+        auto fixedExecutorConfig = executor::ExecutorConfig(executorConfig);
+        fixedExecutorConfig.setKvCacheConfig(kvCacheConfig);
+        return fixedExecutorConfig;
     }
-    if (modelConfig.computeContextLogits())
-    {
-        TLLM_LOG_WARNING(
-            "Fix optionalParams : KV cache reuse disabled because model was built to return context logits");
-        fixedOptionalParams.kvCacheConfig.enableBlockReuse = false;
-    }
-    return fixedOptionalParams;
+    return executorConfig;
 }
 
 TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer1::ILogger> logger,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig, RawEngine const& rawEngine, bool ctxGenFusion,
-    TrtGptModelOptionalParams const& optionalParams)
-    : TrtGptModel(modelConfig, worldConfig, optionalParams)
+    executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode)
+    : TrtGptModel(modelConfig, worldConfig, executorConfig)
     , mModelConfig(modelConfig)
     , mWorldConfig(worldConfig)
     , mDevice{runtime::utils::initDevice(worldConfig)}
-    , mDecodingConfig{optionalParams.decodingConfig}
-    , mExtendedRuntimePerfKnobConfig{optionalParams.extendedRuntimePerfKnobConfig}
-    , mDebugConfig{optionalParams.debugConfig}
-    , mAdditionalModelOutputs{worldConfig.isLastPipelineParallelRank() ? optionalParams.additionalModelOutputs
+    , mDecodingConfig{executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{})}
+    , mExtendedRuntimePerfKnobConfig{executorConfig.getExtendedRuntimePerfKnobConfig()}
+    , mDebugConfig{executorConfig.getDebugConfig()}
+    , mAdditionalModelOutputs{worldConfig.isLastPipelineParallelRank() ? executorConfig.getAdditionalModelOutputs()
                                                                        : std::nullopt}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
-    , mRuntime{std::make_unique<TllmRuntime>(rawEngine, mLogger.get(), optionalParams.useGpuDirectStorage,
-          optionalParams.gpuWeightsPercent, modelConfig.useShapeInference())}
+    , mRuntime{std::make_unique<TllmRuntime>(rawEngine, mLogger.get(), executorConfig.getUseGpuDirectStorage(),
+          executorConfig.getGpuWeightsPercent(), modelConfig.useShapeInference())}
     , mCopyBufferManager{std::make_shared<CudaStream>()}
     , mCtxGenFusion(ctxGenFusion)
     , mOperatingBeamWidth{getMaxBeamWidth()}
-    , mGatherGenerationLogits{optionalParams.gatherGenerationLogits}
-    , mPromptTableOffloading{optionalParams.promptTableOffloading}
+    , mGatherGenerationLogits{executorConfig.getGatherGenerationLogits()}
+    , mPromptTableOffloading{executorConfig.getPromptTableOffloading()}
+    , mIsLeaderInOrchMode{isLeaderInOrchMode}
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -175,7 +181,9 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     mNumBuffers = (mCtxGenFusion ? 1 : 2) * mNumMicroBatches;
 
-    if (!optionalParams.kvCacheConfig.onboardBlocks)
+    auto const kvCacheConfig = KvCacheConfig(executorConfig.getKvCacheConfig());
+
+    if (!kvCacheConfig.onboardBlocks)
     {
         TLLM_CHECK_WITH_INFO(
             !mModelConfig.getPagedContextFMHA(), "KV cache blocks need to be onboarded if context FMHA.");
@@ -183,7 +191,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     if (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
     {
-        TLLM_CHECK_WITH_INFO(optionalParams.kvCacheConfig.enableBlockReuse,
+        TLLM_CHECK_WITH_INFO(kvCacheConfig.enableBlockReuse,
             "KV cache block reuse must be enabled for speculative decoding target model");
     }
 
@@ -203,9 +211,9 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     setupSpeculativeDecodingModule(mDecodingConfig);
 
-    if (mWorldConfig.isLastPipelineParallelRank() && optionalParams.guidedDecodingConfig)
+    if (mWorldConfig.isLastPipelineParallelRank() && executorConfig.getGuidedDecodingConfig())
     {
-        mGuidedDecoder = std::make_unique<GuidedDecoder>(optionalParams.guidedDecodingConfig.value(),
+        mGuidedDecoder = std::make_unique<GuidedDecoder>(executorConfig.getGuidedDecodingConfig().value(),
             getMaxNumSequences(), mModelConfig.getVocabSizePadded(mWorldConfig.getSize()),
             mModelConfig.getLogitsDtype(), mRuntime->getBufferManager());
     }
@@ -241,8 +249,10 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     if (mModelConfig.useLoraPlugin())
     {
+        auto const peftCacheManagerConfig
+            = PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig()));
         mPeftCacheManager = std::make_shared<PeftCacheManager>(
-            optionalParams.peftCacheManagerConfig, mModelConfig, mWorldConfig, mRuntime->getBufferManager());
+            peftCacheManagerConfig, mModelConfig, mWorldConfig, mRuntime->getBufferManager());
     }
     else
     {
@@ -256,53 +266,38 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     if (mModelConfig.isTransformerBased() && modelConfig.isKVCacheEnabled())
     {
         auto cacheTransceiverConfig
-            = optionalParams.cacheTransceiverConfig.value_or(executor::CacheTransceiverConfig());
-        auto const cacheSizePerToken
-            = kv_cache_manager::BaseKVCacheManager::calculateCacheSizePerToken(modelConfig, worldConfig, false);
-        //  TODO: cacheType
-        auto cacheTransPreAllocaSize = kv_cache_manager::CacheTransBufferManager::preAllocBufferSize(
-            cacheTransceiverConfig.getMaxNumTokens(), cacheSizePerToken);
-        auto const [blocksInPrimaryPool, blocksInSecondaryPool]
-            = BaseKVCacheManager::calculateMaxNumBlocks(optionalParams.kvCacheConfig, mModelConfig.getKvDataType(),
-                mModelConfig, mWorldConfig, mRuntime->getBufferManager(), 2, cacheTransPreAllocaSize);
-        TLLM_LOG_INFO("before Create KVCacheManager cacheTransPreAllocaSize:%ld", cacheTransPreAllocaSize);
+            = executorConfig.getCacheTransceiverConfig().value_or(executor::CacheTransceiverConfig());
+        auto cacheTransPreAllocaSize
+            = kv_cache_manager::CacheTransBufferManager::preAllocBufferSize(cacheTransceiverConfig.getMaxNumTokens());
+
+        auto const [freePrimaryMemBytes, freeSecondaryMemBytes]
+            = BaseKVCacheManager::calculateFreeMemBytes(mRuntime->getBufferManager(), kvCacheConfig);
+
         if (mModelConfig.useCrossAttention())
         {
-            TLLM_CHECK_WITH_INFO(optionalParams.kvCacheConfig.crossKvCacheFraction.has_value(),
+            TLLM_CHECK_WITH_INFO(kvCacheConfig.crossKvCacheFraction.has_value(),
                 "Must set crossKvCacheFraction for encoder-decoder model");
-            auto const crossKvCacheFraction = optionalParams.kvCacheConfig.crossKvCacheFraction.value();
-            auto selfCacheSizePerToken
-                = kv_cache_manager::KVCacheManager::calculateCacheSizePerToken(mModelConfig, mWorldConfig, false);
-            auto crossCacheSizePerToken
-                = kv_cache_manager::KVCacheManager::calculateCacheSizePerToken(mModelConfig, mWorldConfig, true);
-            mKvCacheManager = createKvCacheManager(optionalParams.kvCacheConfig,
-                blocksInPrimaryPool * (1.0f - crossKvCacheFraction),
-                blocksInSecondaryPool * (1.0f - crossKvCacheFraction), KvCacheType::kSELF);
-            auto const numCrossBlocks
-                = (float) blocksInPrimaryPool * crossKvCacheFraction * selfCacheSizePerToken / crossCacheSizePerToken;
-            auto const numCrossSecondaryBlocks
-                = (float) blocksInSecondaryPool * crossKvCacheFraction * selfCacheSizePerToken / crossCacheSizePerToken;
-            mCrossKvCacheManager = createKvCacheManager(
-                optionalParams.kvCacheConfig, numCrossBlocks, numCrossSecondaryBlocks, KvCacheType::kCROSS);
+            auto const crossKvCacheFraction = kvCacheConfig.crossKvCacheFraction.value();
+            mKvCacheManager = createKvCacheManager(kvCacheConfig, KvCacheType::kSELF,
+                freePrimaryMemBytes * (1.0f - crossKvCacheFraction),
+                freeSecondaryMemBytes * (1.0f - crossKvCacheFraction), cacheTransPreAllocaSize);
+            mCrossKvCacheManager
+                = createKvCacheManager(kvCacheConfig, KvCacheType::kCROSS, freePrimaryMemBytes * crossKvCacheFraction,
+                    freeSecondaryMemBytes * crossKvCacheFraction, cacheTransPreAllocaSize);
             TLLM_LOG_INFO("This is an Encoder-Decoder model, set %0.1f cross KV cache fraction based on the config.",
                 crossKvCacheFraction);
-            TLLM_LOG_INFO("Number of blocks in self KV cache primary pool: %d, in cross KV cache primary pool: %d",
-                (SizeType32) (blocksInPrimaryPool * (1.0f - crossKvCacheFraction)), (SizeType32) (numCrossBlocks));
-            TLLM_LOG_INFO("Number of blocks in self KV cache secondary pool: %d, in cross KV cache secondary pool: %d",
-                (SizeType32) (blocksInSecondaryPool * (1.0f - crossKvCacheFraction)),
-                (SizeType32) (numCrossSecondaryBlocks));
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(!optionalParams.kvCacheConfig.crossKvCacheFraction.has_value(),
+            TLLM_CHECK_WITH_INFO(!kvCacheConfig.crossKvCacheFraction.has_value(),
                 "Do not set crossKvCacheFraction for decoder-only model");
             mKvCacheManager = createKvCacheManager(
-                optionalParams.kvCacheConfig, blocksInPrimaryPool, blocksInSecondaryPool, KvCacheType::kSELF);
+                kvCacheConfig, KvCacheType::kSELF, freePrimaryMemBytes, freeSecondaryMemBytes, cacheTransPreAllocaSize);
         }
 
         mCacheTransceiver
             = CacheTransceiverFactory::createCacheTransceiver(mKvCacheManager.get(), mModelConfig, mWorldConfig,
-                executor::kv_cache::CacheState::AttentionType::kDEFAULT, optionalParams.cacheTransceiverConfig);
+                executor::kv_cache::CacheState::AttentionType::kDEFAULT, executorConfig.getCacheTransceiverConfig());
     }
 
     if (mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind())
@@ -354,7 +349,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     }
 
     mSeqSlotManager
-        = std::make_shared<SequenceSlotManager>(getMaxNumSequences(), optionalParams.maxSeqIdleMicroseconds);
+        = std::make_shared<SequenceSlotManager>(getMaxNumSequences(), executorConfig.getMaxSeqIdleMicroseconds());
 
     mMicroBatchScheduledRequests.resize(mNumMicroBatches);
     mDecoderFinishedEvents.resize(mNumMicroBatches);
@@ -364,13 +359,13 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     {
         TLLM_CHECK_WITH_INFO(modelConfig.getMaxBeamWidth() == 1, "RNN based model doesn't support beam search now.");
         TLLM_CHECK_WITH_INFO(
-            !optionalParams.enableChunkedContext, "RNN based model doesn't support Chunked Context now.");
+            !executorConfig.getEnableChunkedContext(), "RNN based model doesn't support Chunked Context now.");
         TLLM_CHECK_WITH_INFO(
             modelConfig.getSpeculativeDecodingMode().isNone(), "RNN based model doesn't support speculative decoding.");
     }
 
     std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig;
-    if (optionalParams.enableChunkedContext)
+    if (executorConfig.getEnableChunkedContext())
     {
         TLLM_CHECK_WITH_INFO(modelConfig.isKVCacheEnabled() && mModelConfig.getPagedContextFMHA(),
             "Chunked context requires context FMHA, paged kv_cache and paged context FMHA all enabled at the same "
@@ -383,10 +378,10 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             chunkUnitSize = std::max(/* maxKvStepSizeInFmha */ 256, chunkUnitSize);
             TLLM_LOG_INFO("ChunkUnitSize is set to %d as sliding window attention is used.", chunkUnitSize);
         }
-        ctxChunkConfig
-            = batch_scheduler::ContextChunkingConfig{optionalParams.schedulerConfig.getContextChunkingPolicy().value_or(
-                                                         texe::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED),
-                chunkUnitSize};
+        ctxChunkConfig = batch_scheduler::ContextChunkingConfig{
+            executorConfig.getSchedulerConfig().getContextChunkingPolicy().value_or(
+                executor::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED),
+            chunkUnitSize};
     }
 
     auto maxNumTokens = getMaxNumTokens();
@@ -394,7 +389,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     // Max context size is limited by `max_num_tokens` for chunked-context or context-FMHA,
     // or by `max_input_len` of the model.
-    auto const maxContextLength = (optionalParams.enableChunkedContext || mModelConfig.getContextFMHA())
+    auto const maxContextLength = (executorConfig.getEnableChunkedContext() || mModelConfig.getContextFMHA())
         ? maxNumTokens
         : std::make_optional<SizeType32>(mModelConfig.getMaxInputLen());
 
@@ -413,7 +408,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     }
 
     mCapacityScheduler = std::make_unique<CapacityScheduler>(getMaxNumSequences(),
-        optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), mKvCacheManager != nullptr, mNumMicroBatches > 1);
+        executorConfig.getSchedulerConfig().getCapacitySchedulerPolicy(), mKvCacheManager != nullptr,
+        mWorldConfig.isPipelineParallel());
 
     mMicroBatchScheduler = std::make_unique<MicroBatchScheduler>(ctxChunkConfig, maxContextLength);
 
@@ -452,9 +448,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         mCudaGraphExecutorCaches.resize(mNumBuffers, utils::CudaGraphExecutorCache(cudaGraphCacheSize));
     }
 
-    mSpeculativeDecodingFastLogits = optionalParams.speculativeDecodingConfig.has_value()
-        && optionalParams.speculativeDecodingConfig.value().fastLogits;
-    mIsLeaderInOrchMode = optionalParams.isLeaderInOrchMode;
+    mSpeculativeDecodingFastLogits
+        = executorConfig.getSpecDecConfig().has_value() && executorConfig.getSpecDecConfig()->fastLogits;
     if (mSpeculativeDecodingFastLogits && modelConfig.getSpeculativeDecodingMode().isNone() && mIsLeaderInOrchMode)
     {
         mDraftModelSendLogitsThread = std::make_unique<std::thread>(&utils::draftModelSendLogitsThread, mDevice,
@@ -528,7 +523,10 @@ void TrtGptModelInflightBatching::reshapeKvTensors(OffsetTableDimensions const& 
     }
 }
 
-void TrtGptModelInflightBatching::adjustMaxAttentionWindow(SizeType32 numPrimaryBlocks, SizeType32 numTokensPerBlock)
+using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+
+std::pair<BlocksPerWindow, std::vector<SizeType32>>
+TrtGptModelInflightBatching::clampWindowSizesToFitAtLeastOneSequence(BlocksPerWindow const& blocksPerWindow)
 {
     // At this point, we can only validate that the cheapest sequence in terms of kv-cache resources still fits. More
     // validation is needed on a per-request basis, once the prompt / output lengths and the actual beam width are
@@ -538,37 +536,60 @@ void TrtGptModelInflightBatching::adjustMaxAttentionWindow(SizeType32 numPrimary
         = getMaxSequenceLen() - promptLength; // This makes it the best case scenario, as context tokens are 'cheaper'
                                               // in terms of kv-cache resources on average.
     auto const sinkTokenLength = getSinkTokenLen();
-    auto const maxAttentionWindow = getMaxAttentionWindow();
     auto const maxBeamWidth = getMaxBeamWidth();
-    auto const bestCaseBlockRequirements = kv_cache_manager::KVCacheManager::calculateMaxBlockRequirements(
-        promptLength, outputLength, sinkTokenLength, maxAttentionWindow, maxBeamWidth, numTokensPerBlock);
-    if (bestCaseBlockRequirements > numPrimaryBlocks)
+    auto const tokensPerBlock = mModelConfig.getTokensPerBlock();
+    auto const& oldMaxAttentionWindowVec = getMaxAttentionWindowVec();
+    std::vector<SizeType32> newMaxAttentionWindowVec;
+    BlocksPerWindow newBlocksPerWindow;
+
+    newMaxAttentionWindowVec.reserve(oldMaxAttentionWindowVec.size());
+    for (auto const windowSize : oldMaxAttentionWindowVec)
     {
-        auto const newMaxAttentionWindow = KVCacheManager::calculateMaxAttentionWindow(
-            promptLength, outputLength, sinkTokenLength, numPrimaryBlocks, maxBeamWidth, numTokensPerBlock);
-        TLLM_LOG_WARNING(
-            "maxAttentionWindow and maxSequenceLen are too large for at least one sequence to fit in kvCache. "
-            "they are reduced to %d",
-            newMaxAttentionWindow);
-        setMaxAttentionWindow(newMaxAttentionWindow);
-        setMaxSequenceLen(newMaxAttentionWindow);
+        auto const bestCaseBlockRequirements = kv_cache_manager::KVCacheManager::calculateMaxBlockRequirements(
+            promptLength, outputLength, sinkTokenLength, windowSize, maxBeamWidth, tokensPerBlock);
+        auto const [numPrimaryBlocks, numSecondaryBlocks] = blocksPerWindow.at(windowSize);
+        if (bestCaseBlockRequirements > numPrimaryBlocks)
+        {
+            auto const newMaxAttentionWindow = KVCacheManager::calculateMaxAttentionWindow(
+                promptLength, outputLength, sinkTokenLength, numPrimaryBlocks, maxBeamWidth, tokensPerBlock);
+            newMaxAttentionWindowVec.push_back(newMaxAttentionWindow);
+            newBlocksPerWindow[newMaxAttentionWindow] = std::make_tuple(numPrimaryBlocks, numSecondaryBlocks);
+        }
+        else
+        {
+            newMaxAttentionWindowVec.push_back(windowSize);
+            newBlocksPerWindow[windowSize] = std::make_tuple(numPrimaryBlocks, numSecondaryBlocks);
+        }
+    }
+    if (newMaxAttentionWindowVec == getMaxAttentionWindowVec())
+    {
+        return {blocksPerWindow, newMaxAttentionWindowVec};
+    }
+    TLLM_LOG_WARNING("maxAttentionWindowVec too large to fit at least one sequence in kvCache. Old: %s, New: %s",
+        common::vec2str(getMaxAttentionWindowVec()).c_str(), common::vec2str(newMaxAttentionWindowVec).c_str());
+    setMaxAttentionWindowVec(newMaxAttentionWindowVec);
+    if (getMaxSequenceLen() < getMaxAttentionWindow())
+    {
+        TLLM_LOG_WARNING("maxSequenceLen is reduced to maxAttentionWindow: %d", getMaxAttentionWindow());
+        setMaxSequenceLen(getMaxAttentionWindow());
         if (getMaxInputLen() > getMaxSequenceLen() - 1)
         {
             setMaxInputLen(getMaxSequenceLen() - 1);
             TLLM_LOG_WARNING("maxInputLen is reduced to %d", getMaxInputLen());
         }
-
-        // createBuffers depends on:
-        // maxAttentionWindow; maxAttentionWindowVec; maxSequenceLen;
-        // TODO(nhaber): This is problematic, as createBuffers edits the state of trtGptModelInflightBatching, but what
-        // if there are different window values for cross+self etc. in encoder+decoder scenario...
-        createBuffers(mDecodingConfig, mAdditionalModelOutputs);
     }
+    // createBuffers depends on:
+    // maxAttentionWindow; maxAttentionWindowVec; maxSequenceLen;
+    // TODO: This is problematic, as createBuffers edits the state of trtGptModelInflightBatching, but
+    // what if there are different window values for cross+self etc. in encoder+decoder scenario...
+    createBuffers(mDecodingConfig, mAdditionalModelOutputs);
+    createDecoder(mDecodingConfig.getDecodingMode());
+    return {newBlocksPerWindow, newMaxAttentionWindowVec};
 }
 
 std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::createKvCacheManager(
-    KvCacheConfig const& kvCacheConfig, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
-    KvCacheType kvCacheType)
+    KvCacheConfig const& kvCacheConfig, KvCacheType kvCacheType, uint64_t freePrimaryMemBytes,
+    uint64_t freeSecondaryMemBytes, size_t extraCostMemory)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     bool isCrossAttention = kvCacheType == KvCacheType::kCROSS;
@@ -595,21 +616,24 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = mModelConfig.getNumKvHeadsPerLayerLocalRange(
         mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank(), isCrossAttention);
     auto numKvHeadsPerLayer = std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd);
-    auto const sizePerHead = mModelConfig.getSizePerHead();
-
-    // now we check if maxAttentionWindow is too large for at least one sequence to fit in kvCache
-    // this can happen if maxSeqLen is deduced from the model and is too large
-    // and user also either didn't provide maxAttentionWindow, which leads it to be equal to maxSeqLen
-    if (kvCacheType == KvCacheType::kSELF)
-    {
-        adjustMaxAttentionWindow(blocksInPrimaryPool, tokensPerBlock);
-    }
 
     auto maxAttentionWindowVec = getMaxAttentionWindowVec();
-
     if (kvCacheType != KvCacheType::kSELF) // TODO(nhaber): more foolproof way of initing cross-kvcache-manager
     {
         maxAttentionWindowVec = std::vector<SizeType32>{mModelConfig.getMaxEncoderLen()};
+    }
+
+    auto const numLayers = static_cast<SizeType32>(numKvHeadsPerLayer.size());
+    auto const windowSizeToLayers = KVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, numLayers);
+    auto blocksPerWindow = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, isCrossAttention, kvDtype, mModelConfig,
+        mWorldConfig, windowSizeToLayers, freePrimaryMemBytes, freeSecondaryMemBytes, extraCostMemory, 2);
+
+    // now we check if any of the window sizes is too large for at least one sequence to fit in kvCache
+    // this can happen if e.g. maxSeqLen is deduced from the model and is too large
+    // and user also didn't provide maxAttentionWindow, which leads it to be equal to maxSeqLen
+    if (kvCacheType == KvCacheType::kSELF)
+    {
+        std::tie(blocksPerWindow, maxAttentionWindowVec) = clampWindowSizesToFitAtLeastOneSequence(blocksPerWindow);
     }
 
     kv_cache_manager::TempAttentionWindowInputs tempAttentionWindowInputs;
@@ -624,10 +648,11 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
             "Thus, KV cache reuse is disabled for cross KV cache.");
     }
     auto const enableBlockReuse = kvCacheType == KvCacheType::kSELF ? kvCacheConfig.enableBlockReuse : false;
+    auto const sizePerHead = mModelConfig.getSizePerHead();
 
     auto kvCacheManager = std::make_unique<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
-        blocksInPrimaryPool, blocksInSecondaryPool, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec,
-        tempAttentionWindowInputs, kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse,
+        blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
+        kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse,
         kvCacheConfig.onboardBlocks, kvCacheType, kvCacheConfig.secondaryOffloadMinPriority,
         kvCacheConfig.eventBufferMaxSize > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.eventBufferMaxSize)
@@ -1408,8 +1433,8 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
         }
 
         mDecoder = std::make_unique<runtime::GptDecoderBatched>(mRuntime->getStreamPtr());
-        mDecoder->setup(decodingMode, getMaxNumSequences(), mOperatingBeamWidth, getMaxSequenceLen(), decoderType,
-            mModelConfig, mWorldConfig);
+        mDecoder->setup(
+            decodingMode, getMaxNumSequences(), mOperatingBeamWidth, decoderType, mModelConfig, mWorldConfig);
 
         mDecoderState = std::make_unique<runtime::decoder::DecoderState>(decoderType, mRuntime->getBufferManager());
         if (!mModelConfig.getSpeculativeDecodingMode().isNone())
@@ -1422,19 +1447,13 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
             getMaxSequenceLen(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
         mDecoderState->setupSpeculativeDecoding(mDecoderState->getSpeculativeDecodingMode(),
             mModelConfig.getMaxDecodingTokens(), mModelConfig, mWorldConfig, mRuntime->getBufferManager());
-
-        if (decodingMode.isExplicitDraftTokens())
-        {
-            mDecoderState->setupExplicitDraftTokens(mDecoderBuffers->explicitDraftTokensBuffers);
-        }
-        else if (decodingMode.isLookahead())
-        {
-            mDecoderState->setupLookahead(mDecoderBuffers->lookaheadBuffers.value());
-        }
-        else if (decodingMode.isEagle())
-        {
-            mDecoderState->setupEagle(mDecoderBuffers->eagleBuffers);
-        }
+    }
+    else
+    {
+        auto constexpr decoderDummyType = TRTDataType<float>::value;
+        mDecoderState
+            = std::make_unique<runtime::decoder::DecoderState>(decoderDummyType, mRuntime->getBufferManager());
+        mDecoderState->setupCacheIndirection(getMaxNumSequences(), mOperatingBeamWidth, getMaxAttentionWindow());
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -1459,14 +1478,13 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
     for (SizeType32 i = 0; i < mNumMicroBatches; ++i)
     {
         mDecoderInputBuffers.emplace_back(
-            getMaxBatchSize(), mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
+            getMaxNumSequences(), getMaxBatchSize(), mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
         mDecoderOutputBuffers.emplace_back(getMaxNumSequences(), mOperatingBeamWidth, getMaxSequenceLen(),
             mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager());
     }
 
-    mDecoderBuffers
-        = std::make_unique<DecoderBuffers>(getMaxNumSequences(), mOperatingBeamWidth, getMaxAttentionWindow(),
-            mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager(), mModelConfig, mWorldConfig);
+    mDecoderBuffers = std::make_unique<DecoderBuffers>(getMaxNumSequences(), mModelConfig.getMaxDecodingTokens(),
+        mRuntime->getBufferManager(), mModelConfig, mWorldConfig);
 
     mSlotDecoderBuffers.clear();
     for (SizeType32 i = 0; i < getMaxNumSequences(); ++i)
@@ -1592,7 +1610,7 @@ void TrtGptModelInflightBatching::prepareDistGenBufferAndDecoder(RequestVector c
         auto const bufferId = getFusedBufferId();
         auto& runtimeBuffers = *mBuffers[bufferId];
         runtimeBuffers.prepareStep(cacheTransCompleteRequests, {}, getMaxBeamWidth(), getMaxAttentionWindow(),
-            *mDecoderBuffers, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
+            *mDecoderState, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
             mPeftTables[mMicroBatchId], *mRuntime, mModelConfig, mWorldConfig, getGatherGenerationLogits(),
             isTrtOverlap());
         auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
@@ -1657,9 +1675,9 @@ TrtGptModelInflightBatching::prepareBuffers(
         : std::nullopt;
 
     auto [optProfileId, inputMap, outputMap] = runtimeBuffers.prepareStep(contextRequests, generationRequests,
-        mOperatingBeamWidth, getMaxAttentionWindow(), *mDecoderBuffers, mKvCacheManager.get(),
-        mCrossKvCacheManager.get(), mRnnStateManager.get(), mPeftTables[bufferId], *mRuntime, mModelConfig,
-        mWorldConfig, getGatherGenerationLogits(), isTrtOverlap(), allNewTokens);
+        mOperatingBeamWidth, getMaxAttentionWindow(), *mDecoderState, mKvCacheManager.get(), mCrossKvCacheManager.get(),
+        mRnnStateManager.get(), mPeftTables[bufferId], *mRuntime, mModelConfig, mWorldConfig,
+        getGatherGenerationLogits(), isTrtOverlap(), allNewTokens);
 
     // For Variable-Beam-Width-Search
     mRuntime->setCurrentBeamWidths(
@@ -1783,18 +1801,18 @@ void TrtGptModelInflightBatching::setupDecoderStep(
     {
         auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
 
-        auto [batchSlots, decoderRequests, samplingConfigs]
+        auto [batchSlots, samplingConfigs, lookaheadPrompt, lookaheadAlgoConfigs]
             = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig, mDecodingConfig, contextRequests,
                 mRuntime->getBufferManager(), logitsType, inputBuffers, *mDecoderState, mRuntime->getStream(),
-                *mDecoder->getDecoderStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.medusaBuffers);
+                *mDecoder->getDecoderStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.mMedusaBuffers);
 
-        if (!decoderRequests.empty())
+        auto const localBatchSize = batchSlots->getSize();
+        if (localBatchSize > 0)
         {
-            // Setup underlying decoder.
-            auto const localBatchSize = batchSlots->getSize();
             auto samplingConfig = SamplingConfig(samplingConfigs);
             mDecoder->getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
-                {mDecoderState->getJointDecodingOutput()}, {decoderRequests});
+                {mDecoderState->getJointDecodingOutput()}, mModelConfig.getDataType(), lookaheadPrompt,
+                lookaheadAlgoConfigs);
 
             auto const& stream = mDecoder->getDecoderStream();
             CudaEvent event{};
@@ -1992,40 +2010,44 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(decoderStepAsync);
 
+    auto& decoderInputBuffers = mDecoderInputBuffers.at(getFusedBufferId());
+    auto& seqSlotLogits = decoderInputBuffers.logits;
+
     auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
     auto& contextRuntimeBuffers = mBuffers.at(contextBufferId);
-    auto const logitsIndex = (*mHandleContextLogits)(scheduledRequests.contextRequests,
-        contextRuntimeBuffers->numContextLogits, contextRuntimeBuffers->logits, *mDecoderBuffers, mModelConfig,
-        mRuntime->getBufferManager(), mRuntime->getStream(), contextRuntimeBuffers->medusaBuffers);
+    auto const logitsIndex = (*mHandleContextLogits)(decoderInputBuffers, scheduledRequests.contextRequests,
+        contextRuntimeBuffers->logits, contextRuntimeBuffers->numContextLogits, mModelConfig,
+        mRuntime->getBufferManager(), mDecoderBuffers->draftBuffers, contextRuntimeBuffers->mMedusaBuffers);
 
     auto const genLogitsIndex = mCtxGenFusion ? logitsIndex : 0;
     auto const genBufferId = mCtxGenFusion ? getFusedBufferId() : getGenerationBufferId();
     auto& genRuntimeBuffers = mBuffers.at(genBufferId);
-    (*mHandleGenerationLogits)(genLogitsIndex, scheduledRequests.generationRequests, *mDecoderBuffers, mModelConfig,
-        mRuntime->getBufferManager(), genRuntimeBuffers->logits, *genRuntimeBuffers);
+    (*mHandleGenerationLogits)(decoderInputBuffers, scheduledRequests.generationRequests, genRuntimeBuffers->logits,
+        genLogitsIndex, mModelConfig, mRuntime->getBufferManager(), *genRuntimeBuffers, mDecoderBuffers->draftBuffers);
 
-    // Copy indirection output into input
-    // TODO: Could we avoid this by modifying batchDecoder to take a vector of tensors instead?
-    copyCacheIndirectionFromOutputsToInputs(scheduledRequests, genBufferId);
+    if (mOperatingBeamWidth > 1)
+    {
+        copyCacheIndirectionFromOutputsToInputs(scheduledRequests, genBufferId);
+    }
 
     mLogitsPostProcessorIsApplied
         = (*mLogitsPostProcessor)(scheduledRequests.contextRequests, scheduledRequests.generationRequests,
-            mReplicateLogitsPostProcessor, *mDecoderBuffers, mWorldConfig, *mRuntime, mLogitsPostProcessorBatched);
+            mReplicateLogitsPostProcessor, seqSlotLogits, mWorldConfig, *mRuntime, mLogitsPostProcessorBatched);
 
     if (mGuidedDecoder)
     {
-        mGuidedDecoder->execute(scheduledRequests, mRuntime->getBufferManager(), mDecoderBuffers->logits);
+        mGuidedDecoder->execute(scheduledRequests, mRuntime->getBufferManager(), seqSlotLogits);
     }
 
     auto const fusedBufferId = getFusedBufferId();
     auto& fusedRuntimeBuffers = mBuffers.at(fusedBufferId);
 
     auto& decodingInput = mDecodingInputs.at(mMicroBatchId);
-    std::tie(decodingInput, mDecodingOutput) = (*mMakeDecodingBatchInputOutput)(scheduledRequests.contextRequests,
+    decodingInput = (*mMakeDecodingBatchInputOutput)(scheduledRequests.contextRequests,
         scheduledRequests.generationRequests, *mDecoderBuffers, mDecoderInputBuffers.at(fusedBufferId), *mDecoderState,
         mModelConfig, getMaxNumSequences(), *fusedRuntimeBuffers);
 
-    auto decoderFinishEvent = mDecoder->forwardAsync(*mDecoderState, *mDecodingOutput, *decodingInput);
+    auto decoderFinishEvent = mDecoder->forwardAsync(*mDecoderState, *decodingInput);
 
     auto const returnLogProbs = batchReturnLogProbs(scheduledRequests);
     auto updateDecoderBuffersEvent
@@ -2048,7 +2070,10 @@ void TrtGptModelInflightBatching::copyCacheIndirectionFromOutputsToInputs(
     auto* copySizesPtr = bufferCast<SizeType64>(*genRuntimeBuffers.cacheIndirDecoderIOBatchedCopySizes);
 
     // Only `cacheIndirShape.d[2]` is used
-    auto const& cacheIndirShape = mDecoderBuffers->cacheIndirectionOutput->getShape();
+    auto const& cacheIndirShape = mDecoderState->getCacheIndirectionOutput()->getShape();
+    auto const maxBeamWidth = cacheIndirShape.d[1];
+    auto const maxAttentionWindow = cacheIndirShape.d[2];
+    auto const slotOffset = maxBeamWidth * maxAttentionWindow;
 
     SizeType32 batchIdx{0};
     SizeType64 maxCopySize{0};
@@ -2059,9 +2084,9 @@ void TrtGptModelInflightBatching::copyCacheIndirectionFromOutputsToInputs(
         {
             auto const reqBeamWidth = llmReq->getBeamWidthByIter();
             auto const seqSlot = llmReq->mSeqSlot.value();
-            auto const copySize = static_cast<SizeType64>(cacheIndirShape.d[2]) * reqBeamWidth;
-            srcOffsetsPtr[batchIdx] = seqSlot * copySize;
-            dstOffsetsPtr[batchIdx] = seqSlot * copySize;
+            auto const copySize = reqBeamWidth * maxAttentionWindow;
+            srcOffsetsPtr[batchIdx] = seqSlot * slotOffset;
+            dstOffsetsPtr[batchIdx] = seqSlot * slotOffset;
             copySizesPtr[batchIdx] = copySize;
             maxCopySize = std::max(maxCopySize, copySize);
             batchIdx++;
@@ -2085,8 +2110,8 @@ void TrtGptModelInflightBatching::copyCacheIndirectionFromOutputsToInputs(
         auto const copySizesDeviceSlice
             = ITensor::slice(genRuntimeBuffers.mCacheIndirDecoderIOBatchedCopyCopySizesDevice, 0, batchIdx);
         manager.copy(sizesSlice->data(), *copySizesDeviceSlice); // Explicitly move to device for faster access.
-        runtime::kernels::invokeCopyBatch(*mDecoderBuffers->cacheIndirectionOutput,
-            *mDecoderBuffers->cacheIndirectionInput, *srcOffsetsSliceDeviceSlice, *dstOffsetsSliceDeviceSlice,
+        runtime::kernels::invokeCopyBatch(*mDecoderState->getCacheIndirectionOutput(),
+            *mDecoderState->getCacheIndirectionInput(), *srcOffsetsSliceDeviceSlice, *dstOffsetsSliceDeviceSlice,
             *copySizesDeviceSlice, maxCopySize, manager.getStream());
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -2105,30 +2130,34 @@ std::vector<std::unique_ptr<DecoderStepAsyncSend>> TrtGptModelInflightBatching::
     {
         if (broadcastPostDecoder())
         {
-            DecoderStepAsyncSend::bcast(decoderOutputBuffers, *mDecoderBuffers, returnLogProbs, mOperatingBeamWidth,
+            DecoderStepAsyncSend::bcast(decoderOutputBuffers, mDecoderBuffers->draftBuffers,
+                mDecoderState->getCacheIndirectionOutput(), returnLogProbs, mOperatingBeamWidth,
                 mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), *mMpiCommTensorPara, 0);
         }
 
         if (mWorldConfig.isPipelineParallel())
         {
             auto const peerSend = 0;
-            asyncHandles.emplace_back(std::make_unique<DecoderStepAsyncSend>(decoderOutputBuffers, *mDecoderBuffers,
-                returnLogProbs, mOperatingBeamWidth, mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(),
-                *mMpiCommPipelinePara, peerSend));
+            asyncHandles.emplace_back(
+                std::make_unique<DecoderStepAsyncSend>(decoderOutputBuffers, mDecoderBuffers->draftBuffers,
+                    mDecoderState->getCacheIndirectionOutput(), returnLogProbs, mOperatingBeamWidth,
+                    mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), *mMpiCommPipelinePara, peerSend));
         }
     }
     else
     {
         auto const peerRecv = mWorldConfig.isFirstPipelineParallelRank() ? mWorldConfig.getPipelineParallelism() - 1
                                                                          : mWorldConfig.getPipelineParallelRank() - 1;
-        DecoderStepAsyncSend::recv(decoderOutputBuffers, *mDecoderBuffers, returnLogProbs, mOperatingBeamWidth,
+        DecoderStepAsyncSend::recv(decoderOutputBuffers, mDecoderBuffers->draftBuffers,
+            mDecoderState->getCacheIndirectionOutput(), returnLogProbs, mOperatingBeamWidth,
             mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), *mMpiCommPipelinePara, peerRecv);
         auto const peerSend = mWorldConfig.getPipelineParallelRank() + 1;
         if (peerSend != mWorldConfig.getPipelineParallelism() - 1)
         {
-            asyncHandles.emplace_back(std::make_unique<DecoderStepAsyncSend>(decoderOutputBuffers, *mDecoderBuffers,
-                returnLogProbs, mOperatingBeamWidth, mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(),
-                *mMpiCommPipelinePara, peerSend));
+            asyncHandles.emplace_back(
+                std::make_unique<DecoderStepAsyncSend>(decoderOutputBuffers, mDecoderBuffers->draftBuffers,
+                    mDecoderState->getCacheIndirectionOutput(), returnLogProbs, mOperatingBeamWidth,
+                    mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), *mMpiCommPipelinePara, peerSend));
         }
     }
     TLLM_CHECK_WITH_INFO(asyncHandles.size() <= 2, "Up to two decoder step async handles expected");
@@ -2539,7 +2568,7 @@ void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& sch
         mModelConfig.enableSeamlessLookaheadDecoding(mSeamlessLADMaxDraftLen);
         mDecodingConfig.enableSeamlessLookaheadDecoding();
         setupSpeculativeDecodingModule(mDecodingConfig);
-        mBuffers.at(bufferId)->lookaheadBuffers->enableLookaheadDecoding(
+        mBuffers.at(bufferId)->mLookaheadBuffers->enableLookaheadDecoding(
             getMaxBatchSize(), mModelConfig.getMaxDecodingTokens());
         mDecoderOutputBuffers.at(getFusedBufferId())
             .enableLookaheadDecoding(getMaxNumSequences(), mModelConfig.getMaxDecodingTokens());
@@ -2551,7 +2580,7 @@ void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& sch
         // Lookahead -> None
         mModelConfig.disableSeamlessLookaheadDecoding();
         mDecodingConfig.setDecodingMode(executor::DecodingMode::Auto());
-        mBuffers.at(bufferId)->lookaheadBuffers->disableLookaheadDecoding();
+        mBuffers.at(bufferId)->mLookaheadBuffers->disableLookaheadDecoding();
         mDecoderOutputBuffers.at(getFusedBufferId()).disableLookaheadDecoding(getMaxNumSequences());
         mDecoder->disableLookahead(
             scheduledRequests.generationRequests, mDecoderInputBuffers.at(getFusedBufferId()).setupBatchSlots);

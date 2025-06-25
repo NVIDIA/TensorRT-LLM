@@ -153,8 +153,8 @@ class GemmaConfig(PretrainedConfig):
         model_type = loads(
             (Path(config_dir) / "config.json").read_text())["model_type"]
         HFConfigClass = {
-            "gemma2": transformers.GemmaConfig,
-            "gemma": transformers.Gemma2Config,
+            "gemma": transformers.GemmaConfig,
+            "gemma2": transformers.Gemma2Config,
             "gemma3_text": transformers.Gemma3TextConfig,
         }[model_type]
         hf_config = HFConfigClass.from_pretrained(config_dir)

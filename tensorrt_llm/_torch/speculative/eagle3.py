@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
-from itertools import chain
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -9,7 +8,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.sampler import SampleState, SampleStateTensors, TorchSampler
+from ..pyexecutor.llm_request import LlmRequest
+from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
+from ..pyexecutor.sampler import TorchSampler
+from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 from .mtp import MTPSampler
 
@@ -31,12 +33,12 @@ class Eagle3Config(SpecConfig):
         else:
             self.spec_dec_mode = SpeculativeDecodingMode.from_string(
                 self.spec_dec_name)
-            self.num_extra_kv_tokens = 0
         logger.info(f"EAGLE3 Config: {self}")
 
     def update_from_model_config(self, model_config):
         self.num_layers = model_config.num_hidden_layers
         self.hidden_size = model_config.hidden_size
+        self.dtype = model_config.torch_dtype
 
     def get_draft_model_prompt(self,
                                input_tokens: torch.Tensor) -> torch.Tensor:
@@ -46,13 +48,79 @@ class Eagle3Config(SpecConfig):
         return input_tokens[1:]
 
 
+class Eagle3ResourceManager(BaseResourceManager):
+    """
+    Eagle3 needs to save the hidden states for the draft model. When using
+    Eagle3TwoModel, there will be two model engines, one for the target model
+    and one for the draft model. Use this class to manage the hidden states.
+    """
+
+    def __init__(self, config: Eagle3Config, dtype: torch.dtype,
+                 hidden_size: int, max_num_requests: int, max_seq_len: int,
+                 max_num_tokens: int):
+        self.dtype = dtype
+        self.max_draft_tokens = config.max_draft_tokens
+        self.hidden_size = hidden_size
+        self.max_num_requests = max_num_requests
+        self.max_seq_len = max_seq_len
+        self.slot_manager = SlotManager(max_num_requests)
+
+        # empty hidden states tensor
+        max_num_tokens = min(max_num_tokens,
+                             max_num_requests * self.max_seq_len)
+        self.hidden_states = torch.empty((max_num_tokens, self.hidden_size * 3),
+                                         dtype=self.dtype,
+                                         device='cuda')
+        # sequence length, only used for metadata preparation
+        self.seq_lens = {i: 0 for i in range(max_num_requests)}
+        # start indices of each slot
+        self.start_indices = {i: 0 for i in range(max_num_requests)}
+        # whether the next draft forward is the first
+        self.is_first_draft = True
+
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        context_batch = scheduled_batch.context_requests
+        # allocate hidden state tensors and update slot ids
+        self.slot_ids = []
+        for req in context_batch:
+            if req.is_first_context_chunk:
+                slot_id = self.slot_manager.add_slot(req.request_id)
+                self.slot_ids.append(slot_id)
+        # reset the flag before model forward
+        self.is_first_draft = True
+
+    def update_resources(self, scheduled_batch: ScheduledRequests):
+        pass
+
+    def free_resources(self, request: LlmRequest):
+        self.slot_manager.remove_slot(request.request_id)
+
+    def add_dummy_requests(self, request_ids: List[int]):
+        for rid in request_ids:
+            self.slot_manager.add_slot(rid)
+
+    def shutdown(self):
+        pass
+
+    def get_max_resource_count(self) -> int:
+        return self.max_num_requests
+
+    def get_needed_resource_to_completion(self, request: LlmRequest):
+        return 0
+
+
 @dataclass
 class Eagle3SpecMetadata(SpecMetadata):
     hidden_states: List[torch.Tensor] = field(default_factory=list)
-    num_layers: int = 0
+    num_capture_layers: int = 3
     layers_to_capture: Tuple[int, ...] = field(init=False)
     target_model_embed_tokens: Optional[torch.nn.Module] = None
     hidden_size: int = 0
+    max_num_tokens: int = 0
+    dtype: torch.dtype = torch.bfloat16
+    is_draft_model: bool = False
+    is_first_draft: bool = False
+    eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
 
     def __post_init__(self):
         if self.num_layers == 1:
@@ -64,94 +132,92 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.layers_to_capture = (1, self.num_layers // 2 - 1,
                                       self.num_layers - 4)
 
-        self.hidden_states = []
-        if self.is_cuda_graph:
-            # CUDA graphs need to use the same buffers between runs.
-            max_seqlen = self.max_num_requests * (self.max_draft_tokens + 1)
-            hidden_state_shape = (max_seqlen, self.hidden_size)
-            for layer in self.layers_to_capture:
-                self.hidden_states.append(
-                    torch.empty(hidden_state_shape, device='cuda'))
+        # Initialize to 0 to avoid reading uninitialized memory during warmup
+        self.hidden_states_read_indices = torch.zeros([self.max_num_tokens],
+                                                      dtype=torch.long,
+                                                      device='cuda')
+        self.hidden_states_write_indices = torch.zeros([self.max_num_tokens],
+                                                       dtype=torch.long,
+                                                       device='cuda')
+        self.hidden_states_read_indices_host = None
+        self.hidden_states_write_indices_host = None
 
     def prepare(self):
-        if not self.is_cuda_graph:
-            self.hidden_states = []
+        is_first_draft = self.eagle3_resource_manager.is_first_draft
+        # Update start indices
+        # Here, we assume the sequence lengths (seq_lens) during the draft model
+        # forward will not exceed those of the target model. So pre-allocate
+        # hidden state space before the target model forward.
+        start_idx = 0
+        if not self.is_draft_model:
+            for req_id, seq_len in zip(self.request_ids, self.seq_lens):
+                slot_id = self.eagle3_resource_manager.slot_manager.get_slot(
+                    req_id)
+                self.eagle3_resource_manager.start_indices[slot_id] = start_idx
+                start_idx += seq_len
+        # Prepare hidden states gather ids
+        hidden_states_read_indices = []
+        hidden_states_write_indices = []
+        for req_id, seq_len in zip(self.request_ids, self.seq_lens):
+            slot_id = self.eagle3_resource_manager.slot_manager.get_slot(req_id)
+            start_idx = self.eagle3_resource_manager.start_indices[slot_id]
+            # If this is the first draft or the target model forward, we need to
+            # read/write all of the hidden states, otherwise, only read the last token
+            if is_first_draft or not self.is_draft_model:
+                hidden_states_read_indices.extend(
+                    list(range(start_idx, start_idx + seq_len)))
+                hidden_states_write_indices.extend(
+                    list(range(start_idx, start_idx + seq_len)))
+            else:
+                old_seq_len = self.eagle3_resource_manager.seq_lens[slot_id]
+                hidden_states_read_indices.append(start_idx + old_seq_len - 1)
+                hidden_states_write_indices.append(start_idx + seq_len - 1)
+            self.eagle3_resource_manager.seq_lens[slot_id] = seq_len
+        # Prepare hidden states gather ids
+        self.hidden_states_read_indices_host = torch.tensor(
+            hidden_states_read_indices, dtype=torch.long, pin_memory=True)
+        self.hidden_states_write_indices_host = torch.tensor(
+            hidden_states_write_indices, dtype=torch.long, pin_memory=True)
+        self.is_first_draft = is_first_draft and self.is_draft_model
+        if self.is_draft_model:
+            self.eagle3_resource_manager.is_first_draft = False
+
+        self.hidden_states_read_indices[:self.num_tokens].copy_(
+            self.hidden_states_read_indices_host, non_blocking=True)
+        self.hidden_states_write_indices[:self.num_tokens].copy_(
+            self.hidden_states_write_indices_host, non_blocking=True)
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
 
-    def maybe_capture_hidden_states(self, layer_id: int,
-                                    hidden_states: torch.Tensor,
-                                    residual: torch.Tensor) -> None:
-        if not self.is_cuda_graph:
-            if layer_id in self.layers_to_capture:
-                self.hidden_states.append(hidden_states + residual)
-        else:
-            assert len(self.hidden_states) == len(self.layers_to_capture)
-            for i, captured_layer_id in enumerate(self.layers_to_capture):
-                if captured_layer_id == layer_id:
-                    self.hidden_states[i].copy_(hidden_states + residual)
-                    break
-
-    def get_hidden_states(
+    def maybe_capture_hidden_states(
             self,
-            scheduled_requests,
-            num_rejected_tokens: Optional[Dict] = None) -> torch.Tensor:
-        req_id_to_gather_ids = {}
-        seq_start = 0
-        for req_id, seqlen in zip(self.request_ids, self.seq_lens):
-            if num_rejected_tokens is not None:
-                if req_id in num_rejected_tokens:
-                    req_id_to_gather_ids[req_id] = list(
-                        range(seq_start,
-                              seq_start + seqlen - num_rejected_tokens[req_id]))
-            else:
-                req_id_to_gather_ids[req_id] = [seq_start + seqlen - 1]
+            layer_id: int,
+            hidden_states: torch.Tensor,
+            residual: Optional[torch.Tensor] = None) -> None:
+        token_idx = self.hidden_states_write_indices[:self.num_tokens]
+        eagle3_hidden_states = self.eagle3_resource_manager.hidden_states
+        for i, captured_layer_id in enumerate(self.layers_to_capture):
+            if captured_layer_id == layer_id:
+                to_save = hidden_states + residual if residual is not None else hidden_states
+                to_save = to_save.to(dtype=eagle3_hidden_states.dtype)
+                eagle3_hidden_states[:, i * self.hidden_size:(i + 1) *
+                                     self.hidden_size].index_copy_(
+                                         0, token_idx, to_save)
+                break
 
-            seq_start += seqlen
-
-        hidden_states_gather_ids = []
-        for req in chain(scheduled_requests.context_requests,
-                         scheduled_requests.generation_requests):
-            hidden_states_gather_ids.extend(
-                req_id_to_gather_ids[req.py_request_id])
-
-        if len(self.hidden_states) == 1:
-            return self.hidden_states[0][hidden_states_gather_ids]
-        else:
-            # Note that we must call cat() here. We can't have this control
-            # flow inside the model - that would break CUDA graphs.
-            return torch.cat(
-                [h[hidden_states_gather_ids] for h in self.hidden_states],
-                dim=-1)
-
-
-class Eagle3Sampler(TorchSampler):
-
-    def _batch_sample(self, scheduled_requests, model_outputs) -> SampleState:
-        logits = model_outputs["logits"]
-        new_tokens_device = torch.argmax(logits, dim=-1)
-        if "d2t" in model_outputs:
-            d2t = model_outputs["d2t"]
-            new_tokens_device = d2t[new_tokens_device] + new_tokens_device
-        device = SampleStateTensors(new_tokens=new_tokens_device)
-        host = SampleStateTensors(
-            new_tokens=new_tokens_device.to('cpu', non_blocking=True))
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
-        return SampleState(scheduled_requests=scheduled_requests,
-                           logits=logits,
-                           device=device,
-                           host=host,
-                           sampler_event=sampler_event)
+    def get_hidden_states(self):
+        hidden_states = self.eagle3_resource_manager.hidden_states[
+            self.hidden_states_read_indices[:self.num_tokens], :]
+        if not self.is_first_draft:
+            hidden_states = hidden_states[:, :self.hidden_size]
+        return hidden_states
 
 
 @dataclass
 class Eagle3OneModelSpecMetadata(SpecMetadata):
     # The hidden states
     hidden_states: Optional[torch.Tensor] = None
-    # The number of layers
-    num_layers: int = 0
     # The layers to be captured
     layers_to_capture: Tuple[int, ...] = field(init=False)
     # The hidden size of the hidden states
@@ -213,31 +279,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 break
 
 
-class Eagle3Decoder(TorchSampler):
+class Eagle3OneModelSampler(MTPSampler):
 
-    def _batch_sample(self, scheduled_requests, model_outputs) -> SampleState:
-        logits = model_outputs["logits"]
-        new_tokens_device = torch.argmax(logits, dim=-1)
-        if "d2t" in model_outputs:
-            d2t = model_outputs["d2t"]
-            new_tokens_device = d2t[new_tokens_device] + new_tokens_device
-        new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
-        new_tensors_device = {"new_tokens_device": new_tokens_device}
-        new_tensors_host = {"new_tokens_host": new_tokens_host}
-        decoder_event = torch.cuda.Event()
-        decoder_event.record()
-        return SampleState(scheduled_requests=scheduled_requests,
-                           logits=logits,
-                           new_tensors_device=new_tensors_device,
-                           new_tensors_host=new_tensors_host,
-                           decoder_event=decoder_event)
-
-
-class Eagle3OneModelDecoder(MTPSampler):
-
-    def __init__(self, max_seq_len: int, config: Eagle3Config):
-        super().__init__(max_seq_len, None)
-        self.draft_len = config.max_draft_tokens
+    def __init__(self, args: TorchSampler.Args):
+        super().__init__(args, nextn=args.max_draft_tokens)
 
 
 class Eagle3OneModelWorker(nn.Module):

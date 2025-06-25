@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "BatchedGemmEnums.h"
 #include "GemmGatedActOptions.h"
 #include "GemmOptions.h"
 
@@ -81,33 +82,36 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
     BatchedGemmOptions() = default;
 
     // FIXME We create explicit constructor with all options to WAR stubgen issue in TRT-LLM.
-    BatchedGemmOptions(gemm::AllReduceAlgo allReduceAlgo, int clusterDimX, int clusterDimY, int clusterDimZ,
-        tg::Dtype dtypeAcc, tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, bool enablesEarlyExit,
-        bool enablesDelayedEarlyExit, bool enablesGlobalPtxKnobs, int epilogueLdtmDps, int epilogueLdtmBits,
-        int epilogueTileM, int epilogueTileN, bool gridTriggerSecondaryA, bool gridTriggerSecondaryB,
-        bool gridWaitForPrimaryEarlyExit, bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit,
-        bool hoistMmaTaskTryWaits, int k, gemm::KernelTraits kernelTraits, int m, int mmaK, tg::MmaKind mmaKind,
-        int mmaM, int mmaN, bool mockAllReduce, int n, int numSlicesForSplitK, int numSlicesForSliceK, int numStages,
-        int numStagesMma, int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile, int numStagesWorkId,
-        bool outputDebugTensors, bool useShuffledMatrixA, bool sliceK, gemm::SplitK splitK, bool transposeMatrixA,
-        bool transposeMatrixB, bool transposeMmaOutput, int tileM, int tileN, int tileK, bool useUnrollLoop2xForMma,
-        bool useCustomMmaSchedule, bool useHoistTryWaitForCustomMmaSchedule, bool useDeepSeekFp8, bool usePerTokenSfA,
-        bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps, tg::SfLayout sfLayoutA,
-        tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC, gemm::TileScheduler tileScheduler,
-        gemmGatedAct::ActType actType, std::vector<int> batchedM, std::vector<int> batchedN, BatchMode batchMode,
-        int numBatches, bool isStaticBatch, int numTokens, bool routeAct, bool gridWaitForPrimaryRouting, bool fusedAct,
-        int numRegsPerThreadNonEpilogueWarp, int numRegsPerThreadEpilogueWarp)
+    BatchedGemmOptions(gemm::AllReduceAlgo allReduceAlgo, gemm::BiasType biasType, int blockK, int clusterDimX,
+        int clusterDimY, int clusterDimZ, tg::Dtype dtypeAcc, tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC,
+        tg::Dtype dtypeMmaA, tg::Dtype dtypeMmaB, bool enablesEarlyExit, bool enablesDelayedEarlyExit,
+        bool enablesGlobalPtxKnobs, int epilogueLdtmDps, int epilogueLdtmBits, int epilogueTileM, int epilogueTileN,
+        bool gridTriggerSecondaryA, bool gridTriggerSecondaryB, bool gridWaitForPrimaryEarlyExit,
+        bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit, bool hoistMmaTaskTryWaits, int k,
+        gemm::KernelTraits kernelTraits, gemm::MatrixLayout layoutA, gemm::MatrixLayout layoutB, int m, int mmaK,
+        tg::MmaKind mmaKind, int mmaM, int mmaN, bool mockAllReduce, int n, int numSlicesForSplitK,
+        int numSlicesForSliceK, int numStages, int numStagesMma, int numStagesMmaWithinWorkTile,
+        int numStagesMmaAcrossWorkTile, int numStagesWorkId, bool outputDebugTensors, bool useShuffledMatrixA,
+        bool sliceK, gemm::SplitK splitK, bool transposeMmaOutput, int tileM, int tileN, int tileK,
+        bool useUnrollLoop2xForMma, bool useCustomMmaSchedule, bool useHoistTryWaitForCustomMmaSchedule,
+        bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps,
+        bool useTwoMmaWarps, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
+        int32_t sfReshapeFactor, gemm::TileScheduler tileScheduler, gemmGatedAct::ActType actType,
+        std::vector<int> batchedM, std::vector<int> batchedN, BatchMode batchMode, int numBatches, bool isStaticBatch,
+        int numTokens, RouteImpl routeImpl, bool gridWaitForPrimaryRouting, bool fusedAct,
+        int numRegsPerThreadNonEpilogueWarp, int numRegsPerThreadEpilogueWarp, int numRegsCastAWarps)
         : gemmGatedAct::GemmGatedActOptions(
-            gemm::GemmOptions(allReduceAlgo, clusterDimX, clusterDimY, clusterDimZ, dtypeAcc, dtypeA, dtypeB, dtypeC,
-                enablesEarlyExit, enablesDelayedEarlyExit, enablesGlobalPtxKnobs, epilogueLdtmDps, epilogueLdtmBits,
-                epilogueTileM, epilogueTileN, gridTriggerSecondaryA, gridTriggerSecondaryB, gridWaitForPrimaryEarlyExit,
-                gridWaitForPrimaryA, gridWaitForPrimaryB, hoistLoadTaskInit, hoistMmaTaskTryWaits, k, kernelTraits, m,
-                mmaK, mmaKind, mmaM, mmaN, mockAllReduce, n, numSlicesForSplitK, numSlicesForSliceK, numStages,
-                numStagesMma, numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile, numStagesWorkId,
-                outputDebugTensors, useShuffledMatrixA, sliceK, splitK, transposeMatrixA, transposeMatrixB,
-                transposeMmaOutput, tileM, tileN, tileK, useUnrollLoop2xForMma, useCustomMmaSchedule,
-                useHoistTryWaitForCustomMmaSchedule, useDeepSeekFp8, usePerTokenSfA, usePerTokenSfB, useTmaStore,
-                useTwoTmaLoadWarps, useTwoMmaWarps, sfLayoutA, sfLayoutB, sfLayoutC, tileScheduler),
+            gemm::GemmOptions(allReduceAlgo, biasType, blockK, clusterDimX, clusterDimY, clusterDimZ, dtypeAcc, dtypeA,
+                dtypeB, dtypeC, dtypeMmaA, dtypeMmaB, enablesEarlyExit, enablesDelayedEarlyExit, enablesGlobalPtxKnobs,
+                epilogueLdtmDps, epilogueLdtmBits, epilogueTileM, epilogueTileN, gridTriggerSecondaryA,
+                gridTriggerSecondaryB, gridWaitForPrimaryEarlyExit, gridWaitForPrimaryA, gridWaitForPrimaryB,
+                hoistLoadTaskInit, hoistMmaTaskTryWaits, k, kernelTraits, layoutA, layoutB, m, mmaK, mmaKind, mmaM,
+                mmaN, mockAllReduce, n, numSlicesForSplitK, numSlicesForSliceK, numStages, numStagesMma,
+                numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile, numStagesWorkId, outputDebugTensors,
+                useShuffledMatrixA, sliceK, splitK, transposeMmaOutput, tileM, tileN, tileK, useUnrollLoop2xForMma,
+                useCustomMmaSchedule, useHoistTryWaitForCustomMmaSchedule, useDeepSeekFp8, usePerTokenSfA,
+                usePerTokenSfB, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps, sfLayoutA, sfLayoutB, sfLayoutC,
+                sfReshapeFactor, tileScheduler),
             actType)
         , mBatchedM(batchedM)
         , mBatchedN(batchedN)
@@ -115,11 +119,12 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
         , mNumBatches(numBatches)
         , mIsStaticBatch(isStaticBatch)
         , mNumTokens(numTokens)
-        , mRouteAct(routeAct)
+        , mRouteImpl(routeImpl)
         , mGridWaitForPrimaryRouting(gridWaitForPrimaryRouting)
         , mFusedAct(fusedAct)
         , mNumRegsPerThreadNonEpilogueWarp(numRegsPerThreadNonEpilogueWarp)
         , mNumRegsPerThreadEpilogueWarp(numRegsPerThreadEpilogueWarp)
+        , mNumRegsCastAWarps(numRegsCastAWarps)
     {
     }
 
@@ -137,7 +142,7 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
     // Total number of tokens.
     int mNumTokens{32};
     // Whether load the input tokens and do routing.
-    bool mRouteAct{false};
+    RouteImpl mRouteImpl{RouteImpl::NoRoute};
     // Whether the loads that load from ptrRouteMap, ptrTotalNumPaddedTokens,
     // ptrCtaIdxXyToBatchIdx, etc.. should wait on a grid dependency.
     bool mGridWaitForPrimaryRouting{true};
@@ -149,6 +154,8 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
     int mNumRegsPerThreadNonEpilogueWarp{0};
     // Number of registers per thread for epilogue warps
     int mNumRegsPerThreadEpilogueWarp{0};
+    // Number of registers for the cast A warps.
+    int mNumRegsCastAWarps{0};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -196,19 +203,15 @@ bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, bool isBlackw
         if (batchM)
         {
             TLLM_CHECK_ERROR(options.mN > 0 && options.mK > 0, "N and K must be larger than 0");
-            TLLM_CHECK_ERROR(options.mN >= options.mTileN && options.mK >= options.mTileK,
-                "N and K must be equal or larger than TileN and TileK respectively.");
-            TLLM_CHECK_ERROR(options.mN % options.mTileN == 0 && options.mK % options.mTileK == 0,
-                "N and K must be divisible by TileN and TileK respectively.");
+            TLLM_CHECK_ERROR(options.mN >= options.mTileN, "N must be equal or larger than TileN.");
+            TLLM_CHECK_ERROR(options.mN % options.mTileN == 0, "N must be divisible by TileN.");
             TLLM_CHECK_ERROR(!options.mTransposeMmaOutput, "When batchM the MMA output has to be in row-major.");
         }
         else
         {
             TLLM_CHECK_ERROR(options.mM > 0 && options.mK > 0, "M and K must be larger than 0");
-            TLLM_CHECK_ERROR(options.mM >= options.mTileM && options.mK >= options.mTileK,
-                "N and K must be equal or larger than tileN and tileK respectively.");
-            TLLM_CHECK_ERROR(options.mM % options.mTileM == 0 && options.mK % options.mTileK == 0,
-                "M and K must be divisible by TileM and TileK respectively.");
+            TLLM_CHECK_ERROR(options.mM >= options.mTileM, "N must be equal or larger than tileN.");
+            TLLM_CHECK_ERROR(options.mM % options.mTileM == 0, "M must be divisible by TileM.");
             TLLM_CHECK_ERROR(options.mTransposeMmaOutput, "When batchN the MMA output has to be in column-major.");
         }
     }
@@ -240,26 +243,82 @@ bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, bool isBlackw
     {
         if (options.mDtypeA == tg::Dtype::MxE2m1 && options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4)
         {
-            TLLM_CHECK_ERROR(!options.mRouteAct, "RouteAct is not supported with dtypeA = MxE2m1 and MxFp8Fp6Fp4.");
+            TLLM_CHECK_ERROR(doesRouteImplUseNoRoute(options.mRouteImpl),
+                "RouteAct is not supported with dtypeA = MxE2m1 and MxFp8Fp6Fp4.");
         }
     }
     else
     {
         if (options.mDtypeB == tg::Dtype::MxE2m1 && options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4)
         {
-            TLLM_CHECK_ERROR(!options.mRouteAct, "RouteAct is not supported with dtypeB = MxE2m1 and MxFp8Fp6Fp4.");
+            TLLM_CHECK_ERROR(doesRouteImplUseNoRoute(options.mRouteImpl),
+                "RouteAct is not supported with dtypeB = MxE2m1 and MxFp8Fp6Fp4.");
         }
     }
 
     TLLM_CHECK_ERROR(options.mUseTmaStore, "Only TMA store is supported.");
     if (batchM)
     {
-        TLLM_CHECK_ERROR(!options.mTransposeMatrixA, "Activations must be in k-major format");
+        TLLM_CHECK_ERROR(options.mLayoutA == gemm::MatrixLayout::MajorK, "Activations must be in k-major format");
     }
     else
     {
-        TLLM_CHECK_ERROR(options.mTransposeMatrixB, "Activations must be in k-major format");
+        TLLM_CHECK_ERROR(options.mLayoutB == gemm::MatrixLayout::MajorK, "Activations must be in k-major format");
     }
+
+    if (tg::mmaKindIsBlockFmt(options.mMmaKind) && !options.mUseDeepSeekFp8)
+    {
+        if (!doesRouteImplUseNoRoute(options.mRouteImpl))
+        {
+            if (batchM)
+            {
+                TLLM_CHECK_ERROR(
+                    options.mSfLayoutA == tg::SfLayout::Linear, "Tokens need use SF linear layout when being routed");
+            }
+            else
+            {
+                TLLM_CHECK_ERROR(
+                    options.mSfLayoutB == tg::SfLayout::Linear, "Tokens need use SF linear layout when being routed");
+            }
+        }
+
+        if (doesRouteImplUseTma(options.mRouteImpl))
+        {
+            TLLM_CHECK_ERROR(!batchM, "UTMALDG.GATHER4 only supported for batch N.");
+
+            if (tg::mmaKindIsBlockFmt(options.mMmaKind))
+            {
+                auto dtypeRoute = batchM ? options.mDtypeA : options.mDtypeB;
+                TLLM_CHECK_ERROR(options.mTileK % tg::dtypeNumEltsPerSf(dtypeRoute) == 0,
+                    "tileK needs to be a multiple of 16 * tg::dtypeNumEltsPerSf(dtypeA).");
+                TLLM_CHECK_ERROR(options.mTileK % (tg::dtypeNumEltsPerSf(dtypeRoute) * 16) == 0,
+                    "tileK needs to be a multiple of 16 * tg::dtypeNumEltsPerSf(dtypeA).");
+            }
+        }
+
+        if (!batchM || doesRouteImplUseNoRoute(options.mRouteImpl))
+        {
+            TLLM_CHECK_ERROR(options.mSfLayoutA == tg::SfLayout::R128c4,
+                "options.mSfLayoutA has to be tg::SfLayout::R128c4 when not being routed");
+        }
+    }
+
+    if (!gemm::isBiasTypeNone(options.mBiasType))
+    {
+        TLLM_CHECK_ERROR(
+            (gemm::isBiasTypeN(options.mBiasType) && options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM)
+                || (gemm::isBiasTypeM(options.mBiasType)
+                    && options.mBatchMode == BatchedGemmOptions::BatchMode::BatchN),
+            "BatchedGemm supports only per channel bias.");
+    }
+
+    // We do not handle the case where K is not a multiple of TileK.
+    // TMA based load handles the case transparently.
+    if (doesRouteImplUseLdgsts(options.mRouteImpl))
+    {
+        TLLM_CHECK_ERROR(options.mK % options.mTileK == 0, "K must be a multiple of TileK");
+    }
+
     return isValid;
 }
 
@@ -301,11 +360,12 @@ inline std::string dumpOptions(BatchedGemmOptions const& options)
     ss << "mNumBatches=" << options.mNumBatches << "," << std::endl;
     ss << "mIsStaticBatch=" << options.mIsStaticBatch << "," << std::endl;
     ss << "mNumTokens=" << options.mNumTokens << "," << std::endl;
-    ss << "mRouteAct=" << options.mRouteAct << "," << std::endl;
+    ss << "mRouteImpl=batchedGemm::RouteImpl(" << static_cast<int32_t>(options.mRouteImpl) << ")," << std::endl;
     ss << "mGridWaitForPrimaryRouting=" << options.mGridWaitForPrimaryRouting << "," << std::endl;
     ss << "mFusedAct=" << options.mFusedAct << "," << std::endl;
     ss << "mNumRegsPerThreadNonEpilogueWarp=" << options.mNumRegsPerThreadNonEpilogueWarp << "," << std::endl;
-    ss << "mNumRegsPerThreadEpilogueWarp=" << options.mNumRegsPerThreadEpilogueWarp << std::endl;
+    ss << "mNumRegsPerThreadEpilogueWarp=" << options.mNumRegsPerThreadEpilogueWarp << "," << std::endl;
+    ss << "mNumRegsCastAWarps=" << options.mNumRegsCastAWarps << std::endl;
     return ss.str();
 }
 

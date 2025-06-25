@@ -219,7 +219,6 @@ class PPInitCaller(type):
 
     def __call__(cls, *args, **kwargs):
         obj = type.__call__(cls, *args, **kwargs)
-        obj.__pp_init__()
         return obj
 
 
@@ -235,6 +234,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         self.model_config = model_config
         self.prologue = []
         self.epilogue = []
+        self.keep_embed_tokens = False
 
     def forward(
         self,
@@ -278,7 +278,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
             )
             return
 
-        if hasattr(self, "embed_tokens"):
+        if hasattr(self, "embed_tokens") and not self.keep_embed_tokens:
             self.prologue.append(self.embed_tokens)
         if hasattr(self, "norm"):
             self.epilogue.append(self.norm)
@@ -394,6 +394,8 @@ class DecoderModelForCausalLM(nn.Module,
             assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
                 "lm_head and vocab embedding should use the same TP mode")
             self.lm_head.weight = self.model.embed_tokens.weight
+            if config.mapping.is_last_pp_rank():
+                self.model.keep_embed_tokens = True
 
         self.logits_processor = LogitsProcessor()
 

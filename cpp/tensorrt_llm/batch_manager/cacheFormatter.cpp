@@ -16,6 +16,7 @@
  */
 
 #include "cacheFormatter.h"
+#include "mlaCacheFormatter.h"
 
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
@@ -751,4 +752,15 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
     }
     return true;
 }
+
+std::unique_ptr<BaseCacheFormatter> createCacheFormatter(
+    BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager, bool isMLA)
+{
+    if (isMLA)
+    {
+        return std::make_unique<MLACacheFormatter>(cacheManager, cacheTransBufferManager);
+    }
+    return std::make_unique<CacheFormatter>(cacheManager, cacheTransBufferManager);
+}
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

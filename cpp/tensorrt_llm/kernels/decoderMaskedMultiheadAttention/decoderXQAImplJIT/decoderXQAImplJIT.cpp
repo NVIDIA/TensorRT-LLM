@@ -48,6 +48,7 @@ namespace tensorrt_llm::kernels
 DecoderXQAImplJIT::DecoderXQAImplJIT(DecoderXQARunner* runner)
     : DecoderXQAImpl(runner)
     , mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
+    , mResource(DecoderXQARunner::getResourceGlobal())
     , mForceXQA(tensorrt_llm::common::forceXQAKernels())
     , mSM(tensorrt_llm::common::getSMVersion())
 {
@@ -137,7 +138,7 @@ void DecoderXQAImplJIT::prepareForActualXQAParams(XQAParams const& xqaParams)
 
     jit::CompileEngine compileEngine(mSM, xqaParams);
 
-    auto registryGlobal = DecoderXQARunner::getResourceGlobal()->getCubinObjRegistry();
+    auto registryGlobal = mResource->getCubinObjRegistry();
 
     if (supportConfig(xqaParams, true))
     {
@@ -204,7 +205,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     int multiprocessor_count, cudaStream_t const& stream) const
 {
     jit::CubinObjKey const key = getCubinObjKeyFromXQAParams(xqaParams);
-    jit::CubinObj const* const cubinObj = DecoderXQARunner::getResourceGlobal()->getCubinObjRegistry()->getCubin(key);
+    jit::CubinObj const* const cubinObj = mResource->getCubinObjRegistry()->getCubin(key);
     TLLM_CHECK(cubinObj != nullptr && cubinObj->isInitialized());
     bool const isSpecDec = xqaParams.multi_query_tokens;
     bool const isGMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kHOPPER_WARP_SPECIALIZED);

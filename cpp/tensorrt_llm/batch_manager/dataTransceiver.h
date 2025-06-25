@@ -34,47 +34,6 @@
 namespace tensorrt_llm::batch_manager
 {
 
-// Used to support the data transmission with different layouts and different protocols.
-class IOFormatter
-{
-public:
-    using SizeType32 = tensorrt_llm::runtime::SizeType32;
-    using CacheState = executor::kv_cache::CacheState;
-
-    virtual void formatOutput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
-        = 0;
-
-    virtual void formatInput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
-        = 0;
-
-    /// @brief Determine whether the sender is applicable to the source and target.
-    /// @param selfConfig Source data arrangement.
-    /// @param destConfig Target data arrangement.
-    /// @return Whether the sender is applicable to the source and target.
-    [[nodiscard]] virtual bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const = 0;
-
-    /// @brief Obtain the indies of the counterparts that need to be actually communicated with.
-    /// @param selfConfig Source data arrangement.
-    /// @param selfIdx The sequential index of the current executor process within the entire parallel group.
-    /// @param destConfig Target data arrangement.
-    /// @return The indies of the counterparts.
-    [[nodiscard]] virtual std::vector<SizeType32> getCounterparts(
-        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
-        = 0;
-
-    [[nodiscard]] virtual std::vector<executor::kv_cache::Connection const*> pickRecvConnections(
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig) const
-        = 0;
-
-    /// @brief Destructor.
-    virtual ~IOFormatter() = default;
-};
-
 // Used to store the information that needs to be sent to the context executor to ensure the generation
 // executor smoothly receives the data.
 class RequestInfo

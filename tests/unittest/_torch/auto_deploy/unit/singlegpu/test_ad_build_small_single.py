@@ -65,11 +65,11 @@ def _check_ad_config(simple_config: SimpleConfig, ad_config: _AutoDeployLlmArgs)
         f"got {ad_config.use_cuda_graph}"
     )
 
-    # compile_backend -> torch_compile_enabled
+    # compile_backend -> torch_compile_config
     expected_torch_compile = simple_config.compile_backend in ["torch-opt", "torch-compile"]
-    assert ad_config.torch_compile_enabled == expected_torch_compile, (
-        f"Expected torch_compile_enabled {expected_torch_compile} for "
-        f"{simple_config.compile_backend}, got {ad_config.torch_compile_enabled}"
+    assert bool(ad_config.torch_compile_config) == expected_torch_compile, (
+        f"Expected torch_compile_config to be {expected_torch_compile} for "
+        f"{simple_config.compile_backend}, got {ad_config.torch_compile_config}"
     )
 
     # backend should always be "_autodeploy"

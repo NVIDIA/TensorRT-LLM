@@ -402,97 +402,12 @@ def test_llm_request():
     assert torch.equal(llm_request.draft_logits, logits)
 
 
-def test_trt_gpt_model_optional_params():
-    opt_params = _tb.TrtGptModelOptionalParams()
-
-    kv_cache_config = _tb.KvCacheConfig(10, [10], 0, 0.5, False)
-    opt_params.kv_cache_config = kv_cache_config
-    assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
-
-    assert not opt_params.enable_trt_overlap
-    opt_params.enable_trt_overlap = True
-    assert opt_params.enable_trt_overlap
-
-    assert opt_params.device_ids is None
-    opt_params.device_ids = [0, 1]
-    assert opt_params.device_ids == [0, 1]
-
-    assert not opt_params.enable_chunked_context
-    opt_params.enable_chunked_context = True
-    assert opt_params.enable_chunked_context
-
-    assert opt_params.normalize_log_probs
-    opt_params.normalize_log_probs = False
-    assert not opt_params.normalize_log_probs
-
-    assert not opt_params.decoding_config.decoding_mode
-    opt_params.decoding_config.decoding_mode = _tb.executor.DecodingMode.TopKTopP(
-    )
-    assert opt_params.decoding_config.decoding_mode.isTopKandTopP()
-
-    assert not opt_params.max_beam_width
-    opt_params.max_beam_width = 4
-    assert opt_params.max_beam_width == 4
-
-    assert opt_params.scheduler_config.capacity_scheduler_policy == _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-    assert opt_params.scheduler_config.context_chunking_policy is None
-    opt_params.scheduler_config = _tb.executor.SchedulerConfig(
-        _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
-        _tb.executor.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
-    assert opt_params.scheduler_config.capacity_scheduler_policy == _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-    assert opt_params.scheduler_config.context_chunking_policy == _tb.executor.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
-
-
-def test_trt_gpt_model_optional_params_ctor():
-    kv_cache_config = _tb.KvCacheConfig(10, [10], 0, 0.5, False)
-    enable_trt_overlap = True
-    device_ids = [0, 1]
-    normalize_log_probs = False
-    enable_chunked_context = True
-    peft_cache_manager_config = _tb.PeftCacheManagerConfig()
-
-    opt_params = _tb.TrtGptModelOptionalParams(kv_cache_config,
-                                               enable_trt_overlap, device_ids,
-                                               normalize_log_probs,
-                                               enable_chunked_context,
-                                               peft_cache_manager_config)
-    assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
-    assert opt_params.enable_trt_overlap
-    assert opt_params.device_ids == device_ids
-    assert opt_params.normalize_log_probs == normalize_log_probs
-    assert opt_params.enable_chunked_context == enable_chunked_context
-    assert opt_params.gpu_weights_percent == 1
-
-
 def test_KvCacheConfig_pickle():
     cache = _tb.KvCacheConfig(free_gpu_memory_fraction=0.4)
     cache1 = pickle.dumps(cache)
     cache2 = pickle.loads(cache1)
 
     assert cache2 == cache
-
-
-def test_TrtGptModelOptionalParams_pickle():
-    kv_cache_config = _tb.KvCacheConfig(10, [10], 0, 0.5, False)
-    enable_trt_overlap = True
-    device_ids = [0, 1]
-    normalize_log_probs = False
-    enable_chunked_context = True
-    peft_cache_manager_config = _tb.PeftCacheManagerConfig()
-
-    params1 = _tb.TrtGptModelOptionalParams(kv_cache_config, enable_trt_overlap,
-                                            device_ids, normalize_log_probs,
-                                            enable_chunked_context,
-                                            peft_cache_manager_config)
-
-    params2 = pickle.loads(pickle.dumps(params1))
-
-    assert params2.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
-    assert params2.enable_trt_overlap
-    assert params2.device_ids == device_ids
-    assert params2.normalize_log_probs == normalize_log_probs
-    assert params2.enable_chunked_context == enable_chunked_context
-    assert params2.gpu_weights_percent == 1
 
 
 def test_Mpicomm():
@@ -541,21 +456,21 @@ def test_SamplingConfig_pickle():
 
 def test_KvCache_events_binding():
     stream = torch.cuda.Stream()
+    max_sequence_length = 10
     kwargs = {
         'num_kv_heads_per_layer': [1, 1],
         'size_per_head':
         128,
         'tokens_per_block':
         64,
-        'blocks_in_primary_pool':
-        1000,
-        'blocks_in_secondary_pool':
-        10000,
+        'blocks_per_window': {
+            max_sequence_length: (1000, 10000)
+        },
         'max_num_sequences':
         1,
         'max_beam_width':
         1,
-        'max_attention_window_vec': [10],
+        'max_attention_window_vec': [max_sequence_length],
         'temp_attention_window_inputs':
         None,
         'dtype':
@@ -565,7 +480,7 @@ def test_KvCache_events_binding():
         'stream':
         stream.cuda_stream,
         'max_sequence_length':
-        10,
+        max_sequence_length,
         'enable_block_reuse':
         True,
         'onboard_blocks':

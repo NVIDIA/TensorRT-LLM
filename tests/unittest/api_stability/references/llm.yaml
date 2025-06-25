@@ -1,89 +1,125 @@
 methods:
   __init__:
     parameters:
-     # Parallelism
-      cp_config:
-        annotation: Optional[dict]
-        default: null
-      auto_parallel:
-        annotation: bool
-        default: false
-      auto_parallel_world_size:
-        annotation: Optional[int]
-        default: null
-      embedding_parallel_mode:
-        annotation: str
-        default: SHARDING_ALONG_VOCAB
-      moe_cluster_parallel_size:
-        annotation: Optional[int]
-        default: null
-      # Engine building
-      build_config:
-        annotation: Optional[tensorrt_llm.builder.BuildConfig]
-        default: null
-      enable_build_cache:
-        annotation: Union[tensorrt_llm.llmapi.build_cache.BuildCacheConfig, bool]
-        default: false
-      fast_build:
-        annotation: bool
-        default: false
-      # Bindings and mirrored configs
-      batching_type:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.BatchingType]
-        default: null
-      peft_cache_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
-        default: null
-      scheduler_config:
-        annotation: tensorrt_llm.llmapi.llm_args.SchedulerConfig
-        default: null
-      extended_runtime_perf_knob_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig]
-        default: null
-      decoding_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]
-        default: null
-      cache_transceiver_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig]
-        default: null
-      # Misc
-      backend:
-        annotation: Optional[str]
-        default: null
-      enable_attention_dp:
-        annotation: bool
-        default: false
-      normalize_log_probs:
-        annotation: bool
-        default: false
-      gather_generation_logits:
-        annotation: bool
-        default: false
+      # Parallelism
       gpus_per_node:
         annotation: Optional[int]
         default: null
+      moe_cluster_parallel_size:
+        annotation: Optional[int]
+        default: null
+      enable_attention_dp:
+        annotation: bool
+        default: False
+      cp_config:
+        annotation: Optional[dict]
+        default: null
+      # Stats
       iter_stats_max_iterations:
         annotation: Optional[int]
         default: null
       request_stats_max_iterations:
         annotation: Optional[int]
         default: null
-      workspace:
+      # Bindings and mirrored configs
+      peft_cache_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
+        default: null
+      scheduler_config:
+        annotation: tensorrt_llm.llmapi.llm_args.SchedulerConfig
+        default: null
+      cache_transceiver_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig]
+        default: null
+      batching_type:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.BatchingType]
+        default: null
+      normalize_log_probs:
+        annotation: bool
+        default: False
+      gather_generation_logits:
+        annotation: bool
+        default: False
+      num_postprocess_workers:
+        annotation: int
+        default: 0
+      postprocess_tokenizer_dir:
         annotation: Optional[str]
         default: null
-      # LoRA
-      max_lora_rank:
+      stream_interval:
+        annotation: int
+        default: 1
+      # reasoning
+      reasoning_parser:
+        annotation: Optional[str]
+        default: null
+      garbage_collection_gen0_threshold:
+        annotation: int
+        default: 20000
+      # Misc
+      backend:
+        annotation: Optional[str]
+        default: null
+      build_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.BuildConfig]
+        default: null
+      use_cuda_graph:
+        annotation: bool
+        default: False
+      cuda_graph_batch_sizes:
+        annotation: Optional[List[int]]
+        default: null
+      cuda_graph_max_batch_size:
+        annotation: int
+        default: 0
+      cuda_graph_padding_enabled:
+        annotation: bool
+        default: False
+      disable_overlap_scheduler:
+        annotation: bool
+        default: False
+      moe_max_num_tokens:
         annotation: Optional[int]
         default: null
-      max_loras:
-        annotation: int
-        default: 4
-      max_cpu_loras:
-        annotation: int
-        default: 4
-      kwargs:
-        annotation: Any
-        default: inspect._empty
+      moe_load_balancer:
+        annotation: Union[tensorrt_llm._torch.MoeLoadBalancerConfig, str, None]
+        default: null
+      attn_backend:
+        annotation: str
+        default: TRTLLM
+      moe_backend:
+        annotation: str
+        default: CUTLASS
+      mixed_sampler:
+        annotation: bool
+        default: False
+      enable_trtllm_sampler:
+        annotation: bool
+        default: False
+      kv_cache_dtype:
+        annotation: str
+        default: auto
+      enable_iter_perf_stats:
+        annotation: bool
+        default: False
+      enable_iter_req_stats:
+        annotation: bool
+        default: False
+      print_iter_log:
+        annotation: bool
+        default: False
+      torch_compile_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
+        default: null
+      autotuner_enabled:
+        annotation: bool
+        default: True
+      enable_layerwise_nvtx_marker:
+        annotation: bool
+        default: False
+      enable_min_latency:
+        annotation: bool
+        default: False
     return_annotation: None
   generate:
     parameters:
@@ -127,19 +163,10 @@ methods:
         annotation: Optional[float]
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
-  save:
-    parameters:
-      engine_dir:
-        annotation: str
-        default: inspect._empty
-    return_annotation: None
   shutdown:
     parameters: {}
     return_annotation: None
 properties:
-  workspace:
-    annotation: pathlib.Path
-    default: inspect._empty
   llm_id:
     annotation: str
     default: inspect._empty

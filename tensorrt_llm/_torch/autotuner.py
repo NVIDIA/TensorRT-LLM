@@ -341,11 +341,7 @@ class AutoTuner:
             Runner authors are suggested to provide a fallback implementation for each runner to avoid potential issues.
         """
 
-        # Treat None tensors as size zero
-        # This allows the tuner to handle TRT-LLM-Gen torch ops that have optional tensor
-        # arguments, such as block scaling factors.
-        input_shapes = tuple(
-            (t.shape if t is not None else torch.Size((0, ))) for t in inputs)
+        input_shapes = tuple(self._get_input_sizes(inputs))
 
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
@@ -398,11 +394,7 @@ class AutoTuner:
                             time_measured = self._profile_single_kernel(
                                 r, tensors, tac, **kwargs)
                         except Exception as e:
-                            # Handle None tensors for optional inputs
-                            shapes = [
-                                t.size() if t is not None else torch.Size((0, ))
-                                for t in tensors
-                            ]
+                            shapes = self._get_input_sizes(tensors)
 
                             logger.error(
                                 f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
@@ -444,6 +436,16 @@ class AutoTuner:
 
         return runners[runner_id], tactic
 
+    def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
+
+        # Handle None tensors for optional inputs and non-Tensor scalar values
+        sizes = [
+            input.size() if isinstance(input, torch.Tensor) else torch.Size(
+                (0, )) for input in inputs
+        ]
+
+        return sizes
+
     def _profile_single_kernel(self, runner: TunableRunner,
                                inputs: List[torch.Tensor], tactic: int,
                                **kwargs) -> float:
@@ -483,10 +485,7 @@ class AutoTuner:
 
         avg_time = start.elapsed_time(end) / self.repeat
 
-        # Handle None tensors for optional inputs
-        shapes = [
-            t.size() if t is not None else torch.Size((0, )) for t in inputs
-        ]
+        shapes = self._get_input_sizes(inputs)
         logger.debug(
             f"[Autotuner]: profiling {runner} {tactic}, shapes={shapes}, avg_time {avg_time}"
         )
@@ -512,10 +511,10 @@ class AutoTuner:
         # every dimension created from the concrete input tensor shape
         # generate some dynamic dimension description based on the dynamic_tensors
 
-        # Zero handles the case where a TRTLLM op has optional inputs.
+        # Zero handles the case where a TRTLLM op has optional or scalar inputs.
         base_profile = OptimizationProfile(
-            [[StaticDim(x)
-              for x in t.size()] if t is not None else [StaticDim(0)]
+            [[StaticDim(x) for x in t.size()]
+             if isinstance(t, torch.Tensor) else [StaticDim(0)]
              for t in inputs])
 
         generated_profiles: List[OptimizationProfile] = []

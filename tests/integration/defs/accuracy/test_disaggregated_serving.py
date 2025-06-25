@@ -58,7 +58,7 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
 
         for future in self.futures:
             future.cancel()
-        self.shutdown(wait=False, cancel_futures=True)
+        self.shutdown(wait=True, cancel_futures=True)
         return False
 
 
@@ -83,7 +83,6 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
         yaml.dump(gen_server_config, f)
 
     args = LlmArgs.from_kwargs(model=model_name,
-                               backend="pytorch",
                                tensor_parallel_size=tensor_parallel_size)
 
     trtllm_serve_path = "trtllm-serve"
@@ -134,11 +133,12 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
         client = openai.OpenAI(api_key="1234567890",
                                base_url=f"http://localhost:8000/v1")
 
-        def send_request(prompt: str, sampling_params: SamplingParams):
+        def send_request(prompt: str, sampling_params: SamplingParams,
+                         streaming: bool):
             response = client.completions.create(
                 model=model_name,
                 prompt=prompt,
-                stream=False,
+                stream=streaming,
                 **({
                     "max_tokens": sampling_params.max_tokens,
                     "temperature": sampling_params.temperature,
@@ -158,20 +158,23 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
             return requested_output
 
         def generate_async(prompt: str,
-                           sampling_params: Optional[SamplingParams] = None):
-            future = thread_pool.submit(send_request, prompt, sampling_params)
+                           sampling_params: Optional[SamplingParams] = None,
+                           streaming: bool = False):
+            future = thread_pool.submit(send_request, prompt, sampling_params,
+                                        streaming)
             thread_pool.futures.append(future)
             return future
 
-        yield DuckLLM(args, generate_async)
+        try:
+            yield DuckLLM(args, generate_async)
+        finally:
+            ctx_server.terminate()
+            gen_server.terminate()
+            disaggregated_server.terminate()
 
-        ctx_server.terminate()
-        gen_server.terminate()
-        disaggregated_server.terminate()
-
-        ctx_server.wait()
-        gen_server.wait()
-        disaggregated_server.wait()
+            ctx_server.wait()
+            gen_server.wait()
+            disaggregated_server.wait()
 
 
 @pytest.mark.timeout(3600)
@@ -252,16 +255,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("mtp_nextn",
                           [0, pytest.param(2, marks=skip_pre_hopper)])
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
-        ctx_server_config = {
-            "pytorch_backend_config": {
-                "disable_overlap_scheduler": True
-            }
-        }
-        gen_server_config = {
-            "pytorch_backend_config": {
-                "disable_overlap_scheduler": not overlap_scheduler
-            }
-        }
+        ctx_server_config = {"disable_overlap_scheduler": True}
+        gen_server_config = {"disable_overlap_scheduler": not overlap_scheduler}
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
                 "decoding_type": "MTP",

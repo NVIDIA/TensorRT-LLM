@@ -60,6 +60,8 @@ bool getEnvUseNixlKvCache();
 
 std::string getEnvUCXInterface();
 
+std::string getEnvNixlInterface();
+
 bool getEnvDisaggLayerwise();
 
 bool getEnvDisableSelectiveCacheTransfer();

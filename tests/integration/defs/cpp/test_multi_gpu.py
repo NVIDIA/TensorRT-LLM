@@ -85,6 +85,8 @@ def run_cache_transceiver_tests(build_dir: _pl.Path,
                      env=mgpu_env,
                      timeout=timeout)
 
+    # TODO: Re-enable it after the NIXL backend has stabilized.
+    '''
     # Nixl transfer agent tests
     new_env = get_multi_gpu_env(kv_cache_type=KVCacheType.NIXL)
 
@@ -100,6 +102,7 @@ def run_cache_transceiver_tests(build_dir: _pl.Path,
                      cwd=tests_dir,
                      env=new_env,
                      timeout=600)
+    '''
 
 
 def run_llama_executor_leader_tests(build_dir: _pl.Path, timeout=1500):

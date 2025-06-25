@@ -182,10 +182,11 @@ class HostMoeTensorSharer:
         offset = 0
         for name in self.names:
             for expert_id in range(self.expert_start, self.expert_end):
-                t = self.shared_tensors[(expert_id, name)]
+                t = self.shared_tensors[(expert_id, name)].contiguous().cpu()
                 data_size = t.numel() * t.element_size()
                 aligned_size = self.align_size(data_size)
-                shm.buf[offset:offset + data_size] = t.numpy().tobytes()
+                shm.buf[offset:offset + data_size] = t.flatten().view(
+                    torch.int8).numpy().tobytes()
                 dtype = t.dtype
                 tensor_shape = t.shape
                 elt_count = t.numel()
@@ -270,7 +271,8 @@ class SingleLayerMoeLoadBalancer:
             single_layer_load_balancer_impl: _tbr.SingleLayerMoeLoadBalancer,
             shared_mpi_comm: MPI.Comm,
             expert_count: int,
-            updates_enabled: bool = True):
+            updates_enabled: bool = True,
+            repeated_count=1):
         """
         Initialize a SingleLayerMoeLoadBalancer instance.
 
@@ -279,6 +281,7 @@ class SingleLayerMoeLoadBalancer:
             shared_mpi_comm: The MPI communicator for shared memory
             expert_count: total number of experts
             updates_enabled: whether to enable weight updates
+            repeated_count: the repeated count of current layer, used when forward is repeated more than once like MTP.
         """
         self.single_layer_load_balancer_impl = single_layer_load_balancer_impl
         self.single_layer_load_balancer_ptr = single_layer_load_balancer_impl.get_pointer(
@@ -302,9 +305,14 @@ class SingleLayerMoeLoadBalancer:
         self.load_expert_ids = list(range(load_expert_start, load_expert_end))
 
         self.statistic_flag_tensor = None
+        self.local_statistic_tensor = None
 
         self.cudagraph_stream = None
         self.cudagraph_event = None
+        self.repeated_count = repeated_count
+
+        self.statistic_stream = None
+        self.statistic_event = None
 
     def get_layer_idx(self):
         return self.single_layer_load_balancer_impl.get_layer_id()
@@ -312,6 +320,9 @@ class SingleLayerMoeLoadBalancer:
     def get_load_expert_ids(self):
         assert self.updates_enabled, "should not call get_load_expert_ids when using statistic routing"
         return self.load_expert_ids
+
+    def get_repeat_count(self):
+        return self.repeated_count
 
     def is_static_routing(self):
         return not self.updates_enabled
@@ -474,6 +485,12 @@ class SingleLayerMoeLoadBalancer:
             self.statistic_flag_tensor = None
             if is_graph_capturing():
                 assert self.cudagraph_stream is not None, "Doesn't have cudagraph_stream, should not set_cpu_stage."
+                assert self.statistic_event is not None
+                assert self.statistic_stream is not None
+                # wait statistic update done
+                self.statistic_event.wait()
+                self.statistic_event = None
+                self.statistic_stream = None
                 current_stream_event = torch.cuda.Event()
                 current_stream_event.record(torch.cuda.current_stream())
                 with torch.cuda.stream(self.cudagraph_stream):
@@ -510,6 +527,87 @@ class SingleLayerMoeLoadBalancer:
                 gathered_raw_expert_ids, self.statistic_flag_tensor,
                 self.single_layer_load_balancer_ptr, is_first_stage,
                 is_last_stage)
+
+    def local_statistic(self, local_raw_expert_ids: torch.Tensor,
+                        is_first_stage: bool, is_last_stage: bool):
+        """
+        Perform local statistics on the expert IDs.
+
+        Args:
+            local_raw_expert_ids: The gathered raw expert IDs from all ranks
+            is_first_stage: Whether this is the first stage
+            is_last_stage: Whether this is the last stage
+        """
+        if self.updates_enabled:
+            assert isinstance(self.statistic_flag_tensor, torch.Tensor)
+            if is_first_stage:
+                assert self.local_statistic_tensor is None
+                self.local_statistic_tensor = torch.empty(
+                    (self.expert_count, ),
+                    dtype=torch.int32,
+                    device=torch.device('cuda'))
+            if is_graph_capturing():
+                self.statistic_event = torch.cuda.Event()
+                self.statistic_stream = torch.cuda.Stream()
+                current_stream_event = torch.cuda.Event()
+                current_stream_event.record(torch.cuda.current_stream())
+                with torch.cuda.stream(self.statistic_stream):
+                    current_stream_event.wait()
+                    torch.ops.trtllm.moe_hierarchical_statistic_local_device(
+                        local_raw_expert_ids, self.local_statistic_tensor,
+                        self.statistic_flag_tensor,
+                        self.single_layer_load_balancer_ptr, is_first_stage,
+                        is_last_stage)
+                    self.statistic_event.record(self.statistic_stream)
+            else:
+                torch.ops.trtllm.moe_hierarchical_statistic_local_device(
+                    local_raw_expert_ids, self.local_statistic_tensor,
+                    self.statistic_flag_tensor,
+                    self.single_layer_load_balancer_ptr, is_first_stage,
+                    is_last_stage)
+
+    def get_local_statistic_tensor(self):
+        """
+        Get the local statistic tensor. Should perform allreduce on it and then call update_statistic
+        Returns:
+            The local statistic tensor if using statistic else None
+        """
+        if self.updates_enabled:
+            assert self.local_statistic_tensor is not None
+            if is_graph_capturing():
+                assert self.statistic_event is not None
+                assert self.statistic_stream is not None
+                self.statistic_event.wait()
+            return self.local_statistic_tensor
+        return None
+
+    def update_statistic(self, gathered_local_statistic_tensor: torch.Tensor):
+        """
+        Perform update with global statistics.
+
+        Args:
+            gathered_local_statistic_tensor: gathered local statistics info, should have shape (world_size, self.expert_count)
+        """
+        if self.updates_enabled:
+            assert isinstance(self.statistic_flag_tensor, torch.Tensor)
+
+            def _update_statistic():
+                global_statistic_info = torch.sum(
+                    gathered_local_statistic_tensor, dim=0, dtype=torch.int32)
+                torch.ops.trtllm.moe_hierarchical_statistic_update(
+                    global_statistic_info, self.statistic_flag_tensor,
+                    self.single_layer_load_balancer_ptr)
+
+            if is_graph_capturing():
+                current_stream_event = torch.cuda.Event()
+                current_stream_event.record(torch.cuda.current_stream())
+                with torch.cuda.stream(self.statistic_stream):
+                    current_stream_event.wait()
+                    _update_statistic()
+                    self.statistic_event.record(self.statistic_stream)
+            else:
+                _update_statistic()
+            self.local_statistic_tensor = None
 
     def route(self,
               token_selected_experts: torch.Tensor,
@@ -584,6 +682,8 @@ class MoeLoadBalancer:
         self.enable_statistic = False
         self.enable_update_weights = False
 
+        self.next_layer_repeated_count = None
+
     def __del__(self):
         if not self.is_shutdown:
             self.shutdown()
@@ -605,6 +705,16 @@ class MoeLoadBalancer:
     def set_use_gpu_memcpy(self, use_gpu_memcpy: bool):
         self.load_balancer_impl.set_use_gpu_memcpy(use_gpu_memcpy)
 
+    def set_repeated_for_next_layer(self, repeated_count: int):
+        """
+        Set repeat count for next layer.
+
+        Args:
+            repeated_count: The repeat count for next layer
+        """
+        assert repeated_count > 0, "repeat count must be greater than 0"
+        self.next_layer_repeated_count = repeated_count
+
     def add_layer(self, expert_count: int, top_k: int,
                   slot_count_per_rank: int) -> SingleLayerMoeLoadBalancer:
         """
@@ -621,11 +731,16 @@ class MoeLoadBalancer:
         single_layer_load_balancer_impl = self.load_balancer_impl.add_layer(
             expert_count, top_k, slot_count_per_rank)
         updates_enabled = not self.is_static_routing()
+        repeat_count = 1
+        if self.next_layer_repeated_count is not None:
+            repeat_count = self.next_layer_repeated_count
+            self.next_layer_repeated_count = None
         single_layer_load_balancer = SingleLayerMoeLoadBalancer(
             single_layer_load_balancer_impl,
             self.shared_mpi_comm,
             expert_count,
-            updates_enabled=updates_enabled)
+            updates_enabled=updates_enabled,
+            repeated_count=repeat_count)
         single_layer_load_balancer.set_shared_memory_base_name(
             self.shared_memory_base_name)
         self.single_layer_load_balancers.append(single_layer_load_balancer)
@@ -754,6 +869,10 @@ class MoeLoadBalancer:
 
 moe_model_arch_list = [
     'DeepseekV3ForCausalLM',
+    'MixtralForCausalLM',
+    'Llama4ForConditionalGeneration',
+    'Qwen2MoeForCausalLM',
+    'Qwen3MoeForCausalLM',
 ]
 
 
@@ -837,6 +956,18 @@ def get_moe_load_balancer() -> Optional[MoeLoadBalancer]:
         return getattr(_current_moe_load_balancer, 'instance', None)
     except AttributeError:
         return None
+
+
+def moe_load_balancer_set_repeated_for_next_layer(repeat_count: int):
+    """
+    Set repeated count for next Single Layer created.
+
+    Args:
+        repeat_count: repeated count
+    """
+    load_balancer = get_moe_load_balancer()
+    if load_balancer is not None:
+        load_balancer.set_repeated_for_next_layer(repeat_count)
 
 
 def moe_load_balancer_add_single_layer(

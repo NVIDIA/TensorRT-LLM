@@ -41,12 +41,12 @@ The Low-Precision-AllReduce algorithm can be enabled in two ways:
 ```
 AllReduce allreduce(mapping=mapping, strategy=AllReduceStrategy.LOWPRECISION);
 ```
-2. **Environment variable control** with AUTO strategy:
+
+2. Enable by LlmArgs
 ```
-// In your code
-AllReduce allreduce(mapping=mapping, strategy=AllReduceStrategy.AUTO);
-// Set environment variable before running
-export FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY=1
+Set allreduce_strategy field in LlmArgs.
+Candidates of strategies are "AUTO", "NCCL", "UB", "MINLATENCY", "ONESHOT", "TWOSHOT", "LOWPRECISION" and "MNNVL".
+If no strategy is set, AUTO will be set.
 ```
 
 ## Performance and Accuracy Considerations
@@ -57,9 +57,5 @@ Low-Precision-AllReduce reduces communication volume by using FP8 data format fo
 - Automatically falls back to other strategies when no performance benefit is expected (e.g., with NVLink or small messages)
 
 Users should evaluate the precision impact on their specific models and workloads.
-
-## Environment Variables
-
-- `FORCE_LOW_PRECISION_ALL_REDUCE_STRATEGY`: When set to `1`, forces the use of low-precision algorithm with AUTO strategy. If the algorithm determines it cannot provide performance benefits, it will automatically fall back to other strategies.
 
 **Note**: When compiling TensorRT-LLM without enabling the `ENABLE_FP8` option, setting Low Precision allreduce will not take effect.

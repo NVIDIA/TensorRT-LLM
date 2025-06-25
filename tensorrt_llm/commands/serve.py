@@ -11,10 +11,11 @@ import yaml
 from strenum import StrEnum
 from torch.cuda import device_count
 
-from tensorrt_llm._torch.llm import LLM as PyTorchLLM
+from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
-from tensorrt_llm.llmapi import (LLM, BuildConfig, CapacitySchedulerPolicy,
+from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
                                  SchedulerConfig)
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
@@ -121,9 +122,9 @@ def get_llm_args(model: str,
         "max_seq_len": max_seq_len,
         "kv_cache_config": kv_cache_config,
         "backend": backend if backend == "pytorch" else None,
-        "_num_postprocess_workers": num_postprocess_workers,
-        "_postprocess_tokenizer_dir": tokenizer or model,
-        "_reasoning_parser": reasoning_parser,
+        "num_postprocess_workers": num_postprocess_workers,
+        "postprocess_tokenizer_dir": tokenizer or model,
+        "reasoning_parser": reasoning_parser,
     }
 
     return llm_args, llm_args_extra_dict
@@ -247,12 +248,6 @@ def launch_server(host: str,
     type=str,
     default=None,
     help="Server role. Specify this value only if running in disaggregated mode."
-)
-@click.option(
-    "--trust_remote_code",
-    type=bool,
-    default=False,
-    help="Whether to trust remote code.",
 )
 def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           log_level: str, backend: str, max_beam_width: int,
@@ -425,6 +420,8 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
         llm_args = update_llm_args_with_extra_dict(llm_args,
                                                    llm_args_extra_dict)
 
+        # Ignore the non-LLM args
+        llm_args.pop("router", None)
         _launch_disaggregated_server(config_file, llm_args)
         return
 

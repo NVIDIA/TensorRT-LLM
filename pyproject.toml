@@ -10,14 +10,54 @@ build-backend = "setuptools.build_meta"
 ####################################################################################################
 [tool.isort]
 line_length = 80
-extend_skip_glob = ["**/auto_deploy/**"]
+# This should match the `include` in `[tool.ruff]`. See the comments in that section for why this
+# is necessary.
+extend_skip_glob = [
+    "**/auto_deploy/**",
+    "tensorrt_llm/_common.py",
+    "tensorrt_llm/_dlpack_utils.py",
+    "tensorrt_llm/_ipc_utils.py",
+    "tensorrt_llm/_mnnvl_utils.py",
+    "tensorrt_llm/disaggregated_params.py",
+    "tensorrt_llm/engine.py",
+    "tensorrt_llm/graph_rewriting.py",
+    "tensorrt_llm/logger.py",
+    "tensorrt_llm/lora_manager.py",
+    "tensorrt_llm/module.py",
+    "tensorrt_llm/moe_config.py",
+    "tensorrt_llm/profiler.py",
+    "tensorrt_llm/prompt_adapter_manager.py",
+    "tensorrt_llm/python_plugin.py",
+    "tensorrt_llm/sampling_params.py",
+    "tensorrt_llm/top_model_mixin.py",
+]
 
 [tool.yapf]
 based_on_style = "pep8"
 column_limit = 80
 
 [tool.yapfignore]
-ignore_patterns = ["**/auto_deploy/**"]
+# This should match the `include` in `[tool.ruff]`. See the comments in that section for why this
+# is necessary.
+ignore_patterns = [
+    "**/auto_deploy/**",
+    "tensorrt_llm/_common.py",
+    "tensorrt_llm/_dlpack_utils.py",
+    "tensorrt_llm/_ipc_utils.py",
+    "tensorrt_llm/_mnnvl_utils.py",
+    "tensorrt_llm/disaggregated_params.py",
+    "tensorrt_llm/engine.py",
+    "tensorrt_llm/graph_rewriting.py",
+    "tensorrt_llm/logger.py",
+    "tensorrt_llm/lora_manager.py",
+    "tensorrt_llm/module.py",
+    "tensorrt_llm/moe_config.py",
+    "tensorrt_llm/profiler.py",
+    "tensorrt_llm/prompt_adapter_manager.py",
+    "tensorrt_llm/python_plugin.py",
+    "tensorrt_llm/sampling_params.py",
+    "tensorrt_llm/top_model_mixin.py",
+]
 
 [tool.codespell]
 skip = ".git,3rdparty,tests/integration/test_input_files**,**.jsonl,**.json"
@@ -28,7 +68,27 @@ ignore-words-list = "rouge,inout,atleast,strat,nd,subtile,thrid,improbe,NotIn,te
 in-place = true
 remove_all_unused_imports = true
 remove_unused_variables = true
-exclude = ["**/auto_deploy/**"]
+# This should match the `include` in `[tool.ruff]`. See the comments in that section for why this
+# is necessary.
+exclude = [
+    "**/auto_deploy/**",
+    "tensorrt_llm/_common.py",
+    "tensorrt_llm/_dlpack_utils.py",
+    "tensorrt_llm/_ipc_utils.py",
+    "tensorrt_llm/_mnnvl_utils.py",
+    "tensorrt_llm/disaggregated_params.py",
+    "tensorrt_llm/engine.py",
+    "tensorrt_llm/graph_rewriting.py",
+    "tensorrt_llm/logger.py",
+    "tensorrt_llm/lora_manager.py",
+    "tensorrt_llm/module.py",
+    "tensorrt_llm/moe_config.py",
+    "tensorrt_llm/profiler.py",
+    "tensorrt_llm/prompt_adapter_manager.py",
+    "tensorrt_llm/python_plugin.py",
+    "tensorrt_llm/sampling_params.py",
+    "tensorrt_llm/top_model_mixin.py",
+]
 
 
 ####################################################################################################
@@ -44,6 +104,33 @@ include = [
     "**/auto_deploy/**/*.py",
     "**/auto_deploy/**/*.pyi",
     "**/auto_deploy/**/*.ipynb",
+    # Progressively enable ruff on all the repo to keep individual changes reasonably-sized, and
+    # keep merge conflicts manageable.
+    # Since keeping both `yapf` and `ruff` makes no sense (given that their formatting philosophies
+    # are quite different), we should move towards removing one in favor of the other. ruff's
+    # formatting mirrors black's, and both are much more widely adopted than yapf. ruff is also
+    # orders of magnitude faster, so we should move to deprecate `yapf`.
+    # In the transition period, we should keep the `ignore_patterns` in `[tool.yapfignore]` in sync
+    # with the below, so that both pre-commit hooks can complete successfully.
+    "tensorrt_llm/_common.py",
+    "tensorrt_llm/_dlpack_utils.py",
+    "tensorrt_llm/_ipc_utils.py",
+    "tensorrt_llm/_mnnvl_utils.py",
+    "tensorrt_llm/disaggregated_params.py",
+    "tensorrt_llm/engine.py",
+    "tensorrt_llm/graph_rewriting.py",
+    "tensorrt_llm/logger.py",
+    "tensorrt_llm/lora_manager.py",
+    "tensorrt_llm/module.py",
+    "tensorrt_llm/moe_config.py",
+    "tensorrt_llm/profiler.py",
+    "tensorrt_llm/prompt_adapter_manager.py",
+    "tensorrt_llm/python_plugin.py",
+    "tensorrt_llm/sampling_params.py",
+    "tensorrt_llm/top_model_mixin.py",
+]
+exclude = [
+    "3rdparty/**",
 ]
 
 

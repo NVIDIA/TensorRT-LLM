@@ -50,5 +50,12 @@ function(add_benchmark test_name test_src)
   add_dependencies(micro_benchmarks ${test_name})
 endfunction()
 
+# currently only support internal-cutlass lib version
 add_benchmark(mixtureOfExpertsBackendBenchmark
               mixtureOfExpertsBackendBenchmarkLauncher.cu)
+# Temporary opend-sourced version. Will be daleted when open-sourced moe_gemm
+# support MXFP4
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  add_benchmark(mixtureOfExpertsBackendBenchmarkOss
+                mixtureOfExpertsBackendBenchmarkLauncherOss.cu)
+endif()

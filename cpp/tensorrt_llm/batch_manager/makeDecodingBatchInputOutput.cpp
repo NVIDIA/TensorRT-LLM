@@ -33,8 +33,7 @@ using TensorPtr = MakeDecodingBatchInputOutput::TensorPtr;
 
 std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDecoderBatchInputs(
     std::vector<SizeType32> const& activeSlots, runtime::decoder::DecoderState const& decoderState,
-    std::vector<TensorPtr> const& logits, SizeType32 maxNumSequences, std::vector<TensorPtr> const& batchSlots,
-    TensorPtr const& cacheIndirectionInput)
+    std::vector<TensorPtr> const& logits, SizeType32 maxNumSequences, std::vector<TensorPtr> const& batchSlots)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -83,7 +82,6 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
 
     auto decodingInput = std::make_unique<tr::decoder_batch::Input>(logitsVec, maxActiveDecoderSteps);
     decodingInput->batchSlots = batchSlots;
-    decodingInput->cacheIndirection = cacheIndirectionInput;
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return decodingInput;
 }
@@ -122,9 +120,8 @@ std::pair<std::vector<SizeType32>, std::vector<SizeType32>> getActiveSlots(
 
 } // namespace
 
-std::tuple<std::unique_ptr<tr::decoder_batch::Input>, std::unique_ptr<tr::decoder_batch::Output>>
-MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
-    DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
+std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests,
+    RequestVector const& generationRequests, DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
     runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
     OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
 {
@@ -132,8 +129,8 @@ MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, R
 
     auto [activeSlots, generationSteps] = getActiveSlots(contextRequests, generationRequests);
 
-    auto decodingInput = createDecoderBatchInputs(activeSlots, decoderState, decoderBuffers.logits, maxNumSequences,
-        inputBuffers.forwardBatchSlots, decoderBuffers.cacheIndirectionInput);
+    auto decodingInput = createDecoderBatchInputs(
+        activeSlots, decoderState, inputBuffers.logits, maxNumSequences, inputBuffers.forwardBatchSlots);
     decodingInput->generationSteps = generationSteps;
 
     if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
@@ -146,23 +143,20 @@ MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, R
         TLLM_CHECK(fusedRuntimeBuffers);
         // requires mCtxGenFusion == true
         decodingInput->batchSlotsRequestOrder = fusedRuntimeBuffers->seqSlots;
-        decodingInput->explicitDraftTokensInputs = fusedRuntimeBuffers->explicitDraftTokensBuffers->engineOutputs;
-        decodingInput->explicitDraftTokensLastInputs = fusedRuntimeBuffers->explicitDraftTokensBuffers->engineInputs;
+        decodingInput->explicitDraftTokensInputs = fusedRuntimeBuffers->mExplicitDraftTokensBuffers->engineOutputs;
+        decodingInput->explicitDraftTokensLastInputs = fusedRuntimeBuffers->mExplicitDraftTokensBuffers->engineInputs;
     }
     else if (modelConfig.getSpeculativeDecodingMode().isEagle())
     {
         TLLM_CHECK(fusedRuntimeBuffers);
         // requires mCtxGenFusion == true
         decodingInput->batchSlotsRequestOrder = fusedRuntimeBuffers->seqSlots;
-        decodingInput->eagleInputs = fusedRuntimeBuffers->eagleBuffers->engineOutputs;
-        decodingInput->eagleLastInputs = fusedRuntimeBuffers->eagleBuffers->engineInputs;
+        decodingInput->eagleInputs = fusedRuntimeBuffers->mEagleBuffers->engineOutputs;
+        decodingInput->eagleLastInputs = fusedRuntimeBuffers->mEagleBuffers->engineInputs;
     }
 
-    auto decodingOutput = std::make_unique<tr::decoder_batch::Output>();
-    decodingOutput->cacheIndirection = decoderBuffers.cacheIndirectionOutput;
-
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return {std::move(decodingInput), std::move(decodingOutput)};
+    return decodingInput;
 }
 
 } // namespace tensorrt_llm::batch_manager

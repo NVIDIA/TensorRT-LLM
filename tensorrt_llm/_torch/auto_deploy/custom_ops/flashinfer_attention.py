@@ -153,7 +153,7 @@ class _FlashInferPlanner:
 _GlobalFlashInferPlanner = _FlashInferPlanner()
 
 
-@torch.library.custom_op("attention::prepare_flashinfer_metadata", mutates_args=())
+@torch.library.custom_op("auto_deploy::flashinfer_attention_prepare_metadata", mutates_args=())
 def prepare_flashinfer_metadata(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
@@ -228,7 +228,7 @@ def prepare_flashinfer_metadata_fake(
     )
 
 
-@torch.library.custom_op("attention::flashinfer_mha_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::flashinfer_attention_mha_with_cache", mutates_args=())
 def flashinfer_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -355,15 +355,15 @@ class FlashInferAttention(AttentionDescriptor):
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
         """Get the source attention op that we target for replacement."""
-        return torch.ops.attention.bsnd_grouped_sdpa
+        return torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.attention.flashinfer_mha_with_cache
+        return torch.ops.auto_deploy.flashinfer_attention_mha_with_cache
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.attention.prepare_flashinfer_metadata, 6
+        return torch.ops.auto_deploy.flashinfer_attention_prepare_metadata, 6
 
     @classmethod
     def get_cache_initializers(
@@ -404,7 +404,7 @@ class FlashInferAttention(AttentionDescriptor):
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
         )
         if attn_mask is not None or dropout_p != 0.0 or not is_causal:
-            ad_logger.warning(
+            ad_logger.debug(
                 "Unsupported attention arguments for "
                 f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
             )

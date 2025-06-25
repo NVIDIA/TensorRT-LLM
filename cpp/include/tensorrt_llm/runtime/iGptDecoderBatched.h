@@ -76,8 +76,6 @@ public:
     TensorPtr batchSlotsRequestOrder;
 
     //! For Beam Search
-    //! Indices into KV cache of different rays within one beam, [maxBatchSize, maxBeamWidth, maxSeqLen], on gpu
-    TensorPtr cacheIndirection;
     //! The generation step of each request (for Variable-Beam-Width-Search), [batchSize]
     std::vector<SizeType32> generationSteps;
 
@@ -95,17 +93,6 @@ public:
     std::optional<EagleBuffers::Inputs> eagleLastInputs;
 };
 
-class Output
-{
-public:
-    using TensorPtr = std::shared_ptr<ITensor>;
-
-    Output() = default;
-
-    //! parameters for beam search, [batchSize, maxBeamWidth, maxSeqLen], on gpu
-    TensorPtr cacheIndirection;
-};
-
 } // namespace decoder_batch
 
 //! GPT decoder class with support for in-flight batching
@@ -119,22 +106,17 @@ public:
 
     //! @brief Setup the decoder before calling `forward()`
     virtual void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
-        SizeType32 maxSequenceLength, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
-        WorldConfig const& worldConfig)
+        nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
         = 0;
 
     //! @brief Disable Lookahead decoding.
     virtual void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots) = 0;
 
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
-    virtual CudaEvent forwardAsync(
-        decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input)
-        = 0;
+    virtual CudaEvent forwardAsync(decoder::DecoderState const& decoderState, decoder_batch::Input const& input) = 0;
 
     //! @brief Run one step for all requests and wait for completion on the host.
-    virtual void forward(
-        decoder::DecoderState const& decoderState, decoder_batch::Output& output, decoder_batch::Input const& input)
-        = 0;
+    virtual void forward(decoder::DecoderState const& decoderState, decoder_batch::Input const& input) = 0;
 
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned

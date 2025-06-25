@@ -2,10 +2,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy.shim.demollm import DemoLLM
 from tensorrt_llm._torch.auto_deploy.transformations.transform import InferenceOptimizer
-from tensorrt_llm.llmapi.llm import LLM
-from tensorrt_llm.llmapi.llm_args import _AutoDeployLlmArgs
+from tensorrt_llm.llmapi.llm_args import TorchCompileConfig, _AutoDeployLlmArgs
 
 # ================================
 # _AutoDeployLlmArgs Direct Tests
@@ -128,7 +128,8 @@ def test_config_flow(
 
     # Create instance with appropriate mocking
     with patch.object(api_class, "_try_load_tokenizer", return_value=MagicMock()):
-        instance = api_class(**config_params)
+        with patch.object(api_class, "_build_model", return_value=MagicMock()):
+            instance = api_class(**config_params)
 
     # Verify args were created correctly
     assert hasattr(instance, "args")
@@ -155,23 +156,23 @@ def test_config_flow(
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,torch_compile_enabled,expected_backend",
+    "use_cuda_graph,torch_compile_config,expected_backend",
     [
-        (True, True, "torch-opt"),
-        (True, False, "torch-cudagraph"),
-        (False, True, "torch-compile"),
-        (False, False, "torch-simple"),
+        (True, TorchCompileConfig(), "torch-opt"),
+        (True, None, "torch-cudagraph"),
+        (False, TorchCompileConfig(), "torch-compile"),
+        (False, None, "torch-simple"),
     ],
 )
 @patch("tensorrt_llm._torch.auto_deploy.models.factory.ModelFactoryRegistry.get")
 def test_compile_backend_mapping(
-    mock_factory_registry, use_cuda_graph, torch_compile_enabled, expected_backend
+    mock_factory_registry, use_cuda_graph, torch_compile_config, expected_backend
 ):
     """Test that compile backend is correctly determined from config."""
     ad_config = _AutoDeployLlmArgs(
         model="test-model",
         use_cuda_graph=use_cuda_graph,
-        torch_compile_enabled=torch_compile_enabled,
+        torch_compile_config=torch_compile_config,
     )
     optimizer = InferenceOptimizer(factory=MagicMock(), ad_config=ad_config)
     assert optimizer.compile_backend == expected_backend

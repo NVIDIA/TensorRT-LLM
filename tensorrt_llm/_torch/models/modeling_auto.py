@@ -16,6 +16,8 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         # Hack to detect eagle3 checkpoints. TODO: should we provide
         # our own checkpoints with the correct arch? It would let us
         # avoid nasty stuff like this.
+        model_arch = model_arch.replace("Eagle3",
+                                        "")  # Strip the appended EAGLE3
         if hasattr(config.pretrained_config, "draft_vocab_size"):
             model_arch = "EAGLE3" + model_arch
 

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "../include/common.h"
 #include "cutlass_extensions/gemm_configs.h"
 #include "cutlass_extensions/weight_only_quant_op.h"
 #include <cuda_runtime_api.h>
@@ -29,16 +30,6 @@ namespace kernels
 {
 namespace cutlass_kernels
 {
-
-// TRT Activation Type does not have Gelu or Silu
-enum class ActivationType
-{
-    Gelu,
-    Relu,
-    Silu,
-    Identity,
-    InvalidType
-};
 
 /*
   This runner only supports:

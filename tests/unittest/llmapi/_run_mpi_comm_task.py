@@ -1,5 +1,4 @@
 import os
-import time
 from typing import Literal
 
 import click
@@ -24,9 +23,6 @@ def main(task_type: Literal["submit", "submit_sync"]):
         elif task_type == "submit_sync":
             res = client.submit_sync(print_colored, f"{task}\n", "green")
             print(res)
-
-    time.sleep(10)
-    client.shutdown()
 
 
 if __name__ == "__main__":

@@ -18,7 +18,10 @@ In this blog, we share the configurations and procedures about how to reproduce 
   - [Reproducing steps](#reproducing-steps)
     - [B200 min-latency](#b200-min-latency)
       - [Expected Results](#expected-results)
-    - [B200 max-throughput](#b200-max-throughput)
+    - [B200 max-throughput with FP8 KV](#b200-max-throughput-for-r1-0528-with-fp8-kv-cache)
+      - [Benchmark](#benchmark)
+      - [Expected Result Format](#expected-result-format)
+    - [B200 max-throughput with FP16 KV](#b200-max-throughput-for-r1-with-fp16-kv-cache)
       - [Benchmark](#benchmark)
       - [Expected Result Format](#expected-result-format)
     - [H200 min-latency](#h200-min-latency)
@@ -181,9 +184,68 @@ Total Token Throughput (tokens/sec):              414.0461
 Total Latency (ms):                               74561.7520
 Average request latency (ms):                     7456.1219
 ```
+### B200 max-throughput for R1-0528 with FP8 KV cache
 
-### B200 max-throughput
-Our benchmark results are based on **Batch = 3072, ISL = 1K, OSL = 2K, num_requests = 49152 from synthetic dataset**
+Due to our evaluation found that FP8 KV cache does not introduce obvious accuracy drop compared to BF16 KV cache. See [Precision strategy](./tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md#precision-strategy), the latest [DeepSeek-R1-0528-FP4](https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4) checkpoint had enabled FP8 KV cache by-default.
+
+We are seeing meaningful speedup using FP8 KV cache, thus refreshing the numbers here. The results are reproduced with TensorRT-LLM commit b6261862419c33d6ce2313aff1e7116067d6037d.
+
+!! Note that the exact command to reproduce numbers can change as the API/options are refactored, the option and numbers here is a reference at given exact commit.
+
+#### Benchmark
+```bash
+cat >./extra-llm-api-config.yml <<EOF
+pytorch_backend_config:
+  use_cuda_graph: true
+  cuda_graph_padding_enabled: true
+  cuda_graph_batch_sizes:
+  - 896
+  - 512
+  - 256
+  - 128
+  - 64
+  - 32
+  - 16
+  - 8
+  - 4
+  - 2
+  - 1
+  print_iter_log: true
+  kv_cache_dtype: fp8
+enable_attention_dp: true
+EOF
+trtllm-bench  --model nvidia/DeepSeek-R1-0528-FP4
+     throughput
+     --dataset ${YOUR_DATA_PATH}
+     --backend pytorch
+     --tp 8  --ep 8
+     --extra_llm_api_options ./extra-llm-api-config.yml
+     --max_batch_size 896
+     --max_num_tokens 2048
+     --kv_cache_free_gpu_mem_fraction 0.93
+     --concurrency 7168
+     --num_requests 114688
+```
+#### Expected Result Format
+```
+===========================================================
+= PERFORMANCE OVERVIEW
+===========================================================
+Request Throughput (req/sec):                     21.0675
+Total Output Throughput (tokens/sec):             43146.2042
+Total Token Throughput (tokens/sec):              65100.6376
+Total Latency (ms):                               5443839.8140
+Average request latency (ms):                     332826.9898
+Per User Output Throughput [w/ ctx] (tps/user):   6.1806
+Per GPU Output Throughput (tps/gpu):              5393.2755
+```
+
+### B200 max-throughput for R1 with FP16 KV cache
+Our benchmark results are based on **Batch = 3072, ISL = 1K, OSL = 2K, num_requests = 49152 from synthetic dataset**.
+
+The results are reproduced with TensorRT-LLM commit b6261862419c33d6ce2313aff1e7116067d6037d.
+
+!! Note that the exact command to reproduce numbers can change as the API/options are refactored, the option and numbers here is a reference at given exact commit.
 
 #### Benchmark
 To do the benchmark, run the following command:
@@ -201,20 +263,21 @@ python ${YOUR_WORK_PATH}/benchmarks/cpp/prepare_dataset.py \
 YOUR_DATA_PATH=./dataset.txt
 
 cat >./extra-llm-api-config.yml <<EOF
-use_cuda_graph: true
-cuda_graph_padding_enabled: true
-cuda_graph_batch_sizes:
-- 1
-- 2
-- 4
-- 8
-- 16
-- 32
-- 64
-- 128
-- 256
-- 384
-print_iter_log: true
+pytorch_backend_config:
+    use_cuda_graph: true
+    cuda_graph_padding_enabled: true
+    cuda_graph_batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 384
+    print_iter_log: ${PRINT_ITER_LOG}
 enable_attention_dp: true
 EOF
 
@@ -239,12 +302,13 @@ The perf might be different from different datasets and machines
 ===========================================================
 = PERFORMANCE OVERVIEW
 ===========================================================
-Request Throughput (req/sec):                     17.3885
-Total Output Throughput (tokens/sec):             35611.5942
-Per User Output Throughput (tokens/sec/user):     11.6701
-Per GPU Output Throughput (tokens/sec/gpu):       4451.4493
-Total Latency (ms):                               2826700.0758
-Average request latency (ms):                     176064.1921
+Request Throughput (req/sec):                     17.7657
+Total Output Throughput (tokens/sec):             36384.0838
+Total Token Throughput (tokens/sec):              54576.1257
+Total Latency (ms):                               2766684.9197
+Average request latency (ms):                     172321.7206
+Per User Output Throughput [w/ ctx] (tps/user):   11.9263
+Per GPU Output Throughput (tps/gpu):              4548.0105
 ```
 
 ### H200 min-latency

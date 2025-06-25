@@ -21,10 +21,12 @@ This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) m
     - [Quick start](#quick-start)
       - [Run a single inference](#run-a-single-inference)
     - [Evaluation](#evaluation)
+    - [Model Quantization to FP4](#model-quantization-to-fp4)
+    - [Benchmark](#benchmark)
     - [Serving](#serving)
       - [trtllm-serve](#trtllm-serve)
       - [Disaggregated Serving](#disaggregated-serving)
-      - [Dynamo](#dynamo)
+  - [Dynamo](#dynamo)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
   - [Credits](#credits)
 
@@ -648,6 +650,80 @@ trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch 
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |84.3063|±  |1.0019|
 |     |       |strict-match    |     5|exact_match|↑  |88.6277|±  |0.8745|
 
+```
+
+### Model Quantization to FP4
+
+To quantize the Qwen3 model for use with the PyTorch backend, we'll use NVIDIA's Model Optimizer (ModelOpt) tool. Follow these steps:
+
+```bash
+# Clone the TensorRT Model Optimizer (ModelOpt)
+git clone https://github.com/NVIDIA/TensorRT-Model-Optimizer.git
+pushd TensorRT-Model-Optimizer
+
+# install the ModelOpt
+pip install -e .
+
+# Quantize the Qwen3-235B-A22B model by nvfp4
+./examples/llm_ptq/scripts/huggingface_example.sh --model Qwen3-235B-A22B/ --quant nvfp4 --export_fmt hf
+popd
+```
+
+By default, the checkpoint would be stored in `TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/`.
+
+### Benchmark
+
+To run the benchmark, we suggest using the `trtllm-bench` tool. Please refer to the following script on B200:
+
+```bash
+#!/bin/bash
+
+folder_model=TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
+path_config=extra-llm-api-config.yml
+num_gpus=8
+ep_size=8
+max_input_len=1024
+max_batch_size=512
+# We want to limit the number of prefill requests to 1 with in-flight batching.
+max_num_tokens=$(( max_input_len + max_batch_size - 1 ))
+kv_cache_free_gpu_mem_fraction=0.9
+concurrency=128
+
+path_data=./aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt
+
+# Setup the extra configuration for llm-api
+echo -e "disable_overlap_scheduler: false\nuse_cuda_graph: true\nprint_iter_log: true\ncuda_graph_batch_sizes: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128]\nenable_attention_dp: true " > ${path_config}
+
+# Run trtllm-bench with pytorch backend
+mpirun --allow-run-as-root --oversubscribe -n 1 \
+trtllm-bench --model ${folder_model} --model_path ${folder_model} throughput \
+  --backend pytorch \
+  --max_batch_size ${max_batch_size} \
+  --max_num_tokens ${max_num_tokens} \
+  --dataset ${path_data} \
+  --tp ${num_gpus}\
+  --ep ${ep_size} \
+  --kv_cache_free_gpu_mem_fraction ${kv_cache_free_gpu_mem_fraction} \
+  --extra_llm_api_options ${path_config} \
+  --concurrency ${concurrency} \
+  --num_requests $(( concurrency * 5 )) \
+  --warmup 0 \
+  --streaming
+```
+
+We suggest benchmarking with a real dataset. It will prevent from having improperly distributed tokens in the MoE. Here, we use the `aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt` dataset. It has 10000 samples with an average input length of 1024 and an average output length of 2048. If you don't have a dataset (this or an other) and you want to run the benchmark, you can use the following command to generate a random dataset:
+
+```bash
+folder_model=TensorRT-Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
+min_input_len=1024
+min_output_len=2048
+concurrency=128
+path_data=random_data.txt
+
+python3 benchmarks/cpp/prepare_dataset.py \
+    --tokenizer=${folder_model} \
+    --stdout token-norm-dist --num-requests=$(( concurrency * 5 )) \
+    --input-mean=${min_input_len} --output-mean=${min_output_len} --input-stdev=0 --output-stdev=0 > ${path_data}
 ```
 
 ### Serving

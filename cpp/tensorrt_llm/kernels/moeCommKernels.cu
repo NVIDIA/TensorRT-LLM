@@ -646,6 +646,48 @@ void computeSendRecvIndices(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expe
         sendRankLocalIndices, recvRankLocalIndices, backwardRecvRankLocalIndices);
 }
 
+__global__ void moeAllToAllMemsetKernel(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo,
+    int maxTokenCountPerRank, int* sendRankCountCumSum, int* recvRankCountCumSum, int* localGatherIndices,
+    int* sendRankLocalIndices, int* recvRankLocalIndices, int* backwardRecvRankLocalIndices)
+{
+    int maxSendRanksPerToken = std::max(worldInfo.epSize, expertParallelInfo.topK);
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int maxRankRecvTokenCount = maxTokenCountPerRank * worldInfo.epSize;
+    int maxRankSendTokenCount = maxTokenCountPerRank * maxSendRanksPerToken;
+    if (idx < worldInfo.epSize)
+    {
+        sendRankCountCumSum[idx] = 0;
+        recvRankCountCumSum[idx] = 0;
+    }
+    if (idx < maxRankRecvTokenCount)
+    {
+        localGatherIndices[idx] = -1;
+        recvRankLocalIndices[idx] = -1;
+    }
+    if (idx < maxRankSendTokenCount)
+    {
+        sendRankLocalIndices[idx] = -1;
+        backwardRecvRankLocalIndices[idx] = -1;
+    }
+}
+
+void moeAllToAllMemset(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo, int maxTokenCountPerRank,
+    int* sendRankCountCumSum, int* recvRankCountCumSum, int* localGatherIndices, int* sendRankLocalIndices,
+    int* recvRankLocalIndices, int* backwardRecvRankLocalIndices, cudaStream_t stream)
+{
+    int maxSendRanksPerToken = std::max(worldInfo.epSize, expertParallelInfo.topK);
+    int maxRankRecvTokenCount = maxTokenCountPerRank * worldInfo.epSize;
+    int maxRankSendTokenCount = maxTokenCountPerRank * maxSendRanksPerToken;
+    int maxEltCount = std::max<int>(maxRankRecvTokenCount, maxRankSendTokenCount);
+    maxEltCount = std::max<int>(maxEltCount, worldInfo.epSize);
+    static constexpr int kBlockSize = 256;
+    int blockCount = (maxEltCount + kBlockSize - 1) / kBlockSize;
+    dim3 grid(blockCount, 1);
+    moeAllToAllMemsetKernel<<<grid, kBlockSize, 0, stream>>>(worldInfo, expertParallelInfo, maxTokenCountPerRank,
+        sendRankCountCumSum, recvRankCountCumSum, localGatherIndices, sendRankLocalIndices, recvRankLocalIndices,
+        backwardRecvRankLocalIndices);
+}
+
 void moeAllToAllPrepareIndices(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo,
     int maxTokenCountPerRank, int const* gatheredTargetRankIds, int const* realRankTokenCountCumSum,
     // indices of gatheredTargetRankIds that has the local rank in topK
@@ -663,19 +705,9 @@ void moeAllToAllPrepareIndices(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo e
                                       // rank has maxTokenCountPerRank tokens to send and all has expertCount dest
     cudaStream_t stream)
 {
+    moeAllToAllMemset(worldInfo, expertParallelInfo, maxTokenCountPerRank, sendRankCountCumSum, recvRankCountCumSum,
+        localGatherIndices, sendRankLocalIndices, recvRankLocalIndices, backwardRecvRankLocalIndices, stream);
     TLLM_CHECK_WITH_INFO(worldInfo.epSize <= 1024, "Only worldInfo.epSize less than or equal to 1024 supported now.");
-    TLLM_CUDA_CHECK(cudaMemsetAsync(sendRankCountCumSum, 0, sizeof(int) * worldInfo.epSize, stream));
-    TLLM_CUDA_CHECK(cudaMemsetAsync(recvRankCountCumSum, 0, sizeof(int) * worldInfo.epSize, stream));
-    int maxSendRanksPerToken = std::max(worldInfo.epSize, expertParallelInfo.topK);
-
-    TLLM_CUDA_CHECK(
-        cudaMemsetAsync(localGatherIndices, -1, maxTokenCountPerRank * worldInfo.epSize * sizeof(int), stream));
-    TLLM_CUDA_CHECK(
-        cudaMemsetAsync(sendRankLocalIndices, -1, maxTokenCountPerRank * maxSendRanksPerToken * sizeof(int), stream));
-    TLLM_CUDA_CHECK(
-        cudaMemsetAsync(recvRankLocalIndices, -1, maxTokenCountPerRank * worldInfo.epSize * sizeof(int), stream));
-    TLLM_CUDA_CHECK(cudaMemsetAsync(
-        backwardRecvRankLocalIndices, -1, maxTokenCountPerRank * maxSendRanksPerToken * sizeof(int), stream));
     computeSendRecvRankCount(worldInfo, expertParallelInfo, maxTokenCountPerRank, realRankTokenCountCumSum,
         gatheredTargetRankIds, sendRankCountCumSum, recvRankCountCumSum, stream);
     inplaceSendRecvRankCumSum(worldInfo, sendRankCountCumSum, recvRankCountCumSum, stream);

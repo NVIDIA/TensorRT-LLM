@@ -73,7 +73,7 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             reduce_output=False,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-        )
+            allreduce_strategy=config.allreduce_strategy)
 
         self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
                                    [self.hidden_size])
@@ -89,7 +89,7 @@ class GatedMLP(nn.Module):
             reduce_output=reduce_output,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.down_lora,
-        )
+            allreduce_strategy=config.allreduce_strategy)
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
         # but never both at the same time. splitted_gate_up_lora handles gate and up separately while fused_gate_up_lora

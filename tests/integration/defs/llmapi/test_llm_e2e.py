@@ -23,7 +23,7 @@ from defs.common import convert_weights, venv_check_call
 from defs.conftest import llm_models_root, unittest_path
 from defs.trt_test_alternative import check_call
 
-from tensorrt_llm.llmapi import LLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi.llm_utils import BuildConfig
 
 

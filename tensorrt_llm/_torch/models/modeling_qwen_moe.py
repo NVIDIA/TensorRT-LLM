@@ -29,6 +29,7 @@ class QwenMoE(nn.Module):
         self,
         model_config: ModelConfig[Qwen2MoeConfig],
         aux_stream: torch.cuda.Stream,
+        layer_idx: Optional[int] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -57,7 +58,8 @@ class QwenMoE(nn.Module):
             aux_stream=aux_stream,
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
-            model_config=model_config)
+            model_config=model_config,
+            layer_idx=layer_idx)
 
         self.shared_expert = GatedMLP(
             hidden_size=config.hidden_size,
@@ -143,7 +145,7 @@ class QwenMoeDecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
         )
 
-        self.mlp = QwenMoE(model_config, aux_stream)
+        self.mlp = QwenMoE(model_config, aux_stream, layer_idx=layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -189,7 +191,6 @@ class QwenMoeModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Qwen2MoeConfig]):
         super().__init__(model_config)
         config = self.model_config
-        self.padding_idx = config.pretrained_config.pad_token_id
         self.aux_stream = torch.cuda.Stream()
 
         self.embed_tokens = Embedding(

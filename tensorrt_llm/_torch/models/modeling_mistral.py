@@ -119,7 +119,6 @@ class MistralModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[MistralConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
 
         self.embed_tokens = Embedding(
             config.vocab_size,

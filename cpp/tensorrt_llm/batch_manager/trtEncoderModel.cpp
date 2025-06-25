@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
@@ -39,14 +40,14 @@ namespace tensorrt_llm::batch_manager
 
 TrtEncoderModel::TrtEncoderModel(runtime::ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     runtime::RawEngine const& rawEngine, std::shared_ptr<nvinfer1::ILogger> logger,
-    TrtGptModelOptionalParams const& optionalParams)
-    : TrtGptModel(modelConfig, worldConfig, optionalParams)
+    executor::ExecutorConfig const& executorConfig)
+    : TrtGptModel(modelConfig, worldConfig, executorConfig)
     , mModelConfig{modelConfig}
     , mWorldConfig{worldConfig}
     , mDevice{runtime::utils::initDevice(worldConfig)}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
     , mRuntime{std::make_shared<TllmRuntime>(
-          rawEngine, mLogger.get(), optionalParams.useGpuDirectStorage, optionalParams.gpuWeightsPercent)}
+          rawEngine, mLogger.get(), executorConfig.getUseGpuDirectStorage(), executorConfig.getGpuWeightsPercent())}
     , mNumMicroBatches{1}
     , mNumBuffers{mNumMicroBatches}
     , mCopyBufferManager{std::make_shared<CudaStream>()}
@@ -75,8 +76,8 @@ TrtEncoderModel::TrtEncoderModel(runtime::ModelConfig const& modelConfig, WorldC
     // handling of maximizing utilization or pause/evict
     // TODO: finer control on encoder requests scheduling
     mCapacityScheduler = std::make_unique<tensorrt_llm::batch_manager::CapacityScheduler>(
-        getMaxBatchSize() * mNumMicroBatches, optionalParams.schedulerConfig.getCapacitySchedulerPolicy(), false, false,
-        LlmRequestState::kENCODER_INIT, LlmRequestState::kCONTEXT_INIT);
+        getMaxBatchSize() * mNumMicroBatches, executorConfig.getSchedulerConfig().getCapacitySchedulerPolicy(), false,
+        false, LlmRequestState::kENCODER_INIT, LlmRequestState::kCONTEXT_INIT);
 
     mMicroBatchScheduler = std::make_unique<tensorrt_llm::batch_manager::MicroBatchScheduler>(
         std::nullopt, mModelConfig.getMaxInputLen(), LlmRequestState::kENCODER_INIT, LlmRequestState::kCONTEXT_INIT);
