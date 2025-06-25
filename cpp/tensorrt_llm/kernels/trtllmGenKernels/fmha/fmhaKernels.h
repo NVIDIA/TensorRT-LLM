@@ -336,7 +336,7 @@ private:
             numCtasPerSeqKv = std::min(maxNumCtasPerSeqKv,
                 std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
             // Update the numCtasX.
-            numCtasX *= numCtasPerSeqQ;
+            numCtasX *= numCtasPerSeqKv;
             // The current total number of CTAs.
             int totalNumCtas = numCtasX * numCtasZ * numCtasY;
             // Disable the multiCtasKvMode if there is only one CtaKv.
