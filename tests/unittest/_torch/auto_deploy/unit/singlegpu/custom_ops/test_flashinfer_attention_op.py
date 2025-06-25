@@ -88,7 +88,7 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         ),
         BATCH_SIZE * SEQ_LEN,
     )
-    flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
+    flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
@@ -213,7 +213,7 @@ def test_flashinfer_attention_op_decode(
         ),
         BATCH_SIZE * SEQ_LEN,
     )
-    flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
+    flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
@@ -329,7 +329,7 @@ def test_flashinfer_attention_context_and_generate(
         ),
         BATCH_SIZE * PREFILL_SEQ_LEN,
     )
-    flashinfer_output_1 = torch.ops.attention.flashinfer_mha_with_cache(
+    flashinfer_output_1 = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q_1,
         k_1,
@@ -404,7 +404,7 @@ def test_flashinfer_attention_context_and_generate(
         ),
         BATCH_SIZE * 1,
     )
-    flashinfer_output_3 = torch.ops.attention.flashinfer_mha_with_cache(
+    flashinfer_output_3 = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q_3,
         k_3,
@@ -513,7 +513,7 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         ),
         BATCH_SIZE * SEQ_LEN,
     )
-    flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
+    flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
@@ -660,7 +660,7 @@ def test_flashinfer_attention_with_fp8_cache(
         ),
         BATCH_SIZE * SEQ_LEN,
     )
-    flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
+    flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
@@ -757,7 +757,7 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         ),
         BATCH_SIZE * SEQ_LEN,
     )
-    flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
+    flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
@@ -840,7 +840,7 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         ),
         BATCH_SIZE * 1,
     )
-    flashinfer_output_gen = torch.ops.attention.flashinfer_mha_with_cache(
+    flashinfer_output_gen = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q_gen,
         k_gen,

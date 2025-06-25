@@ -53,7 +53,7 @@ def deepseek_v3_attention(
     # Use custom op to capture mla. This does not handle KV cache
     # as passing transformers Cache into a custom op is throwing an error.
     # Would not be an issue, cause we intend to replace mla op with our implementation further along the pipeline
-    attn_output = torch.ops.deepseek.fused_mla(
+    attn_output = torch.ops.auto_deploy.torch_attention_deepseek_fused_mla(
         q_nope,
         q_pe,
         kv,
@@ -131,7 +131,7 @@ def deepseek_v3_moe(self, hidden_states):
     """DeepSeekV3MoE forward function rewritten in Mixtral style to enable torch export."""
 
     selected_experts, routing_weights, *_ = self.gate(hidden_states)
-    final_hidden_states = torch.ops.moe.torch_moe(
+    final_hidden_states = torch.ops.auto_deploy.torch_moe(
         hidden_states,
         selected_experts,
         routing_weights,
