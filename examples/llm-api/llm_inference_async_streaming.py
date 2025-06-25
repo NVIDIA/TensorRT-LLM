@@ -1,4 +1,4 @@
-### :session Basics
+### :section Basics
 ### :title Generate text in streaming
 ### :order 2
 import asyncio

@@ -1,4 +1,4 @@
-### :session Basics
+### :section Basics
 ### :title Generate text asynchronously
 ### :order 1
 import asyncio

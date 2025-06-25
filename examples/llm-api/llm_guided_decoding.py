@@ -1,4 +1,4 @@
-### :session Customization
+### :section Customization
 ### :title Generate text with guided decoding
 ### :order 0
 from tensorrt_llm import LLM, SamplingParams
