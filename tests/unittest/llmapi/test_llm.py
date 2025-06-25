@@ -2141,13 +2141,17 @@ def run_llm_with_postprocess_parallel_and_result_handler(
     kwargs = {}
     if backend not in ["pytorch", "autodeploy"]:
         kwargs["fast_build"] = True
-    llm = LLM(model=llama_model_path,
-              backend=backend,
-              kv_cache_config=global_kvcache_config,
-              tensor_parallel_size=tp_size,
-              num_postprocess_workers=2,
-              postprocess_tokenizer_dir=llama_model_path,
-              **kwargs)
+        LLM_CLASS = LLM
+    else:
+        LLM_CLASS = LLM_torch
+
+    llm = LLM_CLASS(model=llama_model_path,
+                    backend=backend,
+                    kv_cache_config=global_kvcache_config,
+                    tensor_parallel_size=tp_size,
+                    num_postprocess_workers=2,
+                    postprocess_tokenizer_dir=llama_model_path,
+                    **kwargs)
     golden_result = "DEFGHI"
     for i, output in enumerate(
             llm.generate_async(prompts[0],
