@@ -15,7 +15,7 @@ from typing import Optional, Tuple
 import torch.nn.functional as F
 from cuda import cudart
 from huggingface_hub import hf_hub_download
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from safetensors import safe_open
 from torch import nn
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
@@ -2173,8 +2173,23 @@ class MultimodalModelRunner:
                 if image_path.startswith("http") or image_path.startswith(
                         "https"):
                     logger.info(f"downloading image from url {image_path}")
-                    response = requests.get(image_path, timeout=5)
-                    image = Image.open(BytesIO(response.content)).convert("RGB")
+                    try:
+                        response = requests.get(image_path, timeout=5)
+                        response.raise_for_status()
+                        if 'image' not in response.headers.get(
+                                'Content-Type', ''):
+                            raise Exception(
+                                f"URL does not point to an image: {image_path}."
+                            )
+                        image = Image.open(BytesIO(
+                            response.content)).convert("RGB")
+                    except (UnidentifiedImageError, IOError):
+                        raise Exception(
+                            f"Cannot identify image file at URL: {image_path}.")
+                    except Exception as e:
+                        raise Exception(
+                            f"Failed to download image from url {image_path}: {e}"
+                        )
                 else:
                     image = Image.open(image_path).convert("RGB")
                 images.append(image)
