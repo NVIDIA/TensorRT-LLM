@@ -87,6 +87,10 @@ class PyTorchConfig:
     enable_min_latency: bool = False
     allreduce_strategy: str = "AUTO"
 
+    # The iteration interval to create responses under the streaming mode.
+    # TODO: make this a per-request parameter
+    stream_interval: int = 1
+
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'backend',

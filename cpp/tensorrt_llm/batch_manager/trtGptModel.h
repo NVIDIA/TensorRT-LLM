@@ -18,7 +18,6 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -52,15 +51,15 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
     TrtGptModel(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
-        TrtGptModelOptionalParams const& optionalParams)
-        : mMaxBatchSize{optionalParams.maxBatchSize.value_or(modelConfig.getMaxBatchSize())}
-        , mMaxBeamWidth{optionalParams.maxBeamWidth.value_or(modelConfig.getMaxBeamWidth())}
+        executor::ExecutorConfig const& executorConfig)
+        : mMaxBatchSize{executorConfig.getMaxBatchSize().value_or(modelConfig.getMaxBatchSize())}
+        , mMaxBeamWidth{executorConfig.getMaxBeamWidth()}
         , mMaxSequenceLen{modelConfig.getMaxSequenceLen()}
         , mMaxDraftLen{modelConfig.getMaxDecodingDraftTokens()}
         , mVocabSizePadded{modelConfig.getVocabSizePadded(worldConfig.getSize())}
-        , mNormalizeLogProbs{optionalParams.normalizeLogProbs}
-        , mEnableTrtOverlap{optionalParams.enableTrtOverlap}
-        , mCudaGraphMode{optionalParams.extendedRuntimePerfKnobConfig.getCudaGraphMode()}
+        , mNormalizeLogProbs{executorConfig.getNormalizeLogProbs()}
+        , mEnableTrtOverlap{executorConfig.getEnableTrtOverlap()}
+        , mCudaGraphMode{executorConfig.getExtendedRuntimePerfKnobConfig().getCudaGraphMode()}
     {
         TLLM_CHECK_WITH_INFO(mMaxBeamWidth <= modelConfig.getMaxBeamWidth(),
             "Runtime configured max beam width (%d) must not exceed engine max beam width (%d)", mMaxBeamWidth,
@@ -68,7 +67,7 @@ public:
         TLLM_CHECK_WITH_INFO(mMaxBatchSize <= modelConfig.getMaxBatchSize(),
             "Runtime configured max batch size (%d) must not exceed engine max batch size (%d)", mMaxBatchSize,
             modelConfig.getMaxBatchSize());
-        if (optionalParams.enableTrtOverlap)
+        if (executorConfig.getEnableTrtOverlap())
         {
             if (mMaxBeamWidth > 1)
             {
@@ -85,10 +84,11 @@ public:
         }
 
         mMaxAttentionWindow = 0;
-        if (optionalParams.kvCacheConfig.maxAttentionWindowVec.has_value())
+        if (executorConfig.getKvCacheConfig().getMaxAttentionWindowVec().has_value())
         {
             bool warning = false;
-            for (int maxAttenWin : optionalParams.kvCacheConfig.maxAttentionWindowVec.value())
+            auto const& maxAttentionWindowVec = executorConfig.getKvCacheConfig().getMaxAttentionWindowVec();
+            for (int maxAttenWin : maxAttentionWindowVec.value())
             {
                 mMaxAttentionWindowVec.push_back(std::min(maxAttenWin, mMaxSequenceLen));
                 mMaxAttentionWindow = std::max(mMaxAttentionWindow, mMaxAttentionWindowVec.back());
@@ -112,8 +112,8 @@ public:
             mMaxAttentionWindow = mMaxSequenceLen;
         }
 
-        mSinkTokenLen = optionalParams.kvCacheConfig.sinkTokenLength.has_value()
-            ? optionalParams.kvCacheConfig.sinkTokenLength.value()
+        mSinkTokenLen = executorConfig.getKvCacheConfig().getSinkTokenLength().has_value()
+            ? executorConfig.getKvCacheConfig().getSinkTokenLength().value()
             : 0;
 
         mMaxNumSequences = mMaxBatchSize * worldConfig.getPipelineParallelism();
@@ -136,18 +136,18 @@ public:
         TLLM_LOG_INFO("TRTGptModel normalizeLogProbs: %d", mNormalizeLogProbs);
 
         mMaxNumTokens = modelConfig.getMaxNumTokens();
-        if (optionalParams.maxNumTokens && mMaxNumTokens)
+        if (executorConfig.getMaxNumTokens().has_value() && mMaxNumTokens)
         {
-            if (optionalParams.maxNumTokens.value() > mMaxNumTokens.value())
+            if (executorConfig.getMaxNumTokens().value() > mMaxNumTokens.value())
             {
                 TLLM_LOG_WARNING(
                     "Runtime configured max num tokens (%d) is larger than model max num tokens (%d) and will be "
                     "ignored.",
-                    optionalParams.maxNumTokens.value(), mMaxNumTokens.value());
+                    executorConfig.getMaxNumTokens().value(), mMaxNumTokens.value());
             }
             else
             {
-                mMaxNumTokens = optionalParams.maxNumTokens;
+                mMaxNumTokens = executorConfig.getMaxNumTokens();
             }
         }
         if (mMaxNumTokens)
@@ -155,7 +155,7 @@ public:
             TLLM_LOG_INFO("TRTGptModel maxNumTokens: %d", mMaxNumTokens.value());
         }
 
-        if (optionalParams.enableChunkedContext)
+        if (executorConfig.getEnableChunkedContext())
         {
             mMaxInputLen = mMaxSequenceLen - 1;
             TLLM_LOG_INFO(
@@ -199,9 +199,9 @@ public:
         using tensorrt_llm::common::stl_utils::toString;
 
         TLLM_LOG_INFO("Capacity Scheduler Policy: %s",
-            toString(optionalParams.schedulerConfig.getCapacitySchedulerPolicy()).c_str());
+            toString(executorConfig.getSchedulerConfig().getCapacitySchedulerPolicy()).c_str());
         TLLM_LOG_INFO("Context Chunking Scheduler Policy: %s",
-            toString(optionalParams.schedulerConfig.getContextChunkingPolicy()).c_str());
+            toString(executorConfig.getSchedulerConfig().getContextChunkingPolicy()).c_str());
     }
 
     [[nodiscard]] std::optional<SizeType32> getMaxNumTokens() const

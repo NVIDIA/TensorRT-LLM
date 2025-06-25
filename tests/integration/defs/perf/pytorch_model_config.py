@@ -101,6 +101,26 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': False,
             }
         },
+        # Qwen3 models with fp4 quantization on B200 and fp8 quantization on H200/H20
+        {
+            'patterns': [
+                'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:512-ep:4-gpus:4',
+                'qwen3_235b_a22b_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:256-ep:8-gpus:8'
+            ],
+            'config': {
+                'enable_attention_dp': True,
+            }
+        },
+        # Qwen3 models with fp4 quantization on B200 with moe backend equal to TRTLLM
+        {
+            'patterns': [
+                'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:8-ep:8-gpus:8',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'moe_backend': 'TRTLLM'
+            }
+        }
     ]
 
     # Apply pattern-based configurations on top of base config

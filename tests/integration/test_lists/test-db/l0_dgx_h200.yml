@@ -156,7 +156,7 @@ l0_dgx_h200:
   - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_fp8_tp2[disable_reduce_fusion-enable_fp8_context_fmha]
   - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_fp8_tp2[enable_reduce_fusion-disable_fp8_context_fmha]
   - accuracy/test_cli_flow.py::TestPhi2::test_tp2
-  - llmapi/test_llm_e2e.py::test_llmapi_quant_llama_70b
+  - llmapi/test_llm_e2e.py::test_llmapi_quant_llama_70b TIMEOUT (60)
   - llmapi/test_llm_examples.py::test_llmapi_example_distributed_autopp_tp2
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:2-pp:2-nb:1-disable_fp8]
   - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_py_session-tp2]
