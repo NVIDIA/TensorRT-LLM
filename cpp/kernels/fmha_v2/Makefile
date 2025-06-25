@@ -44,7 +44,7 @@ NVCC ?= $(CCACHE) $(CUDA)/bin/nvcc
 # Flags to compile C++ files.
 CXX_FLAGS = $(CXXFLAGS) -O3 -std=c++17 -g
 # Flags to compile CUDA files.
-NVCC_FLAGS = $(CUDAFLAGS) -O3 -std=c++17 -ccbin $(CXX) -use_fast_math -Xptxas=-v
+NVCC_FLAGS = $(CUDAFLAGS) -O3 -std=c++17 -ccbin $(CXX) -use_fast_math -Xptxas=-v --expt-relaxed-constexpr
 
 # Remove -g -lineinfo when generating cubin files
 ifndef GENERATE_CUBIN
@@ -55,8 +55,6 @@ endif
 GTEST_DIR ?= /usr
 GTEST_LIB = -lgtest -lgtest_main
 GTEST_INC = -I$(GTEST_DIR)/include
-
-NVCC_FLAGS += -Xcicc --uumn -Xptxas -uumn
 
 # Special SM89 support for QMMA.
 ifdef ENABLE_SM89_QMMA

@@ -25,14 +25,15 @@
 
 namespace tensorrt_llm::executor
 {
-// 35 parameters
+// 36 parameters
 Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, SamplingConfig const& samplingConfig,
     OutputConfig const& outputConfig, std::optional<SizeType32> const& endId, std::optional<SizeType32> const& padId,
     std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
     std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
     std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig, std::optional<PromptTuningConfig> pTuningConfig,
-    std::optional<Tensor> multimodalEmbedding, std::optional<MropeConfig> mRopeConfig,
-    std::optional<LoraConfig> loraConfig, std::optional<LookaheadDecodingConfig> lookaheadConfig,
+    std::optional<MultimodalInput> multimodalInput, std::optional<Tensor> multimodalEmbedding,
+    std::optional<MropeConfig> mRopeConfig, std::optional<LoraConfig> loraConfig,
+    std::optional<LookaheadDecodingConfig> lookaheadConfig,
     std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig, std::optional<std::string> logitsPostProcessorName,
     std::optional<LogitsPostProcessor> logitslogitsPostProcessor, std::optional<VecTokens> encoderInputTokenIds,
     std::optional<IdType> clientId, bool returnAllGeneratedTokens, float priority, RequestType type,
@@ -43,12 +44,13 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     std::optional<MillisecondsType> allottedTimeMs)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
         padId, std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
-        std::move(externalDraftTokensConfig), std::move(pTuningConfig), std::move(multimodalEmbedding),
-        std::move(mRopeConfig), std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig),
-        std::move(logitsPostProcessorName), std::move(logitslogitsPostProcessor), std::move(encoderInputTokenIds),
-        clientId, returnAllGeneratedTokens, priority, type, std::move(contextPhaseParams),
-        std::move(encoderInputFeatures), encoderOutputLength, crossAttentionMask, numReturnSequences, eagleConfig,
-        skipCrossAttnBlocks, std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs))
+        std::move(externalDraftTokensConfig), std::move(pTuningConfig), std::move(multimodalInput),
+        std::move(multimodalEmbedding), std::move(mRopeConfig), std::move(loraConfig), lookaheadConfig,
+        std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName), std::move(logitslogitsPostProcessor),
+        std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, type,
+        std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength, crossAttentionMask,
+        numReturnSequences, eagleConfig, skipCrossAttnBlocks, std::move(guidedDecodingParams), languageAdapterUid,
+        allottedTimeMs))
 {
 }
 
@@ -140,6 +142,11 @@ std::optional<PromptTuningConfig> Request::getPromptTuningConfig() const
 std::optional<Tensor> Request::getMultimodalEmbedding() const
 {
     return mImpl->getMultimodalEmbedding();
+}
+
+std::optional<MultimodalInput> Request::getMultimodalInput() const
+{
+    return mImpl->getMultimodalInput();
 }
 
 std::optional<MropeConfig> Request::getMropeConfig() const
@@ -300,6 +307,11 @@ void Request::setPromptTuningConfig(PromptTuningConfig const& pTuningConfig)
 void Request::setMultimodalEmbedding(Tensor const& multimodalEmbedding)
 {
     return mImpl->setMultimodalEmbedding(multimodalEmbedding);
+}
+
+void Request::setMultimodalInput(MultimodalInput const& multimodalInput)
+{
+    return mImpl->setMultimodalInput(multimodalInput);
 }
 
 void Request::setMropeConfig(MropeConfig const& mRopeConfig)

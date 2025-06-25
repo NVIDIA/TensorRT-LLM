@@ -144,9 +144,9 @@ class AttentionMetadata:
             ).item()
             self._num_generations = self._seq_lens.shape[0] - self.num_contexts
         if self._seq_lens_kv is not None:
-            self._num_tokens = int(self._seq_lens_kv.sum())
+            self._num_tokens = self._seq_lens_kv.sum().item()
         elif self._seq_lens is not None:
-            self._num_tokens = int(self._seq_lens.sum())
+            self._num_tokens = self._seq_lens.sum().item()
 
     @property
     def seq_lens(self) -> Optional[torch.Tensor]:
@@ -296,9 +296,6 @@ class AttentionMetadata:
                 )
 
         cuda_graph_metadata.num_contexts = 0
-        cuda_graph_metadata.max_num_requests = max_batch_size
-        cuda_graph_metadata.max_num_tokens = max_batch_size * (1 +
-                                                               max_draft_tokens)
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
@@ -422,7 +419,7 @@ class RopeParams:
                     self.original_max_positions,
                 })
         if rope_inv_freq is not None:
-            rope_inv_freq = torch.torch.tensor(
+            rope_inv_freq = torch.tensor(
                 rope_inv_freq,
                 dtype=torch.float32,
                 device='cuda',
@@ -431,7 +428,7 @@ class RopeParams:
             rope_cos_sin = rope_cos_sin.reshape(
                 self.max_positions, -1,
                 2)[:, :self.dim // 2, :].transpose(0, 2, 1).reshape(1, -1)
-        rope_cos_sin = torch.torch.tensor(
+        rope_cos_sin = torch.tensor(
             rope_cos_sin,
             dtype=torch.float32,
             device='cuda',
@@ -557,6 +554,10 @@ class AttentionBackend(Generic[TMetadata]):
 
     @classmethod
     def support_mla(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_nvfp4_output(cls) -> bool:
         return False
 
 

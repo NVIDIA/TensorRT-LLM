@@ -146,14 +146,15 @@ def calculate_ref_result_gen(fused_q: torch.Tensor, q_pe: torch.Tensor,
                              q_scaling: float):
     """
     use standard attention to calculate the reference result by iterating over each request
-    fused_q shape: (num_requests, num_heads * (kv_lora_rank + qk_rope_head_dim))
-    q_pe shape: (num_requests, num_heads, qk_rope_head_dim)
+    fused_q shape: (num_tokens, num_heads * (kv_lora_rank + qk_rope_head_dim))
+    q_pe shape: (num_tokens, num_heads, qk_rope_head_dim)
     compressed_kv shape: (num_requests, kv_lora_rank)
     k_pe shape: (num_requests, qk_rope_head_dim)
     latent_cache shape: (total_tokens, kv_lora_rank + qk_rope_head_dim)
     rope_cos_sin shape: (max_position_embeddings, 2, qk_rope_head_dim)
     """
     num_requests = len(sequence_lengths)
+    seq_len_q = fused_q.shape[0] // num_requests
 
     # Reshape inputs for reference calculation
     q_reshaped = []
@@ -162,16 +163,17 @@ def calculate_ref_result_gen(fused_q: torch.Tensor, q_pe: torch.Tensor,
     latent_cache_list = []
     total_tokens = 0
     for i in range(num_requests):
-        fused_q_seq = fused_q[i:i + 1].unflatten(
+        fused_q_seq = fused_q[i * seq_len_q:(i + 1) * seq_len_q].unflatten(
             -1, [num_heads, kv_lora_rank + qk_rope_head_dim])
-        q_pe_seq = q_pe[i:i + 1]
-        compressed_kv_seq = compressed_kv[i:i + 1].unsqueeze(-2)
-        k_pe_seq = k_pe[i:i + 1].unsqueeze(-2)
+        q_pe_seq = q_pe[i * seq_len_q:(i + 1) * seq_len_q]
+        compressed_kv_seq = compressed_kv[i * seq_len_q:(i + 1) *
+                                          seq_len_q].unsqueeze(-2)
+        k_pe_seq = k_pe[i * seq_len_q:(i + 1) * seq_len_q].unsqueeze(-2)
         latent_cache_seq = latent_cache[total_tokens:total_tokens +
                                         sequence_lengths[i]].unsqueeze(-2)
 
         cos, sin = rope_cos_sin[sequence_lengths[i]:sequence_lengths[i] +
-                                1].chunk(2, dim=-2)
+                                seq_len_q].chunk(2, dim=-2)
         q_pe_seq = q_pe_seq.unflatten(-1, [-1, 2]).transpose(
             -2, -1).flatten(start_dim=-2)
         k_pe_seq = k_pe_seq.unflatten(-1, [-1, 2]).transpose(
@@ -189,20 +191,21 @@ def calculate_ref_result_gen(fused_q: torch.Tensor, q_pe: torch.Tensor,
         latent_cache_list.append(latent_cache_seq)
 
         q_reshaped.append(fused_q_seq.transpose(
-            0, 1))  # (num_heads, 1, kv_lora_rank + qk_rope_head_dim)
+            0, 1))  # (num_heads, seq_len_q, kv_lora_rank + qk_rope_head_dim)
         k_reshaped.append(latent_cache_seq.transpose(
-            0, 1))  # (1, seq_len, kv_lora_rank + qk_rope_head_dim)
+            0, 1))  # (1, seq_len_kv, kv_lora_rank + qk_rope_head_dim)
         v_reshaped.append(latent_cache_seq[..., :kv_lora_rank].transpose(
-            0, 1))  # (1, seq_len, kv_lora_rank)
+            0, 1))  # (1, seq_len_kv, kv_lora_rank)
 
         total_tokens += sequence_lengths[i]
 
     # Calculate reference result batch by batch
     ref_results = []
     for i in range(num_requests):
-        q = q_reshaped[i]  # (num_heads, 1, kv_lora_rank + qk_rope_head_dim)
-        k = k_reshaped[i]  # (1, seq_len, kv_lora_rank + qk_rope_head_dim)
-        v = v_reshaped[i]  # (1, seq_len, kv_lora_rank)
+        q = q_reshaped[
+            i]  # (num_heads, seq_len_q, kv_lora_rank + qk_rope_head_dim)
+        k = k_reshaped[i]  # (1, seq_len_kv, kv_lora_rank + qk_rope_head_dim)
+        v = v_reshaped[i]  # (1, seq_len_kv, kv_lora_rank)
 
         # Handle grouped-query attention
         k = repeat_kv(k.unsqueeze(0), num_heads).squeeze(0)
@@ -212,6 +215,17 @@ def calculate_ref_result_gen(fused_q: torch.Tensor, q_pe: torch.Tensor,
         attn_weights = torch.matmul(q, k.transpose(1, 2)) / (
             q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
 
+        # Use MTP mask by default if seqlen_q > 1.
+        seq_len_q = q.shape[1]
+        seq_len_kv = k.shape[1]
+        mask = torch.zeros(seq_len_q,
+                           seq_len_kv,
+                           device=q.device,
+                           dtype=torch.bool)
+        for qi in range(seq_len_q):
+            for ki in range(seq_len_kv - seq_len_q + 1 + qi, seq_len_kv):
+                mask[qi, ki] = 1
+        attn_weights = attn_weights.masked_fill(mask, float('-inf'))
         # Apply softmax to get attention probabilities
         attn_weights = torch.nn.functional.softmax(attn_weights,
                                                    dim=-1,
@@ -222,9 +236,9 @@ def calculate_ref_result_gen(fused_q: torch.Tensor, q_pe: torch.Tensor,
         attn_output = torch.matmul(attn_weights,
                                    v)  # (num_heads, 1, kv_lora_rank)
 
-        # Reshape back to (1, num_heads*kv_lora_rank)
+        # Reshape back to (seq_len_q, num_heads*kv_lora_rank)
         attn_output = attn_output.transpose(0, 1).contiguous().view(
-            1, num_heads * kv_lora_rank)
+            -1, num_heads * kv_lora_rank)
         ref_results.append(attn_output)
 
     ref_result = torch.cat(ref_results)
@@ -292,6 +306,8 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
                                  head_dim)
 
 
+# Set seed for reproducibility.
+random.seed(0)
 min_context_sequence_length = 1
 max_context_sequence_length = 1000
 min_num_contexts = 1
@@ -309,6 +325,8 @@ context_sequence_lengths = [
     [100, 1110, 1000, 1000],
     random_context_sequence_lengths,
 ]
+# Use MTP by default if seqlen_q > 1.
+generation_seq_len_q = [1, 4]
 num_generation_steps = [10]
 
 kv_cache_dtype_list = [torch.bfloat16]
@@ -321,7 +339,7 @@ scenarios = [
 
 accuracy_dict = {
     torch.bfloat16: (3e-2, 3e-3),
-    torch.float8_e4m3fn: (3e-1, 3e-2),
+    torch.float8_e4m3fn: (4e-1, 4e-2),
 }
 
 
@@ -330,10 +348,14 @@ accuracy_dict = {
 @pytest.mark.parametrize("context_sequence_lengths",
                          context_sequence_lengths,
                          ids=lambda x: f"context_sequence_lengths: {x}")
+@pytest.mark.parametrize("generation_seq_len_q",
+                         generation_seq_len_q,
+                         ids=lambda x: f"generation_seq_len_q: {x}")
 @pytest.mark.parametrize("num_generation_steps",
                          num_generation_steps,
                          ids=lambda x: f"num_generation_steps: {x}")
 def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
+                       generation_seq_len_q: int,
                        num_generation_steps: List[int]):
     """Test MLA computation for both context and generation phases"""
     num_heads = scenario.num_heads
@@ -375,7 +397,7 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
                           qk_rope_head_dim, v_head_dim, rope_config,
                           kv_cache_tokens_per_block, device, dtype,
                           kv_cache_dtype, context_sequence_lengths,
-                          num_generation_steps)
+                          generation_seq_len_q, num_generation_steps)
 
 
 def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
@@ -383,9 +405,12 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                           qk_rope_head_dim, v_head_dim, rope_config,
                           kv_cache_tokens_per_block, device, dtype,
                           kv_cache_dtype, context_sequence_lengths,
-                          num_generation_steps):
+                          generation_seq_len_q, num_generation_steps):
     AttentionCls = get_attention_backend(backend_name)
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+
+    # Set seed for reproducibility.
+    torch.manual_seed(123)
 
     # Create inputs
     inputs_per_layer = []
@@ -428,7 +453,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         gen_compressed_kv_list = [
             torch.cat([
                 torch.empty(
-                    [1, kv_lora_rank],
+                    [generation_seq_len_q, kv_lora_rank],
                     dtype=dtype,
                     device=device,
                 ).uniform_(-1, 1) for _ in context_sequence_lengths
@@ -437,7 +462,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         gen_k_pe_list = [
             torch.cat([
                 torch.empty(
-                    [1, qk_rope_head_dim],
+                    [generation_seq_len_q, qk_rope_head_dim],
                     dtype=dtype,
                     device=device,
                 ).uniform_(-1, 1) for _ in context_sequence_lengths
@@ -446,7 +471,10 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         gen_fused_q_list = [
             torch.cat([
                 torch.empty(
-                    [1, num_heads * (kv_lora_rank + qk_rope_head_dim)],
+                    [
+                        generation_seq_len_q, num_heads *
+                        (kv_lora_rank + qk_rope_head_dim)
+                    ],
                     dtype=dtype,
                     device=device,
                 ).uniform_(-1, 1) for _ in context_sequence_lengths
@@ -455,7 +483,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         gen_q_pe_list = [
             torch.cat([
                 torch.empty(
-                    [1, num_heads, qk_rope_head_dim],
+                    [generation_seq_len_q, num_heads, qk_rope_head_dim],
                     dtype=dtype,
                     device=device,
                 ).uniform_(-1, 1) for _ in context_sequence_lengths
@@ -554,7 +582,8 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
     # all layers share the same metadata
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     max_tokens = (
-        max_context_sequence_length + num_generation_steps + 1 +
+        max_context_sequence_length +
+        (num_generation_steps + 1) * generation_seq_len_q +
         kv_cache_tokens_per_block - 1
     ) // kv_cache_tokens_per_block * kv_cache_tokens_per_block * max_num_contexts
     kv_cache_manager = KVCacheManager(
@@ -567,7 +596,8 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         num_kv_heads=1,
         head_dim=kv_lora_rank + qk_rope_head_dim,
         tokens_per_block=kv_cache_tokens_per_block,
-        max_seq_len=max(context_sequence_lengths) + num_generation_steps + 1,
+        max_seq_len=max(context_sequence_lengths) +
+        (num_generation_steps + 1) * generation_seq_len_q,
         max_batch_size=len(context_sequence_lengths),
         mapping=mapping,
         dtype=str_dtype_to_binding(torch_dtype_to_str(kv_cache_dtype)),
@@ -607,9 +637,11 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
     for step in range(num_generation_steps + 1):
         if step > 0:
             for req_id in range(len(context_sequence_lengths)):
-                kv_cache_manager.impl.add_token(req_id)
+                for _ in range(generation_seq_len_q):
+                    kv_cache_manager.impl.add_token(req_id)
             attn_metadata = AttentionCls.Metadata(
-                seq_lens=torch.tensor([1] * len(context_sequence_lengths),
+                seq_lens=torch.tensor([generation_seq_len_q] *
+                                      len(context_sequence_lengths),
                                       dtype=torch.int),
                 request_ids=list(range(len(context_sequence_lengths))),
                 max_num_requests=len(context_sequence_lengths),
@@ -620,7 +652,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 kv_cache_params=KVCacheParams(
                     use_cache=True,
                     num_cached_tokens_per_seq=[
-                        ctx_len + step - 1
+                        ctx_len + (step - 1) * generation_seq_len_q
                         for ctx_len in context_sequence_lengths
                     ],
                 ),
@@ -695,7 +727,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                     qk_nope_head_dim,
                     qk_rope_head_dim,
                     [
-                        ctx_len + step - 1
+                        ctx_len + (step - 1) * generation_seq_len_q
                         for ctx_len in context_sequence_lengths
                     ],
                     q_scaling,

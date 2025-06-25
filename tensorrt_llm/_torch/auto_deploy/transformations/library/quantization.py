@@ -90,7 +90,7 @@ def quantize(gm: GraphModule, quant_config: Dict[str, Any]):
 
     # no quantization to do
     if not (is_quant_graph or quant_config):
-        ad_logger.debug("No quantization to do.")
+        ad_logger.info("No quantization to do.")
         return gm
 
     # tracking quantized linears in the graph

@@ -363,6 +363,12 @@ struct Kernel_traits_
         ENABLE_BMM1_SOFTCAPPING_SCALE = (FLAGS & 0x800) != 0u
     };
 
+    // Use MTP (multi-token prediction for MLA kernels) or not.
+    enum
+    {
+        IS_MTP = (FLAGS & 0x2000) != 0u
+    };
+
     // The number of CTAs per head for Cta_tile_p; equivalent to BMM1 split-K
     enum
     {

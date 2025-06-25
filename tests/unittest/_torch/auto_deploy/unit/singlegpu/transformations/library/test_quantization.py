@@ -14,7 +14,10 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
 def check_quantized(gm):
-    op_expected = {torch.ops.quant.fp8_linear, torch.ops.quant.fp4_linear}
+    op_expected = {
+        torch.ops.auto_deploy.torch_quant_fp8_linear,
+        torch.ops.auto_deploy.torch_quant_fp4_linear,
+    }
     return any(is_op(n, op_expected) for n in gm.graph.nodes)
 
 
@@ -61,6 +64,8 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
         rtol,
         True,  # test_load_hook
         False,  # strict_loading
+        None,  # dynamic_shapes
+        None,  # check_num_matches
         quant_config,
     )
 

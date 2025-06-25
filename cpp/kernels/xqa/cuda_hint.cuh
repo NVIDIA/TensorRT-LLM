@@ -27,7 +27,7 @@
 #define __CUDACC_VER_MAJOR__ 12
 #endif
 #ifndef __CUDACC_VER_MINOR__
-#define __CUDACC_VER_MINOR__ 4
+#define __CUDACC_VER_MINOR__ 9
 #endif
 
 #if __CUDA_ARCH__ == 900

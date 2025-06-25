@@ -24,7 +24,7 @@
 cmake_minimum_required(VERSION 3.17)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules/set_ifndef.cmake)
 
-set_ifndef(TRTLLM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../tensorrt_llm)
+set_ifndef(TRTLLM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../)
 
 include_directories(${TRTLLM_DIR} ${TRTLLM_DIR}/cpp/include)
 
@@ -151,23 +151,17 @@ find_package(Python3 COMPONENTS Interpreter Development)
 find_library(
   tensorrt_llm libtensorrt_llm.so REQUIRED
   PATHS ${Python3_SITEARCH}/tensorrt_llm/libs
-        ${TRTLLM_DIR}/cpp/build/tensorrt_llm
-        ${CMAKE_CURRENT_SOURCE_DIR}/../tensorrt_llm/cpp/build/tensorrt_llm)
+        ${TRTLLM_DIR}/cpp/build/tensorrt_llm)
 
 find_library(
   nvinfer_plugin_tensorrt_llm libnvinfer_plugin_tensorrt_llm.so REQUIRED
-  PATHS
-    ${Python3_SITEARCH}/tensorrt_llm/libs
-    ${TRTLLM_DIR}/cpp/build/tensorrt_llm/plugins
-    ${CMAKE_CURRENT_SOURCE_DIR}/../tensorrt_llm/cpp/build/tensorrt_llm/plugins)
+  PATHS ${Python3_SITEARCH}/tensorrt_llm/libs
+        ${TRTLLM_DIR}/cpp/build/tensorrt_llm/plugins)
 
 find_program(
   TRTLLM_EXECUTOR_WORKER executorWorker REQUIRED
-  PATHS
-    ${Python3_SITEARCH}/tensorrt_llm/bin
-    ${TRTLLM_DIR}/cpp/build/tensorrt_llm/executor_worker
-    ${CMAKE_CURRENT_SOURCE_DIR}/../tensorrt_llm/cpp/build/tensorrt_llm/executor_worker
-)
+  PATHS ${Python3_SITEARCH}/tensorrt_llm/bin
+        ${TRTLLM_DIR}/cpp/build/tensorrt_llm/executor_worker)
 install(
   PROGRAMS ${TRTLLM_EXECUTOR_WORKER}
   DESTINATION ${CMAKE_BINARY_DIR}

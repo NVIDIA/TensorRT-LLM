@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include "moe_gemm_kernels.h"
-#include "moe_kernels.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/runtime/torchUtils.h"

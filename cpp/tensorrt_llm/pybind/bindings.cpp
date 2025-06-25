@@ -24,7 +24,7 @@
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
+#include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
 #include "tensorrt_llm/pybind/batch_manager/bindings.h"
@@ -40,7 +40,6 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
-#include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -114,8 +113,14 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def("get_device", &tr::CudaStream::getDevice);
 
     // Create submodule for executor bindings.
-    py::module_ executor_submodule = m.def_submodule("executor", "Executor bindings");
-    tensorrt_llm::pybind::executor::initBindings(executor_submodule);
+    auto mExecutor = m.def_submodule("executor", "Executor bindings");
+    auto mInternal = m.def_submodule("internal", "Internal submodule of TRTLLM runtime");
+    auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
+    auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
+    auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
+
+    tensorrt_llm::pybind::executor::initBindings(mExecutor);
+    tensorrt_llm::pybind::runtime::initBindingsEarly(mInternalRuntime);
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = py::int_(ENABLE_MULTI_DEVICE);
@@ -292,12 +297,13 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("has_fp8_kv_cache", &tc::QuantMode::hasFp8KvCache)
         .def_property_readonly("has_fp8_qdq", &tc::QuantMode::hasFp8Qdq)
         .def_property_readonly("has_nvfp4", &tc::QuantMode::hasNvfp4)
+        .def_property_readonly("has_w4a8_mxfp4_fp8", &tc::QuantMode::hasW4a8Mxfp4Fp8)
         .def_property_readonly("has_kv_cache_quant", &tc::QuantMode::hasKvCacheQuant)
-        .def_static("from_description", &tc::QuantMode::fromDescription, py::arg("quantize_weights") = false,
-            py::arg("quantize_activations") = false, py::arg("per_token") = false, py::arg("per_channel") = false,
-            py::arg("per_group") = false, py::arg("use_int4_weights") = false, py::arg("use_int8_kv_cache") = false,
-            py::arg("use_fp8_kv_kache") = false, py::arg("use_fp8_qdq") = false, py::arg("use_fp8_rowwise") = false,
-            py::arg("use_w4a8_qserve") = false, py::arg("use_nvfp4") = false, py::arg("use_fp8_block_scales") = false)
+        .def_static("from_description", &tc::QuantMode::fromDescription, py::arg("quantize_weights"),
+            py::arg("quantize_activations"), py::arg("per_token"), py::arg("per_channel"), py::arg("per_group"),
+            py::arg("use_int4_weights"), py::arg("use_int8_kv_cache"), py::arg("use_fp8_kv_kache"),
+            py::arg("use_fp8_qdq"), py::arg("use_fp8_rowwise"), py::arg("use_w4a8_qserve"), py::arg("use_nvfp4"),
+            py::arg("use_fp8_block_scales"), py::arg("use_w4a8_mxfp4_fp8"))
         .def_static("use_smooth_quant", &tc::QuantMode::useSmoothQuant, py::arg("per_token") = false,
             py::arg("per_channel") = false)
         .def_static("use_weight_only", &tc::QuantMode::useWeightOnly, py::arg("use_int4_weights") = false,
@@ -317,7 +323,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::arg("num_heads"), py::arg("hidden_size"), py::arg("data_type"))
         .def_property_readonly("vocab_size", &tr::ModelConfig::getVocabSize)
         .def("vocab_size_padded", &tr::ModelConfig::getVocabSizePadded, py::arg("world_size"))
-        .def("num_layers", &tr::ModelConfig::getNbLayers, py::arg("pipeline_parallelism") = 1)
+        .def("num_layers", &tr::ModelConfig::getNbLayers, py::arg("pipeline_parallelism") = 1,
+            py::arg("pipeline_parallelism_rank") = 0)
         .def("num_attention_layers", &tr::ModelConfig::getNbAttentionLayers, py::arg("pipeline_parallelism") = 1,
             py::arg("pipeline_parallelism_rank") = 0)
         .def("num_rnn_layers", &tr::ModelConfig::getNbRnnLayers, py::arg("pipeline_parallelism") = 1,
@@ -328,6 +335,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("hidden_size", &tr::ModelConfig::getHiddenSize)
         .def_property_readonly("size_per_head", &tr::ModelConfig::getSizePerHead)
         .def_property_readonly("data_type", &tr::ModelConfig::getDataType)
+        .def_property_readonly("speculative_decoding_mode", &tr::ModelConfig::getSpeculativeDecodingMode)
         .def_property("head_size", &tr::ModelConfig::getSizePerHead, &tr::ModelConfig::setSizePerHead)
         .def_property(
             "num_kv_heads_per_layer", &tr::ModelConfig::getNumKvHeadsPerLayer, &tr::ModelConfig::setNumKvHeadsPerLayer)
@@ -455,10 +463,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("num_return_sequences", &tr::SamplingConfig::numReturnSequences)
         .def_readwrite("min_p", &tr::SamplingConfig::minP)
         .def_readwrite("beam_width_array", &tr::SamplingConfig::beamWidthArray)
+        .def_readwrite("normalize_log_probs", &tr::SamplingConfig::normalizeLogProbs)
         .def(py::pickle(SamplingConfigGetState, SamplingConfigSetState))
         .def("__eq__", &tr::SamplingConfig::operator==);
-
-    py::bind_vector<std::vector<tr::SamplingConfig>>(m, "VectorSamplingConfig");
 
     m.def("make_sampling_config", &makeSamplingConfig, py::arg("configs"));
 
@@ -503,43 +510,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("DISAGG_GENERATION_TRANS_COMPLETE", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE)
         .value("DISAGG_CONTEXT_INIT_AND_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
 
-    auto gptModelParamsGetState = [&kvCacheConfigGetState](tb::TrtGptModelOptionalParams const& params)
-    {
-        auto kvCacheState = kvCacheConfigGetState(params.kvCacheConfig);
-        return py::make_tuple(kvCacheState, params.enableTrtOverlap, params.deviceIds, params.normalizeLogProbs,
-            params.enableChunkedContext, params.decodingConfig.getDecodingMode());
-    };
-    auto gptModelParamsSetState = [&kvCacheConfigSetState](py::tuple t)
-    {
-        auto kvCacheConfig = kvCacheConfigSetState(t[0]);
-        return tb::TrtGptModelOptionalParams(kvCacheConfig, t[1].cast<bool>(),
-            t[2].cast<std::optional<std::vector<SizeType32>>>(), t[3].cast<bool>(), t[4].cast<bool>(),
-            tb::PeftCacheManagerConfig{},
-            tensorrt_llm::executor::DecodingConfig(t[5].cast<std::optional<tensorrt_llm::executor::DecodingMode>>()));
-    };
-
-    py::class_<tb::TrtGptModelOptionalParams>(m, "TrtGptModelOptionalParams")
-        .def(py::init<tbk::KvCacheConfig, bool, std::optional<std::vector<SizeType32>> const&, bool, bool,
-                 tb::PeftCacheManagerConfig const&>(),
-            py::arg_v("kv_cache_config", tbk::KvCacheConfig{}, "KvCacheConfig()"),
-            py::arg("enable_trt_overlap") = false, py::arg("device_ids") = std::nullopt,
-            py::arg("normalize_log_probs") = true, py::arg("enable_chunked_context") = false,
-            py::arg_v("peft_cache_manager_config", tb::PeftCacheManagerConfig{}, "PeftCacheManagerConfig()"))
-        .def(py::init<tensorrt_llm::executor::ExecutorConfig const&, bool>(), py::arg("executor_config"),
-            py::arg("is_leader_in_orch_mode") = false)
-        .def_readwrite("kv_cache_config", &tb::TrtGptModelOptionalParams::kvCacheConfig)
-        .def_readwrite("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap)
-        .def_readwrite("device_ids", &tb::TrtGptModelOptionalParams::deviceIds)
-        .def_readwrite("enable_chunked_context", &tb::TrtGptModelOptionalParams::enableChunkedContext)
-        .def_readwrite("normalize_log_probs", &tb::TrtGptModelOptionalParams::normalizeLogProbs)
-        .def_readwrite("decoding_config", &tb::TrtGptModelOptionalParams::decodingConfig)
-        .def_readwrite("use_gpu_direct_storage", &tb::TrtGptModelOptionalParams::useGpuDirectStorage)
-        .def_readwrite("gpu_weights_percent", &tb::TrtGptModelOptionalParams::gpuWeightsPercent)
-        .def_readwrite("max_beam_width", &tb::TrtGptModelOptionalParams::maxBeamWidth)
-        .def_readwrite("scheduler_config", &tb::TrtGptModelOptionalParams::schedulerConfig)
-        .def_readwrite("cache_transceiver_config", &tb::TrtGptModelOptionalParams::cacheTransceiverConfig)
-        .def(py::pickle(gptModelParamsGetState, gptModelParamsSetState));
-
     py::class_<tr::MemoryCounters>(m, "MemoryCounters")
         .def_static("instance", &tr::MemoryCounters::getInstance, py::return_value_policy::reference)
         .def_property_readonly("gpu", &tr::MemoryCounters::getGpu)
@@ -547,15 +517,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("pinned", &tr::MemoryCounters::getPinned)
         .def_property_readonly("uvm", &tr::MemoryCounters::getUVM);
 
-    auto mInternal = m.def_submodule("internal", "Internal submodule of TRTLLM runtime");
-
-    auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
     tensorrt_llm::pybind::runtime::initBindings(mInternalRuntime);
-
-    auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
     tensorrt_llm::pybind::testing::initBindings(mInternalTesting);
-
-    auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
     tpb::initBindings(mInternalBatchManager);
     tb::kv_cache_manager::KVCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::BasePeftCacheManagerBindings::initBindings(mInternalBatchManager);

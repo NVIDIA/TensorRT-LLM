@@ -4,3 +4,5 @@
 *.dll filter=lfs diff=lfs merge=lfs -text
 *.xz filter=lfs diff=lfs merge=lfs -text
 triton_backend/tools/gpt/input_data.json filter=lfs diff=lfs merge=lfs -text
+*cubin.cpp filter=lfs diff=lfs merge=lfs -text
+docs/source/blogs/media/tech_blog3_mla_absorb.png filter=lfs diff=lfs merge=lfs -text

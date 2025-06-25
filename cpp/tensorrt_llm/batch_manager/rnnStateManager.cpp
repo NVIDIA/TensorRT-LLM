@@ -41,7 +41,8 @@ RnnStateManager::RnnStateManager(SizeType32 maxNumSequences, tensorrt_llm::runti
     auto const rnnHiddenSize = rnnConfig->rnnHiddenSize;
     auto const rnnHeadSize = rnnConfig->rnnHeadSize;
     auto const rnnConvDimSize = rnnConfig->rnnConvDimSize;
-    auto const localNbLayers = modelConfig.getNbRnnLayers(worldConfig.getPipelineParallelism());
+    auto const localNbLayers
+        = modelConfig.getNbRnnLayers(worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
     auto const dataType = modelConfig.getDataType();
 
     auto const rnnStateShape = [&]()
@@ -84,8 +85,8 @@ RnnStateManager::RnnStateManager(SizeType32 maxNumSequences, tensorrt_llm::runti
 void RnnStateManager::getPtrBuffers(
     TensorMap& inputBuffers, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig) const
 {
-    auto const localNbLayers = modelConfig.getNbRnnLayers(worldConfig.getPipelineParallelism());
-    auto const firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
+    auto const firstLayerId
+        = modelConfig.getFirstLocalLayer(worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
     auto const& layerTypes = modelConfig.getLayerTypes();
 
     utils::insertTensorVector(

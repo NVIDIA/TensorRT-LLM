@@ -81,6 +81,8 @@ def _test_llm_multimodal_general(llm_venv,
 
     if "neva-22b" in tllm_model_name and get_device_memory() < 80000:
         pytest.skip("GPU memory is insufficient.")
+    if "Mistral-Small" in tllm_model_name and get_device_memory() < 80000:
+        pytest.skip("GPU memory is insufficient.")
 
     print("Converting huggingface model into binary format...")
     # ckpt from llm_models/<model_name> --> cmodels/<model_name>/<dtype>
@@ -621,12 +623,13 @@ def _test_llm_multimodal_general(llm_venv,
     'cogvlm-chat',
     'fuyu-8b',
     'deplot',
-    'neva-22b',
+    pytest.param('neva-22b',
+                 marks=pytest.mark.skip(reason="RCCA https://nvbugs/5220761")),
     'kosmos-2',
     'video-neva',
     pytest.param('Phi-3-vision-128k-instruct', marks=skip_post_blackwell),
-    'Phi-3.5-vision-instruct',
-    'Phi-4-multimodal-instruct',
+    pytest.param('Phi-3.5-vision-instruct', marks=skip_post_blackwell),
+    pytest.param('Phi-4-multimodal-instruct', marks=skip_post_blackwell),
     'Llama-3.2-11B-Vision',
     'Qwen2-VL-7B-Instruct',
     'internlm-xcomposer2-vl-7b',

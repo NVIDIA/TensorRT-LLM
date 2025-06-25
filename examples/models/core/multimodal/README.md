@@ -831,7 +831,7 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
 
 ## NeVA
 
-[NeVA](https://docs.nvidia.com/nemo-framework/user-guide/latest/multimodalmodels/neva/index.html) is a groundbreaking addition to the NeMo Multimodal ecosystem. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.
+[NeVA](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/multimodal/mllm/neva.html) is a groundbreaking addition to the NeMo Multimodal ecosystem. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.
 
 1. Generate TRT-LLM engine for NVGPT following example in `examples/models/core/gpt/README.md`. To adhere to the NVGPT conventions of the conversion script, some layer keys have to be remapped using `--nemo_rename_key`.
 

@@ -10,7 +10,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.flashinfer_attention import Flas
 from tensorrt_llm._torch.auto_deploy.custom_ops.triton_attention import TritonWithFlattenedInputs
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations.library import check_in_out_nodes
+from tensorrt_llm._torch.auto_deploy.transformations.library import update_in_out_nodes
 from tensorrt_llm._torch.auto_deploy.transformations.library.kvcache import insert_cached_attention
 
 
@@ -53,7 +53,9 @@ class GQAWithSdpa(GQA):
         v = v.view(b, s, self.num_kv_heads, self.head_dim)
 
         # Use grouped SDPA in bsnd layout
-        attn_output = torch.ops.attention.bsnd_grouped_sdpa(q, k, v, None, 0.0, True, None)
+        attn_output = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa(
+            q, k, v, None, 0.0, True, None
+        )
 
         # SDPA output is already in [b, s, n, h_d] format
         # Reshape to [b, s, n*h_d]
@@ -135,11 +137,11 @@ def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
     cache_config = CacheConfig()
 
     # Get input node(s)
-    input_nodes = check_in_out_nodes(gm)
+    gm_transformed = update_in_out_nodes(gm, cm)
 
     # Apply the transformation
     gm_transformed = insert_cached_attention(
-        gm, cm, attn_descriptor=attn_descriptor, cache_config=cache_config, input_nodes=input_nodes
+        gm_transformed, cm, attn_descriptor=attn_descriptor, cache_config=cache_config
     )
     gm_transformed.to("cuda")
     cm.initialize_caches()

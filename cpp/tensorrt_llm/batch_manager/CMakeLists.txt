@@ -27,7 +27,6 @@ set(SRCS
     dataTransceiverImpl.cpp
     decoderBuffers.cpp
     encoderBuffers.cpp
-    generateRequestOptions.cpp
     guidedDecoder.cpp
     handleContextLogits.cpp
     handleGenerationLogits.cpp
@@ -96,6 +95,10 @@ set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 target_compile_definitions(${BATCH_MANAGER_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
+if(ENABLE_CUFILE)
+  target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${CUFILE_LIBRARY})
+endif()
+
 if(ENABLE_UCX)
   find_package(ucx REQUIRED)
   find_package(ucxx REQUIRED)
@@ -103,4 +106,5 @@ if(ENABLE_UCX)
     ${BATCH_MANAGER_STATIC_TARGET}
     PRIVATE $<TARGET_PROPERTY:ucxx::ucxx,INTERFACE_INCLUDE_DIRECTORIES>)
   target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC)
+
 endif()

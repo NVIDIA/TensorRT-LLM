@@ -364,9 +364,14 @@ __device__ inline InputElem2 float2ToInputElem2(float2 src)
         reinterpret_cast<nv_bfloat162&>(dst) = __float22bfloat162_rn(src);
         return dst;
     }
+    else if constexpr (mha::is_same_v<InputElem2, __nv_fp8x2_e4m3>)
+    {
+        reinterpret_cast<__nv_fp8x2_e4m3&>(dst) = __nv_fp8x2_e4m3{src};
+        return dst;
+    }
     else
     {
-        return InputElem2{InputElem{src.x}, InputElem{src.y}};
+        trap();
     }
 }
 

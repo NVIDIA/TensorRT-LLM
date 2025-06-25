@@ -107,7 +107,7 @@ public:
     std::vector<Response> awaitResponses(std::optional<std::chrono::milliseconds> const& timeout = std::nullopt);
 
     std::vector<Response> awaitResponses(
-        IdType const& optId, std::optional<std::chrono::milliseconds> const& optTimeout = std::nullopt);
+        IdType const& reqId, std::optional<std::chrono::milliseconds> const& optTimeout = std::nullopt);
 
     std::vector<std::vector<Response>> awaitResponses(
         std::vector<IdType> const& requestIds, std::optional<std::chrono::milliseconds> const& timeout);

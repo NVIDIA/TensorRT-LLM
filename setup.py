@@ -31,7 +31,8 @@ def parse_requirements(filename: os.PathLike):
         extra_URLs = []
         deps = []
         for line in requirements:
-            if line.startswith("#") or line.startswith("-r"):
+            if line.startswith("#") or line.startswith("-r") or line.startswith(
+                    "-c"):
                 continue
 
             # handle -i and --extra-index-url options
@@ -87,6 +88,10 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
+constraints_file = Path("constraints.txt")
+if constraints_file.exists():
+    constraints, _ = parse_requirements(constraints_file)
+    required_deps.extend(constraints)
 
 if on_windows:
     package_data = [
@@ -98,6 +103,7 @@ else:
         'bin/executorWorker', 'libs/libtensorrt_llm.so', 'libs/libth_common.so',
         'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
+        'libs/libtensorrt_llm_nixl_wrapper.so',
         'libs/libdecoder_attention_1.so', 'bindings.*.so', "include/**/*"
     ]
 

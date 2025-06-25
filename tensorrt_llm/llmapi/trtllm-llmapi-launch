@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-task_with_command="${@:1}"
+task_with_command=("$@")
 native_mpi_rank=$OMPI_COMM_WORLD_RANK
 mpi_rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
 
@@ -47,7 +47,7 @@ log_stderr "tllm_mpi_size: $tllm_mpi_size"
 export_free_tcp_addr_for_spawn_proxy_process
 
 if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
-    log_stderr "rank${mpi_rank} run ${task_with_command} in background"
+    log_stderr "rank${mpi_rank} run ${task_with_command[@]} in background"
 
     # MPI doesn't allow spawn a process sharing the MPI environment in a MPI
     # process, or duplicate MPI_Init in the child process will cause undefined
@@ -71,7 +71,9 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         done
 
         # Execute the task with cleaned environment
-        $task_with_command
+       "${task_with_command[@]}"
+        # stop the MPI Comm server
+        python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop
     ) &
 
     log_stderr "rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_world_size) ..."

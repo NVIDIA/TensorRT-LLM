@@ -1497,9 +1497,17 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     int const shift_for_cyclic_k = (enable_use_seq_idx_kv) ? tlength - cyclic_kv_cache_len : pastKCache.mBubbleLen;
     // The actual kv cache length.
     // tlength is the past length actually.
-    int const kv_loop_length = min(tlength, cyclic_kv_cache_len);
+    int kv_loop_length = min(tlength, cyclic_kv_cache_len);
     // The bound of the kv token idx (kv_loop_length = 0 should not happen ideally, but add here for safety).
     int const kv_token_idx_bound = max(kv_loop_length - 1, 0);
+    // The kv_token_start_offset. All tokens before kv_token_start_offset will be fully masked.
+    int kv_token_start_offset = 0;
+    // Only consider the current attention chunk if the chunked attention is used.
+    if (params.chunked_attention_size_log2 > 0)
+    {
+        kv_token_start_offset = (tlength >> params.chunked_attention_size_log2) << params.chunked_attention_size_log2;
+        kv_loop_length -= kv_token_start_offset;
+    }
     // The shared context length for beam searching optimization (all points to beam 0).
     // TODO: with cyclic kv cache, we set it 0 for now (will optimize in the future)
     // as context kv cache might be overwritten by the new kv cache
@@ -1687,7 +1695,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         int const smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts
 
         assert(half_rotary_dim % QK_VEC_SIZE == 0);
-        if (params.position_embedding_type == PositionEmbeddingType::kROPE_M)
+        if (params.position_embedding_type == PositionEmbeddingType::kROPE_M && params.mrope_position_deltas != nullptr)
         {
             current_pos_idx += params.mrope_position_deltas[batch_idx];
         }
@@ -1964,7 +1972,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 // Dh OOB values will be handled by zero_q.
                 // Seq OOB values will be masked out when storing back to smem.
                 auto const jj = min(k_idx.y + k_vec_i * K_ELTS_PER_CHUNK, Dh - K_VEC_SIZE);
-                int valid_time_now = min(time_now + k_loop * K_PER_ITER, kv_token_idx_bound);
+                int valid_time_now = min(time_now + kv_token_start_offset + k_loop * K_PER_ITER, kv_token_idx_bound);
                 // The beam offset is always 0 either when beam_width = 1
                 // or the time_idx < kv_loop_length (all beams share the same context kv cache).
                 int beam_offset
@@ -2331,6 +2339,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             {
                 // Fetch offset based on cache_indir when beam sampling
                 int time_idx = ti + v_loop * V_PER_ITER + (MULTI_BLOCK_FLAG ? c_tile_times_timesteps_per_block : 0);
+                time_idx += kv_token_start_offset;
                 time_idx = min(time_idx, kv_token_idx_bound);
                 // The beam offset is always 0 either when beam_width = 1
                 // or the time_idx < kv_loop_length (all beams share the same context kv cache).

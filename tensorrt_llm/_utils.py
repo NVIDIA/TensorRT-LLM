@@ -523,6 +523,23 @@ def mpi_recv(buf, source, tag):
     return None
 
 
+def mpi_send_object(obj, dest, tag=0):
+    if ENABLE_MULTI_DEVICE:
+        mpi_comm().send(obj, dest=dest, tag=tag)
+
+
+def mpi_isend_object(obj, dest, tag=0):
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().isend(obj, dest=dest, tag=tag)
+    return None
+
+
+def mpi_recv_object(source, tag):
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().recv(source=source, tag=tag)
+    return None
+
+
 def pad_vocab_size(vocab_size, tp_size):
     return int(math.ceil(vocab_size / tp_size) * tp_size)
 
@@ -647,7 +664,6 @@ def trace_func(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        import dill  # nosec B403
 
         def globaltrace(frame, why, arg):
             if why == "call":
@@ -676,8 +692,7 @@ def trace_func(func):
             return localtrace
 
         ignoredirs = [
-            os.path.dirname(package.__file__)
-            for package in [os, torch, trace, dill]
+            os.path.dirname(package.__file__) for package in [os, torch, trace]
         ]
         tracer = trace.Trace(trace=1, count=0, ignoredirs=ignoredirs)
         rank = global_mpi_rank()
@@ -764,6 +779,26 @@ class QuantModeWrapper:
 
     def __getitem__(self, index):
         return self.objs[index]
+
+
+PYTHON_DEFAULT_GC_THRESHOLDS = gc.get_threshold()
+
+
+@contextmanager
+def customized_gc_thresholds(gen0_threshold: Optional[int] = None):
+    try:
+        if gen0_threshold:
+            gc.set_threshold(gen0_threshold)
+            logger.debug(
+                f'Set Python GC threshold to customized value: {gen0_threshold}'
+            )
+        yield
+    finally:
+        if gen0_threshold:
+            gc.set_threshold(*PYTHON_DEFAULT_GC_THRESHOLDS)
+            logger.debug(
+                f'Reset Python GC thresholds to default value: {PYTHON_DEFAULT_GC_THRESHOLDS}'
+            )
 
 
 @contextmanager

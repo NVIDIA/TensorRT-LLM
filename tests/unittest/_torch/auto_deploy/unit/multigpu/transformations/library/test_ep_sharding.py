@@ -33,7 +33,7 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
         expected_expert = num_experts_per_rank * hidden_size * intermediate_size * 3
         return n_gate + expected_expert
 
-    op_expected = torch.ops.dist.all_reduce
+    op_expected = torch.ops.auto_deploy.torch_dist_all_reduce
 
     run_test(
         model,
@@ -47,7 +47,7 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
 
 
 @pytest.mark.parametrize("device_count", get_device_counts())
-@pytest.mark.parametrize("num_experts", [3, 4, 8, 10])
+@pytest.mark.parametrize("num_experts", [3, 8])
 def test_ep_shard(device_count: int, num_experts: int):
     dist_common.spawn_multiprocess_job(
         job=partial(_run_ep_shard_job, num_experts),

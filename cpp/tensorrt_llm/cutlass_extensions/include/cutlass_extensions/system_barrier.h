@@ -43,7 +43,7 @@ __forceinline__ __device__ uint32_t atomicCAS_system_acq(uint32_t* p, uint32_t c
 
 } // namespace detail
 
-template <class Sync, bool SafeBetweenPhases>
+template <class Sync, bool SafeBetweenPhases, bool UseMembarGPU>
 struct MulticastSystemBarrier : public GenericBarrier<Sync>
 {
 
@@ -66,7 +66,14 @@ protected:
         // See
         // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-multimem-ld-reduce-multimem-st-multimem-red
         // for multimem PTX doc
-        asm volatile("multimem.red.release.sys.global.add.u32 [%0], %1;" ::"l"(mc_ptr), "r"(val) : "memory");
+        if constexpr (UseMembarGPU)
+        {
+            asm volatile("multimem.red.release.gpu.global.add.u32 [%0], %1;" ::"l"(mc_ptr), "r"(val) : "memory");
+        }
+        else
+        {
+            asm volatile("multimem.red.release.sys.global.add.u32 [%0], %1;" ::"l"(mc_ptr), "r"(val) : "memory");
+        }
 
         // Need a fence between MC and UC access to the same memory:
         // - fence.proxy instructions establish an ordering between memory accesses that may happen through different
@@ -202,7 +209,7 @@ public:
     }
 };
 
-template <class Sync, bool SafeBetweenPhases>
+template <class Sync, bool SafeBetweenPhases, bool UseMembarGPU>
 struct SystemBarrier : public GenericBarrier<Sync>
 {
     using T = uint32_t;
@@ -218,7 +225,14 @@ protected:
     static T red_release(T* ptr, int val)
     {
         T old_arrive = 0;
-        asm volatile("atom.add.release.sys.u32 %0,[%1],%2;" : "=r"(old_arrive) : "l"(ptr), "r"(val) : "memory");
+        if constexpr (UseMembarGPU)
+        {
+            asm volatile("atom.add.release.gpu.u32 %0,[%1],%2;" : "=r"(old_arrive) : "l"(ptr), "r"(val) : "memory");
+        }
+        else
+        {
+            asm volatile("atom.add.release.sys.u32 %0,[%1],%2;" : "=r"(old_arrive) : "l"(ptr), "r"(val) : "memory");
+        }
         return old_arrive;
     }
 

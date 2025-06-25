@@ -34,8 +34,11 @@ def create_kv_cache_transceiver(
     comm_type = None
     if getenv("TRTLLM_USE_UCX_KVCACHE"):
         comm_type = CommTypeCpp.UCX
+    elif getenv("TRTLLM_USE_NIXL_KVCACHE"):
+        comm_type = CommTypeCpp.NIXL
     elif getenv("TRTLLM_USE_MPI_KVCACHE"):
         comm_type = CommTypeCpp.MPI
+
     cache_transceiver = None
     if comm_type is not None:
         cache_transceiver = BindKvCacheTransceiver(mapping, comm_type,
@@ -120,4 +123,4 @@ class CacheTransBufferManager:
     def pre_alloc_buffer_size(max_num_tokens: int,
                               kv_cache_size_per_token: int):
         return CacheTransBufferManagerCpp.pre_alloc_buffer_size(
-            max_num_tokens, kv_cache_size_per_token)
+            max_num_tokens) * kv_cache_size_per_token

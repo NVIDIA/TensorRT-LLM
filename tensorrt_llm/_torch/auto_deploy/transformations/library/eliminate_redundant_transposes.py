@@ -46,7 +46,6 @@ def eliminate_redundant_transposes(gm: GraphModule) -> GraphModule:
     This transformation identifies pairs of consecutive transpose operations with
     the same dimension arguments and removes both operations, as they cancel out.
     """
-    ad_logger.info("Eliminating redundant transpose operations")
     ad_logger.debug("Before eliminating redundant transposes: " + str(gm))
 
     graph = gm.graph
@@ -109,6 +108,6 @@ def eliminate_redundant_transposes(gm: GraphModule) -> GraphModule:
     if nodes_to_eliminate:
         gm.graph.eliminate_dead_code()
         gm = canonicalize_graph(gm)
-
+    ad_logger.info(f"Found and eliminated {len(nodes_to_eliminate)} redundant transpose pairs")
     ad_logger.debug("After eliminating redundant transposes: " + str(gm))
     return gm

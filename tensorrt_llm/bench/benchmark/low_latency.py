@@ -10,13 +10,14 @@ import yaml
 from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
-from tensorrt_llm.llmapi import LLM, CapacitySchedulerPolicy
+from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 # isort: off
@@ -76,6 +77,12 @@ from tensorrt_llm.sampling_params import SamplingParams
                 cls=MutuallyExclusiveOptionGroup,
                 help="Limits how requests are loaded.")
 @optgroup.option(
+    "--beam_width",
+    type=int,
+    default=1,
+    help="Number of search beams.",
+)
+@optgroup.option(
     "--concurrency",
     type=int,
     default=1,
@@ -133,6 +140,7 @@ def latency_command(
     checkpoint_path: Path = bench_env.checkpoint_path or bench_env.model
     engine_dir: Path = params.pop("engine_dir")
     concurrency: int = params.pop("concurrency")
+    beam_width: int = params.pop("beam_width")
     warmup: int = params.get("warmup")
     # Engine configuration parsing
     exec_settings, build_cfg = get_settings_from_engine(engine_dir)
@@ -153,7 +161,7 @@ def latency_command(
     exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
     exec_settings["settings_config"]["max_batch_size"] = 1
     exec_settings["settings_config"]["max_num_tokens"] = engine_tokens
-    exec_settings["settings_config"]["beam_width"] = 1
+    exec_settings["settings_config"]["beam_width"] = beam_width
     exec_settings["settings_config"]["chunking"] = False
     exec_settings["settings_config"][
         "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
@@ -208,8 +216,10 @@ def latency_command(
         sampling_params = SamplingParams(
             end_id=eos_id,
             pad_id=pad_id,
-            n=1,
+            n=beam_width,
+            use_beam_search=beam_width > 1,
         )
+        post_proc_params = None  # No detokenization
         llm = LLM(**kwargs)
 
         # Perform warmup if requested.
@@ -218,8 +228,8 @@ def latency_command(
             warmup_dataset = generate_warmup_dataset(requests, warmup)
             logger.info("Running warmup.")
             asyncio.run(
-                async_benchmark(llm, sampling_params, warmup_dataset, False,
-                                concurrency))
+                async_benchmark(llm, sampling_params, post_proc_params,
+                                warmup_dataset, False, concurrency))
             # WAR: IterationResult is a singleton tied to the executor.
             # Since the benchmark calls asyncio.run() multiple times (e.g., during warmup),
             # we must reset it to ensure it attaches to the correct event loop.
@@ -228,8 +238,9 @@ def latency_command(
 
         with iteration_writer.capture():
             statistics = asyncio.run(
-                async_benchmark(llm, sampling_params, requests, True,
-                                concurrency, iteration_writer.full_address))
+                async_benchmark(llm, sampling_params, post_proc_params,
+                                requests, True, concurrency,
+                                iteration_writer.full_address))
 
         logger.info(f"Benchmark done. Reporting results...")
         report_utility = ReportUtility(statistics, metadata, runtime_config,

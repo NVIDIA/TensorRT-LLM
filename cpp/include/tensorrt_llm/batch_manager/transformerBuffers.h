@@ -119,14 +119,8 @@ public:
 
     void getBuffers(TensorMap& inputBuffers, TensorMap& outputBuffers, runtime::ModelConfig const& modelConfig) const;
 
-    void reshapePositionIds(std::vector<SizeType32> const& positionIdsHost, bool isChatGlm);
-
     void copyPositionIds(runtime::TllmRuntime const& runtime, std::vector<SizeType32> const& positionIdsHost,
         bool isChatGlm, TensorPtr const& decoderPositionIds);
-
-    void resetCacheIndirection(RequestVector const& contextRequests, SizeType32 maxBeamWidth,
-        SizeType32 maxAttentionWindow, TensorPtr const& decoderCacheIndirectionInput,
-        TensorPtr const& decoderCacheIndirectionOutput, runtime::BufferManager const& manager);
 
     void copyKvBlockOffsets(RequestVector const& contextRequests, RequestVector const& genRequests,
         kv_cache_manager::BaseKVCacheManager const* kvCacheManager,

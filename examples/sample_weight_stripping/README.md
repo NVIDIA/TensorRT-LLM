@@ -241,7 +241,7 @@ python3 ../summarize.py --engine_dir engines/llama2-70b-hf-fp8-tp2.refit \
 
 ## Experimental
 ### Checkpoint Pruner
-The checkpoint pruner allows you to strip `Conv` and `Gemm` weights out of a TensorRT-LLM [checkpoint](https://nvidia.github.io/TensorRT-LLM/new_workflow.html). Since these make up the vast majority of weights, the pruner will decrease the size of your checkpoint up to 99%.
+The checkpoint pruner allows you to strip `Conv` and `Gemm` weights out of a TensorRT-LLM [checkpoint](https://nvidia.github.io/TensorRT-LLM/latest/architecture/checkpoint.html). Since these make up the vast majority of weights, the pruner will decrease the size of your checkpoint up to 99%.
 
 When building an engine with a pruned checkpoint, TensorRT-LLM fills in the missing weights with random ones. These weights should later be [refit](#engine-refitter) with the original weights to preserve the intended behavior.
 

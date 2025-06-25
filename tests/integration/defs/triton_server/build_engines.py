@@ -575,67 +575,6 @@ def prepare_llava_onevision_engine(tensorrt_llm_multimodal_example_root,
     return engine_dir, multimodal_engine_dir
 
 
-def prepare_vila_engine(tensorrt_llm_multimodal_example_root,
-                        tensorrt_llm_llama_example_root, vila_model_root,
-                        vila_repo_root):
-    # Convert LLAMA from HF
-    ckpt_dir = os.path.join(tensorrt_llm_multimodal_example_root, "model_dir",
-                            "vila")
-    convert_cmd = [
-        "python3",
-        f"{tensorrt_llm_llama_example_root}/convert_checkpoint.py",
-        f"--model_dir={vila_model_root}",
-        f"--output_dir={ckpt_dir}",
-        "--dtype=float16",
-    ]
-
-    # Build VILA
-    engine_dir = os.path.join(tensorrt_llm_multimodal_example_root,
-                              "engine_dir", "vila")
-
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={ckpt_dir}",
-        "--gemm_plugin=float16",
-        "--max_batch_size=8",
-        "--max_multimodal_len=6272",
-        "--max_input_len=2048",
-        "--max_seq_len=2560",
-        f"--output_dir={engine_dir}",
-    ]
-
-    multimodal_engine_dir = os.path.join(tensorrt_llm_multimodal_example_root,
-                                         "tmp", "trt_engines", "VILA1.5-3b",
-                                         "multimodal_encoder")
-
-    build_visual_engine_cmd = [
-        "python3", "build_multimodal_engine.py", "--model_type=vila",
-        f"--model_path={vila_model_root}", "--max_batch_size=32",
-        f"--vila_path={vila_repo_root}", f"--output_dir={multimodal_engine_dir}"
-    ]
-
-    append_timing_cache_args(build_cmd)
-    convert_cmd = " ".join(convert_cmd)
-    build_cmd = " ".join(build_cmd)
-    build_visual_engine_cmd = " ".join(build_visual_engine_cmd)
-    if not os.path.exists(engine_dir):
-        check_call(convert_cmd, shell=True)
-        check_call(build_cmd, shell=True)
-        check_call(build_visual_engine_cmd,
-                   shell=True,
-                   cwd=tensorrt_llm_multimodal_example_root)
-    else:
-        print_info(f"Reusing engine: {engine_dir}")
-        print_info(f"Skipped: {convert_cmd}")
-        print_info(f"Skipped: {build_cmd}")
-        print_info(f"Skipped: {build_visual_engine_cmd}")
-
-    assert os.path.exists(engine_dir), f"{engine_dir} does not exists."
-    assert os.path.exists(
-        multimodal_engine_dir), f"{multimodal_engine_dir} does not exists."
-    return engine_dir, multimodal_engine_dir
-
-
 def prepare_mllama_engine(tensorrt_llm_multimodal_example_root,
                           tensorrt_llm_mllama_example_root, mllama_model_root,
                           llm_backend_root):
@@ -955,7 +894,8 @@ def prepare_gpt_2b_lora_engine(type, tensorrt_llm_gpt_example_root,
     return engine_dir
 
 
-def prepare_gpt_175b_engine(type, tensorrt_llm_gpt_example_root):
+def prepare_gpt_175b_engine(type, tensorrt_llm_gpt_example_root,
+                            tensorrt_llm_example_root):
     # Build GPT
     if type == "python_backend":
         engine_dir = os.path.join(tensorrt_llm_gpt_example_root, "engine_dir",
@@ -965,8 +905,7 @@ def prepare_gpt_175b_engine(type, tensorrt_llm_gpt_example_root):
                                   "gpt_175b_ifb")
 
     convert_cmd = [
-        "python3",
-        f"{tensorrt_llm_gpt_example_root}/../generate_checkpoint_config.py",
+        "python3", f"{tensorrt_llm_example_root}/generate_checkpoint_config.py",
         f"--output_path={engine_dir}/ckpt_config.json",
         "--architecture=GPTForCausalLM", "--dtype=float16",
         "--num_hidden_layers=96", "--num_attention_heads=96",
@@ -1009,7 +948,8 @@ def prepare_gpt_175b_engine(type, tensorrt_llm_gpt_example_root):
     return engine_dir
 
 
-def prepare_gpt_multi_node_engine(type, tensorrt_llm_gpt_example_root):
+def prepare_gpt_multi_node_engine(type, tensorrt_llm_gpt_example_root,
+                                  tensorrt_llm_example_root):
     # Build GPT
     if type == "python_backend":
         engine_dir = os.path.join(tensorrt_llm_gpt_example_root, "engine_dir",
@@ -1019,8 +959,7 @@ def prepare_gpt_multi_node_engine(type, tensorrt_llm_gpt_example_root):
                                   "gpt_multi_node_ifb")
 
     convert_cmd = [
-        "python3",
-        f"{tensorrt_llm_gpt_example_root}/../generate_checkpoint_config.py",
+        "python3", f"{tensorrt_llm_example_root}/generate_checkpoint_config.py",
         f"--output_path={engine_dir}/ckpt_config.json",
         "--architecture=GPTForCausalLM", "--dtype=float16",
         "--num_hidden_layers=96", "--num_attention_heads=96",
@@ -1172,7 +1111,8 @@ def prepare_llama_v2_13b_engine(tensorrt_llm_llama_example_root,
     return engine_dir
 
 
-def prepare_llama_v3_8b_engine(tensorrt_llm_llama_example_root,
+def prepare_llama_v3_8b_engine(tensorrt_llm_example_root,
+                               tensorrt_llm_llama_example_root,
                                llama_v3_8b_model_root,
                                workers=8,
                                data_type="bfloat16"):
@@ -1194,7 +1134,7 @@ def prepare_llama_v3_8b_engine(tensorrt_llm_llama_example_root,
     elif data_type == "fp8":
         convert_cmd = [
             "python3",
-            "../quantization/quantize.py",
+            f"{tensorrt_llm_example_root}/quantization/quantize.py",
             f"--model_dir={llama_v3_8b_model_root}",
             "--dtype=float16",
             "--qformat=fp8",
@@ -1247,6 +1187,7 @@ def prepare_llama_v3_8b_engine(tensorrt_llm_llama_example_root,
 
 
 def prepare_llama_v3_70b_engine(type,
+                                tensorrt_llm_example_root,
                                 tensorrt_llm_llama_example_root,
                                 llama_v3_70b_model_root,
                                 data_type="bfloat16"):
@@ -1272,7 +1213,7 @@ def prepare_llama_v3_70b_engine(type,
     elif data_type == "fp8":
         convert_cmd = [
             "python3",
-            "../quantization/quantize.py",
+            f"{tensorrt_llm_example_root}/quantization/quantize.py",
             f"--model_dir={llama_v3_70b_model_root}",
             "--dtype=float16",
             "--qformat=fp8",
@@ -1768,7 +1709,8 @@ def prepare_tiny_llama_1b_engine(type, tensorrt_llm_llama_example_root,
     return engine_dir, xgrammar_tokenizer_info_path
 
 
-def prepare_rcca_nvbug_4714193_engine(tensorrt_llm_mixtral_example_root,
+def prepare_rcca_nvbug_4714193_engine(tensorrt_llm_example_root,
+                                      tensorrt_llm_mixtral_example_root,
                                       mixtral_8x7b_v0_1_model_root,
                                       llm_backend_root):
     engine_dir = os.path.join(tensorrt_llm_mixtral_example_root, "engine_dir",
@@ -1779,7 +1721,7 @@ def prepare_rcca_nvbug_4714193_engine(tensorrt_llm_mixtral_example_root,
     # Quantize model
     quantize_cmd = [
         "python3",
-        "../quantization/quantize.py",
+        f"{tensorrt_llm_example_root}/quantization/quantize.py",
         f"--model_dir={mixtral_8x7b_v0_1_model_root}",
         "--dtype=float16",
         "--qformat=fp8",

@@ -101,12 +101,18 @@ Developer workflow for code contributions is as follows:
 
 The naming of the merge requests in TensorRT-LLM follows the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). If the PR includes an API change that might break user code/API usage, consider adding "BREAKING CHANGE" in the title so that reviewers know what to expect. Additionally, if the PR is not related to any bug and task, consider using "chore" or None as the placeholder.
 
+[!IMPORTANT]
+For NVIDIA developers, please include the JIRA number or NVBUG ID in the PR title whenever possible.
+
 Good PR Titles Examples:
 * feat: Add support for starcoder-v2 FP8 base + FP16/BF16 LoRA
 * BREAKING CHANGE: Set default max batch size to 2048
 * chore: Remove version from plugins .so
 * None: Stringized enums for better error msgs
 * fix https://github.com/NVIDIA/TensorRT-LLM/issues/700: a Memory leak issue in C++ runtime
+* [TRTLLM-5516] perf: replicate dummy request for cuda graph padding (**NVIDIAN only**)
+* [nvbug/5334370] fix: Fix one model EAGLE3 (**NVIDIAN only**)
+
 
 This is important for tracking and collecting what has been submitted to which release and makes it easier for others to track the bugs or tasks. It could also be helpful when collecting GitHub publish announcement.
 
@@ -117,6 +123,13 @@ In the PR description, please consider addressing these points:
 * If the PR is large, explain why it cannot be broken down into multiple PRs.
 * Potential performance or functional impacts of the changes. If there are risks, please inform the reviewers.
 * Link to the related PRs.
+
+[!IMPORTANT]
+For NVIDIA developers,  please submit feature or bug fixes to the dedicated branch specified in the nvbug
+**Keywords** field. For example, if a bug is reported on the release/v0.20 branch, please submit the fix to
+`release/v0.20` instead of the main branch.
+
+Meanwhile, please add the "release blocker" label to any PRs that could potentially cause a release delay.
 
 
 ## Tests and Code Review for Protected APIs

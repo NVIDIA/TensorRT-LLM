@@ -1,8 +1,8 @@
 ### Generate Text Using Eagle Decoding
 
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (LLM, BuildConfig, EagleDecodingConfig,
-                                 KvCacheConfig, SamplingParams)
+from tensorrt_llm import SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.llmapi import EagleDecodingConfig, KvCacheConfig
 
 
 def main():
@@ -15,9 +15,6 @@ def main():
     ]
     # The end user can customize the sampling configuration with the SamplingParams class
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
-
-    # The end user can customize the build configuration with the BuildConfig class
-    build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
 
     # The end user can customize the kv cache configuration with the KVCache class
     kv_cache_config = KvCacheConfig(enable_block_reuse=True)
@@ -45,9 +42,10 @@ def main():
     )
 
     llm = LLM(model=model,
-              build_config=build_config,
               kv_cache_config=kv_cache_config,
               speculative_config=speculative_config,
+              max_batch_size=1,
+              max_seq_len=1024,
               **llm_kwargs)
 
     outputs = llm.generate(prompts, sampling_params)

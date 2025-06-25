@@ -48,7 +48,7 @@ void scatterTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, 
 void tileTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, CudaStream const& stream);
 
 void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output,
-    std::vector<TensorPtr> const& inputVector, ITensor& cachePointerDevice, ITensor& cachePointerHost,
+    std::vector<TensorPtr> const& fragmentsVector, ITensor& cachePointerDevice, ITensor& cachePointerHost,
     SizeType32 firstBatchSlotIdx, SizeType32 microBatchSize, SizeType32 beamWidth, CudaStream const& stream,
     int stepOffset);
 

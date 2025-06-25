@@ -44,143 +44,6 @@
 
 namespace deep_gemm
 {
-template <uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t kNumGroups,
-    uint32_t kNumStages, uint32_t kNumTMAMulticast, GemmType kGemmType>
-class Gemm
-{
-private:
-    using Barrier = cuda::barrier<cuda::thread_scope_block>;
-
-public:
-    Gemm() = default;
-
-    // DeepGEMM
-    template <typename LayoutIndexType>
-    static void run(__nv_bfloat16* gmem_d, float* scales_b, LayoutIndexType* grouped_layout, uint32_t shape_m,
-        CUtensorMap const& tma_a_desc, CUtensorMap const& tma_b_desc, CUtensorMap const& tma_scales_a_desc,
-        CUtensorMap const& tma_d_desc, cudaStream_t stream, int num_sms, uint32_t smem_size)
-    {
-        using SchedulerType = typename SchedulerSelector<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
-            kNumGroups, kNumTMAMulticast>::type;
-        using InputType = typename SchedulerType::Input;
-        // NOTES: we must use 4 warps to do TMA, because `setmaxnreg.aligned` requires 4 warps
-        constexpr uint32_t kNumTMAThreads = 128;
-        constexpr uint32_t kNumMathThreadsPerGroup = 128;
-        auto kernel = fp8_gemm_kernel<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K, kNumGroups, kNumStages,
-            kNumTMAThreads, kNumMathThreadsPerGroup, kNumTMAMulticast, SchedulerType>;
-        DG_HOST_ASSERT(
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
-
-        // Cluster launch
-        cudaLaunchConfig_t config;
-        config.gridDim = num_sms;
-        config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);
-        config.dynamicSmemBytes = smem_size;
-        config.stream = stream;
-
-        // Clusters for TMA multicast
-        // NOTES: `>= 4` cluster size will cause performance degradation
-        cudaLaunchAttribute attr;
-        attr.id = cudaLaunchAttributeClusterDimension;
-        attr.val.clusterDim = {kNumTMAMulticast, 1, 1};
-        config.attrs = &attr;
-        config.numAttrs = 1;
-
-        InputType input;
-        input.shape_m = shape_m;
-        input.grouped_layout = grouped_layout;
-
-        // Launch
-        auto status = cudaLaunchKernelEx(
-            &config, kernel, gmem_d, scales_b, input, tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc);
-        DG_HOST_ASSERT(status == cudaSuccess);
-    }
-
-    // Grouped GEMM with Offset
-    // `problem_m_padded_offsets` is used for reading scales, to satisfy the alignment requirements of TMA,
-    // each problem offset in problem_m_padded_offsets must be padded to multiple for 4.
-    template <typename LayoutIndexType>
-    static void run(__nv_bfloat16* gmem_d, float* scales_b, LayoutIndexType* problem_m_offsets,
-        LayoutIndexType* problem_m_padded_offsets, CUtensorMap const& tma_a_desc, CUtensorMap const& tma_b_desc,
-        CUtensorMap const& tma_scales_a_desc, CUtensorMap const& tma_d_desc, cudaStream_t stream, int num_sms,
-        uint32_t smem_size)
-    {
-        using SchedulerType = typename SchedulerSelector<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
-            kNumGroups, kNumTMAMulticast>::type;
-        using InputType = typename SchedulerType::Input;
-        // NOTES: we must use 4 warps to do TMA, because `setmaxnreg.aligned` requires 4 warps
-        constexpr uint32_t kNumTMAThreads = 128;
-        constexpr uint32_t kNumMathThreadsPerGroup = 128;
-        auto kernel = fp8_gemm_kernel<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K, kNumGroups, kNumStages,
-            kNumTMAThreads, kNumMathThreadsPerGroup, kNumTMAMulticast, SchedulerType>;
-        DG_HOST_ASSERT(
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
-
-        // Cluster launch
-        cudaLaunchConfig_t config;
-        config.gridDim = num_sms;
-        config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);
-        config.dynamicSmemBytes = smem_size;
-        config.stream = stream;
-
-        // Clusters for TMA multicast
-        // NOTES: `>= 4` cluster size will cause performance degradation
-        cudaLaunchAttribute attr;
-        attr.id = cudaLaunchAttributeClusterDimension;
-        attr.val.clusterDim = {kNumTMAMulticast, 1, 1};
-        config.attrs = &attr;
-        config.numAttrs = 1;
-
-        InputType input;
-        input.problem_m_offsets = problem_m_offsets;
-        input.problem_m_padded_offsets = problem_m_padded_offsets;
-
-        // Launch
-        auto status = cudaLaunchKernelEx(
-            &config, kernel, gmem_d, scales_b, input, tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc);
-        DG_HOST_ASSERT(status == cudaSuccess);
-    }
-
-    // Batched Strided GEMM
-    static void run(__nv_bfloat16* gmem_d, float* scales_b, uint32_t shape_m, CUtensorMap const& tma_a_desc,
-        CUtensorMap const& tma_b_desc, CUtensorMap const& tma_scales_a_desc, CUtensorMap const& tma_d_desc,
-        uint64_t ld_a, uint64_t stride_a, uint64_t ld_b, uint64_t stride_b, uint64_t ld_d, uint64_t stride_d,
-        cudaStream_t stream, int num_sms, uint32_t smem_size)
-    {
-        using SchedulerType = typename SchedulerSelector<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
-            kNumGroups, kNumTMAMulticast>::type;
-        using InputType = typename SchedulerType::Input;
-        // NOTES: we must use 4 warps to do TMA, because `setmaxnreg.aligned` requires 4 warps
-        constexpr uint32_t kNumTMAThreads = 128;
-        constexpr uint32_t kNumMathThreadsPerGroup = 128;
-        auto kernel = fp8_gemm_kernel<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K, kNumGroups, kNumStages,
-            kNumTMAThreads, kNumMathThreadsPerGroup, kNumTMAMulticast, SchedulerType>;
-        DG_HOST_ASSERT(
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
-
-        // Cluster launch
-        cudaLaunchConfig_t config;
-        config.gridDim = num_sms;
-        config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);
-        config.dynamicSmemBytes = smem_size;
-        config.stream = stream;
-
-        // Clusters for TMA multicast
-        // NOTES: `>= 4` cluster size will cause performance degradation
-        cudaLaunchAttribute attr;
-        attr.id = cudaLaunchAttributeClusterDimension;
-        attr.val.clusterDim = {kNumTMAMulticast, 1, 1};
-        config.attrs = &attr;
-        config.numAttrs = 1;
-
-        InputType input{shape_m, ld_a, stride_a, ld_b, stride_b, ld_d, stride_d};
-        // Launch
-        auto status = cudaLaunchKernelEx(
-            &config, kernel, gmem_d, scales_b, input, tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc);
-        DG_HOST_ASSERT(status == cudaSuccess);
-    }
-};
-
 template <typename T>
 static CUtensorMap make_2d_tma_a_desc(T* global_address, uint32_t shape_m, uint32_t shape_k, uint32_t block_m,
     uint32_t block_k, uint32_t num_groups, GemmType gemm_type, uint64_t global_stride_in_bytes = 0)
@@ -227,6 +90,53 @@ CUtensorMap make_tma_scales_a_offset_desc(T* global_address, int64_t max_m_padde
 {
     return make_2d_tma_desc(global_address, Layout::ColMajor, max_m_padded_total, ceil_div(shape_k, block_k), block_m,
         1, global_stride_in_bytes, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+}
+
+template <typename T>
+CUtensorMap make_2d_tma_a_desc_swapAB(T* global_address, uint32_t shape_m, uint32_t shape_k, uint32_t block_m,
+    uint32_t block_k, uint32_t num_groups, GemmType gemm_type, uint64_t global_stride_in_bytes = 0)
+{
+    return make_2d_tma_desc(global_address, Layout::RowMajor,
+        shape_m * (gemm_type != GemmType::Normal ? num_groups : 1), shape_k, block_m, block_k, global_stride_in_bytes);
+}
+
+template <typename T>
+CUtensorMap make_2d_tma_b_desc_swapAB(T* global_address, uint32_t shape_n, uint32_t shape_k, uint32_t block_n,
+    uint32_t block_k, uint32_t num_groups, GemmType gemm_type, uint64_t global_stride_in_bytes = 0)
+{
+    return make_2d_tma_desc(global_address, Layout::ColMajor, shape_k,
+        shape_n * (gemm_type == GemmType::GroupedMasked ? num_groups : 1), block_k, block_n, global_stride_in_bytes);
+}
+
+template <typename T>
+CUtensorMap make_2d_tma_d_desc_swapAB(T* global_address, uint32_t shape_m, uint32_t shape_n, uint32_t block_m,
+    uint32_t block_n, uint32_t num_groups, GemmType gemm_type, uint64_t global_stride_in_bytes = 0)
+{
+    return make_2d_tma_desc(global_address, Layout::RowMajor,
+        shape_n * (gemm_type == GemmType::GroupedMasked ? num_groups : 1), shape_m, min(block_n, shape_n),
+        min(block_m, shape_m), global_stride_in_bytes, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+}
+
+template <typename T>
+CUtensorMap make_2d_tma_scales_b_desc_swapAB(T* global_address, uint32_t shape_n, uint32_t shape_k, uint32_t block_n,
+    uint32_t block_k, uint32_t num_groups, GemmType gemm_type, uint64_t global_stride_in_bytes = 0)
+{
+    // Make TMA aligned to 16 bytes
+    constexpr uint32_t kAlignment = 16 / sizeof(T);
+    shape_n = ceil_div(shape_n, kAlignment) * kAlignment;
+
+    return make_2d_tma_desc(global_address, Layout::RowMajor,
+        ceil_div(shape_k, block_k)
+            * ((gemm_type == GemmType::GroupedMasked || gemm_type == GemmType::StridedBatched) ? num_groups : 1),
+        shape_n, 1, block_n, global_stride_in_bytes, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+}
+
+template <typename T>
+CUtensorMap make_tma_scales_b_offset_desc_swapAB(T* global_address, int64_t max_n_padded_total, uint32_t shape_k,
+    uint32_t block_n, uint32_t block_k, uint64_t global_stride_in_bytes = 0)
+{
+    return make_2d_tma_desc(global_address, Layout::RowMajor, ceil_div(shape_k, block_k), max_n_padded_total, 1,
+        block_n, global_stride_in_bytes, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
 }
 
 template <typename T>
@@ -295,19 +205,61 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
 }
 
 template <typename LayoutIndexType>
+void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,
+    float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, uint32_t block_m,
+    uint32_t block_n, uint32_t block_k, uint32_t num_groups, uint32_t num_tma_multicast, GemmType gemm_type,
+    LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms, uint32_t smem_size)
+{
+    auto tma_a_desc = make_2d_tma_a_desc_swapAB(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m, block_k, num_groups, gemm_type, ld_a);
+    auto tma_b_desc = make_2d_tma_b_desc_swapAB(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_b), shape_n, shape_k, block_n, block_k, num_groups, gemm_type, ld_b);
+    auto tma_scales_b_desc
+        = make_2d_tma_scales_b_desc_swapAB(scales_b, shape_n, shape_k, block_n, block_k, num_groups, gemm_type);
+    auto tma_d_desc = make_2d_tma_d_desc_swapAB(
+        reinterpret_cast<__nv_bfloat16*>(mat_d), shape_m, shape_n, block_m, block_n, num_groups, gemm_type, ld_d * 2);
+
+    constexpr uint32_t kNumTMAThreads = 128;
+    constexpr uint32_t kNumMathThreadsPerGroup = 128;
+    DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
+
+    // Cluster launch
+    cudaLaunchConfig_t config;
+    config.gridDim = num_sms;
+    config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(static_cast<int32_t>(block_m));
+    config.dynamicSmemBytes = smem_size;
+    config.stream = stream;
+
+    // Clusters for TMA multicast
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {num_tma_multicast, 1, 1};
+    config.attrs = &attr;
+    config.numAttrs = 1;
+
+    NormalSchedulerInputSwapAB input;
+    input.shape_n = shape_n;
+    input.grouped_layout = grouped_layout;
+
+    auto status = cudaLaunchKernelEx(&config, kernel, reinterpret_cast<__nv_bfloat16*>(mat_d), scales_a, input,
+        tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc);
+    DG_HOST_ASSERT(status == cudaSuccess);
+}
+
+template <typename LayoutIndexType>
 void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d, float* scales_a,
     float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, uint32_t block_m, uint32_t block_n,
     uint32_t block_k, uint32_t num_groups, uint32_t num_tma_multicast, GemmType gemm_type,
-    LayoutIndexType* problem_m_offsets, LayoutIndexType* problem_m_padded_offsets, cudaStream_t stream, int num_sms,
-    uint32_t smem_size, uint32_t max_shape_m_padded)
+    LayoutIndexType* problem_m_offsets, cudaStream_t stream, int num_sms, uint32_t smem_size,
+    uint32_t max_shape_m_padded)
 {
     auto tma_a_desc = make_2d_tma_a_desc(
-        reinterpret_cast<__nv_fp8_e4m3*>(mat_a), max_shape_m_padded, shape_k, block_m, block_k, num_groups, gemm_type);
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m, block_k, num_groups, gemm_type);
     auto tma_b_desc = make_2d_tma_b_desc(
         reinterpret_cast<__nv_fp8_e4m3*>(mat_b), shape_n, shape_k, block_n, block_k, num_groups, gemm_type);
     auto tma_scales_a_desc = make_tma_scales_a_offset_desc(scales_a, max_shape_m_padded, shape_k, block_m, block_k);
     auto tma_d_desc = make_2d_tma_d_desc(
-        reinterpret_cast<__nv_bfloat16*>(mat_d), max_shape_m_padded, shape_n, block_m, block_n, num_groups, gemm_type);
+        reinterpret_cast<__nv_bfloat16*>(mat_d), shape_m, shape_n, block_m, block_n, num_groups, gemm_type);
     constexpr uint32_t kNumTMAThreads = 128;
     constexpr uint32_t kNumMathThreadsPerGroup = 128;
     DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
@@ -329,11 +281,53 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
 
     GroupedWithOffsetSchedulerInput input;
     input.problem_m_offsets = problem_m_offsets;
-    input.problem_m_padded_offsets = problem_m_padded_offsets;
 
     // Launch
     auto status = cudaLaunchKernelEx(&config, kernel, reinterpret_cast<__nv_bfloat16*>(mat_d), scales_b, input,
         tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc);
+    DG_HOST_ASSERT(status == cudaSuccess);
+}
+
+template <typename LayoutIndexType>
+void runGemmSwapAB(cudaKernel_t kernel, void* mat_a /* weight*/, int ld_a, void* mat_b /* act*/, int ld_b, void* mat_d,
+    int ld_d, float* scales_a /* weight scales*/, float* scales_b /* act scales*/, uint32_t shape_m, uint32_t shape_n,
+    uint32_t shape_k, uint32_t block_m, uint32_t block_n, uint32_t block_k, uint32_t num_groups,
+    uint32_t num_tma_multicast, GemmType gemm_type, LayoutIndexType* problem_n_offsets, cudaStream_t stream,
+    int num_sms, uint32_t smem_size, uint32_t max_shape_n_padded)
+{
+    // Create tensor mappings using swapAB version functions, note the parameter order
+    auto tma_a_desc = make_2d_tma_a_desc_swapAB(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m, block_k, num_groups, gemm_type);
+    auto tma_b_desc = make_2d_tma_b_desc_swapAB(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_b), shape_n, shape_k, block_n, block_k, num_groups, gemm_type);
+    auto tma_scales_b_desc
+        = make_tma_scales_b_offset_desc_swapAB(scales_b, max_shape_n_padded, shape_k, block_n, block_k);
+    auto tma_d_desc = make_2d_tma_d_desc_swapAB(
+        reinterpret_cast<__nv_bfloat16*>(mat_d), shape_m, shape_n, block_m, block_n, num_groups, gemm_type);
+    constexpr uint32_t kNumTMAThreads = 128;
+    constexpr uint32_t kNumMathThreadsPerGroup = 128;
+    DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
+
+    // Cluster launch
+    cudaLaunchConfig_t config;
+    config.gridDim = num_sms;
+    config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(static_cast<int32_t>(block_m));
+    config.dynamicSmemBytes = smem_size;
+    config.stream = stream;
+
+    // Clusters for TMA multicast
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {num_tma_multicast, 1, 1};
+    config.attrs = &attr;
+    config.numAttrs = 1;
+
+    // Update input structure to use N dimension offsets
+    GroupedWithOffsetSchedulerInputSwapAB input;
+    input.problem_n_offsets = problem_n_offsets; // Now offsets are for N dimension
+
+    auto status = cudaLaunchKernelEx(&config, kernel, reinterpret_cast<__nv_bfloat16*>(mat_d), scales_a, input,
+        tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc);
     DG_HOST_ASSERT(status == cudaSuccess);
 }
 

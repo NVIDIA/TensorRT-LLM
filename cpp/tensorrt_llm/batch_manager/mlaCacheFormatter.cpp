@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheConcatenate.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -40,7 +41,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 // some context rank in connection
 std::vector<executor::kv_cache::Connection const*> MLACacheFormatter::pickRecvConnections(
     std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-    SizeType32 selfIdx, CacheState const& destConfig)
+    SizeType32 selfIdx, CacheState const& destConfig) const
 {
 
     TLLM_CHECK(!connections.empty());
@@ -105,9 +106,8 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
     // diff end
     auto reqId = llmRequest.mRequestId;
 
-    constexpr SizeType32 beam{0};
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
-    auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId, beam);
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
 
     int blockNum = 0;
     std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
@@ -159,6 +159,13 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
         cacheBufferId, pPDomainSize, targetBufferSize, bufferManager);
     auto& outputSplitCaches = std::get<0>(result);
     auto& bufferCoverTargetNum = std::get<1>(result);
+    auto& onlyUseDynamicBuffer = std::get<2>(result);
+    auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+    if (agentConnnecion != nullptr)
+    {
+        TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == pPDomainSize, "Agent need all buffer pre-allocated");
+        TLLM_CHECK(onlyUseDynamicBuffer == false);
+    }
     // diff end
 
     // The size of outputSplitCaches should be equal to pPDomainSize
@@ -275,8 +282,7 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
     // diff start
     auto pickUpConnections = pickRecvConnections(connections, selfConfig, selfIdx, destConfig);
     // diff end
-    constexpr SizeType32 beam{0};
-    auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId, beam);
+    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
@@ -318,7 +324,16 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
     }
     else
     {
-        cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
+        auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+        if (agentConnnecion != nullptr)
+        {
+            cacheBufferId = agentConnnecion->getCacheBufferId();
+            TLLM_CHECK(cacheBufferId.has_value());
+        }
+        else
+        {
+            cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
+        }
 
         auto cacheBlockSize = outputBuffers.at(0)->getSize();
 
@@ -330,7 +345,12 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
         auto& recvSplitCaches = std::get<0>(result);
         auto& bufferCoverTargetNum = std::get<1>(result);
         size_t remainNoCoverTargetNum = targetNum > bufferCoverTargetNum ? targetNum - bufferCoverTargetNum : 0;
-
+        auto& onlyUseDynamicBuffer = std::get<2>(result);
+        if (agentConnnecion != nullptr)
+        {
+            TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need buffer pre-allocated");
+            TLLM_CHECK(onlyUseDynamicBuffer == false);
+        }
         bufferManager.getStream().synchronize();
 
         auto preAllocRecvBuffer = mCacheTransBufferManager->getRecvBuffer(cacheBufferId);
@@ -447,14 +467,20 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
 
 [[nodiscard]] bool MLACacheFormatter::inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const
 {
+    if (selfConfig.getDataType() != destConfig.getDataType())
+    {
+        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: only support same data type");
+        return false;
+    }
     if (selfConfig.getAttentionConfig().mAttentionType != CacheState::AttentionType::kMLA
         || destConfig.getAttentionConfig().mAttentionType != CacheState::AttentionType::kMLA)
     {
-
+        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: only support MLA");
         return false;
     }
     if (selfConfig.getAttentionConfig().mKvFactor != destConfig.getAttentionConfig().mKvFactor)
     {
+        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: only support same kv factor");
         return false;
     }
 
@@ -463,6 +489,7 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
 
     if (setVecSelf.size() != 1)
     {
+        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: only support equal number of heads per layer");
         return false;
     }
     std::unordered_set<int> setVecDest{
@@ -470,41 +497,48 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
 
     if (setVecDest.size() != 1)
     {
+        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: only support equal number of heads per layer");
         return false;
     }
     if (selfConfig.getModelConfig().mTokensPerBlock != destConfig.getModelConfig().mTokensPerBlock
         || selfConfig.getModelConfig().mSizePerHead != destConfig.getModelConfig().mSizePerHead)
     {
+        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: only support same tokens per block and size per head");
         return false;
     }
     if (selfConfig.getModelConfig().mNbKvHeadsPerLayer.size() != destConfig.getModelConfig().mNbKvHeadsPerLayer.size())
     {
+        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: only support same number of layers");
         return false;
     }
     if ((selfConfig.getModelConfig().mNbKvHeadsPerLayer.at(0) != 1)
         || (selfConfig.getModelConfig().mNbKvHeadsPerLayer.at(0) != 1))
     {
+        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: only support MLA");
         return false;
     }
 
     if (selfConfig.getAttentionConfig().mKvFactor != destConfig.getAttentionConfig().mKvFactor)
     {
+        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: only support same kv factor");
         return false;
     }
     if (selfConfig.getParallelConfig().mEnableAttentionDP
         && (selfConfig.getParallelConfig().mTensorParallelism % selfConfig.getParallelConfig().mDPsize != 0))
     {
-
+        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: TP size must be divisible by DP size");
         return false;
     }
     if (destConfig.getParallelConfig().mEnableAttentionDP
         && (destConfig.getParallelConfig().mTensorParallelism % destConfig.getParallelConfig().mDPsize != 0))
     {
+        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: TP size must be divisible by DP size");
         return false;
     }
     if ((destConfig.getParallelConfig().mEnableAttentionDP)
         && (destConfig.getParallelConfig().mTensorParallelism != destConfig.getParallelConfig().mDPsize))
     {
+        TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: TP size must be equal to DP size");
         return false;
     }
 

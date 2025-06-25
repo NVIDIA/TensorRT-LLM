@@ -6,7 +6,10 @@ import platform
 import signal
 import subprocess
 import sys
-import tempfile
+import time
+import warnings
+from collections.abc import Generator
+from typing import List, Optional
 
 import psutil
 
@@ -68,7 +71,9 @@ if is_linux():
 
         return pids
 
-    def cleanup_process_tree(p: subprocess.Popen, has_session=False):
+    def cleanup_process_tree(p: subprocess.Popen,
+                             has_session=False,
+                             verbose_message=False):
         target_pids = set()
         if has_session:
             # Session ID is the pid of the leader process
@@ -82,8 +87,30 @@ if is_linux():
         except psutil.Error:
             pass
 
-        print("Found leftover pids:", target_pids)
-        for pid in target_pids:
+        persist_pids = []
+        if target_pids:
+            # Grace period
+            time.sleep(5)
+
+            lines = []
+            for pid in sorted(target_pids):
+                try:
+                    sp = psutil.Process(pid)
+                    if verbose_message:
+                        cmdline = sp.cmdline()
+                        lines.append(f"{pid}: {cmdline}")
+                    persist_pids.append(pid)
+                except psutil.Error:
+                    pass
+
+            if persist_pids:
+                msg = f"Found leftover subprocesses: {persist_pids} launched by {p.args}"
+                if verbose_message:
+                    detail = '\n'.join(lines)
+                    msg = f"{msg}\n{detail}"
+                warnings.warn(msg)
+
+        for pid in persist_pids:
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
@@ -148,38 +175,56 @@ elif is_windows():
         p.kill()
 
 
-def call(*popenargs,
-         timeout=None,
-         start_new_session=True,
-         suppress_output_info=False,
-         **kwargs):
+@contextlib.contextmanager
+def popen(*popenargs,
+          start_new_session=True,
+          suppress_output_info=False,
+          **kwargs) -> Generator[subprocess.Popen]:
     if not suppress_output_info:
-        print(f"Start subprocess with call({popenargs}, {kwargs})")
+        print(f"Start subprocess with popen({popenargs}, {kwargs})")
 
-    running_log = None
-    if "running_log" in kwargs:
-        if isinstance(kwargs["running_log"], tempfile._TemporaryFileWrapper):
-            running_log = kwargs["running_log"]
-        kwargs.pop("running_log", 'Not Found')
-    with Popen(*popenargs,
-               start_new_session=start_new_session,
-               stdout=running_log,
-               **kwargs) as p:
+    with Popen(*popenargs, start_new_session=start_new_session, **kwargs) as p:
         try:
-            retcode = p.wait(timeout=timeout)
-            if retcode and start_new_session:
-                cleanup_process_tree(p, True)
-            return retcode
+            yield p
+            if start_new_session:
+                cleanup_process_tree(p, True, True)
         except Exception as e:
+            cleanup_process_tree(p, start_new_session)
             if isinstance(e, subprocess.TimeoutExpired):
                 print("Process timed out.")
                 stdout, stderr = p.communicate()
-                if stdout:
-                    print("STDOUT:", stdout.decode('utf-8', errors='replace'))
-                if stderr:
-                    print("STDERR:", stderr.decode('utf-8', errors='replace'))
-            cleanup_process_tree(p, start_new_session)
+                e.output = stdout
+                e.stderr = stderr
             raise
+
+
+def call(*popenargs,
+         timeout: Optional[float] = None,
+         start_new_session=True,
+         suppress_output_info=False,
+         spin_time: float = 1.0,
+         poll_procs: Optional[List[subprocess.Popen]] = None,
+         **kwargs):
+    poll_procs = poll_procs or []
+    if not suppress_output_info:
+        print(f"Start subprocess with call({popenargs}, {kwargs})")
+    actual_timeout = get_pytest_timeout(timeout)
+    with popen(*popenargs,
+               start_new_session=start_new_session,
+               suppress_output_info=True,
+               **kwargs) as p:
+        elapsed_time = 0
+        while True:
+            try:
+                return p.wait(timeout=spin_time)
+            except subprocess.TimeoutExpired:
+                elapsed_time += spin_time
+                if actual_timeout is not None and elapsed_time >= actual_timeout:
+                    raise
+            for p_poll in poll_procs:
+                if p_poll.poll() is None:
+                    continue
+                raise RuntimeError("A sub-process has exited.")
 
 
 def check_call(*popenargs, **kwargs):
@@ -195,12 +240,13 @@ def check_call(*popenargs, **kwargs):
 
 def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
     print(f"Start subprocess with check_output({popenargs}, {kwargs})")
+    actual_timeout = get_pytest_timeout(timeout)
     with Popen(*popenargs,
                stdout=subprocess.PIPE,
                start_new_session=start_new_session,
                **kwargs) as process:
         try:
-            stdout, stderr = process.communicate(None, timeout=timeout)
+            stdout, stderr = process.communicate(None, timeout=actual_timeout)
         except subprocess.TimeoutExpired as exc:
             cleanup_process_tree(process, start_new_session)
             if is_windows():
@@ -212,9 +258,9 @@ def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
             cleanup_process_tree(process, start_new_session)
             raise
         retcode = process.poll()
+        if start_new_session:
+            cleanup_process_tree(process, True, True)
         if retcode:
-            if start_new_session:
-                cleanup_process_tree(process, True)
             raise subprocess.CalledProcessError(retcode,
                                                 process.args,
                                                 output=stdout,
@@ -275,3 +321,26 @@ def check_call_negative_test(*popenargs, **kwargs):
             f"Subprocess expected to fail with check_call_negative_test({popenargs}, {kwargs}), but passed."
         )
         raise subprocess.CalledProcessError(1, cmd)
+
+
+def get_pytest_timeout(timeout=None):
+    try:
+        import pytest
+        marks = None
+        try:
+            current_item = pytest.current_test
+            if hasattr(current_item, 'iter_markers'):
+                marks = list(current_item.iter_markers('timeout'))
+        except (AttributeError, NameError):
+            pass
+
+        if marks and len(marks) > 0:
+            timeout_mark = marks[0]
+            timeout_pytest = timeout_mark.args[0] if timeout_mark.args else None
+            if timeout_pytest and isinstance(timeout_pytest, (int, float)):
+                return max(30, int(timeout_pytest * 0.9))
+
+    except (ImportError, Exception) as e:
+        print(f"Error getting pytest timeout: {e}")
+
+    return timeout

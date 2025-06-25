@@ -18,12 +18,17 @@
 #pragma once
 
 #include "tensorrt_llm/common/algorithm.h"
-#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 
 namespace tensorrt_llm::runtime
 {
 class BufferManager;
+class CudaEvent;
+
+namespace decoder
+{
+class DecoderState;
+} // namespace decoder
 } // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::batch_manager
@@ -41,7 +46,7 @@ public:
 
     runtime::CudaEvent operator()(runtime::ModelConfig const& modelConfig, DecoderBuffers& decoderBuffers,
         DecoderOutputBuffers& decoderOutputBuffers, runtime::BufferManager const& copyBufferManager,
-        runtime::GptDecoderBatched const& decoder, bool returnLogProbs,
+        runtime::decoder::DecoderState const& decoderState, bool returnLogProbs,
         runtime::CudaEvent const& decoderFinishEvent) const;
 };
 

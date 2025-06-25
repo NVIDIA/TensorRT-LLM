@@ -1,10 +1,26 @@
-# Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
-"""We want triton==2.1.0 or triton==2.2.0 or triton==2.3.0 for this"""
+# Copyright (c) 2024, Tri Dao, Albert Gu.
+#
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import torch
 import triton
 import triton.language as tl
+
+from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 
 from .softplus import softplus
 
@@ -33,6 +49,7 @@ def _selective_scan_update_kernel(
     z_ptr,
     out_ptr,
     state_batch_indices_ptr,
+    pad_slot_id,
     # Matrix dimensions
     batch,
     nheads,
@@ -83,6 +100,9 @@ def _selective_scan_update_kernel(
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
 
+    # If HAS_STATE_BATCH_INDICES is true, then the ssm state's batch coordinate
+    # is taken from the state_batch_indices_ptr Otherwise, the state coordinate
+    # is the same as the batch id.
     if HAS_STATE_BATCH_INDICES:
         state_batch_indices_ptr += pid_b
         state_batch_idx = tl.load(state_batch_indices_ptr)
@@ -122,10 +142,11 @@ def _selective_scan_update_kernel(
     if HAS_Z:
         z_ptrs = z_ptr + offs_m * stride_z_dim
     out_ptrs = out_ptr + offs_m * stride_out_dim
+    mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
+    if HAS_STATE_BATCH_INDICES:
+        mask &= (state_batch_idx != pad_slot_id)
+    state = tl.load(state_ptrs, mask=mask, other=0.0)
 
-    state = tl.load(state_ptrs,
-                    mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate),
-                    other=0.0)
     x = tl.load(x_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
     if not TIE_HDIM:
         dt = tl.load(dt_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
@@ -159,9 +180,11 @@ def _selective_scan_update_kernel(
     else:
         dB = B * dt  # vector of size (dstate,)
     state = state * dA + dB * x[:, None]
-    tl.store(state_ptrs,
-             state,
-             mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate))
+
+    mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
+    if HAS_STATE_BATCH_INDICES:
+        mask &= (state_batch_idx != pad_slot_id)
+    tl.store(state_ptrs, state, mask=mask)
     out = tl.sum(state * C[None, :], axis=1)
     if HAS_D:
         out += x * D
@@ -170,19 +193,18 @@ def _selective_scan_update_kernel(
     tl.store(out_ptrs, out, mask=offs_m < dim)
 
 
-def selective_state_update(
-    state,
-    x,
-    dt,
-    A,
-    B,
-    C,
-    D=None,
-    z=None,
-    dt_bias=None,
-    dt_softplus=False,
-    state_batch_indices=None,
-):
+def selective_state_update(state,
+                           x,
+                           dt,
+                           A,
+                           B,
+                           C,
+                           D=None,
+                           z=None,
+                           dt_bias=None,
+                           dt_softplus=False,
+                           state_batch_indices=None,
+                           pad_slot_id=PAD_SLOT_ID):
     """
     Argument:
         state: (batch, dim, dstate) or (batch, nheads, dim, dstate)
@@ -194,6 +216,12 @@ def selective_state_update(
         D: (dim,) or (nheads, dim)
         z: (batch, dim) or (batch, nheads, dim)
         dt_bias: (dim,) or (nheads, dim)
+        pad_slot_id: int
+            if cache_indices is passed, lets the kernel identify padded
+            entries that will not be processed,
+            for example: cache_indices = [pad_slot_id, 1, 20, pad_slot_id]
+            in this case, the kernel will not process entries at
+            indices 0 and 3
     Return:
         out: (batch, dim) or (batch, nheads, dim)
     """
@@ -216,10 +244,10 @@ def selective_state_update(
         z = z.unsqueeze(1)
     if dt_bias is not None and dt_bias.dim() == 1:
         dt_bias = dt_bias.unsqueeze(0)
+
     _, nheads, dim, dstate = state.shape
     batch = x.shape[0]
-    if x.shape != (batch, nheads, dim):
-        print(f"{state.shape} {x.shape} {batch} {nheads} {dim}")
+
     assert x.shape == (batch, nheads, dim)
     assert dt.shape == x.shape
     assert A.shape == (nheads, dim, dstate)
@@ -260,6 +288,7 @@ def selective_state_update(
             z,
             out,
             state_batch_indices,
+            pad_slot_id,
             batch,
             nheads,
             dim,

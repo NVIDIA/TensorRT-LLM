@@ -15,16 +15,23 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 }
 LLM_ROOT = "llm"
 
+// LLM repository configuration
+withCredentials([string(credentialsId: 'default-scan-repo', variable: 'DEFAULT_SCAN_REPO')]) {
+    SCAN_REPO = "${DEFAULT_SCAN_REPO}"
+}
+SCAN_COMMIT = "main"
+SCAN_ROOT = "scan"
+
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
 // Container configuration
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505121727-4049"
-LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-aarch64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505121727-4049"
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310-trt10.10.0.31-skip-tritondevel-202505131825-4114"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312-trt10.10.0.31-skip-tritondevel-202505131825-4114"
+LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.05-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202506051650-4885"
+LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.05-py3-aarch64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202506051650-4885"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310-trt10.11.0.33-skip-tritondevel-202506051650-4885"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312-trt10.11.0.33-skip-tritondevel-202506051650-4885"
 
 // TODO: Move common variables to an unified location
 BUILD_CORES_REQUEST = "8"
@@ -98,6 +105,8 @@ def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 @Field
 def DEBUG_MODE = "debug"
+@Field
+def DETAILED_LOG = "detailed_log"
 
 def testFilter = [
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
@@ -114,6 +123,7 @@ def testFilter = [
     (ONLY_PYTORCH_FILE_CHANGED): false,
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
+    (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -168,7 +178,7 @@ String getShortenedJobName(String path)
     return parts.join('-').toLowerCase()
 }
 
-def createKubernetesPodConfig(image, type)
+def createKubernetesPodConfig(image, type, arch = "amd64")
 {
     def targetCould = "kubernetes-cpu"
     def selectors = """
@@ -178,6 +188,9 @@ def createKubernetesPodConfig(image, type)
     def nodeLabelPrefix = ""
     def jobName = getShortenedJobName(env.JOB_NAME)
     def buildID = env.BUILD_ID
+
+    def archSuffix = arch == "arm64" ? "arm" : "amd"
+    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     switch(type)
     {
@@ -270,7 +283,7 @@ def createKubernetesPodConfig(image, type)
                         fieldRef:
                           fieldPath: spec.nodeName
                   - name: jnlp
-                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11
+                    image: ${jnlpImage}
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
@@ -352,8 +365,33 @@ def launchReleaseCheck(pipeline)
                 sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
             }
         }
-        // Step 3: do some check in container
+        // Step 3: Run license check
         sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
+
+        // Step 4: Run guardwords scan
+        def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+        if (env.alternativeTRT || isOfficialPostMergeJob) {
+            trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
+            try {
+                ignoreList = [
+                    "*/.git/*",
+                    "*/3rdparty/*",
+                    "*/examples/scaffolding/contrib/mcp/weather/weather.py",
+                    "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz"
+                ]
+                sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')}) 2>&1 | tee scan.log"
+                def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
+                if (lastLine.toLowerCase().contains("error")) {
+                    error "Guardwords Scan Failed."
+                }
+            } catch (Exception e) {
+                throw e
+            } finally {
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/guardwords-scan-results/")
+                echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
+            }
+        }
     }
 
     def image = "urm.nvidia.com/docker/golang:1.22"
@@ -685,6 +723,45 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
+        stage("Rerun report") {
+            sh "rm -rf rerun && mkdir -p rerun"
+            sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
+            sh "find rerun -type f"
+            def rerunFileCount = sh(returnStdout: true, script: 'find rerun -type f | wc -l').replaceAll("\\s","").toInteger()
+            if (rerunFileCount == 0) {
+                echo "Rerun report is skipped because there is no rerun test data file."
+                return
+            }
+            def xmlFiles = findFiles(glob: 'rerun/**/*.xml')
+            def xmlFileList = xmlFiles.collect { it.path }
+            def inputfiles = xmlFileList.join(',')
+            echo "inputfiles: ${inputfiles}"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
+            sh """
+                python3 llm/tests/integration/defs/test_rerun.py \
+                generate_rerun_report \
+                --output-file=rerun/rerun_report.xml \
+                --input-files=${inputfiles}
+            """
+            trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
+            echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+            def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+            if (env.alternativeTRT || isOfficialPostMergeJob) {
+                catchError(
+                    buildResult: 'FAILURE',
+                    stageResult: 'FAILURE') {
+                    error "Some failed tests were reruned, please check the rerun report."
+                }
+            } else {
+                catchError(
+                    buildResult: 'SUCCESS',
+                    stageResult: 'UNSTABLE') {
+                    error "Some failed tests were reruned, please check the rerun report."
+                }
+            }
+        } // Rerun report stage
         try {
             stage("Test coverage") {
                 sh "ls"
@@ -714,8 +791,8 @@ def collectTestResults(pipeline, testFilter)
 
                 sh "cd cov && coverage combine"
                 sh "cd cov && find . -type f"
-                sh "cd cov && coverage report"
-                sh "cd cov && coverage html -d test_coverage_html"
+                sh "cd cov && coverage report -i"   // -i: ignore errors. Ignore the error that the source code file cannot be found.
+                sh "cd cov && coverage html -d test_coverage_html -i"
                 trtllm_utils.uploadArtifacts("cov/test_coverage_html/*", "${UPLOAD_PATH}/test-results/coverage-report/")
                 echo "Test coverage report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/coverage-report/index.html"
             } // Test coverage
@@ -935,6 +1012,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             ]
                         }
 
+                        if (env.testPhase2StageName) {
+                            parameters += [
+                                'testPhase2StageName': env.testPhase2StageName,
+                            ]
+                        }
+
                         echo "trigger SBSA test job, params: ${parameters}"
 
                         def status = triggerJob(
@@ -964,6 +1047,44 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             }
         },
     ]
+    def dockerBuildJob = [
+        "Build-Docker-Images": {
+            script {
+                stage("[Build-Docker-Images] Remote Run") {
+                    def parameters = getCommonParameters()
+                    String globalVarsJson = writeJSON returnText: true, json: globalVars
+                    def branch = env.gitlabBranch ? env.gitlabBranch : "main"
+                    if (globalVars[GITHUB_PR_API_URL]) {
+                        branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                    }
+
+                    parameters += [
+                        'enableFailFast': enableFailFast,
+                        'branch': branch,
+                        'action': "push",
+                        'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
+                        'globalVars': globalVarsJson,
+                    ]
+
+                    echo "trigger BuildDockerImages job, params: ${parameters}"
+
+                    def status = triggerJob("/LLM/helpers/BuildDockerImages", parameters)
+                    if (status != "SUCCESS") {
+                        error "Downstream job did not succeed"
+                    }
+                }
+            }
+        }
+    ]
+    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+        stages += dockerBuildJob
+    }
+    if (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") || testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images")) {
+        stages += dockerBuildJob
+        testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
+        testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
+        echo "Will run Build-Docker-Images job"
+    }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {

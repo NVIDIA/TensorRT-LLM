@@ -16,7 +16,7 @@ The following sections explain how to use these implementations and provide a br
 
 
 There are currently three available attention backends: the vanilla backend, the TRT-LLM backend, and the Flashinfer backend.
-You can specify the desired attention backend using `PyTorchConfig.attn_backend`. For instance, to utilize the Flashinfer backend, you can create a `PyTorchConfig` with `attn_backend = "flashinfer"` and then pass it to the `LLM` constructor as follows: `LLM(pytorch_backend_config=pytorch_config)`. This will enable the use of the Flashinfer backend for your model.
+You can specify the desired attention backend using `PyTorchConfig.attn_backend`. For instance, to utilize the Flashinfer backend, you can pass `attn_backend="flashinfer"` to the `LLM` constructor as follows: `LLM(attn_backend="flashinfer")`. This will enable the use of the Flashinfer backend for your model.
 
 The vanilla backend, `VanillaAttention`, is a reference implementation designed primarily for inflight batching and linear KV cache support. While it serves as a useful baseline, it is not recommended for production use due to its limited optimizations.
 

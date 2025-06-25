@@ -26,7 +26,8 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, MoEAllReduce)
+                                             AllReduceParams, MoEAllReduce,
+                                             MoEAllReduceParams)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.mapping import Mapping
@@ -381,16 +382,19 @@ def run_moe_allreduce_op(token_input: torch.Tensor, residual: torch.Tensor,
     scale_parallel = torch.chunk(scale.clone(), tensor_parallel_size, dim=0)
     scale_equalized = scale_parallel[tensor_parallel_rank]
 
+    moe_all_reduce_params = MoEAllReduceParams(
+        residual=residual,
+        norm_weight=norm_weight,
+        device_num_experts=tensor_num_device_experts,
+        expert_scale_factor=scale_equalized,
+        shared_expert_output=fc2_output,
+        eps=eps,
+        is_cutlass_min_latency=True,
+    )
+
     # Run with fusion
     output_hidden_states, output_residual = moe_allreduce(
-        residual,
-        norm_weight,
-        tensor_num_device_experts,
-        scale_equalized,
-        active_experts_token_equalized,
-        fc2_output,
-        eps,
-    )
+        active_experts_token_equalized, all_reduce_params=moe_all_reduce_params)
 
     torch_l0 = torch.nn.Linear(in_features=hidden_size,
                                out_features=hidden_size,
@@ -449,6 +453,121 @@ def test_moe_allreduce_patterns():
             run_moe_single_rank,
             *zip(*[(tensor_parallel_size, run_moe_allreduce_op, token_input,
                     residual, active_experts_token_input, scale, l0_weight)] *
+                 tensor_parallel_size),
+        )
+        for r in results:
+            assert r is True
+
+
+def run_moe_finalize_single_rank(tensor_parallel_size, single_rank_forward_func,
+                                 fc2_output, residual, shared_expert_output,
+                                 expanded_idx_to_permuted_idx, scale):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        single_rank_forward_func(fc2_output, residual, shared_expert_output,
+                                 expanded_idx_to_permuted_idx, scale, rank,
+                                 tensor_parallel_size)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@torch.inference_mode()
+def run_moe_finalize_allreduce_op(
+        fc2_output: torch.Tensor, residual: torch.Tensor,
+        shared_expert_output: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor, scale: torch.Tensor,
+        tensor_parallel_rank: int, tensor_parallel_size: int):
+    torch.manual_seed(42)
+
+    fc2_output = fc2_output.cuda()
+    residual = residual.cuda()
+    shared_expert_output = shared_expert_output.cuda()
+    expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.cuda()
+    scale = scale.cuda()
+
+    dtype = fc2_output.dtype
+    hidden_size = residual.shape[1]
+
+    # Setup parameters
+    eps = 1e-5
+    norm_weight = torch.randn((hidden_size, ), dtype=dtype, device="cuda")
+
+    # Initialize MoEAllreduce
+    moe_allreduce = MoEAllReduce(mapping=Mapping(
+        world_size=tensor_parallel_size,
+        tp_size=tensor_parallel_size,
+        rank=tensor_parallel_rank,
+    ))
+
+    # Initialize RMSNorm
+    norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
+    norm.weight.data.copy_(norm_weight)
+
+    moe_all_reduce_params = MoEAllReduceParams(
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        expert_scale_factor=scale,
+        shared_expert_output=shared_expert_output,
+        residual=residual,
+        norm_weight=norm_weight,
+        eps=eps,
+        is_cutlass_min_latency=False,
+    )
+
+    # Run with fusion
+    output_hidden_states, output_residual = moe_allreduce(
+        fc2_output, all_reduce_params=moe_all_reduce_params)
+
+    # Verify with torch reference implementation
+    expert_reduction = torch.sum(fc2_output[expanded_idx_to_permuted_idx] *
+                                 scale.unsqueeze(-1),
+                                 dim=1)
+
+    torch_before_residual = (expert_reduction +
+                             shared_expert_output) * tensor_parallel_size
+    torch_residual = torch_before_residual + residual
+    torch_residual = torch_residual.to(torch.float32)
+    torch_output_hidden_states = rms_norm(torch_residual, norm_weight,
+                                          eps).to(dtype)
+
+    # Verify results are close to reference
+    torch.testing.assert_close(
+        output_hidden_states,
+        torch_output_hidden_states,
+        rtol=0.2,
+        atol=0.2,
+    )
+
+    return True
+
+
+@torch.inference_mode()
+def test_moe_finalize_allreduce_patterns():
+    torch.manual_seed(42)
+
+    seq_len = 16
+    hidden_size = 7168
+    dtype = torch.bfloat16
+    tensor_parallel_size = 2
+    top_k = 8
+
+    shared_expert_output = torch.randn((seq_len, hidden_size), dtype=dtype)
+    fc2_output = torch.randn((seq_len * top_k, hidden_size), dtype=dtype)
+    scale = torch.randn((seq_len, top_k), dtype=dtype)
+    expanded_idx_to_permuted_idx = torch.randint(0,
+                                                 seq_len * top_k,
+                                                 (seq_len, top_k),
+                                                 dtype=torch.int32)
+    residual = torch.randn_like(shared_expert_output)
+
+    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
+        results = executor.map(
+            run_moe_finalize_single_rank,
+            *zip(*[(tensor_parallel_size, run_moe_finalize_allreduce_op,
+                    fc2_output, residual, shared_expert_output,
+                    expanded_idx_to_permuted_idx, scale)] *
                  tensor_parallel_size),
         )
         for r in results:

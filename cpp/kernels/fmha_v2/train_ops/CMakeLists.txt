@@ -16,7 +16,6 @@ set(CMAKE_CUDA_FLAGS
 -Wno-deprecated-declarations \
 --resource-usage \
 -use_fast_math \
--Xcicc --uumn -Xptxas -uumn \
 -Xptxas=-v \
 ")
 
@@ -109,18 +108,3 @@ add_executable(test test.cpp test_bmm.cpp ../src/convert.cu
                     $<TARGET_OBJECTS:fmha_fp8_obj>)
 
 target_link_libraries(test PRIVATE ${TORCH_LIBRARIES} cublasLt python3.8)
-
-# Build APEX kernels for benchmarking
-#
-# pybind11_add_module(apex_mha MODULE apex_mha_api.cpp apex_mha_kernels.cu )
-#
-# target_compile_definitions(apex_mha PUBLIC TORCH_EXTENSION_NAME=apex_mha)
-#
-# target_include_directories(apex_mha PRIVATE ${TORCH_INCLUDE_DIRS}
-# /data/projects/apex_gitlab/apex/contrib/csrc/multihead_attn/cutlass
-# /data/projects/apex_gitlab/apex/contrib/csrc/multihead_attn
-# #/data/projects/mlperf/training/apex/apex/contrib/csrc/multihead_attn/cutlass
-# #/data/projects/mlperf/training/apex/apex/contrib/csrc/multihead_attn )
-#
-# target_link_libraries(apex_mha PRIVATE ${TORCH_LIBRARIES}
-# ${TORCH_PYTHON_LIBRARY} )

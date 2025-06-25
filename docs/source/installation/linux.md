@@ -5,7 +5,7 @@
 1. Install TensorRT-LLM (tested on Ubuntu 24.04).
 
     ```bash
-    (Optional) pip3 install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+    (Optional) pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
     sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
     ```
@@ -55,4 +55,10 @@ There are some known limitations when you pip install pre-built TensorRT-LLM whe
 
    ```bash
    [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt
+   ```
+
+   PyTorch NGC Container typically includes a pre-installed `tensorrt` Python package. If there is a version mismatch between this pre-installed package and the version required by the TensorRT-LLM wheel, you will need to uninstall the existing `tensorrt` package before installing TensorRT-LLM.
+
+   ```bash
+   pip uninstall -y tensorrt
    ```

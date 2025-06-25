@@ -32,8 +32,8 @@ enum class TrtllmGenAttentionMaskType
     Dense = 0,
     // Causal mask.
     Causal,
-    // Sliding window causal mask.
-    SlidingWindowCausal,
+    // Sliding window or chunked causal mask.
+    SlidingOrChunkedCausal,
     // Custom mask.
     Custom
 };
@@ -50,7 +50,7 @@ enum class TrtllmGenAttentionMaskType
 
 ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
-ATTENTION_MASK_TYPE_FUNCTION(SlidingWindowCausal)
+ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
 ATTENTION_MASK_TYPE_FUNCTION(Custom)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
@@ -246,8 +246,11 @@ struct TllmGenFmhaRunnerParams
     int mMaxSeqLenQ;
     // The max kv sequence length.
     int mMaxSeqLenKv;
-    // The attention window size for sliding window attention.
+    // The attention window size for sliding window attention (sliding-window-attention is enabled when seqLenKv >
+    // mAttentionWindowSize).
     int mAttentionWindowSize;
+    // The chunked attention size (chunked-context is enabled when seqLenKv > mChunkedAttentionSize).
+    int mChunkedAttentionSize;
     // The sum of sequence lengths for Q and K/V. (Only used when mSupportsVarSeqLens = true)
     int mSumOfSeqLensQ;
     int mSumOfSeqLensKv;
@@ -283,8 +286,8 @@ struct TllmGenFmhaRunnerParams
         case 1: // tensorrt_llm::kernels::ContextAttentionMaskType::CAUSAL
             mMaskType = TrtllmGenAttentionMaskType::Causal;
             break;
-        case 2: // tensorrt_llm::kernels::ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL
-            mMaskType = TrtllmGenAttentionMaskType::SlidingWindowCausal;
+        case 2: // tensorrt_llm::kernels::ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
+            mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
             break;
         case 3: // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
             mMaskType = TrtllmGenAttentionMaskType::Custom;
@@ -310,6 +313,8 @@ struct TllmGenSelectKernelParams
     MultiCtasKvMode mMultiCtasKvMode;
     // Force using GmemRedution for the multiCtasKvMode.
     bool mForceGmemReduction;
+    // The mask type.
+    TrtllmGenAttentionMaskType mMaskType;
     // Reuse smemK for V or not (only work with MLA generation kernels).
     bool mReuseSmemKForV;
     // Do we need to select a new kernel as the parameters have been updated.
@@ -328,6 +333,7 @@ struct TllmGenSelectKernelParams
         // Note the CgaSmemReduction will be enabled based on the heuristic.
         , mMultiCtasKvMode(params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction : MultiCtasKvMode::Disabled)
         , mForceGmemReduction(false)
+        , mMaskType(params.mMaskType)
         , mReuseSmemKForV(false)
         , mSelectNewKernel(false)
         , mTileScheduler(params.mTileScheduler)

@@ -28,8 +28,9 @@ try:
 except ImportError:
     TemplateLM = object
 
-from .._torch import LLM as PyTorchLLM
-from ..llmapi import LLM, RequestOutput
+from .. import LLM as PyTorchLLM
+from .._tensorrt_engine import LLM
+from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .interface import Evaluator
@@ -39,10 +40,12 @@ class LmEvalWrapper(TemplateLM):
 
     def __init__(self,
                  llm: Union[LLM, PyTorchLLM],
-                 sampling_params: Optional[SamplingParams] = None):
+                 sampling_params: Optional[SamplingParams] = None,
+                 streaming: bool = False):
         super().__init__()
         self.llm = llm
         self.sampling_params = sampling_params
+        self.streaming = streaming
 
     @property
     def eot_token_id(self) -> int:
@@ -96,20 +99,23 @@ class LmEvalWrapper(TemplateLM):
 
     def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
         profiler.start("trtllm exec")
-        outputs = []
+        results = []
         for request in tqdm(requests,
                             desc="Submitting requests",
                             disable=disable_tqdm):
             prompt, gen_kwargs = request.args
             sampling_params = self._get_sampling_params(gen_kwargs)
             output = self.llm.generate_async(prompt,
-                                             sampling_params=sampling_params)
-            outputs.append(output)
+                                             sampling_params=sampling_params,
+                                             streaming=self.streaming)
+            results.append(output)
 
-        for output in tqdm(outputs,
+        outputs = []
+        for output in tqdm(results,
                            desc="Fetching responses",
                            disable=disable_tqdm):
-            output.result()
+            outputs.append(output.result())
+
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
@@ -182,9 +188,11 @@ class LmEvalEvaluator(Evaluator):
 
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM],
-                 sampling_params: Optional[SamplingParams] = None) -> float:
+                 sampling_params: Optional[SamplingParams] = None,
+                 streaming: bool = False) -> float:
         import lm_eval
-        results = lm_eval.evaluate(lm=LmEvalWrapper(llm, sampling_params),
+        results = lm_eval.evaluate(lm=LmEvalWrapper(llm, sampling_params,
+                                                    streaming),
                                    task_dict=self.task_dict,
                                    limit=self.num_samples,
                                    apply_chat_template=self.apply_chat_template,
@@ -246,7 +254,7 @@ class GSM8K(LmEvalEvaluator):
                   default=False,
                   help="Whether to apply chat template.")
     @click.option("--system_prompt",
-                  type=Optional[str],
+                  type=str,
                   default=None,
                   help="System prompt.")
     @click.option("--max_input_length",
@@ -289,7 +297,7 @@ class GPQADiamond(LmEvalEvaluator):
                   default=False,
                   help="Whether to apply chat template.")
     @click.option("--system_prompt",
-                  type=Optional[str],
+                  type=str,
                   default=None,
                   help="System prompt.")
     @click.option("--max_input_length",
@@ -332,7 +340,7 @@ class GPQAMain(LmEvalEvaluator):
                   default=False,
                   help="Whether to apply chat template.")
     @click.option("--system_prompt",
-                  type=Optional[str],
+                  type=str,
                   default=None,
                   help="System prompt.")
     @click.option("--max_input_length",
@@ -375,7 +383,7 @@ class GPQAExtended(LmEvalEvaluator):
                   default=False,
                   help="Whether to apply chat template.")
     @click.option("--system_prompt",
-                  type=Optional[str],
+                  type=str,
                   default=None,
                   help="System prompt.")
     @click.option("--max_input_length",

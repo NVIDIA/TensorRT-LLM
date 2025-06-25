@@ -507,6 +507,9 @@ def generate_api_docs_as_docstring(model: Type[BaseModel],
         elif field_name in type_hints:
             type_str = str(type_hints[field_name])
             type_str = type_str.replace("typing.", "")
+            # Extract just the class name from full class path
+            if "<class '" in type_str:
+                type_str = type_str[8:-2]
         else:
             type_str = field_type or 'Any'
 

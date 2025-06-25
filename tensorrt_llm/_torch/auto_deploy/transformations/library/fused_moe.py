@@ -1,22 +1,23 @@
 from collections import defaultdict
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 from torch.fx import GraphModule, Node
 
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
-from ...utils.node_utils import identify_regions_between_residuals, is_linear_op, is_op
+from ...utils.node_utils import bfs, identify_regions_between_residuals, is_linear_op, is_op
 from .._graph import canonicalize_graph
 
 
 def match_moe_pattern(gm: GraphModule) -> GraphModule:
     graph = gm.graph
 
-    ad_logger.info("MoE Pattern Matching")
     ad_logger.debug("Before MoE Pattern Matching: " + str(gm))
     # Preprocessing: Identify boundary nodes (e.g. residual connections) in the graph.
     boundary_nodes = identify_regions_between_residuals(gm)
+
+    num_moe_patterns = 0
 
     for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         # Step 1: Identify Expert Compute pattern
@@ -36,7 +37,7 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
         common_ancessor2 = _find_lowest_common_ancessor(arg2_list)
         if not common_ancessor2:
             continue
-        selected_experts = _bfs(
+        selected_experts = bfs(
             common_ancessor2,
             lambda node: is_op(node, torch.ops.aten.one_hot),
             attr_next="all_input_nodes",
@@ -68,7 +69,7 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
             w3_list = expert_weights["w3"]
 
             fused_moe_node = graph.call_function(
-                torch.ops.moe.torch_moe,
+                torch.ops.auto_deploy.torch_moe,
                 args=(
                     hidden_states,
                     selected_experts,
@@ -85,33 +86,39 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
         while _remove_dead_inplace_nodes_in_region(gm.graph, start_boundary, end_boundary):
             gm.graph.eliminate_dead_code()
 
+        num_moe_patterns += 1
+
     gm = canonicalize_graph(gm)
+
+    ad_logger.info(f"Found {num_moe_patterns} MoE Patterns")
     ad_logger.debug("After MoE Pattern Matching: " + str(gm))
+
     return gm
 
 
 def fuse_moe(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     """
     Scan the FX graph and replace all calls to torch.ops.moe.torch_moe with
-    torch.ops.moe.trtllm_fused_moe.
+    torch.ops.auto_deploy.trtllm_moe_fused.
     """
-    ad_logger.info("MoE fusion")
     ad_logger.debug("Before MoE fusion: " + str(gm))
 
     with cuda_memory_tracker():
-        _insert_fused_moe_ops(gm)
-        gm = canonicalize_graph(gm)
+        fused_key_counter = _insert_fused_moe_ops(gm)
+        if fused_key_counter:
+            gm = canonicalize_graph(gm)
 
+    ad_logger.info(f"Found {fused_key_counter} MoE fusions")
     ad_logger.debug("After MoE fusion: " + str(gm))
     return gm
 
 
-def _insert_fused_moe_ops(gm: GraphModule):
+def _insert_fused_moe_ops(gm: GraphModule) -> int:
     fused_key_counter = 0
     graph = gm.graph
 
     for node in list(graph.nodes):
-        if not is_op(node, torch.ops.moe.torch_moe):
+        if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
 
         ad_logger.debug(f"Found MoE op to fuse: {node} with args: {node.args}")
@@ -139,7 +146,7 @@ def _insert_fused_moe_ops(gm: GraphModule):
 
         with graph.inserting_before(node):
             new_node = graph.call_function(
-                torch.ops.moe.trtllm_fused_moe,
+                torch.ops.auto_deploy.trtllm_moe_fused,
                 args=(
                     hidden_states,
                     selected_experts,
@@ -152,25 +159,7 @@ def _insert_fused_moe_ops(gm: GraphModule):
         node.replace_all_uses_with(new_node)
         graph.erase_node(node)
 
-
-def _bfs(
-    node: Node, target: Callable, attr_next: str = "users", boundary: Optional[Node] = None
-) -> Node:
-    queue = [node]
-    visited = set()
-    while queue:
-        cur_node = queue.pop(0)
-        if boundary is not None and cur_node == boundary:
-            continue  # Skip the boundary node.
-        if target(cur_node):
-            return cur_node
-        for next_node in getattr(cur_node, attr_next):
-            if boundary is not None and next_node == boundary:
-                continue  # Do not expand past the boundary.
-            if next_node not in visited:
-                visited.add(next_node)
-                queue.append(next_node)
-    raise RuntimeError(f"Could not find node with target condition {target}.")
+    return fused_key_counter
 
 
 def _find_lowest_common_ancessor(nodes: list[Node]) -> Optional[Node]:
@@ -326,7 +315,7 @@ def _find_final_hidden_state_node(
     For each expert output node (from the expert compute pattern), this function:
       1. Retrieves a multiplication node from its users.
       2. Extracts the second argument from the multiplication node (assumed to be the index node).
-      3. Uses a BFS (via _bfs) to locate the subsequent index_add_ node (guarded by the end_boundary).
+      3. Uses a BFS to locate the subsequent index_add_ node (guarded by the end_boundary).
 
     After collecting all such index_add_ nodes, the final hidden state node is determined
     as the one that is not used by any of the other index_add_ nodes.
@@ -346,7 +335,7 @@ def _find_final_hidden_state_node(
         if not (hasattr(mul_node, "args") and len(mul_node.args) >= 2):
             return None
         index_node = mul_node.args[1]
-        index_add_node = _bfs(
+        index_add_node = bfs(
             index_node, lambda n: is_op(n, torch.ops.aten.index_add_), boundary=end_boundary
         )
         if not index_add_node:
@@ -412,7 +401,7 @@ def _remove_dead_inplace_nodes_in_region(
         return is_op(n, {torch.ops.aten.index_add_}) and len(n.users) == 0
 
     try:
-        node_to_remove = _bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
+        node_to_remove = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
         ad_logger.debug(f"Removing In-place Dead Node: {node_to_remove}")
         graph.erase_node(node_to_remove)
         return True

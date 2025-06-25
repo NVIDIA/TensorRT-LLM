@@ -620,7 +620,7 @@ static inline void store_paged_kv_cache(void** paged_kv_cache_ptrs, // [B, 2, M]
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T>
-static inline void extract_and_transpose_chunked_output(void* dst_, void* src_, std::vector<uint32_t> const& seqlens,
+static inline void extract_and_transpose_output(void* dst_, void* src_, std::vector<uint32_t> const& seqlens,
     std::vector<uint32_t> const& q_seqlens, int const s, int const q_seqlen, int const b, int const h, int const d,
     bool const s_padded = false)
 {

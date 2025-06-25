@@ -42,9 +42,7 @@ def can_access_peer(mapping: Mapping) -> bool:
 
         # Early exit if devices are on different nodes
         if mapping.get_node_rank(rank) != mapping.node_rank:
-            logger.info(
-                f"Detect inter-node TP between rank {mapping.rank} and rank {rank}"
-            )
+            logger.info(f"Detect inter-node TP between rank {mapping.rank} and rank {rank}")
             return False
 
         # Skip if same device
@@ -63,8 +61,7 @@ def can_access_peer(mapping: Mapping) -> bool:
     return True
 
 
-class IpcMemory():
-
+class IpcMemory:
     # WARNING: Must in sync with FLAGS_SIZE in cpp/include/tensorrt_llm/runtime/ipcUtils.h
     # (Max all reduce blocks + 1) * sizeof(int)
     IPC_BARRIERS_SIZE_PER_GPU = (24 + 1) * 4
@@ -73,8 +70,7 @@ class IpcMemory():
         self.mapping = mapping
         self.open_ipc = open_ipc and mapping.tp_size <= mapping.gpus_per_node
         if self.open_ipc:
-            self.peer_ptrs, self.local_ptr = IpcMemory.open_ipc_memory(
-                self.mapping, size, True)
+            self.peer_ptrs, self.local_ptr = IpcMemory.open_ipc_memory(self.mapping, size, True)
         else:
             self.peer_ptrs = [0] * mapping.tp_size
             self.local_ptr = 0
@@ -91,10 +87,10 @@ class IpcMemory():
         return array.array("Q", buffer).tolist()
 
     @staticmethod
-    def open_ipc_memory(mapping: Mapping,
-                        size: int,
-                        set_to_zero: bool = False) -> Tuple[List[int], int]:
-        """ Allocates a buffer with the given *size* on each GPU. Then, enables IPC communication between TP groups.
+    def open_ipc_memory(
+        mapping: Mapping, size: int, set_to_zero: bool = False
+    ) -> Tuple[List[int], int]:
+        """Allocates a buffer with the given *size* on each GPU. Then, enables IPC communication between TP groups.
         Returns a list of buffer pointers, buffers[i] is a handle to the corresponding buffer residing on GPU #i.
         Call close_ipc_handle with the *buffer*.
         """
@@ -105,8 +101,8 @@ class IpcMemory():
             return size
 
         comm = mpi_comm().Split(
-            mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
-            mapping.tp_rank)
+            mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
+        )
 
         # see allocateIpcMemory in cpp/tensorrt_llm/runtime/ipcUtils.cpp for alignment reason
         # 1 << 21 is 2MB
@@ -131,7 +127,8 @@ class IpcMemory():
                 peer_ptrs.append(local_ptr)
             else:
                 error, ptr = cudart.cudaIpcOpenMemHandle(
-                    handle, cudart.cudaIpcMemLazyEnablePeerAccess)
+                    handle, cudart.cudaIpcMemLazyEnablePeerAccess
+                )
                 _raise_if_error(error)
                 peer_ptrs.append(ptr)
 

@@ -15,13 +15,13 @@ from .trt_test_alternative import call, check_call, print_info
 @pytest.fixture(autouse=True)
 def stop_triton_server():
     # Make sure Triton server are killed before each test.
-    call(f"pkill -9 tritonserver", shell=True)
-    call(f"pkill -9 trtllmExecutorWorker", shell=True)
+    call(f"pkill -9 -f tritonserver", shell=True)
+    call(f"pkill -9 -f trtllmExecutorWorker", shell=True)
     time.sleep(2)
     yield
     # Gracefully terminate Triton Server after each test.
-    call(f"pkill tritonserver", shell=True)
-    call(f"pkill trtllmExecutorWorker", shell=True)
+    call(f"pkill -f tritonserver", shell=True)
+    call(f"pkill -f trtllmExecutorWorker", shell=True)
     time.sleep(8)
 
 
@@ -37,7 +37,7 @@ def stop_triton_server():
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -170,7 +170,7 @@ def test_llama_v2_7b_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -287,7 +287,7 @@ def test_mistral_v1_7b_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -474,7 +474,7 @@ def test_mistral_v1_7b_python_backend(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -592,7 +592,7 @@ def test_llama_v2_70b_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1043,7 +1043,7 @@ def test_gpt_350m_python_backend(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1445,7 +1445,7 @@ def test_whisper_large_v3_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1569,7 +1569,7 @@ def test_gpt_gather_logits_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1759,7 +1759,7 @@ def test_gpt_350m_speculative_decoding(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -1950,7 +1950,7 @@ def test_gpt_350m_speculative_decoding_return_logits(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -2104,7 +2104,7 @@ def test_gpt_speculative_decoding_bls(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.2"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -2145,6 +2145,7 @@ def test_llama_v3_speculative_decoding_bls(
     tensorrt_llm_llama_example_root,
     llama_v3_8b_model_root,
     llama_v3_70b_model_root,
+    tensorrt_llm_example_root,
     llm_backend_inflight_batcher_llm_root,
     llm_backend_dataset_root,
     llm_backend_venv,
@@ -2161,16 +2162,19 @@ def test_llama_v3_speculative_decoding_bls(
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build engine
     DRAFT_ENGINE_DIR = prepare_llama_v3_8b_engine(
+        tensorrt_llm_example_root,
         tensorrt_llm_llama_example_root,
         llama_v3_8b_model_root,
         data_type=DATA_TYPE)
     CONTROL_ENGINE_DIR = prepare_llama_v3_70b_engine(
         "control_ifb",
+        tensorrt_llm_example_root,
         tensorrt_llm_llama_example_root,
         llama_v3_70b_model_root,
         data_type=DATA_TYPE)
     TARGET_ENGINE_DIR = prepare_llama_v3_70b_engine(
         "target_ifb",
+        tensorrt_llm_example_root,
         tensorrt_llm_llama_example_root,
         llama_v3_70b_model_root,
         data_type=DATA_TYPE)
@@ -2274,7 +2278,7 @@ def test_llama_v3_speculative_decoding_bls(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -2310,6 +2314,7 @@ def test_gpt_175b_dummyWeights_ifb(
     EXCLUDE_INPUT_IN_OUTPUT,
     inflight_batcher_llm_client_root,
     tensorrt_llm_gpt_example_root,
+    tensorrt_llm_example_root,
     gpt_tokenizer_model_root,
     llm_backend_venv,
 ):
@@ -2321,7 +2326,8 @@ def test_gpt_175b_dummyWeights_ifb(
 
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build Engine
-    ENGINE_PATH = prepare_gpt_175b_engine("ifb", tensorrt_llm_gpt_example_root)
+    ENGINE_PATH = prepare_gpt_175b_engine("ifb", tensorrt_llm_gpt_example_root,
+                                          tensorrt_llm_example_root)
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
     prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)
@@ -2388,7 +2394,7 @@ def test_gpt_175b_dummyWeights_ifb(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.7"])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
                          ids=["enableDecoupleMode", "disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -2656,151 +2662,6 @@ def test_llava_onevision(
             ]
     output_result = venv_check_output(llm_backend_venv, run_cmd)
     validate_by_keyword(output_result, keyword)
-
-
-@pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble", "tensorrt_llm_bls"])
-@pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
-@pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("PREPROCESSING_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
-@pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
-@pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
-@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
-                         ["max_utilization", "guaranteed_no_evict"])
-@pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.7"])
-@pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
-                         ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
-@pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
-                         ids=["enableDecoupleMode", "disableDecoupleMode"])
-@pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
-@pytest.mark.parametrize("MAX_QUEUE_DELAY_MICROSECONDS", ["0"])
-@pytest.mark.parametrize("ENABLE_KV_CACHE_REUSE", ["False"])
-@pytest.mark.parametrize("NORMALIZE_LOG_PROBS", ["True"])
-@pytest.mark.parametrize("ENABLE_CHUNKED_CONTEXT", ["False"])
-@pytest.mark.parametrize("GPU_DEVICE_IDS", [""])
-@pytest.mark.parametrize("DECODING_MODE", [""])
-@pytest.mark.parametrize("MAX_BEAM_WIDTH", ["1"])
-@pytest.mark.parametrize("EXCLUDE_INPUT_IN_OUTPUT", ["False"])
-@pytest.mark.parametrize("MAX_NUM_IMAGES", ["4"])
-def test_vila(
-    E2E_MODEL_NAME,
-    MAX_TOKENS_IN_KV_CACHE,
-    MAX_ATTENTION_WINDOW_SIZE,
-    BATCH_SCHEDULER_POLICY,
-    KV_CACHE_FREE_GPU_MEM_FRACTION,
-    ENABLE_TRT_OVERLAP,
-    BATCHING_STRATEGY,
-    DECOUPLED_MODE,
-    TRITON_MAX_BATCH_SIZE,
-    MAX_QUEUE_DELAY_MICROSECONDS,
-    MAX_BEAM_WIDTH,
-    ENABLE_KV_CACHE_REUSE,
-    NORMALIZE_LOG_PROBS,
-    ENABLE_CHUNKED_CONTEXT,
-    GPU_DEVICE_IDS,
-    DECODING_MODE,
-    PREPROCESSING_INSTANCE_COUNT,
-    POSTPROCESSING_INSTANCE_COUNT,
-    ACCUMULATE_TOKEN,
-    BLS_INSTANCE_COUNT,
-    EXCLUDE_INPUT_IN_OUTPUT,
-    MAX_NUM_IMAGES,
-    tensorrt_llm_multimodal_example_root,
-    tensorrt_llm_llama_example_root,
-    vila_model_root,
-    vila_repo_root,
-    llm_backend_multimodal_example_root,
-    llm_backend_venv,
-):
-    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
-        pytest.skip("Skipping. V1 doesn't support max_utilization.")
-
-    if E2E_MODEL_NAME == "ensemble" and ACCUMULATE_TOKEN == "True":
-        pytest.skip("Skipping.")
-
-    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
-
-    # install vila requirements
-    requirements_vila = os.path.join(llm_backend_repo_root, "all_models",
-                                     "multimodal", "requirements-vila.txt")
-    check_call(f"pip install -r {requirements_vila}", shell=True)
-
-    # Build Engine
-    ENGINE_PATH, MULTIMODAL_ENGINE_DIR = prepare_vila_engine(
-        tensorrt_llm_multimodal_example_root, tensorrt_llm_llama_example_root,
-        vila_model_root, vila_repo_root)
-    # Prepare model repo
-    new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
-    prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)
-
-    # Prepare multimodal specific repo
-    prepare_multimodal_model_repo(llm_backend_repo_root, new_model_repo,
-                                  "ensemble")
-    prepare_multimodal_model_repo(llm_backend_repo_root, new_model_repo,
-                                  "multimodal_encoders")
-
-    # Modify config.pbtxt
-    TOKENIZER_PATH = os.path.join(vila_model_root, "llm")
-    modify_ib_config_pbtxt(
-        new_model_repo,
-        ENGINE_PATH,
-        TOKENIZER_PATH,
-        llm_backend_repo_root,
-        DECOUPLED_MODE,
-        MAX_TOKENS_IN_KV_CACHE,
-        MAX_ATTENTION_WINDOW_SIZE,
-        BATCH_SCHEDULER_POLICY,
-        BATCHING_STRATEGY,
-        KV_CACHE_FREE_GPU_MEM_FRACTION,
-        EXCLUDE_INPUT_IN_OUTPUT,
-        ENABLE_TRT_OVERLAP,
-        TRITON_MAX_BATCH_SIZE,
-        MAX_QUEUE_DELAY_MICROSECONDS,
-        MAX_BEAM_WIDTH,
-        ENABLE_KV_CACHE_REUSE,
-        NORMALIZE_LOG_PROBS,
-        ENABLE_CHUNKED_CONTEXT,
-        GPU_DEVICE_IDS,
-        DECODING_MODE,
-        PREPROCESSING_INSTANCE_COUNT,
-        POSTPROCESSING_INSTANCE_COUNT,
-        ACCUMULATE_TOKEN,
-        BLS_INSTANCE_COUNT,
-        MULTIMODAL_ENGINE_PATH=MULTIMODAL_ENGINE_DIR,
-        MAX_NUM_IMAGES=MAX_NUM_IMAGES,
-    )
-
-    # Launch Triton Server
-    launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
-                                    "launch_triton_server.py")
-
-    # NOTE
-    # Due to mpi init error, manually set PMIX_MCA_gds=hash (ref: https://github.com/open-mpi/ompi/issues/6981)
-    check_call(
-        f"PMIX_MCA_gds=hash python3 {launch_server_py} --world_size=1 --model_repo={new_model_repo}",
-        shell=True)
-    check_server_ready()
-    # Run Test
-
-    text_prompt = "<image>\nPlease elaborate what you see in the image?"
-    run_cmd = [
-        f"{llm_backend_multimodal_example_root}/client.py",
-        "--model_type=vila",
-        f"--hf_model_dir={vila_model_root}",
-        f"--text='{text_prompt}'",
-    ]
-    if DECOUPLED_MODE == "True":
-        run_cmd += [
-            "--streaming",
-        ]
-
-        if E2E_MODEL_NAME == "tensorrt_llm_bls":
-            run_cmd += [
-                "--use_bls",
-            ]
-
-    venv_check_call(llm_backend_venv, run_cmd)
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -3827,6 +3688,20 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
                 run_cmd += [
                     "--streaming",
                 ]
+
+            print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
+            venv_check_call(llm_backend_venv, run_cmd)
+
+            run_cmd = [
+                f"{llm_backend_inflight_batcher_llm_root}/benchmark_core_model.py",
+                f"--max-input-len=300",
+                f"--tensorrt-llm-model-name={E2E_MODEL_NAME}",
+                f"--protocol={protocol}",
+                f"--test-llmapi",
+                'dataset',
+                f"--dataset={os.path.join(llm_backend_dataset_root, 'mini_cnn_eval.json')}",
+                f"--tokenizer-dir=TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            ]
 
             print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
             venv_check_call(llm_backend_venv, run_cmd)

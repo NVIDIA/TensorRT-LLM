@@ -12,7 +12,7 @@ def deepseek_v3_attention(
     self,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
+    position_ids: Optional[torch.IntTensor] = None,
     past_key_value: Optional[Cache] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
@@ -53,7 +53,7 @@ def deepseek_v3_attention(
     # Use custom op to capture mla. This does not handle KV cache
     # as passing transformers Cache into a custom op is throwing an error.
     # Would not be an issue, cause we intend to replace mla op with our implementation further along the pipeline
-    attn_output = torch.ops.deepseek.fused_mla(
+    attn_output = torch.ops.auto_deploy.torch_attention_deepseek_fused_mla(
         q_nope,
         q_pe,
         kv,
@@ -131,7 +131,7 @@ def deepseek_v3_moe(self, hidden_states):
     """DeepSeekV3MoE forward function rewritten in Mixtral style to enable torch export."""
 
     selected_experts, routing_weights, *_ = self.gate(hidden_states)
-    final_hidden_states = torch.ops.moe.torch_moe(
+    final_hidden_states = torch.ops.auto_deploy.torch_moe(
         hidden_states,
         selected_experts,
         routing_weights,
@@ -146,18 +146,33 @@ def deepseek_v3_moe(self, hidden_states):
     return final_hidden_states.to(hidden_states.dtype)
 
 
+def deepseek_v3_rope(self, x, seq_len=None):
+    """DeepSeekV3 Rotary Embedding forward function rewritten to enable torch export.
+    We return the full cached cos and sin values, instead of slicing them based on seq_len as this
+    would cause an issue during the generate phase (when seq_len=1 from input_ids). We also move the cos
+    sin buffers to appropriate device to enable export.
+    """
+
+    return (
+        self.cos_cached.to(dtype=x.dtype).to(device=x.device),
+        self.sin_cached.to(dtype=x.dtype).to(device=x.device),
+    )
+
+
 _from_config_original = AutoModelForCausalLM.from_config
 
 CUSTOM_MODULE_PATCHES: Dict[str, callable] = {
     "DeepseekV3MoE": deepseek_v3_moe,
     "DeepseekV2MoE": deepseek_v3_moe,
-    "DeepseekV3Attention": deepseek_v3_attention,
-    "DeepseekV2Attention": deepseek_v3_attention,
+    "DeepseekV3RotaryEmbedding": deepseek_v3_rope,
+    "DeepseekV3YarnRotaryEmbedding": deepseek_v3_rope,
+    "DeepseekV2RotaryEmbedding": deepseek_v3_rope,
+    "DeepseekV2YarnRotaryEmbedding": deepseek_v3_rope,
 }
 
 
-def get_model_from_config_patched(model_config, trust_remote_code):
-    model = _from_config_original(model_config, trust_remote_code=trust_remote_code)
+def get_model_from_config_patched(config, **kwargs):
+    model = _from_config_original(config, **kwargs)
     # Patch modules
     for _, module in model.named_modules():
         if type(module).__name__ in CUSTOM_MODULE_PATCHES.keys():

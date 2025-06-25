@@ -15,13 +15,13 @@ from .trt_test_alternative import call, check_call, print_info
 @pytest.fixture(autouse=True)
 def stop_triton_server():
     # Make sure Triton server are killed before each test.
-    call(f"pkill -9 tritonserver", shell=True)
-    call(f"pkill -9 trtllmExecutorWorker", shell=True)
+    call(f"pkill -9 -f tritonserver", shell=True)
+    call(f"pkill -9 -f trtllmExecutorWorker", shell=True)
     time.sleep(2)
     yield
     # Gracefully terminate Triton Server after each test.
-    call(f"pkill tritonserver", shell=True)
-    call(f"pkill trtllmExecutorWorker", shell=True)
+    call(f"pkill -f tritonserver", shell=True)
+    call(f"pkill -f trtllmExecutorWorker", shell=True)
     time.sleep(8)
 
 
@@ -42,7 +42,7 @@ def get_rcca_path():
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -152,7 +152,7 @@ def test_rcca_bug_4323566(
 @pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", [""])
 @pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
                          ids=["disableTrtOverlap"])
-@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching", "V1"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
 @pytest.mark.parametrize("DECOUPLED_MODE", ["False"],
                          ids=["disableDecoupleMode"])
 @pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["128"])
@@ -618,6 +618,7 @@ def test_rcca_bug_4714193(
     TOP_K,
     TOP_P,
     TEMPERATURE,
+    tensorrt_llm_example_root,
     tensorrt_llm_mixtral_example_root,
     mixtral_8x7b_v0_1_model_root,
     llm_backend_root,
@@ -631,8 +632,8 @@ def test_rcca_bug_4714193(
     llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
     # Build engine
     ENGINE_PATH = prepare_rcca_nvbug_4714193_engine(
-        tensorrt_llm_mixtral_example_root, mixtral_8x7b_v0_1_model_root,
-        llm_backend_root)
+        tensorrt_llm_example_root, tensorrt_llm_mixtral_example_root,
+        mixtral_8x7b_v0_1_model_root, llm_backend_root)
 
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")

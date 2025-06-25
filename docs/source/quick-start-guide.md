@@ -15,7 +15,7 @@ Here is a simple example to show how to use the LLM API with TinyLlama.
 ```
 
 You can also directly load TensorRT Model Optimizer's [quantized checkpoints on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) in the LLM constructor.
-To learn more about the LLM API, check out the [](llm-api/index) and [](llm-api-examples/index).
+To learn more about the LLM API, check out the [](llm-api/index) and [](examples/llm_api_examples).
 
 (deploy-with-trtllm-serve)=
 ## Deploy with trtllm-serve
@@ -151,7 +151,7 @@ In this Quick Start Guide, you:
 
 For more examples, refer to:
 
-- [examples/](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples) for showcases of how to run a quick benchmark on latest LLMs.
+- [examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples) for showcases of how to run a quick benchmark on latest LLMs.
 
 ## Related Information
 

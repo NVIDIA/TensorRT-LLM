@@ -22,6 +22,7 @@ from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  KvCacheRetentionConfig, SchedulerConfig)
 # yapf: enable
 from ..builder import BuildConfig, Engine, build
+from ..llmapi.llm_args import TrtLlmArgs
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
@@ -29,10 +30,11 @@ from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
-from .llm_args import (CalibConfig, EagleDecodingConfig, KvCacheConfig, LlmArgs,
+from .llm_args import (CalibConfig, DraftTargetDecodingConfig,
+                       EagleDecodingConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MTPDecodingConfig, _ModelFormatKind, _ModelWrapper,
-                       _ParallelConfig, get_model_format,
+                       MTPDecodingConfig, NGramDecodingConfig, _ModelFormatKind,
+                       _ModelWrapper, _ParallelConfig, get_model_format,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
 from .mpi_session import MPINodeState, MpiSession
@@ -105,14 +107,13 @@ class ModelLoader:
         self._workspace = workspace or tempfile.TemporaryDirectory()
         self.llm_build_stats = llm_build_stats or LlmBuildStats()
 
-        assert self.llm_args.build_config
-        self.build_config = self.llm_args.build_config
-
         self.model_obj = _ModelWrapper(self.llm_args.model)
         self.speculative_model_obj = _ModelWrapper(
             self.llm_args.speculative_model
         ) if self.llm_args.speculative_model is not None else None
-        self.convert_checkpoint_options = self.llm_args._convert_checkpoint_options
+
+        if isinstance(self.llm_args, TrtLlmArgs):
+            self.convert_checkpoint_options = self.llm_args._convert_checkpoint_options
         self.rank = mpi_rank()
         self.global_rank = global_mpi_rank()
         self.mapping = llm_args.parallel_config.to_mapping()
@@ -128,16 +129,21 @@ class ModelLoader:
         self._model_info: Optional[_ModelInfo] = None
         self._model_format = self.llm_args.model_format
 
-        self.auto_parallel_config = AutoParallelConfig(
-            world_size=llm_args.parallel_config.world_size if llm_args.
-            parallel_config.auto_parallel else 1)
-        default_config = self.llm_args.auto_parallel_config
-        self.auto_parallel_config.set_defaults(
-            cluster_key=default_config.cluster_key,
-            cluster_info=default_config.cluster_info,
-            same_buffer_io=default_config.same_buffer_io,
-            sharded_io_allowlist=default_config.sharded_io_allowlist,
-        )
+        if isinstance(self.llm_args, TrtLlmArgs):
+            assert self.llm_args.build_config
+            self.build_config = self.llm_args.build_config
+
+            self.auto_parallel_config = AutoParallelConfig(
+                world_size=llm_args.parallel_config.world_size if llm_args.
+                parallel_config.auto_parallel else 1)
+
+            default_config = self.llm_args.auto_parallel_config
+            self.auto_parallel_config.set_defaults(
+                cluster_key=default_config.cluster_key,
+                cluster_info=default_config.cluster_info,
+                same_buffer_io=default_config.same_buffer_io,
+                sharded_io_allowlist=default_config.sharded_io_allowlist,
+            )
 
         self._gather_build_steps()
 
@@ -626,7 +632,7 @@ class CachedModelLoader:
         self.model_loader = ModelLoader(self.llm_args)
 
         if self.llm_args.backend is not None:
-            if self.llm_args.backend not in ["pytorch", "autodeploy"]:
+            if self.llm_args.backend not in ["pytorch", "_autodeploy"]:
                 raise ValueError(
                     f'backend {self.llm_args.backend} is not supported.')
 
@@ -745,6 +751,11 @@ class CachedModelLoader:
 
                 if self.llm_args.parallel_config.is_multi_gpu:
                     assert self.mpi_session
+
+                    #mpi_session cannot be pickled so remove from self.llm_args
+                    if self.llm_args.mpi_session:
+                        del self.llm_args.mpi_session
+
                     # The engine_dir:Path will be stored to MPINodeState.state
                     build_infos = self.mpi_session.submit_sync(
                         CachedModelLoader._node_build_task,
@@ -860,6 +871,8 @@ __all__ = [
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
     'MTPDecodingConfig',
+    'NGramDecodingConfig',
+    'DraftTargetDecodingConfig',
     'ContextChunkingPolicy',
     'CapacitySchedulerPolicy',
     'BuildConfig',

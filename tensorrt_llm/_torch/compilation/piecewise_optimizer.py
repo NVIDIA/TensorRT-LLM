@@ -13,7 +13,7 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.logger import logger
 
 from ..utils import get_piecewise_cuda_graph_flag, make_weak_ref
-from .utils import (get_arg, get_enable_piecewise_cuda_graph_capture_flag,
+from .utils import (get_enable_piecewise_cuda_graph_capture_flag,
                     is_call_function)
 
 
@@ -221,52 +221,6 @@ def piecewise_optimizer(
 ) -> GraphModule:
     graph_pool_handle = torch.cuda.graph_pool_handle()
     graph = gm.graph
-    nodes_to_remove = []
-
-    symint_node = {}
-
-    for node in graph.nodes:
-        if node.op == "placeholder":
-            if isinstance(node.meta["val"], torch.SymInt):
-                symint_node[str(node.meta["val"])] = node
-
-        elif is_call_function(node, torch.ops.trtllm.attention.default):
-            q = get_arg(node, 0, "q")
-            fake_mode = detect_fake_mode()
-            with fake_mode:
-                new_output_tensor = torch.ops.trtllm.attention.default(
-                    *[
-                        i.meta["val"] if hasattr(i, "meta") else i
-                        for i in node.args
-                    ],
-                    **node.kwargs,
-                )
-            with graph.inserting_before(node):
-                output = graph.call_function(
-                    torch.ops.aten.new_empty.default,
-                    (q, [
-                        symint_node[str(i)]
-                        if isinstance(i, torch.SymInt) else i
-                        for i in new_output_tensor.shape
-                    ]),
-                    {"dtype": new_output_tensor.dtype},
-                )
-                if len(node.args) > 3:
-                    args = node.args[:3] + tuple((output, )) + node.args[3:]
-                else:
-                    node.kwargs["output"] = output
-                new_attention = graph.call_function(
-                    torch.ops.trtllm.attention_inplace.default, args,
-                    node.kwargs)
-                node.replace_all_uses_with(output)
-                output.meta["val"] = new_output_tensor
-
-            nodes_to_remove.append(node)
-
-    for node in nodes_to_remove:
-        graph.erase_node(node)
-
-    gm.recompile()
 
     stop_partition = False
     node_to_graph_id = {}
@@ -278,13 +232,14 @@ def piecewise_optimizer(
             continue
         if (not stop_partition and is_call_function(node, [
                 torch.ops.trtllm.attention_inplace.default,
+                torch.ops.trtllm.mla_custom_op_inplace.default,
                 torch.ops.aten.index.Tensor,
                 torch.ops.aten.cumsum.default,
         ])):
             idx += 1
             node_to_graph_id[node] = idx
             exclude_modules_id.append(idx)
-            if node.target != torch.ops.trtllm.attention_inplace.default:
+            if node.target != torch.ops.trtllm.attention_inplace.default and node.target != torch.ops.trtllm.mla_custom_op_inplace.default:
                 # We only know it is safe to continue splitting after attention
                 # since attention_inplace will not produce any new tensor
                 stop_partition = True

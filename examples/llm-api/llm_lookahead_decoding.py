@@ -1,6 +1,6 @@
 ### Generate Text Using Lookahead Decoding
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (LLM, BuildConfig, KvCacheConfig,
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.llmapi import (BuildConfig, KvCacheConfig,
                                  LookaheadDecodingConfig, SamplingParams)
 
 

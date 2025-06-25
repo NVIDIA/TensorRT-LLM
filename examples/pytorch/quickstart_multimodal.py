@@ -1,12 +1,11 @@
 import argparse
 import json
 import os
-from typing import Any, Dict, List
 
 from quickstart_advanced import add_llm_args, setup_llm
 
-from tensorrt_llm.inputs import (INPUT_FORMATTER_MAP, default_image_loader,
-                                 default_video_loader)
+from tensorrt_llm.inputs import (ALL_SUPPORTED_MULTIMODAL_MODELS,
+                                 default_multimodal_input_loader)
 
 example_images = [
     "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
@@ -28,32 +27,10 @@ example_video_prompts = [
 ]
 
 
-def prepare_multimodal_inputs(model_dir: str,
-                              model_type: str,
-                              modality: str,
-                              prompts: List[str],
-                              media: List[str],
-                              image_data_format: str = "pt",
-                              num_frames: int = 8) -> List[Dict[str, Any]]:
-
-    inputs = []
-    if modality == "image":
-        inputs = default_image_loader(prompts, media, image_data_format)
-    elif modality == "video":
-        inputs = default_video_loader(prompts, media, image_data_format,
-                                      num_frames)
-    else:
-        raise ValueError(f"Unsupported modality: {modality}")
-
-    inputs = INPUT_FORMATTER_MAP[model_type](model_dir, inputs)
-
-    return inputs
-
-
 def add_multimodal_args(parser):
     parser.add_argument("--model_type",
                         type=str,
-                        choices=INPUT_FORMATTER_MAP.keys(),
+                        choices=ALL_SUPPORTED_MULTIMODAL_MODELS,
                         help="Model type.")
     parser.add_argument("--modality",
                         type=str,
@@ -68,6 +45,11 @@ def add_multimodal_args(parser):
                         type=int,
                         default=8,
                         help="The number of video frames to be sampled.")
+    parser.add_argument("--image_format",
+                        type=str,
+                        choices=["pt", "pil"],
+                        default="pt",
+                        help="The format of the image.")
     return parser
 
 
@@ -95,22 +77,29 @@ def main():
 
     llm, sampling_params = setup_llm(args)
 
-    image_format = "pt"  # ["pt", "pil"]
+    image_format = args.image_format
     if args.model_type is not None:
         model_type = args.model_type
     else:
         model_type = json.load(
             open(os.path.join(llm._hf_model_dir, 'config.json')))['model_type']
-    assert model_type in INPUT_FORMATTER_MAP, f"Unsupported model_type: {model_type}"
+    assert model_type in ALL_SUPPORTED_MULTIMODAL_MODELS, f"Unsupported model_type: {model_type}"
 
-    inputs = prepare_multimodal_inputs(args.model_dir, model_type,
-                                       args.modality, args.prompt, args.media,
-                                       image_format, args.num_frames)
+    device = "cuda"
+    inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
+                                             model_dir=llm._hf_model_dir,
+                                             model_type=model_type,
+                                             modality=args.modality,
+                                             prompts=args.prompt,
+                                             media=args.media,
+                                             image_data_format=image_format,
+                                             num_frames=args.num_frames,
+                                             device=device)
 
     outputs = llm.generate(inputs, sampling_params)
 
     for i, output in enumerate(outputs):
-        prompt = inputs[i]['prompt']
+        prompt = args.prompt[i]
         generated_text = output.outputs[0].text
         print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
 

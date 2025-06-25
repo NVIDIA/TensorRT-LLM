@@ -85,4 +85,21 @@ struct MoeReductionAllReduceFusionParams : public AllReduceFusionParams
 
 void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& params);
 
+struct MoeFinalizeAllReduceFusionParams : public AllReduceFusionParams
+{
+    // * moe reduction specific params
+    // Refer to kernel implementation on layout of those params
+    // number of active experts on current device
+    int top_k;
+    nvinfer1::DataType scale_dtype;
+    // [num_tokens, top_k]
+    void* expert_scale_factor = nullptr;
+    void* shared_expert_output = nullptr;
+    // [num_tokens, top_k]
+    int32_t* expanded_idx_to_permuted_idx = nullptr;
+    // allreduce_in [maxPermutedPaddedCount, hidden_dim]
+};
+
+void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& params);
+
 } // namespace tensorrt_llm::kernels::ar_fusion::moe

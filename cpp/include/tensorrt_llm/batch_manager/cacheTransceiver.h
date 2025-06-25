@@ -74,7 +74,8 @@ public:
     {
         UNKNOWN = 0,
         MPI = 1,
-        UCX = 2
+        UCX = 2,
+        NIXL = 3
     };
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, CommType commType,

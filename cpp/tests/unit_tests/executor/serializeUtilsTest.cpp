@@ -160,6 +160,7 @@ void compareResponse(texec::Response res, texec::Response res2)
     {
         compareResult(res.getResult(), res2.getResult());
     }
+    EXPECT_EQ(res.getClientId(), res2.getClientId());
 }
 
 template <typename T>
@@ -428,11 +429,15 @@ TEST(SerializeUtilsTest, ResultResponse)
         auto val = texec::Response(1, "my error msg");
         testSerializeDeserialize(val);
     }
+    {
+        auto val = texec::Response(1, "my error msg", 2);
+        testSerializeDeserialize(val);
+    }
 }
 
 TEST(SerializeUtilsTest, VectorResponses)
 {
-    int numResponses = 10;
+    int numResponses = 15;
     std::vector<texec::Response> responsesIn;
     for (int i = 0; i < numResponses; ++i)
     {
@@ -443,10 +448,15 @@ TEST(SerializeUtilsTest, VectorResponses)
                 std::nullopt, std::vector<texec::FinishReason>{texec::FinishReason::kEND_ID}};
             responsesIn.emplace_back(i, res);
         }
-        else
+        else if (i < 10)
         {
             std::string errMsg = "my_err_msg" + std::to_string(i);
             responsesIn.emplace_back(i, errMsg);
+        }
+        else
+        {
+            std::string errMsg = "my_err_msg" + std::to_string(i);
+            responsesIn.emplace_back(i, errMsg, i + 1);
         }
     }
 

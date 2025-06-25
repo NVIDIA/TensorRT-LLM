@@ -39,17 +39,32 @@ TensorPtr collectRequestIds(RequestVector const& contextRequests, RequestVector 
     return requestIds;
 }
 
-void sortByLoraId(ScheduledRequests& scheduledRequests)
+void sortRequests(RequestVector& contextRequests, RequestVector& generationRequests, bool chunksPresent)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto sortRequests = [](RequestVector& requests)
+    auto sortByLoraId = [](RequestVector::iterator begin, RequestVector::iterator end)
     {
-        std::sort(requests.begin(), requests.end(),
-            [](auto const& lhs, auto const& rhs) { return lhs->getLoraTaskId() < rhs->getLoraTaskId(); });
+        std::sort(
+            begin, end, [](auto const& lhs, auto const& rhs) { return lhs->getLoraTaskId() < rhs->getLoraTaskId(); });
     };
-    sortRequests(scheduledRequests.contextRequests);
-    sortRequests(scheduledRequests.generationRequests);
+
+    if (chunksPresent)
+    {
+        // Move context requests that reached the last context chunk to the end of the vector.
+        // This order is required for moveFinishedContextRequestsToGeneration.
+        auto firstFinished = std::partition(contextRequests.begin(), contextRequests.end(),
+            [](auto const& llmReq) { return !llmReq->isLastContextChunk(); });
+
+        // Sort context requests by lora task id, but keep finished requests separate.
+        sortByLoraId(contextRequests.begin(), firstFinished);
+        sortByLoraId(firstFinished, contextRequests.end());
+    }
+    else
+    {
+        sortByLoraId(contextRequests.begin(), contextRequests.end());
+    }
+    sortByLoraId(generationRequests.begin(), generationRequests.end());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -63,7 +78,9 @@ void moveFinishedContextRequestsToGeneration(ScheduledRequests& scheduledRequest
     auto firstFinished = std::find_if(
         contextRequests.begin(), contextRequests.end(), [](auto const& llmReq) { return llmReq->isContextFinished(); });
     TLLM_LOG_DEBUG(
-        "Moving %ld finished context requests to generation.", std::distance(firstFinished, contextRequests.end()));
+        "Found %ld unfinished chunked context requests. Found %ld finished context requests, moving them to "
+        "generation.",
+        std::distance(contextRequests.begin(), firstFinished), std::distance(firstFinished, contextRequests.end()));
     generationRequests.insert(generationRequests.begin(), std::make_move_iterator(firstFinished),
         std::make_move_iterator(contextRequests.end()));
     contextRequests.erase(firstFinished, contextRequests.end());
@@ -322,7 +339,7 @@ void CudaGraphExecutor::clear()
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void CudaGraphExecutor::prepareNextGraph(std::shared_ptr<runtime::TllmRuntime>& runtime, SizeType32 nextContextId)
+void CudaGraphExecutor::prepareNextGraph(std::unique_ptr<runtime::TllmRuntime>& runtime, SizeType32 nextContextId)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& stream = runtime->getStream();
@@ -368,7 +385,7 @@ void CudaGraphExecutorCache::put(BatchState const& state, std::shared_ptr<CudaGr
     {
         mCache.erase(it->second);
     }
-    mCache.emplace_front(BatchStateGraphExecutorPair{state, value});
+    mCache.emplace_front(state, value);
     mMap[state] = mCache.begin();
 
     if (static_cast<runtime::SizeType32>(mMap.size()) > mCapacity)

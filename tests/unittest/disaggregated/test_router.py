@@ -1,4 +1,6 @@
 import copy
+import threading
+from unittest import mock
 
 import pytest
 
@@ -8,6 +10,40 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 DisaggregatedParams)
 from tensorrt_llm.serve.router import (KvCacheAwareRouter, LoadBalancingRouter,
                                        RoundRobinRouter, create_router)
+
+
+# Mock class for metadata server
+class MockMetadataServer:
+    """Mock metadata server for testing router interactions"""
+
+    def __init__(self):
+        self.servers = {}
+        self.lock = threading.Lock()
+
+    def get(self, key):
+        with self.lock:
+            return self.servers.get(key)
+
+    def put(self, key, value):
+        with self.lock:
+            self.servers[key] = value
+            return True
+
+    def remove(self, key):
+        with self.lock:
+            if key in self.servers:
+                del self.servers[key]
+                return True
+            return False
+
+    def add_server(self, key, url):
+        with self.lock:
+            self.servers[key] = url
+            return True
+
+    def keys(self, prefix=""):
+        with self.lock:
+            return [k for k in self.servers.keys() if k.startswith(prefix)]
 
 
 @pytest.fixture
@@ -100,7 +136,7 @@ def chat_gen_requests():
 
 @pytest.mark.asyncio
 async def test_round_robin_router(servers, context_requests):
-    router = RoundRobinRouter(servers)
+    router = RoundRobinRouter(server_role=None, servers=servers)
     server_sequence = [(await router.get_next_server(req))[0]
                        for req in context_requests]
     assert server_sequence == [
@@ -114,7 +150,9 @@ async def test_round_robin_router(servers, context_requests):
     "chat_gen_requests"
 ])
 async def test_request_balancing_router(servers, requests_fixture, request):
-    router = LoadBalancingRouter(servers, use_tokens=False)
+    router = LoadBalancingRouter(server_role=None,
+                                 servers=servers,
+                                 use_tokens=False)
     requests = request.getfixturevalue(requests_fixture)
 
     server, _ = await router.get_next_server(requests[0])
@@ -142,7 +180,9 @@ async def test_request_balancing_router(servers, requests_fixture, request):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("requests_fixture", ["context_requests"])
 async def test_tokens_balancing_router(servers, requests_fixture, request):
-    router = LoadBalancingRouter(servers, use_tokens=True)
+    router = LoadBalancingRouter(server_role=None,
+                                 servers=servers,
+                                 use_tokens=True)
     requests = request.getfixturevalue(requests_fixture)
 
     server_sequence = [(await router.get_next_server(req))[0]
@@ -198,7 +238,9 @@ async def test_tokens_balancing_router(servers, requests_fixture, request):
     "requests_fixture",
     ["chat_context_requests", "gen_requests", "chat_gen_requests"])
 async def test_gen_tokens_balancing_router(servers, requests_fixture, request):
-    router = LoadBalancingRouter(servers, use_tokens=True)
+    router = LoadBalancingRouter(server_role=None,
+                                 servers=servers,
+                                 use_tokens=True)
     requests = request.getfixturevalue(requests_fixture)
 
     # Should throw an error if trying to use tokens load balancing with gen-only requests or chat completion requests
@@ -216,7 +258,11 @@ async def test_kv_cache_aware_router(servers):
         CompletionRequest(model="TinyLlama", prompt=[[1002] * 300]),
     ]
 
-    router = KvCacheAwareRouter(servers, use_tokens=False, max_batch_size=32)
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
     results = [await router.get_next_server(req) for req in requests]
     servers, infos = zip(*results)
     assert servers == ("server1", "server2", "server3")
@@ -236,6 +282,10 @@ async def test_kv_cache_aware_router(servers):
     results = [await router.get_next_server(req) for req in reversed(requests)]
     servers, infos = zip(*results)
     assert servers == ("server3", "server2", "server1")
+    # matched partial block will be counted as a whole block
+    assert infos[0]["matches"] == [0, 0, 320]
+    assert infos[1]["matches"] == [32, 224, 0]
+    assert infos[2]["matches"] == [128, 32, 0]
     for request in requests:
         await router.finish_request(request)
 
@@ -253,6 +303,7 @@ async def test_kv_cache_aware_router(servers):
     for server in servers:
         counts[server] += 1
     assert counts["server1"] > counts["server2"] > counts["server3"] > 0
+    assert infos[0]["matches"] == [96, 32, 0]
     for req in dup_requests:
         await router.finish_request(req)
 
@@ -293,3 +344,83 @@ def test_create_router(servers):
 
     with pytest.raises(ValueError):
         create_router(RouterConfig(type="unsupported_router"), servers)
+
+
+@pytest.fixture
+def mock_metadata_server():
+    return MockMetadataServer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "router_class", [RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter])
+async def test_fetch_live_servers_context(mock_metadata_server, router_class):
+    # Create router with mock metadata server
+    router = router_class(server_role="context",
+                          metadata_server=mock_metadata_server)
+
+    # Initial check - should be no servers
+    with pytest.raises(ValueError):
+        servers = await router.fetch_live_servers()
+
+    # Add a server
+    server_key = "trtllm/server1"
+    server_url = "http://localhost:8001"
+    mock_metadata_server.add_server(server_key, {"url": server_url})
+
+    # Fetch servers again
+    servers = await router.fetch_live_servers()
+    assert len(servers) == 1, "Should have one server after adding and waiting"
+    assert server_key in servers, "Server key should be present"
+    assert servers[
+        server_key] == server_url, "Server URL should match what was added"
+
+    # Add another server
+    server_key2 = "trtllm/server2"
+    server_url2 = "http://localhost:8002"
+    mock_metadata_server.add_server(server_key2, {"url": server_url2})
+
+    # Fetch servers again
+    servers = await router.fetch_live_servers()
+    assert len(
+        servers
+    ) == 2, "Should have two servers after adding second one and waiting"
+    assert server_key in servers, "First server should still be present"
+    assert server_key2 in servers, "Second server should be present"
+
+    # Remove a server
+    mock_metadata_server.remove(server_key)
+
+    # Fetch servers again
+    servers = await router.fetch_live_servers()
+    assert len(
+        servers) == 1, "Should have one server after removing one and waiting"
+    assert server_key2 in servers, "Second server should still be present"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "router_class", [RoundRobinRouter, LoadBalancingRouter, KvCacheAwareRouter])
+async def test_server_health_check(mock_metadata_server, router_class):
+    router = router_class(server_role="context",
+                          metadata_server=mock_metadata_server)
+
+    # Add two servers
+    server_key1 = "trtllm/server1"
+    server_url1 = "http://localhost:8001"
+    mock_metadata_server.add_server(server_key1, {"url": server_url1})
+
+    server_key2 = "trtllm/server2"
+    server_url2 = "http://localhost:8002"
+    mock_metadata_server.add_server(server_key2, {"url": server_url2})
+
+    # Mock the is_server_healthy method to simulate one server being down
+    with mock.patch.object(router, '_check_server_health') as mock_is_healthy:
+        # Only the second server is "healthy"
+        mock_is_healthy.side_effect = lambda url, silent=False: url == server_url2
+
+        # Fetch servers with health check
+        servers = await router.fetch_live_servers()
+        live_servers = await router.check_servers_health(servers)
+        assert len(live_servers) == 1, "Should have one healthy server"
+        assert server_url2 in live_servers, "Second server should still be present"

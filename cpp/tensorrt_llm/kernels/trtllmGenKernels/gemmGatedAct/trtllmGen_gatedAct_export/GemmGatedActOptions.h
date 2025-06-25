@@ -117,6 +117,14 @@ inline bool checkAndUpdateGemmGatedActOptions(
         TLLM_CHECK_ERROR(hiddenSize % 256 == 0, "Output hidden size must be a multiple of 256");
     }
 
+    if (options.mDtypeC == tg::Dtype::E2m1 || options.mDtypeC == tg::Dtype::MxE4m3)
+    {
+        int const outHiddenSize = (options.mTransposeMmaOutput ? options.mM : options.mN) / 2;
+        int const hiddenGranularity = 4 * tg::dtypeNumEltsPerSf(options.mDtypeC);
+        TLLM_CHECK_ERROR(outHiddenSize % hiddenGranularity == 0, "Output hidden size (", outHiddenSize,
+            ") must be a multiple of ", hiddenGranularity, " for block-scaled outputs.");
+    }
+
     auto isValid = gemm::checkAndUpdateGemmOptions(options, isBlackwell,
         /* tpGrpSize */ 1, updateOptions);
 

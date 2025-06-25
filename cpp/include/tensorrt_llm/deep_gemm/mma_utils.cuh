@@ -760,6 +760,30 @@ struct SM90_U32x4_STSM_N
     }
 };
 
+template <typename dtype_t>
+struct SM90_U32x2_STSM_T
+{
+    __device__ __forceinline__ static void copy(dtype_t src_0, dtype_t src_1, void* smem_dst)
+    {
+        const uint32_t src[2] = {*reinterpret_cast<uint32_t*>(&src_0), *reinterpret_cast<uint32_t*>(&src_1)};
+        asm volatile("stmatrix.sync.aligned.x2.m8n8.shared.b16.trans [%0], {%1, %2};\n" ::"l"(smem_dst), "r"(src[0]),
+            "r"(src[1]));
+    }
+};
+
+template <typename dtype_t>
+struct SM90_U32x4_STSM_T
+{
+    __device__ __forceinline__ static void copy(
+        dtype_t src_0, dtype_t src_1, dtype_t src_2, dtype_t src_3, void* smem_dst)
+    {
+        const uint32_t src[4] = {*reinterpret_cast<uint32_t*>(&src_0), *reinterpret_cast<uint32_t*>(&src_1),
+            *reinterpret_cast<uint32_t*>(&src_2), *reinterpret_cast<uint32_t*>(&src_3)};
+        asm volatile("stmatrix.sync.aligned.x4.m8n8.shared.b16.trans [%0], {%1, %2, %3, %4};\n" ::"l"(smem_dst),
+            "r"(src[0]), "r"(src[1]), "r"(src[2]), "r"(src[3]));
+    }
+};
+
 __device__ void warpgroup_arrive()
 {
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
@@ -802,6 +826,13 @@ __device__ __forceinline__ float ld_shared(float const* __restrict__ ptr)
 {
     float ret;
     asm volatile("ld.shared.f32 %0, [%1];" : "=f"(ret) : "l"(ptr));
+    return ret;
+}
+
+__device__ __forceinline__ float2 ld_shared(float2 const* __restrict__ ptr)
+{
+    float2 ret;
+    asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(ret.x), "=f"(ret.y) : "l"(ptr));
     return ret;
 }
 

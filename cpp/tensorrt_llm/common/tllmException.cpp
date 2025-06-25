@@ -57,7 +57,13 @@ std::string TllmException::getTrace() const
 #if defined(_MSC_VER)
     return "";
 #else
-    auto const trace = backtrace_symbols(mCallstack.data(), mNbFrames);
+    auto const trace = std::unique_ptr<char const*, void (*)(char const**)>(
+        const_cast<char const**>(backtrace_symbols(mCallstack.data(), mNbFrames)),
+        [](char const** p) { std::free(p); });
+    if (trace == nullptr)
+    {
+        throw std::bad_alloc();
+    }
     std::ostringstream buf;
     for (auto i = 1; i < mNbFrames; ++i)
     {
@@ -70,7 +76,7 @@ std::string TllmException::getTrace() const
         }
         else
         {
-            buf << fmtstr("%-3d %*p %s", i, VOID_PTR_SZ, mCallstack[i], trace[i]);
+            buf << fmtstr("%-3d %*p %s", i, VOID_PTR_SZ, mCallstack[i], trace.get()[i]);
         }
         if (i < mNbFrames - 1)
             buf << std::endl;
@@ -79,7 +85,6 @@ std::string TllmException::getTrace() const
     if (mNbFrames == MAX_FRAMES)
         buf << std::endl << "[truncated]";
 
-    std::free(trace);
     return buf.str();
 #endif
 }

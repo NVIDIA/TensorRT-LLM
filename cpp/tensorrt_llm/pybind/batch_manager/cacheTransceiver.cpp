@@ -83,7 +83,8 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
     py::enum_<tb::CacheTransceiver::CommType>(m, "CommType")
         .value("UNKNOWN", tb::CacheTransceiver::CommType::UNKNOWN)
         .value("MPI", tb::CacheTransceiver::CommType::MPI)
-        .value("UCX", tb::CacheTransceiver::CommType::UCX);
+        .value("UCX", tb::CacheTransceiver::CommType::UCX)
+        .value("NIXL", tb::CacheTransceiver::CommType::NIXL);
 
     py::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)
@@ -101,5 +102,5 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
         .def(py::init<tb::kv_cache_manager::BaseKVCacheManager*, std::optional<size_t>>(), py::arg("cache_manager"),
             py::arg("max_num_tokens") = std::nullopt)
         .def_static("pre_alloc_buffer_size", &tb::kv_cache_manager::CacheTransBufferManager::preAllocBufferSize,
-            py::arg("max_num_tokens") = std::nullopt, py::arg("kv_cache_size_per_token") = std::nullopt);
+            py::arg("max_num_tokens") = std::nullopt);
 }

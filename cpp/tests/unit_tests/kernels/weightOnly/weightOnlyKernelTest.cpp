@@ -220,7 +220,7 @@ void exec_cutlass_kernel(
     {
         tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<AType, AType>(
             reinterpret_cast<AType*>(scaled_act), reinterpret_cast<AType const*>(params.act),
-            reinterpret_cast<AType const*>(params.act_scale), params.m, params.k, stream);
+            reinterpret_cast<AType const*>(params.act_scale), params.m, params.k, nullptr, stream);
         act = scaled_act;
     }
     if constexpr (QuantOp == cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY)

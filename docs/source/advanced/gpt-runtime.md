@@ -171,6 +171,8 @@ value for a given parameter, the vector can be limited to a single element
 
  * `minP` is explained in [_Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs_](https://arxiv.org/abs/2407.01082).
 
+ * TensorRT-LLM does not generate all possible tokenizations of a word. Therefore, stop words may appear in the output if there are multiple ways to tokenize a stop word and the token sequence in the output differs from the one in `stopWords`.
+
 ***Beam-search***
 
 |      Name in TRT-LLM      |           Description           |      Data type      |      Range of value      |       Default value       |     Name in HF      |

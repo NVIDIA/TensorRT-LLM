@@ -30,6 +30,9 @@ from utils import (DEFAULT_HF_MODEL_DIRS, add_common_args, get_beam_width_array,
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm._utils import mpi_broadcast, str_dtype_to_torch
+from tensorrt_llm.builder import EngineConfig
+from tensorrt_llm.functional import RopeEmbeddingUtils, RotaryScalingType
+from tensorrt_llm.layers import MropeParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.qwen.utils import make_context
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
@@ -39,6 +42,42 @@ if PYTHON_BINDINGS:
     from tensorrt_llm.runtime import ModelRunnerCpp
 
 from prompt_lookup.run_dtm_pld import run_dtm_pld
+
+
+def ensemble_mrope_params(batch_input_ids, max_position_embeddings,
+                          rotary_embedding_dim, theta):
+    mrope_params = MropeParams()
+    batch_size = len(batch_input_ids)
+
+    _, rotary_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+        num_pos=max_position_embeddings,
+        dim=rotary_embedding_dim,
+        theta=1000000.0,
+        scale_type=RotaryScalingType.mrope,
+    )
+    rotary_cos_sin = torch.tensor(rotary_cos_sin).to(batch_input_ids[0].device)
+    rotary_cos_sin = rotary_cos_sin.reshape(max_position_embeddings,
+                                            int(rotary_embedding_dim / 2), 2)
+
+    cos_ori = rotary_cos_sin[:, :, 0]
+    sin_ori = rotary_cos_sin[:, :, 1]
+
+    mrope_position_ids_padding = torch.zeros(
+        (batch_size, max_position_embeddings), dtype=torch.int32)
+    for i in range(batch_size):
+        seq_len = batch_input_ids[i].shape[-1]
+        mrope_position_ids_padding[i, :seq_len] = torch.arange(
+            seq_len, device=batch_input_ids[i].device)
+
+    cos = cos_ori[mrope_position_ids_padding].unsqueeze(-1)
+    sin = sin_ori[mrope_position_ids_padding].unsqueeze(-1)
+
+    mrope_params.mrope_rotary_cos_sin = torch.concatenate(
+        (cos, sin), axis=-1).reshape(batch_size, -1)
+    mrope_params.mrope_position_deltas = torch.zeros(
+        [batch_size, 1], device=batch_input_ids[0].device)
+
+    return mrope_params
 
 
 def main(args):
@@ -262,8 +301,20 @@ def main(args):
                                           eval_task=eval_task,
                                           add_special_tokens=add_special_tokens,
                                           min_input_length=min_input_length)
-        batch_size = len(batch_input_ids)
-        if batch_size == 0:
+        # Generate mrope params for qwen model
+        engine_config = EngineConfig.from_json_file(
+            f"{args.engine_dir}/config.json")
+        pretrain_config = engine_config.pretrained_config
+        mrope_params = None
+        if 'qwen' in model_name.lower():
+            mrope_params = ensemble_mrope_params(
+                batch_input_ids,
+                max_position_embeddings=pretrain_config.max_position_embeddings,
+                rotary_embedding_dim=pretrain_config.rotary_embedding_dim,
+                theta=pretrain_config.rotary_base,
+            )
+
+        if batch_size == 0 or len(batch_input_ids) == 0:
             return [], [], [], {}
         input_lengths = [x.size(0) for x in batch_input_ids]
 
@@ -309,7 +360,8 @@ def main(args):
                     return_dict=True,
                     random_seed=random_seed,
                     medusa_choices=args.medusa_choices,
-                    eagle_choices=args.eagle_choices)
+                    eagle_choices=args.eagle_choices,
+                    mrope_params=mrope_params)
                 torch.cuda.synchronize()
 
         # Extract a list of tensors of shape beam_width x output_ids.
@@ -491,10 +543,34 @@ def main(args):
             f"Using {'Python' if args.use_py_session else 'C++'} session")
 
         runner_cls = ModelRunner if args.use_py_session else ModelRunnerCpp
-        runner_kwargs = dict(engine_dir=args.engine_dir,
-                             rank=runtime_rank,
-                             debug_mode=args.debug_mode,
-                             gpu_weights_percent=args.gpu_weights_percent)
+        runner_kwargs = dict(
+            engine_dir=args.engine_dir,
+            rank=runtime_rank,
+            debug_mode=args.debug_mode,
+            gpu_weights_percent=args.gpu_weights_percent,
+            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc,
+        )
+        if not args.use_py_session:
+            runner_kwargs.update(
+                lora_dir=args.lora_dir,
+                lora_ckpt_source=args.lora_ckpt_source,
+                max_batch_size=max_batch_size,
+                max_input_len=test_token_num,
+                max_output_len=output_len,
+                max_beam_width=num_beams,
+                max_attention_window_size=max_attention_window_size,
+                sink_token_length=sink_token_length,
+                max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
+                kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
+                kv_cache_free_gpu_memory_fraction=args.
+                kv_cache_free_gpu_memory_fraction,
+                enable_chunked_context=args.enable_chunked_context,
+                multi_block_mode=args.multi_block_mode,
+                cuda_graph_mode=args.cuda_graph_mode,
+                gather_generation_logits=args.eval_ppl,
+                use_gpu_direct_storage=args.use_gpu_direct_storage,
+            )
+
         if args.medusa_choices is not None:
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
@@ -523,38 +599,16 @@ def main(args):
         if args.prompt_lookup_config is not None:
             assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
             assert not args.use_py_session, "`--use_py_session` is not supported in Speculative decoding."
+            assert not is_enc_dec, "Encoder-Decoder model is not supported in Speculative decoding."
             assert args.num_beams == 1, "`--num_beams>1` is not supported in Speculative decoding."
             prompt_lookup_num_tokens, _, target_device_list = ast.literal_eval(
                 args.prompt_lookup_config)
             args.max_output_len = output_len  # Specialization for PLD
             runner_kwargs.update(is_orchestrator_mode=True,
-                                 device_ids=target_device_list)
-
-        if not args.use_py_session:
-            runner_kwargs.update(
-                lora_dir=args.lora_dir,
-                lora_ckpt_source=args.lora_ckpt_source,
-                max_batch_size=max_batch_size,
-                max_input_len=test_token_num,
-                max_output_len=output_len,
-                max_beam_width=num_beams,
-                max_attention_window_size=max_attention_window_size,
-                sink_token_length=sink_token_length,
-                max_tokens_in_paged_kv_cache=args.max_tokens_in_paged_kv_cache,
-                kv_cache_enable_block_reuse=args.kv_cache_enable_block_reuse,
-                kv_cache_free_gpu_memory_fraction=args.
-                kv_cache_free_gpu_memory_fraction,
-                enable_chunked_context=args.enable_chunked_context,
-                multi_block_mode=args.multi_block_mode,
-                cuda_graph_mode=args.cuda_graph_mode,
-                gather_generation_logits=args.eval_ppl,
-                use_gpu_direct_storage=args.use_gpu_direct_storage)
-        runner_kwargs.update(
-            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
-        if args.prompt_lookup_config is not None:
-            # Specialization for PLD since many call of `generate()` is needed
-            runner_kwargs.update(max_input_len=test_token_num +
+                                 device_ids=target_device_list,
+                                 max_input_len=test_token_num +
                                  prompt_lookup_num_tokens + output_len)
+
         runner = runner_cls.from_dir(**runner_kwargs)
         assert not (args.eval_ppl and not runner.gather_context_logits), \
             "PPL evaluation requires engine built with gather_context_logits enabled"

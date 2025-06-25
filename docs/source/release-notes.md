@@ -5,6 +5,127 @@
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
 
+## TensorRT-LLM Release 0.19.0
+
+### Key Features and Enhancements
+  - **The C++ runtime is now open sourced.**
+  - **PyTorch workflow**
+    - Added DeepSeek V3/R1 support. Refer to `examples/deepseek_v3/README.md`, also to the blog `docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md`.
+    - Added Llava-Next support.
+    - Added BERT support.
+    - Added a C++ based decoder, which added support for:
+      - TopK / TopP.
+      - Bad words.
+      - Stop words.
+      - Embedding bias.
+    - Added Autotuner for custom-op-compatible tuning process.
+      - Added a Python-based Autotuner core framework for kernel tuning.
+      - Applied the Autotuner to fused MoE and NVFP4 linear operators for concept and performance evaluations.
+    - Added guided decoding support (XGrammar integration).
+    - Added pipeline parallelism support for the overlap scheduler in `PyExecutor`.
+    - Added Qwen2VL model support.
+    - Added mixed precision quantization support.
+    - Added pipeline parallelism with attention DP support.
+    - Added no-cache attention support.
+    - Added `PeftCacheManager` support.
+    - Added Qwen2.5‑VL support and refactored Qwen2‑VL.
+    - Added trtllm‑gen FP4 GEMM support.
+    - Added Qwen2 MoE support.
+    - Applied `AutoTuner` to both Fused MoE and NVFP4 Linear operators.
+    - Introduced a `UserBuffers` allocator.
+    - Added Deepseek eager mode AllReduce fusion support.
+    - Added Multi-Token Prediction (MTP) support. Refer to the “Multi-Token Prediction (MTP)” section of `examples/deepseek_v3/README.md`.
+    - Added FlashMLA support for SM90.
+    - Added support for enabling MTP with CUDA graph padding.
+    - Added initial EAGLE-3 implementation.
+    - Added support for FP8 MLA on NVIDIA Hopper and Blackwell GPUs.
+  - **AutoDeploy for PyTorch workflow**.
+    - The AutoDeploy for PyTorch workflow is an **experimental** feature in `tensorrt_llm._torch.auto_deploy`.
+    - AutoDeploy provides an automated path from off-the-shelf models to optimized deployment in the TensorRT-LLM runtime.
+    - Check out `examples/auto_deploy/README.md` for more details.
+  - LLM API
+    - [BREAKING CHANGE] Added dynamic logits processor support, and deprecated static logits processor.
+    - Added batched logits processor support.
+    - Added EAGLE support.
+    - Added abort request support.
+    - Added `get_stats` support.
+    - Added multi-node support for Slurm-based clusters, refer to `examples/llm-api/llm_mgmn_*.sh`.
+  - Added InternLM-XComposer2 support. Refer to “InternLM-XComposer2” section in `examples/multimodal/README.md`.
+  - Added INT4-AWQ support for MoE models. Refer to the “AWQ Quantization” section in `examples/mixtral/README.md`.
+  - Added Qwen2-Audio support. Refer to `examples/qwen2audio/README.md`.
+  - Added Language-Adapter support. Refer to `examples/language_adapter/README.md`.
+  - Added STDiT for OpenSoRA text-to-video support. Refer to `examples/stdit/README.md`.
+  - Added vision encoders with tensor parallelism and context parallelism support. Refer to `examples/vit/README.md`.
+  - Added EXAONE-Deep support. Refer to `examples/exaone/README.md`.
+  - Added support for Phi-4-mini and Phi‑4‑MM.
+  - Added Gemma3 text‑only model support. Refer to "Run Gemma 3" section at `examples/gemma/README.md`.
+  - Added FP8 quantization support for Qwen2-VL.
+  - Added batched inference support for the LLM API MMLU example `examples/mmlu_llmapi.py`.
+  - Added FP4 quantization-layernorm fusion plugin support. (Llama models only)
+  - Added Mamba-Hybrid support.
+  - Added NVILA video support. The support includes 1 prompt - N media and N prompt - N media batching modes.
+  - Added a `--quantize_lm_head` option `examples/quantization/quantize.py` to support `lm_head` quantization.
+  - Added batched tensor FP4 quantization support.
+  - Added a `/metrics` endpoint for `trtllm-serve` to log iteration statistics.
+  - Added LoRA support for Phi-2 model.
+  - Added returning context logits support for `trtllm-serve`.
+  - Added one-shot version for UserBuffer AllReduce-Normalization on FP16/BF16.
+  - Added request BW metric measurement for `disaggServerBenchmark`.
+  - Updated logits bitmask kernel to v3.
+  - Enabled CUDA graphs when attention DP was used and active requests on different GPUs were uneven.
+  - Added iteration log support for `trtllm-bench`.
+  - `fp8_blockscale_gemm` is now open-sourced.
+  - Added AWQ support for ModelOpt checkpoints.
+  - Added Linear block scale layout support in FP4 quantization.
+  - Added pre-quantized FP8 checkpoint support for Nemotron-mini-4b-instruct.
+  - Added Variable-Beam-Width-Search (VBWS) support (part2).
+  - Added LoRA support for Gemma.
+  - Refactored scaffolding worker, added OpenAI API worker support.
+  - Optionally split MoE inputs into chunks to reduce GPU memory usage.
+  - Added UCX IP interface support.
+  - [BREAKING CHANGE] Added output of first token to additional generation outputs.
+  - Added FP8 support for SM120 architecture.
+  - Registered `ENABLE_MULTI_DEVICE` and `ENABLE_UCX` as CMake options.
+  - Made the scaffolding Controller more generic.
+  - Breaking change: Added individual gatherContext support for each additional output.
+  - Enabled `PyExecutor` inference flow to estimate `max_num_tokens` for `kv_cache_manager`.
+  - Added `TLLM_OVERRIDE_LAYER_NUM` and `TLLM_TRACE_MODEL_FORWARD` environment variables for debugging.
+  - Supported aborting disconnected requests.
+  - Added an option to run disaggregated serving without context servers.
+  - Fixed and improved allreduce and fusion kernels.
+  - Enhanced the integrated robustness of scaffolding via `init.py`.
+
+### API Changes
+  - Exposed `kc_cache_retention_config` from C++ `executor` API to the LLM API.
+  - Moved `BuildConfig` arguments to `LlmArgs`.
+  - Removed speculative decoding parameters from stateful decoders.
+  - Exposed `DecoderState` via bindings and integrated it in decoder.
+  - Refactored the `LlmArgs` with `Pydantic` and migrated remaining pybinding configurations to Python.
+  - Refactored disaggregated serving scripts.
+  - Added `numNodes` to `ParallelConfig`.
+  - Redesigned the multi‑stream API for DeepSeek.
+
+### Fixed Issues
+  - Fixed misused length argument of PluginField. Thanks to the contribution from @jl749 in #2712. This also fixes #2685.
+  - Fixed a Llama-3.2 SmoothQuant convert checkpoint issue. (#2677)
+  - Fixed a bug when loading an engine using LoRA through the LLM API. (#2782)
+  - Fixed incorrect batch slot usage in `addCumLogProbs` kernel. Thanks to the contribution from @aotman in #2787.
+  - Fixed incorrect output for Llama-3.2-11B-Vision-Instruct. (#2796)
+  - Removed the necessary of `--extra-index-url https://pypi.nvidia.com` when running `pip install tensorrt-llm`.
+
+### Infrastructure Changes
+  - The dependent NVIDIA ModelOpt version is updated to 0.27.
+
+### Known Issues
+  - The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
+
+
+## TensorRT-LLM Release 0.18.2
+
+### Key Features and Enhancements
+  - This update addresses known security issues. For the latest NVIDIA Vulnerability Disclosure Information visit https://www.nvidia.com/en-us/security/.
+
+
 ## TensorRT-LLM Release 0.18.1
 
 ### Key Features and Enhancements
@@ -65,7 +186,7 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Known Issues
   - Need `--extra-index-url https://pypi.nvidia.com` when running `pip install tensorrt-llm` due to new third-party dependencies.
   - The PYPI SBSA wheel is incompatible with PyTorch 2.5.1 due to a break in the PyTorch ABI/API, as detailed in the related [GitHub issue](https://github.com/pytorch/pytorch/issues/144966).
-  - The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container (https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
+  - The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
 
 ### Fixed Issues
   - Fixed incorrect LoRA output dimension. Thanks for the contribution from @akhoroshev in #2484.

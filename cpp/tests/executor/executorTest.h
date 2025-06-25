@@ -32,12 +32,19 @@ public:
 protected:
     void SetUp() override
     {
+        mDeviceCount = tensorrt_llm::common::getDeviceCount();
+        if (mDeviceCount == 0)
+        {
+            GTEST_SKIP() << "No GPUs found";
+        }
+
         mLogger = std::make_shared<tensorrt_llm::runtime::TllmLogger>();
         initTrtLlmPlugins(mLogger.get());
     }
 
     void TearDown() override {}
 
+    int mDeviceCount{};
     std::shared_ptr<nvinfer1::ILogger> mLogger{};
     SizeType32 mMaxWaitMs = 300000;
     SizeType32 mTrigWarnMs = 10000;

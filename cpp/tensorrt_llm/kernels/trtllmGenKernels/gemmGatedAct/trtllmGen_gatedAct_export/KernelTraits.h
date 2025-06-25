@@ -38,9 +38,11 @@ public:
     MemAllocatorHelper() {}
 
     // Constructor to initialize chunk sizes, alignments, and reuse flags
-    MemAllocatorHelper(std::vector<std::pair<int32_t, int32_t>> const& sizes, std::vector<bool> const& reuse)
+    MemAllocatorHelper(std::vector<std::pair<int32_t, int32_t>> const& sizes, std::vector<bool> const& reuse,
+        std::vector<std::string> const& names)
         : mNumBytesAndAlignmentPerSmemChunk(sizes)
         , mFirstChunkReuse(reuse)
+        , mSmemChunkNames(names)
     {
     }
 
@@ -92,6 +94,23 @@ public:
         return getOffsetBeforeChunk(static_cast<int32_t>(mNumBytesAndAlignmentPerSmemChunk.size()));
     }
 
+    // Returns the first chunk reuse flag for the ith chunk.
+    int getFirstChunkReuseFlag(int32_t ii) const
+    {
+        return mFirstChunkReuse[ii];
+    }
+
+    // Print the contents of this object.
+    void print() const
+    {
+        for (size_t ii = 0; ii < mNumBytesAndAlignmentPerSmemChunk.size(); ++ii)
+        {
+            printf("Chunk %zd %s: %d bytes, %d alignment, reuse %s, offset %d\n", ii, mSmemChunkNames[ii].c_str(),
+                mNumBytesAndAlignmentPerSmemChunk[ii].first, mNumBytesAndAlignmentPerSmemChunk[ii].second,
+                mFirstChunkReuse[ii] ? "true" : "false", getChunkOffset(ii));
+        }
+    }
+
 private:
     // Helper function to calculate padded size
     int32_t getSizePaddedToAlignment(int32_t size, int32_t alignment) const
@@ -107,6 +126,8 @@ private:
     std::vector<std::pair<int32_t, int32_t>> mNumBytesAndAlignmentPerSmemChunk;
     // Chunk reuse configuration. True at ith position means that ith chunk starts at smemOffset = 0.
     std::vector<bool> mFirstChunkReuse;
+    // Buffer names for inspection purposes.
+    std::vector<std::string> mSmemChunkNames;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -145,6 +166,8 @@ public:
 
             std::vector<std::pair<int32_t, int32_t>> numBytesAndAlignmentPerSmemChunk;
             std::vector<bool> firstChunkReuseSmem;
+            // Buffer names for inspection purposes.
+            std::vector<std::string> smemChunkNames;
 
             // LoadA
             {
@@ -154,8 +177,8 @@ public:
                 auto const numBytesAlignmentLoadA = 1024;
                 // loadA is already at first chunk. No need to reuse it.
                 auto const reuseChunksSmemLoadA = false;
-
                 // Add info.
+                smemChunkNames.emplace_back("smemLoadA");
                 numBytesAndAlignmentPerSmemChunk.emplace_back(
                     std::make_pair(numSmemBytesLoadA, numBytesAlignmentLoadA));
                 firstChunkReuseSmem.emplace_back(reuseChunksSmemLoadA);
@@ -169,8 +192,8 @@ public:
                 auto const numBytesAlignmentLoadB = 1024;
                 // No need to reuse the first chunk.
                 auto const reuseChunksSmemLoadB = false;
-
                 // Add info.
+                smemChunkNames.emplace_back("smemLoadB");
                 numBytesAndAlignmentPerSmemChunk.emplace_back(
                     std::make_pair(numSmemBytesLoadB, numBytesAlignmentLoadB));
                 firstChunkReuseSmem.emplace_back(reuseChunksSmemLoadB);
@@ -192,6 +215,7 @@ public:
                 auto const reuseChunksSmemLoadB = false;
 
                 // Add info.
+                smemChunkNames.emplace_back("smemBShuffle");
                 numBytesAndAlignmentPerSmemChunk.emplace_back(
                     std::make_pair(numSmemBytesLoadB, numBytesAlignmentLoadB));
                 firstChunkReuseSmem.emplace_back(reuseChunksSmemLoadB);
@@ -236,6 +260,7 @@ public:
                     = doesSplitKUseDsmem(splitK) && resIdx == 0 && !usePersistentScheduler;
 
                 // Add info.
+                smemChunkNames.emplace_back("smemGmemC" + std::to_string(resIdx));
                 numBytesAndAlignmentPerSmemChunk.emplace_back(
                     std::make_pair(numBytesSmemStoreC, numBytesAlignmentStoreC));
                 firstChunkReuseSmem.emplace_back(reuseFirstChunksSmemStoreC);
@@ -252,6 +277,7 @@ public:
                 auto const numBytesAlignmentRowMax = 16;
 
                 // Add info.
+                smemChunkNames.emplace_back("smemRowMax");
                 numBytesAndAlignmentPerSmemChunk.emplace_back(
                     std::make_pair(numBytesSmemRowMax, numBytesAlignmentRowMax));
                 firstChunkReuseSmem.emplace_back(false);
@@ -268,6 +294,7 @@ public:
                 auto const numBytesAlignmentTile = 16;
 
                 // Add info.
+                smemChunkNames.emplace_back("smemSliceK");
                 numBytesAndAlignmentPerSmemChunk.emplace_back(std::make_pair(numBytesSmemTile, numBytesAlignmentTile));
                 firstChunkReuseSmem.emplace_back(false);
             }
@@ -280,13 +307,41 @@ public:
                 // Number of bytes alignment for per-token scale factors
                 auto const numBytesAlignmentPerTokenSf = 16;
                 // Add info.
+                smemChunkNames.emplace_back("smemPerTokenSf");
                 numBytesAndAlignmentPerSmemChunk.emplace_back(
                     std::make_pair(numBytesSmemPerTokenSf, numBytesAlignmentPerTokenSf));
                 firstChunkReuseSmem.emplace_back(false);
             }
 
+            // Per-block absolute maximum for multi-warp reduction.
+            {
+                // Number of bytes: number of epilogue warps * number of tile columns.
+                // TODO: avoid allocating this memory when it's not needed (it's only for MxFp8 + fusedAct)
+                auto const numBytesSmemBlockAmax = transposeMmaOutput ? 4 * tileN * sizeof(float) : 0;
+                // Number of bytes alignment.
+                auto const numBytesAlignmentBlockAmax = 16;
+                // Add info.
+                smemChunkNames.emplace_back("smemBlockAmax");
+                numBytesAndAlignmentPerSmemChunk.emplace_back(
+                    std::make_pair(numBytesSmemBlockAmax, numBytesAlignmentBlockAmax));
+                firstChunkReuseSmem.emplace_back(false);
+            }
+
             // Create SMEM helper object.
-            mSmemAllocatorHelper = MemAllocatorHelper(numBytesAndAlignmentPerSmemChunk, firstChunkReuseSmem);
+            mSmemAllocatorHelper
+                = MemAllocatorHelper(numBytesAndAlignmentPerSmemChunk, firstChunkReuseSmem, smemChunkNames);
+#if 0
+      // E.g.,
+      // Chunk 0 smemLoadA: 32768 bytes, 1024 alignment, false, offset 0
+      // Chunk 1 smemLoadB: 32768 bytes, 1024 alignment, false, offset 32768
+      // Chunk 2 smemBShuffle: 0 bytes, 1024 alignment, false, offset 65536
+      // Chunk 3 smemGmemC0: 65536 bytes, 1024 alignment, true, offset 0
+      // Chunk 4 smemGmemC1: 65536 bytes, 1024 alignment, false, offset 65536
+      // Chunk 5 smemRowMax: 512 bytes, 16 alignment, false, offset 131072
+      // Chunk 6 smemSliceK: 0 bytes, 16 alignment, false, offset 131584
+      // Chunk 7 smemPerTokenSf: 0 bytes, 16 alignment, false, offset 131584
+      mSmemAllocatorHelper.print();
+#endif
         }
 
         //
@@ -296,7 +351,7 @@ public:
         {
             std::vector<std::pair<int32_t, int32_t>> numBytesAndAlignmentPerTmemChunk;
             std::vector<bool> firstChunkReuseTmem;
-
+            std::vector<std::string> tmemChunkNames;
             // Matrix D
             {
                 // Number of columns for accumulators.
@@ -308,6 +363,7 @@ public:
                 auto const reuseChunksTmemD = false;
 
                 // Add info.
+                tmemChunkNames.emplace_back("tmemD");
                 numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsD, numColsAlignmentD));
                 firstChunkReuseTmem.emplace_back(reuseChunksTmemD);
             }
@@ -324,6 +380,7 @@ public:
                 auto const reuseChunksTmemA = false;
 
                 // Add info.
+                tmemChunkNames.emplace_back("tmemA");
                 numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsA, numColsAlignmentA));
                 firstChunkReuseTmem.emplace_back(reuseChunksTmemA);
             }
@@ -341,6 +398,7 @@ public:
                 auto const reuseChunksTmemSfA = false;
 
                 // Add info.
+                tmemChunkNames.emplace_back("tmemSfA");
                 numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsSfA, numColsAlignmentSfA));
                 firstChunkReuseTmem.emplace_back(reuseChunksTmemSfA);
             }
@@ -356,12 +414,14 @@ public:
                 auto const reuseChunksTmemSfB = false;
 
                 // Add info.
+                tmemChunkNames.emplace_back("tmemSfB");
                 numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsSfB, numColsAlignmentSfB));
                 firstChunkReuseTmem.emplace_back(reuseChunksTmemSfB);
             }
 
             // Create TMEM helper object.
-            mTmemAllocatorHelper = MemAllocatorHelper(numBytesAndAlignmentPerTmemChunk, firstChunkReuseTmem);
+            mTmemAllocatorHelper
+                = MemAllocatorHelper(numBytesAndAlignmentPerTmemChunk, firstChunkReuseTmem, tmemChunkNames);
         }
     }
 
@@ -444,6 +504,21 @@ inline int32_t getSmemOffsetSliceK(KernelTraits traits)
 inline int32_t getSmemOffsetPerTokenSf(KernelTraits traits)
 {
     return traits.mSmemAllocatorHelper.getChunkOffset(7);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getSmemOffsetBlockAmax(KernelTraits traits)
+{
+    return traits.mSmemAllocatorHelper.getChunkOffset(8);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t isSmemAbRepurposedToGmemC(KernelTraits traits, int resIdx = 0)
+{
+    // Be conscious that the index (3 + resIdx) should match the index in getSmemOffsetGmemC().
+    return traits.mSmemAllocatorHelper.getFirstChunkReuseFlag(3 + resIdx);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

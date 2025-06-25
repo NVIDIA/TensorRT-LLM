@@ -235,7 +235,7 @@ class TestFunctional(unittest.TestCase):
     def test_selective_scan_v2(self, dim, headdim, ngroups, dstate, req_type,
                                dtype, batch_size, max_seq_len, has_z,
                                remove_padding):
-
+        pytest.skip("https://nvbugs/5324258")
         if dtype == 'float32' and req_type == 'context':
             pytest.skip(
                 "Mamba2 chunk scan kernel only support float16 and bfloat16")

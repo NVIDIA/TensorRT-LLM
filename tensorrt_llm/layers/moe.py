@@ -47,7 +47,7 @@ from .linear import RowLinear
 from .mlp import MLP, GatedMLP
 
 activation_str_to_int_map = {
-    # [WARNING] Keep the below in sync with cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h
+    # [WARNING] Keep the below in sync with cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
     "gelu": 0,
     "gelu_new": 0,
     "relu": 1,
@@ -500,8 +500,8 @@ class MOEWeightWrapper(Module):
             else:
                 self.register_parameter('zero', None)
             if groupwise_quant_algo & GroupwiseQuantAlgo.PRE_QUANT_SCALE:
-                self.prequant_scaling_factor = Parameter(
-                    shape=(experts_per_node, 1), dtype=dtype)
+                self.prequant_scaling_factor = Parameter(shape=(1, in_features),
+                                                         dtype=dtype)
             else:
                 self.register_parameter('prequant_scaling_factor', None)
             if groupwise_quant_algo & GroupwiseQuantAlgo.W4A8_ALPHA:

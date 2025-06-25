@@ -1,8 +1,10 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+
+from ..._utils import get_sm_version
 
 
 def _register_fake():
@@ -19,6 +21,7 @@ def _register_fake():
         strategy,
         op,
         eps,
+        trigger_completion_at_end,
     ):
         from tensorrt_llm.functional import AllReduceFusionOp
         if op == int(AllReduceFusionOp.NONE):
@@ -52,6 +55,18 @@ def _register_fake():
         else:
             return [torch.empty_like(input)]
 
+    #MNNVL Allreduce
+    @torch.library.register_fake("trtllm::mnnvl_twoshot_allreduce")
+    def _(input, buffer, buffer_flags, wait_for_results):
+        output = input.new_empty(input.shape)
+        return output
+
+    @torch.library.register_fake("trtllm::mnnvl_twoshot_rmsnorm")
+    def _(comm_buf, gamma, eps, residual, buffer_flags):
+        output = residual.new_empty(residual.shape)
+        residual_out = residual.new_empty(residual.shape)
+        return [output, residual_out]
+
     @torch.library.register_fake("trtllm::moe_allreduce")
     def _(residual, norm_weight, device_num_experts, scale_input,
           active_experts_token_input, token_input, workspace, rank, nranks,
@@ -61,8 +76,11 @@ def _register_fake():
         return [norm_out, residual_out]
 
     @torch.library.register_fake("trtllm::allgather")
-    def _(input, group):
-        output_shape = (len(group), *input.shape)
+    def _(input, sizes, group):
+        if sizes is None:
+            output_shape = (len(group) * input.shape[0], *input.shape[1:])
+        else:
+            output_shape = (sum(sizes), *input.shape[1:])
         return input.new_empty(output_shape)
 
     @torch.library.register_fake("trtllm::cublas_scaled_mm")
@@ -81,6 +99,22 @@ def _register_fake():
         return ret
 
     @torch.library.register_fake("trtllm::cublas_mm")
+    def _(mat_a, mat_b, bias, out_dtype):
+        shape = list(mat_a.shape)
+        shape[-1] = mat_b.shape[-1]
+        ret = mat_a.new_empty(
+            shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
+        return ret
+
+    @torch.library.register_fake("trtllm::dsv3_router_gemm_op")
+    def _(mat_a, mat_b, bias, out_dtype):
+        shape = list(mat_a.shape)
+        shape[-1] = mat_b.shape[-1]
+        ret = mat_a.new_empty(
+            shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
+        return ret
+
+    @torch.library.register_fake("trtllm::dsv3_fused_a_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
         shape = list(mat_a.shape)
         shape[-1] = mat_b.shape[-1]
@@ -120,7 +154,7 @@ def _register_fake():
     def _(a, b, a_scale, b_scale):
         m = a.shape[0]
         n = b.shape[0]
-        return a.new_empty((m, n))
+        return a.new_empty((m, n), dtype=torch.bfloat16)
 
     @torch.library.register_fake(
         "tensorrt_llm::static_quantize_e4m3_per_tensor")
@@ -218,6 +252,40 @@ def _register_fake():
     def _(max_sm_count: int):
         pass
 
+    @torch.library.register_fake("trtllm::moe_load_balance_wait_gpu_stage")
+    def _(single_layer_load_balancer_ptr: int):
+        return torch.empty((1, ),
+                           dtype=torch.int32,
+                           device=torch.device("cuda"))
+
+    @torch.library.register_fake("trtllm::moe_load_balance_set_cpu_stage")
+    def _(single_layer_load_balancer_ptr: int):
+        pass
+
+    @torch.library.register_fake("trtllm::moe_load_balance_statistic")
+    def _(gathered_raw_expert_ids: torch.Tensor, enabled: torch.Tensor,
+          single_layer_load_balancer_ptr: int, is_first_stage: bool,
+          is_last_stage: bool):
+        pass
+
+    @torch.library.register_fake(
+        "trtllm::moe_hierarchical_statistic_local_device")
+    def _(local_raw_expert_ids: torch.Tensor,
+          local_expert_token_count: torch.Tensor, enabled: torch.Tensor,
+          single_layer_load_balancer_ptr: int, is_first_stage: bool,
+          is_last_stage: bool):
+        pass
+
+    @torch.library.register_fake("trtllm::moe_hierarchical_statistic_update")
+    def _(global_expert_token_count: torch.Tensor, enabled: torch.Tensor,
+          single_layer_load_balancer_ptr: int):
+        pass
+
+    @torch.library.register_fake("trtllm::moe_load_balance_routing")
+    def _(single_layer_load_balancer_ptr: int,
+          token_selected_experts: torch.Tensor, offset_by_ep_rank: bool):
+        return torch.empty_like(token_selected_experts)
+
     @torch.library.custom_op("trtllm::group_rms_norm_base",
                              mutates_args=("outputs", ))
     def group_rms_norm_base(
@@ -281,3 +349,51 @@ def _register_fake():
         weight_bias: float,
     ) -> List[torch.Tensor]:
         return outputs
+
+    @torch.library.register_fake(
+        "trtllm::mtp_sampling_and_accepted_draft_tokens_op")
+    def _(logits: torch.Tensor, draft_tokens: torch.Tensor,
+          target_tokens: torch.Tensor, num_mtp_modules: int, batch_size: int,
+          num_context_request: int, vocab_size: int):
+        return logits.new_empty((batch_size, num_mtp_modules + 1),
+                                dtype=torch.int32), logits.new_empty(
+                                    (batch_size, ), dtype=torch.int32)
+
+    @torch.library.register_fake("trtllm::fp8_quantize_1x128")
+    def _(input: torch.Tensor):
+        pad_m = fp4_utils.pad_up(input.shape[0], 4)
+        blocked_n = (input.shape[1] + 127) // 128
+        if get_sm_version() >= 100:
+            sz = (blocked_n, input.shape[0])
+        else:
+            sz = (fp4_utils.pad_up(pad_m * blocked_n * 4, 128) // 4, )
+        return torch.empty_like(input,
+                                dtype=torch.float8_e4m3fn), input.new_empty(
+                                    sz, dtype=torch.float)
+
+    @torch.library.register_fake("trtllm::causal_conv1d_fwd")
+    def _(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias_: Optional[torch.Tensor],
+        conv_states: Optional[torch.Tensor],
+        query_start_loc: Optional[torch.Tensor],
+        cache_indices: Optional[torch.Tensor],
+        has_initial_state: Optional[torch.Tensor],
+        silu_activation: bool,
+        pad_slot_id: int,
+    ) -> None:
+        pass
+
+    @torch.library.register_fake("trtllm::causal_conv1d_update")
+    def _(
+        x: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias_: Optional[torch.Tensor],
+        silu_activation: bool,
+        cache_seqlens_: Optional[torch.Tensor],
+        conv_state_indices_: Optional[torch.Tensor],
+        pad_slot_id: int,
+    ) -> None:
+        pass

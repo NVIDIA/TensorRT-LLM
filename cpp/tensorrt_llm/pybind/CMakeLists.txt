@@ -16,6 +16,7 @@ set(SRCS
     executor/request.cpp
     runtime/bindings.cpp
     testing/modelSpecBinding.cpp
+    runtime/moeBindings.cpp
     userbuffers/bindings.cpp
     ../runtime/ipcNvlsMemory.cpp
     bindings.cpp)

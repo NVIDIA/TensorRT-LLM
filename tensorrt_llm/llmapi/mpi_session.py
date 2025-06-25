@@ -179,9 +179,6 @@ class MpiPoolSession(MpiSession):
 class MpiCommSession(MpiSession):
 
     def __init__(self, comm=None, n_workers: int = 1):
-        if not external_mpi_comm_available(n_workers):
-            raise RuntimeError('The LLM instance should be launched by mpirun.')
-
         self.comm = comm
         self.n_workers = n_workers
         self.thread_pool: Optional[ThreadPoolExecutor] = None
@@ -277,6 +274,7 @@ class RemoteMpiCommSessionClient(MpiSession):
             f"RemoteMpiCommSessionClient connecting to {addr}\n", "yellow")
         self.queue = ZeroMqQueue((addr, hmac_key),
                                  is_server=False,
+                                 socket_type=zmq.PAIR,
                                  use_hmac_encryption=bool(hmac_key))
         self._is_shutdown = False
 
@@ -328,24 +326,14 @@ class RemoteMpiCommSessionClient(MpiSession):
             return self.queue.get()  # should get a True if success
         return False
 
-    def shutdown(self, wait=True):
-        if self._is_shutdown:
-            return
-
-        try:
-            print_colored_debug(
-                f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] send shutdown signal to server\n",
-                "green")
-            self.queue.put(None)  # ask RemoteMpiCommSessionServer to shutdown
-        except zmq.error.ZMQError as e:
-            print_colored_debug(
-                f"Error during RemoteMpiCommSessionClient shutdown: {e}\n",
-                "red")
-        finally:
-            self._is_shutdown = True
-
     def abort(self):
         self.shutdown()
+
+    def shutdown(self, wait=True):
+        pass
+
+    def shutdown_abort(self, grace: float = 60, reason=None):
+        pass
 
 
 class RemoteMpiCommSessionServer():
@@ -364,6 +352,7 @@ class RemoteMpiCommSessionServer():
         self.addr = addr
         self.queue = ZeroMqQueue((addr, hmac_key),
                                  is_server=True,
+                                 socket_type=zmq.PAIR,
                                  use_hmac_encryption=bool(hmac_key))
         self.comm = comm
         self.results = []  # the results may arrive in any order
@@ -411,7 +400,7 @@ class RemoteMpiCommSessionServer():
                 print_colored_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",
                     "green")
-                self.session.shutdown()
+                self.session.shutdown_abort()
                 break
             else:
                 print_colored_debug(
@@ -445,7 +434,15 @@ class RemoteMpiCommSessionServer():
             print_colored_debug(
                 f"RemoteMpiCommSessionServer received all results, sending to client\n",
                 "green")
-            self.queue.put(self.results)
+            try:
+                self.queue.put_noblock(self.results)
+            except zmq.ZMQError as e:
+                # The client could be shutdown first.
+                if e.errno == zmq.EAGAIN:
+                    pass
+                else:
+                    raise e
+
             print_colored_debug(
                 f"RemoteMpiCommSessionServer sent results to client\n", "green")
             self.results.clear()

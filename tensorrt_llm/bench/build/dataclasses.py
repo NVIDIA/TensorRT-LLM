@@ -122,11 +122,13 @@ class ModelConfig(BaseModel):
         "num_hidden_layers",
         "n_layer",
         AliasPath("text_config", "num_hidden_layers"),
+        AliasPath("language_config", "num_hidden_layers"),
     ))
     num_attention_heads: int = Field(validation_alias=AliasChoices(
         "num_attention_heads",
         "n_head",
         AliasPath("text_config", "num_attention_heads"),
+        AliasPath("language_config", "num_attention_heads"),
     ))
     num_key_value_heads: Optional[int] = Field(
         default=None,
@@ -134,6 +136,7 @@ class ModelConfig(BaseModel):
             "num_key_value_heads",
             "num_kv_heads",
             AliasPath("text_config", "num_key_value_heads"),
+            AliasPath("language_config", "num_key_value_heads"),
         ),
     )
     hidden_size: int = Field(validation_alias=AliasChoices(
@@ -154,7 +157,7 @@ class ModelConfig(BaseModel):
             "n_positions",
             AliasPath("text_config", "max_position_embeddings"),
         ))
-    dtype: Literal["float16", "bfloat16",
+    dtype: Literal["float16", "bfloat16", "float32",
                    None] = Field(default="float16",
                                  validation_alias=AliasChoices(
                                      "dtype", "torch_dtype"))
@@ -188,7 +191,6 @@ class ModelConfig(BaseModel):
         model_name_or_path = hf_model_path or model_hf_name
         hf_config = AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=True).to_dict()
-
         param_count = cls.get_param_count(model_hf_name, hf_model_path)
 
         return cls(name=model_hf_name, param_count=param_count, **hf_config)

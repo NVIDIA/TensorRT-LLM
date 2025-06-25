@@ -40,97 +40,6 @@
 
 extern "C" __device__ uint32_t __nvvm_get_smem_pointer(void* ptr);
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-#if 1
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-inline __device__ void __nv_ptx_builtin_ocg_acqblk(void)
-{
-    asm volatile("griddepcontrol.wait;\n");
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-inline __device__ void __nv_ptx_builtin_ocg_preexit(void)
-{
-    asm volatile("griddepcontrol.launch_dependents;\n");
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-inline __device__ void __nv_ptx_builtin_ocg_fence_view_async_shared(void)
-{
-    asm volatile("fence.proxy.async.shared::cta;\n");
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-inline __device__ void __nv_ptx_builtin_ocg_fence_view_async_global(void)
-{
-    asm volatile("fence.proxy.async.global::cta;\n");
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-inline __device__ void __nv_ptx_builtin_ocg_cp_async_commit_bulk_global_shared(void)
-{
-    asm volatile("cp.async.bulk.commit_group;\n");
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-inline __device__ void __nv_ptx_builtin_ocg_cp_async_wait_bulk_global_shared_read(uint32_t count)
-{
-    if (count == 0)
-    {
-        asm volatile("cp.async.bulk.wait_group.read %0;\n" ::"n"(0) : "memory");
-    }
-    else if (count == 1)
-    {
-        asm volatile("cp.async.bulk.wait_group.read %0;\n" ::"n"(1) : "memory");
-    }
-    else
-    {
-        assert(false);
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-inline __device__ void __nv_ptx_builtin_ocg_write_async_shared_b32(uint32_t dstAddr, uint32_t mbarrierAddr, uint32_t b0)
-{
-    asm volatile("st.async.shared::cluster.mbarrier::meet_tx::bytes.b32 [%0], %1, [%2];" ::"r"(dstAddr), "r"(b0),
-        "r"(mbarrierAddr));
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-inline __device__ int32_t __nv_ptx_builtin_ocg_vimax3_s32(int32_t srcA, int32_t srcB, int32_t srcC)
-{
-    int32_t tmp;
-    asm volatile("max.s16x2 %0, %1, %2;\n" : "=r"(tmp) : "r"(srcA), "r"(srcB));
-    asm volatile("max.s16x2 %0, %0, %1;\n" : "+r"(tmp) : "r"(tmp), "r"(srcC));
-    return tmp;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#else
-extern "C"
-{
-    __device__ void __nv_ptx_builtin_ocg_acqblk(void);
-    __device__ void __nv_ptx_builtin_ocg_preexit(void);
-    __device__ void __nv_ptx_builtin_ocg_fence_view_async_shared(void);
-    __device__ void __nv_ptx_builtin_ocg_fence_view_async_global(void);
-    __device__ void __nv_ptx_builtin_ocg_cp_async_commit_bulk_global_shared(void);
-    __device__ void __nv_ptx_builtin_ocg_cp_async_wait_bulk_global_shared_read(uint32_t count);
-    __device__ void __nv_ptx_builtin_ocg_write_async_shared_b32(uint32_t dstAddr, uint32_t mbarrierAddr, uint32_t b0);
-    __device__ int32_t __nv_ptx_builtin_ocg_vimax3_s32(int32_t srcA, int32_t srcB, int32_t srcC);
-}
-#endif
-#endif
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace introspection
@@ -1799,14 +1708,6 @@ inline __device__ void pack_predicates(uint32_t (&preds)[M], uint32_t const (&p)
     };
 
     // Run complete steps.
-    //
-    // NOTE: I use a separate "reg" variable to WAR a compiler limitation (or what seems
-    // to be). The compiler does not seem to be able to deal with
-    //
-    // __nv_p2r(X, tmp, MASK, &preds[ii / BYTES_PER_REG]);
-    //
-    // where I would take the correct predicate with the "&preds[...]" syntax.
-
 #pragma unroll
     for (int ii = 0; ii < M; ++ii)
     {
@@ -1835,24 +1736,6 @@ inline __device__ void pack_predicates(uint32_t (&preds)[M], uint32_t const (&p)
             }
 
             // Store the predicates.
-#ifdef FMHA_USE_P2R_AND_R2P
-            if (jj == 0)
-            {
-                __nv_p2r(0, tmp, COMPLETE_MASK, &reg);
-            }
-            else if (jj == 1)
-            {
-                __nv_p2r(1, tmp, COMPLETE_MASK, &reg);
-            }
-            else if (jj == 2)
-            {
-                __nv_p2r(2, tmp, COMPLETE_MASK, &reg);
-            }
-            else if (jj == 3)
-            {
-                __nv_p2r(3, tmp, COMPLETE_MASK, &reg);
-            }
-#else
 #pragma unroll
             for (int kk = 0; kk < PREDS_PER_BYTE; ++kk)
             {
@@ -1861,7 +1744,6 @@ inline __device__ void pack_predicates(uint32_t (&preds)[M], uint32_t const (&p)
                     reg |= 1u << (jj * 8 + kk);
                 }
             }
-#endif
         }
 
         // Skip the rest of the code if we do not have a remainder.
@@ -1883,24 +1765,6 @@ inline __device__ void pack_predicates(uint32_t (&preds)[M], uint32_t const (&p)
             }
 
             // Store the predicates.
-#ifdef FMHA_USE_P2R_AND_R2P
-            if (COMPLETE == 0)
-            {
-                __nv_p2r(0, tmp, REMAINDER_MASK, &reg);
-            }
-            else if (COMPLETE == 1)
-            {
-                __nv_p2r(1, tmp, REMAINDER_MASK, &reg);
-            }
-            else if (COMPLETE == 2)
-            {
-                __nv_p2r(2, tmp, REMAINDER_MASK, &reg);
-            }
-            else if (COMPLETE == 3)
-            {
-                __nv_p2r(3, tmp, REMAINDER_MASK, &reg);
-            }
-#else
 #pragma unroll
             for (int jj = 0; jj < REMAINDER; ++jj)
             {
@@ -1909,7 +1773,6 @@ inline __device__ void pack_predicates(uint32_t (&preds)[M], uint32_t const (&p)
                     reg |= 1u << (COMPLETE * 8 + jj);
                 }
             }
-#endif
         }
 
         // Store the predicate register.
@@ -1978,31 +1841,12 @@ inline __device__ void ldgsts_(Functor& fct, uint32_t const (&preds)[M])
         uint32_t reg = preds[ii / BYTES_PER_REG];
 
         // Extract the predicates.
-#ifdef FMHA_USE_P2R_AND_R2P
-        if (ii % BYTES_PER_REG == 0)
-        {
-            __nv_r2p(0, p, COMPLETE_MASK, reg);
-        }
-        else if (ii % BYTES_PER_REG == 1)
-        {
-            __nv_r2p(1, p, COMPLETE_MASK, reg);
-        }
-        else if (ii % BYTES_PER_REG == 2)
-        {
-            __nv_r2p(2, p, COMPLETE_MASK, reg);
-        }
-        else if (ii % BYTES_PER_REG == 3)
-        {
-            __nv_r2p(3, p, COMPLETE_MASK, reg);
-        }
-#else
 #pragma unroll
         for (int jj = 0; jj < PREDS_PER_BYTE; ++jj)
         {
             uint32_t mask = 1u << (ii % BYTES_PER_REG * 8 + jj);
             p[jj] = (reg & mask) != 0u;
         }
-#endif
 
 // Issue the loads.
 #pragma unroll
@@ -2026,31 +1870,12 @@ inline __device__ void ldgsts_(Functor& fct, uint32_t const (&preds)[M])
         uint32_t reg = preds[COMPLETE / BYTES_PER_REG];
 
         // Extract the predicates.
-#ifdef FMHA_USE_P2R_AND_R2P
-        if (COMPLETE % BYTES_PER_REG == 0)
-        {
-            __nv_r2p(0, p, REMAINDER_MASK, reg);
-        }
-        else if (COMPLETE % BYTES_PER_REG == 1)
-        {
-            __nv_r2p(1, p, REMAINDER_MASK, reg);
-        }
-        else if (COMPLETE % BYTES_PER_REG == 2)
-        {
-            __nv_r2p(2, p, REMAINDER_MASK, reg);
-        }
-        else if (COMPLETE % BYTES_PER_REG == 3)
-        {
-            __nv_r2p(3, p, REMAINDER_MASK, reg);
-        }
-#else
 #pragma unroll
         for (int jj = 0; jj < PREDS_PER_BYTE; ++jj)
         {
             uint32_t mask = 1u << (COMPLETE % BYTES_PER_REG * 8 + jj);
             p[jj] = (reg & mask) != 0u;
         }
-#endif
 
 // Issue the loads.
 #pragma unroll
@@ -3005,7 +2830,7 @@ inline __device__ void fence_view_async_shared()
     // only compiles on sm90+
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    __nv_ptx_builtin_ocg_fence_view_async_shared();
+    asm volatile("fence.proxy.async.shared::cta;\n");
 #else
     assert(false);
 #endif
@@ -3018,7 +2843,7 @@ inline __device__ void fence_view_async_global()
     // only compiles on sm90+
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    __nv_ptx_builtin_ocg_fence_view_async_global();
+    asm volatile("fence.proxy.async.global::cta;\n");
 #else
     assert(false);
 #endif
@@ -3069,7 +2894,9 @@ static inline __device__ float max3Pos_(float const a, float const b, float cons
     int32_t a_ = reinterpret_cast<int32_t const&>(a);
     int32_t b_ = reinterpret_cast<int32_t const&>(b);
     int32_t c_ = reinterpret_cast<int32_t const&>(c);
-    int32_t tmp = __nv_ptx_builtin_ocg_vimax3_s32(a_, b_, c_);
+    int32_t tmp;
+    asm volatile("max.s16x2 %0, %1, %2;\n" : "=r"(tmp) : "r"(a_), "r"(b_));
+    asm volatile("max.s16x2 %0, %0, %1;\n" : "+r"(tmp) : "r"(tmp), "r"(c_));
     res = reinterpret_cast<float const&>(tmp);
 #else
     res = fmaxf(a, fmaxf(b, c));

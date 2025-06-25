@@ -31,8 +31,8 @@ public:
     {
     };
 
-    static BlockRange fromOldAllocatedBlockIds(BaseKVCacheManager const& cacheManager,
-        LlmRequest::RequestIdType requestId, SizeType32 beam = kFIRST_AND_ONLY_BEAM)
+    static BlockRange fromAllBlockIds(BaseKVCacheManager const& cacheManager, LlmRequest::RequestIdType requestId,
+        SizeType32 beam = kFIRST_AND_ONLY_BEAM)
     {
         assert(kFIRST_AND_ONLY_BEAM == beam);
         auto const windowSize = firstWindowSize(cacheManager);

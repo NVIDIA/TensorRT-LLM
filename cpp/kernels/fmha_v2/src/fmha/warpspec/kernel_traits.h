@@ -231,7 +231,7 @@ struct Kernel_traits
         WARP_GROUP_K = 1
     };
 
-    // The attention mask type: padding (0), causal (1), sliding_window_causal (2), custom_mask (3).
+    // The attention mask type: padding (0), causal (1), sliding_or_chunked_attention (2), custom_mask (3).
     enum
     {
         CAUSAL_MASK = (ATTENTION_MASK_TYPE_ == 1 || ATTENTION_MASK_TYPE_ == 2)
@@ -239,7 +239,7 @@ struct Kernel_traits
 
     enum
     {
-        SLIDING_WINDOW_ATTENTION = ATTENTION_MASK_TYPE_ == 2
+        SLIDING_OR_CHUNKED_ATTENTION = ATTENTION_MASK_TYPE_ == 2
     };
 
     // Is head interleaved ?

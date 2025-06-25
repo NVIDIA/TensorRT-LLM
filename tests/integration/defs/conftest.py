@@ -16,12 +16,14 @@
 
 import datetime
 import os
+import platform
 import re
 import shutil
 import subprocess as sp
 import tempfile
 import time
 import urllib.request
+import warnings
 from functools import wraps
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -35,6 +37,7 @@ import yaml
 from _pytest.mark import ParameterSet
 
 from tensorrt_llm.bindings import ipc_nvls_supported
+from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
 from .perf.gpu_clock_lock import GPUClockLock
 from .perf.session_data_writer import SessionDataWriter
@@ -282,7 +285,6 @@ def gemma_example_root(llm_root, llm_venv):
     # and caused pipeline to fail. We manually install gemma dependency as a WAR.
     llm_venv.run_cmd(["-m", "pip", "install", "safetensors~=0.4.1", "nltk"])
     # Install Jax because it breaks dependency
-    import platform
     google_extension = [
         "-f",
         "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
@@ -709,8 +711,16 @@ def llm_venv(llm_root, custom_user_workspace):
         workspace_dir = "llm-test-workspace"
     workspace_dir = os.path.join(workspace_dir, subdir)
     from defs.local_venv import PythonVenvRunnerImpl
-    return PythonVenvRunnerImpl("", "", "python3",
+    venv = PythonVenvRunnerImpl("", "", "python3",
                                 os.path.join(os.getcwd(), workspace_dir))
+    yield venv
+    # Remove the workspace directory
+    if os.path.exists(workspace_dir):
+        print(f"Cleaning up workspace: {workspace_dir}")
+        try:
+            shutil.rmtree(workspace_dir)
+        except Exception as e:
+            print(f"Failed to clean up workspace: {e}")
 
 
 @pytest.fixture(scope="session")
@@ -1713,8 +1723,6 @@ def qcache_dir(llm_venv, llm_root):
 
     quantization_root = os.path.join(llm_root, "examples", "quantization")
 
-    import platform
-
     # Fix the issue that the requirements.txt is not available on aarch64.
     if "aarch64" not in platform.machine() and get_sm_version() >= 89:
         llm_venv.run_cmd([
@@ -1805,6 +1813,19 @@ def skip_by_device_count(request):
 
 
 @pytest.fixture(autouse=True)
+def skip_by_mpi_world_size(request):
+    "fixture for skip less device count"
+    if request.node.get_closest_marker('skip_less_mpi_world_size'):
+        mpi_world_size = get_mpi_world_size()
+        expected_count = request.node.get_closest_marker(
+            'skip_less_mpi_world_size').args[0]
+        if expected_count > int(mpi_world_size):
+            pytest.skip(
+                f'MPI world size {mpi_world_size} is less than {expected_count}'
+            )
+
+
+@pytest.fixture(autouse=True)
 def skip_by_device_memory(request):
     "fixture for skip less device memory"
     if request.node.get_closest_marker('skip_less_device_memory'):
@@ -1820,6 +1841,22 @@ def get_sm_version():
     "get compute capability"
     prop = torch.cuda.get_device_properties(0)
     return prop.major * 10 + prop.minor
+
+
+def get_gpu_device_list():
+    "get device list"
+    with tempfile.TemporaryDirectory() as temp_dirname:
+        suffix = ".exe" if is_windows() else ""
+        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
+        cmd = " ".join(["nvidia-smi" + suffix, "-L"])
+        output = check_output(cmd, shell=True, cwd=temp_dirname)
+    return [l.strip() for l in output.strip().split("\n")]
+
+
+def check_device_contain(keyword_list):
+    "check device not contain keyword"
+    device = get_gpu_device_list()[0]
+    return any(keyword in device for keyword in keyword_list)
 
 
 skip_pre_ada = pytest.mark.skipif(
@@ -1838,6 +1875,10 @@ skip_post_blackwell = pytest.mark.skipif(
     get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
 
+skip_device_contain_gb200 = pytest.mark.skipif(
+    check_device_contain(["GB200"]),
+    reason="This test is not supported on GB200 or GB100")
+
 skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
                                   reason="NVLS is not supported")
 skip_no_hopper = pytest.mark.skipif(
@@ -1845,7 +1886,11 @@ skip_no_hopper = pytest.mark.skipif(
     reason="This test is only  supported in Hopper architecture")
 
 skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
-                                   reason="This test is for Blackwell SM120")
+                                   reason="This test is for SM120")
+
+skip_arm = pytest.mark.skipif(
+    "aarch64" in platform.machine(),
+    reason="This test is not supported on ARM architecture")
 
 
 def skip_fp8_pre_ada(use_fp8):
@@ -1866,20 +1911,10 @@ def skip_device_not_contain(request):
     if request.node.get_closest_marker('skip_device_not_contain'):
         keyword_list = request.node.get_closest_marker(
             'skip_device_not_contain').args[0]
-        device = get_gpu_device_list()[0]
-        if not any(keyword in device for keyword in keyword_list):
+        if not check_device_contain(keyword_list):
             pytest.skip(
-                f"Device {device} does not contain keyword in {keyword_list}.")
-
-
-def get_gpu_device_list():
-    "get device list"
-    with tempfile.TemporaryDirectory() as temp_dirname:
-        suffix = ".exe" if is_windows() else ""
-        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
-        cmd = " ".join(["nvidia-smi" + suffix, "-L"])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
-    return [l.strip() for l in output.strip().split("\n")]
+                f"Device {get_gpu_device_list()[0]} does not contain keyword in {keyword_list}."
+            )
 
 
 def get_device_count():
@@ -1978,9 +2013,28 @@ def pytest_generate_tests(metafunc: pytest.Metafunc):
         lines = preprocess_test_list_lines(testlist_path, lines)
 
     uts = []
+    ids = []
     for line in lines:
         if line.startswith("unittest/"):
-            uts.append(line.strip())
+            if " TIMEOUT " in line:
+                # Process for marker TIMEOUT
+                case_part, timeout_part = line.split(" TIMEOUT ", 1)
+                case = case_part.strip()
+                timeout_str = timeout_part.strip()
+                timeout_num_match = re.search(r'\(?(\d+)\)?', timeout_str)
+                if timeout_num_match:
+                    timeout_min = int(timeout_num_match.group(1))
+                    timeout_sec = timeout_min * 60
+                else:
+                    raise ValueError(
+                        f"Invalid TIMEOUT format: {timeout_str} in line: {line}"
+                    )
+                mark = pytest.mark.timeout(int(timeout_sec))
+                uts.append(pytest.param(case, marks=mark))
+                # Change back id to include timeout information
+                ids.append(f"{case} TIMEOUT {timeout_str}")
+            else:
+                uts.append(line.strip())
     metafunc.parametrize("case", uts, ids=lambda x: x)
 
 
@@ -2093,7 +2147,7 @@ def all_pytest_items():
 
 
 @pytest.fixture(scope="session")
-def turtle_root():
+def test_root():
     return os.path.dirname(os.path.dirname(__file__))
 
 
@@ -2169,8 +2223,10 @@ def skip_by_host_memory(request):
 
 IS_UNDER_CI_ENV = 'JENKINS_HOME' in os.environ
 
+gpu_warning_threshold = 1024 * 1024 * 1024
 
-def collect_status():
+
+def collect_status(item: pytest.Item):
     if not IS_UNDER_CI_ENV:
         return
 
@@ -2183,6 +2239,22 @@ def collect_status():
         for idx in range(pynvml.nvmlDeviceGetCount())
     }
 
+    deadline = time.perf_counter() + 60  # 1 min
+    observed_used = 0
+    global gpu_warning_threshold
+
+    while time.perf_counter() < deadline:
+        observed_used = max(
+            pynvml.nvmlDeviceGetMemoryInfo(device).used
+            for device in handles.values())
+        if observed_used <= gpu_warning_threshold:
+            break
+        time.sleep(1)
+    else:
+        gpu_warning_threshold = max(observed_used, gpu_warning_threshold)
+        warnings.warn(
+            f"Test {item.name} does not free up GPU memory correctly!")
+
     gpu_memory = {}
     for idx, device in handles.items():
         total_used = pynvml.nvmlDeviceGetMemoryInfo(device).used // 1024 // 1024
@@ -2191,13 +2263,12 @@ def collect_status():
         process = {}
 
         for entry in detail:
-            host_memory_in_mbs = -1
             try:
-                host_memory_in_mbs = psutil.Process(
-                    entry.pid).memory_full_info().uss // 1024 // 1024
+                p = psutil.Process(entry.pid)
+                host_memory_in_mbs = p.memory_full_info().uss // 1024 // 1024
                 process[entry.pid] = (entry.usedGpuMemory // 1024 // 1024,
-                                      host_memory_in_mbs)
-            except:
+                                      host_memory_in_mbs, p.cmdline())
+            except Exception:
                 pass
 
         gpu_memory[idx] = {
@@ -2212,7 +2283,7 @@ def collect_status():
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(item, nextitem):
     ret = yield
-    collect_status()
+    collect_status(item)
     return ret
 
 

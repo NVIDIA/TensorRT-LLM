@@ -83,7 +83,7 @@ class QwenDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
@@ -141,8 +141,8 @@ class QwenModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
         **kwargs,
@@ -185,8 +185,8 @@ class Qwen2ForCausalLM(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.IntTensor = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         mrope_config: Optional[dict] = None,
@@ -236,8 +236,8 @@ class Qwen2ForProcessRewardModel(DecoderModelForCausalLM[QwenModel,
 
     def forward(self,
                 attn_metadata: AttentionMetadata,
-                input_ids: torch.LongTensor,
-                position_ids: Optional[torch.LongTensor] = None,
+                input_ids: torch.IntTensor,
+                position_ids: Optional[torch.IntTensor] = None,
                 inputs_embeds: Optional[torch.FloatTensor] = None,
                 **kwargs) -> torch.Tensor:
         assert attn_metadata.seq_lens is not None
@@ -280,8 +280,8 @@ class Qwen2ForRewardModel(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
 
     def forward(self,
                 attn_metadata: AttentionMetadata,
-                input_ids: torch.LongTensor,
-                position_ids: Optional[torch.LongTensor] = None,
+                input_ids: torch.IntTensor,
+                position_ids: Optional[torch.IntTensor] = None,
                 inputs_embeds: Optional[torch.FloatTensor] = None,
                 **kwargs) -> torch.Tensor:
         assert attn_metadata.seq_lens is not None

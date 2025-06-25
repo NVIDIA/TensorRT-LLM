@@ -282,6 +282,27 @@ private:
     std::optional<VecTokenExtraIds> mInputTokenExtraIds;
 };
 
+/// @brief Multimodal input data class
+class MultimodalInput
+{
+public:
+    explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
+        std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths);
+
+    [[nodiscard]] std::vector<std::vector<SizeType32>> getMultimodalHashes() const;
+    [[nodiscard]] std::vector<SizeType32> getMultimodalPositions() const;
+    [[nodiscard]] std::vector<SizeType32> getMultimodalLengths() const;
+
+private:
+    friend class Serialization;
+    /// @brief The multimodal hashes
+    std::vector<std::vector<SizeType32>> mMultimodalHashes;
+    /// @brief The multimodal positions
+    std::vector<SizeType32> mMultimodalPositions;
+    /// @brief The multimodal lengths
+    std::vector<SizeType32> mMultimodalLengths;
+};
+
 /// @brief Configuration for mrope
 class MropeConfig
 {
@@ -560,11 +581,15 @@ public:
 
     explicit KvCacheRetentionConfig(std::vector<TokenRangeRetentionConfig> const& tokenRangeRetentionPriorities,
         RetentionPriority decodeRetentionPriority = kDefaultRetentionPriority,
-        std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt);
+        std::optional<std::chrono::milliseconds> decodeDurationMs = std::nullopt,
+        KvCacheTransferMode transferMode = KvCacheTransferMode::DRAM,
+        std::optional<std::string> directory = std::nullopt);
 
     [[nodiscard]] std::vector<TokenRangeRetentionConfig> getTokenRangeRetentionConfigs() const;
     [[nodiscard]] RetentionPriority getDecodeRetentionPriority() const;
     [[nodiscard]] std::optional<std::chrono::milliseconds> getDecodeDurationMs() const;
+    [[nodiscard]] KvCacheTransferMode getTransferMode() const;
+    [[nodiscard]] std::optional<std::string> getDirectory() const;
 
     /// @brief Convert the token range data into an entry per kv block. Returns a tuple of vectors corresponding to the
     /// priorities and durations for each block.
@@ -575,7 +600,8 @@ public:
     {
         return mTokenRangeRetentionConfigs == other.mTokenRangeRetentionConfigs
             && mDecodeRetentionPriority == other.mDecodeRetentionPriority
-            && mDecodeDurationMs == other.mDecodeDurationMs;
+            && mDecodeDurationMs == other.mDecodeDurationMs && mTransferMode == other.mTransferMode
+            && mDirectory == other.mDirectory;
     }
 
 private:
@@ -587,6 +613,10 @@ private:
     RetentionPriority mDecodeRetentionPriority;
     /// @brief The duration in ms that decode blocks should remain at their assigned priority level.
     std::optional<std::chrono::milliseconds> mDecodeDurationMs;
+    /// @brief The transfer mode for the block.
+    KvCacheTransferMode mTransferMode;
+    /// @brief Name of the directory if transfer mode is GDS or POSIX_DEBUG_FALLBACK.
+    std::optional<std::string> mDirectory;
 };
 
 /// @brief A class that holds information about the request
@@ -610,6 +640,7 @@ public:
     /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
     /// @param externalDraftTokensConfig The speculative decoding with external draft tokens configuration
     /// @param pTuningConfig The prompt tuning configuration
+    /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths}
     /// @param multimodalEmbedding The multimodal embedding tensor. Expected shape is [num_multimodal_tokens,
     /// hidden_dim]
     /// @param mRopeConfig The mrope configuration
@@ -649,6 +680,7 @@ public:
         std::optional<Tensor> embeddingBias = std::nullopt,
         std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig = std::nullopt,
         std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
+        std::optional<MultimodalInput> multimodalInput = std::nullopt,
         std::optional<Tensor> multimodalEmbedding = std::nullopt, std::optional<MropeConfig> mRopeConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
@@ -691,6 +723,7 @@ public:
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
     [[nodiscard]] std::optional<ExternalDraftTokensConfig> getExternalDraftTokensConfig() const;
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
+    [[nodiscard]] std::optional<MultimodalInput> getMultimodalInput() const;
     [[nodiscard]] std::optional<Tensor> getMultimodalEmbedding() const;
     [[nodiscard]] std::optional<MropeConfig> getMropeConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
@@ -726,6 +759,7 @@ public:
     void setExternalDraftTokensConfig(ExternalDraftTokensConfig const& externalDraftTokensConfig);
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
     void setMultimodalEmbedding(Tensor const& multimodalEmbedding);
+    void setMultimodalInput(MultimodalInput const& multimodalInput);
     void setMropeConfig(MropeConfig const& mRopeConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
     void setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig);
@@ -1317,6 +1351,8 @@ public:
     {
         /// @brief Enable guided decoding with XGrammar backend.
         kXGRAMMAR = 0,
+        /// @brief Enable guided decoding with LLGuidance backend.
+        kLLGUIDANCE = 1,
     };
 
     explicit GuidedDecodingConfig(GuidedDecodingBackend backend,

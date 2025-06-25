@@ -154,7 +154,7 @@ class DeciConfig(PretrainedConfig):
             dtype: str = 'auto',
             mapping: Optional[Mapping] = None,
             quant_config: Optional[QuantConfig] = None,
-            trust_remote_code: bool = False,
+            trust_remote_code: bool = True,
             **kwargs):
         import transformers
 

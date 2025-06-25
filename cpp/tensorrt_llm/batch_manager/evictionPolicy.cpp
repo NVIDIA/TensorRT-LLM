@@ -115,11 +115,10 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
             auto block = mFreeQueues[cacheLevel][level].front();
 
             // mFreeQueues only contains leaf blocks, so no need to iterate through the next block pointers.
-            // It's theoretically possible for a primary block below the offload threshold to have a child in secondary
-            // memory. This would only happen if block priorities are higher at the end of the sequence than the
-            // beginning. In this case, we still need to offload, even if it's below the threshold.
-            return std::make_tuple(
-                block, cacheLevel == 0 && (level > mSecondaryOffloadMinPriority || !block->getNextBlocks().empty()));
+            // It's possible to have a primary block with children in secondary memory. We handle this
+            // by freeing all descendants in WindowBlockManager::getFreeBlock. This is done either by
+            // offloading (preferred method) or explicitly.
+            return std::make_tuple(block, cacheLevel == 0 && level >= mSecondaryOffloadMinPriority);
         }
     }
     TLLM_THROW("No free block found. This shouldn't happen!");

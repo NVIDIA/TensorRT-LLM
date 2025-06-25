@@ -24,8 +24,7 @@ except ImportError:
 
 @dataclass
 class BuildConfig:
-    # TODO: Use `tensorrt_llm.builder.BuildConfig` when we switch to Pytest from TURTLE.
-    # Using TURTLE, we cannot do `import tensorrt_llm` in this file.
+    # TODO: Use `tensorrt_llm.builder.BuildConfig` when we switch to use Pytest.
     max_input_len: int = 256
     max_seq_len: int = 512
     opt_batch_size: int = 8

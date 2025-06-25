@@ -362,3 +362,11 @@ constexpr bool inRange(T val, T lb, T ub)
 {
     return val >= lb && val < ub;
 }
+
+// val is an optimized / pre-computed value, ref is the original value
+template <typename T>
+HOST_DEVICE_FUNC constexpr inline T checkedVal(T val, T ref)
+{
+    assert(val == ref);
+    return val;
+}

@@ -16,19 +16,17 @@
 
 #include "tensorrt_llm/runtime/gptDecoder.h"
 
-#include "tensorrt_llm/kernels/decodingKernels.h"
-#include "tensorrt_llm/kernels/speculativeDecoding/externalDraftTokensKernels.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 #include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
 
-#include <memory>
-
 #include <NvInferRuntime.h>
+
+#include <memory>
 
 namespace tle = tensorrt_llm::executor;
 namespace tl = tensorrt_llm::layers;
-namespace tksd = tensorrt_llm::kernels::speculative_decoding;
 
 using namespace tensorrt_llm::runtime;
 
@@ -39,7 +37,7 @@ using TensorPtr = ITensor::SharedPtr;
 
 template <typename T>
 GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth,
-    size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
+    size_t vocabSize, size_t vocabSizePadded, CudaStreamPtr const& stream,
     std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule)
     : mManager{std::make_shared<BufferManager>(stream)}
     , mMaxBatchSize(maxBatchSize)
@@ -122,8 +120,9 @@ void GptDecoder<T>::disableLookahead(
 
 template <typename T>
 void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
-    std::optional<DecodingOutput> const& output,
-    std::optional<std::vector<decoder_batch::Request> const> const& requestsOpt)
+    std::optional<DecodingOutput> const& output, std::optional<nvinfer1::DataType> explicitDraftTokensDType,
+    std::optional<std::vector<TensorConstPtr>> const& lookaheadPrompt,
+    std::optional<std::vector<tle::LookaheadDecodingConfig>> const& lookaheadAlgoConfigs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -198,33 +197,25 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         explicitDraftTokensParams->temperature = mSamplingConfig.temperature;
         explicitDraftTokensParams->randomDataSample = output->explicitDraftTokensBuffers->randomDataSample;
         explicitDraftTokensParams->temperatures = output->explicitDraftTokensBuffers->temperatures;
-        TLLM_CHECK(requestsOpt);
-        // Ignore the dtype from all other requests assuming that it is the same for all.
-        explicitDraftTokensParams->dtype = requestsOpt.value()[0].dtype;
+        TLLM_CHECK(explicitDraftTokensDType.has_value());
+        explicitDraftTokensParams->dtype = explicitDraftTokensDType.value();
 
         setupParams->decodingParams = explicitDraftTokensParams;
     }
     else if (mDecodingMode.isLookahead())
     {
-        TLLM_CHECK_WITH_INFO(output.has_value(), "Output tensors must be provided for Lookahead decoding");
         TLLM_LOG_DEBUG("gptDecoder setup lookahead, batchSize=%d", batchSize);
         auto lookaheadParams = std::make_shared<tl::LookaheadSetupParams>();
 
-        TLLM_CHECK(requestsOpt);
-        auto& requests = requestsOpt.value();
-        lookaheadParams->prompt.resize(0);
-        lookaheadParams->prompt.reserve(batchSize);
-        lookaheadParams->algoConfigs.resize(0);
-        lookaheadParams->algoConfigs.reserve(batchSize);
-        for (size_t bi = 0; bi < batchSize; bi++)
-        {
-            lookaheadParams->prompt.emplace_back(ITensor::slice(requests[bi].ids, 0, requests[bi].inputLen));
-            TLLM_CHECK(requests[bi].lookaheadRuntimeConfig);
-            lookaheadParams->algoConfigs.emplace_back(requests[bi].lookaheadRuntimeConfig.value());
-        }
+        TLLM_CHECK_WITH_INFO(lookaheadPrompt.has_value(), "Lookahead prompt must be provided");
+        lookaheadParams->prompt = lookaheadPrompt.value();
+        TLLM_CHECK_WITH_INFO(lookaheadAlgoConfigs.has_value(), "Lookahead algo configs must be provided");
+        lookaheadParams->algoConfigs = lookaheadAlgoConfigs.value();
+        TLLM_CHECK_WITH_INFO(output.has_value(), "Output tensors must be provided for Lookahead decoding");
         lookaheadParams->generationLengths = output->lookaheadOutputs->generationLengths;
         lookaheadParams->positionOffsets = output->lookaheadOutputs->positionOffsets;
         lookaheadParams->attentionPackedMasks = output->lookaheadOutputs->packedMasks;
+
         setupParams->decodingParams = std::move(lookaheadParams);
     }
     else if (mDecodingMode.isExternalDraftTokens())
@@ -383,8 +374,7 @@ void prepareExplicitDraftTokensInput(DecodingInput const& inputs, std::shared_pt
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void prepareLookaheadInputs(
-    DecodingInput const& inputs, size_t maxBatchSize, std::shared_ptr<tl::DecodingInputs>& baseInputs)
+void prepareLookaheadInputs(DecodingInput const& inputs, std::shared_ptr<tl::DecodingInputs>& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -527,7 +517,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     }
     else if (decodingMode.isLookahead() && input.lookaheadInputs)
     {
-        prepareLookaheadInputs(input, maxBatchSize, forwardParams);
+        prepareLookaheadInputs(input, forwardParams);
         forwardParams->localBatchSize = input.batchSize;
     }
     else if (decodingMode.isExternalDraftTokens())

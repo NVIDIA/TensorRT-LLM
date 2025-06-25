@@ -129,7 +129,6 @@ def _deduplicate_params_and_buffers(gm: fx.GraphModule):
         submod, _, name = n.target.rpartition(".")
         t_target = getattr(gm.get_submodule(submod), name)
         targets[id(t_target)].append(n)
-
     # now replace all instances of the same tensor with the same get_attr node (idx 0 in the list)
     for nodes in targets.values():
         node_kept = nodes[0]
@@ -161,6 +160,7 @@ def _clean_up_checks(gm: fx.GraphModule):
         torch.ops.aten._assert_scalar,
         torch.ops.aten.sym_constrain_range,
         torch.ops.aten.sym_constrain_range_for_size,
+        torch.ops.aten._assert_tensor_metadata,
         # torch.ops.aten._functional_sym_constrain_range,
         # torch.ops.aten._functional_sym_constrain_range_for_size
     }
@@ -210,6 +210,12 @@ def _torch_where_patch(condition: torch.Tensor, *args, **kwargs):
 _torch_where_patch.where_original = torch.where
 
 
+def _torch_linear_patch(
+    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    return torch.ops.auto_deploy.torch_linear_simple(input, weight, bias)
+
+
 # TODO: remove once https://github.com/pytorch/pytorch/issues/142439 is resolved
 def _torch_modulelist_getitem_patch(self: nn.ModuleList, idx):
     if isinstance(idx, slice):
@@ -236,10 +242,76 @@ def add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> fx.GraphModu
         if mod_name in hooks:
             for hook in hooks.pop(mod_name).values():
                 mod._register_load_state_dict_pre_hook(hook.hook, with_module=hook.with_module)
-
     assert not (bool(hooks)), f"""Mismatch in names of exported and source modules with hooks.
         The following module names were not found in exported module {list(hooks.keys())}"""
+
     return gm
+
+
+def add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module):
+    """
+    Add a load hook to handle aliased parameters in the model.
+
+    When parameters are aliased (multiple parameter names point to the same tensor),
+    we need to ensure all aliases get the same value during loading. This hook:
+    1. Identifies groups of aliased parameters
+    2. For each group, finds a valid parameter value from the state dict
+    3. Applies that value to all aliases in the group
+
+    Args:
+        gm: The graph module to add the hook to
+        model: The source model containing the original parameter aliases
+    """
+    # Find all parameter aliases in the source model
+    param_to_names = defaultdict(list)
+    for name, param in model.named_parameters(remove_duplicate=False):
+        param_to_names[id(param)].append(name)
+
+    # Filter to only groups with multiple aliases
+    aliased_groups = [names for names in param_to_names.values() if len(names) > 1]
+
+    if not aliased_groups:
+        return gm  # No aliases to handle
+
+    def find_valid_param_value(
+        state_dict: Dict[str, torch.Tensor], param_names: List[str]
+    ) -> Optional[torch.Tensor]:
+        """Find a valid parameter value from state dict for a group of aliased parameters.
+
+        Args:
+            state_dict: The state dict being loaded
+            param_names: List of parameter names that are aliases of each other
+
+        Returns:
+            A valid tensor value if found, None otherwise
+        """
+        # First try to find a non-meta tensor value
+        value = None
+        for name in param_names:
+            if name in state_dict:
+                value = state_dict[name]
+                if value.device.type != "meta":
+                    return value
+
+        return value
+
+    def aliasing_load_pre_hook(state_dict: Dict[str, torch.Tensor], prefix: str, *args, **kwargs):
+        """Load hook that ensures aliased parameters get the same value."""
+        for group in aliased_groups:
+            # Find a valid value for this group of aliases
+            value = find_valid_param_value(state_dict, group)
+            assert value is not None, (
+                f"No valid value found in state dict for aliased parameters: {group}"
+            )
+
+            # Apply the value to all aliases
+            for name in group:
+                state_dict[name] = value
+
+            ad_logger.debug(f"Applied value from {group[0]} to aliased parameters: {group}")
+
+    # Register the hook
+    gm._register_load_state_dict_pre_hook(aliasing_load_pre_hook)
 
 
 @torch.inference_mode()
@@ -264,12 +336,13 @@ def torch_export_to_gm(
     # there is no guarantee how it is represented and we need to make sure it is easily identifiable
     # in the graph.
     sdpa_original = F.scaled_dot_product_attention
-    F.scaled_dot_product_attention = torch.ops.attention.scaled_dot_product_attention
+    F.scaled_dot_product_attention = torch.ops.auto_deploy.torch_attention_sdpa
 
     # We overwrite the linear functional as well. This basically avoids exporting the view ops
     # that are used to flatten/unflatten multiple batch dimensions of the input tensor.
     linear_original = F.linear
-    F.linear = torch.ops.linear.simple
+    # patch linear → always supply bias
+    F.linear = _torch_linear_patch
 
     # patch torch.where(condition) to torch.nonzero(condition, as_tuple=True)
     torch.where = _torch_where_patch
@@ -332,6 +405,9 @@ def torch_export_to_gm(
 
     # clean up devices in the graph
     _clean_up_device_info(egm)
+
+    # Add load hook to correctly load parameters that are aliased in the source model.
+    add_load_hook_for_aliased_params(egm, model)
 
     # deduplicate params and buffers
     _deduplicate_params_and_buffers(egm)

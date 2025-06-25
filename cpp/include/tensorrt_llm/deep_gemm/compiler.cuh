@@ -225,21 +225,37 @@ std::vector<std::filesystem::path> getJitIncludeDirs()
 
 std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
     uint32_t const block_n, uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages,
-    uint32_t const num_tma_multicast, deep_gemm::GemmType const gemm_type)
+    uint32_t const num_tma_multicast, deep_gemm::GemmType const gemm_type, bool swapAB = false)
 {
     constexpr uint32_t kNumTMAThreads = 128;
     constexpr uint32_t kNumMathThreadsPerGroup = 128;
 
     std::string input_type;
-    switch (gemm_type)
+    if (!swapAB)
     {
-    case deep_gemm::GemmType::Normal: input_type = "NormalSchedulerInput"; break;
-    case deep_gemm::GemmType::GroupedContiguous: input_type = "GroupedContiguousSchedulerInput"; break;
-    case deep_gemm::GemmType::GroupedMasked: input_type = "GroupedMaskedSchedulerInput"; break;
-    case deep_gemm::GemmType::GroupedWithOffset: input_type = "GroupedWithOffsetSchedulerInput"; break;
-    case deep_gemm::GemmType::StridedBatched: input_type = "StridedBatchedSchedulerInput"; break;
-    default: throw std::runtime_error("Unsupported gemm type");
+        switch (gemm_type)
+        {
+        case deep_gemm::GemmType::Normal: input_type = "NormalSchedulerInput"; break;
+        case deep_gemm::GemmType::GroupedContiguous: input_type = "GroupedContiguousSchedulerInput"; break;
+        case deep_gemm::GemmType::GroupedMasked: input_type = "GroupedMaskedSchedulerInput"; break;
+        case deep_gemm::GemmType::GroupedWithOffset: input_type = "GroupedWithOffsetSchedulerInput"; break;
+        case deep_gemm::GemmType::StridedBatched: input_type = "StridedBatchedSchedulerInput"; break;
+        default: throw std::runtime_error("Unsupported gemm type");
+        }
     }
+    else
+    {
+        switch (gemm_type)
+        {
+        case deep_gemm::GemmType::Normal: input_type = "NormalSchedulerInputSwapAB"; break;
+        case deep_gemm::GemmType::GroupedWithOffset: input_type = "GroupedWithOffsetSchedulerInputSwapAB"; break;
+        default: throw std::runtime_error("Unsupported gemm type");
+        }
+    }
+
+    // Modify kernel name based on swapAB to determine which kernel function to use
+    std::string kernel_name = swapAB ? "fp8_gemm_kernel_swapAB" : "fp8_gemm_kernel";
+    std::string scheduler_name = swapAB ? "SchedulerSelectorSwapAB" : "SchedulerSelector";
 
     // Create the kernel source code using raw string literal
     std::string code = R"(
@@ -265,18 +281,19 @@ std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint3
 using namespace deep_gemm;
 
 using SchedulerType =
-typename SchedulerSelector<GemmType::)"
-        + gemm_type_to_string(gemm_type) + R"(, )" + std::to_string(shape_n) + R"(, )" + std::to_string(shape_k)
-        + R"(, )" + std::to_string(block_m) + R"(, )" + std::to_string(block_n) + R"(, )" + std::to_string(block_k)
-        + R"(, )" + std::to_string(num_groups) + R"(, )" + std::to_string(num_tma_multicast) + R"(>::type;
+typename )"
+        + scheduler_name + R"(<GemmType::)" + gemm_type_to_string(gemm_type) + R"(, )" + std::to_string(shape_n)
+        + R"(, )" + std::to_string(shape_k) + R"(, )" + std::to_string(block_m) + R"(, )" + std::to_string(block_n)
+        + R"(, )" + std::to_string(block_k) + R"(, )" + std::to_string(num_groups) + R"(, )"
+        + std::to_string(num_tma_multicast) + R"(>::type;
 
 __global__ void dummy_kernel() {
-  void *ptr = (void *)&fp8_gemm_kernel<)"
-        + std::to_string(shape_n) + R"(, )" + std::to_string(shape_k) + R"(, )" + std::to_string(block_m) + R"(, )"
-        + std::to_string(block_n) + R"(, )" + std::to_string(block_k) + R"(, )" + std::to_string(num_groups) + R"(, )"
-        + std::to_string(num_stages) + R"(, )" + std::to_string(kNumTMAThreads) + R"(, )"
-        + std::to_string(kNumMathThreadsPerGroup) + R"(, )" + std::to_string(num_tma_multicast) + R"(, SchedulerType, )"
-        + input_type + R"(>;
+  void *ptr = (void *)&)"
+        + kernel_name + R"(<)" + std::to_string(shape_n) + R"(, )" + std::to_string(shape_k) + R"(, )"
+        + std::to_string(block_m) + R"(, )" + std::to_string(block_n) + R"(, )" + std::to_string(block_k) + R"(, )"
+        + std::to_string(num_groups) + R"(, )" + std::to_string(num_stages) + R"(, )" + std::to_string(kNumTMAThreads)
+        + R"(, )" + std::to_string(kNumMathThreadsPerGroup) + R"(, )" + std::to_string(num_tma_multicast)
+        + R"(, SchedulerType, )" + input_type + R"(>;
 }
 )";
 
@@ -305,7 +322,7 @@ public:
     // Build function
     Runtime* build(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m, uint32_t const block_n,
         uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages, uint32_t const num_tma_multicast,
-        deep_gemm::GemmType const gemm_type)
+        deep_gemm::GemmType const gemm_type, bool swapAB = false)
     {
         int sm_version = tensorrt_llm::common::getSMVersion();
         if (sm_version != 90)
@@ -317,8 +334,9 @@ public:
         }
 
         // Build signature - simplified, no MD5 calculation
-        std::string name = "gemm_" + std::to_string(shape_n) + "_" + std::to_string(shape_k) + "_"
-            + std::to_string(block_m) + "_" + std::to_string(block_n) + "_" + std::to_string(block_k) + "_"
+        std::string name = std::string(swapAB ? "gemm_swapAB_" : "gemm_") + std::to_string(shape_n) + "_"
+            + std::to_string(shape_k) + "_" + std::to_string(block_m) + "_" + std::to_string(block_n) + "_"
+            + std::to_string(block_k) + "_" + std::to_string(num_groups) + "_" + std::to_string(num_stages)
             + std::to_string(num_groups) + "_" + std::to_string(num_stages) + "_" + std::to_string(num_tma_multicast)
             + "_" + gemm_type_to_string(gemm_type);
         std::filesystem::path path = getCacheDir() / name;
@@ -393,7 +411,7 @@ public:
         }
 
         std::string code = generateKernel(
-            shape_n, shape_k, block_m, block_n, block_k, num_groups, num_stages, num_tma_multicast, gemm_type);
+            shape_n, shape_k, block_m, block_n, block_k, num_groups, num_stages, num_tma_multicast, gemm_type, swapAB);
 
         if (kJitDebugging)
         {

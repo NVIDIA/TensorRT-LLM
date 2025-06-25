@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from _torch.helpers import reference_moe_torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.modules.fused_moe import FusedMoE  # noqa: F401
+from tensorrt_llm._torch.modules.fused_moe import MoE  # noqa: F401
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -49,7 +49,7 @@ def test_moe_op_run(dtype):
         fused_w2_weight.data[expert_id].copy_(w2)
 
     with torch.inference_mode():
-        output_torch_moe = torch.ops.moe.torch_moe(
+        output_torch_moe = torch.ops.auto_deploy.torch_moe(
             x,
             selected_experts,
             final_scales,
@@ -57,14 +57,14 @@ def test_moe_op_run(dtype):
             w2_weight,
             w3_weight,
         )
-        output_torch_fused_moe = torch.ops.moe.torch_fused_moe(
+        output_torch_fused_moe = torch.ops.auto_deploy.torch_moe_fused(
             x,
             selected_experts,
             final_scales,
             fused_w3_w1_stacked_weight,
             fused_w2_weight,
         )
-        output_trt_fused_moe = torch.ops.moe.trtllm_fused_moe(
+        output_trt_fused_moe = torch.ops.auto_deploy.trtllm_moe_fused(
             x,
             selected_experts,
             final_scales,

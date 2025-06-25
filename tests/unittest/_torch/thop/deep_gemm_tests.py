@@ -17,7 +17,7 @@ from typing import List, Tuple
 
 import pytest
 import torch
-from _torch.helpers import calc_diff, ceil_div, per_block_cast_to_fp8
+from _torch.helpers import calc_diff, per_block_cast_to_fp8
 from utils.util import getSMVersion
 
 
@@ -31,7 +31,7 @@ from utils.util import getSMVersion
 )
 @pytest.mark.parametrize(
     "m",
-    [7, 64, 128, 4096],
+    [7, 16, 64, 128, 4096],
 )
 def test_fp8_block_scale_gemm(m, k, n):
     torch.random.manual_seed(0)
@@ -61,24 +61,32 @@ def change_to_offset_layout(
     num_problems = len(ms)
     m_acc = [0] + list(itertools.accumulate(ms))
 
+    # Need to keep the same as the one in cpp/include/tensorrt_llm/deep_gemm/scheduler.cuh
+    def compute_padded_offset(offset, idx_problem, alignment=32):
+        return (offset + idx_problem * (alignment - 1)) // alignment * alignment
+
+    offset = 0
     for i in range(num_problems):
         ms[i]
         x_list.append(x_fp8[m_acc[i]:m_acc[i + 1]])
-        x_scale_padded = x_scale[m_acc[i]:m_acc[i + 1]]
-        if x_scale_padded.shape[0] % 32 != 0:
-            x_empty = torch.zeros(
-                [32 - (x_scale_padded.shape[0] % 32), x_scale_padded.shape[1]],
-                dtype=x_scale_padded.dtype,
-                device=x_scale_padded.device,
-            )
-            x_scale_padded = torch.cat([x_scale_padded, x_empty])
+        offset_next = compute_padded_offset(m_acc[i + 1], i + 1)
+        size_padded = (offset_next - offset) - (m_acc[i + 1] - m_acc[i])
+        x_scale_padded = torch.cat([
+            x_scale[m_acc[i]:m_acc[i + 1]],
+            torch.zeros(
+                [size_padded, *x_scale.shape[1:]],
+                dtype=x_scale.dtype,
+                device=x_scale.device,
+            ),
+        ])
         x_scale_list.append(x_scale_padded)
+        offset = offset_next
 
     shape_m_total = m_acc[-1]
     ret_x = torch.cat(x_list)
     ret_x_scale = torch.cat(x_scale_list)
     ret_x_scale = ret_x_scale.t().contiguous()
-    pad_target = ceil_div(shape_m_total + num_problems * 31, 32) * 32
+    pad_target = compute_padded_offset(shape_m_total, num_problems)
     pad_target -= ret_x_scale.shape[1]
     ret_x_scale = torch.nn.functional.pad(ret_x_scale, (0, pad_target),
                                           mode='constant',
@@ -162,7 +170,8 @@ def construct_batched(
     getSMVersion() != 90,
     reason="Op only supported on Hopper, current SM is %d." % getSMVersion(),
 )
-@pytest.mark.parametrize("ms", [[256, 256], [128, 64, 64], [16, 24, 48]])
+@pytest.mark.parametrize(
+    "ms", [[256, 256], [128, 64, 64], [16, 24, 48], [4, 8, 16, 32]])
 @pytest.mark.parametrize("k, n", [(7168, 4096), (2048, 7168)])
 def test_fp8_block_scaling_moe_gemm(ms, k, n):
     offset_cpu = [0] + list(itertools.accumulate(ms))

@@ -754,11 +754,13 @@ if __name__ == "__main__":
     output_dir = os.path.abspath(args.output_dir)
 
     fpA_intB_inl = "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/launchers/fpA_intB_launcher_sm90.inl"
-    # moe_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl"
-    moe_gemm_inl = "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl"
-    moe_mixed_gemm_inl = "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl"
+    moe_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl"
+    # moe_gemm_inl = "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl"
+    moe_mixed_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl"
+    # moe_mixed_gemm_inl = "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl"
     # sm80_moe_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/fused_moe_gemm_launcher_sm80.inl"
-    sm80_moe_gemm_inl = "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/fused_moe_gemm_launcher_sm80.inl"
+    # sm80_moe_gemm_inl = "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/fused_moe_gemm_launcher_sm80.inl"
+    sm80_moe_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/fused_moe_gemm_launcher_sm80.inl"
 
     inl_map = {
         (GemmKind.Gemm, 90): [fpA_intB_inl],
@@ -789,23 +791,29 @@ if __name__ == "__main__":
         return (op.act_type != op.weight_type) and (op.gemm_kind
                                                     == GemmKind.Grouped)
 
+    # Fix OOM error in CI. If len(operations) is more than 50, it will be split into multiple sub groups.
+    GROUP_SIZE = 8
     op_groups = dict()
     for op in operations:
-        if should_skip(op):
-            continue
+        # if should_skip(op):
+        #     continue
         dict_key = (op.gemm_kind, op.arch, op.cta_shape[0],
                     is_mixed_dtype_grouped(op))
-        op_group = op_groups.get(dict_key, list())
-        op_group.append(op)
+        op_group = op_groups.get(dict_key, [])
+        if len(op_group) == 0 or len(op_group[-1]) >= GROUP_SIZE:
+            op_group.append([op])
+        else:
+            op_group[-1].append(op)
         op_groups[dict_key] = op_group
 
     file_counter = 1
     for key, value in op_groups.items():
         gemm_kind, _, _, is_mixed_dtype_grouped = key
-        out_file = os.path.join(
-            output_dir, GemmKindNames[gemm_kind],
-            f"cutlass_kernel_file_{file_counter}.generated.cu")
-        inl_file = [moe_mixed_gemm_inl
-                    ] if is_mixed_dtype_grouped else inl_map[key[:2]]
-        write_file(inl_file, value, out_file)
-        file_counter += 1
+        for op_sub_group in value:
+            out_file = os.path.join(
+                output_dir, GemmKindNames[gemm_kind],
+                f"cutlass_kernel_file_{file_counter}.generated.cu")
+            inl_file = [moe_mixed_gemm_inl
+                        ] if is_mixed_dtype_grouped else inl_map[key[:2]]
+            write_file(inl_file, op_sub_group, out_file)
+            file_counter += 1

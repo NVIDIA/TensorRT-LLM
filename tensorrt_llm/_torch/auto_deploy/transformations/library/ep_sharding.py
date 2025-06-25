@@ -29,7 +29,6 @@ from .._graph import canonicalize_graph
 
 
 def ep_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
-    ad_logger.info("Sharding graph for EP")
     ad_logger.debug("Before sharding graph: " + str(gm))
 
     if world_size < 2:
@@ -37,16 +36,17 @@ def ep_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
         return gm
 
     assert isinstance(gm, GraphModule), "Expecting GraphModule"
-
+    num_moe_patterns = 0
     for node in list(gm.graph.nodes):
-        if not is_op(node, torch.ops.moe.torch_moe):
+        if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
         _insert_sharded_moe(gm, node, rank, world_size)
-
+        num_moe_patterns += 1
     # canonicalize and return
     gm = canonicalize_graph(gm)
 
     ad_logger.debug("After sharding: " + str(gm))
+    ad_logger.info(f"Found {num_moe_patterns} MoE patterns")
     return gm
 
 
@@ -123,6 +123,8 @@ def _insert_sharded_moe(
 
     # -- add an all_reduce node --
     with gm.graph.inserting_after(node):
-        dist_node = gm.graph.call_function(torch.ops.dist.all_reduce, args=(node,))
+        dist_node = gm.graph.call_function(
+            torch.ops.auto_deploy.torch_dist_all_reduce, args=(node,)
+        )
         node.replace_all_uses_with(dist_node)
         dist_node.replace_input_with(dist_node, node)

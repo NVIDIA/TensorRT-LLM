@@ -18,8 +18,9 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import CppExecutorError, RequestError
-from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig, SamplingParams
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 

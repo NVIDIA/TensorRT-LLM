@@ -17,6 +17,8 @@
 import os
 import platform
 import sys
+import sysconfig
+import warnings
 from argparse import ArgumentParser
 from contextlib import contextmanager
 from functools import partial
@@ -26,6 +28,11 @@ from shutil import copy, copytree, rmtree
 from subprocess import DEVNULL, CalledProcessError, check_output, run
 from textwrap import dedent
 from typing import List
+
+try:
+    from packaging.requirements import Requirement
+except (ImportError, ModuleNotFoundError):
+    from pip._vendor.packaging.requirements import Requirement
 
 build_run = partial(run, shell=True, check=True)
 
@@ -67,21 +74,31 @@ def clear_folder(folder_path):
             os.remove(item_path)
 
 
-def setup_venv(project_dir: Path, requirements_file: Path):
-    """Creates/updates a venv and installs requirements.
+def sysconfig_scheme(override_vars=None):
+    # Backported 'venv' scheme from Python 3.11+
+    if os.name == 'nt':
+        scheme = {
+            'purelib': '{base}/Lib/site-packages',
+            'scripts': '{base}/Scripts',
+        }
+    else:
+        scheme = {
+            'purelib': '{base}/lib/python{py_version_short}/site-packages',
+            'scripts': '{base}/bin',
+        }
 
-    Args:
-        project_dir: The root directory of the project.
-        requirements_file: Path to the requirements file.
+    vars_ = sysconfig.get_config_vars()
+    if override_vars:
+        vars_.update(override_vars)
+    return {key: value.format(**vars_) for key, value in scheme.items()}
 
-    Returns:
-        Tuple[Path, Path]: Paths to the python and conan executables in the venv.
-    """
+
+def create_venv(project_dir: Path):
     py_major = sys.version_info.major
     py_minor = sys.version_info.minor
-    venv_dir = project_dir / f".venv-{py_major}.{py_minor}"
+    venv_prefix = project_dir / f".venv-{py_major}.{py_minor}"
     print(
-        f"-- Using virtual environment at: {venv_dir} (Python {py_major}.{py_minor})"
+        f"-- Using virtual environment at: {venv_prefix} (Python {py_major}.{py_minor})"
     )
 
     # Ensure compatible virtualenv version is installed (>=20.29.1, <22.0)
@@ -89,21 +106,89 @@ def setup_venv(project_dir: Path, requirements_file: Path):
     build_run(f'"{sys.executable}" -m pip install "virtualenv>=20.29.1,<22.0"')
 
     # Create venv if it doesn't exist
-    if not venv_dir.exists():
-        print(f"-- Creating virtual environment in {venv_dir}...")
+    if not venv_prefix.exists():
+        print(f"-- Creating virtual environment in {venv_prefix}...")
         build_run(
-            f'"{sys.executable}" -m virtualenv --system-site-packages "{venv_dir}"'
+            f'"{sys.executable}" -m virtualenv --system-site-packages "{venv_prefix}"'
         )
     else:
         print("-- Virtual environment already exists.")
 
+    return venv_prefix
+
+
+def setup_venv(project_dir: Path, requirements_file: Path, no_venv: bool):
+    """Creates/updates a venv and installs requirements.
+
+    Args:
+        project_dir: The root directory of the project.
+        requirements_file: Path to the requirements file.
+        no_venv: Use current Python environment as is.
+
+    Returns:
+        Tuple[Path, Path]: Paths to the python and conan executables in the venv.
+    """
+    if no_venv or sys.prefix != sys.base_prefix:
+        reason = "Explicitly requested by user" if no_venv else "Already inside virtual environment"
+        print(f"-- {reason}, using environment {sys.prefix} as is.")
+        venv_prefix = Path(sys.prefix)
+    else:
+        venv_prefix = create_venv(project_dir)
+
+    scheme = sysconfig_scheme({'base': venv_prefix})
     # Determine venv executable paths
-    scripts_dir = venv_dir / "bin"
-    venv_python = scripts_dir / "python"
+    scripts_dir = Path(scheme["scripts"])
+    venv_python = venv_prefix / sys.executable.removeprefix(sys.prefix)[1:]
+
+    if os.environ.get("NVIDIA_PYTORCH_VERSION"):
+        # Ensure PyPI PyTorch is not installed in the venv
+        purelib_dir = Path(scheme["purelib"])
+        pytorch_package_dir = purelib_dir / "torch"
+        if venv_prefix != sys.base_prefix and pytorch_package_dir.exists():
+            warnings.warn(
+                f"Using the NVIDIA PyTorch container with PyPI distributed PyTorch may lead to compatibility issues.\n"
+                f"If you encounter any problems, please delete the environment at `{venv_prefix}` so that "
+                f"`build_wheel.py` can recreate the virtual environment correctly."
+            )
+            print("^^^^^^^^^^ IMPORTANT WARNING ^^^^^^^^^^", file=sys.stderr)
+            input("Press Ctrl+C to stop, any key to continue...\n")
+
+        # Ensure inherited PyTorch version is compatible
+        try:
+            info = check_output(
+                [str(venv_python), "-m", "pip", "show", "torch"])
+        except CalledProcessError:
+            raise RuntimeError(
+                "NVIDIA PyTorch container detected, but cannot find PyTorch installation. "
+                "The environment is corrupted. Please recreate your container.")
+        version_installed = next(
+            line.removeprefix("Version: ")
+            for line in info.decode().splitlines()
+            if line.startswith("Version: "))
+        version_required = None
+        try:
+            with open(requirements_file) as fp:
+                for line in fp:
+                    if line.startswith("torch"):
+                        version_required = Requirement(line)
+                        break
+        except FileNotFoundError:
+            pass
+
+        if version_required is not None:
+            if version_installed not in version_required.specifier:
+                raise RuntimeError(
+                    f"Incompatible NVIDIA PyTorch container detected. "
+                    f"The container provides PyTorch version {version_installed}, "
+                    f"but current revision requires {version_required}. "
+                    f"Please recreate your container using image specified in .devcontainer/docker-compose.yml. "
+                    f"NOTE: Please don't try install PyTorch using pip. "
+                    f"Using the NVIDIA PyTorch container with PyPI distributed PyTorch may lead to compatibility issues."
+                )
 
     # Install/update requirements
     print(
-        f"-- Installing requirements from {requirements_file} into {venv_dir}..."
+        f"-- Installing requirements from {requirements_file} into {venv_prefix}..."
     )
     build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
 
@@ -182,8 +267,8 @@ def generate_fmha_cu(project_dir, venv_python):
     build_run("python3 setup.py", env=env)
 
     # Copy generated header file when cu path is active and cubins are deleted.
-    # cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
-    # build_run(f"mv generated/fmha_cubin.h {cubin_dir}")
+    cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
+    build_run(f"mv generated/fmha_cubin.h {cubin_dir}")
 
     for cu_file in (fmha_v2_dir / "generated").glob("*sm*.cu"):
         build_run(f"mv {cu_file} {fmha_v2_cu_dir}")
@@ -202,6 +287,7 @@ def main(*,
          extra_make_targets: str = "",
          trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
+         nixl_root: str = None,
          internal_cutlass_kernels_root: str = None,
          clean: bool = False,
          clean_wheel: bool = False,
@@ -217,7 +303,8 @@ def main(*,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
          skip_stubs: bool = False,
-         generate_fmha: bool = False):
+         generate_fmha: bool = False,
+         no_venv: bool = False):
 
     if clean:
         clean_wheel = True
@@ -240,12 +327,13 @@ def main(*,
 
     # Setup venv and install requirements
     venv_python, venv_conan = setup_venv(project_dir,
-                                         project_dir / requirements_filename)
+                                         project_dir / requirements_filename,
+                                         no_venv)
 
     # Ensure base TRT is installed (check inside the venv)
-    reqs = check_output([str(venv_python), "-m", "pip", "freeze"])
-    installed_packages = [r.decode().split("==")[0] for r in reqs.split()]
-    if "tensorrt" not in installed_packages:
+    try:
+        check_output([str(venv_python), "-m", "pip", "show", "tensorrt"])
+    except CalledProcessError:
         error_msg = "TensorRT was not installed properly."
         if on_windows:
             error_msg += (
@@ -298,6 +386,9 @@ def main(*,
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
 
+    if nixl_root is not None:
+        cmake_def_args.append(f"-DNIXL_ROOT={nixl_root}")
+
     build_dir = get_build_dir(build_dir, build_type)
     first_build = not Path(build_dir, "CMakeFiles").exists()
 
@@ -349,7 +440,7 @@ def main(*,
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
             build_run(
-                f"\"{venv_conan}\" install --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f"\"{venv_conan}\" install --build=missing --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
@@ -483,6 +574,14 @@ def main(*,
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so",
                 lib_dir / "libtensorrt_llm_ucx_wrapper.so")
+        if os.path.exists(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so"
+        ):
+            install_file(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so",
+                lib_dir / "libtensorrt_llm_nixl_wrapper.so")
         install_file(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",
@@ -638,6 +737,8 @@ def add_arguments(parser: ArgumentParser):
                         help="Directory to find TensorRT headers/libs")
     parser.add_argument("--nccl_root",
                         help="Directory to find NCCL headers/libs")
+    parser.add_argument("--nixl_root",
+                        help="Directory to find NIXL headers/libs")
     parser.add_argument(
         "--internal-cutlass-kernels-root",
         default="",
@@ -680,6 +781,12 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--generate_fmha",
                         action="store_true",
                         help="Generate the FMHA cu files.")
+    parser.add_argument(
+        "--no-venv",
+        action="store_true",
+        help=
+        "Use the current Python interpreter without creating a virtual environment."
+    )
 
 
 if __name__ == "__main__":
