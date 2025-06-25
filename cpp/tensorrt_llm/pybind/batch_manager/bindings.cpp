@@ -33,6 +33,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/unique_ptr.h>
+#include <nanobind/stl/tuple.h>
 #include <torch/extension.h>
 #include <tuple>
 
