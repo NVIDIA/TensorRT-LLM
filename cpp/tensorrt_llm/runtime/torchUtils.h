@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -31,6 +32,11 @@
 #include <initializer_list>
 #include <type_traits>
 #include <vector>
+
+#include <cutlass/float_subbyte.h>
+#include <cutlass/float8.h>
+#include <cutlass/half.h>
+#include <cutlass/bfloat16.h>
 
 namespace tensorrt_llm::runtime
 {
@@ -111,6 +117,31 @@ public:
         case at::ScalarType::BFloat16: return IBuffer::DataType::kBF16;
         case at::ScalarType::QUInt4x2: return IBuffer::DataType::kINT4;
         default: TLLM_THROW("unsupported data type");
+        }
+    }
+
+    template<at::ScalarType ScalarType>
+    static constexpr auto cutlassType()
+    {
+        if constexpr (ScalarType == at::ScalarType::Float)
+        {
+            return float{};
+        }
+        else if constexpr (ScalarType == at::ScalarType::Half)
+        {
+            return cutlass::half_t{};
+        }
+        else if constexpr (ScalarType == torch_ext::FLOAT4_E2M1X2)
+        {
+            return cutlass::float_e2m1_t{};
+        }
+        else if constexpr (ScalarType == at::ScalarType::Float8_e4m3fn)
+        {
+            return cutlass::float_e4m3_t{};
+        }
+        else if constexpr (ScalarType == at::ScalarType::BFloat16)
+        {
+            return cutlass::bfloat16_t{};
         }
     }
 

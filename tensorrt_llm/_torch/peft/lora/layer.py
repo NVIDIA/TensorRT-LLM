@@ -99,6 +99,7 @@ class LoraLayer(torch.nn.Module):
         layer_idx: int,
     ) -> Optional[torch.Tensor]:
 
+        print("INSIDE LORA FORWARD =================================")
         if bool(lora_params):
             lora_ranks = []
             lora_weight_pointers = []

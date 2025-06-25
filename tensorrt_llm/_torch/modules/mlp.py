@@ -58,7 +58,8 @@ class MLP(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.down_lora,
-            allreduce_strategy=config.allreduce_strategy)
+            allreduce_strategy=config.allreduce_strategy,
+            fuse_gemm_allreduce=True) # fuse_gemm_allreduce=config.fuse_gemm_allreduce
 
     def forward(
         self,
