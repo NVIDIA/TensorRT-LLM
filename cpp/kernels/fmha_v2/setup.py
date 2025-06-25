@@ -3049,15 +3049,19 @@ def get_kernel_traits_code(specs_names):
     return code
 
 
+# For now, only hopper head_size 128 kernel uses cubins, and other kernels use cu files. Unused cubins are removed.
+# If you want to use cu files for these kernels, you can change the condition here.
+def use_cubin_header(kspec):
+    return kspec.sm == 90 and kspec.head_size == 128
+
+
 def get_cubin_header(kernel_traits, specs_names):
     cubins = []
     cubin_lens = []
     cubins_dict = {}
     cubin_lens_dict = {}
     for kspec, fname, lname, kname in specs_names:
-        # only generate hopper head_size 128 cubin header
-        if generate_cu_trtllm and not ('sm90' in kname
-                                       and kspec.head_size == 128):
+        if generate_cu_trtllm and not use_cubin_header(kspec):
             continue
         name = fname.replace('.', '_')
         data = 'extern unsigned char cubin_{name}_cubin[];'.format(name=name)
@@ -3210,7 +3214,7 @@ def get_cubin_header(kernel_traits, specs_names):
             if generate_cu_trtllm:
 
                 def get_lname_from_kname(kname: str) -> str:
-                    if 'sm90' in kname and kspec.head_size == 128:
+                    if use_cubin_header(kspec):
                         return 'nullptr'
                     lname = kname.replace('_kernel', '')
                     mask_types = [
@@ -3229,7 +3233,7 @@ def get_cubin_header(kernel_traits, specs_names):
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
 {is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {lname}}}\
-'''.format(**locals()) if ('sm90' in kname and kspec.head_size == 128) else '''\
+'''.format(**locals()) if use_cubin_header(kspec) else '''\
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
 0, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
