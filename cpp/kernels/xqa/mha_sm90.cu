@@ -449,7 +449,7 @@ using Gemm1Acc = GmmaAcc<headElems, ctaNbQHeads>;
 __device__ void rescaleGemm1AccForNewColMax_sync(uint32_t warpRank, ShmQWiseVec const& shmXColMax,
     ShmQWiseVec const (&shmXColSum)[gemm0NbWarps], ShmQWiseVec& shmAccColMax, Gemm1Acc& acc, ShmQWiseVec& shmAccColSum,
     CtaBarrier& gemm1WarpGrpBar);
-template <bool DstIsStrided = false, typename DstHead>
+template <bool dstIsStrided = false, typename DstHead>
 __device__ void finalizeAndWriteOut_sync(uint32_t threadRank, uint32_t warpRank, DstHead* dst,
     SharedMem::OutSwizzleBuf& swizzleBuf, Gemm1Acc& acc, float xvoScale, CtaBarrier& warpGrpBar,
     ShmQWiseVec const& accColSum, uint32_t nbKHeads = 0 /* only for final result in spec dec. */);
@@ -1845,8 +1845,8 @@ __device__ inline void warpGrpApplyMask(
     static_assert(SPEC_Q_SEQ_LEN <= sizeof(MaskType) * 8, "not implemented");
 
     assert(cacheSeqLen >= SPEC_Q_SEQ_LEN);
-    const uint32_t maskStartRow = cacheSeqLen - SPEC_Q_SEQ_LEN;
-    const uint32_t tileStartRow = tileSize * idxTile;
+    uint32_t const maskStartRow = cacheSeqLen - SPEC_Q_SEQ_LEN;
+    uint32_t const tileStartRow = tileSize * idxTile;
     if (tileStartRow + tileSize < maskStartRow)
     {
         return;
@@ -1862,7 +1862,7 @@ __device__ inline void warpGrpApplyMask(
         for (uint32_t j = 0; j < GmmaAccCoreMat::cols; j++)
         {
             uint32_t const col = GmmaAccCoreMat::cols * (4 * n + idxInQuad) + j;
-            const uint32_t maskCol = col / headGrpSize;
+            uint32_t const maskCol = col / headGrpSize;
             MaskType const bit_mask = (1ULL << (maskCol + 1)) - 1;
 
 #pragma unroll
@@ -1872,7 +1872,7 @@ __device__ inline void warpGrpApplyMask(
                 for (uint32_t i = 0; i < GmmaAccCoreMat::rows; i++)
                 {
                     uint32_t const row = gmma::instM * m + gmma::instM / 4 * warpRank + 8 * i + idxQuad;
-                    const uint32_t globalRow = tileStartRow + row;
+                    uint32_t const globalRow = tileStartRow + row;
                     if (globalRow >= cacheSeqLen)
                     {
                         acc(m, n)(i, j) = mha::numeric_limits<float>::lowest();
@@ -1880,7 +1880,7 @@ __device__ inline void warpGrpApplyMask(
                     }
                     if (globalRow >= maskStartRow)
                     {
-                        const uint32_t maskRow = globalRow - maskStartRow;
+                        uint32_t const maskRow = globalRow - maskStartRow;
                         if ((bit_mask >> maskRow) == 0)
                         {
                             acc(m, n)(i, j) = mha::numeric_limits<float>::lowest();
@@ -2710,7 +2710,7 @@ __device__ inline void rescaleAcc(Gemm1Acc& acc, RegRowWiseVec const& scale)
 
 #if SWAP_AB
 // @fixme: consider make this noinline
-template <bool DstIsStrided = false, typename DstHead>
+template <bool dstIsStrided = false, typename DstHead>
 __device__ inline void saveTransposedOutput(uint32_t threadRank, uint32_t warpRank, DstHead* dst,
     SharedMem::OutSwizzleBuf& swizzleBuf, Gemm1Acc const& acc, CtaBarrier& warpGrpBar, uint32_t nbKHeads)
 {
@@ -2780,7 +2780,7 @@ __device__ inline void saveTransposedOutput(uint32_t threadRank, uint32_t warpRa
                 = convert<typename DstHead::Elem>(reinterpret_cast<Vec<InputElem, inputElemsPerGrain> const&>(data));
             uint32_t dstHeadIdx = idxHead;
 #ifdef SPEC_Q_SEQ_LEN
-            if constexpr (DstIsStrided)
+            if constexpr (dstIsStrided)
             {
                 uint32_t const idxToken = idxHead / headGrpSize;
                 if (idxToken < SPEC_Q_SEQ_LEN)
@@ -2795,7 +2795,7 @@ __device__ inline void saveTransposedOutput(uint32_t threadRank, uint32_t warpRa
     }
 }
 
-template <bool DstIsStrided, typename DstHead>
+template <bool dstIsStrided, typename DstHead>
 __device__ inline void finalizeAndWriteOut_sync(uint32_t threadRank, uint32_t warpRank, DstHead* dst,
     SharedMem::OutSwizzleBuf& swizzleBuf, Gemm1Acc& acc, float xvoScale, CtaBarrier& warpGrpBar,
     ShmQWiseVec const& accColSum, uint32_t nbKHeads)
@@ -2807,7 +2807,7 @@ __device__ inline void finalizeAndWriteOut_sync(uint32_t threadRank, uint32_t wa
     auto const regOutScale = __frcp_rn(regColSum) * xvoScale;
     rescaleAcc(acc, regOutScale);
 
-    saveTransposedOutput<DstIsStrided, DstHead>(threadRank, warpRank, dst, swizzleBuf, acc, warpGrpBar, nbKHeads);
+    saveTransposedOutput<dstIsStrided, DstHead>(threadRank, warpRank, dst, swizzleBuf, acc, warpGrpBar, nbKHeads);
     warpGrpBar.arrive_and_wait();
 }
 #else
