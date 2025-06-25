@@ -343,7 +343,7 @@ class PyExecutor:
                 child_req_ids = None
                 sampling_config = request.sampling_config
                 beam_width = sampling_config.beam_width
-                num_return_sequences = sampling_config.num_return_sequences
+                num_return_sequences = sampling_config.num_return_sequences or beam_width
 
                 if beam_width == 1 and num_return_sequences > 1:
                     # Reserve request ids for child requests.
