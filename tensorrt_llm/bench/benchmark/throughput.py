@@ -23,6 +23,10 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
+<<<<<<< HEAD
+=======
+from tensorrt_llm.bench.tuning.dataclasses import BatchingConfiguration, BenchmarkEnvironment, BenchmarkSpecification, LlmRuntimeSpecification, ReportingConfiguration, TuningConstraints, WorldConfig
+>>>>>>> e730e9857 (Continued clean up of benchmark.)
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.tuning.dataclasses import (BenchmarkEnvironment,
                                                    BenchmarkSpecification,
@@ -258,75 +262,51 @@ def throughput_command(
     """Run a throughput test on a TRT-LLM engine."""
 
     logger.info("Preparing to run throughput benchmark...")
-    scenario = ScenarioSpecification(**params)
-    constraints = TuningConstraints(**params)
-    world_config = WorldConfig(**params)
-    benchmark_specification = BenchmarkSpecification(environment=bench_env,
-                                                     scenario=scenario,
-                                                     constraints=constraints,
-                                                     world=world_config)
-
-    scenario = MaxThroughputScenario.get_settings(scenario, world_config,
-                                                  constraints)
-
-    # Parameters from CLI
-    # Model, experiment, and engine params
-    dataset_path: Path = params.pop("dataset")
-    eos_id: int = params.pop("eos_id")
-    warmup: int = params.get("warmup")
-    num_requests: int = params.pop("num_requests")
-    max_seq_len: int = params.pop("max_seq_len")
-    model: str = bench_env.model
-    checkpoint_path: Path = bench_env.checkpoint_path or bench_env.model
-    engine_dir: Path = params.pop("engine_dir")
-    concurrency: int = params.pop("concurrency")
-    backend: str = params.get("backend")
-    modality: str = params.pop("modality")
-    max_input_len: int = params.pop("max_input_len")
-    model_type = get_model_config(model, checkpoint_path).model_type
-
-    # Reporting options
-    report_json: Path = params.pop("report_json")
-    output_json: Path = params.pop("output_json")
-    request_json: Path = params.pop("request_json")
-    iteration_log: Path = params.pop("iteration_log")
-    iteration_writer = IterationWriter(iteration_log)
-
-    # Runtime kwargs and option tracking.
-    kwargs = {}
+    # Populate the benchmark specification with the parameters from the CLI.
+    # TODO: make sure reporting_config includes request timeline.
+    benchmark_specification = BenchmarkSpecification(
+        **params,
+        environment=bench_env,
+        batching_config=BatchingConfiguration(**params),
+        llm_config=LlmRuntimeSpecification(**params),
+        world=WorldConfig(**params),
+        reporting_config=ReportingConfiguration(**params),
+    )
 
     # Initialize the HF tokenizer for the specified model.
-    tokenizer = initialize_tokenizer(checkpoint_path)
+    tokenizer = initialize_tokenizer(benchmark_specification.checkpoint)
 
     # Dataset Loading and Preparation
-    with open(dataset_path, "r") as dataset:
+    with open(benchmark_specification.dataset_path, "r") as dataset:
         metadata, requests = create_dataset_from_stream(
             tokenizer,
             dataset,
-            num_requests=num_requests,
-            model_dir=checkpoint_path,
-            model_type=model_type,
-            modality=modality,
-            max_input_seq_len_for_multimodal=max_input_len)
-        metadata.dataset_path = dataset_path
-        params["target_input_len"] = params.get(
-            "target_input_len") or metadata.avg_isl
-        params["target_output_len"] = params.get(
-            "target_output_len") or metadata.avg_osl
+            model_dir=benchmark_specification.checkpoint,
+            num_requests=benchmark_specification.num_requests,
+            model_type=benchmark_specification.environment.model_type,
+            modality=benchmark_specification.modality,
+            max_input_seq_len_for_multimodal=benchmark_specification.batching_config.max_seq_len)
 
-    if modality is None:
+    benchmark_specification.constraints = TuningConstraints.from_dataset_metadata(metadata)
+    benchmark_specification.dataset_metadata = metadata
+
+    if benchmark_specification.modality == "text":
         # Log dataset info
         # NOTE: This table is only accurate for non-multimodal models.
         #       The accurate table for multimodal models will be logged after the benchmark is done.
-        logger.info(metadata.get_summary_for_print())
+        logger.info(benchmark_specification.get_dataset_summary())
 
     # Engine configuration parsing
+<<<<<<< HEAD
     if backend and backend.lower() in ALL_SUPPORTED_BACKENDS and backend.lower(
     ) != "tensorrt":
+=======
+    if benchmark_specification.llm_config.backend != "trt":
+>>>>>>> 173d3b211 (Continued clean up of benchmark.)
         # If we're dealing with a model name, perform a snapshot download to
         # make sure we have a local copy of the model.
-        if bench_env.checkpoint_path is None:
-            snapshot_download(model)
+        if benchmark_specification.environment.checkpoint_path is None:
+            snapshot_download(benchmark_specification.environment.model)
 
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
@@ -433,6 +413,7 @@ def throughput_command(
             llm._executor._iter_stats_result = None
             logger.info("Warmup done.")
 
+        iteration_writer = IterationWriter(benchmark_specification.reporting_config.iteration_log)
         with iteration_writer.capture():
             statistics = asyncio.run(
                 async_benchmark(llm,

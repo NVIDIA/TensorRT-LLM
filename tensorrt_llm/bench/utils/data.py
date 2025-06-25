@@ -1,6 +1,7 @@
 import json
 from functools import partial
-from typing import List, TextIO, Tuple
+from pathlib import Path
+from typing import List, TextIO, Tuple, Union, Optional
 
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
@@ -35,12 +36,12 @@ def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
 def create_dataset_from_stream(
     tokenizer: PreTrainedTokenizer,
     stream: TextIO,
+    model_dir: Union[str, Path],
     max_input_length: int = 0,
     max_output_length: int = 0,
     num_requests: int = 0,
-    model_dir: str = None,
-    model_type: str = None,
-    modality: str = None,
+    model_type: Optional[str] = None,
+    modality: Optional[str] = None,
     max_input_seq_len_for_multimodal: int = 4096,
 ) -> Tuple[DatasetMetadata, List[InferenceRequest]]:
     """Generate metadata and a list of requests to drive benchmarking.

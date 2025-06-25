@@ -1,6 +1,6 @@
 import math
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
 from tensorrt_llm.bench.build.dataclasses import ModelConfig
@@ -11,8 +11,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig
 from tensorrt_llm.bench.build.utils import get_device_memory
 
-
-BYTES_PER_ELEM = {
+BYTES_PER_ELEM: dict[QuantAlgo, float] = {
     QuantAlgo.NO_QUANT: 2.0,
     QuantAlgo.FP8: 1.0,
     QuantAlgo.FP8_BLOCK_SCALES: 1.0,
@@ -20,7 +19,7 @@ BYTES_PER_ELEM = {
 }
 
 
-def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
+def get_model_config(model_name: str, model_path: Optional[Path] = None) -> ModelConfig:
     """ Obtain the model-related parameters from Hugging Face.
     Args:
         model_name (str): Huggingface model name.
@@ -71,8 +70,8 @@ def calc_engine_setting(
         Tuple[int, int]: Tuple containing engine configuration information for
         engine build (max_num_tokens, max_batch_size).
     """
-    byte_per_elem = BYTES_PER_ELEM.get(quant_config.quant_algo, 2)
-    byte_per_kv_elem = BYTES_PER_ELEM.get(quant_config.kv_cache_quant_algo, 2)
+    byte_per_elem = BYTES_PER_ELEM.get(quant_config.quant_algo, 2.0)
+    byte_per_kv_elem = BYTES_PER_ELEM.get(quant_config.kv_cache_quant_algo, 2.0)
 
     # Each GPU in TP group has at least 1 kv head
     adjusted_num_kv_heads = max(tp_size, model_config.num_key_value_heads)

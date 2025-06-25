@@ -2,57 +2,31 @@ from __future__ import annotations
 
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, Self, Union
 
 import yaml
 from pydantic import (AliasChoices, AliasPath, BaseModel, Field, computed_field,
                       field_validator, model_validator)
+from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
+from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from transformers import AutoConfig
 
 from tensorrt_llm.bench.build.utils import get_safetensors_metadata
 from tensorrt_llm.bench.tuning.utils import get_model_config
 
 
-class BenchmarkSpecification(BaseModel):
-    constraints: Optional[TuningConstraints] = Field(
+class BatchingConfiguration(BaseModel):
+    max_seq_len: Optional[int] = Field(
         default=None,
-        description="The tuning criteria to use for benchmarking.")
-    dataset_path: Optional[str] = Field(
-        default=None,
-        description="The path to the dataset to use for benchmarking.")
-    engine_dir: Optional[Path] = Field(
-        default=None,
-        description="The path to the engine to use for benchmarking.")
-    environment: BenchmarkEnvironment
-    modality: Optional[Literal["text", "image", "video"]] = Field(
-        default="text", description="The modality of the model being used.")
-    mode: Literal["build", "benchmark"] = Field(
-        default="benchmark",
-        description="The path tuning is being accessed from.")
-    scenario: Optional[ScenarioSpecification] = Field(
-        default=None, description="The scenario to use for benchmarking.")
-    world: Optional[WorldConfig] = Field(
-        default=None, description="The world to use for benchmarking.")
-
-    @model_validator(mode="after")
-    def validate_heuristic_constraints(self):
-        build_options = [
-            self.dataset_path, self.constraints.max_input_len,
-            self.constraints.target_input_len
-        ]
-        if all(opt is None for opt in build_options):
-            raise ValueError(
-                "No engine build option is selected, please provide at least one option."
-            )
-        elif sum([bool(opt) for opt in build_options]) > 1:
-            raise ValueError(
-                "Multiple engine build options detected, please choose only one engine build option."
-            )
-
-        if not self.dataset_path and not self.max_input_len:
-            raise ValueError("Unspecified max_input_len for engine build.")
-        return self
-
+        description="The maximum sequence length to use for batch scheduling.")
+    max_batch_size: Optional[int] = Field(
+        description="The maximum batch size to use for batch scheduling.",
+        default=None
+    )
+    max_num_tokens: Optional[int] = Field(
+        description="The maximum number of tokens to use for batch scheduling.",
+        default=None
+    )
 
 class BenchmarkEnvironment(BaseModel):
     model: str = Field(default="",
@@ -63,22 +37,17 @@ class BenchmarkEnvironment(BaseModel):
     workspace: Path = Field(
         default="/tmp", description="The workspace to use for engine building.")
 
-    @cached_property
     @computed_field(
         description=
-        "The type of model being used, derived from the model configuration.", )
+        "The type of model being used, derived from the model configuration.",
+    )
+    @cached_property
     def model_type(self) -> str:
         return get_model_config(self.model, self.checkpoint_path).model_type
 
-    @computed_field(
-        description=
-        "The type of model being used, derived from the model configuration.", )
-    def checkpoint_path(self) -> Path:
-        return self.checkpoint_path or self.model
 
-
-class ScenarioSpecification(BaseModel):
-    backend: Optional[Literal["pytorch", "autodeploy", "trt"]] = Field(
+class LlmRuntimeSpecification(BaseModel):
+    backend: Optional[Literal["pytorch", "_autodeploy", "trt"]] = Field(
         default="pytorch", description="The backend to use for benchmarking.")
     beam_width: Optional[int] = Field(
         default=None, description="The beam width to use for benchmarking.")
@@ -107,9 +76,16 @@ class ScenarioSpecification(BaseModel):
     class Config:
         extra = "ignore"
 
+    @field_validator("backend", mode="before")
+    @classmethod
+    def validate_backend(cls, v) -> Optional[str]:
+        if v is not None:
+            return v.lower()
+        return v
+
     @field_validator("extra_llm_api_options", mode="before")
     @classmethod
-    def validate_extra_llm_api_options(cls, v) -> Dict[str, Any]:
+    def validate_extra_llm_api_options(cls, v) -> Union[Dict[str, Any], None]:
         if v is None:
             return None
         else:
@@ -136,70 +112,37 @@ class ScenarioSpecification(BaseModel):
 
 
 class TuningConstraints(BaseModel):
-    target_input_len: Optional[int] = Field(
-        default=None, description="The target input length to use for tuning.")
-    target_output_len: Optional[int] = Field(
-        default=None,
-        gt=0,
-        description="The target output length to use for tuning.")
-    max_input_len: Optional[int] = Field(
-        default=None,
-        gt=0,
-        description="The maximum input length to use for tuning.")
-    max_output_len: Optional[int] = Field(
-        default=None,
-        description="The maximum output length to use for tuning.")
-    max_seq_len: Optional[int] = Field(
-        default=None,
-        description="The maximum sequence length to use for tuning.")
+    target_input_len: Optional[int] = Field(description="The target input length to use for tuning.")
+    target_output_len: Optional[int] = Field(description="The target output length to use for tuning.")
+    max_input_len: int = Field(description="The maximum input length to use for tuning.")
+    max_output_len: int = Field(description="The maximum output length to use for tuning.")
 
     class Config:
         extra = "ignore"
 
     @model_validator(mode="after")
-    def validate_max_seq_len(self):
-        # Validate and adjust max sequence length, input length, and output length
-        lengths = {
-            "max_seq_len": self.max_seq_len,
-            "max_input_len": self.max_input_len,
-            "max_output_len": self.max_output_len
-        }
-
-        # Check which lengths are provided
-        provided_lengths = {k: v for k, v in lengths.items() if v is not None}
-
-        # If all three are provided, validate the sum
-        if len(provided_lengths) == 3:
-            if lengths["max_input_len"] + lengths["max_output_len"] != lengths[
-                    "max_seq_len"]:
-                raise ValueError(
-                    "max_input_len + max_output_len must equal max_seq_len")
-        # If two are provided, calculate the missing one
-        elif len(provided_lengths) == 2:
-            missing_key = set(lengths.keys()) - set(provided_lengths.keys())
-            if "max_seq_len" in missing_key:
-                self.max_seq_len = lengths["max_input_len"] + lengths[
-                    "max_output_len"]
-            elif "max_input_len" in missing_key:
-                self.max_input_len = lengths["max_seq_len"] - lengths[
-                    "max_output_len"]
-            elif "max_output_len" in missing_key:
-                self.max_output_len = lengths["max_seq_len"] - lengths[
-                    "max_input_len"]
-        else:
-            raise ValueError(
-                "At least two of the following properties must be provided: "
-                "max_input_len, max_output_len, or max_seq_len")
+    def validate_target_input_output_len(self) -> Self:
+        self.target_input_len = self.target_input_len or self.max_input_len
+        self.target_output_len = self.target_output_len or self.max_output_len
 
         return self
 
+    @classmethod
+    def from_dataset_metadata(cls, metadata: DatasetMetadata) -> "TuningConstraints":
+        return cls(
+            target_input_len=metadata.avg_isl,
+            target_output_len=metadata.avg_osl,
+            max_input_len=metadata.max_isl,
+            max_output_len=metadata.max_osl,
+        )
+
 
 class WorldConfig(BaseModel):
-    tp: Optional[int] = Field(
-        default=None,
+    tp: int = Field(
+        default=1,
         description="The tensor parallelism size to use for tuning.")
-    pp: Optional[int] = Field(
-        default=None,
+    pp: int = Field(
+        default=1,
         description="The pipeline parallelism size to use for tuning.")
     ep: Optional[int] = Field(
         default=None,
@@ -209,7 +152,7 @@ class WorldConfig(BaseModel):
 
     @computed_field
     def world_size(self) -> int:
-        return self.tp * self.pp
+        return int(self.tp * self.pp)
 
 
 class ModelConfig(BaseModel):
@@ -293,3 +236,134 @@ class ModelConfig(BaseModel):
         param_count = cls.get_param_count(model_hf_name, hf_model_path)
 
         return cls(name=model_hf_name, param_count=param_count, **hf_config)
+
+
+class ReportingConfiguration(BaseModel):
+    report_json: Optional[Path] = Field(
+        default=None,
+        description="The path to the report to use for benchmarking.")
+    iteration_log: Optional[Path] = Field(
+        default=None,
+        description="The path to the iteration log to use for benchmarking.")
+    output_json: Optional[Path] = Field(
+        default=None,
+        description="The path to the output to use for benchmarking.")
+
+
+class BenchmarkSpecification(BaseModel):
+    constraints: Optional[TuningConstraints] = Field(
+        description="The tuning criteria to use for benchmarking.",
+        default=None,
+    )
+    dataset_path: Path = Field(
+        description="The path to the dataset to use for benchmarking.",
+        alias=AliasChoices("dataset", "dataset_path"),
+    )
+    dataset_metadata: Optional[DatasetMetadata] = Field(
+        description="The metadata of the dataset to use for benchmarking.",
+        default=None,
+    )
+    num_requests: int = Field(
+        description="The number of requests to use for benchmarking.",
+        default=0,
+        ge=0,
+    )
+    engine_dir: Optional[Path] = Field(
+        default=None,
+        description="The path to the engine to use for benchmarking.")
+    environment: BenchmarkEnvironment = Field(
+        description="The environment to use for benchmarking.",
+    )
+    modality: Optional[Literal["text", "image", "video"]] = Field(
+        default="text",
+        description="The modality of the model being used."
+    )
+    mode: Literal["build", "benchmark"] = Field(
+        default="benchmark",
+        description="The path tuning is being accessed from.")
+    llm_config: LlmRuntimeSpecification = Field(description="The LLM runtime options to use for benchmarking.")
+    batching_config: BatchingConfiguration = Field(
+        description="The batching options to use for benchmarking.",
+        default_factory=BatchingConfiguration,
+    )
+    world: WorldConfig = Field(description="The world to use for benchmarking.")
+
+    class Config:
+        validate_assignment = True
+
+    @model_validator(mode="after")
+    def validate_engine_dir(self) -> Self:
+        if self.engine_dir is None and self.llm_config.backend == "trt" and self.mode == "benchmark":
+            raise RuntimeError(
+                "Specifying an engine directory ('engine_dir')is required for running the TRT workflow."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_heuristic_constraints(self) -> Self:
+        if self.constraints is None:
+            return self
+
+        if self.mode == "build":
+            build_options = [
+                self.dataset_path, self.constraints.max_input_len, self.constraints.target_input_len
+            ]
+            if all(opt is None for opt in build_options):
+                raise ValueError(
+                    "No engine build option is selected, please provide at least one option."
+                )
+            elif sum([bool(opt) for opt in build_options]) > 1:
+                raise ValueError(
+                    "Multiple engine build options detected, please choose only one engine build option."
+                )
+
+            if not self.dataset_path and self.constraints.max_input_len:
+                raise ValueError("Unspecified max_input_len for engine build.")
+
+        return self
+
+    @property
+    def checkpoint(self) -> str:
+        return str(self.environment.checkpoint_path or self.environment.model)
+
+    @model_validator(mode="after")
+    def validate_max_seq_len(self) -> Self:
+        if self.batching_config.max_seq_len is None and self.modality != "text":
+            self.batching_config.max_seq_len = 4096
+        return self
+
+    def _format_number(self, value: float) -> str:
+        """Format number to fit within 9 characters including decimal."""
+        if value >= 100000:
+            return f"{value:9.2e}".ljust(
+                9
+            )  # Scientific notation for large numbers, padded to 9 characters
+        return f"{value:9.4f}".ljust(
+            9)  # Fixed point for smaller numbers, padded to 9 characters
+
+    def get_dataset_summary(self) -> str:
+        if self.dataset_metadata is None:
+            raise ValueError("Dataset metadata is not set.")
+
+        form = self._format_number
+        isl_stats: PercentileStats = self.dataset_metadata.isl_stats
+        osl_stats: PercentileStats = self.dataset_metadata.osl_stats
+        seq_len_stats: PercentileStats = self.dataset_metadata.seq_len_stats
+
+        return (
+            "\n===========================================================\n"
+            "= DATASET DETAILS\n"
+            "===========================================================\n"
+            f"Dataset Path:         {self.dataset_path}\n"
+            f"Number of Sequences:  {self.dataset_metadata.num_requests}\n"
+            "\n-- Percentiles statistics ---------------------------------\n\n"
+            "        Input              Output           Seq. Length\n"
+            "-----------------------------------------------------------\n"
+            f"MIN:  {form(isl_stats.minimum)}          {form(osl_stats.minimum)}          {form(seq_len_stats.minimum)}\n"
+            f"MAX:  {form(isl_stats.maximum)}          {form(osl_stats.maximum)}          {form(seq_len_stats.maximum)}\n"
+            f"AVG:  {form(isl_stats.average)}          {form(osl_stats.average)}          {form(seq_len_stats.average)}\n"
+            f"P50:  {form(isl_stats.p50)}          {form(osl_stats.p50)}          {form(seq_len_stats.p50)}\n"
+            f"P90:  {form(isl_stats.p90)}          {form(osl_stats.p90)}          {form(seq_len_stats.p90)}\n"
+            f"P95:  {form(isl_stats.p95)}          {form(osl_stats.p95)}          {form(seq_len_stats.p95)}\n"
+            f"P99:  {form(isl_stats.p99)}          {form(osl_stats.p99)}          {form(seq_len_stats.p99)}\n"
+            "===========================================================\n")
