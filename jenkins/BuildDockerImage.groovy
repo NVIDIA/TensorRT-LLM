@@ -25,6 +25,8 @@ LLM_SHORT_COMMIT = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefi
 
 LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUILD_NUMBER}"
 
+TRIGGER_TYPE = env.triggerType ?: "manual"
+
 BUILD_JOBS = "32"
 BUILD_JOBS_RELEASE_X86_64 = "32"
 BUILD_JOBS_RELEASE_SBSA = "32"
@@ -183,6 +185,27 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 }
 
 
+def prepareWheelFromBuildStage(dockerfileStage, arch) {
+    if (TRIGGER_TYPE == "manual") {
+        echo "Trigger type is manual, skip preparing wheel from build stage"
+        return ""
+    }
+
+    if (!dockerfileStage || !arch) {
+        echo "Error: dockerfileStage and arch are required parameters"
+        return ""
+    }
+
+    if (dockerfileStage != "release") {
+        echo "prepareWheelFromBuildStage: ${dockerfileStage} is not release"
+        return ""
+    }
+
+    def wheelScript = 'scripts/get_wheel_from_package.py'
+    def wheelArgs = "--arch ${arch} --upload_path " + env.uploadPath
+    return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
+}
+
 def buildImage(config, imageKeyToTag)
 {
     def target = config.target
@@ -204,7 +227,7 @@ def buildImage(config, imageKeyToTag)
     def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
 
     if (target == "ngc-release") {
-        if (params.triggerType == "post-merge") {
+        if (TRIGGER_TYPE == "post-merge") {
             echo "Use NGC artifacts for post merge build"
             dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
             imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
@@ -269,6 +292,7 @@ def buildImage(config, imageKeyToTag)
             }
         }
 
+        args += prepareWheelFromBuildStage(dockerfileStage, arch)
         // Avoid the frequency of OOM issue when building the wheel
         if (target == "trtllm") {
             if (arch == "x86_64") {
@@ -412,8 +436,8 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        echo "Build ${key} failed."
                         catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            echo "Build ${key} failed."
                             throw e
                         }
                     }
