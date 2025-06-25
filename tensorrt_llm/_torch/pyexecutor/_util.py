@@ -26,7 +26,8 @@ from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
-from .sampler import EarlyStopSampler, TorchSampler, TRTLLMSampler
+from .sampler import (EarlyStopSampler, TorchSampler, TorchStarAttentionSampler,
+                      TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
@@ -511,7 +512,6 @@ def create_py_executor_instance(
         model_engine=model_engine,
         sampler=sampler,
         dist=dist,
-        max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=pytorch_backend_config.
         disable_overlap_scheduler,
         max_batch_size=executor_config.max_batch_size,
@@ -523,44 +523,31 @@ def create_py_executor_instance(
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
 
 
-def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
-                              *, max_seq_len: int, mixed_sampler: bool):
-    max_num_sequences = executor_config.max_batch_size * mapping.pp_size
-    max_draft_tokens = (0 if executor_config.speculative_config is None else
-                        executor_config.speculative_config.max_draft_tokens)
-    return TorchSampler.Args(
-        max_seq_len=max_seq_len,
-        max_draft_tokens=max_draft_tokens,
-        max_num_sequences=max_num_sequences,
-        max_beam_width=executor_config.max_beam_width,
-        mixed_sampler=mixed_sampler,
-    )
-
-
-def instantiate_sampler(engine: PyTorchModelEngine,
+def instantiate_sampler(model_engine: PyTorchModelEngine,
                         executor_config: ExecutorConfig,
                         pytorch_backend_config: PyTorchConfig,
                         mapping: Mapping):
-    sampler_args = create_torch_sampler_args(
-        executor_config,
-        mapping,
-        max_seq_len=engine.max_seq_len,
-        mixed_sampler=pytorch_backend_config.mixed_sampler)
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
-        return TorchSampler(sampler_args)
-    if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
+        sampler = TorchStarAttentionSampler(
+            max_seq_len=model_engine.max_seq_len)
+    elif model_engine.spec_config is not None and model_engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
-        return get_spec_decoder(sampler_args, engine.spec_config)
-    if pytorch_backend_config.enable_trtllm_sampler:
+        sampler = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
+                                   spec_config=model_engine.spec_config)
+    elif pytorch_backend_config.enable_trtllm_sampler:
         decoding_mode = get_decoding_mode(executor_config)
-        return TRTLLMSampler(executor_config, engine.model, engine.dtype,
-                             mapping, decoding_mode,
-                             pytorch_backend_config.disable_overlap_scheduler)
-    if not engine.model.model_config.is_generation:
+        sampler = TRTLLMSampler(
+            executor_config, model_engine.model, model_engine.dtype, mapping,
+            decoding_mode, pytorch_backend_config.disable_overlap_scheduler)
+    elif not model_engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
-        return EarlyStopSampler()
-    return TorchSampler(sampler_args)
+        sampler = EarlyStopSampler()
+    else:
+        sampler = TorchSampler(
+            max_seq_len=model_engine.max_seq_len,
+            mixed_sampler=pytorch_backend_config.mixed_sampler)
+    return sampler
 
 
 def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:

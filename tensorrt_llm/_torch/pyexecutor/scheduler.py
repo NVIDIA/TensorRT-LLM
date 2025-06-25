@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections import namedtuple
+from itertools import chain
 from typing import Optional
 
 from tensorrt_llm.bindings import executor as tb_executor
@@ -35,8 +36,9 @@ class ScheduledRequests:
     def batch_size(self) -> int:
         return len(self.context_requests) + len(self.generation_requests)
 
-    def all_requests(self) -> list[LlmRequest]:
-        return self.context_requests + self.generation_requests
+    @property
+    def all_requests(self) -> chain[LlmRequest]:
+        return chain(self.context_requests, self.generation_requests)
 
 
 class RequestScheduler(ABC):
