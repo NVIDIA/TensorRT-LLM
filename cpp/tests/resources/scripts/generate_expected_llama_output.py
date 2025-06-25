@@ -34,12 +34,14 @@ def generate_output(engine: str,
                     tp_size: int = 1,
                     pp_size: int = 1,
                     cp_size: int = 1,
-                    max_output_len: int = 8):
+                    max_output_len: int = 8,
+                    output_logits: bool = False,
+                    output_cum_log_probs: bool = False,
+                    output_log_probs: bool = False):
 
     model = 'Llama-3.2-1B'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    hf_dir = models_dir / model
     tp_pp_cp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-cp' + str(
         cp_size) + '-gpu/'
     engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_cp_dir
@@ -54,16 +56,34 @@ def generate_output(engine: str,
 
     base_output_name = os.path.splitext(model_spec_obj.get_results_file())[0]
 
-    args = run.parse_arguments([
-        '--engine_dir',
-        str(engine_dir), '--input_file',
-        str(input_file), '--tokenizer_dir',
-        str(hf_dir), '--output_npy',
-        str(output_dir / (base_output_name + '.npy')), '--output_csv',
-        str(output_dir / (base_output_name + '.csv')), '--max_output_len',
-        str(max_output_len), '--num_beams',
-        str(num_beams), '--use_py_session'
-    ])
+    args_list = [
+        f'--engine_dir={engine_dir}',
+        f'--input_file={input_file}',
+        f'--tokenizer_dir={models_dir / model}',
+        f'--output_npy={output_dir / (base_output_name + ".npy")}',
+        f'--output_csv={output_dir / (base_output_name + ".csv")}',
+        f'--max_output_len={max_output_len}',
+        f'--num_beams={num_beams}',
+        '--use_py_session',
+    ]
+
+    if output_logits:
+        args_list.extend([
+            f'--output_logits_npy={output_dir / (base_output_name + "_logits.npy")}',
+            '--output_generation_logits',
+        ])
+
+    if output_cum_log_probs:
+        args_list.extend([
+            f'--output_cum_log_probs_npy={output_dir / model_spec_obj.get_cum_log_probs_file()}'
+        ])
+
+    if output_log_probs:
+        args_list.extend([
+            f'--output_log_probs_npy={output_dir / model_spec_obj.get_log_probs_file()}'
+        ])
+
+    args = run.parse_arguments(args_list)
     run.main(args)
 
 
