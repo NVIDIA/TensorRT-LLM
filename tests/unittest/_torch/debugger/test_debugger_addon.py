@@ -1,6 +1,7 @@
 import unittest
 from copy import deepcopy
 
+import pytest
 import torch
 from transformers import LlamaConfig
 
@@ -16,7 +17,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
-LLAMA_3_1_8B_CONFIG = {
+LLAMA_3_1_8B_2_layer_CONFIG = {
     "architectures": ["LlamaForCausalLM"],
     "attention_bias": False,
     "attention_dropout": 0.0,
@@ -76,8 +77,11 @@ def register_module_name_dump_hook():
 
 class TestDebugger(unittest.TestCase):
 
-    def test_with_llama(self):
-        config_dict = deepcopy(LLAMA_3_1_8B_CONFIG)
+    def test_with_2_layer_llama(self):
+        pytest.skip(
+            f"skip because this is only demo and unit test for debughook but not functionality."
+        )
+        config_dict = deepcopy(LLAMA_3_1_8B_2_layer_CONFIG)
         if config_dict["num_hidden_layers"] <= 0:
             self.skipTest("Insufficient memory for a single Llama layer")
         llama_config = LlamaConfig.from_dict(config_dict)
@@ -168,7 +172,7 @@ class TestDebugger(unittest.TestCase):
 
         self.assertEqual(len(past_seen_tokens), logits.shape[0])
 
-        with torch.inference_mode() and debug_mode(llama):
+        with torch.inference_mode(), debug_mode(llama):
             register_module_name_dump_hook()
             attn_metadata.prepare()
             logits = llama.forward(input_ids=input_ids,

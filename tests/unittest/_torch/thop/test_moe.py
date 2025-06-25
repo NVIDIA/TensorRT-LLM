@@ -579,8 +579,6 @@ def quant_dequant_per_tensor_fp8(a):
                          ids=["autotune", "no_autotune"])
 def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
                  use_autotune):
-    if use_autotune:
-        pytest.skip("https://nvbugs/5356427")
     torch.random.manual_seed(0)
 
     #
