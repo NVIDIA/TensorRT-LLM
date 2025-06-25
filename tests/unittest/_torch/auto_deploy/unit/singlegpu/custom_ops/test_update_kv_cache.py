@@ -39,6 +39,3 @@ def test_update_kv_cache():
 
     print("k_cache: " + str(k_cache))
     print("v_cache: " + str(v_cache))
-
-
-test_update_kv_cache()
