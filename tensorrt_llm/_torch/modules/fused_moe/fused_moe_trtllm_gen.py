@@ -218,7 +218,7 @@ class TRTLLMGenFusedMoE(MoE):
                 self.fc2_alpha.data,
                 self.num_slots,
                 top_k,
-                0,
+                self.num_fused_shared_expert,
                 n_group,
                 topk_group,
                 self.intermediate_size_per_partition,

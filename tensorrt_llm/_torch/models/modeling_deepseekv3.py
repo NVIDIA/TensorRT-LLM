@@ -495,7 +495,7 @@ class Deepseekv3MoE(nn.Module):
             shared_tp_size = 1
         elif hasattr(self.experts, 'num_fused_shared_expert'
                      ) and self.experts.num_fused_shared_expert > 0:
-            shared_tp_size = self.mapping.tp_size
+            shared_tp_size = self.mapping.moe_tp_size
         else:
             # Due to the restriction of block scale size (i.e., 128), the supported TP sizes only include 1, 2, 4, 8, and 16.
             # The math.gcd operation ensures that shared_tp_size falls in the supported TP sizes.
