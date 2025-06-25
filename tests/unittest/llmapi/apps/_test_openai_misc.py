@@ -15,7 +15,7 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
+@pytest.fixture(scope="module", params=["trt", 'pytorch'])
 def backend(request):
     return request.param
 
@@ -35,7 +35,7 @@ def server(model_name: str, backend: str, max_batch_size: str,
            max_seq_len: str):
     model_path = get_model_path(model_name)
     args = []
-    if backend is not None:
+    if backend == "pytorch":
         args.append("--backend")
         args.append(backend)
     if backend != "pytorch":
