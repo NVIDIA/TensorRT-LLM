@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc2" />
+  <meta name="docsearch:version" content="1.0.0rc0" />
 
 
   </head>
@@ -805,6 +805,7 @@
             <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionClient connecting to </span><span class="si">{</span><span class="n">addr</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="n">ZeroMqQueue</span><span class="p">((</span><span class="n">addr</span><span class="p">,</span> <span class="n">hmac_key</span><span class="p">),</span>
                                  <span class="n">is_server</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                 <span class="n">socket_type</span><span class="o">=</span><span class="n">zmq</span><span class="o">.</span><span class="n">PAIR</span><span class="p">,</span>
                                  <span class="n">use_hmac_encryption</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">hmac_key</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_is_shutdown</span> <span class="o">=</span> <span class="kc">False</span>
 
@@ -860,23 +861,10 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">wait</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_shutdown</span><span class="p">:</span>
-            <span class="k">return</span>
-
-        <span class="k">try</span><span class="p">:</span>
-            <span class="n">print_colored_debug</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionClient [rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2">] send shutdown signal to server</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
-                <span class="s2">&quot;green&quot;</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>  <span class="c1"># ask RemoteMpiCommSessionServer to shutdown</span>
-        <span class="k">except</span> <span class="n">zmq</span><span class="o">.</span><span class="n">error</span><span class="o">.</span><span class="n">ZMQError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
-            <span class="n">print_colored_debug</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;Error during RemoteMpiCommSessionClient shutdown: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
-                <span class="s2">&quot;red&quot;</span><span class="p">)</span>
-        <span class="k">finally</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_is_shutdown</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">pass</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">shutdown_abort</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">grace</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mi">60</span><span class="p">,</span> <span class="n">reason</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+        <span class="k">pass</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">RemoteMpiCommSessionServer</span><span class="p">():</span>
@@ -895,6 +883,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">addr</span> <span class="o">=</span> <span class="n">addr</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">queue</span> <span class="o">=</span> <span class="n">ZeroMqQueue</span><span class="p">((</span><span class="n">addr</span><span class="p">,</span> <span class="n">hmac_key</span><span class="p">),</span>
                                  <span class="n">is_server</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                                 <span class="n">socket_type</span><span class="o">=</span><span class="n">zmq</span><span class="o">.</span><span class="n">PAIR</span><span class="p">,</span>
                                  <span class="n">use_hmac_encryption</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">hmac_key</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">comm</span> <span class="o">=</span> <span class="n">comm</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">results</span> <span class="o">=</span> <span class="p">[]</span>  <span class="c1"># the results may arrive in any order</span>
@@ -976,7 +965,15 @@
             <span class="n">print_colored_debug</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer received all results, sending to client</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
                 <span class="s2">&quot;green&quot;</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="p">)</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put_noblock</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="p">)</span>
+            <span class="k">except</span> <span class="n">zmq</span><span class="o">.</span><span class="n">ZMQError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                <span class="c1"># The client could be shutdown first.</span>
+                <span class="k">if</span> <span class="n">e</span><span class="o">.</span><span class="n">errno</span> <span class="o">==</span> <span class="n">zmq</span><span class="o">.</span><span class="n">EAGAIN</span><span class="p">:</span>
+                    <span class="k">pass</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="n">e</span>
+
             <span class="n">print_colored_debug</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer sent results to client</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;green&quot;</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
@@ -1152,9 +1149,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 16, 2025.</p>
+  <p>Last updated on June 21, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
   
 </div></div>
       

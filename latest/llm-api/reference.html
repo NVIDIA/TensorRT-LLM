@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc2" />
+  <meta name="docsearch:version" content="1.0.0rc0" />
 
 
   </head>
@@ -531,8 +531,9 @@
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm.html#LLM"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LLM" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">_TorchLLM</span></code></p>
 <p>LLM class is the main class for running a LLM model.</p>
+<p>This class is an alias of TorchLLM.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -553,7 +554,7 @@
 <li><p><strong>moe_expert_parallel_size</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The expert parallel size for MoE models’s expert weights. Defaults to None.</p></li>
 <li><p><strong>enable_attention_dp</strong> (<em>bool</em>) – Enable attention data parallel. Defaults to False.</p></li>
 <li><p><strong>cp_config</strong> (<em>Optional</em><em>[</em><em>dict</em><em>]</em>) – Context parallel config. Defaults to None.</p></li>
-<li><p><strong>load_format</strong> (<em>Literal</em><em>[</em><em>'auto'</em><em>, </em><em>'dummy'</em><em>]</em>) – The format to load the model. Defaults to auto.</p></li>
+<li><p><strong>load_format</strong> (<em>Union</em><em>[</em><em>str</em><em>, </em><em>tensorrt_llm.llmapi.llm_args.LoadFormat</em><em>]</em>) – How to load the model weights. By default, detect the weight type from the model checkpoint. Defaults to 0.</p></li>
 <li><p><strong>enable_lora</strong> (<em>bool</em>) – Enable LoRA. Defaults to False.</p></li>
 <li><p><strong>lora_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.lora_manager.LoraConfig</em><em>]</em>) – LoRA configuration for the model. Defaults to None.</p></li>
 <li><p><strong>enable_prompt_adapter</strong> (<em>bool</em>) – Enable prompt adapter. Defaults to False.</p></li>
@@ -568,7 +569,7 @@
 <li><p><strong>peft_cache_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.llmapi.llm_args.PeftCacheConfig</em><em>]</em>) – PEFT cache config. Defaults to None.</p></li>
 <li><p><strong>scheduler_config</strong> (<a class="reference internal" href="#tensorrt_llm.llmapi.SchedulerConfig" title="tensorrt_llm.llmapi.llm_args.SchedulerConfig"><em>tensorrt_llm.llmapi.llm_args.SchedulerConfig</em></a>) – Scheduler config. Defaults to None.</p></li>
 <li><p><strong>cache_transceiver_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.CacheTransceiverConfig" title="tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig"><em>tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig</em></a><em>]</em>) – Cache transceiver config. Defaults to None.</p></li>
-<li><p><strong>speculative_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig" title="tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.MedusaDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.EagleDecodingConfig" title="tensorrt_llm.llmapi.llm_args.EagleDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.MTPDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MTPDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.NGramDecodingConfig" title="tensorrt_llm.llmapi.llm_args.NGramDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – Speculative decoding config. Defaults to None.</p></li>
+<li><p><strong>speculative_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig" title="tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.MedusaDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.EagleDecodingConfig" title="tensorrt_llm.llmapi.llm_args.EagleDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.MTPDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MTPDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.NGramDecodingConfig" title="tensorrt_llm.llmapi.llm_args.NGramDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</em></a><em>, </em><a class="reference internal" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig" title="tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – Speculative decoding config. Defaults to None.</p></li>
 <li><p><strong>batching_type</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BatchingType" title="tensorrt_llm.llmapi.llm_args.BatchingType"><em>tensorrt_llm.llmapi.llm_args.BatchingType</em></a><em>]</em>) – Batching type. Defaults to None.</p></li>
 <li><p><strong>normalize_log_probs</strong> (<em>bool</em>) – Normalize log probabilities. Defaults to False.</p></li>
 <li><p><strong>max_batch_size</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The maximum batch size. Defaults to None.</p></li>
@@ -580,16 +581,29 @@
 <li><p><strong>num_postprocess_workers</strong> (<em>int</em>) – The number of processes used for postprocessing the generated tokens, including detokenization. Defaults to 0.</p></li>
 <li><p><strong>postprocess_tokenizer_dir</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The path to the tokenizer directory for postprocessing. Defaults to None.</p></li>
 <li><p><strong>reasoning_parser</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The parser to separate reasoning content from output. Defaults to None.</p></li>
+<li><p><strong>garbage_collection_gen0_threshold</strong> (<em>int</em>) – Threshold for Python garbage collection of generation 0 objects.Lower values trigger more frequent garbage collection. Defaults to 20000.</p></li>
 <li><p><strong>backend</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The backend to use for this LLM instance. Defaults to None.</p></li>
-<li><p><strong>enable_tqdm</strong> (<em>bool</em>) – Enable tqdm for progress bar. Defaults to False.</p></li>
-<li><p><strong>workspace</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The workspace for the model. Defaults to None.</p></li>
-<li><p><strong>enable_build_cache</strong> (<em>Union</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BuildCacheConfig" title="tensorrt_llm.llmapi.build_cache.BuildCacheConfig"><em>tensorrt_llm.llmapi.build_cache.BuildCacheConfig</em></a><em>, </em><em>bool</em><em>]</em>) – Enable build cache. Defaults to False.</p></li>
-<li><p><strong>extended_runtime_perf_knob_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig" title="tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig"><em>tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig</em></a><em>]</em>) – Extended runtime perf knob config. Defaults to None.</p></li>
-<li><p><strong>calib_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.CalibConfig" title="tensorrt_llm.llmapi.llm_args.CalibConfig"><em>tensorrt_llm.llmapi.llm_args.CalibConfig</em></a><em>]</em>) – Calibration config. Defaults to None.</p></li>
-<li><p><strong>embedding_parallel_mode</strong> (<em>str</em>) – The embedding parallel mode. Defaults to SHARDING_ALONG_VOCAB.</p></li>
-<li><p><strong>fast_build</strong> (<em>bool</em>) – Enable fast build. Defaults to False.</p></li>
 <li><p><strong>build_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.BuildConfig" title="tensorrt_llm.builder.BuildConfig"><em>tensorrt_llm.builder.BuildConfig</em></a><em>]</em>) – Build config. Defaults to None.</p></li>
-<li><p><strong>kwargs</strong> (<em>Any</em>) – Advanced arguments passed to <cite>LlmArgs</cite>.</p></li>
+<li><p><strong>use_cuda_graph</strong> (<em>bool</em>) – If true, use CUDA graphs for decoding. CUDA graphs are only created for the batch sizes in cuda_graph_batch_sizes, and are enabled for batches that consist of decoding requests <em>only</em> (the reason is that it’s hard to capture a single graph with prefill requests since the input shapes are a function of the sequence lengths). Note that each CUDA graph can use up to 200 MB of extra memory. Defaults to False.</p></li>
+<li><p><strong>cuda_graph_batch_sizes</strong> (<em>Optional</em><em>[</em><em>List</em><em>[</em><em>int</em><em>]</em><em>]</em>) – List of batch sizes to create CUDA graphs for. Defaults to None.</p></li>
+<li><p><strong>cuda_graph_max_batch_size</strong> (<em>int</em>) – Maximum batch size for CUDA graphs. Defaults to 0.</p></li>
+<li><p><strong>cuda_graph_padding_enabled</strong> (<em>bool</em>) – If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance. Defaults to False.</p></li>
+<li><p><strong>disable_overlap_scheduler</strong> (<em>bool</em>) – Disable the overlap scheduler. Defaults to False.</p></li>
+<li><p><strong>moe_max_num_tokens</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – If set, at most moe_max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds moe_max_num_tokens, the input tensors will be split into chunks and a for loop will be used. Defaults to None.</p></li>
+<li><p><strong>moe_load_balancer</strong> (<em>Union</em><em>[</em><em>tensorrt_llm._torch.model_config.MoeLoadBalancerConfig</em><em>, </em><em>str</em><em>, </em><em>None</em><em>]</em>) – Configuration for MoE load balancing. Defaults to None.</p></li>
+<li><p><strong>attn_backend</strong> (<em>str</em>) – Attention backend to use. Defaults to TRTLLM.</p></li>
+<li><p><strong>moe_backend</strong> (<em>str</em>) – MoE backend to use. Defaults to CUTLASS.</p></li>
+<li><p><strong>mixed_sampler</strong> (<em>bool</em>) – If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc. Defaults to False.</p></li>
+<li><p><strong>enable_trtllm_sampler</strong> (<em>bool</em>) – If true, will use the TRTLLM sampler instead of the PyTorch sampler. The TRTLLM sampler has a wide coverage of sampling strategies. Defaults to False.</p></li>
+<li><p><strong>kv_cache_dtype</strong> (<em>str</em>) – Data type for KV cache. Defaults to auto.</p></li>
+<li><p><strong>enable_iter_perf_stats</strong> (<em>bool</em>) – Enable iteration performance statistics. Defaults to False.</p></li>
+<li><p><strong>enable_iter_req_stats</strong> (<em>bool</em>) – If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats. Defaults to False.</p></li>
+<li><p><strong>print_iter_log</strong> (<em>bool</em>) – Print iteration logs. Defaults to False.</p></li>
+<li><p><strong>torch_compile_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="#tensorrt_llm.llmapi.TorchCompileConfig" title="tensorrt_llm.llmapi.llm_args.TorchCompileConfig"><em>tensorrt_llm.llmapi.llm_args.TorchCompileConfig</em></a><em>]</em>) – Torch compile config. Defaults to None.</p></li>
+<li><p><strong>autotuner_enabled</strong> (<em>bool</em>) – Enable autotuner only when torch compile is enabled. Defaults to True.</p></li>
+<li><p><strong>enable_layerwise_nvtx_marker</strong> (<em>bool</em>) – If true, enable layerwise nvtx marker. Defaults to False.</p></li>
+<li><p><strong>enable_min_latency</strong> (<em>bool</em>) – If true, enable min-latency mode. Currently only used for Llama4. Defaults to False.</p></li>
+<li><p><strong>stream_interval</strong> (<em>int</em>) – The iteration interval to create responses under the streaming mode. Set this to a larger value when the batch size is large, which helps reduce the streaming overhead. Defaults to 1.</p></li>
 </ul>
 </dd>
 </dl>
@@ -600,17 +614,6 @@
 <dl class="field-list simple">
 <dt class="field-odd">Type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py attribute">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.workspace">
-<span class="sig-name descname"><span class="pre">workspace</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.workspace" title="Link to this definition">#</a></dt>
-<dd><p>The directory to store intermediate files.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>pathlib.Path</p>
 </dd>
 </dl>
 </dd></dl>
@@ -627,26 +630,6 @@
 </dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.__init__">
-<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span>
-
-<dl>
-<dd><em class="sig-param"><span class="n"><span class="pre">model</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Path</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Path</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TokenizerBase</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">PreTrainedTokenizerBase</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer_mode</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'auto'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'slow'</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'auto'</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">skip_tokenizer_init</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">trust_remote_code</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">tensor_parallel_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'auto'</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">revision</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer_revision</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Any</span></span></em>,</dd>
-</dl>
-
-<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm.html#LLM.__init__"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.__init__" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py method">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.generate">
 <span class="sig-name descname"><span class="pre">generate</span></span><span class="sig-paren">(</span>
 
@@ -660,7 +643,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">disaggregated_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><span class="pre">DisaggregatedParams</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><span class="pre">DisaggregatedParams</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput"><span class="pre">RequestOutput</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput"><span class="pre">RequestOutput</span></a><span class="p"><span class="pre">]</span></span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm.html#LLM.generate"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.generate" title="Link to this definition">#</a></dt>
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput"><span class="pre">RequestOutput</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput"><span class="pre">RequestOutput</span></a><span class="p"><span class="pre">]</span></span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.generate" title="Link to this definition">#</a></dt>
 <dd><p>Generate output for the given prompts in the synchronous mode.
 Synchronous generation accepts either single prompt or batched prompts.</p>
 <dl class="field-list simple">
@@ -701,7 +684,7 @@ A default one will be used if not provided.</p></li>
 <dd><em class="sig-param"><span class="n"><span class="pre">_postproc_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">PostprocParams</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput"><span class="pre">RequestOutput</span></a></span></span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm.html#LLM.generate_async"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.generate_async" title="Link to this definition">#</a></dt>
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput"><span class="pre">RequestOutput</span></a></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.generate_async" title="Link to this definition">#</a></dt>
 <dd><p>Generate output for the given prompt in the asynchronous mode.
 Asynchronous generation accepts single prompt only.</p>
 <dl class="field-list simple">
@@ -734,7 +717,7 @@ A default one will be used if not provided.</p></li>
 <dd><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">dict</span><span class="p"><span class="pre">]</span></span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm.html#LLM.get_kv_cache_events"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_events" title="Link to this definition">#</a></dt>
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">dict</span><span class="p"><span class="pre">]</span></span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_events" title="Link to this definition">#</a></dt>
 <dd><p>Get iteration KV events from the runtime.</p>
 <dl class="simple">
 <dt>KV events are used to track changes and operations within the KV Cache. Types of events:</dt><dd><ul class="simple">
@@ -771,7 +754,7 @@ A default one will be used if not provided.</p></li>
 <dd><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">IterationResult</span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm.html#LLM.get_kv_cache_events_async"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_events_async" title="Link to this definition">#</a></dt>
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">IterationResult</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_events_async" title="Link to this definition">#</a></dt>
 <dd><p>Get iteration KV events from the runtime.</p>
 <dl class="simple">
 <dt>KV events are used to track changes and operations within the KV Cache. Types of events:</dt><dd><ul class="simple">
@@ -802,7 +785,7 @@ A default one will be used if not provided.</p></li>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.get_stats">
-<span class="sig-name descname"><span class="pre">get_stats</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">dict</span><span class="p"><span class="pre">]</span></span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm.html#LLM.get_stats"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_stats" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">get_stats</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">dict</span><span class="p"><span class="pre">]</span></span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_stats" title="Link to this definition">#</a></dt>
 <dd><p>Get iteration statistics from the runtime.
 To collect statistics, call this function after prompts have been submitted with LLM().generate().</p>
 <dl class="field-list simple">
@@ -830,7 +813,7 @@ To collect statistics, call this function after prompts have been submitted with
 <dd><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">IterationResult</span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm.html#LLM.get_stats_async"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_stats_async" title="Link to this definition">#</a></dt>
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">IterationResult</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_stats_async" title="Link to this definition">#</a></dt>
 <dd><p>Get iteration statistics from the runtime.
 To collect statistics, you can call this function in an async coroutine or the /metrics endpoint (if you’re using trtllm-serve)
 after prompts have been submitted.</p>
@@ -853,29 +836,13 @@ after prompts have been submitted.</p>
 <dd></dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.save">
-<span class="sig-name descname"><span class="pre">save</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">engine_dir</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm.html#LLM.save"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.save" title="Link to this definition">#</a></dt>
-<dd><p>Save the built engine to the given path.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>engine_dir</strong> (<em>str</em>) – The path to save the engine.</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.shutdown">
-<span class="sig-name descname"><span class="pre">shutdown</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm.html#LLM.shutdown"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.shutdown" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">shutdown</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.shutdown" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py property">
 <dt class="sig sig-object py" id="id1">
 <em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">tokenizer</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">TokenizerBase</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#id1" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py" id="id2">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">workspace</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Path</span></em><a class="headerlink" href="#id2" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1018,8 +985,8 @@ after prompts have been submitted.</p>
 <dd></dd></dl>
 
 <dl class="py property">
-<dt class="sig sig-object py" id="id3">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">length</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#id3" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id2">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">length</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#id2" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1028,8 +995,8 @@ after prompts have been submitted.</p>
 <dd></dd></dl>
 
 <dl class="py property">
-<dt class="sig sig-object py" id="id4">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">logprobs_diff</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="p"><span class="pre">]</span></span></em><a class="headerlink" href="#id4" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id3">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">logprobs_diff</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="p"><span class="pre">]</span></span></em><a class="headerlink" href="#id3" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1048,8 +1015,8 @@ after prompts have been submitted.</p>
 <dd></dd></dl>
 
 <dl class="py property">
-<dt class="sig sig-object py" id="id5">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">text_diff</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><a class="headerlink" href="#id5" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id4">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">text_diff</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><a class="headerlink" href="#id4" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1058,8 +1025,8 @@ after prompts have been submitted.</p>
 <dd></dd></dl>
 
 <dl class="py property">
-<dt class="sig sig-object py" id="id6">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">token_ids_diff</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span></em><a class="headerlink" href="#id6" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id5">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">token_ids_diff</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span></em><a class="headerlink" href="#id5" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1141,8 +1108,8 @@ after prompts have been submitted.</p>
 <dd></dd></dl>
 
 <dl class="py property">
-<dt class="sig sig-object py" id="id7">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">prompt</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#id7" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id6">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">prompt</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#id6" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -2003,7 +1970,7 @@ validated to form a valid model.</p>
 
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values">
-<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_positive_values</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">max_window_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_ngram_size</span></em><em class="property"><span class="pre">,</span> </em><em class="xref py py-obj"><span class="pre">max_verification_set_size</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#LookaheadDecodingConfig.validate_positive_values"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LookaheadDecodingConfig.validate_positive_values" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -2065,7 +2032,7 @@ validated to form a valid model.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">dynamic_tree_max_topK</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">num_eagle_layers</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_non_leaves_per_layer</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">pytorch_eagle_weights_path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">pytorch_weights_path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eagle3_one_model</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
 </dl>
 
@@ -2123,8 +2090,8 @@ validated to form a valid model.</p>
 <dd></dd></dl>
 
 <dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.EagleDecodingConfig.pytorch_eagle_weights_path">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">pytorch_eagle_weights_path</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.EagleDecodingConfig.pytorch_eagle_weights_path" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.EagleDecodingConfig.pytorch_weights_path">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">pytorch_weights_path</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.EagleDecodingConfig.pytorch_weights_path" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -2146,6 +2113,7 @@ validated to form a valid model.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_relaxed_acceptance_for_thinking</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">relaxed_topk</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">relaxed_delta</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0.0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_mtp_vanilla</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#MTPDecodingConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.MTPDecodingConfig" title="Link to this definition">#</a></dt>
@@ -2179,6 +2147,11 @@ validated to form a valid model.</p>
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.MTPDecodingConfig.relaxed_topk">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">relaxed_topk</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.MTPDecodingConfig.relaxed_topk" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.MTPDecodingConfig.use_mtp_vanilla">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">use_mtp_vanilla</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.MTPDecodingConfig.use_mtp_vanilla" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -2987,18 +2960,18 @@ changed, you should remove the caches manually.</p>
 <dd></dd></dl>
 
 <dl class="py property">
+<dt class="sig sig-object py" id="id7">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cache_root</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Path</span></em><a class="headerlink" href="#id7" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
 <dt class="sig sig-object py" id="id8">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">cache_root</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Path</span></em><a class="headerlink" href="#id8" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">max_cache_storage_gb</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span></em><a class="headerlink" href="#id8" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py property">
 <dt class="sig sig-object py" id="id9">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">max_cache_storage_gb</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span></em><a class="headerlink" href="#id9" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py property">
-<dt class="sig sig-object py" id="id10">
-<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">max_records</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#id10" title="Link to this definition">#</a></dt>
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">max_records</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#id9" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -3321,51 +3294,87 @@ Whether to use a common pool for all requests, or the pool is private for each r
 
 <dl>
 <dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_fullgraph</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_inductor_enabled</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_piecewise_cuda_graph</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">torch_compile_enable_userbuffers</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_fullgraph</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_inductor</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_piecewise_cuda_graph</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">enable_userbuffers</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchCompileConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">BaseModel</span></code></p>
 <p>Configuration for torch.compile.</p>
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.enable_fullgraph">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_fullgraph</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.enable_fullgraph" title="Link to this definition">#</a></dt>
+<dd><p>Enable full graph compilation in torch.compile.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.enable_inductor">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_inductor</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.enable_inductor" title="Link to this definition">#</a></dt>
+<dd><p>Enable inductor backend in torch.compile.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.enable_piecewise_cuda_graph">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_piecewise_cuda_graph</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.enable_piecewise_cuda_graph" title="Link to this definition">#</a></dt>
+<dd><p>Enable piecewise CUDA graph in torch.compile.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.enable_userbuffers">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_userbuffers</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.enable_userbuffers" title="Link to this definition">#</a></dt>
+<dd><p>When torch compile is enabled, userbuffers is enabled by default.</p>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.model_config">
 <span class="sig-name descname"><span class="pre">model_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">ConfigDict</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.model_config" title="Link to this definition">#</a></dt>
 <dd><p>Configuration for the model, should be a dictionary conforming to [<cite>ConfigDict</cite>][pydantic.config.ConfigDict].</p>
 </dd></dl>
 
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_enable_userbuffers">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_enable_userbuffers</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_enable_userbuffers" title="Link to this definition">#</a></dt>
-<dd><p>When torch compile is enabled, userbuffers is enabled by default.</p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.DraftTargetDecodingConfig">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">DraftTargetDecodingConfig</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_draft_len</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">speculative_model</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Path</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">pytorch_weights_path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#DraftTargetDecodingConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">DecodingBaseConfig</span></code></p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.DraftTargetDecodingConfig.decoding_type">
+<span class="sig-name descname"><span class="pre">decoding_type</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'DraftTarget'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.decoding_type" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.DraftTargetDecodingConfig.from_dict">
+<em class="property"><span class="pre">classmethod</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">from_dict</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">data</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#DraftTargetDecodingConfig.from_dict"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.from_dict" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_config">
+<span class="sig-name descname"><span class="pre">model_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ClassVar</span><span class="p"><span class="pre">[</span></span><span class="pre">ConfigDict</span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{}</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_config" title="Link to this definition">#</a></dt>
+<dd><p>Configuration for the model, should be a dictionary conforming to [<cite>ConfigDict</cite>][pydantic.config.ConfigDict].</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_fullgraph">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_fullgraph</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_fullgraph" title="Link to this definition">#</a></dt>
-<dd><p>Enable full graph compilation in torch.compile.</p>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_inductor_enabled">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_inductor_enabled</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_inductor_enabled" title="Link to this definition">#</a></dt>
-<dd><p>Enable inductor backend in torch.compile.</p>
-</dd></dl>
-
-<dl class="py attribute pydantic_field">
-<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_piecewise_cuda_graph">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">torch_compile_piecewise_cuda_graph</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_piecewise_cuda_graph" title="Link to this definition">#</a></dt>
-<dd><p>Enable piecewise CUDA graph in torch.compile.</p>
-</dd></dl>
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.DraftTargetDecodingConfig.pytorch_weights_path">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">pytorch_weights_path</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.pytorch_weights_path" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 </dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LlmArgs">
 <span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">LlmArgs</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LlmArgs" title="Link to this definition">#</a></dt>
-<dd><p>alias of <a class="reference internal" href="#tensorrt_llm.llmapi.TrtLlmArgs" title="tensorrt_llm.llmapi.llm_args.TrtLlmArgs"><code class="xref py py-class docutils literal notranslate"><span class="pre">TrtLlmArgs</span></code></a></p>
+<dd><p>alias of <a class="reference internal" href="#tensorrt_llm.llmapi.TorchLlmArgs" title="tensorrt_llm.llmapi.llm_args.TorchLlmArgs"><code class="xref py py-class docutils literal notranslate"><span class="pre">TorchLlmArgs</span></code></a></p>
 </dd></dl>
 
 <dl class="py class">
@@ -3410,7 +3419,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">peft_cache_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.PeftCacheConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">scheduler_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.SchedulerConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cache_transceiver_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">speculative_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">speculative_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">batching_type:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.BatchingType</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">normalize_log_probs:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_batch_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
@@ -3422,6 +3431,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">num_postprocess_workers:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">postprocess_tokenizer_dir:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">reasoning_parser:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">garbage_collection_gen0_threshold:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">20000</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">_mpi_session:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
@@ -3445,6 +3455,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">autotuner_enabled:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_layerwise_nvtx_marker:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_min_latency:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">stream_interval:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">1</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs" title="Link to this definition">#</a></dt>
@@ -3468,6 +3479,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3492,6 +3504,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3516,6 +3529,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3545,6 +3559,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3570,6 +3585,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3594,6 +3610,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3642,6 +3659,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3666,6 +3684,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3690,6 +3709,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3714,6 +3734,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3738,6 +3759,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3762,6 +3784,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3801,6 +3824,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3826,6 +3850,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3836,20 +3861,20 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <span class="sig-name descname"><span class="pre">max_cpu_loras</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_cpu_loras" title="Link to this definition">#</a></dt>
 <dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id11">
-<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id11" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id10">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id10" title="Link to this definition">#</a></dt>
 <dd><p>The deprecation message to be emitted.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id12">
-<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id12" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id11">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id11" title="Link to this definition">#</a></dt>
 <dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id13">
-<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id13" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id12">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id12" title="Link to this definition">#</a></dt>
 <dd><p>The name of the field being deprecated.</p>
 </dd></dl>
 
@@ -3860,20 +3885,20 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <span class="sig-name descname"><span class="pre">max_lora_rank</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_lora_rank" title="Link to this definition">#</a></dt>
 <dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id14">
-<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id14" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id13">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id13" title="Link to this definition">#</a></dt>
 <dd><p>The deprecation message to be emitted.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id15">
-<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id15" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id14">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id14" title="Link to this definition">#</a></dt>
 <dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id16">
-<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id16" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id15">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id15" title="Link to this definition">#</a></dt>
 <dd><p>The name of the field being deprecated.</p>
 </dd></dl>
 
@@ -3884,20 +3909,20 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <span class="sig-name descname"><span class="pre">max_loras</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_loras" title="Link to this definition">#</a></dt>
 <dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id17">
-<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id17" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id16">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id16" title="Link to this definition">#</a></dt>
 <dd><p>The deprecation message to be emitted.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id18">
-<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id18" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id17">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id17" title="Link to this definition">#</a></dt>
 <dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id19">
-<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id19" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id18">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id18" title="Link to this definition">#</a></dt>
 <dd><p>The name of the field being deprecated.</p>
 </dd></dl>
 
@@ -3922,6 +3947,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3967,6 +3993,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -3991,6 +4018,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -4015,6 +4043,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -4039,6 +4068,32 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.stream_interval">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">stream_interval</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.stream_interval" title="Link to this definition">#</a></dt>
+<dd><p>The iteration interval to create responses under the streaming mode. Set this to a larger value when the batch size is large, which helps reduce the streaming overhead.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Validated by<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">init_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_default_max_input_len</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_runtime_knobs_from_build_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_and_init_tokenizer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_remaining</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_build_config_with_runtime_params</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_lora_config_consistency</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_model_format_misc</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -4063,6 +4118,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -4087,6 +4143,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_parallel_config</span></code></p></li>
 <li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_speculative_config</span></code></p></li>
+<li><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></p></li>
 </ul>
 </dd>
 </dl>
@@ -4111,6 +4168,11 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dl class="py method pydantic_validator">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_moe_load_balancer">
 <em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_moe_load_balancer</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_moe_load_balancer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_moe_load_balancer" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method pydantic_validator">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.TorchLlmArgs.validate_stream_interval">
+<em class="property"><span class="pre">validator</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">validate_stream_interval</span></span><em class="autodoc_pydantic_validator_arrow property">&#160; <span class="pre">»</span>&#160; </em><em class="xref py py-obj"><span class="pre">all</span> <span class="pre">fields</span></em><a class="reference internal" href="../_modules/tensorrt_llm/llmapi/llm_args.html#TorchLlmArgs.validate_stream_interval"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_stream_interval" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -4158,7 +4220,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">peft_cache_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.PeftCacheConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">scheduler_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.SchedulerConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">cache_transceiver_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">speculative_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">speculative_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MedusaDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</span> <span class="pre">|</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">batching_type:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.BatchingType</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">normalize_log_probs:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">max_batch_size:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
@@ -4170,6 +4232,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <dd><em class="sig-param"><span class="n"><span class="pre">num_postprocess_workers:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">postprocess_tokenizer_dir:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">reasoning_parser:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">garbage_collection_gen0_threshold:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">20000</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">decoding_config:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">_mpi_session:</span> <span class="pre">object</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">backend:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
@@ -4221,20 +4284,20 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <span class="sig-name descname"><span class="pre">auto_parallel_world_size</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.auto_parallel_world_size" title="Link to this definition">#</a></dt>
 <dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id20">
-<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id20" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id19">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id19" title="Link to this definition">#</a></dt>
 <dd><p>The deprecation message to be emitted.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id21">
-<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id21" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id20">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id20" title="Link to this definition">#</a></dt>
 <dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id22">
-<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id22" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id21">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id21" title="Link to this definition">#</a></dt>
 <dd><p>The name of the field being deprecated.</p>
 </dd></dl>
 
@@ -4296,20 +4359,20 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <span class="sig-name descname"><span class="pre">decoding_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">object</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.decoding_config" title="Link to this definition">#</a></dt>
 <dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id23">
-<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id23" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id22">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id22" title="Link to this definition">#</a></dt>
 <dd><p>The deprecation message to be emitted.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id24">
-<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id24" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id23">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id23" title="Link to this definition">#</a></dt>
 <dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id25">
-<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id25" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id24">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id24" title="Link to this definition">#</a></dt>
 <dd><p>The name of the field being deprecated.</p>
 </dd></dl>
 
@@ -4450,20 +4513,20 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <span class="sig-name descname"><span class="pre">max_cpu_loras</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_cpu_loras" title="Link to this definition">#</a></dt>
 <dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id26">
-<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id26" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id25">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id25" title="Link to this definition">#</a></dt>
 <dd><p>The deprecation message to be emitted.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id27">
-<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id27" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id26">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id26" title="Link to this definition">#</a></dt>
 <dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id28">
-<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id28" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id27">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id27" title="Link to this definition">#</a></dt>
 <dd><p>The name of the field being deprecated.</p>
 </dd></dl>
 
@@ -4474,20 +4537,20 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <span class="sig-name descname"><span class="pre">max_lora_rank</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_lora_rank" title="Link to this definition">#</a></dt>
 <dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id29">
-<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id29" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id28">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id28" title="Link to this definition">#</a></dt>
 <dd><p>The deprecation message to be emitted.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id30">
-<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id30" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id29">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id29" title="Link to this definition">#</a></dt>
 <dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id31">
-<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id31" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id30">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id30" title="Link to this definition">#</a></dt>
 <dd><p>The name of the field being deprecated.</p>
 </dd></dl>
 
@@ -4498,20 +4561,20 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <span class="sig-name descname"><span class="pre">max_loras</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_loras" title="Link to this definition">#</a></dt>
 <dd><p>Read-only data descriptor used to emit a runtime deprecation warning before accessing a deprecated field.</p>
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id32">
-<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id32" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id31">
+<span class="sig-name descname"><span class="pre">msg</span></span><a class="headerlink" href="#id31" title="Link to this definition">#</a></dt>
 <dd><p>The deprecation message to be emitted.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id33">
-<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id33" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id32">
+<span class="sig-name descname"><span class="pre">wrapped_property</span></span><a class="headerlink" href="#id32" title="Link to this definition">#</a></dt>
 <dd><p>The property instance if the deprecated field is a computed field, or <cite>None</cite>.</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="id34">
-<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id34" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="id33">
+<span class="sig-name descname"><span class="pre">field_name</span></span><a class="headerlink" href="#id33" title="Link to this definition">#</a></dt>
 <dd><p>The name of the field being deprecated.</p>
 </dd></dl>
 
@@ -4633,9 +4696,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM"><code class="docutils literal notranslate"><span class="pre">LLM</span></code></a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.tokenizer"><code class="docutils literal notranslate"><span class="pre">tokenizer</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.workspace"><code class="docutils literal notranslate"><span class="pre">workspace</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.llm_id"><code class="docutils literal notranslate"><span class="pre">llm_id</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.__init__"><code class="docutils literal notranslate"><span class="pre">__init__()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.generate"><code class="docutils literal notranslate"><span class="pre">generate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.generate_async"><code class="docutils literal notranslate"><span class="pre">generate_async()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_events"><code class="docutils literal notranslate"><span class="pre">get_kv_cache_events()</span></code></a></li>
@@ -4643,10 +4704,8 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_stats"><code class="docutils literal notranslate"><span class="pre">get_stats()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_stats_async"><code class="docutils literal notranslate"><span class="pre">get_stats_async()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id0"><code class="docutils literal notranslate"><span class="pre">llm_id</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.save"><code class="docutils literal notranslate"><span class="pre">save()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.shutdown"><code class="docutils literal notranslate"><span class="pre">shutdown()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1"><code class="docutils literal notranslate"><span class="pre">tokenizer</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2"><code class="docutils literal notranslate"><span class="pre">workspace</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput"><code class="docutils literal notranslate"><span class="pre">CompletionOutput</span></code></a><ul class="nav section-nav flex-column">
@@ -4660,15 +4719,15 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput.finish_reason"><code class="docutils literal notranslate"><span class="pre">finish_reason</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput.generation_logits"><code class="docutils literal notranslate"><span class="pre">generation_logits</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput.index"><code class="docutils literal notranslate"><span class="pre">index</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id3"><code class="docutils literal notranslate"><span class="pre">length</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2"><code class="docutils literal notranslate"><span class="pre">length</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput.logprobs"><code class="docutils literal notranslate"><span class="pre">logprobs</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id4"><code class="docutils literal notranslate"><span class="pre">logprobs_diff</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id3"><code class="docutils literal notranslate"><span class="pre">logprobs_diff</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput.prompt_logprobs"><code class="docutils literal notranslate"><span class="pre">prompt_logprobs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput.stop_reason"><code class="docutils literal notranslate"><span class="pre">stop_reason</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput.text"><code class="docutils literal notranslate"><span class="pre">text</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id5"><code class="docutils literal notranslate"><span class="pre">text_diff</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id4"><code class="docutils literal notranslate"><span class="pre">text_diff</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.CompletionOutput.token_ids"><code class="docutils literal notranslate"><span class="pre">token_ids</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id6"><code class="docutils literal notranslate"><span class="pre">token_ids_diff</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id5"><code class="docutils literal notranslate"><span class="pre">token_ids_diff</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.RequestOutput"><code class="docutils literal notranslate"><span class="pre">RequestOutput</span></code></a><ul class="nav section-nav flex-column">
@@ -4679,7 +4738,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.RequestOutput.context_logits"><code class="docutils literal notranslate"><span class="pre">context_logits</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.RequestOutput.finished"><code class="docutils literal notranslate"><span class="pre">finished</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.RequestOutput.__init__"><code class="docutils literal notranslate"><span class="pre">__init__()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id7"><code class="docutils literal notranslate"><span class="pre">prompt</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id6"><code class="docutils literal notranslate"><span class="pre">prompt</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.GuidedDecodingParams"><code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams</span></code></a><ul class="nav section-nav flex-column">
@@ -4817,7 +4876,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.EagleDecodingConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.EagleDecodingConfig.num_eagle_layers"><code class="docutils literal notranslate"><span class="pre">num_eagle_layers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.EagleDecodingConfig.posterior_threshold"><code class="docutils literal notranslate"><span class="pre">posterior_threshold</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.EagleDecodingConfig.pytorch_eagle_weights_path"><code class="docutils literal notranslate"><span class="pre">pytorch_eagle_weights_path</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.EagleDecodingConfig.pytorch_weights_path"><code class="docutils literal notranslate"><span class="pre">pytorch_weights_path</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.EagleDecodingConfig.use_dynamic_tree"><code class="docutils literal notranslate"><span class="pre">use_dynamic_tree</span></code></a></li>
 </ul>
 </li>
@@ -4828,6 +4887,7 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MTPDecodingConfig.num_nextn_predict_layers"><code class="docutils literal notranslate"><span class="pre">num_nextn_predict_layers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MTPDecodingConfig.relaxed_delta"><code class="docutils literal notranslate"><span class="pre">relaxed_delta</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MTPDecodingConfig.relaxed_topk"><code class="docutils literal notranslate"><span class="pre">relaxed_topk</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MTPDecodingConfig.use_mtp_vanilla"><code class="docutils literal notranslate"><span class="pre">use_mtp_vanilla</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.MTPDecodingConfig.use_relaxed_acceptance_for_thinking"><code class="docutils literal notranslate"><span class="pre">use_relaxed_acceptance_for_thinking</span></code></a></li>
 </ul>
 </li>
@@ -4945,9 +5005,9 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.BuildCacheConfig.max_records"><code class="docutils literal notranslate"><span class="pre">max_records</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.BuildCacheConfig.max_cache_storage_gb"><code class="docutils literal notranslate"><span class="pre">max_cache_storage_gb</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.BuildCacheConfig.__init__"><code class="docutils literal notranslate"><span class="pre">__init__()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id8"><code class="docutils literal notranslate"><span class="pre">cache_root</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id9"><code class="docutils literal notranslate"><span class="pre">max_cache_storage_gb</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id10"><code class="docutils literal notranslate"><span class="pre">max_records</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id7"><code class="docutils literal notranslate"><span class="pre">cache_root</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id8"><code class="docutils literal notranslate"><span class="pre">max_cache_storage_gb</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id9"><code class="docutils literal notranslate"><span class="pre">max_records</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.RequestError"><code class="docutils literal notranslate"><span class="pre">RequestError</span></code></a></li>
@@ -5002,11 +5062,18 @@ Whether to use a common pool for all requests, or the pool is private for each r
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig"><code class="docutils literal notranslate"><span class="pre">TorchCompileConfig</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.enable_fullgraph"><code class="docutils literal notranslate"><span class="pre">enable_fullgraph</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.enable_inductor"><code class="docutils literal notranslate"><span class="pre">enable_inductor</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.enable_piecewise_cuda_graph"><code class="docutils literal notranslate"><span class="pre">enable_piecewise_cuda_graph</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.enable_userbuffers"><code class="docutils literal notranslate"><span class="pre">enable_userbuffers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_enable_userbuffers"><code class="docutils literal notranslate"><span class="pre">torch_compile_enable_userbuffers</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_fullgraph"><code class="docutils literal notranslate"><span class="pre">torch_compile_fullgraph</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_inductor_enabled"><code class="docutils literal notranslate"><span class="pre">torch_compile_inductor_enabled</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchCompileConfig.torch_compile_piecewise_cuda_graph"><code class="docutils literal notranslate"><span class="pre">torch_compile_piecewise_cuda_graph</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig"><code class="docutils literal notranslate"><span class="pre">DraftTargetDecodingConfig</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.decoding_type"><code class="docutils literal notranslate"><span class="pre">decoding_type</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.from_dict"><code class="docutils literal notranslate"><span class="pre">from_dict()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.DraftTargetDecodingConfig.pytorch_weights_path"><code class="docutils literal notranslate"><span class="pre">pytorch_weights_path</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LlmArgs"><code class="docutils literal notranslate"><span class="pre">LlmArgs</span></code></a></li>
@@ -5036,21 +5103,21 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.kv_cache_dtype"><code class="docutils literal notranslate"><span class="pre">kv_cache_dtype</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.load_format"><code class="docutils literal notranslate"><span class="pre">load_format</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_cpu_loras"><code class="docutils literal notranslate"><span class="pre">max_cpu_loras</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id11"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id12"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id13"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id10"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id11"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id12"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_lora_rank"><code class="docutils literal notranslate"><span class="pre">max_lora_rank</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id14"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id15"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id16"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id13"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id14"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id15"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.max_loras"><code class="docutils literal notranslate"><span class="pre">max_loras</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id17"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id18"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id19"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id16"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id17"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id18"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.mixed_sampler"><code class="docutils literal notranslate"><span class="pre">mixed_sampler</span></code></a></li>
@@ -5060,11 +5127,13 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.moe_load_balancer"><code class="docutils literal notranslate"><span class="pre">moe_load_balancer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.moe_max_num_tokens"><code class="docutils literal notranslate"><span class="pre">moe_max_num_tokens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.print_iter_log"><code class="docutils literal notranslate"><span class="pre">print_iter_log</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.stream_interval"><code class="docutils literal notranslate"><span class="pre">stream_interval</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.torch_compile_config"><code class="docutils literal notranslate"><span class="pre">torch_compile_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.use_cuda_graph"><code class="docutils literal notranslate"><span class="pre">use_cuda_graph</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_config"><code class="docutils literal notranslate"><span class="pre">validate_cuda_graph_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_cuda_graph_max_batch_size"><code class="docutils literal notranslate"><span class="pre">validate_cuda_graph_max_batch_size</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_moe_load_balancer"><code class="docutils literal notranslate"><span class="pre">validate_moe_load_balancer</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TorchLlmArgs.validate_stream_interval"><code class="docutils literal notranslate"><span class="pre">validate_stream_interval</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs"><code class="docutils literal notranslate"><span class="pre">TrtLlmArgs</span></code></a><ul class="nav section-nav flex-column">
@@ -5076,17 +5145,17 @@ Whether to use a common pool for all requests, or the pool is private for each r
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.auto_parallel_config"><code class="docutils literal notranslate"><span class="pre">auto_parallel_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.auto_parallel_world_size"><code class="docutils literal notranslate"><span class="pre">auto_parallel_world_size</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id20"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id21"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id22"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id19"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id20"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id21"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.build_config"><code class="docutils literal notranslate"><span class="pre">build_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.calib_config"><code class="docutils literal notranslate"><span class="pre">calib_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.decoding_config"><code class="docutils literal notranslate"><span class="pre">decoding_config</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id23"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id24"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id25"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id22"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id23"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id24"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.embedding_parallel_mode"><code class="docutils literal notranslate"><span class="pre">embedding_parallel_mode</span></code></a></li>
@@ -5096,21 +5165,21 @@ Whether to use a common pool for all requests, or the pool is private for each r
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.fast_build"><code class="docutils literal notranslate"><span class="pre">fast_build</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.init_calib_config"><code class="docutils literal notranslate"><span class="pre">init_calib_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_cpu_loras"><code class="docutils literal notranslate"><span class="pre">max_cpu_loras</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id26"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id27"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id28"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id25"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id26"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id27"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_lora_rank"><code class="docutils literal notranslate"><span class="pre">max_lora_rank</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id29"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id30"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id31"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id28"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id29"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id30"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.max_loras"><code class="docutils literal notranslate"><span class="pre">max_loras</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id32"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id33"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id34"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id31"><code class="docutils literal notranslate"><span class="pre">msg</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id32"><code class="docutils literal notranslate"><span class="pre">wrapped_property</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id33"><code class="docutils literal notranslate"><span class="pre">field_name</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.TrtLlmArgs.model_config"><code class="docutils literal notranslate"><span class="pre">model_config</span></code></a></li>
@@ -5215,9 +5284,9 @@ Whether to use a common pool for all requests, or the pool is private for each r
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 16, 2025.</p>
+  <p>Last updated on June 21, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
   
 </div></div>
       

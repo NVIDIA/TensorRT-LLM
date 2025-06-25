@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc2" />
+  <meta name="docsearch:version" content="1.0.0rc0" />
 
 
   </head>
@@ -541,12 +541,14 @@
                       <span class="n">create_input_processor_with_hash</span><span class="p">,</span> <span class="n">prompt_inputs</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span> <span class="n">PybindMirror</span><span class="p">,</span> <span class="n">TorchLlmArgs</span><span class="p">,</span>
-                       <span class="n">TrtLlmArgs</span><span class="p">,</span> <span class="n">_AutoDeployLlmArgs</span><span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span>
+                       <span class="n">TRT_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span> <span class="n">PybindMirror</span><span class="p">,</span>
+                       <span class="n">TorchLlmArgs</span><span class="p">,</span> <span class="n">TrtLlmArgs</span><span class="p">,</span> <span class="n">_AutoDeployLlmArgs</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">CachedModelLoader</span><span class="p">,</span> <span class="n">KvCacheRetentionConfig</span><span class="p">,</span>
                         <span class="n">LlmBuildStats</span><span class="p">,</span> <span class="n">ModelLoader</span><span class="p">,</span> <span class="n">_ModelRuntimeContext</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.mpi_session</span><span class="w"> </span><span class="kn">import</span> <span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">external_mpi_comm_available</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">TokenizerBase</span><span class="p">,</span> <span class="n">_xgrammar_tokenizer_info</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">TokenizerBase</span><span class="p">,</span> <span class="n">_llguidance_tokenizer_info</span><span class="p">,</span>
+                        <span class="n">_xgrammar_tokenizer_info</span><span class="p">)</span>
 <span class="c1"># TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">append_docstring</span><span class="p">,</span> <span class="n">exception_handler</span><span class="p">,</span> <span class="n">get_device_count</span><span class="p">,</span>
                     <span class="n">print_colored_debug</span><span class="p">)</span>
@@ -599,8 +601,7 @@
 
 
 
-<span class="n">LLM_DOCSTRING</span> <span class="o">=</span> <span class="n">LLMARGS_EXPLICIT_DOCSTRING</span> <span class="o">+</span> <span class="s2">&quot;&quot;&quot;</span>
-<span class="s2">        kwargs (Any): Advanced arguments passed to `LlmArgs`.</span>
+<span class="n">TRT_LLM_DOCSTRING</span> <span class="o">=</span> <span class="n">TRT_LLMARGS_EXPLICIT_DOCSTRING</span> <span class="o">+</span> <span class="s2">&quot;&quot;&quot;</span>
 
 <span class="s2">    Attributes:</span>
 <span class="s2">        tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.</span>
@@ -608,18 +609,19 @@
 <span class="s2">        llm_id (str): The unique ID of the LLM instance.</span>
 <span class="s2">&quot;&quot;&quot;</span>
 
+<span class="n">TORCH_LLM_DOCSTRING</span> <span class="o">=</span> <span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span> <span class="o">+</span> <span class="s2">&quot;&quot;&quot;</span>
 
-<div class="viewcode-block" id="LLM">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM">[docs]</a>
-<span class="nd">@append_docstring</span><span class="p">(</span><span class="n">LLM_DOCSTRING</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">LLM</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;LLM class is the main class for running a LLM model.</span>
+<span class="s2">    Attributes:</span>
+<span class="s2">        tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.</span>
+<span class="s2">        llm_id (str): The unique ID of the LLM instance.</span>
+<span class="s2">&quot;&quot;&quot;</span>
 
-<span class="sd">    Parameters:</span>
-<span class="sd">&quot;&quot;&quot;</span>
 
-<div class="viewcode-block" id="LLM.__init__">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.__init__">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">BaseLLM</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    The base class for all LLM classes.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">model</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">],</span>
                  <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">,</span> <span class="n">TokenizerBase</span><span class="p">,</span>
@@ -706,6 +708,8 @@
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span> <span class="o">=</span> <span class="n">tempfile</span><span class="o">.</span><span class="n">TemporaryDirectory</span><span class="p">(</span>
                     <span class="n">suffix</span><span class="o">=</span><span class="s2">&quot;-llm-workspace&quot;</span><span class="p">,</span> <span class="nb">dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">workspace</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span> <span class="o">=</span> <span class="kc">None</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Path</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
@@ -720,12 +724,7 @@
             <span class="k">raise</span>
 
         <span class="n">exception_handler</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;shutdown&#39;</span><span class="p">)</span>
-        <span class="n">atexit</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">LLM</span><span class="o">.</span><span class="n">_shutdown_wrapper</span><span class="p">,</span> <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span><span class="p">(</span><span class="bp">self</span><span class="p">))</span></div>
-
-
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">workspace</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="o">.</span><span class="n">name</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="n">atexit</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">LLM</span><span class="o">.</span><span class="n">_shutdown_wrapper</span><span class="p">,</span> <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span><span class="p">(</span><span class="bp">self</span><span class="p">))</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">llm_id</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
@@ -737,8 +736,6 @@
 
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_llm_id</span>
 
-<div class="viewcode-block" id="LLM.generate">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.generate">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">generate</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">inputs</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">]],</span>
@@ -812,11 +809,8 @@
         <span class="k">if</span> <span class="n">unbatched</span><span class="p">:</span>
             <span class="n">futures</span> <span class="o">=</span> <span class="n">futures</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
 
-        <span class="k">return</span> <span class="n">futures</span></div>
+        <span class="k">return</span> <span class="n">futures</span>
 
-
-<div class="viewcode-block" id="LLM.generate_async">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.generate_async">[docs]</a>
     <span class="nd">@nvtx_range_debug</span><span class="p">(</span><span class="s2">&quot;LLM.generate_async&quot;</span><span class="p">,</span> <span class="n">color</span><span class="o">=</span><span class="s2">&quot;green&quot;</span><span class="p">,</span> <span class="n">category</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">generate_async</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -934,11 +928,8 @@
         <span class="p">)</span>
 
         <span class="k">return</span> <span class="n">RequestOutput</span><span class="o">.</span><span class="n">_from_generation_result</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span>
-                                                     <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span></div>
+                                                     <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
 
-
-<div class="viewcode-block" id="LLM.get_stats">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.get_stats">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">dict</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;Get iteration statistics from the runtime.</span>
 <span class="sd">        To collect statistics, call this function after prompts have been submitted with LLM().generate().</span>
@@ -950,11 +941,8 @@
 <span class="sd">            List[dict]: A list of runtime stats as dict.</span>
 <span class="sd">                e.g., [&#39;{&quot;cpuMemUsage&quot;: ..., &quot;iter&quot;: 0, ...}&#39;, &#39;{&quot;cpuMemUsage&quot;: ..., &quot;iter&quot;: 1, ...}&#39;]</span>
 <span class="sd">        &#39;&#39;&#39;</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">get_stats</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">get_stats</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
 
-
-<div class="viewcode-block" id="LLM.get_stats_async">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.get_stats_async">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_stats_async</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">IterationResult</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;Get iteration statistics from the runtime.</span>
 <span class="sd">        To collect statistics, you can call this function in an async coroutine or the /metrics endpoint (if you&#39;re using trtllm-serve)</span>
@@ -966,11 +954,8 @@
 <span class="sd">        Returns:</span>
 <span class="sd">            tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime stats.</span>
 <span class="sd">        &#39;&#39;&#39;</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">aget_stats</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">aget_stats</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
 
-
-<div class="viewcode-block" id="LLM.get_kv_cache_events">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.get_kv_cache_events">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_kv_cache_events</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">dict</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;Get iteration KV events from the runtime.</span>
 
@@ -990,11 +975,8 @@
 <span class="sd">        Returns:</span>
 <span class="sd">            List[dict]: A list of runtime events as dict.</span>
 <span class="sd">        &#39;&#39;&#39;</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">get_kv_events</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">get_kv_events</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
 
-
-<div class="viewcode-block" id="LLM.get_kv_cache_events_async">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.get_kv_cache_events_async">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_kv_cache_events_async</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                                   <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span>
                                   <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">IterationResult</span><span class="p">:</span>
@@ -1016,8 +998,7 @@
 <span class="sd">        Returns:</span>
 <span class="sd">            tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime events.</span>
 <span class="sd">        &#39;&#39;&#39;</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">aget_kv_events</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span></div>
-
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">aget_kv_events</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_prepare_sampling_params</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span>
@@ -1123,7 +1104,7 @@
     <span class="k">def</span><span class="w"> </span><span class="nf">_build_model</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">model_loader</span> <span class="o">=</span> <span class="n">CachedModelLoader</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span>
                                          <span class="n">mpi_session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">,</span>
-                                         <span class="n">workspace</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">workspace</span><span class="p">,</span>
+                                         <span class="n">workspace</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="p">,</span>
                                          <span class="n">llm_build_stats</span><span class="o">=</span><span class="n">weakref</span><span class="o">.</span><span class="n">proxy</span><span class="p">(</span>
                                              <span class="bp">self</span><span class="o">.</span><span class="n">llm_build_stats</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="o">=</span> <span class="n">model_loader</span><span class="p">()</span>
@@ -1200,6 +1181,11 @@
                 <span class="n">backend</span><span class="o">=</span><span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="o">.</span><span class="n">GuidedDecodingBackend</span><span class="o">.</span>
                 <span class="n">XGRAMMAR</span><span class="p">,</span>
                 <span class="o">**</span><span class="n">_xgrammar_tokenizer_info</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">))</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="o">==</span> <span class="s1">&#39;llguidance&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">guided_decoding_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="p">(</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="o">.</span><span class="n">GuidedDecodingBackend</span><span class="o">.</span>
+                <span class="n">LLGUIDANCE</span><span class="p">,</span>
+                <span class="o">**</span><span class="n">_llguidance_tokenizer_info</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">))</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;Unrecognized guided decoding backend </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -1247,7 +1233,9 @@
                 <span class="n">postprocess_tokenizer_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">postprocess_tokenizer_dir</span><span class="p">,</span>
             <span class="p">),</span>
             <span class="n">is_llm_executor</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-            <span class="n">lora_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">lora_config</span><span class="p">)</span>
+            <span class="n">lora_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">lora_config</span><span class="p">,</span>
+            <span class="n">garbage_collection_gen0_threshold</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span>
+            <span class="n">garbage_collection_gen0_threshold</span><span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_on_trt_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -1303,8 +1291,66 @@
     <span class="k">def</span><span class="w"> </span><span class="nf">tokenizer</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tokenizer</span><span class="p">:</span> <span class="n">TokenizerBase</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="n">tokenizer</span>
 
-<div class="viewcode-block" id="LLM.save">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.save">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;_executor&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="kc">None</span>
+
+        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;mpi_session&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_shutdown_wrapper</span><span class="p">(</span><span class="n">self_ref</span><span class="p">):</span>
+        <span class="c1"># Retrieve the instance if it still exists</span>
+        <span class="n">instance</span> <span class="o">=</span> <span class="n">self_ref</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">instance</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">instance</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__enter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__exit__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">exc_type</span><span class="p">,</span> <span class="n">exc_value</span><span class="p">,</span> <span class="n">traceback</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">del</span> <span class="n">exc_value</span><span class="p">,</span> <span class="n">traceback</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+        <span class="k">return</span> <span class="kc">False</span>  <span class="c1"># propagate exceptions</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__getstate__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;LLM object can not be pickled.&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+
+
+<span class="nd">@append_docstring</span><span class="p">(</span><span class="n">TRT_LLM_DOCSTRING</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">_TrtLLM</span><span class="p">(</span><span class="n">BaseLLM</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;LLM class is the main class for running a LLM model using TensorRT-LLM backend.</span>
+
+<span class="sd">    Parameters:</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="n">model</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">],</span>
+                 <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">,</span> <span class="n">TokenizerBase</span><span class="p">,</span>
+                                           <span class="n">PreTrainedTokenizerBase</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">tokenizer_mode</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s1">&#39;auto&#39;</span><span class="p">,</span> <span class="s1">&#39;slow&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="s1">&#39;auto&#39;</span><span class="p">,</span>
+                 <span class="n">skip_tokenizer_init</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">trust_remote_code</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">tensor_parallel_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+                 <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+                 <span class="n">revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">tokenizer_revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># TODO: deprecate backend in LLM kwargs</span>
+
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">tokenizer</span><span class="p">,</span> <span class="n">tokenizer_mode</span><span class="p">,</span> <span class="n">skip_tokenizer_init</span><span class="p">,</span>
+                         <span class="n">trust_remote_code</span><span class="p">,</span> <span class="n">tensor_parallel_size</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span>
+                         <span class="n">revision</span><span class="p">,</span> <span class="n">tokenizer_revision</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">workspace</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="o">.</span><span class="n">name</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span> <span class="k">else</span> <span class="kc">None</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">save</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Save the built engine to the given path.</span>
 
@@ -1328,42 +1374,100 @@
             <span class="k">for</span> <span class="n">file</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="o">.</span><span class="n">iterdir</span><span class="p">():</span>
                 <span class="n">print_colored_debug</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">&quot;Copying </span><span class="si">{</span><span class="n">file</span><span class="si">}</span><span class="s2"> to </span><span class="si">{</span><span class="n">target_engine_dir</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">file</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
-                <span class="n">shutil</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">target_engine_dir</span> <span class="o">/</span> <span class="n">file</span><span class="o">.</span><span class="n">name</span><span class="p">)</span></div>
+                <span class="n">shutil</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">target_engine_dir</span> <span class="o">/</span> <span class="n">file</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
 
 
-<div class="viewcode-block" id="LLM.shutdown">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.shutdown">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;_executor&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="nd">@append_docstring</span><span class="p">(</span><span class="n">TORCH_LLM_DOCSTRING</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">_TorchLLM</span><span class="p">(</span><span class="n">BaseLLM</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;LLM class is the main class for running a LLM model using PyTorch backend.</span>
 
-        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;mpi_session&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="kc">None</span></div>
+<span class="sd">    Parameters:</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="n">model</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">],</span>
+                 <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">,</span> <span class="n">TokenizerBase</span><span class="p">,</span>
+                                           <span class="n">PreTrainedTokenizerBase</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">tokenizer_mode</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s1">&#39;auto&#39;</span><span class="p">,</span> <span class="s1">&#39;slow&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="s1">&#39;auto&#39;</span><span class="p">,</span>
+                 <span class="n">skip_tokenizer_init</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">trust_remote_code</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">tensor_parallel_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+                 <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+                 <span class="n">revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">tokenizer_revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+
+        <span class="c1"># TODO: deprecate backend in LLM kwargs</span>
+        <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;backend&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+
+        <span class="c1"># Validate that users don&#39;t pass TrtLlmArgs-specific arguments</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_validate_args_for_torch_backend</span><span class="p">(</span><span class="n">kwargs</span><span class="p">)</span>
+
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">model</span><span class="p">,</span>
+                         <span class="n">tokenizer</span><span class="p">,</span>
+                         <span class="n">tokenizer_mode</span><span class="p">,</span>
+                         <span class="n">skip_tokenizer_init</span><span class="p">,</span>
+                         <span class="n">trust_remote_code</span><span class="p">,</span>
+                         <span class="n">tensor_parallel_size</span><span class="p">,</span>
+                         <span class="n">dtype</span><span class="p">,</span>
+                         <span class="n">revision</span><span class="p">,</span>
+                         <span class="n">tokenizer_revision</span><span class="p">,</span>
+                         <span class="n">backend</span><span class="o">=</span><span class="s1">&#39;pytorch&#39;</span><span class="p">,</span>
+                         <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_validate_args_for_torch_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Validate that users don&#39;t pass TrtLlmArgs-specific arguments when using PyTorch backend.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">trtllm_fields</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">TrtLlmArgs</span><span class="o">.</span><span class="n">model_fields</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+        <span class="n">torchllm_fields</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">TorchLlmArgs</span><span class="o">.</span><span class="n">model_fields</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+
+        <span class="n">trtllm_specific_fields</span> <span class="o">=</span> <span class="n">trtllm_fields</span> <span class="o">-</span> <span class="n">torchllm_fields</span>
+
+        <span class="c1"># Check if any TrtLlmArgs-specific arguments are passed</span>
+        <span class="n">trtllm_specific_args</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">trtllm_specific_fields</span><span class="p">:</span>
+                <span class="n">trtllm_specific_args</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">trtllm_specific_args</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;The following arguments are specific to TensorRT backend and cannot be used with PyTorch backend: </span><span class="si">{</span><span class="n">trtllm_specific_args</span><span class="si">}</span><span class="s2">.</span><span class="se">\n</span><span class="s2">&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;Please use &#39;from tensorrt_llm._tensorrt_engine import LLM&#39; instead to use the TensorRT backend.&quot;</span>
+            <span class="p">)</span>
 
 
-    <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">_shutdown_wrapper</span><span class="p">(</span><span class="n">self_ref</span><span class="p">):</span>
-        <span class="c1"># Retrieve the instance if it still exists</span>
-        <span class="n">instance</span> <span class="o">=</span> <span class="n">self_ref</span><span class="p">()</span>
-        <span class="k">if</span> <span class="n">instance</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">instance</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+<div class="viewcode-block" id="LLM">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">LLM</span><span class="p">(</span><span class="n">_TorchLLM</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__enter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="k">return</span> <span class="bp">self</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="n">model</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">],</span>
+                 <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">,</span> <span class="n">TokenizerBase</span><span class="p">,</span>
+                                           <span class="n">PreTrainedTokenizerBase</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">tokenizer_mode</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s1">&#39;auto&#39;</span><span class="p">,</span> <span class="s1">&#39;slow&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="s1">&#39;auto&#39;</span><span class="p">,</span>
+                 <span class="n">skip_tokenizer_init</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">trust_remote_code</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">tensor_parallel_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+                 <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+                 <span class="n">revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">tokenizer_revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">tokenizer</span><span class="p">,</span> <span class="n">tokenizer_mode</span><span class="p">,</span> <span class="n">skip_tokenizer_init</span><span class="p">,</span>
+                         <span class="n">trust_remote_code</span><span class="p">,</span> <span class="n">tensor_parallel_size</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span>
+                         <span class="n">revision</span><span class="p">,</span> <span class="n">tokenizer_revision</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__exit__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">exc_type</span><span class="p">,</span> <span class="n">exc_value</span><span class="p">,</span> <span class="n">traceback</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="k">del</span> <span class="n">exc_value</span><span class="p">,</span> <span class="n">traceback</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
-        <span class="k">return</span> <span class="kc">False</span>  <span class="c1"># propagate exceptions</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">__getstate__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;LLM object can not be pickled.&quot;</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span></div>
+<span class="n">_LLM_REPR</span> <span class="o">=</span> <span class="s2">&quot;TorchLLM&quot;</span>
 
+<span class="c1"># sphinx will ignore the LLM&#39;s docstring if it is not explicitly set</span>
+<span class="n">LLM</span><span class="o">.</span><span class="vm">__doc__</span> <span class="o">=</span> \
+    <span class="sa">f</span><span class="s2">&quot;&quot;&quot;LLM class is the main class for running a LLM model.</span>
+
+<span class="s2">    This class is an alias of </span><span class="si">{</span><span class="n">_LLM_REPR</span><span class="si">}</span><span class="s2">.</span>
+
+<span class="s2">    Parameters:</span>
+<span class="s2">&quot;&quot;&quot;</span> <span class="o">+</span> <span class="n">TORCH_LLM_DOCSTRING</span>
 </pre></div>
 
                 </article>
@@ -1475,9 +1579,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 16, 2025.</p>
+  <p>Last updated on June 21, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
   
 </div></div>
       
