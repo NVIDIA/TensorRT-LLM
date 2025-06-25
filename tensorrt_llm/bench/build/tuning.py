@@ -114,10 +114,13 @@ def calc_engine_setting(
                 f"{kv_cache_max_requests:.2f}")
 
     # Fine-tune the max batch size and num token setting for performance.
-    max_batch_size, max_num_tokens = finetune_setting(kv_cache_max_requests,
-                                                      target_input_len,
-                                                      target_output_len,
-                                                      pp_size)
+    # For mamba-attn hybrid models, we disable optimistic tuning because the mamba cache leaves less memory for the KV cache
+    max_batch_size, max_num_tokens = finetune_setting(
+        kv_cache_max_requests,
+        target_input_len,
+        target_output_len,
+        pp_size,
+        enable_optimistic_tuning=not is_mamba_attn_hybrid)
 
     # Functional and performance
     if total_gpu_memory < engine_size:
@@ -156,12 +159,11 @@ def calc_engine_setting(
     return max_batch_size, max_num_tokens
 
 
-def finetune_setting(
-    kv_cache_max_requests: float,
-    input_len: int,
-    output_len: int,
-    pp_size: int,
-) -> Tuple[int, int]:
+def finetune_setting(kv_cache_max_requests: float,
+                     input_len: int,
+                     output_len: int,
+                     pp_size: int,
+                     enable_optimistic_tuning: bool = True) -> Tuple[int, int]:
     """ Calculate and fine-tune the engine build settings (max batch size and
         max num tokens). Both max batch size and max num tokens are fine-tuned
         to be slightly optimistic.
@@ -172,6 +174,7 @@ def finetune_setting(
         input_len (int): Input sequence length to compile the engine.
         output_len (int): Output sequence length to compile the engine.
         pp_size (int): Number of pipeline parallel stages.
+        enable_optimistic_tuning (bool): Whether to enable optimistic tuning.
 
     Returns:
         Tuple[int, int]: Tuple containing fine-tuned values for engine
@@ -183,13 +186,16 @@ def finetune_setting(
     raw_token = min(raw_bs * (1 + input_len / output_len), 32768)
 
     # Fine-tune the max batch size.
-    # Set min BS to be 64.
-    if raw_bs < 256:
-        max_bs = max(64, 32 * math.ceil(raw_bs / 32))
-    elif raw_bs < 1024:
-        max_bs = 128 * math.ceil(raw_bs / 128)
+    if enable_optimistic_tuning:
+        # Set min BS to be 64.
+        if raw_bs < 256:
+            max_bs = max(64, 32 * math.ceil(raw_bs / 32))
+        elif raw_bs < 1024:
+            max_bs = 128 * math.ceil(raw_bs / 128)
+        else:
+            max_bs = 256 * math.ceil(raw_bs / 256)
     else:
-        max_bs = 256 * math.ceil(raw_bs / 256)
+        max_bs = 2 * math.floor(raw_bs / 2)
 
     # Fine-tune the max num tokens.
     # Set min to 2048 to ensure Ctx/Gen overlap efficiency
