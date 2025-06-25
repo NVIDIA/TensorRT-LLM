@@ -22,14 +22,14 @@ def fuse_collectives(gm: GraphModule) -> GraphModule:
     # lookup for fused ops
     # TODO: avoid this hardcoded lookup, e.g., by generating fused ops on the fly.
     lookup = {
-        torch.ops.linear.simple: torch.ops.linear.fused_linear_all_reduce,
-        torch.ops.aten.linear: torch.ops.linear.fused_linear_all_reduce,
-        torch.ops.quant.fp8_linear: torch.ops.quant.fused_fp8_linear_all_reduce,
+        torch.ops.auto_deploy.torch_linear_simple: torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce,
+        torch.ops.aten.linear: torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce,
+        torch.ops.auto_deploy.torch_quant_fp8_linear: torch.ops.auto_deploy.torch_quant_fused_fp8_linear_all_reduce,
     }
 
     # go through all nodes and find all_reduce nodes
     for node in gm.graph.nodes:
-        if not is_op(node, torch.ops.dist.all_reduce):
+        if not is_op(node, torch.ops.auto_deploy.torch_dist_all_reduce):
             continue
 
         # check if args are as expected
@@ -162,7 +162,7 @@ def fuse_allreduce_residual_rmsnorm(gm: GraphModule) -> GraphModule:
 
     # Traverse all nodes
     for node in gm.graph.nodes:
-        if is_op(node, torch.ops.dist.all_reduce):
+        if is_op(node, torch.ops.auto_deploy.torch_dist_all_reduce):
             trace_and_fuse(allreduce_node=node, graph=gm.graph)
 
     gm = canonicalize_graph(gm)

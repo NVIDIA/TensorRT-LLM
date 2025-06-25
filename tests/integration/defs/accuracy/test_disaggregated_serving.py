@@ -133,11 +133,12 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
         client = openai.OpenAI(api_key="1234567890",
                                base_url=f"http://localhost:8000/v1")
 
-        def send_request(prompt: str, sampling_params: SamplingParams):
+        def send_request(prompt: str, sampling_params: SamplingParams,
+                         streaming: bool):
             response = client.completions.create(
                 model=model_name,
                 prompt=prompt,
-                stream=False,
+                stream=streaming,
                 **({
                     "max_tokens": sampling_params.max_tokens,
                     "temperature": sampling_params.temperature,
@@ -157,8 +158,10 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
             return requested_output
 
         def generate_async(prompt: str,
-                           sampling_params: Optional[SamplingParams] = None):
-            future = thread_pool.submit(send_request, prompt, sampling_params)
+                           sampling_params: Optional[SamplingParams] = None,
+                           streaming: bool = False):
+            future = thread_pool.submit(send_request, prompt, sampling_params,
+                                        streaming)
             thread_pool.futures.append(future)
             return future
 
