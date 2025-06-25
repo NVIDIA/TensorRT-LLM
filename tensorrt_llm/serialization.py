@@ -40,6 +40,14 @@ class Unpickler(pickle.Unpickler):
 
     # only import approved classes, this is the security boundary.
     def find_class(self, module, name):
+        print(f"Attempting to unpickle class: {module}.{name}")
+        print(f"Error details:")
+        print(f"  Module: {module}")
+        print(f"  Class: {name}")
+        print(
+            f"  Approved imports for {module}: {self.approved_imports.get(module, [])}"
+        )
+        print(f"  All approved modules: {list(self.approved_imports.keys())}")
         if name not in self.approved_imports.get(module, []):
             # If this is triggered when it shouldn't be, then the module
             # and class should be added to the approved_imports. If the class

@@ -263,7 +263,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor const& dO8, // total x num_heads, x h
 #endif
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+NB_MODULE(TORCH_EXTENSION_NAME, m)
 {
 
     m.doc() = "CUDA fused Multihead-Attention for BERT (FP8)";

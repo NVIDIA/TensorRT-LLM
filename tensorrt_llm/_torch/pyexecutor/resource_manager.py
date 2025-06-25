@@ -285,6 +285,7 @@ class KVCacheManager(BaseResourceManager):
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
+        print("finished KVCacheManager init")
 
     def shutdown(self):
         self.impl.release_pools()

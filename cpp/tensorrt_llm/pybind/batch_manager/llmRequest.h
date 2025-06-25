@@ -24,7 +24,6 @@
 #include <ATen/ops/tensor.h>
 #include <memory>
 #include <optional>
-#include <pybind11/pybind11.h>
 
 namespace tensorrt_llm::pybind::batch_manager
 {

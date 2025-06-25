@@ -20,15 +20,17 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/executor/executor.h"
 #include <ATen/ATen.h>
-#include <pybind11/functional.h>
-#include <pybind11/operators.h>
-#include <pybind11/stl.h>
-#include <pybind11/stl_bind.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/unique_ptr.h>
+#include <nanobind/trampoline.h>
 #include <torch/extension.h>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 namespace tb = tensorrt_llm::batch_manager;
+namespace nb = nanobind;
 
 namespace
 {
@@ -37,42 +39,43 @@ class PyCacheTransceiver : public tb::BaseCacheTransceiver
 {
 public:
     // using BaseCacheTransceiver::BaseCacheTransceiver; // Inherit constructors
+    NB_TRAMPOLINE(tb::BaseCacheTransceiver, 6);
 
     void respondAndSendAsync(tb::LlmRequest* llmRequest) override
     {
-        PYBIND11_OVERLOAD_PURE(void, tb::BaseCacheTransceiver, respondAndSendAsync, llmRequest);
+        NB_OVERRIDE_PURE(respondAndSendAsync, llmRequest);
     }
 
     void requestAndReceiveSync(tb::LlmRequest* llmRequest) override
     {
-        PYBIND11_OVERLOAD_PURE(void, tb::BaseCacheTransceiver, requestAndReceiveSync, llmRequest);
+        NB_OVERRIDE_PURE(requestAndReceiveSync, llmRequest);
     }
 
     void requestAndReceiveAsync(tb::LlmRequest* llmRequest) override
     {
-        PYBIND11_OVERLOAD_PURE(void, tb::BaseCacheTransceiver, requestAndReceiveAsync, llmRequest);
+        NB_OVERRIDE_PURE(requestAndReceiveAsync, llmRequest);
     }
 
     void checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
     {
-        PYBIND11_OVERLOAD_PURE(void, tb::BaseCacheTransceiver, checkContextTransferStatus, atLeastRequestNum);
+        NB_OVERRIDE_PURE(checkContextTransferStatus, atLeastRequestNum);
     }
 
     void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override
     {
-        PYBIND11_OVERLOAD_PURE(void, tb::BaseCacheTransceiver, checkGenTransferStatus, atLeastRequestNum);
+        NB_OVERRIDE_PURE(checkGenTransferStatus, atLeastRequestNum);
     }
 
     bool checkGenTransferComplete() const override
     {
-        PYBIND11_OVERLOAD_PURE(bool, tb::BaseCacheTransceiver, checkGenTransferComplete);
+        NB_OVERRIDE_PURE(checkGenTransferComplete);
     }
 };
 } // namespace
 
-void tb::CacheTransceiverBindings::initBindings(py::module_& m)
+void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
 {
-    py::classh<tb::BaseCacheTransceiver, PyCacheTransceiver>(m, "BaseCacheTransceiver")
+    nb::class_<tb::BaseCacheTransceiver, PyCacheTransceiver>(m, "BaseCacheTransceiver")
         .def("respond_and_send_async", &BaseCacheTransceiver::respondAndSendAsync)
         .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync)
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
@@ -80,27 +83,27 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus)
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete);
 
-    py::enum_<tb::CacheTransceiver::CommType>(m, "CommType")
+    nb::enum_<tb::CacheTransceiver::CommType>(m, "CommType")
         .value("UNKNOWN", tb::CacheTransceiver::CommType::UNKNOWN)
         .value("MPI", tb::CacheTransceiver::CommType::MPI)
         .value("UCX", tb::CacheTransceiver::CommType::UCX)
         .value("NIXL", tb::CacheTransceiver::CommType::NIXL);
 
-    py::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
+    nb::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)
         .value("MLA", executor::kv_cache::CacheState::AttentionType::kMLA);
 
-    py::classh<tb::CacheTransceiver, tb::BaseCacheTransceiver>(m, "CacheTransceiver")
-        .def(py::init<tb::kv_cache_manager::BaseKVCacheManager*, tb::CacheTransceiver::CommType,
+    nb::class_<tb::CacheTransceiver, tb::BaseCacheTransceiver>(m, "CacheTransceiver")
+        .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, tb::CacheTransceiver::CommType,
                  std::vector<SizeType32>, SizeType32, SizeType32, runtime::WorldConfig, nvinfer1::DataType,
                  executor::kv_cache::CacheState::AttentionType, std::optional<executor::CacheTransceiverConfig>>(),
-            py::arg("cache_manager"), py::arg("comm_type"), py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"),
-            py::arg("tokens_per_block"), py::arg("world_config"), py::arg("dtype"), py::arg("attention_type"),
-            py::arg("cache_transceiver_config") = std::nullopt);
+            nb::arg("cache_manager"), nb::arg("comm_type"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"),
+            nb::arg("tokens_per_block"), nb::arg("world_config"), nb::arg("dtype"), nb::arg("attention_type"),
+            nb::arg("cache_transceiver_config") = std::nullopt);
 
-    py::class_<tb::kv_cache_manager::CacheTransBufferManager>(m, "CacheTransBufferManager")
-        .def(py::init<tb::kv_cache_manager::BaseKVCacheManager*, std::optional<size_t>>(), py::arg("cache_manager"),
-            py::arg("max_num_tokens") = std::nullopt)
+    nb::class_<tb::kv_cache_manager::CacheTransBufferManager>(m, "CacheTransBufferManager")
+        .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::optional<size_t>>(), nb::arg("cache_manager"),
+            nb::arg("max_num_tokens") = std::nullopt)
         .def_static("pre_alloc_buffer_size", &tb::kv_cache_manager::CacheTransBufferManager::preAllocBufferSize,
-            py::arg("max_num_tokens") = std::nullopt);
+            nb::arg("max_num_tokens") = std::nullopt);
 }

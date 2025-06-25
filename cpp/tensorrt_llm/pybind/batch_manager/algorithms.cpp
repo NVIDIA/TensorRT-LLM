@@ -37,67 +37,60 @@
 #include "tensorrt_llm/runtime/torchView.h"
 
 #include <ATen/core/TensorBody.h>
-#include <pybind11/cast.h>
-#include <pybind11/functional.h>
-#include <pybind11/operators.h>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <nanobind/nanobind.h>
 #include <torch/extension.h>
 
 #include <optional>
 
-namespace py = pybind11;
+namespace nb = nanobind;
 
 namespace tr = tensorrt_llm::runtime;
 using namespace tensorrt_llm::batch_manager;
 
-void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::module_& m)
+void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(nanobind::module_& m)
 {
-    py::class_<CapacityScheduler>(m, CapacityScheduler::name)
-        .def(py::init<SizeType32, executor::CapacitySchedulerPolicy, bool, bool, LlmRequestState, LlmRequestState>(),
-            py::arg("max_num_requests"), py::arg("capacity_scheduler_policy"), py::arg("has_kv_cache_manager"),
-            py::arg("two_step_lookahead") = false,
-            py::arg_v("no_schedule_until_state", LlmRequestState::kCONTEXT_INIT, "LlmRequestState.CONTEXT_INIT"),
-            py::arg_v("no_schedule_after_state", LlmRequestState::kGENERATION_COMPLETE,
-                "LlmRequestState.GENERATION_COMPLETE"))
-        .def("__call__", &CapacityScheduler::operator(), py::arg("active_requests"),
-            py::arg("kv_cache_manager") = nullptr, py::arg("peft_cache_manager") = nullptr,
-            py::arg("cross_kv_cache_manager") = nullptr)
+    nb::class_<CapacityScheduler>(m, CapacityScheduler::name)
+        .def(nb::init<SizeType32, executor::CapacitySchedulerPolicy, bool, bool, LlmRequestState, LlmRequestState>(),
+            nb::arg("max_num_requests"), nb::arg("capacity_scheduler_policy"), nb::arg("has_kv_cache_manager"),
+            nb::arg("two_step_lookahead") = false, nb::arg("no_schedule_until_state") = LlmRequestState::kCONTEXT_INIT,
+            nb::arg("no_schedule_after_state") = LlmRequestState::kGENERATION_COMPLETE)
+        .def("__call__", &CapacityScheduler::operator(), nb::arg("active_requests"),
+            nb::arg("kv_cache_manager") = nullptr, nb::arg("peft_cache_manager") = nullptr,
+            nb::arg("cross_kv_cache_manager") = nullptr)
         .def("name", [](CapacityScheduler const&) { return CapacityScheduler::name; });
 
-    py::class_<MicroBatchScheduler>(m, MicroBatchScheduler::name)
-        .def(py::init<std::optional<batch_scheduler::ContextChunkingConfig>, std::optional<SizeType32>, LlmRequestState,
+    nb::class_<MicroBatchScheduler>(m, MicroBatchScheduler::name)
+        .def(nb::init<std::optional<batch_scheduler::ContextChunkingConfig>, std::optional<SizeType32>, LlmRequestState,
                  LlmRequestState>(),
-            py::arg("ctx_chunk_config") = std::nullopt, py::arg("max_context_length") = std::nullopt,
-            py::arg_v("no_schedule_until_state", LlmRequestState::kCONTEXT_INIT, "LlmRequestState.CONTEXT_INIT"),
-            py::arg_v("no_schedule_after_state", LlmRequestState::kGENERATION_COMPLETE,
-                "LlmRequestState.GENERATION_COMPLETE"))
-        .def("__call__", &MicroBatchScheduler::operator(), py::arg("active_requests"), py::arg("inflight_req_ids"),
-            py::arg("max_batch_size_runtime"), py::arg("max_num_tokens_runtime"))
+            nb::arg("ctx_chunk_config") = std::nullopt, nb::arg("max_context_length") = std::nullopt,
+            nb::arg("no_schedule_until_state") = LlmRequestState::kCONTEXT_INIT,
+            nb::arg("no_schedule_after_state") = LlmRequestState::kGENERATION_COMPLETE)
+        .def("__call__", &MicroBatchScheduler::operator(), nb::arg("active_requests"), nb::arg("inflight_req_ids"),
+            nb::arg("max_batch_size_runtime"), nb::arg("max_num_tokens_runtime"))
         .def("name", [](MicroBatchScheduler const&) { return MicroBatchScheduler::name; });
 
-    py::class_<PauseRequests>(m, PauseRequests::name)
-        .def(py::init<SizeType32>(), py::arg("max_input_len"))
-        .def("__call__", &PauseRequests::operator(), py::arg("requests_to_pause"), py::arg("inflight_req_ids"),
-            py::arg("req_ids_to_pause"), py::arg("pause_flagged"), py::arg("seq_slot_manager"),
-            py::arg("kv_cache_manager") = std::nullopt, py::arg("cross_kv_cache_manager") = std::nullopt,
-            py::arg("peft_cache_manager") = std::nullopt)
+    nb::class_<PauseRequests>(m, PauseRequests::name)
+        .def(nb::init<SizeType32>(), nb::arg("max_input_len"))
+        .def("__call__", &PauseRequests::operator(), nb::arg("requests_to_pause"), nb::arg("inflight_req_ids"),
+            nb::arg("req_ids_to_pause"), nb::arg("pause_flagged"), nb::arg("seq_slot_manager"),
+            nb::arg("kv_cache_manager") = std::nullopt, nb::arg("cross_kv_cache_manager") = std::nullopt,
+            nb::arg("peft_cache_manager") = std::nullopt)
         .def("name", [](PauseRequests const&) { return PauseRequests::name; });
 
-    py::class_<AssignReqSeqSlots>(m, AssignReqSeqSlots::name)
-        .def(py::init())
-        .def("__call__", &AssignReqSeqSlots::operator(), py::arg("seq_slot_manager"), py::arg("context_requests"),
-            py::arg("generation_requests"))
+    nb::class_<AssignReqSeqSlots>(m, AssignReqSeqSlots::name)
+        .def(nb::init<>())
+        .def("__call__", &AssignReqSeqSlots::operator(), nb::arg("seq_slot_manager"), nb::arg("context_requests"),
+            nb::arg("generation_requests"))
         .def("name", [](AssignReqSeqSlots const&) { return AssignReqSeqSlots::name; });
 
-    py::class_<AllocateKvCache>(m, AllocateKvCache::name)
-        .def(py::init())
-        .def("__call__", &AllocateKvCache::operator(), py::arg("kv_cache_manager"), py::arg("context_requests"),
-            py::arg("generation_requests"), py::arg("model_config"), py::arg("cross_kv_cache_manager") = std::nullopt)
+    nb::class_<AllocateKvCache>(m, AllocateKvCache::name)
+        .def(nb::init<>())
+        .def("__call__", &AllocateKvCache::operator(), nb::arg("kv_cache_manager"), nb::arg("context_requests"),
+            nb::arg("generation_requests"), nb::arg("model_config"), nb::arg("cross_kv_cache_manager") = std::nullopt)
         .def("name", [](AllocateKvCache const&) { return AllocateKvCache::name; });
 
-    py::class_<HandleContextLogits>(m, HandleContextLogits::name)
-        .def(py::init())
+    nb::class_<HandleContextLogits>(m, HandleContextLogits::name)
+        .def(nb::init<>())
         .def(
             "__call__",
             [](HandleContextLogits const& self, DecoderInputBuffers& inputBuffers, RequestVector const& contextRequests,
@@ -108,13 +101,13 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
                 return self(inputBuffers, contextRequests, tr::TorchView::of(logits), numContextLogitsVec, modelConfig,
                     manager, medusaBuffers);
             },
-            py::arg("decoder_input_buffers"), py::arg("context_requests"), py::arg("logits"),
-            py::arg("num_context_logits"), py::arg("model_config"), py::arg("buffer_manager"),
-            py::arg("medusa_buffers") = std::nullopt)
+            nb::arg("decoder_input_buffers"), nb::arg("context_requests"), nb::arg("logits"),
+            nb::arg("num_context_logits"), nb::arg("model_config"), nb::arg("buffer_manager"),
+            nb::arg("draft_buffers") = std::nullopt)
         .def("name", [](HandleContextLogits const&) { return HandleContextLogits::name; });
 
-    py::class_<HandleGenerationLogits>(m, HandleGenerationLogits::name)
-        .def(py::init())
+    nb::class_<HandleGenerationLogits>(m, HandleGenerationLogits::name)
+        .def(nb::init<>())
         .def(
             "__call__",
             [](HandleGenerationLogits const& self, DecoderInputBuffers& inputBuffers,
@@ -126,28 +119,29 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
                 self(inputBuffers, generationRequests, tr::TorchView::of(logits), logitsIndex, modelConfig, manager,
                     genRuntimeBuffers, medusaBuffers);
             },
-            py::arg("decoder_input_buffers"), py::arg("generation_requests"), py::arg("logits"),
-            py::arg("logits_index"), py::arg("model_config"), py::arg("buffer_manager"),
-            py::arg("gen_runtime_buffers") = std::nullopt, py::arg("medusa_buffers") = std::nullopt)
+            nb::arg("decoder_input_buffers"), nb::arg("generation_requests"), nb::arg("logits"),
+            nb::arg("logits_index"), nb::arg("model_config"), nb::arg("buffer_manager"),
+            nb::arg("gen_runtime_buffers") = std::nullopt, nb::arg("medusa_buffers") = std::nullopt)
         .def("name", [](HandleGenerationLogits const&) { return HandleGenerationLogits::name; });
 
-    py::class_<MakeDecodingBatchInputOutput>(m, MakeDecodingBatchInputOutput::name)
-        .def(py::init())
-        .def("__call__", &MakeDecodingBatchInputOutput::operator(), py::arg("context_requests"),
-            py::arg("generation_requests"), py::arg("decoder_input_buffers"), py::arg("decoder_state"),
-            py::arg("model_config"), py::arg("max_num_sequences"), py::arg("fused_runtime_buffers") = std::nullopt)
+    nb::class_<MakeDecodingBatchInputOutput>(m, MakeDecodingBatchInputOutput::name)
+        .def(nb::init<>())
+        .def("__call__", &MakeDecodingBatchInputOutput::operator(), nb::arg("context_requests"),
+            nb::arg("generation_requests"), nb::arg("decoder_input_buffers"),
+            nb::arg("decoder_state"), nb::arg("model_config"), nb::arg("max_num_sequences"),
+            nb::arg("fused_runtime_buffers") = std::nullopt)
         .def("name", [](MakeDecodingBatchInputOutput const&) { return MakeDecodingBatchInputOutput::name; });
 
-    py::class_<LogitsPostProcessor>(m, LogitsPostProcessor::name)
-        .def(py::init())
-        .def("__call__", &LogitsPostProcessor::operator(), py::arg("context_requests"), py::arg("generation_requests"),
-            py::arg("replicate_logits_post_processor"), py::arg("decoder_buffers"), py::arg("world_config"),
-            py::arg("runtime"), py::arg("logits_post_processor_batched") = std::nullopt)
+    nb::class_<LogitsPostProcessor>(m, LogitsPostProcessor::name)
+        .def(nb::init<>())
+        .def("__call__", &LogitsPostProcessor::operator(), nb::arg("context_requests"), nb::arg("generation_requests"),
+            nb::arg("replicate_logits_post_processor"), nb::arg("decoder_buffers"), nb::arg("world_config"),
+            nb::arg("runtime"), nb::arg("logits_post_processor_batched") = std::nullopt)
         .def("name", [](LogitsPostProcessor const&) { return LogitsPostProcessor::name; });
 
-    py::class_<CreateNewDecoderRequests>(m, CreateNewDecoderRequests::name)
-        .def(py::init<bool, bool, bool>(), py::arg("speculative_decoding_fast_logits"),
-            py::arg("is_leader_in_orch_mode"), py::arg("is_normalize_log_probs"))
+    nb::class_<CreateNewDecoderRequests>(m, CreateNewDecoderRequests::name)
+        .def(nb::init<bool, bool, bool>(), nb::arg("speculative_decoding_fast_logits"),
+            nb::arg("is_leader_in_orch_mode"), nb::arg("is_normalize_log_probs"))
         .def(
             "__call__",
             [](CreateNewDecoderRequests& self, tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
@@ -165,16 +159,16 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
                 return std::tuple{runtime::Torch::tensor(batchSlots), std::move(samplingConfigs),
                     std::move(lookaheadPrompt), std::move(lookaheadAlgoConfigs)};
             },
-            py::arg("model_config"), py::arg("world_config"), py::arg("decoding_config"), py::arg("context_requests"),
-            py::arg("buffer_manager"), py::arg("logits_type"), py::arg("decoder_input_buffers"),
-            py::arg("decoder_state"), py::arg("runtime_stream"), py::arg("decoder_stream"),
-            py::arg("max_sequence_length"), py::arg("beam_width"), py::arg("medusa_buffers") = std::nullopt)
+            nb::arg("model_config"), nb::arg("world_config"), nb::arg("decoding_config"), nb::arg("context_requests"),
+            nb::arg("buffer_manager"), nb::arg("logits_type"), nb::arg("decoder_input_buffers"),
+            nb::arg("decoder_state"), nb::arg("runtime_stream"), nb::arg("decoder_stream"),
+            nb::arg("max_sequence_length"), nb::arg("beam_width"), nb::arg("medusa_buffers") = std::nullopt)
         .def("name", [](CreateNewDecoderRequests const&) { return CreateNewDecoderRequests::name; });
 
-    py::class_<UpdateDecoderBuffers>(m, UpdateDecoderBuffers::name)
-        .def(py::init())
-        .def("__call__", &UpdateDecoderBuffers::operator(), py::arg("model_config"), py::arg("decoder_output_buffers"),
-            py::arg("copy_buffer_manager"), py::arg("decoder_state"), py::arg("return_log_probs"),
-            py::arg("decoder_finish_event"))
+    nb::class_<UpdateDecoderBuffers>(m, "UpdateDecoderBuffers")
+        .def(nb::init<>())
+        .def("__call__", &UpdateDecoderBuffers::operator(), nb::arg("model_config"),
+            nb::arg("decoder_output_buffers"), nb::arg("decoder_state"),
+            nb::arg("return_log_probs"), nb::arg("decoder_finish_event"))
         .def("name", [](UpdateDecoderBuffers const&) { return UpdateDecoderBuffers::name; });
 }

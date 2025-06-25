@@ -17,11 +17,11 @@
 
 #pragma once
 
-#include <pybind11/pybind11.h>
+#include <nanobind/nanobind.h>
 
 namespace tensorrt_llm::pybind::runtime
 {
 
-void initMoeBindings(pybind11::module_& m);
+void initMoeBindings(nanobind::module_& m);
 
 } // namespace tensorrt_llm::pybind::runtime
