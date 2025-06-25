@@ -19,16 +19,6 @@ def backend(request):
 
 
 @pytest.fixture(scope="module")
-def max_beam_width():
-    return 2
-
-
-@pytest.fixture(scope="module")
-def max_batch_size():
-    return "2"
-
-
-@pytest.fixture(scope="module")
 def max_seq_len():
     return "1024"
 

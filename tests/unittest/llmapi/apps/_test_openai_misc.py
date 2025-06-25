@@ -22,7 +22,7 @@ def max_seq_len(request):
     return request.param
 
 
-def test_version(server: "RemoteOpenAIServer"):
+def test_version(server: RemoteOpenAIServer):
     version_url = server.url_for("version")
     response = requests.get(version_url)
     assert response.status_code == 200
