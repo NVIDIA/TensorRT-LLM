@@ -413,7 +413,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
     std::optional<torch::Tensor> mla_context_paged_kv, std::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
     std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
-    bool const use_spec_dec, std::optional<torch::Tensor> spec_decoding_position_offsets,
+    bool const use_spec_decoding, std::optional<torch::Tensor> spec_decoding_position_offsets,
     std::optional<torch::Tensor> spec_decoding_packed_mask,
     std::optional<torch::Tensor> spec_decoding_generation_lengths)
 {
@@ -523,7 +523,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
 
     op->mAttentionChunkSize = attention_chunk_size;
 
-    op->mUseSpecDecoding = use_spec_dec; // true
+    op->mUseSpecDecoding = use_spec_decoding; // true
     op->mIsSpecDecodingEnabled = spec_decoding_position_offsets.has_value();
     op->mMultiBlockMode = !(op->mIsSpecDecodingEnabled);
 
@@ -782,7 +782,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? mla_context_kv_cache_block_offsets"
         ", int? attention_chunk_size"
         ", Tensor? softmax_stats_tensor"
-        ", bool use_spec_dec"
+        ", bool use_spec_decoding"
         ", Tensor? spec_decoding_position_offsets"
         ", Tensor? spec_decoding_packed_mask"
         ", Tensor? spec_decoding_generation_lengths"

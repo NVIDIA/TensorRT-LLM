@@ -720,7 +720,7 @@ def attention(
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
     softmax_stats_tensor: Optional[torch.Tensor],
-    use_spec_dec: bool,
+    use_spec_decoding: bool,
     spec_decoding_position_offsets: Optional[torch.Tensor],
     spec_decoding_packed_mask: Optional[torch.Tensor],
     spec_decoding_generation_lengths: Optional[torch.Tensor],
@@ -771,7 +771,7 @@ def attention(
         qk_nope_head_dim, qk_rope_head_dim, v_head_dim, mrope_rotary_cos_sin,
         mrope_position_deltas, mla_context_paged_kv,
         mla_context_kv_cache_block_offsets, attention_chunk_size,
-        softmax_stats_tensor, use_spec_dec, spec_decoding_position_offsets,
+        softmax_stats_tensor, use_spec_decoding, spec_decoding_position_offsets,
         spec_decoding_packed_mask, spec_decoding_generation_lengths)
 
     return output_act, output_sf
@@ -837,7 +837,7 @@ def _(
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
-    use_spec_dec: bool,
+    use_spec_decoding: bool,
     spec_decoding_position_offsets: Optional[torch.Tensor],
     spec_decoding_packed_mask: Optional[torch.Tensor],
     spec_decoding_generation_lengths: Optional[torch.Tensor],

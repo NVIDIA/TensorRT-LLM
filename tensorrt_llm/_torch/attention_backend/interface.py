@@ -316,6 +316,12 @@ class AttentionMetadata:
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
+    def update_spec_dec_param(self, has_spec_dec_tree, is_spec_dec_tree_linear,
+                              is_spec_dec_tree_dynamic, max_draft_tokens):
+        """
+        Hook to be called when using TRTLLM attention backend in spec-dec mode.
+        """
+
 
 class PositionalEmbedder(Protocol):
     """

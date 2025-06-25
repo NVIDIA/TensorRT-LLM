@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -229,9 +228,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     dtype: torch.dtype = torch.bfloat16
     # The index of the batche inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
-    spec_decoding_position_offsets: Optional[torch.Tensor] = None
-    spec_decoding_packed_mask: Optional[torch.Tensor] = None
-    spec_decoding_generation_lengths: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         if self.num_layers == 1:
@@ -252,25 +248,13 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             dtype=torch.int,
             device='cuda',
         )
-        self.spec_decoding_position_offsets = torch.empty(
-            [self.max_num_requests, self.max_draft_tokens + 1],
-            dtype=torch.int,
-            device='cuda',
-        )
 
-        self.spec_decoding_packed_mask = torch.empty(
-            [
-                self.max_num_requests, self.max_draft_tokens + 1,
-                math.ceil(self.max_draft_tokens / 32)
-            ],
-            dtype=torch.int,
-            device='cuda',
-        )
-        self.spec_decoding_generation_lengths = torch.empty(
-            [self.max_num_requests],
-            dtype=torch.int,
-            device='cuda',
-        )
+        # currently Eagle3 only supports linear tree
+        self.has_spec_dec_tree = True
+        self.is_spec_dec_tree_linear = True
+
+        # currently Eagle3 only supports static tree
+        self.is_spec_dec_tree_dynamic = False
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
@@ -286,22 +270,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
         self.num_tokens -= (self.num_generations) * self.max_draft_tokens
-        position_offset = torch.arange(self.max_draft_tokens + 1,
-                                       dtype=torch.int,
-                                       device='cpu',
-                                       pin_memory=True)
-        dummy_idx = torch.arange(self.max_draft_tokens + 1)
-        spec_decoding_packed_mask = torch.pow(2, dummy_idx + 1) - 1
-
-        self.spec_decoding_position_offsets.copy_(position_offset,
-                                                  non_blocking=True)
-        self.spec_decoding_packed_mask[:, :, 0].copy_(spec_decoding_packed_mask,
-                                                      non_blocking=True)
-
-        spec_decoding_generation_length = torch.full((num_seqs, ),
-                                                     self.max_draft_tokens + 1)
-        self.spec_decoding_generation_lengths[:num_seqs].copy_(
-            spec_decoding_generation_length, non_blocking=True)
 
     def maybe_capture_hidden_states(
             self,
@@ -368,7 +336,7 @@ class Eagle3OneModelWorker(nn.Module):
         next_draft_tokens = []
         for i in range(self.max_draft_tokens):
             hidden_states, hidden_states_to_save = draft_model.model(**inputs)
-            spec_metadata.use_spec_dec = False
+            attn_metadata.use_spec_decoding = False
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
                                  (self.max_draft_tokens + 1)).long()
@@ -431,7 +399,7 @@ class Eagle3OneModelWorker(nn.Module):
         next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
                                        dim=1)
 
-        spec_metadata.use_spec_dec = True
+        attn_metadata.use_spec_decoding = True
 
         return {
             'logits': raw_logits,
@@ -544,8 +512,8 @@ class Eagle3OneModelWorker(nn.Module):
         # get draft inputs
         input_ids = torch.concat([input_ids_ctx, input_ids_gen], dim=0)
 
-        # set use_spec_dec = true for attention.py
-        spec_metadata.use_spec_dec = True
+        # set use_spec_decoding = true for the 1st eagle head step
+        attn_metadata.use_spec_decoding = True
 
         return {
             "input_ids": input_ids,

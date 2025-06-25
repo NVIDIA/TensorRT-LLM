@@ -88,12 +88,6 @@ class SpeculativeDecodingMode(IntEnum):
                 and not (isinstance(attention_backend, TrtllmAttention)
                          and get_sm_version() == 100)) or self.is_ngram()
 
-    def require_multi_query_attn_kernel(
-            self, attention_backend: Type[AttentionBackend]):
-        return (self.is_eagle3_one_model()
-                and issubclass(attention_backend, TrtllmAttention)
-                and get_sm_version() < 100)
-
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
         if name is None:
@@ -180,7 +174,12 @@ class SpecMetadata:
     # The number of layers
     num_layers: int = 0
 
-    use_spec_dec: bool = False
+    # some spec-dec method needs a tree-based spec_dec tree
+    has_spec_dec_tree: bool = False
+    # if spec-dec tree is linear, the mask can be computed in an easier way.
+    is_spec_dec_tree_linear: bool = True
+    # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
+    is_spec_dec_tree_dynamic: bool = False
 
     def prepare(self):
         """
