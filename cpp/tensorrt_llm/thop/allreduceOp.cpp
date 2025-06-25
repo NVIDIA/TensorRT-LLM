@@ -913,10 +913,10 @@ private:
         else
         {
             static char* threshold_ptr = std::getenv("ALLREDUCE_AUTO_HEURISTIC_MIN_LATENCY_THRESHOLD_TOKEN_NUM");
-            int threshold = 128;
+            size_t threshold = 128;
             if (threshold_ptr)
             {
-                threshold = std::atoi(threshold_ptr);
+                threshold = static_cast<size_t>(std::atoi(threshold_ptr));
             }
             // Generally, NCCL is faster than MIN_LATENCY when the token number is greater than 256. I conservatively
             // set the threshold here to 128 tokens.
