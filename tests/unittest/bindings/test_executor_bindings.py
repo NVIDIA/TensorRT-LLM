@@ -1231,6 +1231,9 @@ def test_kv_cache_config():
     assert config.onboard_blocks == True
     assert config.secondary_offload_min_priority is None
     assert config.event_buffer_max_size == 0
+    assert config.enable_partial_reuse == True
+    assert config.copy_on_partial_reuse == True
+    assert config.use_uvm == False
 
     config.enable_block_reuse = False
     config.max_tokens = 1
@@ -1242,6 +1245,9 @@ def test_kv_cache_config():
     config.onboard_blocks = False
     config.secondary_offload_min_priority = 50
     config.event_buffer_max_size = 1024
+    config.enable_partial_reuse = False
+    config.copy_on_partial_reuse = False
+    config.use_uvm = True
     assert config.enable_block_reuse == False
     assert config.max_tokens == 1
     assert config.max_attention_window == [2]
@@ -1252,6 +1258,9 @@ def test_kv_cache_config():
     assert config.onboard_blocks == False
     assert config.secondary_offload_min_priority == 50
     assert config.event_buffer_max_size == 1024
+    assert config.enable_partial_reuse == False
+    assert config.copy_on_partial_reuse == False
+    assert config.use_uvm == True
 
     kwargs = {
         "enable_block_reuse": True,
@@ -1262,7 +1271,10 @@ def test_kv_cache_config():
         "cross_kv_cache_fraction": 0.5,
         "host_cache_size": 1024,
         "onboard_blocks": False,
-        "event_buffer_max_size": 2048
+        "event_buffer_max_size": 2048,
+        "enable_partial_reuse": True,
+        "copy_on_partial_reuse": False,
+        "use_uvm": True
     }
     config = trtllm.KvCacheConfig(**kwargs)
     for k, v in kwargs.items():
@@ -2252,9 +2264,18 @@ def test_scheduler_config_pickle():
 def test_kv_cache_config_pickle():
     config = trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5)
     config.enable_block_reuse = True
+    config.max_tokens = 1
+    config.max_attention_window = [2]
+    config.sink_token_length = 3
     config.free_gpu_memory_fraction = 0.3
     config.cross_kv_cache_fraction = 0.5
+    config.host_cache_size = 4
+    config.onboard_blocks = False
+    config.secondary_offload_min_priority = 50
     config.event_buffer_max_size = 1024
+    config.enable_partial_reuse = False
+    config.copy_on_partial_reuse = False
+    config.use_uvm = True
     config_copy = pickle.loads(pickle.dumps(config))
     assert config.enable_block_reuse == config_copy.enable_block_reuse
     assert config.max_tokens == config_copy.max_tokens
@@ -2264,7 +2285,11 @@ def test_kv_cache_config_pickle():
     assert config.cross_kv_cache_fraction == config_copy.cross_kv_cache_fraction
     assert config.host_cache_size == config_copy.host_cache_size
     assert config.onboard_blocks == config_copy.onboard_blocks
+    assert config.secondary_offload_min_priority == config_copy.secondary_offload_min_priority
     assert config.event_buffer_max_size == config_copy.event_buffer_max_size
+    assert config.enable_partial_reuse == config_copy.enable_partial_reuse
+    assert config.copy_on_partial_reuse == config_copy.copy_on_partial_reuse
+    assert config.use_uvm == config_copy.use_uvm
 
 
 def test_kv_cache_retention_config_pickle():
