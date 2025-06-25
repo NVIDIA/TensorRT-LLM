@@ -196,7 +196,7 @@ class WideEPMoE(MoE):
                                             hidden_size, self.num_slots)
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {alltoall_method_type!r}"
+                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
@@ -433,7 +433,7 @@ class WideEPMoE(MoE):
                         token_selected_slots, dtype=token_final_scales.dtype)
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {alltoall_method_type!r}"
+                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         x_sf = None
@@ -552,7 +552,7 @@ class WideEPMoE(MoE):
                 )
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {alltoall_method_type!r}"
+                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         if self.enable_alltoall:
@@ -631,7 +631,7 @@ class WideEPMoE(MoE):
                     deep_ep_topk_weights, deep_ep_handle)
             else:
                 raise NotImplementedError(
-                    f"Not available alltoall method type: {alltoall_method_type!r}"
+                    f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(

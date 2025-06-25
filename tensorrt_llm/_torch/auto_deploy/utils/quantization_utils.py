@@ -136,7 +136,7 @@ class QuantizationImpl:
 class FP8QuantizationImpl(QuantizationImpl):
     @staticmethod
     def target_op():
-        return torch.ops.quant.fp8_linear
+        return torch.ops.auto_deploy.torch_quant_fp8_linear
 
     @staticmethod
     def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
@@ -207,7 +207,7 @@ def _shard_fp4_weight_scale(weight_scale, sharded_uint8_weight_shape, dim, rank,
 class FP4QuantizationImpl(QuantizationImpl):
     @staticmethod
     def target_op():
-        return torch.ops.quant.fp4_linear
+        return torch.ops.auto_deploy.torch_quant_fp4_linear
 
     @staticmethod
     def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
