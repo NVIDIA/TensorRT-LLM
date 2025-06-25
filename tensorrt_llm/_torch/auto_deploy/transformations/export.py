@@ -213,7 +213,7 @@ _torch_where_patch.where_original = torch.where
 def _torch_linear_patch(
     input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    return torch.ops.linear.simple(input, weight, bias)
+    return torch.ops.auto_deploy.torch_linear_simple(input, weight, bias)
 
 
 # TODO: remove once https://github.com/pytorch/pytorch/issues/142439 is resolved
@@ -336,7 +336,7 @@ def torch_export_to_gm(
     # there is no guarantee how it is represented and we need to make sure it is easily identifiable
     # in the graph.
     sdpa_original = F.scaled_dot_product_attention
-    F.scaled_dot_product_attention = torch.ops.attention.scaled_dot_product_attention
+    F.scaled_dot_product_attention = torch.ops.auto_deploy.torch_attention_sdpa
 
     # We overwrite the linear functional as well. This basically avoids exporting the view ops
     # that are used to flatten/unflatten multiple batch dimensions of the input tensor.

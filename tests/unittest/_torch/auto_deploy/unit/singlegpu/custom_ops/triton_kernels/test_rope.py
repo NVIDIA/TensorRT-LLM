@@ -34,7 +34,7 @@ def test_rope(d_head):
     y_ref = torch_rope_reference(x, freqs_cis, input_position)
     freqs_cis = freqs_cis.to("cuda")
     x_reshaped = x.unflatten(-1, (N_ELEM // 2, 2)).transpose(-1, -2).flatten(-2).contiguous()
-    y = torch.ops.rope.apply_rope_with_input_pos(
+    y = torch.ops.auto_deploy.triton_rope_with_input_pos(
         x_reshaped.to("cuda"), freqs_cis, input_position, "bsnd"
     )
     y_reshaped = y.unflatten(-1, (2, N_ELEM // 2)).transpose(-2, -1).flatten(-2).contiguous()
@@ -64,7 +64,7 @@ def test_rope_flattened(d_head):
     seq_start_indices = torch.zeros(len(SEQ_LENS), dtype=torch.int32, device="cuda")
     seq_start_indices[1:] = torch.cumsum(seq_lens[:-1], 0)
 
-    y = torch.ops.rope.apply_rope_on_flattened_inputs(
+    y = torch.ops.auto_deploy.triton_rope_on_flattened_inputs(
         x_reshaped.to("cuda"), freqs_cis, input_position, seq_lens, seq_start_indices
     )
     y_reshaped = y.unflatten(-1, (2, N_ELEM // 2)).transpose(-2, -1).flatten(-2).contiguous()
