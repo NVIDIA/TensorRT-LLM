@@ -33,7 +33,7 @@ using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Run
 at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, at::Tensor const& routing_bias,
     at::Tensor const& hidden_states, at::Tensor const& hidden_states_scale, at::Tensor const& gemm1_weights,
     at::Tensor const& gemm1_weights_scale, at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale,
-    int64_t const num_experts, int64_t const top_k, std::optional<bool> const fuse_shared_expert, int64_t const n_group,
+    int64_t const num_experts, int64_t const top_k, bool const fuse_shared_expert, int64_t const n_group,
     int64_t const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
     int64_t const local_num_experts, double const routed_scaling_factor, int64_t const tile_tokens_dim,
     int64_t const routing_method_type, MoeRunnerType& moe_runner, int64_t moeConfigIndex)
@@ -69,9 +69,9 @@ at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, at::Tensor 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoERunnerArgs args;
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
 
-    int64_t const num_total_experts = num_experts + (fuse_shared_expert.value_or(false) ? 1 : 0);
-    int64_t const total_experts_per_token = top_k + (fuse_shared_expert.value_or(false) ? 1 : 0);
-    int64_t const num_total_local_experts = local_num_experts + (fuse_shared_expert.value_or(false) ? 1 : 0);
+    int64_t const num_total_experts = num_experts + (fuse_shared_expert ? 1 : 0);
+    int64_t const total_experts_per_token = top_k + (fuse_shared_expert ? 1 : 0);
+    int64_t const num_total_local_experts = local_num_experts + (fuse_shared_expert ? 1 : 0);
 
     // setup args
     // note: the assumption is that output data type is always Bfloat16 (the default)
@@ -89,7 +89,7 @@ at::Tensor run_fp8_block_scale_moe(at::Tensor const& routing_logits, at::Tensor 
     args.num_experts = num_experts;
     args.hidden_size = hidden_states.sizes()[1];
     args.top_k = top_k;
-    args.fuse_shared_expert = fuse_shared_expert.value_or(false);
+    args.fuse_shared_expert = fuse_shared_expert;
     args.n_group = n_group;
     args.topk_group = topk_group;
     args.local_expert_offset = local_expert_offset;
@@ -249,8 +249,8 @@ public:
     [[nodiscard]] at::Tensor run(at::Tensor const& routing_logits, at::Tensor const& routing_bias,
         at::Tensor const& hidden_states, at::Tensor const& hidden_states_scale, at::Tensor const& gemm1_weights,
         at::Tensor const& gemm1_weights_scale, at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale,
-        int64_t num_experts, int64_t top_k, int64_t n_group, int64_t topk_group, int64_t intermediate_size,
-        int64_t local_expert_offset, int64_t local_num_experts, double routed_scaling_factor,
+        int64_t num_experts, int64_t top_k, bool fuse_shared_expert, int64_t n_group, int64_t topk_group,
+        int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts, double routed_scaling_factor,
         int64_t routing_method_type, int64_t moeConfigIndex)
     {
 
@@ -265,9 +265,9 @@ public:
         }
 
         return run_fp8_block_scale_moe(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
-            gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, num_experts, top_k, n_group, topk_group,
-            intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, mTileTokensDim,
-            routing_method_type, *mRunner, moeConfigIndex);
+            gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, num_experts, top_k, fuse_shared_expert, n_group,
+            topk_group, intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor,
+            mTileTokensDim, routing_method_type, *mRunner, moeConfigIndex);
     }
 
 private:
