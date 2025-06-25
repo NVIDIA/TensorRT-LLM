@@ -58,7 +58,7 @@ QWEN2_57B_A14B_CONFIG = {
 @dataclass(repr=False)
 class Scenario:
     backend: str
-    use_cuda_graph: bool = False
+    use_cuda_graph: bool = True
 
     def __repr__(self) -> str:
         return f"backend:{self.backend.lower()}-use_cuda_graph:{self.use_cuda_graph}"
