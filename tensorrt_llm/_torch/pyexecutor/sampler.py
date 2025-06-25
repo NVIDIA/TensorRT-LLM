@@ -23,6 +23,7 @@ from tensorrt_llm.bindings.internal.runtime import (BufferManager, DecoderState,
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.mapping import Mapping
 
+from .finish_reason import FinishedState
 from .llm_request import LlmRequest, LlmRequestState
 from .scheduler import ScheduledRequests
 
@@ -648,6 +649,7 @@ class TRTLLMSampler(Sampler):
             for beam in range(beam_width):
                 seq_len = sequence_lengths_host_data[seq_slot * beam_width +
                                                      beam].item()
+                seq_len = seq_len + 1 if self.is_trt_overlap else seq_len
                 num_new_tokens[beam] = min(
                     num_generated_tokens,
                     seq_len - request.get_num_tokens(beam))
@@ -678,9 +680,10 @@ class TRTLLMSampler(Sampler):
                         state.host.cum_log_probs[seq_slot * beam_width +
                                                  beam].item())
 
-                finish_reason = finish_reasons_host[seq_slot * beam_width +
-                                                    beam].item()
-                request.set_finished_reason(FinishReason(finish_reason), beam)
+                finish_reason = FinishedState(
+                    finish_reasons_host[seq_slot * beam_width +
+                                        beam].item()).to_finish_reason()
+                request.set_finished_reason(finish_reason, beam)
 
             if request.py_return_log_probs:
                 request.py_result.append_log_probs([log_probs], cum_log_probs)

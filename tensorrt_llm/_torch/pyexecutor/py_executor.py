@@ -1544,6 +1544,9 @@ class PyExecutor:
             self.resource_manager.resource_managers[
                 ResourceManagerType.KV_CACHE_MANAGER].prepare_resources(
                     disagg_gen_init_to_prepare)
+            self.resource_manager.resource_managers[
+                ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
+                    disagg_gen_init_to_prepare)
 
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
