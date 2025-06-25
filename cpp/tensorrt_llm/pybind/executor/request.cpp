@@ -688,6 +688,22 @@ void initRequestBindings(pybind11::module_& m)
 
     auto requestPerfMetrics = py::class_<tle::RequestPerfMetrics>(m, "RequestPerfMetrics");
 
+    auto timingMetricsGetstate = [](tle::RequestPerfMetrics::TimingMetrics const& self)
+    {
+        return py::make_tuple(self.arrivalTime, self.firstScheduledTime, self.firstTokenTime, self.lastTokenTime,
+            self.kvCacheTransferStart, self.kvCacheTransferEnd, self.kvCacheSize);
+    };
+    auto timingMetricsSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 7)
+        {
+            throw std::runtime_error("Invalid TimingMetrics state!");
+        }
+        return tle::RequestPerfMetrics::TimingMetrics{state[0].cast<tle::RequestPerfMetrics::TimePoint>(),
+            state[1].cast<tle::RequestPerfMetrics::TimePoint>(), state[2].cast<tle::RequestPerfMetrics::TimePoint>(),
+            state[3].cast<tle::RequestPerfMetrics::TimePoint>(), state[4].cast<tle::RequestPerfMetrics::TimePoint>(),
+            state[5].cast<tle::RequestPerfMetrics::TimePoint>(), state[6].cast<size_t>()};
+    };
     py::class_<tle::RequestPerfMetrics::TimingMetrics>(m, "TimingMetrics")
         .def(py::init<>())
         .def_readwrite("arrival_time", &tle::RequestPerfMetrics::TimingMetrics::arrivalTime)
@@ -695,22 +711,70 @@ void initRequestBindings(pybind11::module_& m)
         .def_readwrite("first_token_time", &tle::RequestPerfMetrics::TimingMetrics::firstTokenTime)
         .def_readwrite("last_token_time", &tle::RequestPerfMetrics::TimingMetrics::lastTokenTime)
         .def_readwrite("kv_cache_transfer_start", &tle::RequestPerfMetrics::TimingMetrics::kvCacheTransferStart)
-        .def_readwrite("kv_cache_transfer_end", &tle::RequestPerfMetrics::TimingMetrics::kvCacheTransferEnd);
+        .def_readwrite("kv_cache_transfer_end", &tle::RequestPerfMetrics::TimingMetrics::kvCacheTransferEnd)
+        .def_readwrite("kv_cache_size", &tle::RequestPerfMetrics::TimingMetrics::kvCacheSize)
+        .def(py::pickle(timingMetricsGetstate, timingMetricsSetstate));
 
+    auto kvCacheMetricsGetstate = [](tle::RequestPerfMetrics::KvCacheMetrics const& self)
+    {
+        return py::make_tuple(self.numTotalAllocatedBlocks, self.numNewAllocatedBlocks, self.numReusedBlocks,
+            self.numMissedBlocks, self.kvCacheHitRate);
+    };
+    auto kvCacheMetricsSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 5)
+        {
+            throw std::runtime_error("Invalid KvCacheMetrics state!");
+        }
+        return tle::RequestPerfMetrics::KvCacheMetrics{state[0].cast<SizeType32>(), state[1].cast<SizeType32>(),
+            state[2].cast<SizeType32>(), state[3].cast<SizeType32>(), state[4].cast<float>()};
+    };
     py::class_<tle::RequestPerfMetrics::KvCacheMetrics>(m, "KvCacheMetrics")
         .def(py::init<>())
         .def_readwrite("num_total_allocated_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numTotalAllocatedBlocks)
         .def_readwrite("num_new_allocated_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numNewAllocatedBlocks)
         .def_readwrite("num_reused_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numReusedBlocks)
         .def_readwrite("num_missed_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numMissedBlocks)
-        .def_readwrite("kv_cache_hit_rate", &tle::RequestPerfMetrics::KvCacheMetrics::kvCacheHitRate);
+        .def_readwrite("kv_cache_hit_rate", &tle::RequestPerfMetrics::KvCacheMetrics::kvCacheHitRate)
+        .def(py::pickle(kvCacheMetricsGetstate, kvCacheMetricsSetstate));
+
+    auto speculativeDecodingMetricsGetstate = [](tle::RequestPerfMetrics::SpeculativeDecodingMetrics const& self)
+    { return py::make_tuple(self.acceptanceRate, self.totalAcceptedDraftTokens, self.totalDraftTokens); };
+    auto speculativeDecodingMetricsSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 3)
+        {
+            throw std::runtime_error("Invalid SpeculativeDecodingMetrics state!");
+        }
+        return tle::RequestPerfMetrics::SpeculativeDecodingMetrics{
+            state[0].cast<float>(), state[1].cast<SizeType32>(), state[2].cast<SizeType32>()};
+    };
 
     py::class_<tle::RequestPerfMetrics::SpeculativeDecodingMetrics>(m, "SpeculativeDecodingMetrics")
         .def(py::init<>())
         .def_readwrite("acceptance_rate", &tle::RequestPerfMetrics::SpeculativeDecodingMetrics::acceptanceRate)
         .def_readwrite("total_accepted_draft_tokens",
             &tle::RequestPerfMetrics::SpeculativeDecodingMetrics::totalAcceptedDraftTokens)
-        .def_readwrite("total_draft_tokens", &tle::RequestPerfMetrics::SpeculativeDecodingMetrics::totalDraftTokens);
+        .def_readwrite("total_draft_tokens", &tle::RequestPerfMetrics::SpeculativeDecodingMetrics::totalDraftTokens)
+        .def(py::pickle(speculativeDecodingMetricsGetstate, speculativeDecodingMetricsSetstate));
+
+    auto requestPerfMetricsGetstate = [](tle::RequestPerfMetrics const& self)
+    {
+        return py::make_tuple(self.timingMetrics, self.kvCacheMetrics, self.speculativeDecoding, self.firstIter,
+            self.lastIter, self.iter);
+    };
+    auto requestPerfMetricsSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 6)
+        {
+            throw std::runtime_error("Invalid RequestPerfMetrics state!");
+        }
+        return tle::RequestPerfMetrics{state[0].cast<tle::RequestPerfMetrics::TimingMetrics>(),
+            state[1].cast<tle::RequestPerfMetrics::KvCacheMetrics>(),
+            state[2].cast<tle::RequestPerfMetrics::SpeculativeDecodingMetrics>(),
+            state[3].cast<std::optional<tle::IterationType>>(), state[4].cast<std::optional<tle::IterationType>>(),
+            state[5].cast<std::optional<tle::IterationType>>()};
+    };
 
     // There's a circular dependency between the declaration of the TimingMetrics and RequestPerfMetrics bindings.
     // Defer definition of the RequestPerfMetrics bindings until the TimingMetrics have been defined.
@@ -720,7 +784,8 @@ void initRequestBindings(pybind11::module_& m)
         .def_readwrite("speculative_decoding", &tle::RequestPerfMetrics::speculativeDecoding)
         .def_readwrite("first_iter", &tle::RequestPerfMetrics::firstIter)
         .def_readwrite("last_iter", &tle::RequestPerfMetrics::lastIter)
-        .def_readwrite("iter", &tle::RequestPerfMetrics::iter);
+        .def_readwrite("iter", &tle::RequestPerfMetrics::iter)
+        .def(py::pickle(requestPerfMetricsGetstate, requestPerfMetricsSetstate));
 
     py::class_<tle::AdditionalOutput>(m, "AdditionalOutput")
         .def(py::init([](std::string const& name, tle::Tensor const& output)
@@ -730,7 +795,7 @@ void initRequestBindings(pybind11::module_& m)
 
     auto resultSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 12)
+        if (state.size() != 13)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -747,6 +812,7 @@ void initRequestBindings(pybind11::module_& m)
         result.isSequenceFinal = state[9].cast<bool>();
         result.decodingIter = state[10].cast<SizeType32>();
         result.contextPhaseParams = state[11].cast<std::optional<tle::ContextPhaseParams>>();
+        result.requestPerfMetrics = state[12].cast<std::optional<tle::RequestPerfMetrics>>();
         return std::make_unique<tle::Result>(result);
     };
 
@@ -754,7 +820,7 @@ void initRequestBindings(pybind11::module_& m)
     {
         return py::make_tuple(self.isFinal, self.outputTokenIds, self.cumLogProbs, self.logProbs, self.contextLogits,
             self.generationLogits, self.encoderOutput, self.finishReasons, self.sequenceIndex, self.isSequenceFinal,
-            self.decodingIter, self.contextPhaseParams);
+            self.decodingIter, self.contextPhaseParams, self.requestPerfMetrics);
     };
 
     py::class_<tle::Result>(m, "Result")

@@ -84,6 +84,7 @@ class CompletionOutput:
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
         generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.
         disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Parameters needed for disaggregated serving. Includes the type of request, the first generated tokens, the context request id and the any additional state needing to be transferred from context and generation instances. Defaults to None.
+        request_perf_metrics (tensorrt_llm.executor.RequestPerfMetrics, optional): Performance metrics for the request. Defaults to None.
 
     Attributes:
         length (int): The number of generated tokens.
@@ -102,6 +103,7 @@ class CompletionOutput:
     stop_reason: Optional[Union[int, str]] = None
     generation_logits: Optional[torch.Tensor] = None
     disaggregated_params: Optional[DisaggregatedParams] = None
+    request_perf_metrics: Optional[tllm.RequestPerfMetrics] = None
 
     # hidden fields for tracking the diffs
     _last_text_len: int = field(default=0, init=False, repr=False)
@@ -236,6 +238,9 @@ class GenerationResultBase:
         if finish_reasons and finish_reasons[
                 src_idx] == tllm.FinishReason.CANCELLED:
             output.finish_reason = 'cancelled'
+
+        if response_tensors.request_perf_metrics is not None:
+            output.request_perf_metrics = response_tensors.request_perf_metrics
 
         if self._done:
             if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
