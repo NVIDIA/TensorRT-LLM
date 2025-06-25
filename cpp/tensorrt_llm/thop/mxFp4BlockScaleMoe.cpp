@@ -337,7 +337,14 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(
         dtype, btg::Dtype::MxE2m1, args.mUseDeepSeekFp8, tile_tokens_dim, actType);
-    auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args);
+
+    // TODO: enable autotuner
+    auto const num_tokens = hidden_states.sizes()[0];
+    auto const hidden_size = hidden_states.sizes()[1];
+    auto const moeConfigIndex
+        = moe_runner.getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
+
+    auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
     at::Tensor workspace_fc1 = at::detail::empty_cuda(
         {std::get<0>(workspace_sizes)}, at::ScalarType::Char, hidden_states.device(), std::nullopt);
     at::Tensor workspace_fc2 = at::detail::empty_cuda(
@@ -345,7 +352,7 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::Tensor const& routing_l
     workspace.bmm1_workspace = workspace_fc1.data_ptr();
     workspace.bmm2_workspace = workspace_fc2.data_ptr();
     auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
-    moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream);
+    moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
     return output;
 }
 

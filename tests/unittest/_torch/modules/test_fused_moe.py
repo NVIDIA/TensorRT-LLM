@@ -28,9 +28,12 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import \
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
-from tensorrt_llm._torch.modules.fused_moe import (
-    BaseMoeRoutingMethod, CutlassFusedMoE, DefaultMoeRoutingMethod,
-    RenormalizeMoeRoutingMethod, TritonFusedMoE, VanillaMoE, create_moe, WideEPMoE)
+from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
+                                                   CutlassFusedMoE,
+                                                   DefaultMoeRoutingMethod,
+                                                   RenormalizeMoeRoutingMethod,
+                                                   TritonFusedMoE, VanillaMoE,
+                                                   create_moe, WideEPMoE)
 # isort: on
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._utils import mpi_rank

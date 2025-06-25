@@ -836,8 +836,6 @@ class TestMoeFP8:
         assert top_k <= num_experts
         assert top_k <= 8
         assert num_experts % 4 == 0
-        assert hidden_size % 128 == 0
-        assert intermediate_size % 128 == 0
 
         if are_groups_valid(top_k_groups, n_groups):
             assert top_k_groups <= 4
@@ -1053,8 +1051,6 @@ class TestMoeFp4:
 
         assert top_k <= num_experts
         assert top_k <= 8
-        assert hidden_size % 128 == 0
-        assert intermediate_size % 128 == 0
         assert num_experts % 4 == 0
 
         if are_groups_valid(top_k_groups, n_groups):
@@ -1288,8 +1284,6 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
     assert top_k <= num_experts
     assert top_k <= 8
     assert num_experts % 4 == 0
-    assert hidden_size % 128 == 0
-    assert intermediate_size % 128 == 0
 
     if are_groups_valid(top_k_groups, n_groups):
         assert top_k_groups <= 4
@@ -1460,6 +1454,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     assert top_k <= 8
     assert hidden_size % 128 == 0
     assert intermediate_size % 128 == 0
+
     if are_groups_valid(top_k_groups, n_groups):
         assert top_k_groups == 4
         assert num_experts > n_groups

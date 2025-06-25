@@ -366,7 +366,7 @@ Runner::Runner(
     : mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim, actType))
     , mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim))
 {
-        auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
+    auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
     auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
 
     auto const totalPassingIndices = gemm1PassingIndices.size() * gemm2PassingIndices.size();
