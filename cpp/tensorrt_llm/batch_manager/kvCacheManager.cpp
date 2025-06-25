@@ -1095,7 +1095,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                     // Somebody else is using block or it is not a leaf, copy reusable tokens
                     auto newBlock = getFreeBlock(config, matchingBlock->getPriority(), matchingBlock->getDurationMs());
                     mTransferManager->onboard(
-                        matchingBlock, newBlock, mPools, config.getTransferMode(), config.getDirectory());
+                        matchingBlock, newBlock, mPools, config.getTransferMode(), config.getDirectory(), numMatched);
                     // TODO: (optional) Send out event
                     matchingBlock = newBlock;
                     TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Copied partially filled block %d", mLogPrefix.c_str(),
