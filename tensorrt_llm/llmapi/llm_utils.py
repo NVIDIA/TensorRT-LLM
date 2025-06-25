@@ -680,8 +680,6 @@ class CachedModelLoader:
                 self.llm_build_stats.engine_dir = self.model_loader.model_obj.model_dir
                 return self.llm_build_stats.engine_dir, self._hf_model_dir
 
-        self.force_dynamic_quantization = self.llm_args.force_dynamic_quantization
-
         return self._build_model(), self._hf_model_dir
 
     def get_engine_dir(self) -> Path:
