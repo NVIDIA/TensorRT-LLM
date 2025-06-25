@@ -456,31 +456,25 @@ void initConfigBindings(nanobind::module_& m)
     {
         try
         {
-            std::cout << "[DEBUG] executorConfigSetState called" << std::endl;
-            std::cout << "[DEBUG] state.size(): " << state.size() << std::endl;
-
             if (state.size() != 2)
             {
                 throw std::runtime_error("Invalid state!");
             }
 
-            std::cout << "executorConfigSetState restoring dynamic attributes" << std::endl;
-            // auto py_state = nb::cast<nb::dict>(state[1]);
-            // Restore dynamic attributes
-            // Restore C++ data
             auto cpp_states = nb::cast<nb::tuple>(state[0]);
             auto py_state = nb::cast<nb::dict>(state[1]);
             if (cpp_states.size() != 28)
             {
                 throw std::runtime_error("Invalid cpp_states!");
             }
-            // tle::ExecutorConfig* cpp_self = nb::cast<tle::ExecutorConfig*>(self);
+            // Restore dynamic attributes
             nb::dict self_dict = nb::cast<nb::dict>(self.attr("__dict__"));
             for (auto item : py_state)
             {
                 self_dict[item.first] = item.second;
             }
 
+            // Restore C++ data
             tle::ExecutorConfig* cpp_self = nb::inst_ptr<tle::ExecutorConfig>(self);
             new (cpp_self) tle::ExecutorConfig(                                          //
                 nb::cast<SizeType32>(cpp_states[0]),                                     // MaxBeamWidth
@@ -515,14 +509,12 @@ void initConfigBindings(nanobind::module_& m)
             );
 
             nb::inst_mark_ready(self);
-            // return std::make_pair(ec, py_state);
         }
         catch (const std::exception& e)
         {
             std::cerr << "[ERROR] Exception in executorConfigSetState: " << e.what() << std::endl;
             throw;
         }
-        std::cout << "finished" << std::endl;
         return self;
     };
 

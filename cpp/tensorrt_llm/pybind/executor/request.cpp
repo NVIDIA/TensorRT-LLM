@@ -25,7 +25,9 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/list.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
@@ -809,16 +811,10 @@ void initRequestBindings(nanobind::module_& m)
         .def("__setstate__", resultSetstate);
 
     m.def("deserialize_result",
-        [](std::string& x)
+        [](nb::bytes& x)
         {
-            std::istringstream is(x);
-            return tle::serialize_utils::deserialize<tle::Result>(is);
-        });
-
-    m.def("deserialize_result",
-        [](std::string& x)
-        {
-            std::istringstream is(x);
+            std::string str(x.c_str(), x.size());
+            std::istringstream is(str);
             return tle::serialize_utils::deserialize<tle::Result>(is);
         });
 

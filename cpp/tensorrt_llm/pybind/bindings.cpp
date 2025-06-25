@@ -110,7 +110,7 @@ NB_MODULE(bindings, m)
     nb::class_<tr::CudaStream>(m, "CudaStream")
         .def(
             "__init__",
-            [](nb::object* self, nb::object py_stream)
+            [](tr::CudaStream* self, nb::object py_stream)
             {
                 cudaStream_t stream = reinterpret_cast<cudaStream_t>(nb::cast<uintptr_t>(py_stream));
                 new (self) tr::CudaStream{stream};
