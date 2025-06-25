@@ -63,7 +63,10 @@ def temp_extra_llm_api_options_file(extra_llm_api_options_dict: dict):
 
 
 @pytest.fixture(scope="module")
-def server(request, model_path):
+def server(request, model_path, backend=None, num_postprocess_workers=None, 
+           extra_llm_api_options=None, max_beam_width=None, tp_size=None, 
+           max_batch_size=None, max_seq_len=None, build_engine=None, 
+           engine_from_fp8_quantization=None, reasoning_parser=None, port=None):
     args = []
 
     if 'backend' in request.fixturenames:
