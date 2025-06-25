@@ -862,7 +862,7 @@ class _TorchLLM(BaseLLM):
                  **kwargs: Any) -> None:
 
         # TODO: deprecate backend in LLM kwargs
-        kwargs.pop("backend", None)
+        backend = kwargs.pop("backend", "pytorch")
 
         # Validate that users don't pass TrtLlmArgs-specific arguments
         self._validate_args_for_torch_backend(kwargs)
@@ -876,7 +876,7 @@ class _TorchLLM(BaseLLM):
                          dtype,
                          revision,
                          tokenizer_revision,
-                         backend='pytorch',
+                         backend=backend,
                          **kwargs)
 
     def _build_model(self):
