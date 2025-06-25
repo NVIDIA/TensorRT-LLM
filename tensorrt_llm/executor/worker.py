@@ -18,8 +18,10 @@ from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
                       mpi_comm, mpi_rank, nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import PybindMirror
+from ..llmapi.llm_args import PybindMirror, TorchLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
+from ..llmapi.tokenizer import (_llguidance_tokenizer_info,
+                                _xgrammar_tokenizer_info)
 from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             clear_sched_affinity, print_colored_debug,
@@ -59,6 +61,8 @@ class GenerationExecutorWorker(GenerationExecutor):
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
+        hf_model_dir: Optional[Path] = None,
+        llm_args: Optional[TorchLlmArgs] = None,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
@@ -79,8 +83,7 @@ class GenerationExecutorWorker(GenerationExecutor):
         self._await_response_helper = AwaitResponseHelper(
             self)  # TODO: make it weakref
         self._executor_config = executor_config
-        self._is_pytorch_backend = getattr(self._executor_config, "backend",
-                                           None) == "pytorch"
+        self._is_pytorch_backend = llm_args is not None and llm_args.backend == "pytorch"
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
@@ -88,13 +91,98 @@ class GenerationExecutorWorker(GenerationExecutor):
         if isinstance(engine, list):
             engine = engine[self.rank]
 
-        if executor_config is None:
-            executor_config = tllm.ExecutorConfig(1)
+        def _create_py_executor():
+            device_id = self.global_rank % torch.cuda.device_count()
+            torch.cuda.set_device(device_id)
 
-        executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
-            processor_batched=batched_logits_processor, replicate=False)
+            max_batch_size = llm_args.max_batch_size
+            max_num_tokens = llm_args.max_num_tokens
+            max_seq_len = llm_args.max_seq_len
+
+            self._executor_config = tllm.ExecutorConfig(
+                max_beam_width=llm_args.max_beam_width,
+                scheduler_config=PybindMirror.maybe_to_pybind(
+                    llm_args.scheduler_config),
+                batching_type=PybindMirror.maybe_to_pybind(
+                    llm_args.batching_type) or tllm.BatchingType.INFLIGHT,
+                max_batch_size=max_batch_size,
+                max_num_tokens=max_num_tokens,
+                gather_generation_logits=llm_args.gather_generation_logits)
+
+            if llm_args.kv_cache_config is not None:
+                self._executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
+                    llm_args.kv_cache_config)
+            if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
+                # Disable KV cache reuse for deterministic mode
+                self._executor_config.kv_cache_config.enable_block_reuse = False
+                self._executor_config.kv_cache_config.enable_partial_reuse = False
+            if llm_args.peft_cache_config is not None:
+                self._executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
+                    llm_args.peft_cache_config)
+            if llm_args.decoding_config is not None:
+                self._executor_config.decoding_config = llm_args.decoding_config
+            if llm_args.guided_decoding_backend == 'xgrammar':
+                self._executor_config.guided_decoding_config = tllm.GuidedDecodingConfig(
+                    backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.
+                    XGRAMMAR,
+                    **_xgrammar_tokenizer_info(self.tokenizer))
+            elif llm_args.guided_decoding_backend == 'llguidance':
+                self._executor_config.guided_decoding_config = tllm.GuidedDecodingConfig(
+                    backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.
+                    LLGUIDANCE,
+                    **_llguidance_tokenizer_info(self.tokenizer))
+            elif llm_args.guided_decoding_backend is not None:
+                raise ValueError(
+                    f"Unsupported guided decoding backend {llm_args.guided_decoding_backend}"
+                )
+
+            self._executor_config.normalize_log_probs = llm_args.normalize_log_probs
+            self._executor_config.enable_chunked_context = llm_args.enable_chunked_prefill
+            self._executor_config.max_beam_width = llm_args.max_beam_width
+            if llm_args.cache_transceiver_config is not None:
+                self._executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
+                    llm_args.cache_transceiver_config)
+            from tensorrt_llm._torch.pyexecutor.config import \
+                update_executor_config
+            update_executor_config(
+                self._executor_config,
+                backend=llm_args.backend,
+                pytorch_backend_config=llm_args.get_pytorch_backend_config()
+                if llm_args.backend in ["pytorch", "_autodeploy"] else None,
+                mapping=llm_args.parallel_config.to_mapping(),
+                speculative_config=llm_args.speculative_config,
+                hf_model_dir=hf_model_dir,
+                max_input_len=llm_args.max_input_len,
+                max_seq_len=max_seq_len)
+
+            self._executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
+                processor_batched=batched_logits_processor, replicate=False)
+            args = {
+                "executor_config": self._executor_config,
+                "checkpoint_dir": hf_model_dir,
+            }
+            if llm_args.backend == "pytorch":
+                from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
+                    create_py_executor
+                create_executor = create_py_executor
+                args["lora_config"] = lora_config
+                args[
+                    "garbage_collection_gen0_threshold"] = garbage_collection_gen0_threshold
+            elif executor_config.backend == "_autodeploy":
+                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
+                    create_autodeploy_executor
+                create_executor = create_autodeploy_executor
+            else:
+                raise ValueError(
+                    f"Unsupported backend config: {executor_config.backend}")
+            return create_executor(**args)
 
         def _create_engine():
+            if executor_config is None:
+                executor_config = tllm.ExecutorConfig(1)
+
+            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
+                processor_batched=batched_logits_processor, replicate=False)
             device_id = self.global_rank % torch.cuda.device_count()
             torch.cuda.set_device(device_id)
 
@@ -113,30 +201,11 @@ class GenerationExecutorWorker(GenerationExecutor):
                                      executor_config=executor_config,
                                      managed_weights=engine.managed_weights)
 
-            if not hasattr(executor_config, "backend"):
-                return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
-                                     executor_config)
-            args = {
-                "executor_config": executor_config,
-                "checkpoint_dir": executor_config.hf_model_dir,
-            }
-            if executor_config.backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
-                    create_py_executor
-                create_executor = create_py_executor
-                args["lora_config"] = lora_config
-                args[
-                    "garbage_collection_gen0_threshold"] = garbage_collection_gen0_threshold
-            elif executor_config.backend == "_autodeploy":
-                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
-                    create_autodeploy_executor
-                create_executor = create_autodeploy_executor
-            else:
-                raise ValueError(
-                    f"Unsupported backend config: {executor_config.backend}")
-            return create_executor(**args)
+            return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
+                                 executor_config)
 
-        self.engine = _create_engine()
+        self.engine = _create_py_executor if llm_args is not None else _create_engine(
+        )
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
