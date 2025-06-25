@@ -103,10 +103,18 @@ def generate_outputs(num_beams, only_multi_gpu=False):
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
 
+    output_logits = False
+    output_log_probs = False
+    output_cum_log_probs = False
     for tp_size, pp_size, cp_size in tp_pp_cp_sizes:
         print(
             f'Generating outputs for Llama FP16 with TP={tp_size}, PP={pp_size} and CP={cp_size}'
         )
+        if pp_size == 1:
+            output_logits = True
+            output_log_probs = True
+            output_cum_log_probs = True
+
         model_spec_obj.use_tensor_parallelism(tp_size)
         model_spec_obj.use_pipeline_parallelism(pp_size)
         model_spec_obj.use_context_parallelism(cp_size)
@@ -115,7 +123,10 @@ def generate_outputs(num_beams, only_multi_gpu=False):
                         tp_size=tp_size,
                         pp_size=pp_size,
                         cp_size=cp_size,
-                        model_spec_obj=model_spec_obj)
+                        model_spec_obj=model_spec_obj,
+                        output_logits=output_logits,
+                        output_log_probs=output_log_probs,
+                        output_cum_log_probs=output_cum_log_probs)
 
 
 if __name__ == '__main__':
