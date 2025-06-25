@@ -22,7 +22,9 @@ from .triton_attention import _flattened_context_mha, _generate_mha
 Constant = Union[int, float, str, None]
 
 
-@torch.library.custom_op("attention::fused_flattened_mla_with_cache", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::triton_attention_fused_flattened_mla_with_cache", mutates_args=()
+)
 def fused_flattened_mla_with_cache(
     # Q, K, V
     q_nope: torch.Tensor,
@@ -94,7 +96,7 @@ def fused_flattened_mla_with_cache(
             q_slice = q_pe[start : start + length]
             k_slice = k_pe[start : start + length]
 
-            q_rot, k_rot = torch.ops.rope.torch_apply_rope_with_qk_interleaving(
+            q_rot, k_rot = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
                 q_slice,
                 k_slice,
                 cos,
@@ -169,7 +171,9 @@ def fused_flattened_mla_with_cache_fake(
     return torch.empty_like(kv[..., -v_head_dim:])
 
 
-@torch.library.custom_op("attention::prepare_fused_mla_metadata", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::triton_attention_prepare_fused_mla_metadata", mutates_args=()
+)
 def prepare_fused_mla_metadata(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
@@ -221,15 +225,15 @@ class MultiHeadLatentAttention(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.deepseek.fused_mla
+        return torch.ops.auto_deploy.torch_attention_deepseek_fused_mla
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
-        return torch.ops.attention.fused_flattened_mla_with_cache
+        return torch.ops.auto_deploy.triton_attention_fused_flattened_mla_with_cache
 
     @classmethod
     def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
-        return torch.ops.attention.prepare_fused_mla_metadata, 4
+        return torch.ops.auto_deploy.triton_attention_prepare_fused_mla_metadata, 4
 
     @classmethod
     def get_cache_initializers(
