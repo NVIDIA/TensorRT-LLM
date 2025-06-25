@@ -32,7 +32,6 @@ global_kvcache_config = KvCacheConfig(max_tokens=10000)
 @pytest.mark.parametrize("max_tokens", [8])
 @pytest.mark.parametrize("num_prompts", [1, 2])
 def test_beam_search_output_shapes(disable_overlap_scheduler: bool,
-                                   enable_trtllm_sampler: bool,
                                    gather_context_logits: bool,
                                    gather_generation_logits: bool,
                                    return_log_probs: bool, max_beam_width: int,
@@ -49,7 +48,7 @@ def test_beam_search_output_shapes(disable_overlap_scheduler: bool,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
         max_seq_len=128,
-        enable_trtllm_sampler=enable_trtllm_sampler,
+        enable_trtllm_sampler=True,
         disable_overlap_scheduler=disable_overlap_scheduler,
         max_beam_width=max_beam_width,
     )
