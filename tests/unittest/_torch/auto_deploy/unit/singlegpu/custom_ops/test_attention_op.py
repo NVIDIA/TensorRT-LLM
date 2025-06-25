@@ -21,7 +21,7 @@ def test_attention_op():
 
     q, k, v = (x.contiguous() for x in torch.split(qkv, 1, dim=1))
 
-    output = torch.ops.attention.fused_mha_with_cache(
+    output = torch.ops.auto_deploy.triton_attention_fused_mha_with_cache(
         q, k, v, input_positions, k_cache, v_cache, None
     )
     ref = torch.nn.functional.scaled_dot_product_attention(
@@ -66,7 +66,7 @@ def test_gqa_op(device, dtype, n_heads, group_size, seq_len):
     v_cache = torch.randn(BATCH_SIZE, CACHE_SEQ_LEN, n_kv_heads, D_HEAD, dtype=dtype, device=device)
 
     # run custom op
-    output = torch.ops.attention.fused_mha_with_cache(
+    output = torch.ops.auto_deploy.triton_attention_fused_mha_with_cache(
         q, k, v, input_positions, k_cache, v_cache, None
     )
 
@@ -148,7 +148,7 @@ def test_flat_gqa_op(
     v = torch.randn(1, seq_len.sum(), n_kv_heads * D_HEAD, **dtype_kwargs)
 
     # run op
-    output = torch.ops.attention.flattened_mha_with_cache(
+    output = torch.ops.auto_deploy.triton_attention_flattened_mha_with_cache(
         # Q, K, V
         q,
         k,
@@ -274,7 +274,7 @@ def test_flat_gqa_op_with_rope(
     source = 1
     if source == 1:
         # call rope fusion kernels
-        output = torch.ops.attention.fused_flattened_mha_with_cache_rope_fusion(
+        output = torch.ops.auto_deploy.triton_attention_fused_flattened_mha_with_cache_rope_fusion(
             q,
             k,
             v,
@@ -288,7 +288,7 @@ def test_flat_gqa_op_with_rope(
         )
     else:
         # call stand-alone rope embedding kernel
-        output = torch.ops.attention.fused_flattened_mha_with_cache(
+        output = torch.ops.auto_deploy.triton_attention_fused_flattened_mha_with_cache(
             q,
             k,
             v,
@@ -466,7 +466,7 @@ def test_paged_gqa_op(
     v = torch.randn(1, seq_len.sum(), n_kv_heads * D_HEAD, **dtype_kwargs)
 
     # run op
-    output = torch.ops.attention.fused_mha_with_paged_cache(
+    output = torch.ops.auto_deploy.triton_attention_fused_mha_with_paged_cache(
         q,
         k,
         v,
