@@ -78,11 +78,5 @@ def test_w4a16_linear(dtype, weights_dtype, has_zero=False):
                                                  has_zero,
                                                  bias,
                                                  zeros=None)
-
-    # compare
     torch.cuda.synchronize()
     torch.testing.assert_close(output, output_ref)
-
-
-if __name__ == "__main__":
-    test_w4a16_linear(torch.float16, torch.uint8)

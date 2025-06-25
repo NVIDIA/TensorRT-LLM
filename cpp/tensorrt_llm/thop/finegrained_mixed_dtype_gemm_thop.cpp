@@ -96,8 +96,6 @@ at::Tensor W4A16GemmRunner::runGemm(at::Tensor const& A, at::Tensor const& B_pac
     TORCH_CHECK(B_packed.scalar_type() == torch::kQUInt4x2 || B_packed.scalar_type() == torch::kInt8
             || B_packed.scalar_type() == torch::kUInt8,
         "B_packed must be quint4x2, int8, or uint8 (view of quantized data)");
-    // TORCH_CHECK(scales.scalar_type() == torch::kFloat16 || scales.scalar_type() == torch::kBFloat16,
-    //     "Scales must be FP16 or BF 16");
     TORCH_CHECK(A.is_contiguous() && B_packed.is_contiguous() && scales.is_contiguous(),
         "All input tensors (A, B_packed, scales) must be contiguous");
 

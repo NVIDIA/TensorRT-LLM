@@ -2,10 +2,12 @@ import os
 import sys
 import unittest
 
-project_root = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+# Add project root to Python path for direct execution
+if __name__ == "__main__":
+    project_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
 
 import torch
 from parameterized import parameterized
@@ -108,49 +110,39 @@ class TestW4A16Gemm(unittest.TestCase):
 
         _utils.woq_assert_near_eq(ref, output, 2)
 
-    @parameterized.expand([(3, 1024, 64, 64, True, False, True),
-                           (128, 1024, 256, 64, True, False, True),
-                           (192, 2048, 384, 64, True, False, True),
-                           (256, 2048, 1024, 64, True, False, True),
-                           (4, 1024, 128, 128, True, False, True),
-                           (64, 1024, 256, 128, True, False, True),
-                           (384, 2048, 384, 128, True, False, True),
-                           (512, 2048, 1024, 128, True, False, True),
-                           (4, 1024, 128, 128, True, True, True),
-                           (64, 1024, 256, 128, True, True, True),
-                           (384, 2048, 384, 128, True, True, True),
-                           (512, 2048, 1024, 128, True, True, False)])
-    def test_matmul_fp16_int4_input(self, m, n, k, group_size, has_pre_quant,
-                                    has_zero, has_bias):
+    @parameterized.expand([
+        (3, 1024, 64, 64, torch.bfloat16, True, False, True),
+        (128, 1024, 256, 64, torch.bfloat16, True, False, True),
+        (192, 2048, 384, 64, torch.bfloat16, True, False, True),
+        (256, 2048, 1024, 64, torch.bfloat16, True, False, True),
+        (4, 1024, 128, 128, torch.bfloat16, True, False, True),
+        (64, 1024, 256, 128, torch.bfloat16, True, False, True),
+        (384, 2048, 384, 128, torch.bfloat16, True, False, True),
+        (512, 2048, 1024, 128, torch.bfloat16, True, False, True),
+        (4, 1024, 128, 128, torch.bfloat16, True, True, True),
+        (64, 1024, 256, 128, torch.bfloat16, True, True, True),
+        (384, 2048, 384, 128, torch.bfloat16, True, True, True),
+        (512, 2048, 1024, 128, torch.bfloat16, True, True, False),
+        (3, 1024, 64, 64, torch.float16, True, False, True),
+        (128, 1024, 256, 64, torch.float16, True, False, True),
+        (192, 2048, 384, 64, torch.float16, True, False, True),
+        (256, 2048, 1024, 64, torch.float16, True, False, True),
+        (4, 1024, 128, 128, torch.float16, True, False, True),
+        (64, 1024, 256, 128, torch.float16, True, False, True),
+        (384, 2048, 384, 128, torch.float16, True, False, True),
+        (512, 2048, 1024, 128, torch.float16, True, False, True),
+        (4, 1024, 128, 128, torch.float16, True, True, True),
+        (64, 1024, 256, 128, torch.float16, True, True, True),
+        (384, 2048, 384, 128, torch.float16, True, True, True),
+        (512, 2048, 1024, 128, torch.float16, True, True, False)
+    ])
+    def test_matmul_fp16_int4_input(self, m, n, k, group_size, activation_dtype,
+                                    has_pre_quant, has_zero, has_bias):
         self._run_w4a16_gemm(m,
                              n,
                              k,
                              group_size,
-                             torch.float16,
-                             torch.quint4x2,
-                             has_pre_quant=has_pre_quant,
-                             has_zero=has_zero,
-                             has_bias=has_bias)
-
-    @parameterized.expand([(3, 1024, 64, 64, True, False, True),
-                           (128, 1024, 256, 64, True, False, True),
-                           (192, 2048, 384, 64, True, False, True),
-                           (256, 2048, 1024, 64, True, False, True),
-                           (4, 1024, 128, 128, True, False, True),
-                           (64, 1024, 256, 128, True, False, True),
-                           (384, 2048, 384, 128, True, False, True),
-                           (512, 2048, 1024, 128, True, False, True),
-                           (4, 1024, 128, 128, True, True, True),
-                           (64, 1024, 256, 128, True, True, True),
-                           (384, 2048, 384, 128, True, True, True),
-                           (512, 2048, 1024, 128, True, True, False)])
-    def test_matmul_bf16_int4_input(self, m, n, k, group_size, has_pre_quant,
-                                    has_zero, has_bias):
-        self._run_w4a16_gemm(m,
-                             n,
-                             k,
-                             group_size,
-                             torch.bfloat16,
+                             activation_dtype,
                              torch.quint4x2,
                              has_pre_quant=has_pre_quant,
                              has_zero=has_zero,

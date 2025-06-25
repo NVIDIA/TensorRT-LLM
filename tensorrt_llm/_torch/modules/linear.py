@@ -206,7 +206,7 @@ class LinearMethodBase(ABC):
         """
 
     @abstractmethod
-    def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
         """
         Load weights for the VANILLA weight mode.
         """
@@ -214,7 +214,7 @@ class LinearMethodBase(ABC):
 
     @abstractmethod
     def load_weights_fused_qkv_linear(self, module: Linear,
-                                      weights: List[Dict]):
+                                      weights: List[Dict]) -> None:
         """
         Load weights for the FUSED_QKV_LINEAR weight mode.
         """
@@ -222,7 +222,7 @@ class LinearMethodBase(ABC):
 
     @abstractmethod
     def load_weights_fused_gate_up_linear(self, module: Linear,
-                                          weights: List[Dict]):
+                                          weights: List[Dict]) -> None:
         """
         Load weights for the FUSED_GATE_UP_LINEAR weight mode.
         """
@@ -254,18 +254,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
             output = F.linear(input, module.weight, bias)
         return output
 
-    def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
         load_weights_vanilla_helper(module, weights)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
-                                      weights: List[Dict]):
+                                      weights: List[Dict]) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights)
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
         copy_weight(module.weight, fused_weight)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
-                                          weights: List[Dict]):
+                                          weights: List[Dict]) -> None:
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
             module, weights)
         fused_weight = torch.cat((gate_weight, up_weight))
@@ -333,7 +333,7 @@ class FP8QDQLinearMethod(LinearMethodBase):
                 weight_scale.append(w["weight_scale"][...].reshape([]))
         return input_scale, weight_scale
 
-    def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
         load_weights_vanilla_helper(module, weights)
         input_scale, weight_scale = self.load_weight_scales(weights)
         if len(input_scale) != 0:
@@ -347,7 +347,7 @@ class FP8QDQLinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, weight_scale[0])
 
     def load_weights_fused_qkv_linear(self, module: Linear,
-                                      weights: List[Dict]):
+                                      weights: List[Dict]) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights)
 
@@ -370,7 +370,7 @@ class FP8QDQLinearMethod(LinearMethodBase):
         copy_weight(module.weight, fused_weight)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
-                                          weights: List[Dict]):
+                                          weights: List[Dict]) -> None:
         input_scale, weight_scale = self.load_weight_scales(weights)
         if len(input_scale) != 0:
             # Static quantization
@@ -440,7 +440,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
             scale_name = "weight_scale"
         return scale_name
 
-    def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
         load_weights_vanilla_helper(module, weights)
 
         scale_name = self._get_scale_name(weights)
@@ -452,7 +452,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
             module.inv_input_scale.data = 1.0 / module.input_scale
 
     def load_weights_fused_qkv_linear(self, module: Linear,
-                                      weights: List[Dict]):
+                                      weights: List[Dict]) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights)
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
@@ -469,7 +469,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, fused_fp8_block_scale)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
-                                          weights: List[Dict]):
+                                          weights: List[Dict]) -> None:
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
             module, weights)
         fused_weight = torch.cat((gate_weight, up_weight))
@@ -578,7 +578,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         return input_scale, weight_scale, alpha
 
-    def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
         load_weights_vanilla_helper(module, weights)
 
         input_scale, weight_scale, alpha = self.load_weight_scales(
@@ -600,7 +600,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.alpha, alpha)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
-                                      weights: List[Dict]):
+                                      weights: List[Dict]) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights)
 
@@ -621,7 +621,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.weight, fused_weight)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
-                                          weights: List[Dict]):
+                                          weights: List[Dict]) -> None:
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
             module, weights)
         fused_weight = torch.cat((gate_weight, up_weight))
@@ -708,7 +708,7 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
                 weight_scale.append(ws.view(fp4_utils.float4_sf_dtype))
         return weight_scale
 
-    def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
         load_weights_vanilla_helper(module, weights)
 
         weight_scale = self.load_weight_scales(weights,
@@ -723,7 +723,7 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, weight_scale)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
-                                      weights: List[Dict]):
+                                      weights: List[Dict]) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights)
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
@@ -739,7 +739,7 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, weight_scale)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
-                                          weights: List[Dict]):
+                                          weights: List[Dict]) -> None:
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
             module, weights)
         fused_weight = torch.cat((gate_weight, up_weight))
@@ -833,7 +833,7 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
 
         return weight_scales
 
-    def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
         load_weights_vanilla_helper(module, weights)
 
         device = torch.device('cuda')
@@ -852,7 +852,7 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, weight_scale)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
-                                      weights: List[Dict]):
+                                      weights: List[Dict]) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights)
 
@@ -870,7 +870,7 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, cat_weight_scale)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
-                                          weights: List[Dict]):
+                                          weights: List[Dict]) -> None:
         device = torch.device('cuda')
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
             module, weights)

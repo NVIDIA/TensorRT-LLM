@@ -634,8 +634,7 @@ class W4A16GemmRunner(TunableRunner):
             kwargs["group_size"],
             tactic,
             kwargs["bias"],
-            kwargs[
-                "zeros"],  # NOTE if qunant_mode is 0 (FINEGRAINED_SCALE_ONLY), zeros is not used --> needs to be None
+            kwargs["zeros"],
         )
 
 
@@ -657,7 +656,11 @@ def w4a16_gemm(input: torch.Tensor,
         DynamicTensorSpec(0, 0, (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32,
                                  16, 8, 4, 2, 1), last_positive_power_of_2), ))
 
+    # NOTE: qunant_mode equals 0 it means we use scale only (FINEGRAINED_SCALE_ONLY), zeros is not used, else we use scale and zero point
     quant_mode = 1 if has_zero_point else 0
+    if quant_mode == 0:
+        assert zeros is None, "When quant_mode is 0 (FINEGRAINED_SCALE_ONLY), zeros must be None"
+
     w4a16_gemm_runner = W4A16GemmRunner(input.dtype, quant_mode)
 
     kwargs = {"group_size": group_size, "zeros": zeros, "bias": bias}
