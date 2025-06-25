@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc2" />
+  <meta name="docsearch:version" content="1.0.0rc0" />
 
 
   </head>
@@ -511,6 +511,9 @@
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">concurrent.futures</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">traceback</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">ProcessPoolExecutor</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">queue</span><span class="w"> </span><span class="kn">import</span> <span class="n">Empty</span><span class="p">,</span> <span class="n">Queue</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">NamedTuple</span><span class="p">,</span> <span class="n">Optional</span>
@@ -518,12 +521,12 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">strenum</span><span class="w"> </span><span class="kn">import</span> <span class="n">StrEnum</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">mpi_rank</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.bindings.executor</span><span class="w"> </span><span class="kn">import</span> <span class="n">Response</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">print_colored_debug</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">enable_llm_debug</span><span class="p">,</span> <span class="n">print_colored_debug</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.mpi_session</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">MpiCommSession</span><span class="p">,</span> <span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">MpiSession</span><span class="p">,</span>
                                   <span class="n">RemoteMpiCommSessionClient</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">print_colored_debug</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">LlmLauncherEnvs</span><span class="p">(</span><span class="n">StrEnum</span><span class="p">):</span>
@@ -562,9 +565,9 @@
         <span class="n">print_colored_debug</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">&quot;Using RemoteMpiPoolSessionClient to bind to external MPI processes at </span><span class="si">{</span><span class="n">get_spawn_proxy_process_ipc_addr_env</span><span class="p">()</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
             <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
-        <span class="n">hmac_key</span> <span class="o">=</span> <span class="n">get_spawn_proxy_process_ipc_hmac_key_env</span><span class="p">()</span>
+        <span class="n">get_spawn_proxy_process_ipc_hmac_key_env</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">RemoteMpiCommSessionClient</span><span class="p">(</span>
-            <span class="n">addr</span><span class="o">=</span><span class="n">get_spawn_proxy_process_ipc_addr_env</span><span class="p">(),</span> <span class="n">hmac_key</span><span class="o">=</span><span class="n">hmac_key</span><span class="p">)</span>
+            <span class="n">addr</span><span class="o">=</span><span class="n">get_spawn_proxy_process_ipc_addr_env</span><span class="p">())</span>
     <span class="k">else</span><span class="p">:</span>
         <span class="n">print_colored_debug</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">&quot;Using MpiCommSession to bind to external MPI processes</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
@@ -657,8 +660,26 @@
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">is_llm_response</span><span class="p">(</span><span class="n">instance</span><span class="p">):</span>
-    <span class="k">return</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">instance</span><span class="p">,</span> <span class="n">Response</span><span class="p">)</span> <span class="ow">or</span> \
-        <span class="p">(</span><span class="nb">hasattr</span><span class="p">(</span><span class="n">instance</span><span class="p">,</span> <span class="s1">&#39;_is_llm_response&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="n">instance</span><span class="o">.</span><span class="n">_is_llm_response</span><span class="p">)</span>
+    <span class="k">return</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">instance</span><span class="p">,</span> <span class="s2">&quot;result&quot;</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">print_alive_threads</span><span class="p">():</span>
+    <span class="k">assert</span> <span class="n">enable_llm_debug</span><span class="p">(</span>
+    <span class="p">),</span> <span class="s2">&quot;print_alive_threads must be called with enable_llm_debug() enabled&quot;</span>
+
+    <span class="c1"># Print all alive threads for debugging</span>
+    <span class="n">alive_threads</span> <span class="o">=</span> <span class="p">[</span><span class="n">t</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">threading</span><span class="o">.</span><span class="n">enumerate</span><span class="p">()</span> <span class="k">if</span> <span class="n">t</span><span class="o">.</span><span class="n">is_alive</span><span class="p">()]</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+        <span class="sa">f</span><span class="s1">&#39;All alive threads after shutdown: </span><span class="si">{</span><span class="p">[</span><span class="n">t</span><span class="o">.</span><span class="n">name</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">alive_threads</span><span class="p">]</span><span class="si">}</span><span class="se">\n</span><span class="s1">&#39;</span><span class="p">,</span>
+        <span class="s2">&quot;red&quot;</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">alive_threads</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;Thread </span><span class="si">{</span><span class="n">t</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s1"> (daemon=</span><span class="si">{</span><span class="n">t</span><span class="o">.</span><span class="n">daemon</span><span class="si">}</span><span class="s1">) is still alive&#39;</span><span class="p">)</span>
+        <span class="c1"># Get the stack trace for this thread</span>
+        <span class="n">stack</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">_current_frames</span><span class="p">()</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">ident</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">stack</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;Stack trace for thread </span><span class="si">{</span><span class="n">t</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s1">:&#39;</span><span class="p">)</span>
+            <span class="n">traceback</span><span class="o">.</span><span class="n">print_stack</span><span class="p">(</span><span class="n">stack</span><span class="p">,</span> <span class="n">file</span><span class="o">=</span><span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s1">&#39;&#39;</span><span class="p">)</span>
 </pre></div>
 
                 </article>
@@ -770,9 +791,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 16, 2025.</p>
+  <p>Last updated on June 21, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
   
 </div></div>
       

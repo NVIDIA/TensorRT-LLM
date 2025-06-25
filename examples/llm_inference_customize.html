@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc2" />
+  <meta name="docsearch:version" content="1.0.0rc0" />
 
 
   </head>
@@ -516,59 +516,60 @@
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="c1">### Generate text with customization</span>
 <span class="linenos"> 2</span><span class="kn">import</span><span class="w"> </span><span class="nn">tempfile</span>
 <span class="linenos"> 3</span>
-<span class="linenos"> 4</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">BuildConfig</span><span class="p">,</span> <span class="n">KvCacheConfig</span><span class="p">,</span> <span class="n">SamplingParams</span>
-<span class="linenos"> 5</span>
+<span class="linenos"> 4</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._tensorrt_engine</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+<span class="linenos"> 5</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">BuildConfig</span><span class="p">,</span> <span class="n">KvCacheConfig</span><span class="p">,</span> <span class="n">SamplingParams</span>
 <span class="linenos"> 6</span>
-<span class="linenos"> 7</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
-<span class="linenos"> 8</span>    <span class="c1"># The end user can customize the build configuration with the build_config class and other arguments borrowed from the lower-level APIs</span>
-<span class="linenos"> 9</span>    <span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">()</span>
-<span class="linenos">10</span>    <span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">=</span> <span class="mi">128</span>
-<span class="linenos">11</span>    <span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span> <span class="o">=</span> <span class="mi">2048</span>
-<span class="linenos">12</span>
-<span class="linenos">13</span>    <span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="mi">4</span>
-<span class="linenos">14</span>
-<span class="linenos">15</span>    <span class="c1"># Model could accept HF model name or a path to local HF model.</span>
-<span class="linenos">16</span>
-<span class="linenos">17</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
-<span class="linenos">18</span>        <span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
-<span class="linenos">19</span>        <span class="n">build_config</span><span class="o">=</span><span class="n">build_config</span><span class="p">,</span>
-<span class="linenos">20</span>        <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
-<span class="linenos">21</span>            <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span>
-<span class="linenos">22</span>        <span class="p">),</span>  <span class="c1"># Similar to `build_config`, you can also customize the runtime configuration with the `kv_cache_config`, `runtime_config`, `peft_cache_config` or \</span>
-<span class="linenos">23</span>        <span class="c1"># other arguments borrowed from the lower-level APIs.</span>
-<span class="linenos">24</span>    <span class="p">)</span>
-<span class="linenos">25</span>
-<span class="linenos">26</span>    <span class="c1"># You can save the engine to disk and load it back later, the LLM class can accept either a HF model or a TRT-LLM engine.</span>
-<span class="linenos">27</span>    <span class="n">llm</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">tempfile</span><span class="o">.</span><span class="n">mkdtemp</span><span class="p">())</span>
-<span class="linenos">28</span>
-<span class="linenos">29</span>    <span class="c1"># Sample prompts.</span>
-<span class="linenos">30</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
-<span class="linenos">31</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
-<span class="linenos">32</span>        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
-<span class="linenos">33</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
-<span class="linenos">34</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
-<span class="linenos">35</span>    <span class="p">]</span>
-<span class="linenos">36</span>
-<span class="linenos">37</span>    <span class="c1"># With SamplingParams, you can customize the sampling strategy, such as beam search, temperature, and so on.</span>
-<span class="linenos">38</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
-<span class="linenos">39</span>                                     <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">,</span>
-<span class="linenos">40</span>                                     <span class="n">n</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
-<span class="linenos">41</span>                                     <span class="n">use_beam_search</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="linenos">42</span>
-<span class="linenos">43</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">):</span>
-<span class="linenos">44</span>        <span class="nb">print</span><span class="p">(</span>
-<span class="linenos">45</span>            <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
-<span class="linenos">46</span>        <span class="p">)</span>
-<span class="linenos">47</span>
-<span class="linenos">48</span>    <span class="c1"># Got output like</span>
-<span class="linenos">49</span>    <span class="c1"># Prompt: &#39;Hello, my name is&#39;, Generated text: &#39;\n\nJane Smith. I am a student pursuing my degree in Computer Science at [university]. I enjoy learning new things, especially technology and programming&#39;</span>
-<span class="linenos">50</span>    <span class="c1"># Prompt: &#39;The president of the United States is&#39;, Generated text: &#39;likely to nominate a new Supreme Court justice to fill the seat vacated by the death of Antonin Scalia. The Senate should vote to confirm the&#39;</span>
-<span class="linenos">51</span>    <span class="c1"># Prompt: &#39;The capital of France is&#39;, Generated text: &#39;Paris.&#39;</span>
-<span class="linenos">52</span>    <span class="c1"># Prompt: &#39;The future of AI is&#39;, Generated text: &#39;an exciting time for us. We are constantly researching, developing, and improving our platform to create the most advanced and efficient model available. We are&#39;</span>
-<span class="linenos">53</span>
+<span class="linenos"> 7</span>
+<span class="linenos"> 8</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos"> 9</span>    <span class="c1"># The end user can customize the build configuration with the build_config class and other arguments borrowed from the lower-level APIs</span>
+<span class="linenos">10</span>    <span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">()</span>
+<span class="linenos">11</span>    <span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">=</span> <span class="mi">128</span>
+<span class="linenos">12</span>    <span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span> <span class="o">=</span> <span class="mi">2048</span>
+<span class="linenos">13</span>
+<span class="linenos">14</span>    <span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="mi">4</span>
+<span class="linenos">15</span>
+<span class="linenos">16</span>    <span class="c1"># Model could accept HF model name or a path to local HF model.</span>
+<span class="linenos">17</span>
+<span class="linenos">18</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+<span class="linenos">19</span>        <span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">20</span>        <span class="n">build_config</span><span class="o">=</span><span class="n">build_config</span><span class="p">,</span>
+<span class="linenos">21</span>        <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
+<span class="linenos">22</span>            <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span>
+<span class="linenos">23</span>        <span class="p">),</span>  <span class="c1"># Similar to `build_config`, you can also customize the runtime configuration with the `kv_cache_config`, `runtime_config`, `peft_cache_config` or \</span>
+<span class="linenos">24</span>        <span class="c1"># other arguments borrowed from the lower-level APIs.</span>
+<span class="linenos">25</span>    <span class="p">)</span>
+<span class="linenos">26</span>
+<span class="linenos">27</span>    <span class="c1"># You can save the engine to disk and load it back later, the LLM class can accept either a HF model or a TRT-LLM engine.</span>
+<span class="linenos">28</span>    <span class="n">llm</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">tempfile</span><span class="o">.</span><span class="n">mkdtemp</span><span class="p">())</span>
+<span class="linenos">29</span>
+<span class="linenos">30</span>    <span class="c1"># Sample prompts.</span>
+<span class="linenos">31</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">32</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+<span class="linenos">33</span>        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
+<span class="linenos">34</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+<span class="linenos">35</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+<span class="linenos">36</span>    <span class="p">]</span>
+<span class="linenos">37</span>
+<span class="linenos">38</span>    <span class="c1"># With SamplingParams, you can customize the sampling strategy, such as beam search, temperature, and so on.</span>
+<span class="linenos">39</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
+<span class="linenos">40</span>                                     <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">,</span>
+<span class="linenos">41</span>                                     <span class="n">n</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+<span class="linenos">42</span>                                     <span class="n">use_beam_search</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="linenos">43</span>
+<span class="linenos">44</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">):</span>
+<span class="linenos">45</span>        <span class="nb">print</span><span class="p">(</span>
+<span class="linenos">46</span>            <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
+<span class="linenos">47</span>        <span class="p">)</span>
+<span class="linenos">48</span>
+<span class="linenos">49</span>    <span class="c1"># Got output like</span>
+<span class="linenos">50</span>    <span class="c1"># Prompt: &#39;Hello, my name is&#39;, Generated text: &#39;\n\nJane Smith. I am a student pursuing my degree in Computer Science at [university]. I enjoy learning new things, especially technology and programming&#39;</span>
+<span class="linenos">51</span>    <span class="c1"># Prompt: &#39;The president of the United States is&#39;, Generated text: &#39;likely to nominate a new Supreme Court justice to fill the seat vacated by the death of Antonin Scalia. The Senate should vote to confirm the&#39;</span>
+<span class="linenos">52</span>    <span class="c1"># Prompt: &#39;The capital of France is&#39;, Generated text: &#39;Paris.&#39;</span>
+<span class="linenos">53</span>    <span class="c1"># Prompt: &#39;The future of AI is&#39;, Generated text: &#39;an exciting time for us. We are constantly researching, developing, and improving our platform to create the most advanced and efficient model available. We are&#39;</span>
 <span class="linenos">54</span>
-<span class="linenos">55</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
-<span class="linenos">56</span>    <span class="n">main</span><span class="p">()</span>
+<span class="linenos">55</span>
+<span class="linenos">56</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+<span class="linenos">57</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -701,9 +702,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 16, 2025.</p>
+  <p>Last updated on June 21, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
   
 </div></div>
       

@@ -50,7 +50,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -60,7 +60,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc2" />
+  <meta name="docsearch:version" content="1.0.0rc0" />
 
 
   </head>
@@ -726,6 +726,7 @@
             <span class="s2">&quot;Eagle&quot;</span><span class="p">:</span> <span class="n">EagleDecodingConfig</span><span class="p">,</span>
             <span class="s2">&quot;Lookahead&quot;</span><span class="p">:</span> <span class="n">LookaheadDecodingConfig</span><span class="p">,</span>
             <span class="s2">&quot;NGram&quot;</span><span class="p">:</span> <span class="n">NGramDecodingConfig</span><span class="p">,</span>
+            <span class="s2">&quot;DraftTarget&quot;</span><span class="p">:</span> <span class="n">DraftTargetDecodingConfig</span><span class="p">,</span>
         <span class="p">}</span>
 
         <span class="n">config_class</span> <span class="o">=</span> <span class="n">config_classes</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">decoding_type</span><span class="p">)</span>
@@ -765,7 +766,7 @@
     <span class="n">dynamic_tree_max_topK</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">num_eagle_layers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">max_non_leaves_per_layer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">pytorch_eagle_weights_path</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">pytorch_weights_path</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">eagle3_one_model</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
 
 <div class="viewcode-block" id="EagleDecodingConfig.from_dict">
@@ -819,6 +820,22 @@
 
 
 
+<div class="viewcode-block" id="DraftTargetDecodingConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">DraftTargetDecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
+    <span class="n">pytorch_weights_path</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="DraftTargetDecodingConfig.from_dict">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.from_dict">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">data</span><span class="p">)</span></div>
+
+
+    <span class="n">decoding_type</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;DraftTarget&quot;</span></div>
+
+
+
 <div class="viewcode-block" id="MTPDecodingConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">MTPDecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
@@ -826,6 +843,7 @@
     <span class="n">use_relaxed_acceptance_for_thinking</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">relaxed_topk</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">relaxed_delta</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="mf">0.</span>
+    <span class="n">use_mtp_vanilla</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span>
 
 <div class="viewcode-block" id="MTPDecodingConfig.from_dict">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.from_dict">[docs]</a>
@@ -1478,10 +1496,11 @@
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Cache transceiver config.&quot;</span><span class="p">)</span>
 
     <span class="c1"># Speculative decoding parameters</span>
-    <span class="n">speculative_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span>
-        <span class="n">LookaheadDecodingConfig</span><span class="p">,</span> <span class="n">MedusaDecodingConfig</span><span class="p">,</span> <span class="n">EagleDecodingConfig</span><span class="p">,</span>
-        <span class="n">MTPDecodingConfig</span><span class="p">,</span> <span class="n">NGramDecodingConfig</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-            <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Speculative decoding config.&quot;</span><span class="p">)</span>
+    <span class="n">speculative_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span>
+        <span class="n">Union</span><span class="p">[</span><span class="n">LookaheadDecodingConfig</span><span class="p">,</span> <span class="n">MedusaDecodingConfig</span><span class="p">,</span>
+              <span class="n">EagleDecodingConfig</span><span class="p">,</span> <span class="n">MTPDecodingConfig</span><span class="p">,</span> <span class="n">NGramDecodingConfig</span><span class="p">,</span>
+              <span class="n">DraftTargetDecodingConfig</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+                  <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Speculative decoding config.&quot;</span><span class="p">)</span>
 
     <span class="n">batching_type</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">BatchingType</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                                                   <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Batching type.&quot;</span><span class="p">)</span>
@@ -1522,6 +1541,12 @@
     <span class="n">reasoning_parser</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The parser to separate reasoning content from output.&quot;</span><span class="p">)</span>
+
+    <span class="n">garbage_collection_gen0_threshold</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">20000</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Threshold for Python garbage collection of generation 0 objects.&quot;</span>
+        <span class="s2">&quot;Lower values trigger more frequent garbage collection.&quot;</span><span class="p">)</span>
 
     <span class="c1"># TODO[Superjomn]: To deprecate this config.</span>
     <span class="n">decoding_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">object</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -1878,7 +1903,7 @@
                     <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span> <span class="o">=</span> <span class="n">Eagle3Config</span><span class="p">(</span>
                         <span class="n">max_draft_tokens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">,</span>
                         <span class="n">draft_model_path</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span>
-                        <span class="n">pytorch_eagle_weights_path</span><span class="p">,</span>
+                        <span class="n">pytorch_weights_path</span><span class="p">,</span>
                         <span class="n">eagle3_one_model</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span>
                         <span class="n">eagle3_one_model</span><span class="p">)</span>
             <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">NGramDecodingConfig</span><span class="p">):</span>
@@ -1896,6 +1921,16 @@
                     <span class="n">is_use_oldest</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">is_use_oldest</span><span class="p">,</span>
                     <span class="n">is_public_pool</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">is_public_pool</span><span class="p">,</span>
                 <span class="p">)</span>
+            <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">DraftTargetDecodingConfig</span><span class="p">):</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">speculative_decoding_mode</span> <span class="o">=</span> <span class="n">SpeculativeDecodingMode</span><span class="o">.</span><span class="n">DRAFT_TOKENS_EXTERNAL</span>
+                <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s1">&#39;pytorch&#39;</span>
+                <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&gt;</span> <span class="mi">0</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span>
+                <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.speculative</span><span class="w"> </span><span class="kn">import</span> <span class="n">DraftTargetConfig</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span> <span class="o">=</span> <span class="n">DraftTargetConfig</span><span class="p">(</span>
+                    <span class="n">max_draft_tokens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">,</span>
+                    <span class="n">draft_model_path</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span>
+                    <span class="n">pytorch_weights_path</span><span class="p">)</span>
             <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">MTPDecodingConfig</span><span class="p">):</span>
                 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.speculative</span><span class="w"> </span><span class="kn">import</span> <span class="n">MTPConfig</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span> <span class="o">=</span> <span class="n">MTPConfig</span><span class="p">(</span>
@@ -1905,7 +1940,8 @@
                     <span class="n">use_relaxed_acceptance_for_thinking</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span>
                     <span class="n">use_relaxed_acceptance_for_thinking</span><span class="p">,</span>
                     <span class="n">relaxed_topk</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">relaxed_topk</span><span class="p">,</span>
-                    <span class="n">relaxed_delta</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">relaxed_delta</span><span class="p">)</span>
+                    <span class="n">relaxed_delta</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">relaxed_delta</span><span class="p">,</span>
+                    <span class="n">use_mtp_vanilla</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">use_mtp_vanilla</span><span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">&quot;Speculative config type not recognized: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -2160,12 +2196,6 @@
 
 
 
-<span class="n">LlmArgs</span> <span class="o">=</span> <span class="n">TrtLlmArgs</span>
-
-<span class="n">LLMARGS_EXPLICIT_DOCSTRING</span> <span class="o">=</span> <span class="n">generate_api_docs_as_docstring</span><span class="p">(</span><span class="n">LlmArgs</span><span class="p">,</span>
-                                                            <span class="n">indent</span><span class="o">=</span><span class="s1">&#39; &#39;</span> <span class="o">*</span> <span class="mi">4</span><span class="p">)</span>
-
-
 <span class="k">class</span><span class="w"> </span><span class="nc">LoadFormat</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
     <span class="n">AUTO</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="c1"># Initialize all weights randomly.</span>
@@ -2178,18 +2208,18 @@
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Configuration for torch.compile.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">torch_compile_fullgraph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">enable_fullgraph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Enable full graph compilation in torch.compile.&quot;</span><span class="p">)</span>
 
-    <span class="n">torch_compile_inductor_enabled</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">enable_inductor</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Enable inductor backend in torch.compile.&quot;</span><span class="p">)</span>
 
-    <span class="n">torch_compile_piecewise_cuda_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">enable_piecewise_cuda_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Enable piecewise CUDA graph in torch.compile.&quot;</span><span class="p">)</span>
 
-    <span class="n">torch_compile_enable_userbuffers</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">enable_userbuffers</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;When torch compile is enabled, userbuffers is enabled by default.&quot;</span><span class="p">)</span></div>
@@ -2240,7 +2270,10 @@
     <span class="n">moe_load_balancer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">object</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Configuration for MoE load balancing.&quot;</span><span class="p">,</span>
-        <span class="n">json_schema_extra</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;Union[MoeLoadBalancerConfig, str]&quot;</span><span class="p">})</span>
+        <span class="n">json_schema_extra</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;type&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Union[tensorrt_llm._torch.model_config.MoeLoadBalancerConfig, str, None]&quot;</span>
+        <span class="p">})</span>
 
     <span class="n">attn_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s1">&#39;TRTLLM&#39;</span><span class="p">,</span>
                               <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Attention backend to use.&quot;</span><span class="p">)</span>
@@ -2295,6 +2328,14 @@
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;If true, enable min-latency mode. Currently only used for Llama4.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="c1"># TODO: make this a per-request parameter</span>
+    <span class="n">stream_interval</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;The iteration interval to create responses under the streaming mode. &quot;</span>
+        <span class="s2">&quot;Set this to a larger value when the batch size is large, which helps reduce the streaming overhead.&quot;</span><span class="p">,</span>
     <span class="p">)</span>
 
     <span class="c1"># TODO: remove backend later</span>
@@ -2358,6 +2399,16 @@
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
+<div class="viewcode-block" id="TorchLlmArgs.validate_stream_interval">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_stream_interval">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_stream_interval</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">stream_interval</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;stream_interval must be positive, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">stream_interval</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
     <span class="c1"># TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig</span>
 <div class="viewcode-block" id="TorchLlmArgs.get_pytorch_backend_config">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.get_pytorch_backend_config">[docs]</a>
@@ -2382,22 +2433,21 @@
             <span class="n">enable_iter_req_stats</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_iter_req_stats</span><span class="p">,</span>
             <span class="n">print_iter_log</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">print_iter_log</span><span class="p">,</span>
             <span class="n">torch_compile_enabled</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">),</span>
-            <span class="n">torch_compile_fullgraph</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span><span class="o">.</span>
-            <span class="n">torch_compile_fullgraph</span>
+            <span class="n">torch_compile_fullgraph</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span><span class="o">.</span><span class="n">enable_fullgraph</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">True</span><span class="p">,</span>
             <span class="n">torch_compile_inductor_enabled</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span><span class="o">.</span>
-            <span class="n">torch_compile_inductor_enabled</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">False</span><span class="p">,</span>
+            <span class="n">enable_inductor</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">False</span><span class="p">,</span>
             <span class="n">torch_compile_piecewise_cuda_graph</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span><span class="o">.</span>
-            <span class="n">torch_compile_piecewise_cuda_graph</span>
+            <span class="n">enable_piecewise_cuda_graph</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">False</span><span class="p">,</span>
             <span class="n">torch_compile_enable_userbuffers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span><span class="o">.</span>
-            <span class="n">torch_compile_enable_userbuffers</span>
+            <span class="n">enable_userbuffers</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">torch_compile_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">True</span><span class="p">,</span>
             <span class="n">autotuner_enabled</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">autotuner_enabled</span><span class="p">,</span>
             <span class="n">enable_layerwise_nvtx_marker</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_layerwise_nvtx_marker</span><span class="p">,</span>
             <span class="n">load_format</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">load_format</span><span class="p">,</span>
-            <span class="n">enable_min_latency</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_min_latency</span><span class="p">)</span></div>
+            <span class="n">enable_min_latency</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_min_latency</span><span class="p">,</span>
+            <span class="n">stream_interval</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">stream_interval</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="TorchLlmArgs.validate_cuda_graph_max_batch_size">
@@ -2661,6 +2711,15 @@
         <span class="p">)</span>
     <span class="k">else</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">model_format</span>
+
+
+<span class="n">LlmArgs</span> <span class="o">=</span> <span class="n">TorchLlmArgs</span>
+
+<span class="n">TRT_LLMARGS_EXPLICIT_DOCSTRING</span> <span class="o">=</span> <span class="n">generate_api_docs_as_docstring</span><span class="p">(</span><span class="n">TrtLlmArgs</span><span class="p">,</span>
+                                                                <span class="n">indent</span><span class="o">=</span><span class="s1">&#39; &#39;</span> <span class="o">*</span> <span class="mi">4</span><span class="p">)</span>
+<span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span> <span class="o">=</span> <span class="n">generate_api_docs_as_docstring</span><span class="p">(</span><span class="n">TorchLlmArgs</span><span class="p">,</span>
+                                                                  <span class="n">indent</span><span class="o">=</span><span class="s1">&#39; &#39;</span> <span class="o">*</span>
+                                                                  <span class="mi">4</span><span class="p">)</span>
 </pre></div>
 
                 </article>
@@ -2772,9 +2831,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 16, 2025.</p>
+  <p>Last updated on June 21, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
   
 </div></div>
       

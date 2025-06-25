@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc2" />
+  <meta name="docsearch:version" content="1.0.0rc0" />
 
 
   </head>
@@ -554,8 +554,8 @@
 <section id="jenkins-stage-names">
 <h2>Jenkins stage names<a class="headerlink" href="#jenkins-stage-names" title="Link to this heading">#</a></h2>
 <p><code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code> maps stage names to these YAML files.  For A100 the mapping includes:</p>
-<div class="highlight-groovy notranslate"><div class="highlight"><pre><span></span><span class="w">    </span><span class="s2">&quot;A100X-Triton-Python-[Post-Merge]-1&quot;</span><span class="o">:</span><span class="w"> </span><span class="o">[</span><span class="s2">&quot;a100x&quot;</span><span class="o">,</span><span class="w"> </span><span class="s2">&quot;l0_a100&quot;</span><span class="o">,</span><span class="w"> </span><span class="mi">1</span><span class="o">,</span><span class="w"> </span><span class="mi">2</span><span class="o">],</span>
-<span class="w">    </span><span class="s2">&quot;A100X-Triton-Python-[Post-Merge]-2&quot;</span><span class="o">:</span><span class="w"> </span><span class="o">[</span><span class="s2">&quot;a100x&quot;</span><span class="o">,</span><span class="w"> </span><span class="s2">&quot;l0_a100&quot;</span><span class="o">,</span><span class="w"> </span><span class="mi">2</span><span class="o">,</span><span class="w"> </span><span class="mi">2</span><span class="o">],</span>
+<div class="highlight-groovy notranslate"><div class="highlight"><pre><span></span><span class="w">    </span><span class="s2">&quot;A100X-Triton-[Post-Merge]-1&quot;</span><span class="o">:</span><span class="w"> </span><span class="o">[</span><span class="s2">&quot;a100x&quot;</span><span class="o">,</span><span class="w"> </span><span class="s2">&quot;l0_a100&quot;</span><span class="o">,</span><span class="w"> </span><span class="mi">1</span><span class="o">,</span><span class="w"> </span><span class="mi">2</span><span class="o">],</span>
+<span class="w">    </span><span class="s2">&quot;A100X-Triton-[Post-Merge]-2&quot;</span><span class="o">:</span><span class="w"> </span><span class="o">[</span><span class="s2">&quot;a100x&quot;</span><span class="o">,</span><span class="w"> </span><span class="s2">&quot;l0_a100&quot;</span><span class="o">,</span><span class="w"> </span><span class="mi">2</span><span class="o">,</span><span class="w"> </span><span class="mi">2</span><span class="o">],</span>
 </pre></div>
 </div>
 <p>The array elements are: GPU type, YAML file (without extension), shard index, and total number of shards. Only tests with <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code> from that YAML file are selected when a <code class="docutils literal notranslate"><span class="pre">Post-Merge</span></code> stage runs.</p>
@@ -569,9 +569,9 @@
 </ol>
 <section id="example">
 <h3>Example<a class="headerlink" href="#example" title="Link to this heading">#</a></h3>
-<p><code class="docutils literal notranslate"><span class="pre">triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]</span></code> appears in <code class="docutils literal notranslate"><span class="pre">l0_a100.yml</span></code> under <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code> and <code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">triton</span></code>.  The corresponding Jenkins stages are <code class="docutils literal notranslate"><span class="pre">A100X-Triton-Python-[Post-Merge]-1</span></code> and <code class="docutils literal notranslate"><span class="pre">A100X-Triton-Python-[Post-Merge]-2</span></code> (two shards).</p>
+<p><code class="docutils literal notranslate"><span class="pre">triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]</span></code> appears in <code class="docutils literal notranslate"><span class="pre">l0_a100.yml</span></code> under <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code> and <code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">triton</span></code>.  The corresponding Jenkins stages are <code class="docutils literal notranslate"><span class="pre">A100X-Triton-[Post-Merge]-1</span></code> and <code class="docutils literal notranslate"><span class="pre">A100X-Triton-[Post-Merge]-2</span></code> (two shards).</p>
 <p>To run the same tests on your pull request, comment:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>/bot<span class="w"> </span>run<span class="w"> </span>--stage-list<span class="w"> </span><span class="s2">&quot;A100X-Triton-Python-[Post-Merge]-1,A100X-Triton-Python-[Post-Merge]-2&quot;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>/bot<span class="w"> </span>run<span class="w"> </span>--stage-list<span class="w"> </span><span class="s2">&quot;A100X-Triton-[Post-Merge]-1,A100X-Triton-[Post-Merge]-2&quot;</span>
 </pre></div>
 </div>
 <p>This executes the same tests that run post-merge for this hardware/backend.</p>
@@ -775,9 +775,9 @@ selective keeps CI turnaround fast and conserves hardware resources.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 16, 2025.</p>
+  <p>Last updated on June 21, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
   
 </div></div>
       

@@ -51,7 +51,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '0.21.0rc2';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -63,7 +63,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.21.0rc2" />
+  <meta name="docsearch:version" content="1.0.0rc0" />
 
 
   </head>
@@ -515,52 +515,53 @@
 <p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api/llm_inference_kv_events.py">NVIDIA/TensorRT-LLM</a>.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="c1">### Get KV Cache Events</span>
 <span class="linenos"> 2</span>
-<span class="linenos"> 3</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
-<span class="linenos"> 4</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">KvCacheConfig</span>
-<span class="linenos"> 5</span>
+<span class="linenos"> 3</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
+<span class="linenos"> 4</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._tensorrt_engine</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+<span class="linenos"> 5</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">KvCacheConfig</span>
 <span class="linenos"> 6</span>
-<span class="linenos"> 7</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
-<span class="linenos"> 8</span>
-<span class="linenos"> 9</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
-<span class="linenos">10</span>              <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
-<span class="linenos">11</span>              <span class="n">autotuner_enabled</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-<span class="linenos">12</span>              <span class="n">kv_cache_dtype</span><span class="o">=</span><span class="s1">&#39;auto&#39;</span><span class="p">,</span>
-<span class="linenos">13</span>              <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">enable_block_reuse</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-<span class="linenos">14</span>                                            <span class="n">event_buffer_max_size</span><span class="o">=</span><span class="mi">1024</span><span class="p">),</span>
-<span class="linenos">15</span>              <span class="n">backend</span><span class="o">=</span><span class="s2">&quot;pytorch&quot;</span><span class="p">)</span>
-<span class="linenos">16</span>
-<span class="linenos">17</span>    <span class="c1"># Sample prompts having a common prefix.</span>
-<span class="linenos">18</span>    <span class="n">common_prefix</span> <span class="o">=</span> <span class="p">(</span>
-<span class="linenos">19</span>        <span class="s2">&quot;After the ghost&#39;s departure, Barnardo notes Horatio&#39;s pale appearance and asks if he&#39;s okay. &quot;</span>
-<span class="linenos">20</span>        <span class="s2">&quot;Horatio concedes that he&#39;s shaken and confesses that, without witnessing the ghost himself, he wouldn&#39;t have believed it existed. &quot;</span>
-<span class="linenos">21</span>        <span class="s2">&quot;He&#39;s also disturbed by the ghost&#39;s striking resemblance to the king. It even seems to be wearing the former king&#39;s armor. &quot;</span>
-<span class="linenos">22</span>        <span class="s2">&quot;Horatio thinks the ghost&#39;s presence foretells that something is about to go wrong in Denmark. &quot;</span>
-<span class="linenos">23</span>        <span class="s2">&quot;Marcellus concurs with Horatio, as he and the other guards have observed that their schedules have become more rigorous and have also noticed the preparations taking place within Elsinore, including the building of cannons, the storing of weapons, and the preparation of ships.&quot;</span>
-<span class="linenos">24</span>    <span class="p">)</span>
-<span class="linenos">25</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
-<span class="linenos">26</span>        <span class="n">common_prefix</span><span class="p">,</span> <span class="n">common_prefix</span> <span class="o">+</span> <span class="s2">&quot; Marcellus also notes that the king&#39;s&quot;</span>
-<span class="linenos">27</span>    <span class="p">]</span>
-<span class="linenos">28</span>
-<span class="linenos">29</span>    <span class="c1"># Create a sampling params.</span>
-<span class="linenos">30</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.001</span><span class="p">,</span>
-<span class="linenos">31</span>                                     <span class="n">top_p</span><span class="o">=</span><span class="mf">0.001</span><span class="p">,</span>
-<span class="linenos">32</span>                                     <span class="n">max_tokens</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span>
-<span class="linenos">33</span>
-<span class="linenos">34</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="o">=</span><span class="n">sampling_params</span><span class="p">):</span>
-<span class="linenos">35</span>        <span class="nb">print</span><span class="p">(</span>
-<span class="linenos">36</span>            <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
-<span class="linenos">37</span>        <span class="p">)</span>
-<span class="linenos">38</span>
-<span class="linenos">39</span>    <span class="n">kv_events</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">get_kv_cache_events</span><span class="p">(</span><span class="mi">10</span><span class="p">)</span>
-<span class="linenos">40</span>    <span class="nb">print</span><span class="p">(</span><span class="n">kv_events</span><span class="p">)</span>
-<span class="linenos">41</span>
-<span class="linenos">42</span>    <span class="c1"># Got output like follows:</span>
-<span class="linenos">43</span>    <span class="c1"># [{&#39;event_id&#39;: 0, &#39;data&#39;: {&#39;type&#39;: &#39;created&#39;, &#39;num_blocks_per_cache_level&#39;: [101230, 0]}},</span>
-<span class="linenos">44</span>    <span class="c1">#  {&#39;event_id&#39;: 1, &#39;data&#39;: {&#39;type&#39;: &#39;stored&#39;, &#39;parent_hash&#39;: None, &#39;blocks&#39;: [{&#39;type&#39;: &#39;stored_block&#39;, &#39;block_hash&#39;: 4203099703668305365, &#39;tokens&#39;: [{&#39;type&#39;: &#39;unique_token&#39;, &#39;token_id&#39;: 1, &#39;token_extra_id&#39;: 0}, ...</span>
-<span class="linenos">45</span>
+<span class="linenos"> 7</span>
+<span class="linenos"> 8</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos"> 9</span>
+<span class="linenos">10</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">11</span>              <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+<span class="linenos">12</span>              <span class="n">autotuner_enabled</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+<span class="linenos">13</span>              <span class="n">kv_cache_dtype</span><span class="o">=</span><span class="s1">&#39;auto&#39;</span><span class="p">,</span>
+<span class="linenos">14</span>              <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">enable_block_reuse</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="linenos">15</span>                                            <span class="n">event_buffer_max_size</span><span class="o">=</span><span class="mi">1024</span><span class="p">),</span>
+<span class="linenos">16</span>              <span class="n">backend</span><span class="o">=</span><span class="s2">&quot;pytorch&quot;</span><span class="p">)</span>
+<span class="linenos">17</span>
+<span class="linenos">18</span>    <span class="c1"># Sample prompts having a common prefix.</span>
+<span class="linenos">19</span>    <span class="n">common_prefix</span> <span class="o">=</span> <span class="p">(</span>
+<span class="linenos">20</span>        <span class="s2">&quot;After the ghost&#39;s departure, Barnardo notes Horatio&#39;s pale appearance and asks if he&#39;s okay. &quot;</span>
+<span class="linenos">21</span>        <span class="s2">&quot;Horatio concedes that he&#39;s shaken and confesses that, without witnessing the ghost himself, he wouldn&#39;t have believed it existed. &quot;</span>
+<span class="linenos">22</span>        <span class="s2">&quot;He&#39;s also disturbed by the ghost&#39;s striking resemblance to the king. It even seems to be wearing the former king&#39;s armor. &quot;</span>
+<span class="linenos">23</span>        <span class="s2">&quot;Horatio thinks the ghost&#39;s presence foretells that something is about to go wrong in Denmark. &quot;</span>
+<span class="linenos">24</span>        <span class="s2">&quot;Marcellus concurs with Horatio, as he and the other guards have observed that their schedules have become more rigorous and have also noticed the preparations taking place within Elsinore, including the building of cannons, the storing of weapons, and the preparation of ships.&quot;</span>
+<span class="linenos">25</span>    <span class="p">)</span>
+<span class="linenos">26</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">27</span>        <span class="n">common_prefix</span><span class="p">,</span> <span class="n">common_prefix</span> <span class="o">+</span> <span class="s2">&quot; Marcellus also notes that the king&#39;s&quot;</span>
+<span class="linenos">28</span>    <span class="p">]</span>
+<span class="linenos">29</span>
+<span class="linenos">30</span>    <span class="c1"># Create a sampling params.</span>
+<span class="linenos">31</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.001</span><span class="p">,</span>
+<span class="linenos">32</span>                                     <span class="n">top_p</span><span class="o">=</span><span class="mf">0.001</span><span class="p">,</span>
+<span class="linenos">33</span>                                     <span class="n">max_tokens</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span>
+<span class="linenos">34</span>
+<span class="linenos">35</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="o">=</span><span class="n">sampling_params</span><span class="p">):</span>
+<span class="linenos">36</span>        <span class="nb">print</span><span class="p">(</span>
+<span class="linenos">37</span>            <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
+<span class="linenos">38</span>        <span class="p">)</span>
+<span class="linenos">39</span>
+<span class="linenos">40</span>    <span class="n">kv_events</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">get_kv_cache_events</span><span class="p">(</span><span class="mi">10</span><span class="p">)</span>
+<span class="linenos">41</span>    <span class="nb">print</span><span class="p">(</span><span class="n">kv_events</span><span class="p">)</span>
+<span class="linenos">42</span>
+<span class="linenos">43</span>    <span class="c1"># Got output like follows:</span>
+<span class="linenos">44</span>    <span class="c1"># [{&#39;event_id&#39;: 0, &#39;data&#39;: {&#39;type&#39;: &#39;created&#39;, &#39;num_blocks_per_cache_level&#39;: [101230, 0]}},</span>
+<span class="linenos">45</span>    <span class="c1">#  {&#39;event_id&#39;: 1, &#39;data&#39;: {&#39;type&#39;: &#39;stored&#39;, &#39;parent_hash&#39;: None, &#39;blocks&#39;: [{&#39;type&#39;: &#39;stored_block&#39;, &#39;block_hash&#39;: 4203099703668305365, &#39;tokens&#39;: [{&#39;type&#39;: &#39;unique_token&#39;, &#39;token_id&#39;: 1, &#39;token_extra_id&#39;: 0}, ...</span>
 <span class="linenos">46</span>
-<span class="linenos">47</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
-<span class="linenos">48</span>    <span class="n">main</span><span class="p">()</span>
+<span class="linenos">47</span>
+<span class="linenos">48</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+<span class="linenos">49</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -693,9 +694,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 16, 2025.</p>
+  <p>Last updated on June 21, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8445416">8445416</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/ebadc13">ebadc13</a>.</p>
   
 </div></div>
       
