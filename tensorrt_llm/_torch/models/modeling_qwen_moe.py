@@ -191,7 +191,6 @@ class QwenMoeModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Qwen2MoeConfig]):
         super().__init__(model_config)
         config = self.model_config
-        self.padding_idx = config.pretrained_config.pad_token_id
         self.aux_stream = torch.cuda.Stream()
 
         self.embed_tokens = Embedding(
