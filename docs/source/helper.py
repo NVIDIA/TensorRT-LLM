@@ -3,7 +3,6 @@ import re
 from dataclasses import dataclass
 from itertools import chain, groupby
 from pathlib import Path
-from pprint import pprint
 from typing import Optional
 
 
@@ -54,6 +53,23 @@ def extract_meta_info(filename: str) -> Optional[DocMeta]:
         return metadata
 
 
+def find_content_start_line(filename: str) -> int:
+    """Find the line number where actual content starts (after metadata section)."""
+    metadata_pattern = re.compile(r'^### :([a-zA-Z_]+[0-9]*)\s+(.+)$')
+
+    with open(filename) as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            # Skip empty lines and comment lines that are metadata
+            if not line or metadata_pattern.match(line):
+                continue
+            # Return the line number where content starts
+            return line_num
+
+    # If no content found, return 1 (start from beginning)
+    return 1
+
+
 # NOTE: Update here to keep consistent with the examples
 LLMAPI_SECTIONS = ["Basics", "Customization", "Slurm"]
 
@@ -63,32 +79,28 @@ def generate_examples():
     ignore_list = {'__init__.py', 'quickstart_example.py'}
     doc_dir = root_dir / "docs/source/examples"
 
+    def collect_script_paths(examples_subdir: str) -> list[Path]:
+        """Collect Python and shell script paths from an examples subdirectory."""
+        script_dir = root_dir / f"examples/{examples_subdir}"
+        script_paths = list(
+            chain(script_dir.glob("*.py"), script_dir.glob("*.sh")))
+        return [
+            path for path in sorted(script_paths)
+            if path.name not in ignore_list
+        ]
+
     # Collect source paths for LLMAPI examples
-    llmapi_script_dir = root_dir / "examples/llm-api"
-    llmapi_script_paths = list(llmapi_script_dir.glob("*.py"))
-    llmapi_script_paths += list(llmapi_script_dir.glob("*.sh"))
-
-    llmapi_script_paths = [
-        i for i in llmapi_script_paths if i.name not in ignore_list
-    ]
-
-    # Determine destination .rst paths for LLMAPI examples
+    llmapi_script_paths = collect_script_paths("llm-api")
     llmapi_doc_paths = [
         doc_dir / f"{path.stem}.rst" for path in llmapi_script_paths
     ]
     llmapi_script_base_url = "https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api"
 
     # Collect source paths for trtllm-serve examples
-    serve_script_dir = root_dir / "examples/serve"
-    serve_script_paths = sorted(
-        chain(serve_script_dir.glob("*.py"), serve_script_dir.glob("*.sh")))
-    serve_script_paths = [
-        i for i in serve_script_paths if i.name not in ignore_list
-    ]
+    serve_script_paths = collect_script_paths("serve")
     serve_doc_paths = [
         doc_dir / f"{path.stem}.rst" for path in serve_script_paths
     ]
-    pprint(serve_script_paths)
     serve_script_base_url = "https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve"
 
     # Generate the example docs for each example script
@@ -109,10 +121,9 @@ def generate_examples():
             # Make script_path relative to doc_path and call it include_path
             include_path = '../../..' / script_path.relative_to(root_dir)
 
-            # For Python files, use generate_title to extract title from comments
-            # For shell scripts, use filename as title
-            if meta := extract_meta_info(script_path):
-                title = meta.title
+            # Extract metadata from the script file
+            if meta := extract_meta_info(str(script_path)):
+                title = underline(meta.title)
             else:
                 logging.warning(
                     f"No metadata found for {script_path.name}, using filename as title"
@@ -126,12 +137,11 @@ def generate_examples():
             metas.append(meta)
 
             content = (f"{title}\n"
-                       f"{'='  * len(title)}\n\n"
                        f"{extra_content}"
                        f"Source {script_url}.\n\n"
                        f".. literalinclude:: {include_path}\n"
                        f"    :language: {language}\n"
-                       "    :linenos:\n")
+                       f"    :linenos:\n")
             with open(doc_path, "w+") as f:
                 logging.warning(f"Writing {doc_path}")
                 f.write(content)
@@ -141,62 +151,71 @@ def generate_examples():
     def write_index(metas: list[DocMeta], doc_template_path: Path,
                     doc_path: Path, example_name: str,
                     section_order: list[str]):
-        '''
-        Write the index file for the examples.
+        """Write the index file for the examples.
 
         Args:
             metas: The metadata for the examples.
             doc_template_path: The path to the template file.
             doc_path: The path to the output file.
             example_name: The name of the examples.
+            section_order: The order of sections to display.
 
         The template file is expected to have the following placeholders:
         - %EXAMPLE_DOCS%: The documentation for the examples.
         - %EXAMPLE_NAME%: The name of the examples.
-        '''
+        """
         with open(doc_template_path) as f:
-            examples_index = f.read()
+            template_content = f.read()
 
-        metas.sort(key=lambda x: (section_order.index(x.section)
-                                  if section_order else 0, int(x.order)))
-        pprint(metas)
+        # Sort metadata by section order and example order
+        sort_key = lambda x: (section_order.index(x.section)
+                              if section_order and x.section in section_order
+                              else 0, int(x.order))
+        metas.sort(key=sort_key)
 
         content = []
         for section, group in groupby(metas, key=lambda x: x.section):
-            if section_order:
-                assert section in section_order, f"Section {section} not in {section_order}, please add it with proper order"
-            group = list(group)
-            content.append(section)
-            content.append("_" * len(section))
+            if section_order and section not in section_order:
+                raise ValueError(
+                    f"Section '{section}' not in section_order {section_order}")
+
+            group_list = list(group)
+            content.extend([
+                section, "_" * len(section), "", ".. toctree::",
+                "   :maxdepth: 2", ""
+            ])
+
+            for meta in group_list:
+                content.append(f"   {meta.filename.stem}")
             content.append("")
-            # settings
-            content.append('.. toctree::')
-            content.append('   :maxdepth: 2')
-            content.append('')
-
-            for meta in group:
-                content.append(f'   {meta.filename.stem}')
-
-            content.append('')
 
         example_docs = "\n".join(content)
-        with open(doc_path, "w+") as f:
-            f.write(examples_index.replace(r"%EXAMPLE_DOCS%", example_docs)\
-                    .replace(r"%EXAMPLE_NAME%", example_name))
+
+        # Replace placeholders and write to file
+        output_content = template_content.replace("%EXAMPLE_DOCS%",
+                                                  example_docs).replace(
+                                                      "%EXAMPLE_NAME%",
+                                                      example_name)
+        with open(doc_path, "w") as f:
+            f.write(output_content)
 
     # Generate the toctree for LLMAPI example scripts
-    metas = write_scripts(llmapi_script_base_url, llmapi_script_paths,
-                          llmapi_doc_paths)
-    write_index(metas=metas,
+    llmapi_metas = write_scripts(llmapi_script_base_url, llmapi_script_paths,
+                                 llmapi_doc_paths)
+    write_index(metas=llmapi_metas,
                 doc_template_path=doc_dir / "llm_examples_index.template.rst_",
                 doc_path=doc_dir / "llm_api_examples.rst",
                 example_name="LLM Examples",
                 section_order=LLMAPI_SECTIONS)
+
     # Generate the toctree for trtllm-serve example scripts
-    trtllm_serve_content = "Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.\n\n"
-    metas = write_scripts(serve_script_base_url, serve_script_paths,
-                          serve_doc_paths, trtllm_serve_content)
-    write_index(metas=metas,
+    serve_extra_content = (
+        "Refer to the `trtllm-serve documentation "
+        "<https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ "
+        "for starting a server.\n\n")
+    serve_metas = write_scripts(serve_script_base_url, serve_script_paths,
+                                serve_doc_paths, serve_extra_content)
+    write_index(metas=serve_metas,
                 doc_template_path=doc_dir / "llm_examples_index.template.rst_",
                 doc_path=doc_dir / "trtllm_serve_examples.rst",
                 example_name="Online Serving Examples",
@@ -229,7 +248,7 @@ def extract_all_and_eval(file_path):
 def generate_llmapi():
     root_dir = Path(__file__).parent.parent.parent.resolve()
 
-    # Destination paths
+    # Set up destination paths
     doc_dir = root_dir / "docs/source/llm-api"
     doc_dir.mkdir(exist_ok=True)
     doc_path = doc_dir / "reference.rst"
