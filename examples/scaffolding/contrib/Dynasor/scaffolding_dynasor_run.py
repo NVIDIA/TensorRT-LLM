@@ -59,10 +59,10 @@ def test(prompts, proposer_worker, args):
                 i += 1
                 print(">>>", i, result)
                 async for output in result.output:
-                    print(i, len(output.outputs[0].text))
-            print(f">>> final output {len(output.outputs[0].text)}\n",
+                    print(">>>", i, len(output.outputs[0].token_ids), "\n",
+                          output.outputs[0].text)
+            print(f">>> final output {len(output.outputs[0].token_ids)}\n",
                   output.outputs[0].text)
-            # print(f">>> final result.output {len(result.output.outputs[0].text)} {result.output}\n", result.output.outputs[0].text)
 
         asyncio.run_coroutine_threadsafe(task(prompts[0]), llm.loop).result()
     else:

@@ -40,7 +40,12 @@ def test_async(prompt, proposer_worker):
 
     async def test_async_func(prompt, proposer_worker):
         prototype_controller = NativeGenerationController(
-            sampling_params={"temperature": 0.9}, streaming=True)
+            sampling_params={
+                "temperature": 0.9,
+                "max_tokens": 64
+            },
+            streaming=True,
+        )
         llm = ScaffoldingLlm(
             prototype_controller,
             {NativeGenerationController.WorkerTag.GENERATION: proposer_worker},
@@ -51,13 +56,10 @@ def test_async(prompt, proposer_worker):
             i += 1
             print(">>>", i, result)
             async for output in result.output:
-                print(len(output.outputs[0].text))
-            # print(result.output,
-            #       end='\n' if result.finished else '\r',
-            #       flush=True)
-
-        # result = await future.aresult()
-        # print(result.output.output_str)
+                print(">>>", i, len(output.outputs[0].token_ids), "\n",
+                      output.outputs[0].text)
+        print(f">>> final output {len(output.outputs[0].token_ids)}\n",
+              output.outputs[0].text)
 
         print(f'main shutting down...')
         llm.shutdown()
