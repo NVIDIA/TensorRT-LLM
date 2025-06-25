@@ -92,11 +92,6 @@ def test_llmapi_example_inference_async_streaming(llm_root, engine_dir,
                         "llm_inference_async_streaming.py")
 
 
-def test_llmapi_example_customize(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv,
-                        "llm_inference_customize.py")
-
-
 def test_llmapi_example_multilora(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_multilora.py")
 

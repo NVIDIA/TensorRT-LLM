@@ -53,23 +53,6 @@ def extract_meta_info(filename: str) -> Optional[DocMeta]:
         return metadata
 
 
-def find_content_start_line(filename: str) -> int:
-    """Find the line number where actual content starts (after metadata section)."""
-    metadata_pattern = re.compile(r'^### :([a-zA-Z_]+[0-9]*)\s+(.+)$')
-
-    with open(filename) as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            # Skip empty lines and comment lines that are metadata
-            if not line or metadata_pattern.match(line):
-                continue
-            # Return the line number where content starts
-            return line_num
-
-    # If no content found, return 1 (start from beginning)
-    return 1
-
-
 # NOTE: Update here to keep consistent with the examples
 LLMAPI_SECTIONS = ["Basics", "Customization", "Slurm"]
 
@@ -102,6 +85,51 @@ def generate_examples():
         doc_dir / f"{path.stem}.rst" for path in serve_script_paths
     ]
     serve_script_base_url = "https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve"
+
+    def _get_lines_without_metadata(filename: str) -> str:
+        """Get line ranges that exclude metadata lines.
+        Returns a string like "5-10,15-20" for use in :lines: directive.
+        """
+        with open(filename) as f:
+            metadata_pattern = re.compile(r'^### :([a-zA-Z_]+[0-9]*)\s+(.+)$')
+            all_lines = f.readlines()
+
+        # Find line numbers that are NOT metadata (1-indexed)
+        content_lines = []
+        for line_num, line in enumerate(all_lines, 1):
+            line_stripped = line.strip()
+            # Include line if it's not empty and not metadata
+            if not metadata_pattern.match(line_stripped):
+                content_lines.append(line_num)
+
+        if not content_lines:
+            return ""  # No content lines found
+
+        # Group consecutive line numbers into ranges
+        ranges = []
+        start = content_lines[0]
+        end = start
+
+        for line_num in content_lines[1:]:
+            if line_num == end + 1:
+                # Consecutive line, extend current range
+                end = line_num
+            else:
+                # Gap found, close current range and start new one
+                if start == end:
+                    ranges.append(str(start))
+                else:
+                    ranges.append(f"{start}-{end}")
+                start = line_num
+                end = line_num
+
+        # Add the final range
+        if start == end:
+            ranges.append(str(start))
+        else:
+            ranges.append(f"{start}-{end}")
+
+        return ",".join(ranges)
 
     # Generate the example docs for each example script
     def write_scripts(base_url: str,
@@ -136,12 +164,22 @@ def generate_examples():
                 title = underline(title)
             metas.append(meta)
 
+            # Get line ranges excluding metadata
+            lines_without_metadata = _get_lines_without_metadata(
+                str(script_path))
+
+            # Build literalinclude directive
+            literalinclude_lines = [f".. literalinclude:: {include_path}"]
+            if lines_without_metadata:
+                literalinclude_lines.append(
+                    f"    :lines: {lines_without_metadata}")
+            literalinclude_lines.extend(
+                [f"    :language: {language}", f"    :linenos:"])
+
             content = (f"{title}\n"
                        f"{extra_content}"
                        f"Source {script_url}.\n\n"
-                       f".. literalinclude:: {include_path}\n"
-                       f"    :language: {language}\n"
-                       f"    :linenos:\n")
+                       f"{chr(10).join(literalinclude_lines)}\n")
             with open(doc_path, "w+") as f:
                 logging.warning(f"Writing {doc_path}")
                 f.write(content)
