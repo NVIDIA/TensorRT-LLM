@@ -180,7 +180,6 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
 def create_py_executor(
         executor_config: ExecutorConfig,
         checkpoint_dir: str = None,
-        engine_dir: str = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
     _mangle_executor_config(executor_config)

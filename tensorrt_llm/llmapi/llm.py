@@ -695,7 +695,6 @@ class BaseLLM:
             if self._on_trt_backend else None,
             speculative_config=self.args.speculative_config,
             hf_model_dir=self._hf_model_dir,
-            trt_engine_dir=self._engine_dir,
             max_input_len=self.args.max_input_len,
             max_seq_len=max_seq_len)
         self._executor_config.llm_parallel_config = self.args.parallel_config
