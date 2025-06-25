@@ -239,7 +239,7 @@ class OPTForCausalLM(DecoderModelForCausalLM[OPTModel, OPTConfig]):
 
     def load_weights(self, weights: dict):
         tp_size = self.model_config.mapping.tp_size
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        num_kv_heads = self.config.num_key_value_heads
 
         def filter_weights(prefix: str, weights: dict):
             result = {}
@@ -280,7 +280,7 @@ class OPTForCausalLM(DecoderModelForCausalLM[OPTModel, OPTConfig]):
                                 k:
                                 duplicate_kv_weight(
                                     weight=v[:],
-                                    head_dim=head_dim,
+                                    num_kv_heads=num_kv_heads,
                                     tensor_parallel_size=tp_size)
                                 if k in ['weight', 'bias'] else v
                                 for k, v in fw.items()

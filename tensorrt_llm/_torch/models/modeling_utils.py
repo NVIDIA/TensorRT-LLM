@@ -93,10 +93,8 @@ class MetaInitMode(TorchDispatchMode):
         return func(*args, **kwargs)
 
 
-def duplicate_kv_weight(weight: torch.Tensor, head_dim: int,
+def duplicate_kv_weight(weight: torch.Tensor, num_kv_heads: int,
                         tensor_parallel_size: int):
-
-    num_kv_heads = weight.shape[0] // head_dim
 
     if num_kv_heads >= tensor_parallel_size:
         assert num_kv_heads % tensor_parallel_size == 0
@@ -109,11 +107,15 @@ def duplicate_kv_weight(weight: torch.Tensor, head_dim: int,
     if weight.ndim == 1:
         return weight.repeat_interleave(reps)
 
-    # weight
-    weight = weight.reshape(num_kv_heads, head_dim,
+    # weight and scale
+    assert weight.shape[0] % num_kv_heads == 0
+    size_per_kv_head = weight.shape[0] // num_kv_heads
+    weight = weight.reshape(num_kv_heads, size_per_kv_head,
                             -1)[:, None, :, :].expand(num_kv_heads, reps,
-                                                      head_dim, weight.shape[1])
-    return weight.reshape(num_kv_heads * reps * head_dim, -1).clone().detach()
+                                                      size_per_kv_head,
+                                                      weight.shape[1])
+    return weight.reshape(num_kv_heads * reps * size_per_kv_head,
+                          -1).clone().detach()
 
 
 def iter_modules(
@@ -648,9 +650,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         logger.info(f"Renamed weights with params_map: {params_map}")
 
     tp_size = 1 if model.model_config.mapping.enable_attention_dp else model.model_config.mapping.tp_size
-    head_dim = getattr(
-        model.config, "head_dim",
-        model.config.hidden_size // model.config.num_attention_heads)
+    num_kv_heads = model.config.num_key_value_heads
 
     params_map = {
         'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
@@ -690,7 +690,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                         fw = {
                             k:
                             duplicate_kv_weight(weight=v[:],
-                                                head_dim=head_dim,
+                                                num_kv_heads=num_kv_heads,
                                                 tensor_parallel_size=tp_size)
                             if k in ["weight", "bias"] else v
                             for k, v in fw.items()
