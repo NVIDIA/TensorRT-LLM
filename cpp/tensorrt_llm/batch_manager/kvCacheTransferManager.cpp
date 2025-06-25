@@ -206,7 +206,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
             continue;
         }
 
-#ifdef ENABLE_CUFILE
+#if ENABLE_CUFILE
         CUfileDescr_t cufileDesc = {};
         cufileDesc.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
         cufileDesc.handle.fd = fd;
@@ -216,7 +216,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         if (status.err != CU_FILE_SUCCESS)
         {
             // Fallback to POSIX
-            TLLM_LOG_WARN(
+            TLLM_LOG_WARNING(
                 "cuFileHandleRegister failed (err=%d). Falling back to POSIX for '%s'", status.err, filename.c_str());
             ::close(fd);
             if (isOffload)
