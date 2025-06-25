@@ -57,7 +57,7 @@ Runner::Runner(int32_t tileTokensDim)
 }
 
 void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
-    bool fuseSharedExpert, int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset, int32_t localNumExperts,
+    int32_t numFusedSharedExpert, int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset, int32_t localNumExperts,
     float routedScalingFactor, int32_t* routingExpertIndexes, int32_t* expertCountHistogram, int32_t* permutedIdxSize,
     int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
     void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
@@ -66,7 +66,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 {
     if (routingMethodType == RoutingMethodType::DeepSeekV3)
     {
-        int32_t const totalExpertsPerToken = topK + (fuseSharedExpert ? 1 : 0);
+        int32_t const totalExpertsPerToken = topK + numFusedSharedExpert;
 
         TLLM_CHECK_WITH_INFO(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
         TLLM_CHECK_WITH_INFO(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
@@ -96,7 +96,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         // routingData.mPtrIn = args.mInputActs;
         routingData.mNumTokens = numTokens;
         // routingData.mHiddenDim = args.mHiddenDim;
-        routingData.mFuseSharedExpert = fuseSharedExpert;
+        routingData.mFuseSharedExpert = numFusedSharedExpert > 0;
         routingData.mNumExperts = numExperts;
         routingData.mNumExpertGroups = nGroup;
         routingData.mNumLimitedGroups = topkGroup;
@@ -130,7 +130,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     }
     else if (routingMethodType == RoutingMethodType::Llama4)
     {
-        TLLM_CHECK_WITH_INFO(!fuseSharedExpert, "Llama routing method does not support fusing shared expert");
+        TLLM_CHECK_WITH_INFO(numFusedSharedExpert == 0, "Llama routing method does not support fusing shared expert");
         TLLM_CHECK_WITH_INFO(topK == 1, "For Llama routing method, must have topK == 1");
         if (nGroup > 0 || topkGroup > 0)
         {
@@ -177,7 +177,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     else if (routingMethodType == RoutingMethodType::Renormalize /* default */
         || routingMethodType == RoutingMethodType::RenormalizeNaive /* Softmax -> TopK */)
     {
-        TLLM_CHECK_WITH_INFO(!fuseSharedExpert, "Renormalize routing method does not support fusing shared expert");
+        TLLM_CHECK_WITH_INFO(numFusedSharedExpert == 0, "Renormalize routing method does not support fusing shared expert");
         moe::dev::routingRenormalize::Data routingData;
 
         //
@@ -406,8 +406,8 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     moe::dev::convertsf::Data& convertSfData, moe::dev::activation::Data& activationData,
     moe::dev::finalize::Data& finalizeData)
 {
-    int32_t const totalNumExperts = args.num_experts + (args.fuse_shared_expert ? 1 : 0);
-    int32_t const totalExpertsPerToken = args.top_k + (args.fuse_shared_expert ? 1 : 0);
+    int32_t const totalNumExperts = args.num_experts + args.num_fused_shared_expert;
+    int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_expert;
 
     // Setup sf conversion data if needed
     convertSfData.inSfPtr = args.hidden_states_scale;
@@ -464,8 +464,8 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
 std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const& args, int64_t configIndex) const
 {
     auto const& config = mPassingConfigs[configIndex];
-    int32_t const totalLocalExperts = args.local_num_experts + (args.fuse_shared_expert ? 1 : 0);
-    int32_t const totalExpertsPerToken = args.top_k + (args.fuse_shared_expert ? 1 : 0);
+    int32_t const totalLocalExperts = args.local_num_experts + args.num_fused_shared_expert;
+    int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_expert;
 
     auto workspace_size_fc1 = static_cast<int32_t>(mPermuteGemm1.getWorkspaceSizeInBytes(totalExpertsPerToken,
         args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens, config.gemm1Config));
@@ -521,8 +521,8 @@ void Runner::run(
     sync_check_cuda_error(stream);
     setOpsData(args, workspace, convertSfData, activationData, finalizeData);
 
-    int32_t const totalLocalExperts = args.local_num_experts + (args.fuse_shared_expert ? 1 : 0);
-    int32_t const totalExpertsPerToken = args.top_k + (args.fuse_shared_expert ? 1 : 0);
+    int32_t const totalLocalExperts = args.local_num_experts + args.num_fused_shared_expert;
+    int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_expert;
 
     void* hidden_states_scale_linear{args.hidden_states_scale};
 

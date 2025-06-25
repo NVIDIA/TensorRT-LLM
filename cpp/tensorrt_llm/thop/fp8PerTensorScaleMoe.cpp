@@ -29,7 +29,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
     torch::Tensor const& hidden_states, torch::Tensor const& gemm1_weights, torch::Tensor const& output1_scales_scalar,
     torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& gemm2_weights,
     torch::Tensor const& output2_scales_scalar, int64_t const num_experts, int64_t const top_k,
-    std::optional<bool> const fuse_shared_expert, int64_t const n_group, int64_t const topk_group,
+    std::optional<int64_t> const num_fused_shared_expert, int64_t const n_group, int64_t const topk_group,
     int64_t const intermediate_size, int64_t const local_expert_offset, int64_t const local_num_experts,
     double const routed_scaling_factor, bool const use_routing_scales_on_input, int64_t const tile_tokens_dim,
     int64_t const routing_method_type)
@@ -69,14 +69,17 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
 
     // TODO This is only due to a lack of testing.
     TORCH_CHECK(
-        !fuse_shared_expert.value_or(false), "Fp8 per tensor scale is not compatible with shared expert fusion");
+        !num_fused_shared_expert.value_or(0), "Fp8 per tensor scale is not compatible with shared expert fusion");
 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoERunnerArgs args;
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
 
-    int64_t const num_total_experts = num_experts + (fuse_shared_expert.value_or(false) ? 1 : 0);
-    int64_t const total_experts_per_token = top_k + (fuse_shared_expert.value_or(false) ? 1 : 0);
-    int64_t const num_total_local_experts = local_num_experts + (fuse_shared_expert.value_or(false) ? 1 : 0);
+    int64_t const num_total_experts
+        = num_experts + (num_fused_shared_expert.value_or(0) > 0 ? num_fused_shared_expert.value() : 0);
+    int64_t const total_experts_per_token
+        = top_k + (num_fused_shared_expert.value_or(0) > 0 ? num_fused_shared_expert.value() : 0);
+    int64_t const num_total_local_experts
+        = local_num_experts + (num_fused_shared_expert.value_or(0) > 0 ? num_fused_shared_expert.value() : 0);
 
     // setup args
     args.mDtypeElt = btg::Dtype::E4m3;
@@ -92,7 +95,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
     args.num_experts = num_experts;
     args.hidden_size = hidden_states.sizes()[1];
     args.top_k = top_k;
-    args.fuse_shared_expert = fuse_shared_expert.value_or(false);
+    args.num_fused_shared_expert = num_fused_shared_expert.value_or(0);
     args.n_group = n_group;
     args.topk_group = topk_group;
     args.local_expert_offset = local_expert_offset;
@@ -145,7 +148,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
     auto const& stream = at::cuda::getCurrentCUDAStream(routing_logits.get_device());
     routing_runner.run(routing_logits.data_ptr(), routing_bias.data_ptr(), args.num_tokens, args.num_experts,
-        args.top_k, args.fuse_shared_expert, args.n_group, args.topk_group, args.local_expert_offset,
+        args.top_k, args.num_fused_shared_expert, args.n_group, args.topk_group, args.local_expert_offset,
         args.local_num_experts, args.routed_scaling_factor, expert_indexes.data_ptr<int>(),
         expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
         expanded_idx_to_permuted_idx.data_ptr<int>(), nullptr /*permuted_idx_to_expanded_idx.data_ptr<int>()*/,
@@ -250,7 +253,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor output2_scales_scalar,"
         "int num_experts,"
         "int top_k,"
-        "bool? fuse_shared_expert,"
+        "int? num_fused_shared_expert,"
         "int n_group,"
         "int topk_group,"
         "int intermediate_size,"

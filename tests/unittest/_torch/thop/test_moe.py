@@ -669,9 +669,10 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size,
     with autotune(use_autotune):
         output = torch.ops.trtllm.fp8_block_scale_moe_runner(
             expert_logits, routing_bias, hidden_states, hidden_states_scale,
-            gemm1_weights, gemm1_scales, gemm2_weights, gemm2_scales,
-            num_experts, top_k, fuse_shared_expert, n_groups, top_k_groups,
-            intermediate_size, 0, num_experts, routed_scaling, tile_tokens_dim,
+            gemm1_weights, gemm1_scales,
+            gemm2_weights, gemm2_scales, num_experts, top_k,
+            int(fuse_shared_expert), n_groups, top_k_groups, intermediate_size,
+            0, num_experts, routed_scaling, tile_tokens_dim,
             routing_method_type)
 
     output_dequant_actual = output.to(torch.float)
@@ -998,7 +999,7 @@ def test_moe_fp4(num_tokens, hidden_size, intermediate_size, routing_info):
         scale_c_fc2,
         num_experts,
         top_k,
-        fuse_shared_expert,
+        int(fuse_shared_expert),
         n_groups,
         top_k_groups,
         intermediate_size,
@@ -1155,7 +1156,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
         if use_routing_scales_on_input else expert_logits, routing_bias,
         hidden_states_quant, gemm1_weights_fp8_shuffled, scale_c_fc1,
         scale_gate_fc1, gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts,
-        top_k, False, n_groups, top_k_groups, intermediate_size, 0, num_experts,
+        top_k, 0, n_groups, top_k_groups, intermediate_size, 0, num_experts,
         routed_scaling, use_routing_scales_on_input, tile_tokens_dim,
         routing_method_type)
 

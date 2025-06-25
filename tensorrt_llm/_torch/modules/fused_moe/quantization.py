@@ -9,6 +9,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
     float4_sf_dtype, get_reorder_rows_for_gated_act_gemm_row_indices,
     get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices)
 
+from ..gated_mlp import GatedMLP
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
 
@@ -807,23 +808,29 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     Base class for NVFP4 fused MoE methods for all backends.
     """
 
-    def create_weights(self, module: torch.nn.Module, weight_dtype,
-                       weight_vec_size, block_scales_dtype,
-                       block_scales_vec_size):
+    def create_weights(self,
+                       module: torch.nn.Module,
+                       weight_dtype,
+                       weight_vec_size,
+                       block_scales_dtype,
+                       block_scales_vec_size,
+                       n_shared_experts=0):
 
         module.scaling_vector_size = 16
         # Divide by 16 because we use int64 to pack 16 fp4 values
-        w3_w1_weight_shape = (module.expert_size_per_partition,
+        w3_w1_weight_shape = (module.expert_size_per_partition +
+                              n_shared_experts,
                               module.intermediate_size_per_partition * 2,
                               module.hidden_size // weight_vec_size)
-        w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
+        w2_weight_shape = (module.expert_size_per_partition + n_shared_experts,
+                           module.hidden_size,
                            module.intermediate_size_per_partition //
                            weight_vec_size)
 
         # Divide by 4 because we use int32 to pack 4 fp8 values
         # column parallel
         w3_w1_weight_scale = nn.Parameter(
-            torch.ones(module.expert_size_per_partition,
+            torch.ones(module.expert_size_per_partition + n_shared_experts,
                        module.intermediate_size_per_partition * 2,
                        module.hidden_size // module.scaling_vector_size //
                        block_scales_vec_size,
@@ -833,7 +840,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         # row parallel
         w2_weight_scale = nn.Parameter(
-            torch.ones(module.expert_size_per_partition,
+            torch.ones(module.expert_size_per_partition + n_shared_experts,
                        module.hidden_size,
                        module.intermediate_size_per_partition //
                        module.scaling_vector_size // block_scales_vec_size,
@@ -849,12 +856,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                        requires_grad=False)
         module.register_parameter("fc2_input_scale", fc2_input_scale)
 
-        fc31_alpha = nn.Parameter(torch.ones(module.expert_size_per_partition,
+        fc31_alpha = nn.Parameter(torch.ones(module.expert_size_per_partition +
+                                             n_shared_experts,
                                              dtype=torch.float32),
                                   requires_grad=False)
         module.register_parameter("fc31_alpha", fc31_alpha)
 
-        fc2_alpha = nn.Parameter(torch.ones(module.expert_size_per_partition,
+        fc2_alpha = nn.Parameter(torch.ones(module.expert_size_per_partition +
+                                            n_shared_experts,
                                             dtype=torch.float32),
                                  requires_grad=False)
         module.register_parameter("fc2_alpha", fc2_alpha)
@@ -1170,15 +1179,17 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         permute_indices = self._cache_permute_indices[dst_w2_weight.shape]
         return permute_indices
 
-    def create_weights(self, module: torch.nn.Module):
+    def create_weights(self, module: torch.nn.Module, n_shared_experts: int):
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
         block_scales_vec_size = 1
 
         super().create_weights(module, self.weight_dtype, weight_vec_size,
-                               self.block_scales_dtype, block_scales_vec_size)
+                               self.block_scales_dtype, block_scales_vec_size,
+                               n_shared_experts)
 
-        fc31_scale_c = nn.Parameter(torch.ones(module.expert_size_per_partition,
-                                               dtype=torch.float32),
+        fc31_scale_c = nn.Parameter(torch.ones(
+            module.expert_size_per_partition + n_shared_experts,
+            dtype=torch.float32),
                                     requires_grad=False)
         module.register_parameter("fc31_scale_c", fc31_scale_c)
 
@@ -1342,6 +1353,41 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4FusedMoEMethod):
         super().load_quant_scales(module, weights)
 
         # last step: load fc31_scale_c
+        module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
+                                       module.fc31_alpha.data,
+                                       non_blocking=True)
+
+    def fuse_shared_expert(self, module: torch.nn.Module,
+                           shared_experts: GatedMLP, n_shared_experts: int):
+        w3_w1_weight = shared_experts.gate_up_proj.weight.view(
+            n_shared_experts, module.w3_w1_weight.shape[1],
+            module.w3_w1_weight.shape[2])
+        w2_weight = shared_experts.down_proj.weight.view(
+            n_shared_experts, module.w2_weight.shape[1],
+            module.w2_weight.shape[2])
+        w3_w1_weight_scale = shared_experts.gate_up_proj.weight_scale.view(
+            n_shared_experts, module.w3_w1_weight_scale.shape[1],
+            module.w3_w1_weight_scale.shape[2])
+        w2_weight_scale = shared_experts.down_proj.weight_scale.view(
+            n_shared_experts, module.w2_weight_scale.shape[1],
+            module.w2_weight_scale.shape[2])
+        # TODO: add relayout logic here
+
+        module.w3_w1_weight.data[module.expert_size_per_partition:].copy_(
+            w3_w1_weight.data, non_blocking=True)
+        module.w2_weight.data[module.expert_size_per_partition:].copy_(
+            w2_weight.data, non_blocking=True)
+        module.w3_w1_weight_scale.data[module.expert_size_per_partition:].copy_(
+            w3_w1_weight_scale.data, non_blocking=True)
+        module.w2_weight_scale.data[module.expert_size_per_partition:].copy_(
+            w2_weight_scale.data, non_blocking=True)
+
+        module.fc31_alpha.data[module.expert_size_per_partition:].copy_(
+            shared_experts.gate_up_proj.alpha.data.expand(n_shared_experts),
+            non_blocking=True)
+        module.fc2_alpha.data[module.expert_size_per_partition:].copy_(
+            shared_experts.down_proj.alpha.data.expand(n_shared_experts),
+            non_blocking=True)
         module.fc31_scale_c.data.copy_(module.fc2_input_scale.data *
                                        module.fc31_alpha.data,
                                        non_blocking=True)

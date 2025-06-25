@@ -104,12 +104,13 @@ public:
     explicit Runner(int32_t tileTokensDim);
 
     void run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
-        bool fuseSharedExpert, int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset, int32_t localNumExperts,
-        float routedScalingFactor, int32_t* routingExpertIndexes, int32_t* expertCountHistogram,
-        int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
-        int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
-        int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, batchedGemm::trtllm::gen::Dtype dtypeElt,
-        bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream);
+        int32_t numFusedSharedExpert, int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset,
+        int32_t localNumExperts, float routedScalingFactor, int32_t* routingExpertIndexes,
+        int32_t* expertCountHistogram, int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx,
+        int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx, void* expertWeights,
+        int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
+        int32_t* numNonExitingCtas, batchedGemm::trtllm::gen::Dtype dtypeElt, bool useRoutingScalesOnInput,
+        bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream);
 
 private:
     int32_t mTileTokensDim{8};
@@ -208,7 +209,7 @@ struct MoERunnerArgs
     // The number of routed experts
     int32_t num_experts{0};
     // Will the shared expert be fused in batched gemms?
-    bool fuse_shared_expert{false};
+    int32_t num_fused_shared_expert{0};
     // The number of routed experts on this device
     int32_t local_num_experts{0};
     // The starting index of experts on this device

@@ -32,7 +32,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm2_weights,
     torch::Tensor const& gemm2_weights_scale, torch::Tensor const& output1_scales_scalar,
     torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& output2_scales_scalar,
-    int64_t const num_experts, int64_t const top_k, std::optional<bool> const fuse_shared_expert,
+    int64_t const num_experts, int64_t const top_k, std::optional<int64_t> const num_fused_shared_expert,
     std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
     int64_t const local_expert_offset, int64_t const local_num_experts,
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
@@ -81,9 +81,12 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoERunnerArgs args;
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
 
-    int64_t const num_total_experts = num_experts + (fuse_shared_expert.value_or(false) ? 1 : 0);
-    int64_t const total_experts_per_token = top_k + (fuse_shared_expert.value_or(false) ? 1 : 0);
-    int64_t const num_total_local_experts = local_num_experts + (fuse_shared_expert.value_or(false) ? 1 : 0);
+    int64_t const num_total_experts
+        = num_experts + (num_fused_shared_expert.value_or(0) > 0 ? num_fused_shared_expert.value() : 0);
+    int64_t const total_experts_per_token
+        = top_k + (num_fused_shared_expert.value_or(0) > 0 ? num_fused_shared_expert.value() : 0);
+    int64_t const num_total_local_experts
+        = local_num_experts + (num_fused_shared_expert.value_or(0) > 0 ? num_fused_shared_expert.value() : 0);
 
     // setup args
     // note: the assumption is that output data type is always Bfloat16 (the default)
@@ -104,7 +107,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     // * 2 to compensate for the fact that sizeof(hidden_states.dtype) is 1 because we pack 2 e2m1 into 1 byte.
     args.hidden_size = hidden_states.sizes()[1] * 2;
     args.top_k = top_k;
-    args.fuse_shared_expert = fuse_shared_expert.value_or(false);
+    args.num_fused_shared_expert = num_fused_shared_expert.value_or(0);
     args.n_group = n_group.value_or(1);
     args.topk_group = topk_group.value_or(top_k);
     args.local_expert_offset = local_expert_offset;
@@ -166,7 +169,7 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
     auto const& stream = at::cuda::getCurrentCUDAStream(routing_logits.get_device());
     routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, num_experts, top_k,
-        args.fuse_shared_expert, args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
+        args.num_fused_shared_expert, args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
         args.routed_scaling_factor, expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(),
         total_num_padded_tokens.data_ptr<int>(), expanded_idx_to_permuted_idx.data_ptr<int>(),
         nullptr, /*permuted_idx_to_expanded_idx.data_ptr<int>(),*/
@@ -321,7 +324,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor output2_scale_scalar,"
         "int num_experts,"
         "int top_k,"
-        "bool? fuse_shared_expert,"
+        "int? num_fused_shared_expert,"
         "int? n_group,"
         "int? topk_group,"
         "int intermediate_size,"

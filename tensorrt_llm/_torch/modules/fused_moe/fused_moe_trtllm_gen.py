@@ -4,6 +4,7 @@ import torch
 
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor
+from ..gated_mlp import GatedMLP
 from .interface import MoE, MoEWeightLoadingMode
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod)
@@ -86,6 +87,11 @@ class TRTLLMGenFusedMoE(MoE):
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+        self.num_fused_shared_expert = 0
+
+        if not model_config.mapping.enable_attention_dp and self.quant_config.layer_quant_mode.has_nvfp4(
+        ):
+            self.num_fused_shared_expert = model_config.pretrained_config.n_shared_experts
 
     def _check_configs(self):
         assert self.has_deepseek_fp8_block_scales or self.has_nvfp4, "TRTLLMGenFusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
@@ -109,7 +115,7 @@ class TRTLLMGenFusedMoE(MoE):
             return
 
         self.quant_method = self._get_quant_method()
-        self.quant_method.create_weights(self)
+        self.quant_method.create_weights(self, self.num_fused_shared_expert)
 
         self._weights_created = True
         self._check_configs()
@@ -121,6 +127,11 @@ class TRTLLMGenFusedMoE(MoE):
         weights = weights[0]
 
         self.quant_method.load_weights(self, weights, self.weight_loading_mode)
+
+    def fuse_shared_expert(self, shared_experts: GatedMLP):
+        assert self._weights_created
+        self.quant_method.fuse_shared_expert(self, shared_experts,
+                                             self.num_fused_shared_expert)
 
     def forward(
         self,
@@ -172,6 +183,7 @@ class TRTLLMGenFusedMoE(MoE):
                 self.w2_weight_scaling_factor,
                 self.num_slots,
                 top_k,
+                self.num_fused_shared_expert,
                 n_group,
                 topk_group,
                 self.intermediate_size_per_partition,
@@ -206,6 +218,7 @@ class TRTLLMGenFusedMoE(MoE):
                 self.fc2_alpha.data,
                 self.num_slots,
                 top_k,
+                0,
                 n_group,
                 topk_group,
                 self.intermediate_size_per_partition,
