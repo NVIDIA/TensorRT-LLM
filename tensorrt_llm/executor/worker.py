@@ -203,8 +203,8 @@ class GenerationExecutorWorker(GenerationExecutor):
             return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
                                  executor_config)
 
-        self.engine = _create_py_executor if llm_args is not None else _create_engine(
-        )
+        self.engine = _create_py_executor(
+        ) if llm_args is not None else _create_engine()
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
