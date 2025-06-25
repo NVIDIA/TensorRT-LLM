@@ -128,8 +128,8 @@ inline __device__ void dequantCopy(
     DstType* dst_global_ptr, __nv_fp8_e4m3 const* src_fragment_ptr, float const scale_val = 1.f)
 {
     using DstVecType = uint4;
-    using DstType2 = typename std::conditional<sizeof(DstType) == 2,
-        typename tensorrt_llm::common::TypeConverter<DstType>::Type, float2>::type;
+    using DstType2
+        = std::conditional_t<sizeof(DstType) == 2, typename tensorrt_llm::common::TypeConverter<DstType>::Type, float2>;
     static constexpr int COPY_SIZE = sizeof(DstVecType);
     static constexpr int TOTAL_COPY_SIZE = NUM * sizeof(DstType);
     static constexpr int LOOP_NUM = TOTAL_COPY_SIZE / COPY_SIZE;
@@ -250,6 +250,8 @@ __global__ void loadChunkedKVCacheForMLAKernel(T* output_kv_ptr, T* output_k_pe_
     tensorrt_llm::kernels::KVBlockArray const kv_cache, int64_t const* cu_ctx_chunked_len, int chunked_size,
     int chunked_idx, float const* kv_scale_quant_orig_ptr)
 {
+    static_assert(std::is_same_v<T, TCache> || std::is_same_v<TCache, __nv_fp8_e4m3>,
+        "TCache must be either the same type as T or __nv_fp8_e4m3");
     using KT = loadChunkedKVKernelTraits<TCache>;
     float const kv_scale_quant_orig = kv_scale_quant_orig_ptr ? kv_scale_quant_orig_ptr[0] : 1.0f;
     int const batch_idx = static_cast<int>(blockIdx.y);
@@ -418,7 +420,7 @@ void invokeMLALoadChunkedKV(T* output_kv_ptr, T* output_k_pe_ptr, KVBlockArray c
     int64_t const* cu_ctx_chunked_len, int lora_size, int rope_size, int chunked_size, int chunked_idx,
     float const* kv_scale_quant_orig_ptr, cudaStream_t stream)
 {
-    using KT = loadChunkedKVKernelTraits<T>;
+    using KT = loadChunkedKVKernelTraits<TCache>;
     TLLM_CHECK_WITH_INFO(lora_size + rope_size == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
     TLLM_CHECK_WITH_INFO(lora_size == KT::kLoraSize, "lora dim should be equal to %d", KT::kLoraSize);
     TLLM_CHECK_WITH_INFO(rope_size == KT::kRopeSize, "rope dim should be equal to %d", KT::kRopeSize);
