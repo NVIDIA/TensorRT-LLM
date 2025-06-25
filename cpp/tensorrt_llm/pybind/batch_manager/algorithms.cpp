@@ -38,6 +38,10 @@
 
 #include <ATen/core/TensorBody.h>
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/list.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/tuple.h>
+#include <nanobind/stl/vector.h>
 #include <torch/extension.h>
 
 #include <optional>

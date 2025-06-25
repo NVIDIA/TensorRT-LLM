@@ -236,12 +236,9 @@ def setup_llm(args):
 
 def main():
     args = parse_arguments()
-    print("args", args)
     prompts = args.prompt if args.prompt else example_prompts
 
     llm, sampling_params = setup_llm(args)
-    print("llm", llm)
-    print("sampling_params", sampling_params)
     outputs = llm.generate(prompts, sampling_params)
 
     for i, output in enumerate(outputs):

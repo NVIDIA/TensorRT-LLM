@@ -734,7 +734,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.kv_cache_manager is not None:
             self.kv_cache_manager.impl.copy_batch_block_offsets(
                 self.host_kv_cache_block_offsets, self.request_ids)
-            print("called copy_batch_block_offsets")
             self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
                 self.host_kv_cache_block_offsets[:, :self.num_seqs],
                 non_blocking=True)
@@ -747,7 +746,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
         self.host_request_types_runtime = self.host_request_types[:self.
                                                                   num_seqs]
-        print("finished prepare")
 
     def prepare_flash_mla(self) -> None:
         block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
