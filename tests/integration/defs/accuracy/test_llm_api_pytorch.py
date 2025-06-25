@@ -301,7 +301,7 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_fp8_prequantized(self):
-        model_path = f"{llm_models_root()}/ llama-3.2-models/Llama-3.2-1B-FP8"
+        model_path = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B-FP8"
         with LLM(model_path) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
@@ -1420,6 +1420,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-235B-A22B"
 
     @skip_pre_hopper
+    @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
         [(8, 1, 8, True, True, True), (8, 1, 8, False, True, True)],
@@ -1496,7 +1497,7 @@ class TestKanana_Instruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_device_not_contain(["H20", "H100"])
     def test_auto_dtype(self):
         "RCCA: https://nvbugspro.nvidia.com/bug/5310520"
-        pytorch_config = dict(duse_cuda_graph=True,
+        pytorch_config = dict(use_cuda_graph=True,
                               cuda_graph_padding_enabled=True,
                               cuda_graph_max_batch_size=384)
         with LLM(self.MODEL_PATH, **pytorch_config,
