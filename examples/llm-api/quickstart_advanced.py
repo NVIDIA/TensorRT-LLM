@@ -103,6 +103,7 @@ def add_llm_args(parser):
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)
+    parser.add_argument("--n", type=int, default=1)
     parser.add_argument('--load_format', type=str, default='auto')
     parser.add_argument('--max_beam_width', type=int, default=1)
 
@@ -186,6 +187,13 @@ def setup_llm(args):
     else:
         spec_config = None
 
+    # TorchSampler needs to set mixed_sampler to True for non-greedy decoding.
+    greedy_decoding = ((args.temperature == 0.0)
+                       or (args.top_k == 1 and
+                           (args.top_p == 0.0 or args.top_p is None)))
+    mixed_sampler = not greedy_decoding and not args.enable_trtllm_sampler
+
+
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=args.cuda_graph_batch_sizes,
         padding_enabled=args.cuda_graph_padding_enabled,
@@ -209,6 +217,7 @@ def setup_llm(args):
         if args.use_torch_compile else None,
         moe_backend=args.moe_backend,
         enable_trtllm_sampler=args.enable_trtllm_sampler,
+        mixed_sampler=mixed_sampler,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
         max_num_tokens=args.max_num_tokens,
@@ -224,6 +233,10 @@ def setup_llm(args):
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width)
 
+    if args.max_beam_width > 1:
+        # If beam search is used, set n to the beam width.
+        args.n = args.max_beam_width
+
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
@@ -232,7 +245,7 @@ def setup_llm(args):
         return_context_logits=args.return_context_logits,
         return_generation_logits=args.return_generation_logits,
         logprobs=args.logprobs,
-        n=args.max_beam_width,
+        n=args.n,
         use_beam_search=args.max_beam_width > 1)
     return llm, sampling_params
 
@@ -246,23 +259,23 @@ def main():
 
     for i, output in enumerate(outputs):
         prompt = output.prompt
-        for beam_idx, beam in enumerate(output.outputs):
-            generated_text = beam.text
-            # Skip printing the beam_idx if no beam search was used
-            beam_id_text = f"[{beam_idx}]" if args.max_beam_width > 1 else ""
+        for seq_idx, seq_output in enumerate(output.outputs):
+            # Skip printing the sequnce index if a single sequence is returned.
+            seq_id_text = f"[{seq_idx}]" if args.n > 1 else ""
+            generated_text = seq_output.text
             print(
-                f"[{i}]{beam_id_text} Prompt: {prompt!r}, Generated text: {generated_text!r}"
+                f"[{i}]{seq_id_text} Prompt: {prompt!r}, Generated text: {generated_text!r}"
             )
             if args.return_context_logits:
                 print(
-                    f"[{i}]{beam_id_text} Context logits: {output.context_logits}"
+                    f"[{i}]{seq_id_text} Context logits: {output.context_logits}"
                 )
             if args.return_generation_logits:
                 print(
-                    f"[{i}]{beam_id_text} Generation logits: {beam.generation_logits}"
+                    f"[{i}]{seq_id_text} Generation logits: {beam.generation_logits}"
                 )
             if args.logprobs:
-                print(f"[{i}]{beam_id_text} Logprobs: {beam.logprobs}")
+                print(f"[{i}]{seq_id_text} Logprobs: {beam.logprobs}")
 
 
 if __name__ == '__main__':
