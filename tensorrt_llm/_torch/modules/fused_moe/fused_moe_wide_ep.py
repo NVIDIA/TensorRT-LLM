@@ -445,8 +445,6 @@ class WideEPMoE(MoE):
         x_row = x.shape[0]
         x_col = x.shape[1]
         sf_swizzle = True
-        x_row = x.shape[0]
-        x_col = x.shape[1]
         if self.has_any_quant:
             if self.has_fp8_qdq:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
