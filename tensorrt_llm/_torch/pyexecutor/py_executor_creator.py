@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 
 import tensorrt_llm
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
@@ -23,7 +24,7 @@ from ._util import (KvCacheCreator, create_py_executor_instance,
                     instantiate_sampler, is_mla)
 from .config import PyTorchConfig
 from .config_utils import is_mla
-from .model_engine import DRAFT_KV_CACHE_MANAGER_KEY, PyTorchModelEngine
+from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 
 
@@ -157,6 +158,21 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
             )
             executor_config.kv_cache_config.enable_block_reuse = False
 
+    spec_config = executor_config.speculative_config
+    if spec_config is not None and spec_config.spec_dec_mode.has_draft_model():
+        # The draft and target models have different KV cache managers to support
+        # different head sizes, dtypes, etc in the generic case.
+        # However, this line will set context_current_position > 0 if there are
+        # cached blocks: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/resource_manager.py#L310.
+        # It actually mutates the LLM request! As a result, when we try to allocate KV cache
+        # pages for the draft model, is_first_context_chunk returns False and
+        # no pages are allocated.
+        # We need to refactor LLMRequest to fix this. Disable block reuse for now.
+        logger.warning(
+            f"Disabling block reuse for speculation algorithm {spec_config.spec_dec_mode}"
+        )
+        executor_config.kv_cache_config.enable_block_reuse = False
+
     if pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION" and executor_config.enable_chunked_context:
         logger.warning(
             f"Disabling chunked context for {pytorch_backend_config.attn_backend} backend"
@@ -179,7 +195,6 @@ def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
 def create_py_executor(
         executor_config: ExecutorConfig,
         checkpoint_dir: str = None,
-        engine_dir: str = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
     _mangle_executor_config(executor_config)
@@ -242,7 +257,7 @@ def create_py_executor(
                 spec_config=draft_spec_config,
                 is_draft_model=True,
             )
-            draft_model_engine.kv_cache_manager_key = DRAFT_KV_CACHE_MANAGER_KEY
+            draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
             draft_model_engine.load_weights_from_target_model(
                 model_engine.model)
     else:
@@ -328,7 +343,8 @@ def create_py_executor(
         spec_resource_manager = get_spec_resource_manager(
             spec_config, model_engine, draft_model_engine)
         if spec_resource_manager is not None:
-            resources["spec_resource_manager"] = spec_resource_manager
+            resources[ResourceManagerType.
+                      SPEC_RESOURCE_MANAGER] = spec_resource_manager
 
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES

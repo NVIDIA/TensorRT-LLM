@@ -263,9 +263,22 @@ def _register_fake():
         pass
 
     @torch.library.register_fake("trtllm::moe_load_balance_statistic")
-    def _(single_layer_load_balancer_ptr: int,
-          gathered_raw_expert_ids: torch.Tensor, enabled: torch.Tensor,
-          is_first_stage: bool, is_last_stage: bool):
+    def _(gathered_raw_expert_ids: torch.Tensor, enabled: torch.Tensor,
+          single_layer_load_balancer_ptr: int, is_first_stage: bool,
+          is_last_stage: bool):
+        pass
+
+    @torch.library.register_fake(
+        "trtllm::moe_hierarchical_statistic_local_device")
+    def _(local_raw_expert_ids: torch.Tensor,
+          local_expert_token_count: torch.Tensor, enabled: torch.Tensor,
+          single_layer_load_balancer_ptr: int, is_first_stage: bool,
+          is_last_stage: bool):
+        pass
+
+    @torch.library.register_fake("trtllm::moe_hierarchical_statistic_update")
+    def _(global_expert_token_count: torch.Tensor, enabled: torch.Tensor,
+          single_layer_load_balancer_ptr: int):
         pass
 
     @torch.library.register_fake("trtllm::moe_load_balance_routing")

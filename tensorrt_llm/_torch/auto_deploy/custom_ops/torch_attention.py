@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-@torch.library.custom_op("attention::repeat_kv", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_attention_repeat_kv", mutates_args=())
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -31,7 +31,7 @@ def repeat_kv_fake(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return torch.empty(replicated_shape, device=hidden_states.device, dtype=hidden_states.dtype)
 
 
-@torch.library.custom_op("attention::scaled_dot_product_attention", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_attention_sdpa", mutates_args=())
 def scaled_dot_product_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -66,7 +66,7 @@ def scaled_dot_product_attention_fake(
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
 
 
-@torch.library.custom_op("attention::grouped_sdpa", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_attention_grouped_sdpa", mutates_args=())
 def grouped_sdpa(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -104,7 +104,7 @@ def grouped_sdpa_fake(
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
 
 
-@torch.library.custom_op("attention::bsnd_grouped_sdpa", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_attention_bsnd_grouped_sdpa", mutates_args=())
 def bsnd_grouped_sdpa(
     query: torch.Tensor,  # layout: [b, n, s_q, d]
     key: torch.Tensor,  # layout: [b, n, s_k, d]
@@ -162,7 +162,7 @@ def update_kv_cache(
         )
 
 
-@torch.library.custom_op("attention::fused_mla_ref", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_attention_fused_mla_ref", mutates_args=())
 def fused_mla_ref(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -215,7 +215,7 @@ def fused_mla_ref(
             q_slice = q_pe[start : start + length]
             k_slice = k_pe[start : start + length]
 
-            q_rot, k_rot = torch.ops.rope.torch_apply_rope_with_qk_interleaving(
+            q_rot, k_rot = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
                 q_slice,
                 k_slice,
                 cos,
@@ -315,7 +315,7 @@ def fused_mla_ref_fake(
     return torch.empty_like(kv[..., -v_head_dim:])
 
 
-@torch.library.custom_op("deepseek::fused_mla", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_attention_deepseek_fused_mla", mutates_args=())
 def fused_mla(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -340,7 +340,7 @@ def fused_mla(
 
     cos = cos[position_ids]
     sin = sin[position_ids]
-    q_pe, k_pe = torch.ops.rope.torch_apply_rope_with_qk_interleaving(q_pe, k_pe, cos, sin)
+    q_pe, k_pe = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(q_pe, k_pe, cos, sin)
 
     query_states = k_pe.new_empty(bs, num_heads, q_len, q_head_dim)
     query_states[:, :, :, :qk_nope_head_dim] = q_nope
@@ -399,7 +399,7 @@ def fused_mla(
     return torch.empty_like(kv[..., -v_head_dim:])
 
 
-@torch.library.custom_op("deepseek::mla", mutates_args=())
+@torch.library.custom_op("auto_deploy::torch_attention_deepseek_mla", mutates_args=())
 def mla(
     q_nope: torch.Tensor,  # Down projected q_nope
     q_pe: torch.Tensor,  # q_pe after applying rope

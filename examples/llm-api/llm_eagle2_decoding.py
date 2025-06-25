@@ -1,7 +1,7 @@
 ### Generate Text Using Eagle2 Decoding
 
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (LLM, EagleDecodingConfig, KvCacheConfig,
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
                                  SamplingParams)
 
 

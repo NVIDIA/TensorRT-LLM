@@ -5,8 +5,10 @@ import pytest
 from api_stability_core import (ApiStabilityTestHarness, ClassSnapshot,
                                 MethodSnapshot)
 
+from tensorrt_llm import LLM
 from tensorrt_llm.bindings import executor as tllme
-from tensorrt_llm.llmapi import (LLM, CalibConfig, CompletionOutput,
+from tensorrt_llm.executor.result import IterationResult
+from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
                                  RequestOutput)
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
@@ -130,21 +132,28 @@ class TestLLM(ApiStabilityTestHarness):
 
     def test_modified_method_with_same_signature(self, mocker):
 
-        def new_save(self, engine_dir: str) -> None:
+        def new_get_stats_async(self,
+                                timeout: Optional[float] = 2
+                                ) -> IterationResult:
             pass
 
-        new_save.__doc__ = self.TEST_CLASS.save.__doc__
+        new_get_stats_async.__doc__ = self.TEST_CLASS.get_stats_async.__doc__
 
-        mocker.patch.object(self.TEST_CLASS, "save", new=new_save)
+        mocker.patch.object(self.TEST_CLASS,
+                            "get_stats_async",
+                            new=new_get_stats_async)
         self.test_signature()
         self.test_docstring()
 
     def test_modified_method_with_modified_signature(self, mocker):
 
-        def new_save(self, engine_dir: Optional[str]) -> None:
+        def new_get_stats_async(self,
+                                timeout: Optional[int] = 2) -> IterationResult:
             pass
 
-        mocker.patch.object(self.TEST_CLASS, "save", new=new_save)
+        mocker.patch.object(self.TEST_CLASS,
+                            "get_stats_async",
+                            new=new_get_stats_async)
         with pytest.raises(AssertionError):
             self.test_signature()
         with pytest.raises(AssertionError):

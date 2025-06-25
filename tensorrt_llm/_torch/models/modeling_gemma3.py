@@ -241,7 +241,6 @@ class Gemma3TextModel(DecoderModel):
         super().__init__(model_config)
         config = self.model_config
         self.hidden_size = config.pretrained_config.hidden_size
-        self.padding_idx = config.pretrained_config.pad_token_id
 
         self.embed_tokens = Gemma3TextScaledWordEmbedding(
             config.pretrained_config.vocab_size,

@@ -434,7 +434,7 @@ using CtaBarrier = MBarrier<Scope::CTA>;
 using CgaBarrier = MBarrier<Scope::CGA>;
 
 template <uint32_t nbBars>
-__device__ inline bool toParity(uint32_t i)
+__device__ inline constexpr bool toParity(uint32_t i)
 {
     return i % (nbBars * 2) / nbBars;
 }

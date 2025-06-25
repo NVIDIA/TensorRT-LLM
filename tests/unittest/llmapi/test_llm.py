@@ -25,16 +25,19 @@ import torch
 import transformers
 from utils.util import skip_single_gpu
 
+from tensorrt_llm import LLM as LLM_torch
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (GenerationExecutorWorker, LoRARequest,
                                    PromptAdapterRequest, RequestError)
-from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
+from tensorrt_llm.llmapi import (BuildCacheConfig, EagleDecodingConfig,
                                  KvCacheConfig, KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
+from tensorrt_llm.llmapi import TrtLlmArgs as LlmArgs
 from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
-from tensorrt_llm.llmapi.llm_utils import (BuildConfig, LlmArgs, QuantAlgo,
-                                           QuantConfig, _ParallelConfig)
+from tensorrt_llm.llmapi.llm_utils import (BuildConfig, QuantAlgo, QuantConfig,
+                                           _ParallelConfig)
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.lora_manager import LoraConfig
@@ -118,7 +121,6 @@ def llm_test_harness(model_dir: str,
         tokenizer = model_dir
 
     if backend == "pytorch":
-        from tensorrt_llm._torch import LLM as LLM_torch
         llm = LLM_torch(model_dir, tokenizer=tokenizer, **llm_kwargs)
     else:
         llm = LLM(model_dir, tokenizer=tokenizer, **llm_kwargs)
@@ -1596,7 +1598,6 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
     LLM_CLASS = LLM
     llm_args_extra = {}
     if backend in ["pytorch", "autodeploy"]:
-        from tensorrt_llm._torch import LLM as LLM_torch
         LLM_CLASS = LLM_torch
     else:
         llm_args_extra["fast_build"] = True
@@ -1839,7 +1840,6 @@ def llm_get_stats_test_harness(tp_size: int = 1,
         sampling_args_extra["return_context_logits"] = True
 
     if pytorch_backend:
-        from tensorrt_llm._torch import LLM as LLM_torch
         llm_args_extra.update(
             dict(enable_iter_perf_stats=True,
                  enable_iter_req_stats=enable_iter_req_stats,
@@ -1893,8 +1893,6 @@ def test_llm_get_queued_stats():
 
     llm_args_extra = {}
     sampling_args_extra = {}
-
-    from tensorrt_llm._torch import LLM as LLM_torch
 
     llm_args_extra.update(
         dict(enable_iter_perf_stats=True,
@@ -1967,7 +1965,6 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
         sampling_args_extra["return_context_logits"] = True
 
     if pytorch_backend:
-        from tensorrt_llm._torch import LLM as LLM_torch
         llm_args_extra.update(
             dict(enable_iter_perf_stats=True,
                  enable_iter_req_stats=enable_iter_req_stats,
@@ -2144,13 +2141,17 @@ def run_llm_with_postprocess_parallel_and_result_handler(
     kwargs = {}
     if backend not in ["pytorch", "autodeploy"]:
         kwargs["fast_build"] = True
-    llm = LLM(model=llama_model_path,
-              backend=backend,
-              kv_cache_config=global_kvcache_config,
-              tensor_parallel_size=tp_size,
-              num_postprocess_workers=2,
-              postprocess_tokenizer_dir=llama_model_path,
-              **kwargs)
+        LLM_CLASS = LLM
+    else:
+        LLM_CLASS = LLM_torch
+
+    llm = LLM_CLASS(model=llama_model_path,
+                    backend=backend,
+                    kv_cache_config=global_kvcache_config,
+                    tensor_parallel_size=tp_size,
+                    num_postprocess_workers=2,
+                    postprocess_tokenizer_dir=llama_model_path,
+                    **kwargs)
     golden_result = "DEFGHI"
     for i, output in enumerate(
             llm.generate_async(prompts[0],

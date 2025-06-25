@@ -10,8 +10,8 @@ import pytest
 from utils.util import (skip_gpu_memory_less_than_40gb, skip_pre_ada,
                         skip_single_gpu)
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi import BuildConfig
-from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.llmapi.llm_utils import CalibConfig, QuantAlgo, QuantConfig
 
 from ..test_llm import get_model_path

@@ -62,7 +62,7 @@ methods:
         annotation: Optional[tensorrt_llm.sampling_params.BatchedLogitsProcessor]
         default: null
       guided_decoding_backend:
-        annotation: Optional[str]
+        annotation: Optional[Literal["xgrammar", "llguidance"]]
         default: null
       # Quantization and calibration
       quant_config:
@@ -95,8 +95,8 @@ methods:
         default: null
       # Misc
       load_format:
-        annotation: Literal['auto', 'dummy']
-        default: auto
+        annotation: Union[str, tensorrt_llm.llmapi.llm_args.LoadFormat]
+        default: 0
       enable_tqdm:
         annotation: bool
         default: false
@@ -106,9 +106,10 @@ methods:
       kv_cache_config:
         annotation: tensorrt_llm.llmapi.llm_args.KvCacheConfig
         default: null
-      garbage_collection_gen0_threshold:
-        annotation: int
-        default: 20000
+
+      kwargs:
+        annotation: Any
+        default: inspect._empty
     return_annotation: None
   generate:
     parameters:

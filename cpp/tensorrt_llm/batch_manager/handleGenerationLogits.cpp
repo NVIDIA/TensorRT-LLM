@@ -73,9 +73,10 @@ void setupMedusaLogits(std::vector<TensorPtr>& medusaLogitsHeads, TensorPtr cons
 
 } // namespace
 
-void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector const& generationRequests,
-    DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, BufferManager const& manager,
-    TensorPtr const& logits, OptionalRef<RuntimeBuffers> genRuntimeBuffers) const
+void HandleGenerationLogits::operator()(DecoderInputBuffers& inputBuffers, RequestVector const& generationRequests,
+    tr::ITensor::SharedPtr const& logits, tr::SizeType32 logitsIndex, tr::ModelConfig const& modelConfig,
+    tr::BufferManager const& manager, OptionalRef<RuntimeBuffers> genRuntimeBuffers,
+    OptionalRef<DraftBuffers> draftBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(HandleGenerationLogits);
@@ -99,7 +100,7 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
         TensorPtr logitsView = ITensor::slice(logits, logitsIndex, numLogits);
         TLLM_CHECK_DEBUG_WITH_INFO(tru::tensorHasInvalid<float>(*logitsView, manager, "logits") == false,
             "Found invalid number (NaN or Inf) in logits");
-        auto& decoderLogits = decoderBuffers.logits.at(seqSlot);
+        auto& decoderLogits = inputBuffers.logits.at(seqSlot);
         auto const logitsViewShape = logitsView->getShape();
         if (reqBeamWidth > 1)
         {
@@ -136,8 +137,10 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
         }
         if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
         {
+            TLLM_CHECK(draftBuffers);
+            auto& medusaLogitsHeads = draftBuffers->predictedDraftLogits.at(seqSlot);
             TLLM_CHECK(genRuntimeBuffers);
-            auto& medusaLogitsHeads = decoderBuffers.draftBuffers.predictedDraftLogits.at(seqSlot);
+            TLLM_CHECK(genRuntimeBuffers->mMedusaBuffers);
             setupMedusaLogits(medusaLogitsHeads, genRuntimeBuffers->mMedusaBuffers->medusaLogitsDevice,
                 modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen(), logitsIndex, draftLength);
         }

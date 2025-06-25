@@ -46,6 +46,7 @@ from .builder import BuildConfig, Builder, BuilderConfig, build
 from .disaggregated_params import DisaggregatedParams
 from .functional import Tensor, constant
 from .llmapi import LLM, LlmArgs
+from .llmapi.llm_args import LlmArgs, TorchLlmArgs, TrtLlmArgs
 from .logger import logger
 from .mapping import Mapping
 from .models.automodel import AutoConfig, AutoModelForCausalLM
@@ -98,6 +99,8 @@ __all__ = [
     'tools',
     'LLM',
     'LlmArgs',
+    'TorchLlmArgs',
+    'TrtLlmArgs',
     'SamplingParams',
     'DisaggregatedParams',
     'KvCacheConfig',
