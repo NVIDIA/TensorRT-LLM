@@ -4,7 +4,8 @@ from typing import List, Tuple
 
 import torch
 
-from tensorrt_llm._torch.utils import last_positive_power_of_2
+from tensorrt_llm._torch.utils import (get_last_power_of_2_num_tokens_buckets,
+                                       last_positive_power_of_2)
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
@@ -123,8 +124,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
 
-        m_values = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
-        round_rule = lambda x: last_positive_power_of_2(x)
+        m_values = get_last_power_of_2_num_tokens_buckets(2048)
+        round_rule = lambda x: min(last_positive_power_of_2(x), 2048)
 
         specs = (DynamicTensorSpec(HIDDEN_STATES_IDX, TUNED_DIM, m_values,
                                    round_rule), )
