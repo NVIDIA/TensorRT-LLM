@@ -20,59 +20,106 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/tensor.h"
 
-#include <pybind11/chrono.h>
-#include <pybind11/numpy.h>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
+#include <nanobind/stl/filesystem.h>
+#include <nanobind/stl/map.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
+#include <torch/extension.h>
 
-namespace py = pybind11;
+namespace nb = nanobind;
 namespace tle = tensorrt_llm::executor;
+
+namespace nanobind::detail
+{ // todo
+
+template <>
+struct dtype_traits<half>
+{
+    static constexpr dlpack::dtype value{
+        (uint8_t) dlpack::dtype_code::Float, // type code
+        16,                                  // size in bits
+        1                                    // lanes (simd), usually set to 1
+    };
+    static constexpr auto name = const_name("float16");
+};
+} // namespace nanobind::detail
 
 namespace
 {
-tle::Tensor numpyToTensor(py::array const& array)
+// todo: test this
+tle::Tensor numpyToTensor(nb::ndarray<nb::numpy> const& array)
 {
     auto npDtype = array.dtype();
+    char kind = '\0';
+    switch (npDtype.code)
+    {
+    case static_cast<uint8_t>(nb::dlpack::dtype_code::Int):
+        kind = 'i'; // signed integer
+        break;
+    case static_cast<uint8_t>(nb::dlpack::dtype_code::UInt):
+        kind = 'u'; // unsigned integer
+        break;
+    case static_cast<uint8_t>(nb::dlpack::dtype_code::Float):
+        kind = 'f'; // floating point
+        break;
+    case static_cast<uint8_t>(nb::dlpack::dtype_code::Bfloat):
+        kind = 'f'; // brain floating point (treat as float kind)
+        break;
+    case static_cast<uint8_t>(nb::dlpack::dtype_code::Complex):
+        kind = 'c'; // complex
+        break;
+    default:
+        kind = 'V'; // void/other
+        break;
+    }
     tle::DataType dtype;
-    if (npDtype.is(py::dtype("float16")))
+    if (npDtype == nb::dtype<half>())
     {
         dtype = tle::DataType::kFP16;
     }
-    else if (npDtype.is(py::dtype("float32")))
+    else if (npDtype == nb::dtype<float>())
     {
         dtype = tle::DataType::kFP32;
     }
-    else if (npDtype.is(py::dtype("int8")))
+    else if (npDtype == nb::dtype<int8_t>())
     {
         dtype = tle::DataType::kINT8;
     }
-    else if (npDtype.is(py::dtype("int32")))
+    else if (npDtype == nb::dtype<int32_t>())
     {
         dtype = tle::DataType::kINT32;
     }
-    else if (npDtype.is(py::dtype("int64")))
+    else if (npDtype == nb::dtype<int64_t>())
     {
         dtype = tle::DataType::kINT64;
     }
-    else if (npDtype.attr("kind").cast<std::string>() == "V" && npDtype.attr("itemsize").cast<int>() == 1
-        && npDtype.attr("metadata")["dtype"].cast<std::string>() == "float8")
+    // kind == Void
+    else if (kind == 'V' && array.itemsize() == 1)
     {
         dtype = tle::DataType::kFP8;
     }
-    else if (npDtype.attr("kind").cast<std::string>() == "V" && npDtype.attr("itemsize").cast<int>() == 2
-        && npDtype.attr("metadata")["dtype"].cast<std::string>() == "bfloat16")
+    else if (kind == 'V' && array.itemsize() == 2)
     {
         dtype = tle::DataType::kBF16;
     }
     else
     {
-        TLLM_THROW("Unsupported numpy dtype: " + npDtype.attr("name").cast<std::string>());
+        TLLM_THROW("Unsupported numpy dtype.");
     }
 
-    tle::Shape shape(array.shape(), array.ndim());
+    std::vector<int64_t> dims;
+    for (size_t i = 0; i < array.ndim(); ++i)
+    {
+        dims.push_back(static_cast<int64_t>(array.shape(i)));
+    }
+    tle::Shape shape(dims.data(), dims.size());
 
     return tle::Tensor::of(dtype, const_cast<void*>(array.data()), shape);
 }
+
 } // namespace
 
 namespace tensorrt_llm::pybind::executor
@@ -90,20 +137,19 @@ Executor::Executor(std::filesystem::path const& encoderModelPath, std::filesyste
     mExecutor = std::make_unique<tle::Executor>(encoderModelPath, decoderModelPath, modelType, executorConfig);
 }
 
-Executor::Executor(pybind11::buffer engineBuffer, std::string const& jsonConfigStr, tle::ModelType modelType,
-    tle::ExecutorConfig const& executorConfig, std::optional<pybind11::dict> managedWeights)
+Executor::Executor(nb::ndarray<nb::numpy, uint8_t> const& engineBuffer, std::string const& jsonConfigStr,
+    tle::ModelType modelType, tle::ExecutorConfig const& executorConfig, std::optional<nb::dict> managedWeights)
 {
-    py::buffer_info info = engineBuffer.request();
-    uint8_t const* data = reinterpret_cast<uint8_t const*>(info.ptr);
-    size_t size = info.size;
+    uint8_t const* data = static_cast<uint8_t const*>(engineBuffer.data());
+    size_t size = engineBuffer.size();
     std::optional<std::map<std::string, tle::Tensor>> managedWeightsMap = std::nullopt;
     if (managedWeights.has_value() && !managedWeights.value().empty())
     {
         managedWeightsMap = std::map<std::string, tle::Tensor>();
         for (auto const& item : managedWeights.value())
         {
-            std::string name = item.first.cast<std::string>();
-            py::array array = item.second.cast<py::array>();
+            std::string name = nb::cast<std::string>(item.first);
+            nb::ndarray<nb::numpy> array = nb::cast<nb::ndarray<nb::numpy>>(item.second);
             managedWeightsMap->emplace(name, numpyToTensor(array));
         }
     }
@@ -123,14 +169,14 @@ Executor::Executor(std::string const& encoderEngineBuffer, std::string const& en
         tle::BufferView(decoderData, decoderSize), decoderJsonConfigStr, modelType, executorConfig);
 }
 
-py::object Executor::enter()
+nb::object Executor::enter()
 {
     TLLM_CHECK(static_cast<bool>(mExecutor));
-    return py::cast(this);
+    return nb::cast(this);
 }
 
 void Executor::exit(
-    [[maybe_unused]] py::handle type, [[maybe_unused]] py::handle value, [[maybe_unused]] py::handle traceback)
+    [[maybe_unused]] nb::handle type, [[maybe_unused]] nb::handle value, [[maybe_unused]] nb::handle traceback)
 {
     shutdown();
     mExecutor = nullptr;
@@ -142,45 +188,46 @@ void Executor::shutdown()
     // able to do forward progress for the shutdown process to succeed. It takes the GIL during its callbacks, so
     // we release it now. Note that we shouldn't do anything related to python objects after that.
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    py::gil_scoped_release release;
+    nb::gil_scoped_release release;
     mExecutor->shutdown();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void Executor::initBindings(py::module_& m)
+void Executor::initBindings(nb::module_& m)
 {
-    py::class_<Executor>(m, "Executor")
-        .def(py::init<std::filesystem::path const&, tle::ModelType, tle::ExecutorConfig const&>(),
-            py::arg("model_path"), py::arg("model_type"), py::arg("executor_config"))
-        .def(py::init<std::filesystem::path const&, std::filesystem::path const&, tle::ModelType,
+    nb::class_<Executor>(m, "Executor")
+        .def(nb::init<std::filesystem::path const&, tle::ModelType, tle::ExecutorConfig const&>(),
+            nb::arg("model_path"), nb::arg("model_type"), nb::arg("executor_config"))
+        .def(nb::init<std::filesystem::path const&, std::filesystem::path const&, tle::ModelType,
                  tle::ExecutorConfig const&>(),
-            py::arg("encoder_model_path"), py::arg("decoder_model_path"), py::arg("model_type"),
-            py::arg("executor_config"))
-        .def(py::init<py::buffer, std::string const&, tle::ModelType, tle::ExecutorConfig const&, py::dict>(),
-            py::arg("engine_buffer"), py::arg("json_config_str"), py::arg("model_type"), py::arg("executor_config"),
-            py::arg("managed_weights") = py::dict())
-        .def(py::init<std::string const&, std::string const&, std::string const&, std::string const&, tle::ModelType,
+            nb::arg("encoder_model_path"), nb::arg("decoder_model_path"), nb::arg("model_type"),
+            nb::arg("executor_config"))
+        .def(nb::init<nb::ndarray<nb::numpy, uint8_t>, std::string const&, tle::ModelType, tle::ExecutorConfig const&,
+                 nb::dict>(),
+            nb::arg("engine_buffer"), nb::arg("json_config_str"), nb::arg("model_type"), nb::arg("executor_config"),
+            nb::arg("managed_weights") = nb::dict())
+        .def(nb::init<std::string const&, std::string const&, std::string const&, std::string const&, tle::ModelType,
                  tle::ExecutorConfig const&>(),
-            py::arg("encoder_engine_buffer"), py::arg("encoder_json_config_str"), py::arg("decoder_engine_buffer"),
-            py::arg("decoder_json_config_str"), py::arg("model_type"), py::arg("executor_config"))
+            nb::arg("encoder_engine_buffer"), nb::arg("encoder_json_config_str"), nb::arg("decoder_engine_buffer"),
+            nb::arg("decoder_json_config_str"), nb::arg("model_type"), nb::arg("executor_config"))
         .def("shutdown", &Executor::shutdown)
         .def("__enter__", &Executor::enter)
         .def("__exit__", &Executor::exit)
-        .def("enqueue_request", &Executor::enqueueRequest, py::arg("request"))
-        .def("enqueue_requests", &Executor::enqueueRequests, py::arg("requests"))
+        .def("enqueue_request", &Executor::enqueueRequest, nb::arg("request"))
+        .def("enqueue_requests", &Executor::enqueueRequests, nb::arg("requests"))
         .def("await_responses",
-            py::overload_cast<std::optional<std::chrono::milliseconds> const&>(&Executor::awaitResponses),
-            py::arg("timeout") = py::none())
+            nb::overload_cast<std::optional<std::chrono::milliseconds> const&>(&Executor::awaitResponses),
+            nb::arg("timeout") = nb::none())
         .def("await_responses",
-            py::overload_cast<tle::IdType const&, std::optional<std::chrono::milliseconds> const&>(
+            nb::overload_cast<tle::IdType const&, std::optional<std::chrono::milliseconds> const&>(
                 &Executor::awaitResponses),
-            py::arg("id"), py::arg("timeout") = py::none())
+            nb::arg("id"), nb::arg("timeout") = nb::none())
         .def("await_responses",
-            py::overload_cast<std::vector<tle::IdType> const&, std::optional<std::chrono::milliseconds> const&>(
+            nb::overload_cast<std::vector<tle::IdType> const&, std::optional<std::chrono::milliseconds> const&>(
                 &Executor::awaitResponses),
-            py::arg("ids"), py::arg("timeout") = py::none())
-        .def("get_num_responses_ready", &Executor::getNumResponsesReady, py::arg("id") = py::none())
-        .def("cancel_request", &Executor::cancelRequest, py::arg("id") = py::none())
+            nb::arg("ids"), nb::arg("timeout") = nb::none())
+        .def("get_num_responses_ready", &Executor::getNumResponsesReady, nb::arg("id") = nb::none())
+        .def("cancel_request", &Executor::cancelRequest, nb::arg("id") = nb::none())
         .def("get_latest_iteration_stats", &Executor::getLatestIterationStats)
         .def("get_latest_request_stats", &Executor::getLatestRequestStats)
         .def("get_latest_debug_tensors", &Executor::getLatestDebugTensors)

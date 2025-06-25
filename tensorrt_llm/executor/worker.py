@@ -55,11 +55,14 @@ class GenerationExecutorWorker(GenerationExecutor):
         engine: Union[Path, Engine],
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
+        worker_kwargs: dict = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
     ) -> None:
+        print("id of executor config", id(executor_config),
+              dir(executor_config))
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
             num_postprocess_workers=postproc_config.num_postprocess_workers,
@@ -112,8 +115,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                                      tllm.ModelType.DECODER_ONLY,
                                      executor_config=executor_config,
                                      managed_weights=engine.managed_weights)
-
             if not hasattr(executor_config, "backend"):
+                print(f"engine type: {type(engine)}, value: {engine}")
                 return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
                                      executor_config)
             args = {

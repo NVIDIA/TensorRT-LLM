@@ -18,10 +18,11 @@
 #include "modelSpecBinding.h"
 #include "tensorrt_llm/testing/modelSpec.h"
 
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+// #include <pybind11/pybind11.h>
+// #include <pybind11/stl.h>
+#include <nanobind/nanobind.h>
 
-namespace py = pybind11;
+namespace nb = nanobind;
 using tensorrt_llm::testing::ModelSpec;
 using tensorrt_llm::testing::KVCacheType;
 using tensorrt_llm::testing::QuantMethod;
@@ -30,21 +31,21 @@ using tensorrt_llm::testing::OutputContentType;
 namespace tensorrt_llm::pybind::testing
 {
 
-void initBindings(py::module_& m)
+void initBindings(nb::module_& m)
 {
-    py::enum_<QuantMethod>(m, "QuantMethod", py::arithmetic(), "Quantization Method")
+    nb::enum_<QuantMethod>(m, "QuantMethod", nb::is_arithmetic(), "Quantization Method")
         .value("NONE", QuantMethod::kNONE, "No Quantization")
         .value("SMOOTH_QUANT", QuantMethod::kSMOOTH_QUANT, "Smooth Quantization");
 
-    py::enum_<OutputContentType>(m, "OutputContentType", py::arithmetic(), "Output Content Type")
+    nb::enum_<OutputContentType>(m, "OutputContentType", nb::is_arithmetic(), "Output Content Type")
         .value("NONE", OutputContentType::kNONE, "No Output Content")
         .value("CONTEXT_LOGITS", OutputContentType::kCONTEXT_LOGITS, "Context Logits")
         .value("GENERATION_LOGITS", OutputContentType::kGENERATION_LOGITS, "Generation Logits")
         .value("LOG_PROBS", OutputContentType::kLOG_PROBS, "Log Probs")
         .value("CUM_LOG_PROBS", OutputContentType::kCUM_LOG_PROBS, "Cumulative Log");
 
-    py::class_<ModelSpec>(m, "ModelSpec")
-        .def(py::init<std::string const&, nvinfer1::DataType>())
+    nb::class_<ModelSpec>(m, "ModelSpec")
+        .def(nb::init<std::string const&, nvinfer1::DataType>())
         .def("use_gpt_plugin", &ModelSpec::useGptAttentionPlugin)
         .def("use_packed_input", &ModelSpec::usePackedInput)
         .def("set_kv_cache_type", &ModelSpec::setKVCacheType)

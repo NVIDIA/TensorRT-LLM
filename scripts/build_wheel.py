@@ -621,7 +621,7 @@ def main(*,
         install_file(get_pybind_lib(), pkg_dir)
         if not skip_stubs:
             with working_directory(project_dir):
-                build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
+                build_run(f"\"{venv_python}\" -m pip install nanobind")
             with working_directory(pkg_dir):
                 if on_windows:
                     stubgen = "stubgen.py"
@@ -634,7 +634,7 @@ def main(*,
                     import os
                     import platform
 
-                    from pybind11_stubgen import main
+                    from nanobind.stubgen import main
 
                     if __name__ == "__main__":
                         # Load dlls from `libs` directory before launching bindings.
@@ -643,7 +643,8 @@ def main(*,
                         main()
                     """.format(lib_dir=lib_dir)
                     (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
-                    build_run(f"\"{venv_python}\" {stubgen} -o . bindings")
+                    build_run(f"\"{venv_python}\" {stubgen} -o . bindings"
+                              )  #todo: adjust command for windows
                     (pkg_dir / stubgen).unlink()
                 else:
                     env_ld = os.environ.copy()
@@ -654,10 +655,10 @@ def main(*,
                     env_ld["LD_LIBRARY_PATH"] = new_library_path
                     try:
                         build_run(
-                            f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
+                            f"\"{venv_python}\" -m nanobind.stubgen -m bindings -O .",
                             env=env_ld)
                     except CalledProcessError as ex:
-                        print(f"Failed to build pybind11 stubgen: {ex}",
+                        print(f"Failed to build nanobind stubgen: {ex}",
                               file=sys.stderr)
                         exit(1)
 

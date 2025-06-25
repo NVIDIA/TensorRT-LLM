@@ -18,19 +18,20 @@
 #include "bindings.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/kernels/userbuffers/userbuffersManager.h"
+#include <nanobind/nanobind.h>
 
-namespace py = pybind11;
+namespace nb = nanobind;
 namespace tub = tensorrt_llm::runtime::ub;
 
 namespace tensorrt_llm::kernels::userbuffers
 {
 
-void UserBufferBindings::initBindings(pybind11::module_& m)
+void UserBufferBindings::initBindings(nanobind::module_& m)
 {
-    py::class_<tub::UBBuffer>(m, "UBBuffer")
-        .def_readonly("size", &tub::UBBuffer::size)
-        .def_property_readonly("addr", [](tub::UBBuffer& self) { return reinterpret_cast<intptr_t>(self.addr); })
-        .def_readonly("handle", &tub::UBBuffer::handle)
+    nb::class_<tub::UBBuffer>(m, "UBBuffer")
+        .def_ro("size", &tub::UBBuffer::size)
+        .def_prop_ro("addr", [](tub::UBBuffer& self) { return reinterpret_cast<intptr_t>(self.addr); })
+        .def_ro("handle", &tub::UBBuffer::handle)
         .def("invalid", &tub::UBBuffer::invalid);
 
     m.def("ub_initialize", [](int tp_size) { tub::ub_initialize(tp_size); });
