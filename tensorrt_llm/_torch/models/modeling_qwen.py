@@ -118,7 +118,6 @@ class QwenModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Qwen2Config]):
         super().__init__(model_config)
         config = self.model_config
-        self.padding_idx = config.pretrained_config.pad_token_id
 
         self.embed_tokens = Embedding(
             config.pretrained_config.vocab_size,
