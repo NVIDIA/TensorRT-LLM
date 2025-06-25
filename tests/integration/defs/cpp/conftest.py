@@ -154,14 +154,13 @@ def build_google_tests(request, build_dir):
 
     print(f"Using CUDA arch: {cuda_arch}")
 
-    build_trt_llm(
-        cuda_architectures=cuda_arch,
-        job_count=12,
-        use_ccache=True,
-        clean=True,
-        trt_root="/usr/local/tensorrt",
-        nixl_root="/opt/nvidia/nvda_nixl",
-    )
+    build_trt_llm(cuda_architectures=cuda_arch,
+                  job_count=12,
+                  use_ccache=True,
+                  clean=True,
+                  trt_root="/usr/local/tensorrt",
+                  nixl_root="/opt/nvidia/nvda_nixl",
+                  skip_building_wheel=True)
 
     make_google_tests = [
         "cmake",
