@@ -27,8 +27,8 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
-#include <nanobind/stl/vector.h>
 #include <nanobind/stl/tuple.h>
+#include <nanobind/stl/vector.h>
 #include <sstream>
 
 #include <optional>
@@ -80,25 +80,25 @@ void initRequestBindings(nanobind::module_& m)
         {
             throw std::runtime_error("Invalid SamplingConfig state!");
         }
-        new (&samplingConfig) tle::SamplingConfig(nb::cast<SizeType32>(state[0]),      // BeamWidth
-            nb::cast<std::optional<SizeType32>>(state[1]),              // TopK
-            nb::cast<std::optional<FloatType>>(state[2]),               // TopP
-            nb::cast<std::optional<FloatType>>(state[3]),               // TopPMin
-            nb::cast<std::optional<tle::TokenIdType>>(state[4]),        // TopPResetIds
-            nb::cast<std::optional<FloatType>>(state[5]),               // TopPDecay
-            nb::cast<std::optional<tle::RandomSeedType>>(state[6]),     // Seed
-            nb::cast<std::optional<FloatType>>(state[7]),               // Temperature
-            nb::cast<std::optional<SizeType32>>(state[8]),              // MinTokens
-            nb::cast<std::optional<FloatType>>(state[9]),               // BeamSearchDiversityRate
-            nb::cast<std::optional<FloatType>>(state[10]),              // RepetitionPenalty
-            nb::cast<std::optional<FloatType>>(state[11]),              // PresencePenalty
-            nb::cast<std::optional<FloatType>>(state[12]),              // FrequencyPenalty
-            nb::cast<std::optional<FloatType>>(state[13]),              // LengthPenalty
-            nb::cast<std::optional<SizeType32>>(state[14]),             // EarlyStopping
-            nb::cast<std::optional<SizeType32>>(state[15]),             // NoRepeatNgramSize
-            nb::cast<std::optional<SizeType32>>(state[16]),             // NumReturnSequences
-            nb::cast<std::optional<FloatType>>(state[17]),              // MinP
-            nb::cast<std::optional<std::vector<SizeType32>>>(state[18]) // BeamWidthArray
+        new (&samplingConfig) tle::SamplingConfig(nb::cast<SizeType32>(state[0]), // BeamWidth
+            nb::cast<std::optional<SizeType32>>(state[1]),                        // TopK
+            nb::cast<std::optional<FloatType>>(state[2]),                         // TopP
+            nb::cast<std::optional<FloatType>>(state[3]),                         // TopPMin
+            nb::cast<std::optional<tle::TokenIdType>>(state[4]),                  // TopPResetIds
+            nb::cast<std::optional<FloatType>>(state[5]),                         // TopPDecay
+            nb::cast<std::optional<tle::RandomSeedType>>(state[6]),               // Seed
+            nb::cast<std::optional<FloatType>>(state[7]),                         // Temperature
+            nb::cast<std::optional<SizeType32>>(state[8]),                        // MinTokens
+            nb::cast<std::optional<FloatType>>(state[9]),                         // BeamSearchDiversityRate
+            nb::cast<std::optional<FloatType>>(state[10]),                        // RepetitionPenalty
+            nb::cast<std::optional<FloatType>>(state[11]),                        // PresencePenalty
+            nb::cast<std::optional<FloatType>>(state[12]),                        // FrequencyPenalty
+            nb::cast<std::optional<FloatType>>(state[13]),                        // LengthPenalty
+            nb::cast<std::optional<SizeType32>>(state[14]),                       // EarlyStopping
+            nb::cast<std::optional<SizeType32>>(state[15]),                       // NoRepeatNgramSize
+            nb::cast<std::optional<SizeType32>>(state[16]),                       // NumReturnSequences
+            nb::cast<std::optional<FloatType>>(state[17]),                        // MinP
+            nb::cast<std::optional<std::vector<SizeType32>>>(state[18])           // BeamWidthArray
         );
     };
     nb::class_<tle::SamplingConfig>(m, "SamplingConfig")
@@ -180,7 +180,8 @@ void initRequestBindings(nanobind::module_& m)
         {
             throw std::runtime_error("Invalid AdditionalModelOutput state!");
         }
-        new (&additionalModelOutput) tle::AdditionalModelOutput(nb::cast<std::string>(state[0]), nb::cast<bool>(state[1]));
+        new (&additionalModelOutput)
+            tle::AdditionalModelOutput(nb::cast<std::string>(state[0]), nb::cast<bool>(state[1]));
     };
     nb::class_<tle::AdditionalModelOutput>(m, "AdditionalModelOutput")
         .def(nb::init<std::string, bool>(), nb::arg("name"), nb::arg("gather_context") = false)
@@ -200,8 +201,8 @@ void initRequestBindings(nanobind::module_& m)
         {
             throw std::runtime_error("Invalid OutputConfig state!");
         }
-        new (&outputConfig) tle::OutputConfig(nb::cast<bool>(state[0]), nb::cast<bool>(state[1]), nb::cast<bool>(state[2]),
-            nb::cast<bool>(state[3]), nb::cast<bool>(state[4]), nb::cast<bool>(state[5]),
+        new (&outputConfig) tle::OutputConfig(nb::cast<bool>(state[0]), nb::cast<bool>(state[1]),
+            nb::cast<bool>(state[2]), nb::cast<bool>(state[3]), nb::cast<bool>(state[4]), nb::cast<bool>(state[5]),
             nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(state[6]));
     };
     nb::class_<tle::OutputConfig>(m, "OutputConfig")
@@ -222,14 +223,15 @@ void initRequestBindings(nanobind::module_& m)
 
     auto externalDraftTokensConfigGetstate = [](tle::ExternalDraftTokensConfig const& self)
     { return nb::make_tuple(self.getTokens(), self.getLogits(), self.getAcceptanceThreshold()); };
-    auto externalDraftTokensConfigSetstate = [](tle::ExternalDraftTokensConfig& externalDraftTokensConfig, nb::tuple const& state)
+    auto externalDraftTokensConfigSetstate
+        = [](tle::ExternalDraftTokensConfig& externalDraftTokensConfig, nb::tuple const& state)
     {
         if (state.size() != 3)
         {
             throw std::runtime_error("Invalid ExternalDraftTokensConfig state!");
         }
-        new (&externalDraftTokensConfig) tle::ExternalDraftTokensConfig(nb::cast<VecTokens>(state[0]), nb::cast<std::optional<Tensor>>(state[1]),
-            nb::cast<std::optional<FloatType>>(state[2]));
+        new (&externalDraftTokensConfig) tle::ExternalDraftTokensConfig(nb::cast<VecTokens>(state[0]),
+            nb::cast<std::optional<Tensor>>(state[1]), nb::cast<std::optional<FloatType>>(state[2]));
     };
     nb::class_<tle::ExternalDraftTokensConfig>(m, "ExternalDraftTokensConfig")
         .def(nb::init<VecTokens, std::optional<Tensor>, std::optional<FloatType> const&, std::optional<bool>>(),
@@ -250,7 +252,8 @@ void initRequestBindings(nanobind::module_& m)
         {
             throw std::runtime_error("Invalid PromptTuningConfig state!");
         }
-        new (&promptTuningConfig) tle::PromptTuningConfig(nb::cast<Tensor>(state[0]), nb::cast<std::optional<VecTokenExtraIds>>(state[1]));
+        new (&promptTuningConfig)
+            tle::PromptTuningConfig(nb::cast<Tensor>(state[0]), nb::cast<std::optional<VecTokenExtraIds>>(state[1]));
     };
     nb::class_<tle::PromptTuningConfig>(m, "PromptTuningConfig")
         .def(nb::init<Tensor, std::optional<VecTokenExtraIds>>(), nb::arg("embedding_table"),
@@ -319,7 +322,8 @@ void initRequestBindings(nanobind::module_& m)
 
     auto lookaheadDecodingConfigGetstate = [](tle::LookaheadDecodingConfig const& self)
     { return nb::make_tuple(self.getWindowSize(), self.getNgramSize(), self.getVerificationSetSize()); };
-    auto lookaheadDecodingConfigSetstate = [](tle::LookaheadDecodingConfig& lookaheadDecodingConfig, nb::tuple const& state)
+    auto lookaheadDecodingConfigSetstate
+        = [](tle::LookaheadDecodingConfig& lookaheadDecodingConfig, nb::tuple const& state)
     {
         if (state.size() != 3)
         {
@@ -348,22 +352,24 @@ void initRequestBindings(nanobind::module_& m)
 
     auto TokenRangeRetentionConfigGetstate = [](tle::KvCacheRetentionConfig::TokenRangeRetentionConfig const& self)
     { return nb::make_tuple(self.tokenStart, self.tokenEnd, self.priority, self.durationMs); };
-    auto TokenRangeRetentionConfigSetstate = [](tle::KvCacheRetentionConfig::TokenRangeRetentionConfig& tokenRangeRetentionConfig, nb::tuple const& state)
+    auto TokenRangeRetentionConfigSetstate
+        = [](tle::KvCacheRetentionConfig::TokenRangeRetentionConfig& tokenRangeRetentionConfig, nb::tuple const& state)
     {
         if (state.size() != 4)
         {
             throw std::runtime_error("Invalid state!");
         }
-        new (&tokenRangeRetentionConfig) tle::KvCacheRetentionConfig::TokenRangeRetentionConfig(nb::cast<SizeType32>(state[0]),
-            nb::cast<std::optional<SizeType32>>(state[1]), nb::cast<tle::RetentionPriority>(state[2]),
-            nb::cast<std::optional<std::chrono::milliseconds>>(state[3]));
+        new (&tokenRangeRetentionConfig) tle::KvCacheRetentionConfig::TokenRangeRetentionConfig(
+            nb::cast<SizeType32>(state[0]), nb::cast<std::optional<SizeType32>>(state[1]),
+            nb::cast<tle::RetentionPriority>(state[2]), nb::cast<std::optional<std::chrono::milliseconds>>(state[3]));
     };
     auto kvCacheRetentionConfigGetstate = [](tle::KvCacheRetentionConfig const& self)
     {
         return nb::make_tuple(self.getTokenRangeRetentionConfigs(), self.getDecodeRetentionPriority(),
             self.getDecodeDurationMs(), self.getTransferMode(), self.getDirectory());
     };
-    auto kvCacheRetentionConfigSetstate = [](tle::KvCacheRetentionConfig& kvCacheRetentionConfig, nb::tuple const& state)
+    auto kvCacheRetentionConfigSetstate
+        = [](tle::KvCacheRetentionConfig& kvCacheRetentionConfig, nb::tuple const& state)
     {
         if (state.size() != 5)
         {
@@ -490,8 +496,8 @@ void initRequestBindings(nanobind::module_& m)
         {
             throw std::runtime_error("Invalid EagleConfig state!");
         }
-        new (&eagleConfig) tle::EagleConfig(nb::cast<std::optional<tle::EagleChoices>>(state[0]), nb::cast<bool>(state[1]),
-            nb::cast<std::optional<float>>(state[2]), nb::cast<bool>(state[3]),
+        new (&eagleConfig) tle::EagleConfig(nb::cast<std::optional<tle::EagleChoices>>(state[0]),
+            nb::cast<bool>(state[1]), nb::cast<std::optional<float>>(state[2]), nb::cast<bool>(state[3]),
             nb::cast<std::optional<SizeType32>>(state[4]));
     };
     nb::class_<tle::EagleConfig>(m, "EagleConfig")
