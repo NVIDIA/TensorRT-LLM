@@ -940,6 +940,7 @@ class MLA(nn.Module):
         # currently we assume that the chunk size is the same as the max_num_tokens
         chunk_size = attn_metadata.runtime_features.normal_chunk_size
         chunked_loop_num = attn_metadata.chunked_loop_num
+        assert chunk_size % attn_metadata.runtime_features.chunk_unit_size == 0, 'chunk size must be divisible by chunk unit size'
 
         # [toal_token_q, num_heads, 2] -> [toal_token_q, num_heads] float2
         self.softmax_stats_tensor = torch.empty(

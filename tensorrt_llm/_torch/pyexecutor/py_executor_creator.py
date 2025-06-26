@@ -306,6 +306,12 @@ def create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             executor_config.kv_cache_config.enable_block_reuse = False
+        if executor_config.enable_chunked_context and not (get_sm_version()
+                                                           == 100):
+            logger.warning(
+                "Chunked Prefill for MLA can only be enabled on SM100, "
+                f"disable enable_block_reuse for SM{get_sm_version()}")
+            executor_config.enable_chunked_context = False
 
     if executor_config.enable_chunked_context:
         chunk_unit_size = executor_config.tokens_per_block
