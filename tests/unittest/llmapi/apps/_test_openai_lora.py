@@ -6,9 +6,9 @@ from typing import List, Optional
 import openai
 import pytest
 import yaml
+from utils.util import similar
 
 from tensorrt_llm.executor.request import LoRARequest
-from tests.unittest.utils.util import similar
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
