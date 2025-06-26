@@ -973,7 +973,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata = None
 
         self._cuda_graphs[batch_size] = DecodingCUDAGraphRunner(
-            batch_size, "cuda", attn_metadata, spec_metadata)
+            batch_size, "cuda", attn_metadata, spec_metadata, self.use_mrope)
         return self._cuda_graphs[batch_size]
 
     def __del__(self) -> None:
@@ -2065,22 +2065,12 @@ class PyTorchModelEngine(ModelEngine):
                                                       attn_metadata,
                                                       spec_metadata,
                                                       new_tensors_device)
-<<<<<<< HEAD
-=======
 
             # prepare mrope_position_deltas for cuda graph if necessary
             if 'mrope_config' in inputs:
                 if 'mrope_position_deltas' in inputs['mrope_config']:
-                    mrope_position_deltas_tensor = torch.cat(
+                    inputs["mrope_position_deltas"] = torch.cat(
                         inputs['mrope_config']['mrope_position_deltas'], dim=0)
-                    extra_model_inputs = {
-                        "mrope_position_deltas": mrope_position_deltas_tensor,
-                    }
-
-            if extra_model_inputs is not None:
-                inputs.update(extra_model_inputs)
-            self.last_spec_metadata = spec_metadata
->>>>>>> e5bbe52a4 (fix cuda graph + mrope)
 
             self.iter_counter += 1
 

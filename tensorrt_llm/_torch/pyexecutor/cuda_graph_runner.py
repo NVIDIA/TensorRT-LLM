@@ -28,6 +28,7 @@ class DecodingCUDAGraphRunner:
         device: str,
         attn_metadata: AttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
+        use_mrope: bool = False,
     ) -> None:
         """
         Stores a CUDA graph and its associated input buffers.
@@ -56,6 +57,9 @@ class DecodingCUDAGraphRunner:
         self.position_ids = torch.zeros((1, batch_size * token_per_request),
                                         device=device,
                                         dtype=torch.int32)
+        self.mrope_position_deltas = torch.zeros(
+            (1, batch_size), device=device,
+            dtype=torch.int32) if use_mrope else None
 
         self.attn_metadata = attn_metadata
         self.spec_metadata = spec_metadata
@@ -78,6 +82,7 @@ class DecodingCUDAGraphRunner:
             "position_ids": self.position_ids,
             "inputs_embeds": None,
             "spec_metadata": self.spec_metadata,
+            "mrope_position_deltas": self.mrope_position_deltas,
         }
 
         # We have to do warm up runs to initialize PyTorch's
@@ -121,23 +126,6 @@ class DecodingCUDAGraphRunner:
         self.input_ids[:seqlen].copy_(input_ids)
         self.position_ids[:, :seqlen].copy_(position_ids)
 
-<<<<<<< HEAD
-=======
-        if self.extra_model_inputs:
-            # use optional_extra_model_inputs to fit dummy requests given by operations like estimate_max_kv_cache_tokens
-            if extra_model_inputs is None:
-                assert set(self.extra_model_inputs.keys()).issubset(
-                    set(self.optional_extra_model_inputs)
-                ), "Model was captured with extra model inputs, so extra_model_inputs must be provided to run()"
-            else:
-                for key in self.extra_model_inputs:
-                    if key not in extra_model_inputs and key in self.optional_extra_model_inputs:
-                        continue
-                    assert key in extra_model_inputs, f"Graph runner is missing extra input {key}"
-                    dst_tensor = self.extra_model_inputs[key]
-                    dst_tensor.copy_(extra_model_inputs[key])
-
->>>>>>> e5bbe52a4 (fix cuda graph + mrope)
         assert self._output is not None and self._graph is not None
         self._graph.replay()
         return self._output
