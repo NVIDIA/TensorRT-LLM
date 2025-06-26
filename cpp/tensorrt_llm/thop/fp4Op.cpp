@@ -340,7 +340,7 @@ th::Tensor NVFP4BlockScaleInterleave(th::Tensor const& blockScale)
 // blockScale: [num_experts, rows, cols] or [rows, cols]
 // Note: rows and cols are the dimensions of the original unswizzled SFMatrix, so reshape input before passing into
 // this function! Return: The same shape as blockScale
-th::Tensor NVFP4BlockScaleInterleaveReverse(th::Tensor blockScale)
+th::Tensor NVFP4BlockScaleInterleaveReverse(th::Tensor const& blockScale)
 {
     bool is_cuda = blockScale.device().is_cuda();
     if (is_cuda)
