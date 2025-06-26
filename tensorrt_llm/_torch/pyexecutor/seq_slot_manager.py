@@ -23,7 +23,8 @@ class SeqSlotManager(BaseResourceManager):
                 llm_req.is_disagg_generation_transmission_complete:
                 llm_req.seq_slot = self.slot_manager.add_slot(
                     llm_req.request_id)
-                llm_req.create_first_scheduled_time()
+                if llm_req.return_perf_metrics:
+                    llm_req.create_first_scheduled_time()
 
     def free_resources(self, request: LlmRequest) -> None:
         self.slot_manager.remove_slot(request.request_id)
