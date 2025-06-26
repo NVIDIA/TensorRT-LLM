@@ -55,6 +55,8 @@ using namespace tensorrt_llm::common;
 namespace tensorrt_llm::kernels
 {
 
+// TODO: These kernel implementations are duplicated in moe_kernels.cu. They will be refactored later (tracked by
+// https://jirasw.nvidia.com/browse/TRTLLM-708)
 template <int BLOCK_SIZE, int EXPERTS_PER_TOKEN, int LOG2_NUM_EXPERTS>
 __global__ void fusedBuildExpertMapsSortFirstTokenKernel(int const* const token_selected_experts,
     int* const unpermuted_token_selected_experts, int* const permuted_source_token_ids,
