@@ -603,7 +603,7 @@ __global__ void splitKVCacheKernel(T const** __restrict__ inputBlocks, T** __res
 }
 
 __device__ __forceinline__ void getPosId(int const posLayerId, int const* blockNumPerWindow, int const* layersPerWindow,
-    int windowNum, int domainPPSize, size_t& inputBlockId, size_t& inputLayerId, size_t& outputAllLayerOffset,
+    int windowNum, int domainPPSize, int& inputBlockId, int& inputLayerId, int& outputAllLayerOffset,
     int& outputPPOffset)
 {
 
@@ -612,14 +612,11 @@ __device__ __forceinline__ void getPosId(int const posLayerId, int const* blockN
     int layerInInputTensor = 0;
     int tensorIdxOffset = 0;
     int prevOutputLayerOffset = 0;
-    __shared__ size_t sharedInputBlockId;
-    __shared__ size_t sharedInputLayerId;
-    __shared__ size_t sharedOutputAllLayerOffset;
+    __shared__ int sharedInputBlockId;
+    __shared__ int sharedInputLayerId;
+    __shared__ int sharedOutputAllLayerOffset;
     __shared__ int sharedOutputPPOffset;
 
-    // TODO: scan for blockNumInWindow*layersInWindow
-    // TODO: add inputParams : PrelayerOffsetPerBlock , 不用scan. scan的结果在host端计算， 传到getPosId.
-    // 然后每个线程并行 定位到时哪个window 就是下面的代码循环
     if (threadIdx.x == 0)
     {
 #pragma unroll 1
@@ -631,20 +628,36 @@ __device__ __forceinline__ void getPosId(int const posLayerId, int const* blockN
             // tensorIdxOffset
             if (posLayerId < offset + (blockNumInWindow * layersInWindow))
             {
-                inputTensorIdx = (posLayerId - offset) / layersInWindow + tensorIdxOffset;
-                layerInInputTensor = (posLayerId - offset) % layersInWindow;
-                sharedOutputPPOffset = layerInInputTensor / (layersInWindow / domainPPSize);
+                int remaindLayerInWindow = posLayerId - offset;
+
+                int layerInWindowQuotient = remaindLayerInWindow / layersInWindow;
+                int layerInWindowRemainder = remaindLayerInWindow % layersInWindow;
+
+                inputTensorIdx = layerInWindowQuotient + tensorIdxOffset;
+                layerInInputTensor = layerInWindowRemainder;
+
+                int layersPerDomainPP = layersInWindow / domainPPSize;
+                sharedOutputPPOffset = layerInWindowRemainder / layersPerDomainPP;
+
+                sharedInputBlockId = inputTensorIdx;
+                sharedInputLayerId = layerInInputTensor;
+
+                sharedOutputAllLayerOffset = prevOutputLayerOffset + layerInWindowQuotient * layersPerDomainPP
+                    + layerInWindowRemainder % layersPerDomainPP;
+
+                // printf(
+                //     " getPosId break , posLayerId:%d, offset:%d, blockNumInWindow:%d, layersInWindow:%d, "
+                //     "inputTensorIdx:%d, layerInInputTensor:%d, sharedOutputPPOffset:%d, sharedInputLayerId: %d\n",
+                //     posLayerId, offset, blockNumInWindow, layersInWindow, inputTensorIdx, layerInInputTensor,
+                //     sharedOutputPPOffset, static_cast<int>(sharedInputLayerId));
 
                 break;
             }
 
             offset += blockNumInWindow * layersInWindow;
             tensorIdxOffset += blockNumInWindow;
-            prevOutputLayerOffset += layersInWindow / domainPPSize;
+            prevOutputLayerOffset += blockNumInWindow * (layersInWindow / domainPPSize);
         }
-        sharedInputBlockId = inputTensorIdx;
-        sharedInputLayerId = layerInInputTensor;
-        sharedOutputAllLayerOffset = prevOutputLayerOffset + inputLayerId / domainPPSize;
     }
     __syncthreads();
     inputBlockId = sharedInputBlockId;
@@ -674,15 +687,18 @@ __global__ void splitKVCacheForWindowKernel(T const** __restrict__ inputBlocks, 
 #pragma unroll 1
     for (int threadBlockIdx = blockIdx.x; threadBlockIdx < inputAllLayerNum; threadBlockIdx += gridDim.x)
     {
-        size_t inputBlockId, inputLayerId, outputAllLayerOffset;
+        int inputBlockId, inputLayerId, outputAllLayerOffset;
         int outputPPOffset;
         getPosId(threadBlockIdx, blockNumPerWindow, layersPerWindow, windowNum, DomainPPSize, inputBlockId,
             inputLayerId, outputAllLayerOffset, outputPPOffset);
-
+        // if(threadIdx.x==0){
+        //     printf("in kernel splitKVCacheForWindowKernel, thradIdx.x :%d ,threadBlockIdx:%d,
+        //     inputBlockId:%d,nputLayerId:%d, outputAllLayerOffset:%d, outputPPOffset:%d\n ", threadIdx.x,
+        //     threadBlockIdx, inputBlockId, inputLayerId, outputAllLayerOffset, outputPPOffset);
+        // }
         T const* inputBlockPtr = inputBlocks[inputBlockId];
         T const* inputLayerPtr = inputBlockPtr + inputLayerId * 2 * headNum * tokensPerBlock * dimsPerHead;
         size_t outputLayerEleOffset = outputAllLayerOffset * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead;
-// TODO: haedNumDomainTP is power of 2 , fast way /, %
 #pragma unroll 1
         for (int headId = subWarpGroupId; headId < headNum; headId += subWarpGroupNum)
         {
@@ -690,7 +706,6 @@ __global__ void splitKVCacheForWindowKernel(T const** __restrict__ inputBlocks, 
             T const* vInputPtr = kInputPtr + headNum * tokensPerBlock * dimsPerHead;
             int outputCacheIdx = headId / headNumDomainTP * DomainPPSize + outputPPOffset;
             int headIdInDomainTP = headId % headNumDomainTP;
-            // int headIdInDomainTP = headId & (headNumDomainTP - 1);
             T* outputCachePtr = outputCaches[outputCacheIdx];
             T* kOutputPtr = outputCachePtr + outputLayerEleOffset + headIdInDomainTP * tokensPerBlock * dimsPerHead;
             T* vOutputPtr = kOutputPtr + headNumDomainTP * tokensPerBlock * dimsPerHead;
@@ -831,6 +846,7 @@ __global__ void concatKVCacheKernel(T const** __restrict__ inputCaches, T** __re
 }
 
 template <typename T, int subWarpSize, int subWarpNumInGroup, int vecSizeByte>
+// __maxnreg__(32)
 __global__ void concatKVCacheForWindowKernel(T const** __restrict__ inputCaches, T** __restrict__ outputBlocks,
     int const* blockNumPerWindow, int const* layersPerWindow, int windowNum, int outputAllLayerNum, int tokensPerBlock,
     int headNum, int dimsPerHead, int outputBlockNum, int DomainPPSize, int DomainTPSize, int headNumDomainTP)
@@ -849,11 +865,13 @@ __global__ void concatKVCacheForWindowKernel(T const** __restrict__ inputCaches,
 #pragma unroll 1
     for (int threadBlockIdx = blockIdx.x; threadBlockIdx < outputAllLayerNum; threadBlockIdx += gridDim.x)
     {
-        size_t outputBlockId, outputLayerId, inputAllLayerOffset;
+        int outputBlockId, outputLayerId, inputAllLayerOffset;
         int inputPPOffset;
         getPosId(threadBlockIdx, blockNumPerWindow, layersPerWindow, windowNum, DomainPPSize, outputBlockId,
             outputLayerId, inputAllLayerOffset, inputPPOffset);
-
+        // printf("in kernel concatKVCacheForWindowKernel, thradIdx.x :%d ,threadBlockIdx:%d,
+        // outputBlockId:%d,outputLayerId:%d, inputAllLayerOffset:%d, inputPPOffset:%d\n", threadIdx.x, threadBlockIdx,
+        // outputBlockId, outputLayerId, inputAllLayerOffset, inputPPOffset);
         T* outputBlockPtr = outputBlocks[outputBlockId];
         T* outputLayerPtr = outputBlockPtr + outputLayerId * 2 * headNum * tokensPerBlock * dimsPerHead;
         size_t inputLayerEleOffset = inputAllLayerOffset * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead;
@@ -925,7 +943,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         auto cacheDataType = blocks.front()->getDataType();
         windowSizes.push_back(window);
         blockNumInwindow.push_back(blocks.size());
-        TLLM_LOG_INFO("window: %d, blockNum: %d  blockshape:[%d,%d]", window, blocks.size(),
+        TLLM_LOG_DEBUG("window: %d, blockNum: %d  blockshape:[%d,%d]", window, blocks.size(),
             blocks.front()->getShape().d[0], blocks.front()->getShape().d[1]);
         auto layersNum = blocks.front()->getDimension<1>();
         layersInWindow.push_back(layersNum);
@@ -946,6 +964,8 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         cachePtrs.push_back(static_cast<T*>(outputSplitBlock->data()));
     }
 
+    bool const isWindow = windowSizes.size() > 0;
+
     runtime::BufferManager::IBufferPtr PtrsDeviceBuffer
         = bufferManager.gpu(cachePtrs.size(), nvinfer1::DataType::kINT64);
     TLLM_CHECK(PtrsDeviceBuffer->getSizeInBytes() == cachePtrs.size() * sizeof(T*));
@@ -953,13 +973,21 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
 
     runtime::BufferManager::IBufferPtr windowInfoDeviceBuffer;
     std::vector<SizeType32> windowInfoHostBuffer;
-    windowInfoHostBuffer.reserve(windowSizes.size() * 2);
-    if (windowSizes.size() > 1)
+    if (isWindow)
     {
-        windowInfoHostBuffer.insert(windowInfoHostBuffer.end(), windowSizes.begin(), windowSizes.end());
+        windowInfoHostBuffer.reserve(windowSizes.size() * 2);
+
+        windowInfoHostBuffer.insert(windowInfoHostBuffer.end(), blockNumInwindow.begin(), blockNumInwindow.end());
         windowInfoHostBuffer.insert(windowInfoHostBuffer.end(), layersInWindow.begin(), layersInWindow.end());
         windowInfoDeviceBuffer = bufferManager.gpu(windowInfoHostBuffer.size(), nvinfer1::DataType::kINT32);
         bufferManager.copy(windowInfoHostBuffer.data(), *windowInfoDeviceBuffer, runtime::MemoryType::kCPU);
+
+        for (auto layerNum : layersInWindow)
+        {
+
+            TLLM_CHECK_WITH_INFO(
+                layerNum % targetRankInfo.mDomainPPSize == 0, "layerNum in Window must be divisible by domainPPSize");
+        }
     }
     constexpr int subWarpSize = 8;
     constexpr int subWarpNumInGroup = 8;
@@ -976,7 +1004,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     unsigned int gridDimx = selfModelConfig.mNbKvHeadsPerLayer.size() / oPPNum;
     // blockNum
     unsigned int gridDimy = inputBlockNumSum;
-    bool const isWindow = windowSizes.size() > 1;
+
     int const* blockNumPerWindowDevPtr = nullptr;
     int const* layersPerWindowDevPtr = nullptr;
     int windowNum = windowSizes.size();
@@ -987,6 +1015,8 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
         gridDimy = 1;
         blockNumPerWindowDevPtr = static_cast<int const*>(windowInfoDeviceBuffer->data());
         layersPerWindowDevPtr = static_cast<int const*>(windowInfoDeviceBuffer->data()) + windowSizes.size();
+
+        TLLM_LOG_DEBUG("windowNum:%d, inputBlockLayerNumSum:%d, ", windowNum, inputBlockLayerNumSum);
     }
 
     dim3 gridDim{gridDimx, gridDimy};
@@ -1266,13 +1296,14 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
         = bufferManager.gpu(cachePtrs.size(), nvinfer1::DataType::kINT64);
     TLLM_CHECK(PtrsDeviceBuffer->getSizeInBytes() == cachePtrs.size() * sizeof(T*));
     bufferManager.copy(cachePtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
-    bool const isWindow = windowSizes.size() > 1;
+    bool const isWindow = windowSizes.size() > 0;
     runtime::BufferManager::IBufferPtr windowInfoDeviceBuffer;
     std::vector<SizeType32> windowInfoHostBuffer;
-    windowInfoHostBuffer.reserve(windowSizes.size() * 2);
     if (isWindow)
     {
-        windowInfoHostBuffer.insert(windowInfoHostBuffer.end(), windowSizes.begin(), windowSizes.end());
+        windowInfoHostBuffer.reserve(windowSizes.size() * 2);
+
+        windowInfoHostBuffer.insert(windowInfoHostBuffer.end(), blockNumInwindow.begin(), blockNumInwindow.end());
         windowInfoHostBuffer.insert(windowInfoHostBuffer.end(), layersInWindow.begin(), layersInWindow.end());
         windowInfoDeviceBuffer = bufferManager.gpu(windowInfoHostBuffer.size(), nvinfer1::DataType::kINT32);
         bufferManager.copy(windowInfoHostBuffer.data(), *windowInfoDeviceBuffer, runtime::MemoryType::kCPU);

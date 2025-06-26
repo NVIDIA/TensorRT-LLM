@@ -203,7 +203,9 @@ private:
     {
         if (mIdx < mRange->mBlockIds.size())
         {
+            //  TLLM_LOG_INFO("block update mIdx: %d", mIdx);
             mCurrent = runtime::ITensor::slice(mRange->mPool, mRange->mBlockIds.at(mIdx), 1);
+            //  TLLM_LOG_INFO("block update mIdx finish");
         }
     }
 
