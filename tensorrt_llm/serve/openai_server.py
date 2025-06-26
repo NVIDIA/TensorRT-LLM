@@ -316,7 +316,7 @@ class OpenAIServer:
 
     async def openai_completion(self, request: CompletionRequest, raw_request: Request) -> Response:
 
-        async def completion_response(promise, postproc_params):
+        async def completion_response(promise: RequestOutput, postproc_params: Optional[PostprocParams]):
             response = await promise
             if not self.postproc_worker_enabled:
                 pp_result: CompletionResponse
@@ -324,9 +324,12 @@ class OpenAIServer:
                 pp_result = post_processor(response, args)
             else:
                 pp_result = response.outputs[0]._postprocess_result
+            if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
+                # Include prompt token ids for context-only requests
+                pp_result.prompt_token_ids = response.prompt_token_ids
             return pp_result
 
-        def merge_completion_responses(responses: List[CompletionResponse], disaggregated_params: Optional[LlmDisaggregatedParams] = None):
+        def merge_completion_responses(responses: List[CompletionResponse]):
             all_choices: List[CompletionResponseChoice] = []
             all_prompt_token_ids: List[List[int]] = []
             num_prompt_tokens = num_gen_tokens = 0
@@ -335,8 +338,8 @@ class OpenAIServer:
                 all_choices.extend(choices)
                 num_prompt_tokens += usage.prompt_tokens
                 num_gen_tokens += usage.completion_tokens
-                #Include prompt token ids for context-only requests
-                if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
+                # Aggregate prompt token ids for context-only requests
+                if rsp.prompt_token_ids is not None:
                     all_prompt_token_ids.append(rsp.prompt_token_ids)
 
             usage_info = UsageInfo(
@@ -430,7 +433,7 @@ class OpenAIServer:
             else:
                 rsps = await asyncio.gather(*[completion_response(promise, params)
                                               for promise, params in zip(promises, postproc_params_collection)])
-                response = merge_completion_responses(rsps, disaggregated_params) if len(rsps) > 1 else rsps[0]
+                response = merge_completion_responses(rsps) if len(rsps) > 1 else rsps[0]
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server
