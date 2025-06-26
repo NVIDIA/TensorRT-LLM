@@ -327,8 +327,8 @@ class RandomDataset(BenchmarkDataset):
 class CustomDataset(BenchmarkDataset):
     """
     TensorRT-LLM customized dataset implementation.
-    It assumes the dataset to be consist of several lines of json, each line is a OpenAI API format request.
-    Example format:
+    It assumes the dataset to be consist of several lines of json, each line is a minimal OpenAI API format request.
+    Example format of each sample on each line:
     {
         "input": {
             "messages": [
