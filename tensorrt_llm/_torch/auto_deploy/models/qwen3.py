@@ -17,7 +17,7 @@ def _forward_moe(self: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor):
     # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)
 
-    final_hidden_states = torch.ops.moe.torch_moe(
+    final_hidden_states = torch.ops.auto_deploy.torch_moe(
         hidden_states,
         selected_experts,
         routing_weights,

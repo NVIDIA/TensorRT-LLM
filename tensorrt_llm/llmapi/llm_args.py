@@ -879,8 +879,11 @@ class BaseLlmArgs(BaseModel):
     enable_chunked_prefill: bool = Field(default=False,
                                          description="Enable chunked prefill.")
 
-    guided_decoding_backend: Optional[str] = Field(
-        default=None, description="Guided decoding backend.")
+    guided_decoding_backend: Optional[Literal["xgrammar", "llguidance"]] = Field(
+        default=None,
+        description=
+        "Guided decoding backend. llguidance is supported in PyTorch backend only."
+    )
 
     batched_logits_processor: Optional[object] = Field(
         default=None,

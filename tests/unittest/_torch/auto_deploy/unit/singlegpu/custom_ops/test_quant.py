@@ -20,7 +20,7 @@ def test_fp8_linear(bias):
     weight_scale = (torch.max(torch.abs(weight)) / 448).to("cuda")
     weight_fp8 = (weight / weight_scale).to(torch.float8_e4m3fn)
 
-    output_fp8_gemm = torch.ops.quant.fp8_linear(
+    output_fp8_gemm = torch.ops.auto_deploy.torch_quant_fp8_linear(
         input,
         weight_fp8,
         bias=bias,
@@ -49,7 +49,7 @@ def test_fp4_linear():
         weight, weight_scale_2, scaling_vector_size, False
     )
 
-    output_fp4_gemm = torch.ops.quant.fp4_linear(
+    output_fp4_gemm = torch.ops.auto_deploy.torch_quant_fp4_linear(
         input,
         weight_fp4,
         bias=None,

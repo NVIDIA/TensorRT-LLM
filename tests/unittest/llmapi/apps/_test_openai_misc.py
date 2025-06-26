@@ -34,10 +34,13 @@ def max_seq_len(request):
 def server(model_name: str, backend: str, max_batch_size: str,
            max_seq_len: str):
     model_path = get_model_path(model_name)
-    args = ["--max_beam_width", "4"]
+    args = []
     if backend is not None:
         args.append("--backend")
         args.append(backend)
+    if backend != "pytorch":
+        args.append("--max_beam_width")
+        args.append("4")
     if max_batch_size is not None:
         args.append("--max_batch_size")
         args.append(max_batch_size)

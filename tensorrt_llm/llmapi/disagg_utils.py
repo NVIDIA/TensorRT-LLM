@@ -58,6 +58,7 @@ class MetadataServerConfig():
     hostname: str = "localhost"
     port: int = 2379
     health_check_timeout: float = 5.0
+    refresh_interval: float = 10.0
 
 
 def parse_disagg_config_file(yaml_config_file: str):

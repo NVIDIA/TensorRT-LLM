@@ -13,7 +13,6 @@ from ....bindings.internal.batch_manager import CacheType
 from ....llmapi.llm_args import _AutoDeployLlmArgs
 from ....mapping import Mapping
 from ...distributed import MPIDist
-from ...pyexecutor._util import create_torch_sampler_args
 from ...pyexecutor.config import PyTorchConfig
 from ...pyexecutor.model_engine import ModelEngine
 from ...pyexecutor.py_executor import PyExecutor
@@ -266,9 +265,14 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     ad_config: _AutoDeployLlmArgs = executor_config.pytorch_backend_config
 
     max_batch_size = ad_config.max_batch_size
+    max_num_sequences = ad_config.max_batch_size * dist_mapping.pp_size
     max_seq_len = ad_config.max_seq_len
     attn_page_size = ad_config.attn_page_size
     max_num_tokens = ad_config.max_num_tokens
+    max_draft_tokens = (
+        0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_tokens
+    )
+
     ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}")
 
     # initialize model engine
@@ -309,22 +313,30 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
     # search sampler with speculative decoding
-    sampler_args = create_torch_sampler_args(
-        executor_config, dist_mapping, mixed_sampler=False, max_seq_len=max_seq_len
+    # TODO (lucaslie, fridah-nv): some models require mixed_sampler=True to have good outputs, see
+    # https://github.com/NVIDIA/TensorRT-LLM/issues/5254
+    # We should expose mixed_sample to our build_and_run_ad script so we can configure this
+    # correctly for models as needed.
+    sampler_args = TorchSampler.Args(
+        max_seq_len=max_seq_len,
+        max_draft_tokens=max_draft_tokens,
+        max_num_sequences=max_num_sequences,
+        max_beam_width=executor_config.max_beam_width,
+        mixed_sampler=ad_config.mixed_sampler,
     )
     sampler = TorchSampler(sampler_args)
+
+    # creating the executor object
     py_executor = PyExecutor(
         resource_manager,
         scheduler,
         model_engine=engine,
         sampler=sampler,
         dist=mpi_dist,
-        max_num_sequences=ad_config.max_batch_size * dist_mapping.pp_size,
+        max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         max_input_len=ad_config.max_input_len,
-        max_batch_size=ad_config.max_batch_size,
-        max_draft_tokens=ad_config.speculative_config.max_draft_tokens
-        if ad_config.speculative_config is not None
-        else 0,
+        max_batch_size=max_batch_size,
+        max_draft_tokens=max_draft_tokens,
     )
     return py_executor
