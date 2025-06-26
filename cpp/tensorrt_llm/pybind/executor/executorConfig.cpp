@@ -441,7 +441,6 @@ void initConfigBindings(nanobind::module_& m)
 
     auto executorConfigGetState = [](nb::object const& self)
     {
-        std::cout << "[DEBUG] executorConfigGetState called" << std::endl;
         auto& c = nb::cast<tle::ExecutorConfig&>(self);
         // Return a tuple containing C++ data and the Python __dict__
         auto cpp_states = nb::make_tuple(c.getMaxBeamWidth(), c.getSchedulerConfig(), c.getKvCacheConfig(),
@@ -453,76 +452,61 @@ void initConfigBindings(nanobind::module_& m)
             c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
             c.getAdditionalModelOutputs(), c.getCacheTransceiverConfig(), c.getGatherGenerationLogits(),
             c.getPromptTableOffloading(), c.getEnableTrtOverlap());
-        std::cout << "[DEBUG] executorConfigGetState tuple size: " << nb::len(cpp_states) << std::endl;
         auto pickle_tuple = nb::make_tuple(cpp_states, nb::getattr(self, "__dict__"));
-        std::cout << "finished executorConfigGetState" << std::endl;
         return pickle_tuple;
     };
 
     auto executorConfigSetState = [](nb::object self, nb::tuple const& state)
     {
-        try
+        if (state.size() != 2)
         {
-            if (state.size() != 2)
-            {
-                throw std::runtime_error("Invalid state!");
-            }
-
-            auto cpp_states = nb::cast<nb::tuple>(state[0]);
-            auto py_state = nb::cast<nb::dict>(state[1]);
-            if (cpp_states.size() != 28)
-            {
-                throw std::runtime_error("Invalid cpp_states!");
-            }
-            // Restore dynamic attributes
-            nb::dict self_dict = nb::cast<nb::dict>(self.attr("__dict__"));
-            for (auto item : py_state)
-            {
-                self_dict[item.first] = item.second;
-            }
-
-            // Restore C++ data
-            tle::ExecutorConfig* cpp_self = nb::inst_ptr<tle::ExecutorConfig>(self);
-            new (cpp_self) tle::ExecutorConfig(                                          //
-                nb::cast<SizeType32>(cpp_states[0]),                                     // MaxBeamWidth
-                nb::cast<tle::SchedulerConfig>(cpp_states[1]),                           // SchedulerConfig
-                nb::cast<tle::KvCacheConfig>(cpp_states[2]),                             // KvCacheConfig
-                nb::cast<bool>(cpp_states[3]),                                           // EnableChunkedContext
-                nb::cast<bool>(cpp_states[4]),                                           // NormalizeLogProbs
-                nb::cast<SizeType32>(cpp_states[5]),                                     // IterStatsMaxIterations
-                nb::cast<SizeType32>(cpp_states[6]),                                     // RequestStatsMaxIterations
-                nb::cast<tle::BatchingType>(cpp_states[7]),                              // BatchingType
-                nb::cast<std::optional<SizeType32>>(cpp_states[8]),                      // MaxBatchSize
-                nb::cast<std::optional<SizeType32>>(cpp_states[9]),                      // MaxNumTokens
-                nb::cast<std::optional<tle::ParallelConfig>>(cpp_states[10]),            // ParallelConfig
-                nb::cast<std::optional<tle::PeftCacheConfig>>(cpp_states[11]),           // PeftCacheConfig
-                nb::cast<std::optional<tle::LogitsPostProcessorConfig>>(cpp_states[12]), // LogitsPostProcessorConfig
-                nb::cast<std::optional<tle::DecodingConfig>>(cpp_states[13]),            // DecodingConfig
-                nb::cast<bool>(cpp_states[14]),                                          // UseGpuDirectStorage
-                nb::cast<float>(cpp_states[15]),                                         // GpuWeightsPercent
-                nb::cast<std::optional<SizeType32>>(cpp_states[16]),                     // MaxQueueSize
-                nb::cast<tle::ExtendedRuntimePerfKnobConfig>(cpp_states[17]), // ExtendedRuntimePerfKnobConfig
-                nb::cast<std::optional<tle::DebugConfig>>(cpp_states[18]),    // DebugConfig
-                nb::cast<SizeType32>(cpp_states[19]),                         // RecvPollPeriodMs
-                nb::cast<uint64_t>(cpp_states[20]),                           // MaxSeqIdleMicroseconds
-                nb::cast<std::optional<tle::SpeculativeDecodingConfig>>(cpp_states[21]), // SpecDecConfig
-                nb::cast<std::optional<tle::GuidedDecodingConfig>>(cpp_states[22]),      // GuidedDecodingConfig
-                nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(
-                    cpp_states[23]),                                                     // AdditionalModelOutputs
-                nb::cast<std::optional<tle::CacheTransceiverConfig>>(cpp_states[24]),    // CacheTransceiverConfig
-                nb::cast<bool>(cpp_states[25]),                                          // GatherGenerationLogits
-                nb::cast<bool>(cpp_states[26]),                                          // PromptTableOffloading
-                nb::cast<bool>(cpp_states[27])                                           // EnableTrtOverlap
-            );
-
-            nb::inst_mark_ready(self);
+            throw std::runtime_error("Invalid state!");
         }
-        catch (const std::exception& e)
+
+        auto cpp_states = nb::cast<nb::tuple>(state[0]);
+        if (cpp_states.size() != 28)
         {
-            std::cerr << "[ERROR] Exception in executorConfigSetState: " << e.what() << std::endl;
-            throw;
+            throw std::runtime_error("Invalid cpp_states!");
         }
-        return self;
+
+        // Restore C++ data
+        tle::ExecutorConfig* cpp_self = nb::inst_ptr<tle::ExecutorConfig>(self);
+        new (cpp_self) tle::ExecutorConfig(                                          //
+            nb::cast<SizeType32>(cpp_states[0]),                                     // MaxBeamWidth
+            nb::cast<tle::SchedulerConfig>(cpp_states[1]),                           // SchedulerConfig
+            nb::cast<tle::KvCacheConfig>(cpp_states[2]),                             // KvCacheConfig
+            nb::cast<bool>(cpp_states[3]),                                           // EnableChunkedContext
+            nb::cast<bool>(cpp_states[4]),                                           // NormalizeLogProbs
+            nb::cast<SizeType32>(cpp_states[5]),                                     // IterStatsMaxIterations
+            nb::cast<SizeType32>(cpp_states[6]),                                     // RequestStatsMaxIterations
+            nb::cast<tle::BatchingType>(cpp_states[7]),                              // BatchingType
+            nb::cast<std::optional<SizeType32>>(cpp_states[8]),                      // MaxBatchSize
+            nb::cast<std::optional<SizeType32>>(cpp_states[9]),                      // MaxNumTokens
+            nb::cast<std::optional<tle::ParallelConfig>>(cpp_states[10]),            // ParallelConfig
+            nb::cast<std::optional<tle::PeftCacheConfig>>(cpp_states[11]),           // PeftCacheConfig
+            nb::cast<std::optional<tle::LogitsPostProcessorConfig>>(cpp_states[12]), // LogitsPostProcessorConfig
+            nb::cast<std::optional<tle::DecodingConfig>>(cpp_states[13]),            // DecodingConfig
+            nb::cast<bool>(cpp_states[14]),                                          // UseGpuDirectStorage
+            nb::cast<float>(cpp_states[15]),                                         // GpuWeightsPercent
+            nb::cast<std::optional<SizeType32>>(cpp_states[16]),                     // MaxQueueSize
+            nb::cast<tle::ExtendedRuntimePerfKnobConfig>(cpp_states[17]), // ExtendedRuntimePerfKnobConfig
+            nb::cast<std::optional<tle::DebugConfig>>(cpp_states[18]),    // DebugConfig
+            nb::cast<SizeType32>(cpp_states[19]),                         // RecvPollPeriodMs
+            nb::cast<uint64_t>(cpp_states[20]),                           // MaxSeqIdleMicroseconds
+            nb::cast<std::optional<tle::SpeculativeDecodingConfig>>(cpp_states[21]), // SpecDecConfig
+            nb::cast<std::optional<tle::GuidedDecodingConfig>>(cpp_states[22]),      // GuidedDecodingConfig
+            nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(
+                cpp_states[23]),                                                     // AdditionalModelOutputs
+            nb::cast<std::optional<tle::CacheTransceiverConfig>>(cpp_states[24]),    // CacheTransceiverConfig
+            nb::cast<bool>(cpp_states[25]),                                          // GatherGenerationLogits
+            nb::cast<bool>(cpp_states[26]),                                          // PromptTableOffloading
+            nb::cast<bool>(cpp_states[27])                                           // EnableTrtOverlap
+        );
+
+        auto py_state = nb::cast<nb::dict>(state[1]);
+        self.attr("__dict__").attr("update")(py_state);
+
+        nb::inst_mark_ready(self);
     };
 
     nb::class_<tle::ExecutorConfig>(m, "ExecutorConfig", nanobind::dynamic_attr())
