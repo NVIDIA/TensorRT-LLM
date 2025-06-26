@@ -569,8 +569,8 @@ TEST_F(GptExecutorTest, GenerationChangeEndId)
 
 // stream, excludeInputFromOutput, beamWidth
 using ParamType = std::tuple<bool, bool, int>;
-// streaming, useOrchestratorMode, beamWidth, numReturnSequences, modelName
-using ParamCancelReqType = std::tuple<bool, bool, int, int, std::string>;
+// useOrchestratorMode, beamWidth, modelName
+using ParamCancelReqType = std::tuple<bool, int, std::string>;
 // streaming, modelName
 using LeaderApiUsageType = std::tuple<bool, std::string>;
 // iterStatsMaxIterations, useOrchestratorMode
@@ -583,7 +583,7 @@ using LogitsProcParamsType = std::tuple<std::string, bool, bool>;
 // modelName
 using GuidedDecodingParamsType = std::tuple<std::string>;
 // modelName, useOrchestratorMode, beamWidth
-using TimeoutTestParamsType = std ::tuple<std::string, bool, int>;
+using TimeoutTestParamsType = std::tuple<std::string, bool, int>;
 
 std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
 {
@@ -605,19 +605,11 @@ std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
 
 std::string generateTestNameCancelReq(testing::TestParamInfo<ParamCancelReqType> const& info)
 {
-    auto const streaming = std::get<0>(info.param);
-    auto const& useOrchestratorMode = std::get<1>(info.param);
-    int const beamWidth = std::get<2>(info.param);
-    int const numReturnSequences = std::get<3>(info.param);
-    auto const modelName = std::get<4>(info.param);
+    auto const& useOrchestratorMode = std::get<0>(info.param);
+    auto const beamWidth = std::get<1>(info.param);
+    auto const modelName = std::get<2>(info.param);
     std::string name = "ExecutorTest";
-    if (streaming)
-    {
-        name += "Streaming";
-    }
-
     name.append("BW" + std::to_string(beamWidth));
-    name.append("_numRetSeq" + std::to_string(numReturnSequences));
     name.append("_" + modelName + "_");
 
     if (useOrchestratorMode)
@@ -3768,11 +3760,9 @@ TEST_F(GptExecutorTest, orchModeForwardError)
 
 TEST_P(ParamCancelReqTest, MultipleRequestsMultiGpuCancelRequest)
 {
-    bool const streaming = std::get<0>(GetParam());
-    bool const useOrchestratorMode = std::get<1>(GetParam());
-    auto const beamWidth = std::get<2>(GetParam());
-    auto const numReturnSequences = std::get<3>(GetParam());
-    auto const modelName = std::get<4>(GetParam());
+    auto const useOrchestratorMode = std::get<0>(GetParam());
+    auto const beamWidth = std::get<1>(GetParam());
+    auto const modelName = std::get<2>(GetParam());
 
     std::optional<std::vector<SizeType32>> deviceIds = std::nullopt;
 
@@ -3847,39 +3837,57 @@ TEST_P(ParamCancelReqTest, MultipleRequestsMultiGpuCancelRequest)
     // Create the request
     SizeType32 maxNewTokens = 50;
     VecTokens inputTokens{1, 2, 3, 4};
-    auto samplingConfig = tensorrt_llm::executor::SamplingConfig(beamWidth);
-    auto request = Request(inputTokens, maxNewTokens, streaming, samplingConfig, outConfig);
-    auto samplingConfig2 = tensorrt_llm::executor::SamplingConfig(beamWidth);
-    samplingConfig2.setNumReturnSequences(numReturnSequences);
-    auto request2 = Request(inputTokens, maxNewTokens, streaming, samplingConfig2, outConfig);
+
+    std::vector<Request> requests;
+    for (auto streaming : {false, true})
+    {
+        // Add two requests with numReturnSequences = 1
+        auto samplingConfig = tensorrt_llm::executor::SamplingConfig(beamWidth);
+        requests.emplace_back(inputTokens, maxNewTokens, streaming, samplingConfig, outConfig);
+        requests.emplace_back(inputTokens, maxNewTokens, streaming, samplingConfig, outConfig);
+        // Add a request with numReturnSequences > 1
+        auto samplingConfig2 = tensorrt_llm::executor::SamplingConfig(beamWidth);
+        auto constexpr numReturnSequences = 2;
+        samplingConfig2.setNumReturnSequences(numReturnSequences);
+        requests.emplace_back(inputTokens, maxNewTokens, streaming, samplingConfig2, outConfig);
+    }
+    std::vector<bool> cancelRequests{true, false, true, true, false, true};
 
     if (executor.canEnqueueRequests())
     {
-        auto requestId = executor.enqueueRequest(request);
-        // Enqueue another request
-        auto requestId2 = executor.enqueueRequest(request);
-        // Enqueue a request of numReturnSequences > 1
-        auto requestId3 = executor.enqueueRequest(request2);
+        auto const requestIds = executor.enqueueRequests(requests);
 
         // Cancel the first and third requests
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        executor.cancelRequest(requestId);
-        executor.cancelRequest(requestId3);
+        for (SizeType32 i = 0; i < requests.size(); i++)
+        {
+            if (cancelRequests.at(i))
+            {
+                executor.cancelRequest(requestIds.at(i));
+            }
+        }
 
-        SizeType32 expectedNumToken = (streaming ? 0 : inputTokens.size()) + maxNewTokens;
+        std::unordered_map<IdType, bool> isStreaming;
+        std::unordered_map<IdType, SizeType32> expectedNumTokens;
+        SizeType32 expectedNumResponses = 0;
+        for (SizeType32 i = 0; i < requests.size(); i++)
+        {
+            auto const& request = requests.at(i);
+            auto requestId = requestIds.at(i);
+            isStreaming[requestId] = request.getStreaming();
+            expectedNumTokens[requestId] = (request.getStreaming() ? 0 : inputTokens.size()) + maxNewTokens;
+            expectedNumResponses += request.getStreaming()
+                ? expectedNumTokens[requestId]
+                : request.getSamplingConfig().getNumReturnSequences().value_or(1);
+        }
 
         std::unordered_map<IdType, std::unordered_map<SizeType32, VecTokens>> tokens;
-
-        std::unordered_map<IdType, SizeType32> expectedNumTokens;
-        expectedNumTokens[requestId] = expectedNumToken;
-        expectedNumTokens[requestId2] = expectedNumToken;
-        expectedNumTokens[requestId3] = expectedNumToken;
 
         // Get the new tokens for each requests
         int32_t numFinished = 0;
         int iter = 0;
         SizeType32 numResponses = 0;
-        while (numFinished < 3 && iter < mMaxWaitMs)
+        while (numFinished < requests.size() && iter < mMaxWaitMs)
         {
             std::chrono::milliseconds waitTime(1);
             auto responses = executor.awaitResponses(waitTime);
@@ -3888,6 +3896,7 @@ TEST_P(ParamCancelReqTest, MultipleRequestsMultiGpuCancelRequest)
                 numResponses++;
                 if (!response.hasError())
                 {
+                    auto requestId = response.getRequestId();
                     auto result = response.getResult();
                     numFinished += result.isFinal;
                     auto seqIdx = result.sequenceIndex;
@@ -3895,7 +3904,7 @@ TEST_P(ParamCancelReqTest, MultipleRequestsMultiGpuCancelRequest)
                     auto& newTokens = result.outputTokenIds.at(numSequences - 1);
                     auto& reqResults = tokens[response.getRequestId()];
                     auto& reqTokens = reqResults[seqIdx];
-                    if (streaming && beamWidth > 1)
+                    if (isStreaming.at(requestId) && beamWidth > 1)
                     {
                         reqTokens = newTokens;
                     }
@@ -3912,15 +3921,25 @@ TEST_P(ParamCancelReqTest, MultipleRequestsMultiGpuCancelRequest)
             ++iter;
         }
 
-        EXPECT_LE(numResponses, streaming ? 4 * expectedNumToken : 4);
-        EXPECT_EQ(numFinished, 3);
+        EXPECT_LE(numResponses, expectedNumResponses);
+        EXPECT_EQ(numFinished, requests.size());
         EXPECT_LT(iter, mMaxWaitMs);
 
-        EXPECT_LT(tokens[requestId][0].size(), expectedNumTokens[requestId]);
-        EXPECT_EQ(tokens[requestId2][0].size(), expectedNumTokens[requestId2]);
-        for (auto seqIdx = 0; seqIdx < tokens[requestId3].size(); seqIdx++)
+        for (auto requestIdx = 0; requestIdx < requests.size(); requestIdx++)
         {
-            EXPECT_LT(tokens[requestId3][seqIdx].size(), expectedNumTokens[requestId3]);
+            auto const requestId = requestIds.at(requestIdx);
+            for (auto seqIdx = 0; seqIdx < tokens.at(requestId).size(); seqIdx++)
+            {
+                auto const& seqTokens = tokens.at(requestId).at(seqIdx);
+                if (cancelRequests.at(requestIdx))
+                {
+                    EXPECT_LT(seqTokens.size(), expectedNumTokens.at(requestId));
+                }
+                else
+                {
+                    EXPECT_EQ(seqTokens.size(), expectedNumTokens.at(requestId));
+                }
+            }
         }
     }
 }
@@ -4470,10 +4489,8 @@ INSTANTIATE_TEST_SUITE_P(GptExecutorTest, ParamStatsTest,
 
 INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, ParamCancelReqTest,
     testing::Combine(                                                                  //
-        testing::Values(false, true),                                                  // streaming
         testing::Values(false, true),                                                  // useOrchestratorMode
         testing::Values(1, 2),                                                         // beamWidth
-        testing::Values(1, 2),                                                         // numReturnSequences
         testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp2_pp2_cp1") // modelName
         ),
     generateTestNameCancelReq);
