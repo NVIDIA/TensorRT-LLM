@@ -32,7 +32,7 @@ class PyTorchConfig:
     # it's hard to capture a single graph with prefill requests since the
     # input shapes are a function of the sequence lengths).
     # Note that each CUDA graph can use up to 200 MB of extra memory.
-    use_cuda_graph: bool = False
+    use_cuda_graph: bool = True
     cuda_graph_batch_sizes: Optional[List[int]] = None
     cuda_graph_max_batch_size: int = 0
     # If true, batches are rounded up to the nearest cuda_graph_batch_size.
