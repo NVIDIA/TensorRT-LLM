@@ -1330,6 +1330,7 @@ class PyTorchModelEngine(ModelEngine):
                     past_seen_token_num = request.max_beam_num_tokens - 1
                 else:
                     # the request has previous tensor
+                    previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
 
                 position_ids.append(past_seen_token_num)
@@ -1339,8 +1340,6 @@ class PyTorchModelEngine(ModelEngine):
                 sequence_lengths.append(1)
                 gather_ids.append(len(position_ids) - 1)
 
-            if new_tokens_device is not None and not request.is_dummy and request.py_batch_idx is not None:
-                previous_batch_indices.append(request.py_batch_idx)
             request_ids.append(request.py_request_id)
             seq_slots.append(request.seq_slot)
             request.py_batch_idx = request.seq_slot
