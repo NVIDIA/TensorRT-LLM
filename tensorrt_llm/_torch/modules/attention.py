@@ -938,7 +938,7 @@ class MLA(nn.Module):
 
         # determine the number of loop
         # currently we assume that the chunk size is the same as the max_num_tokens
-        chunk_size = attn_metadata.runtime_features.normal_chunk_size
+        chunk_size = attn_metadata.runtime_features.chunk_size
         chunked_loop_num = attn_metadata.chunked_loop_num
 
         # [toal_token_q, num_heads, 2] -> [toal_token_q, num_heads] float2
