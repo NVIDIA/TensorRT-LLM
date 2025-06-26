@@ -4,8 +4,8 @@ import torch
 
 from ...distributed import allgather, reducescatter
 from ...model_config import ModelConfig
-from ...utils import (EventType, Fp4QuantizedTensor, ceil_div,
-                      disable_fp4_allgather, swizzle_sf)
+from ...utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
+                      swizzle_sf)
 from .interface import MoE
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
@@ -251,7 +251,8 @@ class CutlassFusedMoE(MoE):
                         sfUseUE8M0=False,
                         swizzedLayout=False)
                     x_sf = x_sf.view(x_row,
-                                     ceil_div(x_col, self.scaling_vector_size))
+                                     (x_col + self.scaling_vector_size - 1) //
+                                     self.scaling_vector_size)
             else:
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
