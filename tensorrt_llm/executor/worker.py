@@ -167,13 +167,13 @@ class GenerationExecutorWorker(GenerationExecutor):
                 args["lora_config"] = lora_config
                 args[
                     "garbage_collection_gen0_threshold"] = llm_args.garbage_collection_gen0_threshold
-            elif executor_config.backend == "_autodeploy":
+            elif llm_args.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
                 create_executor = create_autodeploy_executor
             else:
                 raise ValueError(
-                    f"Unsupported backend config: {executor_config.backend}")
+                    f"Unsupported backend config: {llm_args.backend}")
             return create_executor(**args)
 
         def _create_engine():
