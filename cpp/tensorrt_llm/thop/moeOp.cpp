@@ -21,8 +21,10 @@
 #include "moe_gemm_kernels.h"
 #include "moe_kernels.h"
 #endif
+
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -42,19 +44,10 @@ namespace torch_ext
 {
 
 namespace common = tensorrt_llm::common;
-#if defined(USING_OSS_CUTLASS_MOE_GEMM)
-constexpr auto BlockScaleVectorSize
-    = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize;
-namespace kernels = tensorrt_llm::kernels::cutlass_kernels;
-using ActivationType = tensorrt_llm::kernels::cutlass_kernels::ActivationType;
-using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
-#else
-constexpr auto BlockScaleVectorSize = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
-namespace kernels = tensorrt_llm::kernels;
-using ActivationType = tensorrt_llm::ActivationType;
-using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput;
-#endif
-using profiler_backend = kernels::GemmProfilerBackend;
+namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
+using ActivationType = CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
+using TmaWarpSpecializedGroupedGemmInput = CUTLASS_MOE_GEMM_NAMESPACE::TmaWarpSpecializedGroupedGemmInput;
+using profiler_backend = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::GemmProfilerBackend;
 
 class FusedMoeRunner : public torch::CustomClassHolder
 {
@@ -276,6 +269,7 @@ public:
 
         // TODO: support lora in the future
         ::tensorrt_llm::kernels::LoraParams lora_params{};
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
             reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
@@ -286,6 +280,18 @@ public:
             static_cast<char*>(workspace_info.workspace), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+#else
+        mKernelRunner->runMoe(input.const_data_ptr(),
+            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
+            reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
+            token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
+                                           : nullptr,
+            fc1_expert_weights.const_data_ptr(), nullptr, activation_type, fc2_expert_weights.const_data_ptr(), nullptr,
+            quant_params, num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
+            static_cast<char*>(workspace_info.workspace), output.data_ptr(),
+            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
+            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+#endif
 
         return output;
     }
@@ -366,6 +372,7 @@ public:
 
         // TODO: support lora in the future
         ::tensorrt_llm::kernels::LoraParams lora_params{};
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
         mKernelRunner->runMoe(input.const_data_ptr(),
             input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
             reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
@@ -376,6 +383,18 @@ public:
             static_cast<char*>(workspace_info.workspace), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+#else
+        mKernelRunner->runMoe(input.const_data_ptr(),
+            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
+            reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
+            token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
+                                           : nullptr,
+            fc1_expert_weights.const_data_ptr(), nullptr, activation_type, fc2_expert_weights.const_data_ptr(), nullptr,
+            quant_params, num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
+            static_cast<char*>(workspace_info.workspace), output.data_ptr(),
+            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
+            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+#endif
 
         return std::make_tuple(output, num_active_experts_per_node, experts_to_token_score, active_expert_global_ids);
     }
@@ -432,12 +451,21 @@ public:
             bool const USE_LORA = false;
             auto activation_dtype = mUseW4A8GroupScaling ? at::ScalarType::Float8_e4m3fn : mActivationDtype;
             activation_dtype = isNvfp4Quant() ? at::ScalarType::Long : activation_dtype;
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
             mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                 tensorrt_llm::runtime::TorchUtils::dataType(activation_dtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                 hidden_size, inter_size, group_size, ActivationType::Swiglu, USE_BIAS, USE_LORA, min_latency_mode,
                 /*need_weights*/ false, parallelism_config, enable_alltoall);
+#else
+            mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
+                tensorrt_llm::runtime::TorchUtils::dataType(activation_dtype),
+                tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
+                tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
+                hidden_size, inter_size, group_size, ActivationType::Swiglu, USE_BIAS, USE_LORA, min_latency_mode,
+                /*need_weights*/ false, parallelism_config);
+#endif
 
             freeProfileWorkspace();
             size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
@@ -592,12 +620,16 @@ private:
             TORCH_CHECK(fc2_global.dim() == 1, "fc2 global must be 1D");
             TORCH_CHECK(fc1_weight_block.sizes()[0] == num_experts_on_rank
                     && fc1_weight_block.sizes()[1] == inter_size * 2
-                    && fc1_weight_block.sizes()[2] * FP8_PER_INT32 * BlockScaleVectorSize == hidden_size,
+                    && fc1_weight_block.sizes()[2] * FP8_PER_INT32
+                            * TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
+                        == hidden_size,
                 "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
             TORCH_CHECK(fc2_weight_block.sizes()[0] == num_experts_on_rank && fc2_weight_block.sizes()[1] == hidden_size
-                    && fc2_weight_block.sizes()[2] * FP8_PER_INT32 * BlockScaleVectorSize == inter_size,
+                    && fc2_weight_block.sizes()[2] * FP8_PER_INT32
+                            * TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
+                        == inter_size,
                 "fc2 weight block size must be (num_experts_on_rank, hidden_size, inter_size // 4 // "
                 "block_scale_vector_size)");
             TORCH_CHECK(fc2_global.sizes()[0] == num_experts_on_rank, "fc2 global size must be (num_experts_on_rank,)");

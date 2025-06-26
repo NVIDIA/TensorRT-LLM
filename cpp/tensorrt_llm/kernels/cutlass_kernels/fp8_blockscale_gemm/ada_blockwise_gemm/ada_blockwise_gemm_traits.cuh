@@ -24,8 +24,8 @@
 #include <cutlass/arch/mma.h>
 #include "ada_blockwise_mma_utils.cuh"
 #include "ada_blockwise_copy_utils.cuh"
-// clang-format on
 
+// clang-format on
 using namespace cute;
 using namespace cutlass;
 using namespace cutlass::gemm;

@@ -12,15 +12,25 @@
 add_gtest(banRepeatNGramsKernelsTest banRepeatNGramsKernelsTest.cpp)
 add_gtest(decodingKernelsTest decodingKernelTest.cpp)
 add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
-add_gtest(mixtureOfExpertsTest mixtureOfExpertsTest.cu) # currently only support
-                                                        # internal-cutlass lib
-                                                        # version
 
-# Temporary opend-sourced version. Will be daleted when open-sourced moe_gemm
-# support MXFP4
+macro(remove_compile_definition TARGET_NAME DEFINITION)
+  get_target_property(DEFS ${TARGET_NAME} COMPILE_DEFINITIONS)
+  if(DEFS)
+    list(REMOVE_ITEM DEFS ${DEFINITION})
+    set_target_properties(${TARGET_NAME} PROPERTIES COMPILE_DEFINITIONS
+                                                    "${DEFS}")
+  endif()
+endmacro()
+
+add_gtest(mixtureOfExpertsTest mixtureOfExpertsTest.cu)
+
+# If we are using oss cutlass, build an explicit internal test
 if(USING_OSS_CUTLASS_MOE_GEMM)
-  add_gtest(mixtureOfExpertsOssTest mixtureOfExpertsOssTest.cu)
+  add_gtest(mixtureOfExpertsInternalTest mixtureOfExpertsTest.cu)
+  remove_compile_definition(mixtureOfExpertsInternalTest
+                            USING_OSS_CUTLASS_MOE_GEMM)
 endif()
+
 add_gtest(ropeTest ropeTest.cu)
 add_gtest(shiftKCacheKernelTest shiftKCacheKernelTest.cu)
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)

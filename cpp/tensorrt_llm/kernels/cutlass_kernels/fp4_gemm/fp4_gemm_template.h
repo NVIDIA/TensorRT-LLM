@@ -41,17 +41,16 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
-using namespace cute;
-
-namespace tk = tensorrt_llm::common;
-namespace tkc = tensorrt_llm::cutlass_extensions;
-
 namespace tensorrt_llm
 {
 namespace kernels
 {
 namespace cutlass_kernels
 {
+using namespace cute;
+
+namespace tk = tensorrt_llm::common;
+namespace tkc = tensorrt_llm::cutlass_extensions;
 
 template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_>
 size_t dispatchNVFP4xNVFP4GemmClusterShapeSm100(T* D, void const* A, void const* B, void const* input_sf,

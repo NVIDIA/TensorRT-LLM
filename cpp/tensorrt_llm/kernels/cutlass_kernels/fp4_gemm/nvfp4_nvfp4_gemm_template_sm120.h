@@ -39,15 +39,13 @@
 #pragma GCC diagnostic pop
 #endif // #ifndef _WIN32
 
-using namespace cute;
-using namespace tensorrt_llm::kernels::cutlass_kernels;
-
 namespace tensorrt_llm
 {
 namespace kernels
 {
 namespace cutlass_kernels
 {
+using namespace cute;
 
 template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, typename CGA_M_, typename CGA_N_,
     typename CGA_K_>
