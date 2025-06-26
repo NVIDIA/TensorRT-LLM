@@ -1755,8 +1755,6 @@ class BertAttention(Module):
         if default_net().plugin_config.bert_attention_plugin:
             # TRT plugin mode
             assert input_lengths is not None
-            assert get_sm_version() < 100 or get_sm_version() >= 120, \
-                "bert_attention_plugin does not support SM100"
             context = bert_attention(
                 qkv,
                 input_lengths,
