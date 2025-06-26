@@ -28,9 +28,6 @@ methods:
       use_meta_recipe:
         annotation: bool
         default: false
-      force_dynamic_quantization:
-        annotation: bool
-        default: False
     return_annotation: None
   from_dict:
     parameters:
