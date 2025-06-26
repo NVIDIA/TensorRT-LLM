@@ -268,8 +268,8 @@ class TestGemma3(unittest.TestCase):
                                        ref.logits[:, -1].float(),
                                        atol=0.1,
                                        rtol=0.1)
-            print("[test_gemma3_allclose_to_hf] max diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())))
-            print("[test_gemma3_allclose_to_hf] mean diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
+            print("[test_gemma3_allclose_to_hf] max prefill diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())))
+            print("[test_gemma3_allclose_to_hf] mean prefill diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
 
         # gen
         gen_input_ids = torch.tensor([600], dtype=torch.int, device=device)
@@ -303,11 +303,13 @@ class TestGemma3(unittest.TestCase):
             ref = hf_gemma3.forward(input_ids=gen_input_ids.unsqueeze(0),
                                      position_ids=gen_position_ids,
                                      use_cache=True)
+            print("[test_gemma3_allclose_to_hf] max gen diff: ", torch.max(torch.abs(logits - ref.logits[:, -1].float())))
+            print("[test_gemma3_allclose_to_hf] mean gen diff: ", torch.mean(torch.abs(logits - ref.logits[:, -1].float())))
 
-        # TODO: Fix this. Thresholds below are unacceptably high.
-        torch.testing.assert_close(logits,
-                                   ref.logits[:, -1].float(),
-                                   atol=5,
-                                   rtol=14000)
+            # TODO: Fix this. Thresholds below are unacceptably high.
+            torch.testing.assert_close(logits,
+                                    ref.logits[:, -1].float(),
+                                    atol=5,
+                                    rtol=14000)
 
         kv_cache_manager.shutdown()
