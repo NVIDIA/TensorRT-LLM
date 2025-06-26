@@ -1,14 +1,11 @@
 import copy
 import math
-import os
 from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 import transformers
-from PIL import Image
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
 
@@ -21,6 +18,7 @@ from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import register_auto_model
+
 
 # Copied from HyperCLOVAX-SEED-Vision-Instruct-3B/modeling_hyperclovax.py
 def select_best_resolution(original_size: tuple,
@@ -527,23 +525,28 @@ class HCXVisionInputProcessor(InputProcessor):
 
         mm_data = {}
         mm_data["image"] = {
-            "pixel_values": torch.stack(preprocessed_image['pixel_values'][0], dim=0), #TODO change the pixel_values into the Shared Tensor
-            "image_sizes": preprocessed_image.get('image_sizes', None),
-            "is_videos": preprocessed_image.get('is_videos', None),
-            "num_queries_vis_abstractors": preprocessed_image.get('num_queries_vis_abstractors', None),
-            "num_queries_vis_abstractors_slow": preprocessed_image.get('num_queries_vis_abstractors_slow', None),
-            "first_last_frames_slows": preprocessed_image.get('first_last_frames_slows', None),
+            "pixel_values":
+            torch.stack(
+                preprocessed_image['pixel_values'][0],
+                dim=0),  #TODO change the pixel_values into the Shared Tensor
+            "image_sizes":
+            preprocessed_image.get('image_sizes', None),
+            "is_videos":
+            preprocessed_image.get('is_videos', None),
+            "num_queries_vis_abstractors":
+            preprocessed_image.get('num_queries_vis_abstractors', None),
+            "num_queries_vis_abstractors_slow":
+            preprocessed_image.get('num_queries_vis_abstractors_slow', None),
+            "first_last_frames_slows":
+            preprocessed_image.get('first_last_frames_slows', None),
         }
-        return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_data": mm_data
-        }
+        return fused_input_ids.to(torch.int32).tolist(), {"mm_data": mm_data}
 
 
 class HCXVisionModel:
 
-    def __init__(self,
-                 pretrained_config: PretrainedConfig):
-    
+    def __init__(self, pretrained_config: PretrainedConfig):
+
         self.pretrained_config = pretrained_config
         self.vision_config = self.pretrained_config.vision_config
 
@@ -614,8 +617,13 @@ class HCXVisionModel:
             for key in preprocessed_image_list[0].keys()
         }
 
-    def _parse_and_batch_mm_data(self, mm_data: List[Dict[str, Any]]) -> Tuple[List[torch.Tensor], Dict[str, List[Any]]]:
-        pixel_values = [list(torch.unbind(data["image"]["pixel_values"], dim=0)) for data in mm_data]
+    def _parse_and_batch_mm_data(
+        self, mm_data: List[Dict[str, Any]]
+    ) -> Tuple[List[torch.Tensor], Dict[str, List[Any]]]:
+        pixel_values = [
+            list(torch.unbind(data["image"]["pixel_values"], dim=0))
+            for data in mm_data
+        ]
         mm_extra_data = {
             key: [d["image"][key][0] for d in mm_data]
             for key in mm_data[0]["image"].keys()
@@ -624,7 +632,7 @@ class HCXVisionModel:
 
     @torch.inference_mode()
     def forward(self, mm_data: List[Dict[str, Any]]):
-        
+
         pixel_values, mm_extra_data = self._parse_and_batch_mm_data(mm_data)
         pixel_values = self._to_device(pixel_values)
         image_sizes = mm_extra_data.get("image_sizes", None)
@@ -633,8 +641,8 @@ class HCXVisionModel:
             "num_queries_vis_abstractors", None)
         num_queries_vis_abstractors_slow = mm_extra_data.get(
             "num_queries_vis_abstractors_slow", None)
-        first_last_frames_slows = mm_extra_data.get(
-            "first_last_frames_slows", None)
+        first_last_frames_slows = mm_extra_data.get("first_last_frames_slows",
+                                                    None)
 
         len_pixel_values = [len(pixel_value) for pixel_value in pixel_values]
         concat_pixel_values = torch.cat(list(chain(*pixel_values)),
@@ -825,9 +833,9 @@ class HCXVisionForCausalLM(PreTrainedModel):
         mm_data = kwargs.get("mm_data", [])
         mm_embeds = []
         if len(mm_data) > 0:
-            assert len(
+            assert len(mm_data) == num_context_requests == len(
                 mm_data
-            ) == num_context_requests == len(mm_data), f"Number of multimodal tensors ({len(mm_data)}) should be equal to number of context requests ({num_context_requests}) in the batch."
+            ), f"Number of multimodal tensors ({len(mm_data)}) should be equal to number of context requests ({num_context_requests}) in the batch."
             mm_embeds = self.mm_encoder.forward(mm_data)
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
