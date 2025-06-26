@@ -151,8 +151,11 @@ class ModelConfig(Generic[TConfig]):
     @property
     def enable_flash_mla(self):
         if self.attn_backend == 'TRTLLM':
-            if hasattr(self.pretrained_config, "kv_lora_rank") and hasattr(
-                    self.pretrained_config, "qk_rope_head_dim"):
+            if hasattr(
+                    self.pretrained_config, "kv_lora_rank"
+            ) and self.pretrained_config.kv_lora_rank is not None and hasattr(
+                    self.pretrained_config, "qk_rope_head_dim"
+            ) and self.pretrained_config.qk_rope_head_dim is not None:
                 head_dim = self.pretrained_config.kv_lora_rank + self.pretrained_config.qk_rope_head_dim
                 if head_dim == 576 and torch.cuda.get_device_capability() == (
                         9, 0):
