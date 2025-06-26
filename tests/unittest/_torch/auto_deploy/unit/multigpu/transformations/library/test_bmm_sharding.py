@@ -64,7 +64,7 @@ def _run_job(
         return num_params
 
     # now run the test
-    op_expected = getattr(torch.ops.dist, "all_gather")
+    op_expected = getattr(torch.ops.auto_deploy, "torch_dist_all_gather")
     run_test(
         model,
         x,

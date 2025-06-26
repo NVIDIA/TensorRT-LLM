@@ -423,12 +423,10 @@ void initBindings(pybind11::module_& m)
             py::arg("runtime"), py::arg("model_config"));
 
     py::classh<tb::DecoderBuffers>(m, "DecoderBuffers")
-        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, runtime::SizeType32,
-                 runtime::BufferManager const&, runtime::ModelConfig const&, runtime::WorldConfig const&>(),
-            py::arg("max_num_sequences"), py::arg("max_beam_width"), py::arg("max_attention_window"),
-            py::arg("max_tokens_per_step"), py::arg("buffer_manager"), py::arg("model_config"), py::arg("world_config"))
-        .def_readwrite("cache_indirection_input", &tb::DecoderBuffers::cacheIndirectionInput)
-        .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
+        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&,
+                 runtime::ModelConfig const&, runtime::WorldConfig const&>(),
+            py::arg("max_num_sequences"), py::arg("max_tokens_per_step"), py::arg("buffer_manager"),
+            py::arg("model_config"), py::arg("world_config"))
         .def_readwrite("draft_buffers", &tb::DecoderBuffers::draftBuffers);
 
     py::class_<tb::SlotDecoderBuffers>(m, "SlotDecoderBuffers")

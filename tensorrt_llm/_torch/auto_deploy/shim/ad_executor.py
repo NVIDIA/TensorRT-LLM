@@ -243,9 +243,7 @@ class ADEngine(ModelEngine):
         return {"logits": logits_flat}
 
 
-def create_autodeploy_executor(
-    executor_config: ExecutorConfig, checkpoint_dir: str = None, engine_dir: str = None
-):
+def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: str = None):
     """Create an AutoDeploy executor from the given configuration and checkpoint directory.
 
     This is the entrypoint API to the _autodeploy backend.
@@ -269,6 +267,10 @@ def create_autodeploy_executor(
     max_seq_len = ad_config.max_seq_len
     attn_page_size = ad_config.attn_page_size
     max_num_tokens = ad_config.max_num_tokens
+    max_draft_tokens = (
+        0 if ad_config.speculative_config is None else ad_config.speculative_config.max_draft_tokens
+    )
+
     ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}")
 
     # initialize model engine
@@ -314,9 +316,7 @@ def create_autodeploy_executor(
         dist=mpi_dist,
         disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         max_input_len=ad_config.max_input_len,
-        max_batch_size=ad_config.max_batch_size,
-        max_draft_tokens=ad_config.speculative_config.max_draft_tokens
-        if ad_config.speculative_config is not None
-        else 0,
+        max_batch_size=max_batch_size,
+        max_draft_tokens=max_draft_tokens,
     )
     return py_executor

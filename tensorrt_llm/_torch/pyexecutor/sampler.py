@@ -23,6 +23,7 @@ from tensorrt_llm.bindings.internal.runtime import (BufferManager, DecoderState,
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.mapping import Mapping
 
+from .finish_reason import FinishedState
 from .llm_request import LlmRequest, LlmRequestState
 from .scheduler import ScheduledRequests
 
@@ -524,9 +525,7 @@ class TRTLLMSampler(Sampler):
             "buffer_manager":
             buffer_manager,
             "decoder_buffers":
-            DecoderBuffers(self.max_num_sequences,
-                           self.executor_config.max_beam_width,
-                           self.max_attention_window, self.MAX_DECODING_TOKENS,
+            DecoderBuffers(self.max_num_sequences, self.MAX_DECODING_TOKENS,
                            buffer_manager, self.model_config,
                            self.world_config),
             "decoder_input_buffers":
@@ -626,7 +625,7 @@ class TRTLLMSampler(Sampler):
 
         self.store["decoder_input_buffers"].logits = decoder_buffer_logits
 
-        decoding_input, self.decoding_output = self.algs.make_decoding_batch_input_output(
+        decoding_input = self.algs.make_decoding_batch_input_output(
             scheduled_requests.context_requests,
             scheduled_requests.generation_requests,
             self.store["decoder_buffers"], self.store["decoder_input_buffers"],
@@ -634,7 +633,7 @@ class TRTLLMSampler(Sampler):
             self.max_num_sequences)
 
         self.algs.decoder.forward_async(self.store["decoder_state"],
-                                        self.decoding_output, decoding_input)
+                                        decoding_input)
 
         # NOTE: The following code prepares a new_tokens_device_tensor in accordance with the
         #       current implementation of model_engine.
@@ -717,6 +716,7 @@ class TRTLLMSampler(Sampler):
             for beam in range(beam_width):
                 seq_len = sequence_lengths_host_data[seq_slot * beam_width +
                                                      beam].item()
+                seq_len = seq_len + 1 if self.is_trt_overlap else seq_len
                 num_new_tokens[beam] = min(
                     num_generated_tokens,
                     seq_len - request.get_num_tokens(beam))
@@ -744,9 +744,10 @@ class TRTLLMSampler(Sampler):
                         state.host.cum_log_probs[seq_slot * beam_width +
                                                  beam].item())
 
-                finish_reason = finish_reasons_host[seq_slot * beam_width +
-                                                    beam].item()
-                request.set_finished_reason(FinishReason(finish_reason), beam)
+                finish_reason = FinishedState(
+                    finish_reasons_host[seq_slot * beam_width +
+                                        beam].item()).to_finish_reason()
+                request.set_finished_reason(finish_reason, beam)
 
             if request.py_return_log_probs:
                 request.py_result.append_log_probs([log_probs], cum_log_probs)

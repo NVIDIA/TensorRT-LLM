@@ -54,9 +54,14 @@ public:
     void allocateSpeculativeDecodingBuffers(
         SpeculativeDecodingMode speculativeDecodingMode, nvinfer1::DataType dtype, BufferManager const& bufferManager);
 
+    //! @brief Setup buffers for the decoder excluding speculative decoding.
     void setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
         SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig, BufferManager const& bufferManager);
+
+    //! @brief Setup buffers for the cache indirection.
+    //! @details This is used for beam search on pipeline parallel ranks without a decoder.
+    void setupCacheIndirection(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow);
 
     //! @brief Setup buffers for speculative decoding.
     void setupSpeculativeDecoding(SpeculativeDecodingMode const& speculativeDecodingMode,
@@ -173,6 +178,12 @@ public:
 
     //! @brief Workspace for beam search in streaming mode.
     [[nodiscard]] BeamSearchBuffers const& getBeamSearchBuffers() const;
+
+    //! @brief Cache indirection input for beam search.
+    [[nodiscard]] TensorPtr getCacheIndirectionInput() const;
+
+    //! @brief Cache indirection output for beam search.
+    [[nodiscard]] TensorPtr getCacheIndirectionOutput() const;
 
     //! @brief Stateful inputs for the decoder. Allocated for maxBatchSize slots.
     [[nodiscard]] DecodingInput& getJointDecodingInput() const;

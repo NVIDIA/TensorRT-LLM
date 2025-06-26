@@ -81,7 +81,7 @@ def test_flashinfer_custom_op_and_hf_impl(dtype, atol, rtol, head_dim):
 
     # Custom op call
     positions_flat = torch.arange(batch * seq_len, device=device)
-    custom_q, custom_k = torch.ops.rope.flashinfer(
+    custom_q, custom_k = torch.ops.auto_deploy.flashinfer_rope(
         query, key, positions_flat, cos_sin_cache_expand, True
     )
 
@@ -135,7 +135,7 @@ def test_flashinfer_custom_op_and_complex_impl(dtype, atol, rtol, head_dim):
 
     # q/k of llama4 rope is interleaved
     positions_flat = torch.arange(batch * seq_len, device=device)
-    custom_q, custom_k = torch.ops.rope.flashinfer(
+    custom_q, custom_k = torch.ops.auto_deploy.flashinfer_rope(
         query, key, positions_flat, cos_sin_cache_expand, False
     )
 
@@ -211,8 +211,8 @@ def test_triton_custom_op_and_hf_impl(layout, head_dim, dtype, atol, rtol):
     q_hf = q_f32.to(dtype)
     k_hf = k_f32.to(dtype)
 
-    q_out = torch.ops.rope.apply_rope_with_input_pos(q, cosin_cache, positions, layout)
-    k_out = torch.ops.rope.apply_rope_with_input_pos(k, cosin_cache, positions, layout)
+    q_out = torch.ops.auto_deploy.triton_rope_with_input_pos(q, cosin_cache, positions, layout)
+    k_out = torch.ops.auto_deploy.triton_rope_with_input_pos(k, cosin_cache, positions, layout)
 
     torch.testing.assert_close(q_hf, q_out, atol=atol, rtol=rtol)
     torch.testing.assert_close(k_hf, k_out, atol=atol, rtol=rtol)

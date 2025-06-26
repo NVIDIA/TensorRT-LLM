@@ -37,15 +37,13 @@
 #pragma GCC diagnostic pop
 #endif // #ifndef _WIN32
 
-using namespace cute;
-using namespace tensorrt_llm::kernels::cutlass_kernels;
-
 namespace tensorrt_llm
 {
 namespace kernels
 {
 namespace cutlass_kernels
 {
+using namespace cute;
 
 #ifdef ENABLE_BF16
 using SafeBF16 = __nv_bfloat16;
@@ -117,7 +115,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         /* // Input C */                                                                                               \
         using ElementC = void;                                                                                         \
         using LayoutC = cutlass::layout::RowMajor;                                                                     \
-        static constexpr int AlignmentC = 4;                                                                           \
+        static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;                           \
                                                                                                                        \
         using SFType = cutlass::float_ue4m3_t;                                                                         \
         using ElementCompute = float;                                                                                  \

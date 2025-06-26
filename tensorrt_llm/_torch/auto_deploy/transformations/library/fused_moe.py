@@ -69,7 +69,7 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
             w3_list = expert_weights["w3"]
 
             fused_moe_node = graph.call_function(
-                torch.ops.moe.torch_moe,
+                torch.ops.auto_deploy.torch_moe,
                 args=(
                     hidden_states,
                     selected_experts,
@@ -99,7 +99,7 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
 def fuse_moe(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     """
     Scan the FX graph and replace all calls to torch.ops.moe.torch_moe with
-    torch.ops.moe.trtllm_fused_moe.
+    torch.ops.auto_deploy.trtllm_moe_fused.
     """
     ad_logger.debug("Before MoE fusion: " + str(gm))
 
@@ -118,7 +118,7 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
     graph = gm.graph
 
     for node in list(graph.nodes):
-        if not is_op(node, torch.ops.moe.torch_moe):
+        if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
 
         ad_logger.debug(f"Found MoE op to fuse: {node} with args: {node.args}")
@@ -146,7 +146,7 @@ def _insert_fused_moe_ops(gm: GraphModule) -> int:
 
         with graph.inserting_before(node):
             new_node = graph.call_function(
-                torch.ops.moe.trtllm_fused_moe,
+                torch.ops.auto_deploy.trtllm_moe_fused,
                 args=(
                     hidden_states,
                     selected_experts,

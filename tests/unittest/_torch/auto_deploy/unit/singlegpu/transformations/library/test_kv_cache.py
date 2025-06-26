@@ -53,7 +53,9 @@ class GQAWithSdpa(GQA):
         v = v.view(b, s, self.num_kv_heads, self.head_dim)
 
         # Use grouped SDPA in bsnd layout
-        attn_output = torch.ops.attention.bsnd_grouped_sdpa(q, k, v, None, 0.0, True, None)
+        attn_output = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa(
+            q, k, v, None, 0.0, True, None
+        )
 
         # SDPA output is already in [b, s, n, h_d] format
         # Reshape to [b, s, n*h_d]
