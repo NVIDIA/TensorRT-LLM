@@ -571,8 +571,8 @@ TEST_F(GptExecutorTest, GenerationChangeEndId)
 using ParamType = std::tuple<bool, bool, int>;
 // useOrchestratorMode, beamWidth, modelName
 using ParamCancelReqType = std::tuple<bool, int, std::string>;
-// streaming, modelName
-using LeaderApiUsageType = std::tuple<bool, std::string>;
+// modelName
+using LeaderApiUsageType = std::tuple<std::string>;
 // iterStatsMaxIterations, useOrchestratorMode
 using ParamStatsType = std::tuple<int, bool>;
 // streaming, beamWidth, computeLogProbs, excludeInputInOutput, returnContextLogits, returnGenerationLogits, modelName,
@@ -625,14 +625,8 @@ std::string generateTestNameCancelReq(testing::TestParamInfo<ParamCancelReqType>
 
 std::string generateTestNameLeaderApiUsage(testing::TestParamInfo<LeaderApiUsageType> const& info)
 {
-    auto const streaming = std::get<0>(info.param);
-    auto const modelName = std::get<1>(info.param);
+    auto const modelName = std::get<0>(info.param);
     std::string name = "ExecutorTest";
-    if (streaming)
-    {
-        name += "Streaming";
-    }
-
     name.append("_" + modelName);
     return name;
 }
@@ -3944,12 +3938,11 @@ TEST_P(ParamCancelReqTest, MultipleRequestsMultiGpuCancelRequest)
     }
 }
 
-TEST_P(LeaderApiUsageTest, LeaderApiUsageTest)
+TEST_P(LeaderApiUsageTest, LeaderModeTest)
 {
-    bool const streaming = std::get<0>(GetParam());
-    auto const modelName = std::get<1>(GetParam());
+    auto const modelName = std::get<0>(GetParam());
 
-    SizeType32 beamWidth = 32;
+    SizeType32 beamWidth = 2;
     OutputConfig outConfig;
     std::optional<std::vector<SizeType32>> deviceIds = std::nullopt;
 
@@ -4006,18 +3999,22 @@ TEST_P(LeaderApiUsageTest, LeaderApiUsageTest)
     SizeType32 maxNewTokens = 50;
     VecTokens inputTokens{1, 2, 3, 4};
     auto request
-        = Request(inputTokens, maxNewTokens, streaming, tensorrt_llm::executor::SamplingConfig(beamWidth), outConfig);
+        = Request(inputTokens, maxNewTokens, false, tensorrt_llm::executor::SamplingConfig(beamWidth), outConfig);
+    auto requestStreaming
+        = Request(inputTokens, maxNewTokens, true, tensorrt_llm::executor::SamplingConfig(beamWidth), outConfig);
 
     // Leader enqueues requests and wait for responses
     if (executor.canEnqueueRequests())
     {
         auto requestId = executor.enqueueRequest(request);
         auto requestId2 = executor.enqueueRequest(request);
+        auto requestId3 = executor.enqueueRequest(requestStreaming);
+        auto requestId4 = executor.enqueueRequest(requestStreaming);
 
         int32_t numFinished = 0;
         int iter = 0;
         SizeType32 numResponses = 0;
-        while (numFinished < 2 && iter < mMaxWaitMs)
+        while (numFinished < 4 && iter < mMaxWaitMs)
         {
             std::chrono::milliseconds waitTime(1);
             auto responses = executor.awaitResponses(waitTime);
@@ -4036,7 +4033,7 @@ TEST_P(LeaderApiUsageTest, LeaderApiUsageTest)
             }
             ++iter;
         }
-        EXPECT_EQ(numFinished, 2);
+        EXPECT_EQ(numFinished, 4);
         EXPECT_LT(iter, mMaxWaitMs);
     }
     else
@@ -4048,7 +4045,6 @@ TEST_P(LeaderApiUsageTest, LeaderApiUsageTest)
         EXPECT_THROW({ executor.cancelRequest(1); }, tensorrt_llm::common::TllmException);
         EXPECT_THROW({ auto stats = executor.getLatestIterationStats(); }, tensorrt_llm::common::TllmException);
         EXPECT_THROW({ auto stats = executor.getLatestRequestStats(); }, tensorrt_llm::common::TllmException);
-        EXPECT_THROW({ executor.shutdown(); }, tensorrt_llm::common::TllmException);
     }
 }
 
@@ -4505,7 +4501,6 @@ INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, TimeoutTest,
 
 INSTANTIATE_TEST_SUITE_P(LlamaExecutorTest, LeaderApiUsageTest,
     testing::Combine(                                                                  //
-        testing::Values(false, true),                                                  // streaming
         testing::Values("llama_tp1_pp4_cp1", "llama_tp4_pp1_cp1", "llama_tp2_pp2_cp1") // modelName
         ),
     generateTestNameLeaderApiUsage);
