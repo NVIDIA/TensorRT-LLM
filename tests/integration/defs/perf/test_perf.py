@@ -1213,7 +1213,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--report_json={report_path}",
         ]
         if self._config.backend != "pytorch":
-            benchmark_cmd += [f"--backend=trt", f"--engine_dir={engine_dir}"]
+            benchmark_cmd += [
+                f"--backend=tensorrt", f"--engine_dir={engine_dir}"
+            ]
         else:
             benchmark_cmd += ["--backend=pytorch"]
         if self._config.num_reqs > 0:
