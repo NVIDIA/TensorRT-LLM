@@ -81,7 +81,7 @@ class DynasorGenerationController(Controller):
         probe_task.temperature = 0.6
         probe_task.top_p = 0.95
         probe_task.worker_tag = self.WorkerTag.GENERATION
-        probe_task.streaming = self.streaming
+        probe_task.streaming = False
 
         probe_answers = []
         probe_responses = []
@@ -107,9 +107,6 @@ class DynasorGenerationController(Controller):
             yield [proposer_task, probe_task]
 
             # Retrieve the output from the probe task.
-            # if probe_task.streaming:
-            #     print("[DynasorGenerationController] wait result for probe_task")
-            #     probe_task.result.result()
             probe_text = probe_task.output_str
 
             # Extract the potential answer from the probe response.
@@ -149,9 +146,6 @@ class DynasorGenerationController(Controller):
             # yield [proposer_task]
 
             # Append the newly generated text from the proposer to the current prompt for the next iteration.
-            # if proposer_task.streaming:
-            #     print("[DynasorGenerationController] wait result for proposer_task")
-            #     proposer_task.result.result()
             current_prompt += proposer_task.output_str
 
         # If the maximum token limit is reached without satisfying the certainty condition,
