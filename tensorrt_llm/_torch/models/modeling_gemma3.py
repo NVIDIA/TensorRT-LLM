@@ -115,7 +115,7 @@ class Gemma3Attention(Attention):
                                mrope_config=mrope_config,
                                all_reduce_params=all_reduce_params,
                                lora_params=lora_params,
-                               attention_window_size=attention_window_size,
+                            #    attention_window_size=attention_window_size,
                                **kwargs)
 
     def apply_qk_norm(self, q, k):
