@@ -40,4 +40,3 @@ class DefaultScenario(ScenarioProtocol):
             dict(kv_cache_free_gpu_mem_fraction=scenario.
                  kv_cache_free_gpu_mem_fraction, ),
         }
-

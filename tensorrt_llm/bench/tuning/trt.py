@@ -1,8 +1,8 @@
-
-
 from typing import Any, Dict
-from tensorrt_llm.bench.dataclasses.scenario import ScenarioSpecification
-from tensorrt_llm.bench.dataclasses.scenario import TuningConstraints, WorldConfig
+
+from tensorrt_llm.bench.dataclasses.scenario import (ScenarioSpecification,
+                                                     TuningConstraints,
+                                                     WorldConfig)
 from tensorrt_llm.bench.tuning.heuristics import DefaultScenario
 
 
